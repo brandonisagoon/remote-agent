@@ -6,9 +6,9 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/cubic-surveys/remote-agent.git"
+    "url": "git+https://github.com/brandonisagoon/remote-agent.git"
   },
-  "homepage": "https://github.com/cubic-surveys/remote-agent#readme",
+  "homepage": "https://github.com/brandonisagoon/remote-agent#readme",
   "type": "module",
   "packageManager": "bun@1.3.14",
   "engines": {
