@@ -1,0 +1,19 @@
+/// One business worker's bounded attempt to handle an accepted webhook.
+model WorkerRun {
+  id                      String  @id @default(cuid())
+  receiptId               String
+  workerKey               String
+  status                     String
+  attempts                   Int     @default(0)
+  detail                     String?
+  targetAgentIssueIdentifier String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  receipt LinearWebhookReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@unique([receiptId, workerKey])
+  @@index([receiptId])
+  @@index([createdAt])
+}

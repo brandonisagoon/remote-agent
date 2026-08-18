@@ -1,0 +1,10 @@
+node_modules/
+src/generated/prisma/
+*.sqlite
+*.sqlite-journal
+*.sqlite-shm
+*.sqlite-wal
+.env
+.env.*
+!.env.example
+.DS_Store
