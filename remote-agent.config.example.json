@@ -1,0 +1,32 @@
+{
+  "serviceName": "remote-agent",
+  "hosts": [
+    {
+      "id": "studio-mac",
+      "label": "Studio Mac",
+      "bbHostId": "replace-with-bb-host-id",
+      "zedConnection": "local",
+      "acceptsTrackerInput": true,
+      "default": true
+    }
+  ],
+  "repository": {
+    "root": "~/checkouts/your-repository",
+    "worktreeRoot": "../.worktrees",
+    "bootstrapCommand": ["bash", "scripts/bootstrap.sh"],
+    "workflows": {
+      "describe": {
+        "prompt": "prompts/describe-issue.md",
+        "harness": "claude",
+        "model": "opus"
+      },
+      "orchestrate": {
+        "prompt": "prompts/orchestrate-plan.md",
+        "harness": "codex"
+      },
+      "reflect": {
+        "prompt": "prompts/reflect.md"
+      }
+    }
+  }
+}

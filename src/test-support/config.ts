@@ -1,4 +1,24 @@
 import type { ServerConfig } from "../lib/config.ts";
+import { configureMachines } from "../lib/machines/index.ts";
+
+export const TEST_HOSTS = [
+  {
+    id: "macbook-air",
+    label: "Test MacBook Air",
+    bbHostId: "host_air",
+    zedConnection: "ssh" as const,
+    acceptsTrackerInput: true,
+    default: true,
+  },
+  {
+    id: "macbook-pro",
+    label: "Test MacBook Pro",
+    bbHostId: "host_pro",
+    zedConnection: "local" as const,
+    acceptsTrackerInput: false,
+    default: false,
+  },
+];
 
 /**
  * Baseline config for tests.
@@ -10,7 +30,11 @@ import type { ServerConfig } from "../lib/config.ts";
 export function testConfig(
   overrides: Partial<ServerConfig> = {},
 ): ServerConfig {
+  configureMachines(overrides.hosts ?? TEST_HOSTS);
   return {
+    serviceName: "remote-agent-test",
+    configFile: "/nonexistent/remote-agent.config.json",
+    installRoot: "/nonexistent/remote-agent",
     hostname: "127.0.0.1",
     port: 9000,
     publicUrl: "https://agents.example.com",
@@ -24,12 +48,9 @@ export function testConfig(
     agentTeamKey: "AGENT",
     bbBaseUrl: "http://127.0.0.1:38886",
     bbProjectId: "proj_test",
-    bbHostIds: {
-      "macbook-air": "host_air",
-      "macbook-pro": "host_pro",
-    },
+    hosts: TEST_HOSTS,
     machine: "macbook-air",
-    zedRemoteHost: "cubic-remote",
+    zedRemoteHost: "test-remote",
     codexExecutable: "codex",
     routerModel: null,
     routerTimeoutMs: 30_000,
@@ -37,11 +58,28 @@ export function testConfig(
     webhookMaxAgeMs: 60_000,
     deployScript: "/nonexistent/deploy.sh",
     deployBranch: "main",
-    deployJobLabel: "dev.cubicsurveys.test-poll",
+    deployJobLabel: "dev.remote-agent-test.deploy",
     reflectOnState: "Pull Request",
     orchestrateOnState: "Planning",
     describeReactionEmoji: "pencil2",
-    workspaceRepoRoot: "/nonexistent/cubic",
+    repository: {
+      root: "/nonexistent/repository",
+      worktreeRoot: "/nonexistent/.worktrees",
+      bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
+      workflows: {
+        describe: {
+          prompt: "prompts/describe-issue.md",
+          harness: "claude",
+          model: "opus",
+        },
+        orchestrate: {
+          prompt: "prompts/orchestrate-plan.md",
+          harness: "codex",
+          model: null,
+        },
+        reflect: { prompt: "prompts/reflect.md" },
+      },
+    },
     endOnState: "End",
     ...overrides,
   };

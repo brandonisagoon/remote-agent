@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 
-import type { CreatedIssueComment } from "../../../integrations/linear/index.ts";
+import type { CreatedIssueComment } from "../../../integrations/tracker/index.ts";
 import { createFakeBbClient } from "../../../../test-support/bb.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import {
@@ -12,7 +12,7 @@ import type {
   AgentIssue,
   AgentIssueStateValue,
 } from "../../../../types/sessions/index.ts";
-import { buildAgentIssueDescription } from "../registry/index.ts";
+import { buildAgentIssueDescription } from "../../../integrations/tracker/index.ts";
 import {
   projectBbEvent,
   type ProjectBbEventDependencies,
@@ -65,14 +65,14 @@ function agentIssue(state: AgentIssueStateValue): AgentIssue {
         machine: "macbook-air",
         role: "primary",
         lifecycle: "persistent",
-        cubeIssueIdentifier: "CUBE-3273",
+        sourceIssueIdentifier: "CUBE-3273",
         bbThreadId: "thr_1",
       },
       {
         eventId: "session-event-1",
         generation: 1,
         occurredAt: "2026-08-13T00:00:00.000Z",
-        cubeIssueIdentifier: "CUBE-3273",
+        sourceIssueIdentifier: "CUBE-3273",
       },
       config,
     ),
@@ -139,7 +139,7 @@ function recordingLinear(state: AgentIssueStateValue): RecordingLinear {
     dependencies: {
       bbClient,
       findIssue: async () => agentIssue(state),
-      getIssue: async () => ({ id: "cube-issue-id" }),
+      getIssue: async () => ({ id: "source-issue-id" }),
       createComment: async (_apiKey, input) => {
         creates.push(input);
         if (input.parentId && failParentIds.has(input.parentId)) return null;

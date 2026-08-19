@@ -5,9 +5,9 @@ import {
 } from "../../../../types/dispatcher/index.ts";
 import {
   fetchCommentContext,
-  Reaction,
+  TrackerReaction,
   reactToComment,
-} from "../../../integrations/linear/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
 import { createBbClient } from "../../../transports/bb/index.ts";
 import { buildAgentMentionMessage, excerpt } from "./message.ts";
@@ -15,7 +15,7 @@ import { selectOutcomeReactions } from "./reactions.ts";
 
 type MentionEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.LinearCommentMentioned }
+  { type: typeof DispatchEventType.TrackerCommentMentioned }
 >;
 
 export interface AgentMentionWorkerDependencies {
@@ -32,26 +32,26 @@ export function createAgentMentionWorker({
   return {
     key: "product.agent-mention",
     supports(event): event is MentionEvent {
-      return event.type === DispatchEventType.LinearCommentMentioned;
+      return event.type === DispatchEventType.TrackerCommentMentioned;
     },
     async execute(event, context) {
       const data = event.webhook.data;
 
       // Re-deliveries are harmless: duplicate reactions are best-effort and the
       // Linear client intentionally swallows any duplicate-emoji rejection.
-      await react(context.config.linearApiKey, data.id, Reaction.Received);
+      await react(context.config.linearApiKey, data.id, TrackerReaction.Received);
 
       const commentContext = await fetchContext(
         context.config.linearApiKey,
         data.id,
       );
-      const cubeIssueIdentifier =
-        data.issue?.identifier ?? commentContext.cubeIssueIdentifier;
-      if (!cubeIssueIdentifier) {
+      const sourceIssueIdentifier =
+        data.issue?.identifier ?? commentContext.sourceIssueIdentifier;
+      if (!sourceIssueIdentifier) {
         await react(
           context.config.linearApiKey,
           data.id,
-          Reaction.Unrouted,
+          TrackerReaction.Unrouted,
         );
         return {
           status: "ignored",
@@ -93,7 +93,7 @@ export function createAgentMentionWorker({
       const result = await forward({
         config: context.config,
         bbClient: context.bbClient ?? createBbClient(context.config.bbBaseUrl),
-        cubeIssueIdentifier,
+        sourceIssueIdentifier,
         workerContext: {
           key: "product.agent-mention",
           routingHint:
@@ -101,7 +101,7 @@ export function createAgentMentionWorker({
         },
         replyContext,
         message: buildAgentMentionMessage(
-          cubeIssueIdentifier,
+          sourceIssueIdentifier,
           data.user?.name ?? null,
           data.body,
           {

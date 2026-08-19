@@ -32,8 +32,8 @@ const labelDefinitions = [
   ["Unassigned", "Role"],
   ["Accepts Linear Input", "Routing"],
   ["Does Not Accept Linear Input", "Routing"],
-  ["Brandon's MacBook Air", "Machine"],
-  ["Brandon's MacBook Pro", "Machine"],
+  ["Test MacBook Air", "Machine"],
+  ["Test MacBook Pro", "Machine"],
   ["General", "Workflow"],
   ["describe-linear-issue", "Workflow"],
   ["plan-linear", "Workflow"],
@@ -73,7 +73,7 @@ function installLinearSessionFixture() {
         },
       });
     }
-    if (query.includes("CubeIssue")) {
+    if (query.includes("SourceIssue")) {
       return Response.json({
         data: { issue: { id: `cube-${variables.id}` } },
       });
@@ -142,7 +142,7 @@ function installLinearSessionFixture() {
                     {
                       id: `relation-${variables.id}`,
                       type: "related",
-                      cubeIssue: { identifier: "CUBE-2999" },
+                      sourceIssue: { identifier: "CUBE-2999" },
                     },
                   ]
                 : [],
@@ -292,8 +292,8 @@ describe("POST /api/session-events", () => {
           },
         });
       }
-      if (query.includes("CubeIssue")) {
-        return Response.json({ data: { issue: { id: "cube-issue" } } });
+      if (query.includes("SourceIssue")) {
+        return Response.json({ data: { issue: { id: "source-issue" } } });
       }
       if (query.includes("SearchAgentIssues")) {
         return Response.json({ data: { searchIssues: { nodes: [] } } });
@@ -435,8 +435,8 @@ describe("POST /api/session-events", () => {
           },
         });
       }
-      if (query.includes("CubeIssue")) {
-        return Response.json({ data: { issue: { id: "cube-issue" } } });
+      if (query.includes("SourceIssue")) {
+        return Response.json({ data: { issue: { id: "source-issue" } } });
       }
       if (query.includes("SearchAgentIssues")) {
         return Response.json({ data: { searchIssues: { nodes: [] } } });
@@ -495,7 +495,7 @@ describe("POST /api/session-events", () => {
                       {
                         id: "relation",
                         type: "related",
-                        cubeIssue: { identifier: "CUBE-2999" },
+                        sourceIssue: { identifier: "CUBE-2999" },
                       },
                     ]
                   : [],
@@ -541,7 +541,7 @@ describe("POST /api/session-events", () => {
       machine: "macbook-air",
       role: "primary",
       lifecycle: "persistent",
-      cubeIssueIdentifier: "CUBE-2999",
+      sourceIssueIdentifier: "CUBE-2999",
       bbThreadId: "main-session",
     };
     const request = (body: object) =>
@@ -573,7 +573,7 @@ describe("POST /api/session-events", () => {
       generation: 2,
       type: "workflow.started",
       workflow: "describe-linear-issue",
-      cubeIssueIdentifier: "CUBE-2999",
+      sourceIssueIdentifier: "CUBE-2999",
       runtime,
     });
     expect(workflowStarted.status).toBe(200);
@@ -615,7 +615,7 @@ describe("POST /api/session-events", () => {
       generation: 4,
       type: "workflow.started",
       workflow: "describe-linear-issue",
-      cubeIssueIdentifier: "not-an-id",
+      sourceIssueIdentifier: "not-an-id",
       runtime,
     });
     expect(invalid.status).toBe(400);
@@ -646,8 +646,8 @@ describe("POST /api/session-events", () => {
           },
         });
       }
-      if (query.includes("CubeIssue")) {
-        return Response.json({ data: { issue: { id: "cube-issue" } } });
+      if (query.includes("SourceIssue")) {
+        return Response.json({ data: { issue: { id: "source-issue" } } });
       }
       if (query.includes("SearchAgentIssues")) {
         return Response.json({ data: { searchIssues: { nodes: [] } } });
@@ -711,7 +711,7 @@ describe("POST /api/session-events", () => {
                       {
                         id: "relation",
                         type: "related",
-                        cubeIssue: { identifier: "CUBE-2999" },
+                        sourceIssue: { identifier: "CUBE-2999" },
                       },
                     ]
                   : [],
@@ -788,7 +788,7 @@ describe("POST /api/session-events", () => {
           generation: 11,
           type: "workflow.started",
           workflow: "describe-linear-issue",
-          cubeIssueIdentifier: "CUBE-2999",
+          sourceIssueIdentifier: "CUBE-2999",
           runtime,
         })
       ).status,
@@ -850,7 +850,7 @@ describe("POST /api/session-events", () => {
       machine: "macbook-air",
       role: "primary",
       lifecycle: "one-shot",
-      cubeIssueIdentifier: "CUBE-2999",
+      sourceIssueIdentifier: "CUBE-2999",
       bbThreadId: "clean-one-shot-thread",
     };
 
@@ -927,7 +927,7 @@ describe("POST /api/session-events", () => {
       machine: "macbook-air",
       role: "primary",
       lifecycle,
-      cubeIssueIdentifier: "CUBE-2999",
+      sourceIssueIdentifier: "CUBE-2999",
       bbThreadId: `${lifecycle}-reconcile-thread`,
     });
 

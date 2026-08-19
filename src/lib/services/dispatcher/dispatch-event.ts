@@ -6,7 +6,7 @@ import type {
   Worker,
   WorkerResult,
 } from "../../../types/dispatcher/index.ts";
-import { Reaction, reactToIssue } from "../../integrations/linear/index.ts";
+import { TrackerReaction, reactToIssue } from "../../integrations/tracker/index.ts";
 import { eventIssueId } from "./event-issue.ts";
 import { workers } from "./worker-registry.ts";
 import { finishWorkerRun, startWorkerRun } from "./worker-run-store.ts";
@@ -81,7 +81,7 @@ export async function dispatchEvent(
       const issueId = eventIssueId(input.event);
       if (issueId) {
         await dependencies
-          .react(input.config.linearApiKey, issueId, Reaction.Failed)
+          .react(input.config.linearApiKey, issueId, TrackerReaction.Failed)
           .catch((error) => {
             console.error(`Failed to react to issue ${issueId}:`, error);
           });

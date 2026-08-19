@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
-import { Reaction, reactToComment, reactToIssue } from "./reactions.ts";
+import { TrackerReaction, reactToComment, reactToIssue } from "./reactions.ts";
 
 const originalFetch = globalThis.fetch;
 
@@ -26,7 +26,7 @@ describe("Linear reactions", () => {
     const result = await reactToComment(
       "linear-key",
       "comment-id",
-      Reaction.Received,
+      TrackerReaction.Received,
     );
 
     expect(result).toBe(true);
@@ -43,7 +43,7 @@ describe("Linear reactions", () => {
     const result = await reactToIssue(
       "linear-key",
       "issue-id",
-      Reaction.Describing,
+      TrackerReaction.Describing,
     );
 
     expect(result).toBe(true);
@@ -62,7 +62,7 @@ describe("Linear reactions", () => {
     const result = await reactToIssue(
       "linear-key",
       "issue-id",
-      Reaction.Describing,
+      TrackerReaction.Describing,
     );
 
     expect(result).toBe(false);

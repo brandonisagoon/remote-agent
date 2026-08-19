@@ -19,7 +19,7 @@ export type BbReasoningLevel =
 export interface BbConfig {
   baseUrl: string;
   projectId: string;
-  hostIds: Partial<Record<"macbook-air" | "macbook-pro", string>>;
+  hostIds: Record<string, string>;
 }
 
 export interface BbThread {

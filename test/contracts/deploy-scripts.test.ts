@@ -35,6 +35,28 @@ describe("remote-agent deployment scripts", () => {
     expect(script).toContain(
       '"refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"',
     );
+    expect(script).toContain('git clone --quiet --depth=1 --branch "$BRANCH"');
+    expect(script).not.toContain("sparse-checkout");
+    expect(script).not.toContain("apps/remote-agent");
+  });
+
+  test("derives install paths and launchd labels from the service name", () => {
+    const install = readFileSync(
+      path.join(REMOTE_AGENT, "scripts/install.sh"),
+      "utf8",
+    );
+    const deploy = readFileSync(
+      path.join(REMOTE_AGENT, "scripts/deploy.sh"),
+      "utf8",
+    );
+
+    for (const script of [install, deploy]) {
+      expect(script).toContain("SERVICE_NAME=");
+      expect(script).not.toContain("dev.cubicsurveys");
+      expect(script).not.toContain("cubic-remote-agent");
+    }
+    expect(install).toContain('REMOTE_AGENT_ENV_FILE must point to a secrets env file');
+    expect(install).toContain('"$REPO/" "$APP/"');
   });
 
   test("typechecks only production sources during deployment", () => {

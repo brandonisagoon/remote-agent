@@ -8,15 +8,10 @@
 #   --purge   also delete $ROOT, including the database
 set -euo pipefail
 
-# Deliberately NOT under ~/Desktop: macOS TCC blocks launchd agents from
-# reading Desktop/Documents/Downloads, and grants are per-executable, so the
-# whole bash -> node -> bun chain would need Full Disk Access — and would break
-# again on every `brew upgrade`. ~/Library is not TCC-protected.
-# Space-free on purpose: this path is threaded through plist strings and shell
-# quoting, and "Application Support" would add a space to every one of them.
-ROOT="${REMOTE_AGENT_HOME:-$HOME/Library/cubic-remote-agent}"
-LABEL="dev.cubicsurveys.remote-agent"
-POLL_LABEL="dev.cubicsurveys.remote-agent-poll"
+SERVICE_NAME="${REMOTE_AGENT_SERVICE_NAME:-remote-agent}"
+ROOT="${REMOTE_AGENT_INSTALL_ROOT:-${REMOTE_AGENT_HOME:-$HOME/Library/Application Support/$SERVICE_NAME}}"
+LABEL="dev.$SERVICE_NAME.service"
+POLL_LABEL="dev.$SERVICE_NAME.deploy"
 
 for label in "$LABEL" "$POLL_LABEL"; do
   launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true

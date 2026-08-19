@@ -183,11 +183,11 @@ async function runCodexRouter(
     writeFileSync(
       contextFile,
       JSON.stringify({
-        cubeIssueIdentifier: input.cubeIssueIdentifier,
-        cubeIssue: input.cubeIssue
+        sourceIssueIdentifier: input.sourceIssueIdentifier,
+        sourceIssue: input.sourceIssue
           ? {
-              ...input.cubeIssue,
-              description: bounded(input.cubeIssue.description, 2_000),
+              ...input.sourceIssue,
+              description: bounded(input.sourceIssue.description, 2_000),
             }
           : null,
         comment: bounded(input.comment, 8_000),

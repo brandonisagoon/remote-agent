@@ -5,7 +5,7 @@ import {
 
 export function buildAgentIssueTitle(
   runtime: SessionRuntime,
-  cubeIssueIdentifier: string | null,
+  sourceIssueIdentifier: string | null,
 ): string {
   const harness =
     runtime.harness === "claude"
@@ -14,5 +14,5 @@ export function buildAgentIssueTitle(
   const role =
     runtime.role[0]!.toUpperCase() + runtime.role.slice(1);
   const suffix = runtime.harnessSessionId.slice(-8);
-  return `${cubeIssueIdentifier ?? "Unrelated"} · ${role} · ${harness} · ${suffix}`;
+  return `${sourceIssueIdentifier ?? "Unrelated"} · ${role} · ${harness} · ${suffix}`;
 }

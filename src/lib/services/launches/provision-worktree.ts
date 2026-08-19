@@ -1,8 +1,10 @@
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 
+import type { RepositoryConfig } from "../../config.ts";
+
 export interface ProvisionWorktreeInput {
-  repoRoot: string;
+  repository: RepositoryConfig;
   branchName: string;
   baseBranch?: string;
 }
@@ -22,23 +24,27 @@ async function run(args: string[], cwd: string): Promise<void> {
 }
 
 export function worktreePathForBranch(
-  repoRoot: string,
+  worktreeRoot: string,
   branchName: string,
 ): string {
   const safeName = branchName.replaceAll("/", "-").replaceAll(" ", "-");
-  return path.join(path.dirname(repoRoot), ".worktrees", safeName);
+  return path.join(worktreeRoot, safeName);
 }
 
 export async function provisionWorktree(
   input: ProvisionWorktreeInput,
 ): Promise<string> {
-  const worktreePath = worktreePathForBranch(input.repoRoot, input.branchName);
-  mkdirSync(path.dirname(worktreePath), { recursive: true });
+  const { repository } = input;
+  const worktreePath = worktreePathForBranch(
+    repository.worktreeRoot,
+    input.branchName,
+  );
+  mkdirSync(repository.worktreeRoot, { recursive: true });
   await run(
     [
       "git",
       "-C",
-      input.repoRoot,
+      repository.root,
       "worktree",
       "add",
       "-b",
@@ -46,11 +52,8 @@ export async function provisionWorktree(
       worktreePath,
       input.baseBranch ?? "main",
     ],
-    input.repoRoot,
+    repository.root,
   );
-  await run(
-    ["bash", path.join(worktreePath, "scripts/workspace/worktree/bootstrap.sh")],
-    worktreePath,
-  );
+  await run(repository.bootstrapCommand, worktreePath);
   return worktreePath;
 }

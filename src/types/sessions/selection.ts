@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type {
   RouteCandidate,
-  RouteCubeIssue,
+  RouteSourceIssue,
 } from "./session.ts";
 
 export const RouteActionSchema = z.enum([
@@ -21,8 +21,8 @@ export interface ReplyTarget {
 }
 
 export interface RoutingInput {
-  cubeIssueIdentifier: string;
-  cubeIssue: RouteCubeIssue | null;
+  sourceIssueIdentifier: string;
+  sourceIssue: RouteSourceIssue | null;
   comment: string;
   workerContext: {
     key: string;

@@ -9,7 +9,7 @@ import type {
   RoutingInput,
 } from "../../../types/sessions/index.ts";
 import {
-  fetchLinearRoutingContext,
+  fetchTrackerRoutingContext,
   fetchRouteCandidates,
   isEligibleCandidate,
   RouterTimeoutError,
@@ -25,7 +25,7 @@ export interface ReplyContext {
 export interface ForwardMessageOptions {
   config: ServerConfig;
   bbClient: BbClient;
-  cubeIssueIdentifier: string;
+  sourceIssueIdentifier: string;
   message: string;
   workerContext: RoutingInput["workerContext"];
   replyContext?: ReplyContext;
@@ -34,7 +34,7 @@ export interface ForwardMessageOptions {
   ) => string | Promise<string>;
   fetchCandidates?: (
     config: ServerConfig,
-    cubeIssueIdentifier: string,
+    sourceIssueIdentifier: string,
   ) => Promise<RouteCandidate[]>;
   selectSession?: (
     config: ServerConfig,
@@ -65,15 +65,15 @@ async function route(
   const selectSession = options.selectSession ?? selectSessionWithCodex;
   const initial = options.fetchCandidates
     ? {
-        cubeIssue: null,
+        sourceIssue: null,
         candidates: await options.fetchCandidates(
           options.config,
-          options.cubeIssueIdentifier,
+          options.sourceIssueIdentifier,
         ),
       }
-    : await fetchLinearRoutingContext(
+    : await fetchTrackerRoutingContext(
         options.config,
-        options.cubeIssueIdentifier,
+        options.sourceIssueIdentifier,
       );
   const candidates = (initial?.candidates ?? []).filter((candidate) =>
     isEligibleCandidate(options.config, candidate),
@@ -87,8 +87,8 @@ async function route(
     };
   }
   const selectedDecision = await selectSession(options.config, {
-    cubeIssueIdentifier: options.cubeIssueIdentifier,
-    cubeIssue: initial?.cubeIssue ?? null,
+    sourceIssueIdentifier: options.sourceIssueIdentifier,
+    sourceIssue: initial?.sourceIssue ?? null,
     comment: options.message,
     workerContext: options.workerContext,
     candidates,
@@ -110,7 +110,7 @@ async function route(
   }
   const fresh = (await fetchCandidates(
     options.config,
-    options.cubeIssueIdentifier,
+    options.sourceIssueIdentifier,
   )).find(
     (candidate) =>
       candidate.agentIssueIdentifier === decision.targetAgentIssueIdentifier,
@@ -137,7 +137,7 @@ async function route(
     : options.message;
   const message = normalized.replyRequested && options.replyContext
     ? `${baseMessage}\n\n${buildReplyDirective(
-        options.cubeIssueIdentifier,
+        options.sourceIssueIdentifier,
         options.replyContext.threadRootCommentId,
       )}`
     : baseMessage;

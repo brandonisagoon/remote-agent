@@ -5,13 +5,14 @@ import type { ServerConfig } from "../../../config.ts";
 import {
   createIssueComment,
   issueHasCommentContaining,
-} from "../../../integrations/linear/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import {
   buildZedDeepLink,
   getMachine,
   type MachineRecord,
 } from "../../../machines/index.ts";
 import { buildBbThreadOpenLink } from "../../../transports/bb/thread-link.ts";
+import { worktreePathForBranch } from "../../../services/launches/index.ts";
 
 export const WORKTREE_LINK_SEARCH_TEXT = "Open Worktree in Zed";
 export const WORKTREE_READY_TIMEOUT_MS = 15 * 60_000;
@@ -50,22 +51,16 @@ const defaultReadyDependencies: WorktreeReadyDependencies = {
 };
 
 export function predictWorktreePath(
-  workspaceRepoRoot: string,
+  worktreeRoot: string,
   branchName: string,
 ): string {
-  // The workspace launcher defaults WORKTREE_ROOT to a sibling .worktrees
-  // directory and replaces branch slashes so every worktree is one child.
-  return path.join(
-    path.dirname(workspaceRepoRoot),
-    ".worktrees",
-    branchName.replaceAll("/", "-"),
-  );
+  return worktreePathForBranch(worktreeRoot, branchName);
 }
 
 export function buildWorktreeLinkComment(input: {
   config: Pick<ServerConfig, "apiKey" | "publicUrl">;
   machine: MachineRecord;
-  zedRemoteHost: string;
+  zedRemoteHost: string | null;
   worktreePath: string;
   bbThreadId: string;
 }): string {
@@ -134,7 +129,7 @@ export async function postWorktreeLinkComment(
   try {
     const machine = getMachine({ id: input.config.machine });
     const worktreePath = predictWorktreePath(
-      input.config.workspaceRepoRoot,
+      input.config.repository.worktreeRoot,
       input.branchName,
     );
     const ready = await dependencies.waitForReady({

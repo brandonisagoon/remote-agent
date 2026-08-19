@@ -8,18 +8,18 @@ import {
   type DispatchEvent,
 } from "../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../test-support/config.ts";
-import { Reaction } from "../../../integrations/linear/index.ts";
+import { TrackerReaction } from "../../../integrations/tracker/index.ts";
 import type { ForwardMessageOptions } from "../../../services/messages/index.ts";
 import { createAgentMentionWorker } from "./worker.ts";
 
 type MentionEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.LinearCommentMentioned }
+  { type: typeof DispatchEventType.TrackerCommentMentioned }
 >;
 
 function event(parentId: string | null = "thread-root"): MentionEvent {
   return {
-    type: DispatchEventType.LinearCommentMentioned,
+    type: DispatchEventType.TrackerCommentMentioned,
     webhook: {
       type: "Comment" as const,
       action: "create" as const,
@@ -70,7 +70,7 @@ describe("createAgentMentionWorker", () => {
     const forwarded: ForwardMessageOptions[] = [];
     const worker = createAgentMentionWorker({
       fetchContext: async () => ({
-        cubeIssueIdentifier: "CUBE-2827",
+        sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
         parentBody: "The combined plan is ready.",
         parentAuthor: "Agent",
@@ -93,10 +93,10 @@ describe("createAgentMentionWorker", () => {
       targetAgentIssueIdentifier: "AGENT-9",
     });
     expect(reactions).toEqual([
-      Reaction.Received,
-      Reaction.Delivered,
-      Reaction.Reply,
-      Reaction.CodeChange,
+      TrackerReaction.Received,
+      TrackerReaction.Delivered,
+      TrackerReaction.Reply,
+      TrackerReaction.CodeChange,
     ]);
     expect(forwarded[0]?.replyContext).toEqual({
       threadRootCommentId: "thread-root",
@@ -121,7 +121,7 @@ describe("createAgentMentionWorker", () => {
     let replyContext: unknown;
     const worker = createAgentMentionWorker({
       fetchContext: async () => ({
-        cubeIssueIdentifier: "CUBE-2827",
+        sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
         parentBody: null,
         parentAuthor: null,
@@ -155,7 +155,7 @@ describe("createAgentMentionWorker", () => {
     unresolved.webhook.data.issue = null;
     const worker = createAgentMentionWorker({
       fetchContext: async () => ({
-        cubeIssueIdentifier: null,
+        sourceIssueIdentifier: null,
         quotedText: null,
         parentBody: null,
         parentAuthor: null,
@@ -178,14 +178,14 @@ describe("createAgentMentionWorker", () => {
       targetAgentIssueIdentifier: null,
     });
     expect(forwarded).toBeFalse();
-    expect(reactions).toEqual([Reaction.Received, Reaction.Unrouted]);
+    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Unrouted]);
   });
 
   test("warns after a no-candidate routing outcome", async () => {
     const reactions: string[] = [];
     const worker = createAgentMentionWorker({
       fetchContext: async () => ({
-        cubeIssueIdentifier: "CUBE-2827",
+        sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
         parentBody: null,
         parentAuthor: null,
@@ -204,14 +204,14 @@ describe("createAgentMentionWorker", () => {
 
     await worker.execute(event(), context());
 
-    expect(reactions).toEqual([Reaction.Received, Reaction.Unrouted]);
+    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Unrouted]);
   });
 
   test("marks a delivery failure after acknowledging receipt", async () => {
     const reactions: string[] = [];
     const worker = createAgentMentionWorker({
       fetchContext: async () => ({
-        cubeIssueIdentifier: "CUBE-2827",
+        sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
         parentBody: null,
         parentAuthor: null,
@@ -230,6 +230,6 @@ describe("createAgentMentionWorker", () => {
 
     await worker.execute(event(), context());
 
-    expect(reactions).toEqual([Reaction.Received, Reaction.Failed]);
+    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Failed]);
   });
 });

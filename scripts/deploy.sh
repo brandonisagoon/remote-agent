@@ -15,18 +15,20 @@ set -euo pipefail
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
-ROOT="${REMOTE_AGENT_HOME:-$HOME/Library/cubic-remote-agent}"
+SERVICE_NAME="${REMOTE_AGENT_SERVICE_NAME:-remote-agent}"
+ROOT="${REMOTE_AGENT_INSTALL_ROOT:-${REMOTE_AGENT_HOME:-$HOME/Library/Application Support/$SERVICE_NAME}}"
 REPO="$ROOT/repo"
 APP="$ROOT/app"
 STATE="$ROOT/state"
 BACKUPS="$STATE/backups"
-LABEL="dev.cubicsurveys.remote-agent"
+LABEL="dev.$SERVICE_NAME.service"
 
 # Machine-local, non-secret config (ports, paths). Sourced by the launchd
 # wrapper too, so both see identical values.
 [ -f "$STATE/remote-agent.env" ] && { set -a; . "$STATE/remote-agent.env"; set +a; }
-# The single plaintext secret: DOTENV_PRIVATE_KEY_PRODUCTION.
-[ -f "$STATE/remote-agent.keys" ] && { set -a; . "$STATE/remote-agent.keys"; set +a; }
+export REMOTE_AGENT_CONFIG="${REMOTE_AGENT_CONFIG:-$STATE/remote-agent.config.json}"
+export REMOTE_AGENT_INSTALL_ROOT="$ROOT"
+export REMOTE_AGENT_SERVICE_NAME="$SERVICE_NAME"
 
 BRANCH="${REMOTE_AGENT_DEPLOY_BRANCH:-main}"
 PORT="${REMOTE_AGENT_PORT:-9000}"
@@ -69,11 +71,10 @@ if [ "$PREVIOUS" = "$TARGET" ] && [ "$FORCE" -eq 0 ]; then
   exit 0
 fi
 
-# Only rebuild when something we actually ship changed. A commit touching only
-# the mobile app should not restart this service.
+# Only rebuild when something shipped by the standalone service changed.
 if [ "$FORCE" -eq 0 ] && [ "$PREVIOUS" != "$TARGET" ]; then
   if ! git diff --name-only "$PREVIOUS" "$TARGET" \
-      | grep -qE '^(apps/remote-agent/|\.env\.production$)'; then
+      | grep -qE '^(src/|prisma/|scripts/|package\.json$|bun\.lock$|tsconfig.*\.json$|prisma\.config\.ts$)'; then
     log "no relevant changes ($PREVIOUS -> $TARGET), fast-forwarding without rebuild"
     git reset --hard --quiet "$TARGET"
     exit 0
@@ -142,7 +143,8 @@ build() {
   rsync -a --delete \
     --exclude 'node_modules' \
     --exclude 'src/generated' \
-    "$REPO/apps/remote-agent/" "$APP/"
+    --exclude '.git' \
+    "$REPO/" "$APP/"
 
   cd "$APP"
   bun install --silent

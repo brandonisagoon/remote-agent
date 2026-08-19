@@ -4,7 +4,7 @@ model LinearWebhookReceipt {
   linearDeliveryId      String  @unique
   eventType             String
   trigger               String?
-  cubeIssueIdentifier   String?
+  sourceIssueIdentifier String?
   sourceCommentId       String?
   status                String
   detail                String?
@@ -14,6 +14,6 @@ model LinearWebhookReceipt {
 
   runs WorkerRun[]
 
-  @@index([cubeIssueIdentifier])
+  @@index([sourceIssueIdentifier])
   @@index([createdAt])
 }

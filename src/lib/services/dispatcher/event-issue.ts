@@ -5,13 +5,13 @@ import {
 
 export function eventIssueId(event: DispatchEvent): string | null {
   switch (event.type) {
-    case DispatchEventType.LinearCommentMentioned:
+    case DispatchEventType.TrackerCommentMentioned:
       return event.webhook.data.issueId ?? event.webhook.data.issue?.id ?? null;
-    case DispatchEventType.LinearIssueDescribeRequested:
+    case DispatchEventType.TrackerIssueDescribeRequested:
       return event.webhook.data.issueId ?? event.webhook.data.issue?.id ?? null;
-    case DispatchEventType.LinearIssueReflectionRequested:
-    case DispatchEventType.LinearIssueOrchestrationRequested:
-    case DispatchEventType.LinearIssueEndRequested:
+    case DispatchEventType.TrackerIssueReflectionRequested:
+    case DispatchEventType.TrackerIssueOrchestrationRequested:
+    case DispatchEventType.TrackerIssueEndRequested:
       return event.webhook.data.id;
   }
 }

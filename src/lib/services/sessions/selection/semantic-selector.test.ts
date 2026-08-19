@@ -52,7 +52,7 @@ function candidate(
       "Codex",
       "Primary",
       "Accepts Linear Input",
-      "Brandon's MacBook Air",
+      "Test MacBook Air",
     ],
     runtime: {
       harnessSessionId: `session-${identifier}`,
@@ -72,8 +72,8 @@ function routingInput(
   overrides: Partial<Pick<RoutingInput, "comment" | "replyTargets">> = {},
 ): RoutingInput {
   return {
-    cubeIssueIdentifier: "CUBE-2829",
-    cubeIssue: {
+    sourceIssueIdentifier: "CUBE-2829",
+    sourceIssue: {
       identifier: "CUBE-2829",
       title: "Open Worktree From Linear Deep Link Comment",
       description: "Regression fixture for the AGENT-130 delivery failure.",

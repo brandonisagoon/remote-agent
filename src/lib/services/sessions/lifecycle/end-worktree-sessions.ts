@@ -10,7 +10,7 @@ import {
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   updateAgentIssue,
-} from "../registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import {
   AgentIssueState,
   isTerminalAgentIssueState,
@@ -34,7 +34,7 @@ export async function endWorktreeSessions(
     const runtime = parseAgentIssueRuntime(issue.description);
     return (
       runtime?.worktreePath === event.locator.worktreePath &&
-      issue.labels.nodes.some((label) => label.name === machine.linearLabel) &&
+      issue.labels.nodes.some((label) => label.name === machine.label) &&
       !isTerminalAgentIssueState(issue.state.name)
     );
   });
@@ -42,7 +42,7 @@ export async function endWorktreeSessions(
     eventId: event.eventId,
     generation: event.generation,
     occurredAt: event.occurredAt,
-    cubeIssueIdentifier: null,
+    sourceIssueIdentifier: null,
   };
 
   let updated = 0;

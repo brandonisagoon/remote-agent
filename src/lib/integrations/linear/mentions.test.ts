@@ -6,7 +6,7 @@ const AGENT_USER_ID = "ac8abcbc-5d47-4c0c-93ca-a1c6df69a60a";
 const OPTIONS = { agentUserId: AGENT_USER_ID, agentHandle: "agent" };
 
 /**
- * Verbatim `data.body` from a real Linear Comment webhook — CUBE-2600,
+ * Verbatim `data.body` from a captured Linear Comment webhook,
  * delivery 48b12d46-310a-42d0-9bc9-7a136cd57d05, captured 2026-07-27.
  *
  * Kept exactly as received. If Linear ever changes the mention encoding, this

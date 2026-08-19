@@ -9,17 +9,13 @@ import {
   agentIssueRuntimeDescription,
 } from "../../../../test-support/agent-issue.ts";
 import type { CommandClient } from "../../../../types/runtime/index.ts";
-import type { CubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
 import {
   DispatchEventType,
   WorkerRunStatus,
 } from "../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeBbClient } from "../../../../test-support/bb.ts";
-import {
-  OPEN_ISSUE_SCRIPT,
-  ORCHESTRATE_PLAN_LINEAR_TUNNEL_ACTION,
-} from "./launch.ts";
 import {
   createOrchestrationWorker,
   type OrchestrationWorkerDependencies,
@@ -36,19 +32,13 @@ afterEach(() => {
 function fixtureRoot(): string {
   const root = mkdtempSync(path.join(tmpdir(), "orchestration-worker-"));
   tempDirectories.push(root);
-  const script = path.join(root, OPEN_ISSUE_SCRIPT);
-  const prompt = path.join(root, ORCHESTRATE_PLAN_LINEAR_TUNNEL_ACTION);
-  mkdirSync(path.dirname(script), { recursive: true });
+  const prompt = path.join(root, "prompts", "orchestrate-plan.md");
   mkdirSync(path.dirname(prompt), { recursive: true });
-  writeFileSync(script, "#!/usr/bin/env bash\n", { mode: 0o755 });
-  writeFileSync(
-    prompt,
-    "Use {{SKILL:orchestrate-plan-linear+run-container-tunnel}}\n",
-  );
+  writeFileSync(prompt, "Plan {{sourceIssueIdentifier}} and execute it.\n");
   return root;
 }
 
-function issue(): CubeIssueWithAgentIssues {
+function issue(): SourceIssueWithAgentIssues {
   return {
     id: "issue-id",
     identifier: "CUBE-2774",
@@ -64,7 +54,7 @@ function issue(): CubeIssueWithAgentIssues {
 
 function event() {
   return {
-    type: DispatchEventType.LinearIssueOrchestrationRequested,
+    type: DispatchEventType.TrackerIssueOrchestrationRequested,
     webhook: {
       type: "Issue" as const,
       action: "update" as const,
@@ -94,9 +84,17 @@ function commandClient(
 }
 
 function context(root: string, client: CommandClient) {
+  const base = testConfig();
   return {
     prisma: {} as PrismaClient,
-    config: testConfig({ workspaceRepoRoot: root }),
+    config: {
+      ...base,
+      repository: {
+        ...base.repository,
+        root,
+        worktreeRoot: path.join(path.dirname(root), ".worktrees"),
+      },
+    },
     commandClient: client,
     bbClient: createFakeBbClient(),
     runId: "run-id",
@@ -155,7 +153,7 @@ describe("orchestrationWorker", () => {
     );
 
     expect(result.status).toBe("failed");
-    expect(result.detail).toContain("required orchestration file is missing");
+    expect(result.detail).toContain("required orchestration prompt is missing");
     expect(commands.calls).toHaveLength(0);
     expect(reaction.callCount()).toBe(0);
   });
@@ -176,7 +174,7 @@ describe("orchestrationWorker", () => {
 
     expect(result).toMatchObject({
       status: "failed",
-      detail: "cube issue not found",
+      detail: "source issue not found",
     });
     expect(commands.calls).toHaveLength(0);
     expect(reaction.callCount()).toBe(0);

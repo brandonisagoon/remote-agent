@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import {
@@ -7,44 +7,36 @@ import {
   type Worker,
   type WorkerResult,
 } from "../../../../types/dispatcher/index.ts";
-import type { CubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
-import { getCubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
-import { Reaction, reactToIssue } from "../../../integrations/linear/index.ts";
-import {
-  composeSkill,
-  skillInvocation,
-  type ComposeOptions,
-  type ComposeResult,
-} from "../../../workflows/skills.ts";
-import {
-  DESCRIBE_AGENT_HARNESS,
-  DESCRIBE_AGENT_MODEL,
-  buildDescribeSessionName,
-  describePaths,
-} from "./launch.ts";
+import { TrackerReaction, reactToIssue } from "../../../integrations/tracker/index.ts";
 import { spawnAgentThread } from "../../../services/launches/index.ts";
-import { productLabelSnippets } from "./product-labels.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import { getSourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import {
+  renderWorkflowPrompt,
+  workflowPromptPath,
+} from "../../../workflows/repository.ts";
+import { buildDescribeSessionName } from "./launch.ts";
 
 type DescribeEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.LinearIssueDescribeRequested }
+  { type: typeof DispatchEventType.TrackerIssueDescribeRequested }
 >;
 
 export interface DescribeWorkerDependencies {
   exists: (file: string) => boolean;
+  readPrompt: (file: string) => string;
   getIssue: (
-    config: Parameters<typeof getCubeIssueWithAgentIssues>[0],
+    config: Parameters<typeof getSourceIssueWithAgentIssues>[0],
     query: { id: string },
-  ) => Promise<CubeIssueWithAgentIssues | null>;
-  compose: (options: ComposeOptions) => Promise<ComposeResult>;
+  ) => Promise<SourceIssueWithAgentIssues | null>;
   react: typeof reactToIssue;
   launch?: typeof spawnAgentThread;
 }
 
 const defaultDependencies: DescribeWorkerDependencies = {
   exists: existsSync,
-  getIssue: getCubeIssueWithAgentIssues,
-  compose: composeSkill,
+  readPrompt: (file) => readFileSync(file, "utf8").trim(),
+  getIssue: getSourceIssueWithAgentIssues,
   react: reactToIssue,
 };
 
@@ -62,14 +54,14 @@ export function createDescribeWorker(
   return {
     key: "product.describe",
     supports(event): event is DescribeEvent {
-      return event.type === DispatchEventType.LinearIssueDescribeRequested;
+      return event.type === DispatchEventType.TrackerIssueDescribeRequested;
     },
     async execute(event, context) {
-      const paths = describePaths(context.config.workspaceRepoRoot);
-      for (const file of [paths.promptFile]) {
-        if (!dependencies.exists(file)) {
-          return result("failed", `required describe file is missing: ${file}`);
-        }
+      const repository = context.config.repository;
+      const workflow = repository.workflows.describe;
+      const promptFile = workflowPromptPath(repository, "describe");
+      if (!dependencies.exists(promptFile)) {
+        return result("failed", `required describe prompt is missing: ${promptFile}`);
       }
 
       const data = event.webhook.data;
@@ -77,10 +69,8 @@ export function createDescribeWorker(
         data.issue?.identifier ?? data.issueId ?? data.issue?.id ?? null;
       if (!issueRef) return result("failed", "reaction has no issue reference");
 
-      const issue = await dependencies.getIssue(context.config, {
-        id: issueRef,
-      });
-      if (!issue) return result("failed", "cube issue not found");
+      const issue = await dependencies.getIssue(context.config, { id: issueRef });
+      if (!issue) return result("failed", "source issue not found");
       if (
         issue.identifier
           .toUpperCase()
@@ -89,48 +79,25 @@ export function createDescribeWorker(
         return result("ignored", "agent_team_issue");
       }
 
-      let composed: ComposeResult;
-      try {
-        const snippets = productLabelSnippets(issue.labels.nodes);
-        const allSnippets = snippets.length === 0;
-        composed = await dependencies.compose({
-          skillset: "describe-linear-issue",
-          selection: {
-            snippets,
-            hooks: [],
-            flags: [],
-            allSnippets,
-            allHooks: true,
-          },
-          root: context.config.workspaceRepoRoot,
-        });
-      } catch (error) {
-        return result(
-          "failed",
-          `describe skill composition failed: ${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      if (
-        !composed.compatibility.harnesses.includes(DESCRIBE_AGENT_HARNESS)
-      ) {
-        return result(
-          "failed",
-          `composed skill is incompatible with ${DESCRIBE_AGENT_HARNESS}: ${composed.skill}`,
-        );
-      }
+      const sourcePrompt = dependencies.readPrompt(promptFile).trim();
+      if (!sourcePrompt) return result("failed", "describe workflow prompt is empty");
+      const prompt = renderWorkflowPrompt(sourcePrompt, {
+        sourceIssueIdentifier: issue.identifier,
+        sourceIssueTitle: issue.title,
+        sourceIssueLabels: issue.labels.nodes.map((label) => label.name).join(", "),
+      });
 
-      const prompt = `Use ${skillInvocation(DESCRIBE_AGENT_HARNESS, composed.skill)} to augment ${issue.identifier}.`;
       let launched: Awaited<ReturnType<typeof spawnAgentThread>>;
       try {
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
-          prisma: context.prisma,
+          prisma: context.prisma as PrismaClient,
           bbClient: context.bbClient!,
           machine: context.config.machine,
-          worktreePath: context.config.workspaceRepoRoot,
+          worktreePath: repository.root,
           issueIdentifier: issue.identifier,
-          harness: DESCRIBE_AGENT_HARNESS,
-          model: DESCRIBE_AGENT_MODEL,
+          harness: workflow.harness,
+          ...(workflow.model ? { model: workflow.model } : {}),
           lifecycle: "one-shot",
           role: "primary",
           title: buildDescribeSessionName(issue.identifier),
@@ -145,11 +112,11 @@ export function createDescribeWorker(
       const reacted = await dependencies.react(
         context.config.linearApiKey,
         issue.id,
-        Reaction.Describing,
+        TrackerReaction.Describing,
       );
       return result(
         "delivered",
-        `bb_thread:${launched.thread.id} started with ${composed.skill}; pencil reaction ${reacted ? "posted" : "failed"}`,
+        `bb_thread:${launched.thread.id} started from ${promptFile}; pencil reaction ${reacted ? "posted" : "failed"}`,
         issue.identifier,
       );
     },

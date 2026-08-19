@@ -11,8 +11,8 @@ import { buildBbThreadOpenLink } from "./lib/transports/bb/thread-link.ts";
 import {
   verifyBearerToken,
   verifyGithubSignature,
-  verifyLinearSignature,
 } from "./lib/security.ts";
+import { verifyTrackerWebhookSignature } from "./lib/integrations/tracker/index.ts";
 
 const SECRET = "test-webhook-secret";
 const API_KEY = "test-api-key";
@@ -159,31 +159,31 @@ describe("/api authentication", () => {
   });
 });
 
-describe("verifyLinearSignature", () => {
+describe("verifyTrackerWebhookSignature", () => {
   const body = JSON.stringify({ type: "Comment", action: "create" });
 
   test("accepts a signature over the raw body", () => {
-    expect(verifyLinearSignature(body, sign(body), SECRET)).toBe(true);
+    expect(verifyTrackerWebhookSignature(body, sign(body), SECRET)).toBe(true);
   });
 
   test("rejects a signature made with a different secret", () => {
-    expect(verifyLinearSignature(body, sign(body, "other"), SECRET)).toBe(
+    expect(verifyTrackerWebhookSignature(body, sign(body, "other"), SECRET)).toBe(
       false,
     );
   });
 
   test("rejects when the body was altered after signing", () => {
     const signature = sign(body);
-    expect(verifyLinearSignature(`${body} `, signature, SECRET)).toBe(false);
+    expect(verifyTrackerWebhookSignature(`${body} `, signature, SECRET)).toBe(false);
   });
 
   test("rejects a missing signature", () => {
-    expect(verifyLinearSignature(body, null, SECRET)).toBe(false);
+    expect(verifyTrackerWebhookSignature(body, null, SECRET)).toBe(false);
   });
 
   test("rejects malformed signatures without throwing", () => {
     for (const bad of ["", "abc", "z".repeat(64), `${sign(body)}00`]) {
-      expect(verifyLinearSignature(body, bad, SECRET)).toBe(false);
+      expect(verifyTrackerWebhookSignature(body, bad, SECRET)).toBe(false);
     }
   });
 });

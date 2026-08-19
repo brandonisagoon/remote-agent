@@ -1,15 +1,15 @@
 import type { MessageDispatchResult } from "../../../../types/messages/index.ts";
-import { Reaction } from "../../../integrations/linear/index.ts";
+import { TrackerReaction } from "../../../integrations/tracker/index.ts";
 
 export function selectOutcomeReactions(
   result: MessageDispatchResult,
 ): string[] {
   if (result.status === "delivered") {
-    const reactions: string[] = [Reaction.Delivered];
+    const reactions: string[] = [TrackerReaction.Delivered];
     const actions = new Set(result.decision?.expectedActions ?? []);
-    if (actions.has("reply")) reactions.push(Reaction.Reply);
-    if (actions.has("plan_update")) reactions.push(Reaction.PlanUpdate);
-    if (actions.has("code_change")) reactions.push(Reaction.CodeChange);
+    if (actions.has("reply")) reactions.push(TrackerReaction.Reply);
+    if (actions.has("plan_update")) reactions.push(TrackerReaction.PlanUpdate);
+    if (actions.has("code_change")) reactions.push(TrackerReaction.CodeChange);
     return reactions;
   }
 
@@ -18,8 +18,8 @@ export function selectOutcomeReactions(
     result.status === "ambiguous" ||
     result.status === "ignored"
   ) {
-    return [Reaction.Unrouted];
+    return [TrackerReaction.Unrouted];
   }
 
-  return [Reaction.Failed];
+  return [TrackerReaction.Failed];
 }

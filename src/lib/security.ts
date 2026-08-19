@@ -5,24 +5,6 @@ function safeEqual(a: Buffer, b: Buffer): boolean {
   return timingSafeEqual(a, b);
 }
 
-/**
- * Verify Linear's HMAC-SHA256 signature over the RAW request body.
- *
- * Must run against the unparsed body string: re-serializing the JSON would
- * change key order and whitespace, and the signature would never match.
- */
-export function verifyLinearSignature(
-  rawBody: string,
-  signature: string | null,
-  secret: string,
-): boolean {
-  if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) return false;
-
-  const expected = createHmac("sha256", secret).update(rawBody).digest();
-  const received = Buffer.from(signature, "hex");
-  return safeEqual(expected, received);
-}
-
 /** Verify GitHub's `x-hub-signature-256` header (`sha256=<hex>`). */
 export function verifyGithubSignature(
   rawBody: string,

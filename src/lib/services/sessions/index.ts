@@ -9,18 +9,18 @@ export {
 export type { EndSessionGroupResult } from "./lifecycle/index.ts";
 export {
   buildAgentIssueDescription,
-  cubeIssueIdentifierFromBranch,
+  sourceIssueIdentifierFromBranch,
   parseAgentIssueRuntime,
   parseAgentIssueSourceIdentifier,
   parseAgentIssueSyncMetadata,
   workflowLabelForEvent,
-} from "./registry/index.ts";
+} from "../../integrations/tracker/index.ts";
 export {
   reconcileMachineSessions,
   reconcileMachineSnapshot,
 } from "./reconciliation/index.ts";
 export {
-  fetchLinearRoutingContext,
+  fetchTrackerRoutingContext,
   fetchRouteCandidates,
   isEligibleCandidate,
   RouterTimeoutError,
@@ -45,10 +45,10 @@ export type {
   AgentIssue,
   AgentIssueSyncMetadata,
   LinearLabel,
-  LinearRoutingContext,
+  TrackerRoutingContext,
   RouteCandidate,
   RouteDecision,
-  RouteCubeIssue,
+  RouteSourceIssue,
   RoutingInput,
   RuntimeSessionEvent,
   SessionActivity,
