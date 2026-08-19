@@ -4,7 +4,7 @@ import type { AgentIssue, SessionRuntime } from "../../../../types/sessions/inde
 import { testConfig } from "../../../../test-support/config.ts";
 import {
   buildAgentIssueDescription,
-} from "../../../services/sessions/registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import { createFakeBbClient, type FakeBbClient } from "../../../../test-support/bb.ts";
 import { endSessionWorker } from "./worker.ts";
 
@@ -25,8 +25,8 @@ const labelDefinitions = [
   ["Delegate", "Role"],
   ["Accepts Linear Input", "Routing"],
   ["Does Not Accept Linear Input", "Routing"],
-  ["Brandon's MacBook Air", "Machine"],
-  ["Brandon's MacBook Pro", "Machine"],
+  ["Test MacBook Air", "Machine"],
+  ["Test MacBook Pro", "Machine"],
   ["General", "Workflow"],
 ] as const;
 const labels = labelDefinitions.map(([name, parent]) => ({
@@ -64,7 +64,7 @@ function agentIssue(input: {
     input.runtime?.harness === "claude" ? "Claude Code" : "Codex",
     input.runtime?.role === "delegate" ? "Delegate" : "Primary",
     "Accepts Linear Input",
-    "Brandon's MacBook Air",
+    "Test MacBook Air",
     "General",
   ];
   return {
@@ -80,7 +80,7 @@ function agentIssue(input: {
               eventId: `event-${input.id}`,
               generation: 1,
               occurredAt: "2026-08-01T12:00:00.000Z",
-              cubeIssueIdentifier: "CUBE-2801",
+              sourceIssueIdentifier: "CUBE-2801",
             },
             config,
           ),
@@ -101,7 +101,7 @@ function commandClient(present = true): FakeBbClient {
         id,
         projectId: config.bbProjectId,
         environmentId: "env-1",
-        hostId: config.bbHostIds["macbook-air"] ?? null,
+        hostId: "host_air",
         providerId: "codex",
         title: null,
         status: "idle",
@@ -180,7 +180,7 @@ function installLinear(issues: AgentIssue[]) {
 
 function event(target: AgentIssue) {
   return {
-    type: "linear.issue.end-requested" as const,
+    type: "tracker.issue.end-requested" as const,
     webhook: {
       type: "Issue" as const,
       action: "update" as const,
@@ -282,7 +282,7 @@ describe("agents.end-session worker", () => {
         "Codex",
         "Primary",
         "Accepts Linear Input",
-        "Brandon's MacBook Pro",
+        "Test MacBook Pro",
         "General",
       ],
     });

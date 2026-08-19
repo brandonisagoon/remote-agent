@@ -1,0 +1,91 @@
+import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
+import type { ServerConfig } from "../../../../config.ts";
+import type { BbClient } from "../../../../../types/runtime/index.ts";
+import { bunCommandClient } from "../../../../transports/command/index.ts";
+import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
+import {
+  IssueWebhookResultKind,
+  type IssueWebhookResult,
+  type LinearIssueWebhook,
+} from "../../webhook-types/index.ts";
+import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
+import { createWebhookReceipt } from "../receipt-store.ts";
+
+export type { IssueWebhookResult } from "../../webhook-types/index.ts";
+
+export async function handleIssueWebhook(input: {
+  prisma: PrismaClient;
+  config: ServerConfig;
+  bbClient: BbClient;
+  deliveryId: string;
+  webhook: LinearIssueWebhook;
+}): Promise<IssueWebhookResult> {
+  const { prisma, config, bbClient, deliveryId, webhook } = input;
+  const data = webhook.data;
+  if (!webhook.updatedFrom?.stateId) {
+    return { kind: IssueWebhookResultKind.Ignored };
+  }
+
+  if (data.team?.key === config.agentTeamKey) {
+    if (data.state?.name !== config.endOnState) {
+      return { kind: IssueWebhookResultKind.Ignored };
+    }
+    const receipt = await createWebhookReceipt(prisma, {
+      linearDeliveryId: deliveryId,
+      eventType: "issue",
+      trigger: "end",
+      sourceIssueIdentifier: data.identifier,
+      sourceCommentId: null,
+      status: "accepted",
+    });
+    if (!receipt) return { kind: IssueWebhookResultKind.Duplicate };
+    void dispatchEvent({
+      prisma,
+      config,
+      commandClient: bunCommandClient,
+      bbClient,
+      receiptId: receipt.id,
+      event: { type: DispatchEventType.TrackerIssueEndRequested, webhook },
+    });
+    return { kind: IssueWebhookResultKind.Ending };
+  }
+
+  const stateName = data.state?.name;
+  const trigger =
+    stateName === config.reflectOnState
+      ? "reflection"
+      : stateName === config.orchestrateOnState
+        ? "orchestration"
+        : null;
+  if (!trigger) return { kind: IssueWebhookResultKind.Ignored };
+
+  const receipt = await createWebhookReceipt(prisma, {
+    linearDeliveryId: deliveryId,
+    eventType: "issue",
+    trigger,
+    sourceIssueIdentifier: data.identifier,
+    sourceCommentId: null,
+    status: "accepted",
+  });
+  if (!receipt) return { kind: IssueWebhookResultKind.Duplicate };
+  void dispatchEvent({
+    prisma,
+    config,
+    commandClient: bunCommandClient,
+    bbClient,
+    receiptId: receipt.id,
+    event: {
+      type:
+        trigger === "reflection"
+          ? DispatchEventType.TrackerIssueReflectionRequested
+          : DispatchEventType.TrackerIssueOrchestrationRequested,
+      webhook,
+    },
+  });
+  return {
+    kind:
+      trigger === "reflection"
+        ? IssueWebhookResultKind.Reflecting
+        : IssueWebhookResultKind.Orchestrating,
+  };
+}

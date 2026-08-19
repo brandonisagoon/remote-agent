@@ -21,12 +21,12 @@ describe("orchestration worktree link comment", () => {
     const body = buildWorktreeLinkComment({
       config: testConfig(),
       machine: getMachine({ id: "macbook-air" }),
-      zedRemoteHost: "cubic-remote",
-      worktreePath: "/Users/brandon/Desktop/.worktrees/foo-cube-2829",
+      zedRemoteHost: "test-remote",
+      worktreePath: "/srv/worktrees/foo-cube-2829",
       bbThreadId: "thr_2829",
     });
     expect(body).toContain(
-      "[Open Worktree in Zed](zed://ssh/cubic-remote/Users/brandon/Desktop/.worktrees/foo-cube-2829)",
+      "[Open Worktree in Zed](zed://ssh/test-remote/srv/worktrees/foo-cube-2829)",
     );
     expect(body).toContain(
       "[Open Thread in bb](https://agents.example.com/session-links/bb/thr_2829?signature=",
@@ -40,21 +40,21 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         machine: getMachine({ id: "macbook-pro" }),
         zedRemoteHost: "unused",
-        worktreePath: "/Users/brandon/Desktop/.worktrees/foo cube",
+        worktreePath: "/srv/worktrees/foo cube",
         bbThreadId: "thr_local",
       }),
     ).toContain(
-      "[Open Worktree in Zed](zed://file/Users/brandon/Desktop/.worktrees/foo%20cube)",
+      "[Open Worktree in Zed](zed://file/srv/worktrees/foo%20cube)",
     );
   });
 
   test("predicts the default worktree path and sanitizes branch slashes", () => {
     expect(
       predictWorktreePath(
-        "/Users/brandon/Desktop/cubic",
+        "/workspace/.worktrees",
         "feature/deep-link-cube-2829",
       ),
-    ).toBe("/Users/brandon/Desktop/.worktrees/feature-deep-link-cube-2829");
+    ).toBe("/workspace/.worktrees/feature-deep-link-cube-2829");
   });
 
   test("waits for matching bootstrap stamps", async () => {
@@ -167,7 +167,11 @@ describe("orchestration worktree link comment", () => {
     const outcome = await postWorktreeLinkComment(
       {
         config: testConfig({
-          workspaceRepoRoot: "/Users/brandon/Desktop/cubic",
+          repository: {
+            ...testConfig().repository,
+            root: "/workspace/repository",
+            worktreeRoot: "/workspace/.worktrees",
+          },
         }),
         issueId: "issue-id",
         branchName: "feature/deep-link-cube-2829",
@@ -192,7 +196,7 @@ describe("orchestration worktree link comment", () => {
 
     expect(outcome).toBe("posted");
     expect(events).toEqual([
-      "ready:/Users/brandon/Desktop/.worktrees/feature-deep-link-cube-2829:feature/deep-link-cube-2829",
+      "ready:/workspace/.worktrees/feature-deep-link-cube-2829:feature/deep-link-cube-2829",
       "inspect",
       "create",
     ]);

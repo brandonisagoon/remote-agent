@@ -1,4 +1,5 @@
 import type { ServerConfig } from "../../../../../config.ts";
+import { getMachine } from "../../../../../machines/index.ts";
 import type { BbClient, BbEvent, BbThread } from "../../../../../../types/runtime/index.ts";
 import type { RuntimeSessionEvent } from "../../../../../../types/sessions/index.ts";
 
@@ -59,7 +60,7 @@ export async function resolveBbBackedEvent(
           bbClient,
           thread,
           event,
-          config.bbHostIds[event.runtime.machine],
+          getMachine({ id: event.runtime.machine }).bbHostId,
         ))
           ? thread
           : null,

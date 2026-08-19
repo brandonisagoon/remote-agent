@@ -14,7 +14,7 @@ import {
   getAgentStateId,
   parseAgentIssueRuntime,
   updateAgentIssue,
-} from "../registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import { enqueueAgentIssueWrite } from "./agent-issue/mutations/index.ts";
 
 interface SessionGroupMember {

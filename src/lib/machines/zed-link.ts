@@ -2,10 +2,14 @@ import type { MachineRecord } from "./registry.ts";
 
 export function buildZedDeepLink(
   machine: MachineRecord,
-  zedRemoteHost: string,
+  zedRemoteHost: string | null,
   worktreePath: string,
 ): string {
-  return machine.zedConnection === "ssh"
-    ? `zed://ssh/${encodeURIComponent(zedRemoteHost)}${encodeURI(worktreePath)}`
-    : `zed://file${encodeURI(worktreePath)}`;
+  if (machine.zedConnection === "local") {
+    return `zed://file${encodeURI(worktreePath)}`;
+  }
+  if (!zedRemoteHost) {
+    throw new Error("zedRemoteHost is required for an SSH machine");
+  }
+  return `zed://ssh/${encodeURIComponent(zedRemoteHost)}${encodeURI(worktreePath)}`;
 }

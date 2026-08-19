@@ -4,7 +4,7 @@ import { createBbClient } from "../../../../../transports/bb/index.ts";
 import {
   agentIssueRuntimeWithLabels,
   buildAgentIssueDescription,
-  cubeIssueIdentifierFromBranch,
+  sourceIssueIdentifierFromBranch,
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   parseAgentIssueSourceIdentifier,
@@ -17,8 +17,10 @@ import {
   getAgentStateId,
   getAgentIssueRelations,
   getAgentIssues,
-  getCubeIssue,
+  getSourceIssue,
   updateAgentIssue,
+} from "../../../../../integrations/tracker/index.ts";
+import {
   deleteAgentIssueRecord,
   findAgentIssueRecordByHarnessSessionId,
   updateAgentIssueRecord,
@@ -137,7 +139,7 @@ async function upsertAgentIssue(
   const previousMetadata = parseAgentIssueSyncMetadata(
     existingAgentIssue?.description ?? null,
   );
-  const previousCubeIssueIdentifier = parseAgentIssueSourceIdentifier(
+  const previousSourceIssueIdentifier = parseAgentIssueSourceIdentifier(
     existingAgentIssue?.description ?? null,
   );
   const storedGeneration = agentIssueRecord?.lastGeneration;
@@ -200,12 +202,12 @@ async function upsertAgentIssue(
               ? registered.role
               : event.runtime.role,
           lifecycle: event.runtime.lifecycle ?? registered.lifecycle,
-          cubeIssueIdentifier:
-            event.runtime.cubeIssueIdentifier ??
+          sourceIssueIdentifier:
+            event.runtime.sourceIssueIdentifier ??
             (event.type === "workflow.started" ||
             event.type === "workflow.ended"
               ? null
-              : previousCubeIssueIdentifier) ??
+              : previousSourceIssueIdentifier) ??
             null,
         },
       };
@@ -220,17 +222,17 @@ async function upsertAgentIssue(
   // Linear replies.
   const workflowIssueIdentifier =
     event.type === "workflow.started" || event.type === "workflow.ended"
-      ? event.cubeIssueIdentifier
+      ? event.sourceIssueIdentifier
       : null;
-  const cubeIssueIdentifier =
+  const sourceIssueIdentifier =
     workflowIssueIdentifier ??
-    event.runtime.cubeIssueIdentifier ??
-    cubeIssueIdentifierFromBranch(event.runtime.branchName);
-  const cubeIssue = cubeIssueIdentifier
-    ? await getCubeIssue(config, { id: cubeIssueIdentifier })
+    event.runtime.sourceIssueIdentifier ??
+    sourceIssueIdentifierFromBranch(event.runtime.branchName);
+  const sourceIssue = sourceIssueIdentifier
+    ? await getSourceIssue(config, { id: sourceIssueIdentifier })
     : null;
   const hasCompleteRuntime =
-    Boolean(cubeIssue) && Boolean(event.runtime.bbThreadId);
+    Boolean(sourceIssue) && Boolean(event.runtime.bbThreadId);
   const stateName = resolveAgentIssueState(
     event,
     hasCompleteRuntime,
@@ -240,10 +242,10 @@ async function upsertAgentIssue(
     eventId: event.eventId,
     generation: event.generation,
     occurredAt: event.occurredAt,
-    cubeIssueIdentifier,
+    sourceIssueIdentifier,
   };
   const data = {
-    title: buildAgentIssueTitle(event.runtime, cubeIssueIdentifier),
+    title: buildAgentIssueTitle(event.runtime, sourceIssueIdentifier),
     description: buildAgentIssueDescription(event.runtime, metadata, config),
     assigneeId: config.agentUserId,
     stateId: getAgentStateId(catalog, { name: stateName }),
@@ -260,8 +262,8 @@ async function upsertAgentIssue(
 
   if (
     existingAgentIssue &&
-    previousCubeIssueIdentifier &&
-    previousCubeIssueIdentifier !== cubeIssueIdentifier
+    previousSourceIssueIdentifier &&
+    previousSourceIssueIdentifier !== sourceIssueIdentifier
   ) {
     const relations = await getAgentIssueRelations(config, {
       agentIssueId: existingAgentIssue.id,
@@ -269,7 +271,7 @@ async function upsertAgentIssue(
     const staleRelations = relations.filter(
       (relation) =>
         relation.type === "related" &&
-        relation.cubeIssue.identifier === previousCubeIssueIdentifier,
+        relation.sourceIssue.identifier === previousSourceIssueIdentifier,
     );
     await Promise.all(
       staleRelations.map((relation) =>
@@ -327,10 +329,10 @@ async function upsertAgentIssue(
     }
   }
 
-  if (cubeIssue) {
+  if (sourceIssue) {
     await createAgentIssueRelation(config, {
       agentIssueId: agentIssue.id,
-      cubeIssueId: cubeIssue.id,
+      sourceIssueId: sourceIssue.id,
       type: "related",
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);

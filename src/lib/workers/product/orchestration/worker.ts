@@ -7,29 +7,33 @@ import {
   type Worker,
   type WorkerResult,
 } from "../../../../types/dispatcher/index.ts";
-import type { CubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
-import { getCubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
-import { Reaction, reactToIssue } from "../../../integrations/linear/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import { getSourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import { TrackerReaction, reactToIssue } from "../../../integrations/tracker/index.ts";
 import { postWorktreeLinkComment } from "./comment.ts";
 import { decideOrchestration } from "./decide.ts";
-import { buildOrchestrationSessionName, orchestrationPaths } from "./launch.ts";
+import { buildOrchestrationSessionName } from "./launch.ts";
 import {
   provisionWorktree,
   spawnAgentThread,
 } from "../../../services/launches/index.ts";
+import {
+  renderWorkflowPrompt,
+  workflowPromptPath,
+} from "../../../workflows/repository.ts";
 
 type OrchestrationEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.LinearIssueOrchestrationRequested }
+  { type: typeof DispatchEventType.TrackerIssueOrchestrationRequested }
 >;
 
 export interface OrchestrationWorkerDependencies {
   exists: (file: string) => boolean;
   readPrompt: (file: string) => string;
   getIssue: (
-    config: Parameters<typeof getCubeIssueWithAgentIssues>[0],
+    config: Parameters<typeof getSourceIssueWithAgentIssues>[0],
     query: { id: string },
-  ) => Promise<CubeIssueWithAgentIssues | null>;
+  ) => Promise<SourceIssueWithAgentIssues | null>;
   react: typeof reactToIssue;
   postWorktreeComment: typeof postWorktreeLinkComment;
   provision?: typeof provisionWorktree;
@@ -39,7 +43,7 @@ export interface OrchestrationWorkerDependencies {
 const defaultDependencies: OrchestrationWorkerDependencies = {
   exists: existsSync,
   readPrompt: (file) => readFileSync(file, "utf8").trimEnd(),
-  getIssue: getCubeIssueWithAgentIssues,
+  getIssue: getSourceIssueWithAgentIssues,
   react: reactToIssue,
   postWorktreeComment: postWorktreeLinkComment,
 };
@@ -66,24 +70,24 @@ export function createOrchestrationWorker(
   return {
     key: "product.orchestration",
     supports(event): event is OrchestrationEvent {
-      return event.type === DispatchEventType.LinearIssueOrchestrationRequested;
+      return event.type === DispatchEventType.TrackerIssueOrchestrationRequested;
     },
     async execute(event, context) {
-      const paths = orchestrationPaths(context.config.workspaceRepoRoot);
-      for (const file of [paths.promptFile]) {
-        if (!dependencies.exists(file)) {
-          return result(
-            "failed",
-            `required orchestration file is missing: ${file}`,
-          );
-        }
+      const repository = context.config.repository;
+      const workflow = repository.workflows.orchestrate;
+      const promptFile = workflowPromptPath(repository, "orchestrate");
+      if (!dependencies.exists(promptFile)) {
+        return result(
+          "failed",
+          `required orchestration prompt is missing: ${promptFile}`,
+        );
       }
 
       const issueIdentifier = event.webhook.data.identifier;
       const issue = await dependencies.getIssue(context.config, {
         id: issueIdentifier,
       });
-      if (!issue) return result("failed", "cube issue not found");
+      if (!issue) return result("failed", "source issue not found");
 
       const decision = decideOrchestration({
         issue,
@@ -96,7 +100,7 @@ export function createOrchestrationWorker(
 
       const branchResult = await context.commandClient.run("git", [
         "-C",
-        context.config.workspaceRepoRoot,
+        repository.root,
         "show-ref",
         "--verify",
         "--quiet",
@@ -115,15 +119,20 @@ export function createOrchestrationWorker(
         );
       }
 
-      const prompt = dependencies.readPrompt(paths.promptFile);
-      if (!prompt) return result("failed", "orchestration prompt is empty");
+      const sourcePrompt = dependencies.readPrompt(promptFile);
+      if (!sourcePrompt) return result("failed", "orchestration prompt is empty");
+      const prompt = renderWorkflowPrompt(sourcePrompt, {
+        sourceIssueIdentifier: issue.identifier,
+        sourceIssueTitle: issue.title,
+        branchName: decision.branchName,
+      });
 
       let launched: Awaited<ReturnType<typeof spawnAgentThread>>;
       try {
         const worktreePath = await (
           dependencies.provision ?? provisionWorktree
         )({
-          repoRoot: context.config.workspaceRepoRoot,
+          repository,
           branchName: decision.branchName,
         });
         launched = await (dependencies.launch ?? spawnAgentThread)({
@@ -134,7 +143,8 @@ export function createOrchestrationWorker(
           worktreePath,
           issueIdentifier,
           branchName: decision.branchName,
-          harness: "codex",
+          harness: workflow.harness,
+          ...(workflow.model ? { model: workflow.model } : {}),
           lifecycle: "persistent",
           role: "primary",
           title: buildOrchestrationSessionName(issueIdentifier),
@@ -149,7 +159,7 @@ export function createOrchestrationWorker(
       const reacted = await dependencies.react(
         context.config.linearApiKey,
         issue.id,
-        Reaction.PlanUpdate,
+        TrackerReaction.PlanUpdate,
       );
       const commentOutcome = await dependencies.postWorktreeComment({
         config: context.config,

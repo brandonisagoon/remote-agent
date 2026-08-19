@@ -9,7 +9,7 @@ import {
   getAgentIssues,
   parseAgentIssueRuntime,
   updateAgentIssue,
-} from "../registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import {
   AgentIssueLabel,
   AgentIssueState,
@@ -45,7 +45,7 @@ export async function reconcileMachineSnapshot(
         : AgentIssueState.Disconnected;
     const registeredMachine = getMachine({ id: runtime.machine });
     const desiredRouting =
-      live && registeredMachine.acceptsLinearInput && runtime.role === "primary";
+      live && registeredMachine.acceptsTrackerInput && runtime.role === "primary";
     const currentRouting = agentIssue.labels.nodes.some(
       (label) =>
         label.name ===
@@ -80,12 +80,10 @@ export async function reconcileMachineSessions(
   });
   const totals = { connected: 0, disconnected: 0, ended: 0 };
   for (const machine of getMachines()) {
-    const hostId = config.bbHostIds[machine.id];
-    if (!hostId) continue;
     const result = await reconcileMachineSnapshot(
       config,
       machine.id,
-      threads.filter((thread) => thread.hostId === hostId),
+      threads.filter((thread) => thread.hostId === machine.bbHostId),
     );
     totals.connected += result.connected;
     totals.disconnected += result.disconnected;

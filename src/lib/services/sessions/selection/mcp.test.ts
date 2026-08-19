@@ -20,8 +20,8 @@ describe("read-only routing MCP", () => {
     runDirectory = mkdtempSync(path.join(tmpdir(), "remote-agent-mcp-test-"));
     const contextFile = path.join(runDirectory, "context.json");
     const context = {
-      cubeIssueIdentifier: "CUBE-2600",
-      cubeIssue: {
+      sourceIssueIdentifier: "CUBE-2600",
+      sourceIssue: {
         identifier: "CUBE-2600",
         title: "Remote Agent Server",
         description: "Implementation plan",

@@ -4,19 +4,20 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 import type { AppEnv } from "../../middleware/context.ts";
-import { MachineSchema } from "../../lib/machines/index.ts";
+import { getMachine, MachineSchema } from "../../lib/machines/index.ts";
 import {
   ModelResolutionError,
   spawnAgentThread,
 } from "../../lib/services/launches/index.ts";
 import {
   HarnessSchema,
+  SourceIssueIdentifierSchema,
   SessionLifecycleSchema,
   SessionRoleSchema,
 } from "../../types/sessions/index.ts";
 
 const LaunchSchema = z.object({
-  issueIdentifier: z.string().regex(/^CUBE-\d+$/),
+  issueIdentifier: SourceIssueIdentifierSchema,
   harness: HarnessSchema,
   model: z.string().min(1).max(128).optional(),
   prompt: z.string().min(1).max(100_000),
@@ -41,7 +42,9 @@ route.post("/", async (c) => {
   }
 
   const config = c.get("config");
-  if (!config.bbHostIds[parsed.data.machine]) {
+  try {
+    getMachine({ id: parsed.data.machine });
+  } catch {
     return c.json(
       { error: `No bb host is configured for ${parsed.data.machine}` },
       409,

@@ -4,7 +4,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import {
   buildAgentIssueDescription,
   isEligibleCandidate,
-  cubeIssueIdentifierFromBranch,
+  sourceIssueIdentifierFromBranch,
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   type RouteCandidate,
@@ -15,10 +15,10 @@ const DESCRIPTION = `<!-- remote-agent-session:v1 -->
 | Runtime field | Value |
 | --- | --- |
 | Harness session ID | \`thr_abc123\` |
-| Worktree | \`/Users/brandon/Desktop/.worktrees/example-cube-2600\` |
+| Worktree | \`/srv/worktrees/example-cube-2600\` |
 | Lifecycle | — |
 | bb thread ID | \`ztt-example-codex-1\` |
-| bb machine | \`Brandon's MacBook Air\` |
+| bb machine | \`Test MacBook Air\` |
 <!-- /remote-agent-session:v1 -->
 <!-- remote-agent-sync:v1 {"eventId":"evt-1","generation":42,"occurredAt":"2026-07-28T12:00:00.000Z","sourceKey":"Q1VCRS0yNjAw"} -->
 
@@ -31,7 +31,7 @@ describe("agent issue description", () => {
     expect(parseAgentIssueRuntime(DESCRIPTION)).toEqual({
       harnessSessionId: "thr_abc123",
       parentSessionId: null,
-      worktreePath: "/Users/brandon/Desktop/.worktrees/example-cube-2600",
+      worktreePath: "/srv/worktrees/example-cube-2600",
       branchName: null,
       harness: "codex",
       machine: "macbook-air",
@@ -46,7 +46,7 @@ describe("agent issue description", () => {
       eventId: "evt-1",
       generation: 42,
       occurredAt: "2026-07-28T12:00:00.000Z",
-      cubeIssueIdentifier: "CUBE-2600",
+      sourceIssueIdentifier: "CUBE-2600",
     });
   });
 
@@ -59,7 +59,7 @@ describe("agent issue description", () => {
       {
         harnessSessionId: "thr_abc123",
         parentSessionId: null,
-        worktreePath: "/Users/brandon/Desktop/.worktrees/example-cube-2600",
+        worktreePath: "/srv/worktrees/example-cube-2600",
         branchName: "example-cube-2600",
         harness: "codex",
         machine: "macbook-air",
@@ -71,18 +71,18 @@ describe("agent issue description", () => {
         eventId: "evt-2",
         generation: 43,
         occurredAt: "2026-07-28T12:01:00.000Z",
-        cubeIssueIdentifier: "CUBE-2600",
+        sourceIssueIdentifier: "CUBE-2600",
       },
       testConfig(),
     );
     expect(description).toContain(
-      "| Worktree | `/Users/brandon/Desktop/.worktrees/example-cube-2600` |",
+      "| Worktree | `/srv/worktrees/example-cube-2600` |",
     );
     expect(description).toContain("| Lifecycle | `one-shot` |");
     expect(description).toContain("| Source issue | `CUBE-2600` |");
     expect(description).toContain("+++ Open Session");
     expect(description).toContain(
-      "[Open Worktree in Zed](zed://ssh/cubic-remote/Users/brandon/Desktop/.worktrees/example-cube-2600)",
+      "[Open Worktree in Zed](zed://ssh/test-remote/srv/worktrees/example-cube-2600)",
     );
     expect(description).toContain(
       "[Open Thread in bb](https://agents.example.com/",
@@ -93,13 +93,14 @@ describe("agent issue description", () => {
   });
 });
 
-describe("cube issue resolution", () => {
+describe("source issue resolution", () => {
   test("derives the issue from the branch suffix", () => {
-    expect(cubeIssueIdentifierFromBranch("remote-agent-server-cube-2600")).toBe(
+    expect(sourceIssueIdentifierFromBranch("remote-agent-server-cube-2600")).toBe(
       "CUBE-2600",
     );
+    expect(sourceIssueIdentifierFromBranch("feature-demo-42")).toBe("DEMO-42");
     expect(
-      cubeIssueIdentifierFromBranch("feature-without-an-issue"),
+      sourceIssueIdentifierFromBranch("feature-without-an-issue"),
     ).toBeNull();
   });
 });
@@ -115,7 +116,7 @@ describe("delivery eligibility", () => {
       "Codex",
       "Primary",
       "Accepts Linear Input",
-      "Brandon's MacBook Air",
+      "Test MacBook Air",
     ],
     runtime: {
       harnessSessionId: "thr_abc123",

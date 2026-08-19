@@ -2,12 +2,12 @@ import type { ServerConfig } from "../../../config.ts";
 import { getMachine } from "../../../machines/index.ts";
 import {
   agentIssueRuntimeWithLabels,
-  getCubeIssueWithAgentIssues,
+  getSourceIssueWithAgentIssues,
   parseAgentIssueRuntime,
   parseAgentIssueSourceIdentifier,
-} from "../registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import type {
-  LinearRoutingContext,
+  TrackerRoutingContext,
   RouteCandidate,
 } from "../../../../types/sessions/index.ts";
 import {
@@ -17,26 +17,26 @@ import {
 
 export async function fetchRouteCandidates(
   config: ServerConfig,
-  cubeIssueIdentifier: string,
+  sourceIssueIdentifier: string,
 ): Promise<RouteCandidate[]> {
   return (
-    (await fetchLinearRoutingContext(config, cubeIssueIdentifier))
+    (await fetchTrackerRoutingContext(config, sourceIssueIdentifier))
       ?.candidates ?? []
   );
 }
 
-export async function fetchLinearRoutingContext(
+export async function fetchTrackerRoutingContext(
   config: ServerConfig,
-  cubeIssueIdentifier: string,
-): Promise<LinearRoutingContext | null> {
-  const cubeIssue = await getCubeIssueWithAgentIssues(config, {
-    id: cubeIssueIdentifier,
+  sourceIssueIdentifier: string,
+): Promise<TrackerRoutingContext | null> {
+  const sourceIssue = await getSourceIssueWithAgentIssues(config, {
+    id: sourceIssueIdentifier,
   });
-  if (!cubeIssue) return null;
+  if (!sourceIssue) return null;
 
   const agentIssues = [
-    ...cubeIssue.relations.nodes.map((relation) => relation.agentIssue),
-    ...cubeIssue.inverseRelations.nodes.map((relation) => relation.agentIssue),
+    ...sourceIssue.relations.nodes.map((relation) => relation.agentIssue),
+    ...sourceIssue.inverseRelations.nodes.map((relation) => relation.agentIssue),
   ];
   const unique = new Map(
     agentIssues.map((agentIssue) => [agentIssue.id, agentIssue]),
@@ -48,7 +48,7 @@ export async function fetchLinearRoutingContext(
     if (!parsed) return [];
     if (
       parseAgentIssueSourceIdentifier(agentIssue.description) !==
-      cubeIssueIdentifier
+      sourceIssueIdentifier
     ) {
       return [];
     }
@@ -64,12 +64,12 @@ export async function fetchLinearRoutingContext(
     ];
   });
   return {
-    cubeIssue: {
-      identifier: cubeIssue.identifier,
-      title: cubeIssue.title,
-      description: cubeIssue.description,
-      status: cubeIssue.state.name,
-      labels: cubeIssue.labels.nodes.map((label) => label.name),
+    sourceIssue: {
+      identifier: sourceIssue.identifier,
+      title: sourceIssue.title,
+      description: sourceIssue.description,
+      status: sourceIssue.state.name,
+      labels: sourceIssue.labels.nodes.map((label) => label.name),
     },
     candidates,
   };
@@ -84,10 +84,10 @@ export function isEligibleCandidate(
   return (
     candidate.status === AgentIssueState.Connected &&
     candidate.assigneeId === config.agentUserId &&
-    machine.acceptsLinearInput &&
+    machine.acceptsTrackerInput &&
     candidate.runtime.role === "primary" &&
     labels.has(AgentIssueLabel.Routing.AcceptsInput) &&
-    labels.has(machine.linearLabel) &&
+    labels.has(machine.label) &&
     Boolean(candidate.runtime.bbThreadId)
   );
 }

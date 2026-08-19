@@ -1,88 +1,93 @@
 # Remote Agent
 
-Hono control plane that routes Linear collaboration into durable, server-owned
-bb threads. bb owns the canonical transcript, ordered events, execution host,
-and lifecycle. Linear is the asynchronous/mobile surface, Zed connects through
-the ACP adapter in this app, and the bb desktop/browser UI remains an optional
-operations surface.
+Remote Agent turns Linear collaboration into durable coding-agent sessions backed by [bb](https://github.com/get-bb/bb). It receives tracker webhooks, selects or launches a session on a configured execution host, forwards messages with queue-safe semantics, and projects bb events back to Linear.
 
-The service runs on the remote-agent host, not Vercel, and has its own isolated
-Prisma/SQLite database.
+The service is intentionally standalone: it owns a small Prisma/SQLite routing database, connects to bb through the official `bb-app` SDK, and operates on a host repository through configuration rather than repository-specific scripts.
 
-## Run and verify
+## Requirements
+
+- macOS for the included launchd installer
+- [Bun](https://bun.sh/) 1.3.14 or newer
+- a running bb server with a project and at least one enrolled host
+- a Linear OAuth application or API key, webhook secret, agent user, and session-mirror team
+- a public HTTPS origin for Linear and GitHub webhooks
+
+## Local setup
 
 ```bash
-bun run dev:remote-agent
-cd apps/remote-agent
-bun run lint
-bun test
-bun run acp                    # stdio ACP server; normally started by Zed
+git clone https://github.com/brandonisagoon/remote-agent.git
+cd remote-agent
+bun install
+cp remote-agent.config.example.json remote-agent.config.json
 ```
 
-The HTTP server binds to `127.0.0.1:9000` by default. Linear webhooks terminate
-at `/webhooks/linear`; authenticated compatibility and launch endpoints live
-under `/api/*`.
+Edit `remote-agent.config.json`, create a local environment file, and export it before starting:
 
-## Ownership and persistence
+```bash
+set -a
+. ./remote-agent.env
+set +a
+bun run db:migrate
+bun run start
+```
 
-Each Agents-team Linear issue is a durable routing mirror for one bb thread. It
-stores the harness identity, worktree, bb thread ID, machine, role, workflow,
-lifecycle, state, and source-issue relation. The local `AgentIssueRecord` table
-indexes that mirror by harness session and bb thread; `BbEventCursor` and
-`lastBbEventSeq` make event projection replay-safe.
+The server listens on `127.0.0.1:9000` by default. Linear webhooks terminate at `/webhooks/linear`, GitHub deployment webhooks at `/webhooks/github`, and authenticated launch/session endpoints live under `/api/*`.
 
-If Linear and bb disagree, bb wins. Old v1 issue descriptions still parse, but
-an issue without a bb thread ID is intentionally ineligible after the hard
-cutover.
+Run the verification suite with:
 
-This app never uses the product Postgres database:
+```bash
+bun run lint
+bun test
+```
 
-| Concern    | Product                 | remote-agent                       |
-| ---------- | ----------------------- | ---------------------------------- |
-| Schema     | `prisma/schema/`        | `apps/remote-agent/prisma/schema/` |
-| Provider   | Neon PostgreSQL         | local SQLite                       |
-| Connection | `DATABASE_URL`          | `REMOTE_AGENT_DATABASE_URL`        |
-| Client     | workspace Prisma client | `src/generated/prisma`             |
+## Service configuration
 
-Run Prisma commands with `apps/remote-agent` as the current directory.
+`REMOTE_AGENT_CONFIG` selects the JSON service configuration; it defaults to `remote-agent.config.json` in the current directory. See [the example configuration](remote-agent.config.example.json) and [the adoption guide](docs/adoption.md).
 
-## Runtime flow
+The file declares:
 
-Inbound comments follow this path:
+- `serviceName`, used for install paths and launchd labels;
+- one or more arbitrary execution hosts, each mapped to a bb host ID;
+- the host repository root and worktree root;
+- the bootstrap command used after worktree creation;
+- prompt, harness, and optional model settings for describe, orchestrate, and reflect workflows.
 
-1. Verify the Linear signature, replay window, and delivery ID.
-2. Preserve the existing Agents-team semantic selection rules.
-3. Re-fetch and validate the exact selected mirror and its bb thread.
-4. Submit the comment with bb `queue-if-active` semantics.
-5. Keep the existing Linear reactions and threaded reply contract.
+Secrets and machine-local settings stay in the environment:
 
-The bb event ingestion loop discovers project threads, tails ordered events,
-advances a durable cursor only after projection, and repairs Agents issue state.
-A bounded startup reconciliation compares mirrored records with bb thread state.
-There is no pane inspection or detached-launch watchdog.
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `REMOTE_AGENT_PUBLIC_URL` | yes | Public HTTPS origin for signed links and webhooks |
+| `REMOTE_AGENT_API_KEY` | yes | Bearer token for `/api/*` |
+| `REMOTE_AGENT_BB_PROJECT_ID` | yes | bb project containing the managed repository |
+| `LINEAR_WEBHOOK_SECRET` | yes | Linear webhook signature secret |
+| `LINEAR_API_KEY` | yes | Linear GraphQL access |
+| `LINEAR_AGENT_USER_ID` | yes | Agent identity and assignee |
+| `GITHUB_WEBHOOK_SECRET` | yes | Deployment webhook signature secret |
+| `LINEAR_AGENT_HANDLE` | no | Mention handle fallback |
+| `LINEAR_AGENT_TEAM_KEY` | no | Session-mirror team; defaults to `AGENT` |
+| `REMOTE_AGENT_MACHINE` | no | Configured host ID; defaults to the host marked `default` |
+| `REMOTE_AGENT_ZED_HOST` | conditional | SSH host used by Zed links when any configured host is remote |
+| `REMOTE_AGENT_BB_URL` | no | bb server URL; defaults to `http://127.0.0.1:38886` |
+| `REMOTE_AGENT_DATABASE_URL` | no | SQLite URL; defaults under the service install root |
+| `REMOTE_AGENT_HOST` / `REMOTE_AGENT_PORT` | no | Listener; defaults to `127.0.0.1:9000` |
+| `REMOTE_AGENT_REFLECT_ON_STATE` | no | Reflection trigger; defaults to `Pull Request` |
+| `REMOTE_AGENT_ORCHESTRATE_ON_STATE` | no | Orchestration trigger; defaults to `Planning` |
+| `REMOTE_AGENT_END_ON_STATE` | no | Session-end trigger; defaults to `End` |
+| `REMOTE_AGENT_DESCRIBE_ON_REACTION` | no | Describe reaction; defaults to `pencil2` |
 
-`POST /api/launches` is the shared launch boundary for workspace launchers and
-product workers. It spawns the thread on the selected bb host and immediately
-creates/binds the Agents mirror; the compatibility hook is not on the critical
-path for routability.
+bb currently has no application bearer token. Keep it on loopback or a trusted private network; that network boundary is its access-control boundary.
 
-`scripts/workspace/agents/session-hook.ts` remains only for Cubic metadata bb
-does not know: workflow labels, provider hook identity, subagents, and explicit
-worktree cleanup. Its runtime payload carries `BB_THREAD_ID`. bb events own
-liveness and failure state.
+## Runtime ownership
+
+bb owns the canonical transcript, ordered event stream, execution placement, provider session, pending interactions, and thread lifecycle. Remote Agent owns webhook receipts, routing metadata, projection cursors, workflow policy, and the Linear mirror. If the two disagree about session liveness, bb wins.
+
+Each issue in the configured Linear agent team mirrors one bb thread. The local `AgentIssueRecord` table provides fast lookup by harness session and bb thread, while `BbEventCursor` makes event projection replay-safe. The product/source issue remains separate and is related to the mirror.
+
+The tracker-neutral contract lives in `src/lib/integrations/tracker/`; Linear is the sole implementation under `src/lib/integrations/linear/`. Workers import the tracker facade, not Linear implementation modules. Adding another tracker is intentionally out of scope for the first release.
 
 ## Zed ACP adapter
 
-The adapter is part of this app at `src/acp/main.ts`. ACP session IDs are bb
-thread IDs. It supports new/load, replay, live event tailing, text prompts,
-cancel, tool/message/thought projection, and option-based pending questions.
-Zed exposes native selectors for harness, model, permission mode, reasoning
-effort, and service-tier speed. Harness changes keep the root ACP session stable while bb runs the
-selected harness in a hidden execution thread; reconnecting restores both the
-transcript and the selected execution options.
-The standard `session/list` response reports each root thread's bb environment
-path, so Zed groups and filters sessions by their actual worktree rather than
-the shared bb project path. `session/load` accepts a known bb thread ID.
+`src/acp/main.ts` exposes bb threads through Agent Client Protocol. ACP session IDs are bb thread IDs; load/replay, live event tailing, prompts, cancellation, pending questions, harness/model selection, permission mode, reasoning effort, and service tier are supported.
 
 Example Zed configuration:
 
@@ -92,11 +97,11 @@ Example Zed configuration:
     "bb": {
       "type": "custom",
       "command": "/absolute/path/to/bun",
-      "args": ["/absolute/path/to/apps/remote-agent/src/acp/main.ts"],
+      "args": ["/absolute/path/to/remote-agent/src/acp/main.ts"],
       "env": {
         "REMOTE_AGENT_BB_URL": "http://127.0.0.1:38886",
-        "REMOTE_AGENT_BB_PROJECT_ID": "<project-id>",
-        "BB_CWD_MAP": "{\"<project-id>\":\"/absolute/path/to/cubic\"}"
+        "REMOTE_AGENT_BB_PROJECT_ID": "replace-with-project-id",
+        "BB_CWD_MAP": "{\"replace-with-project-id\":\"/absolute/path/to/host-repository\"}"
       }
     }
   }
@@ -105,66 +110,30 @@ Example Zed configuration:
 
 stdout is reserved for ACP JSON-RPC; diagnostics go to stderr.
 
-## Configuration
+## Install on macOS
 
-| Variable                                  | Default                           | Purpose                                |
-| ----------------------------------------- | --------------------------------- | -------------------------------------- |
-| `LINEAR_WEBHOOK_SECRET`                   | required                          | Linear webhook signature secret        |
-| `REMOTE_AGENT_API_KEY`                    | required                          | Bearer token for `/api/*`              |
-| `REMOTE_AGENT_PUBLIC_URL`                 | `https://agents.cubicsurveys.dev` | Public origin for signed session links |
-| `GITHUB_WEBHOOK_SECRET`                   | required                          | Deploy webhook signature secret        |
-| `LINEAR_API_KEY`                          | required                          | Linear GraphQL access                  |
-| `LINEAR_AGENT_USER_ID`                    | required                          | Agent identity/assignee                |
-| `LINEAR_AGENT_TEAM_KEY`                   | `AGENT`                           | Session mirror team                    |
-| `REMOTE_AGENT_BB_URL`                     | `http://127.0.0.1:38886`          | Canonical bb server                    |
-| `REMOTE_AGENT_BB_PROJECT_ID`              | required                          | Cubic bb project                       |
-| `REMOTE_AGENT_BB_HOST_MACBOOK_AIR`        | required                          | Air execution host ID                  |
-| `REMOTE_AGENT_BB_HOST_MACBOOK_PRO`        | —                                 | Pro execution host ID                  |
-| `REMOTE_AGENT_BB_RECONCILE_INTERVAL_MS`   | `60000`                           | Bounded bb/mirror repair interval      |
-| `REMOTE_AGENT_MACHINE`                    | `macbook-air`                     | This service's machine identity        |
-| `REMOTE_AGENT_WORKSPACE_REPO`             | `~/Desktop/cubic`                 | Full checkout for launch provisioning  |
-| `REMOTE_AGENT_DATABASE_URL`               | local SQLite                      | Isolated registry database             |
-| `REMOTE_AGENT_HOST` / `REMOTE_AGENT_PORT` | `127.0.0.1` / `9000`              | HTTP listener                          |
-
-bb 0.37.0 has no application bearer token. Keep it on loopback/Tailscale; that
-network boundary is the access control boundary.
-
-Agent issue descriptions and orchestration comments include a signed **Open
-Thread in bb** link. The public remote-agent route validates the signature and
-project, then broadcasts bb's native thread-open action to connected desktop
-clients. Linear link previews receive a confirmation page and cannot open a
-thread. If more than one bb desktop window is connected to the same server, bb
-may present the thread in each of them.
-
-## MacBook Air deployment
+Prepare a secrets file and configuration outside the repository, then run:
 
 ```bash
-bash scripts/workspace/agents/install-bb-server.sh
-bash apps/remote-agent/scripts/install.sh
+REMOTE_AGENT_CONFIG=/absolute/path/to/remote-agent.config.json \
+REMOTE_AGENT_ENV_FILE=/absolute/path/to/remote-agent.env \
+bash scripts/install.sh
 ```
 
-`install-bb-server.sh` installs `bb-app@0.37.0` and a launchd user agent. Bind
-to a Tailscale address only when the Pro must reach the server. Then enroll the
-Air and Pro with `bb-host-daemon join`, create the Cubic project/baseline
-environment, and record the project/host IDs in the remote-agent environment.
-
-`install.sh` deploys remote-agent from a sparse clone, applies its SQLite
-migrations, and installs the service/deploy launch agents. The legacy pane
-reconciliation launch agent is explicitly retired.
+The installer clones this repository, copies configuration into `~/Library/Application Support/<serviceName>`, applies SQLite migrations, and installs service and deployment launch agents derived from `serviceName`. Set `REMOTE_AGENT_GIT_REMOTE` to install from a fork or another remote.
 
 ## Source layout
 
 ```text
 src/
-  acp/                          Zed ACP executable and bb projection
-  routes/launches/              authenticated shared thread launch API
-  routes/session-events/        metadata compatibility bridge
-  lib/transports/bb/            official bb SDK adapter and errors
-  lib/transports/command/       generic subprocess adapter
-  lib/services/sessions/
-    bb-events/                  replay-safe ingestion and projection
-    reconciliation/             bb-to-Linear repair sweep
-    registry/                   Agents mirror + SQLite mapping
-    selection/                  unchanged semantic router
-  lib/workers/                  Linear business workflows
+  acp/                              Zed ACP executable and event projection
+  lib/integrations/tracker/         tracker port and worker-facing facade
+  lib/integrations/linear/          Linear API, webhooks, and session store
+  lib/transports/bb/                official bb SDK adapter
+  lib/services/launches/            configured launch/worktree provisioning
+  lib/services/sessions/            local lifecycle, projection, and routing
+  lib/workflows/                     host-repository prompt resolution
+  lib/workers/                       describe, plan, mention, and reflect flows
 ```
+
+The architectural decision is recorded in [ADR 0001](docs/adr/0001-runtime-session-ownership-and-distribution.md). The full configuration and host-repository contract is in [the adoption guide](docs/adoption.md).

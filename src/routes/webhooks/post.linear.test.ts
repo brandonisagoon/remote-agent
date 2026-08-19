@@ -26,7 +26,7 @@ beforeEach(async () => {
     const body = JSON.parse(String(init?.body)) as { query: string };
     if (
       body.query.includes("AgentIssueById") ||
-      body.query.includes("CubeIssueWithAgentIssues")
+      body.query.includes("SourceIssueWithAgentIssues")
     ) {
       return Response.json({ data: { issue: null } });
     }
@@ -269,7 +269,7 @@ describe("description reaction trigger", () => {
       expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
         eventType: "reaction",
         trigger: "describe",
-        cubeIssueIdentifier: "CUBE-2804",
+        sourceIssueIdentifier: "CUBE-2804",
         status: "accepted",
       });
     },
@@ -316,13 +316,13 @@ describe("description reaction trigger", () => {
     expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
       eventType: "reaction",
       trigger: "describe",
-      cubeIssueIdentifier: "AGENT-42",
+      sourceIssueIdentifier: "AGENT-42",
       status: "ignored",
       detail: "agent_team_issue",
     });
   });
 
-  test("logs and safely ignores an unrecognized Reaction shape", async () => {
+  test("logs and safely ignores an unrecognized reaction shape", async () => {
     const warning = spyOn(console, "warn").mockImplementation(() => {});
     const payload = reactionPayload();
     delete (payload.data as { emoji?: string }).emoji;
@@ -349,7 +349,7 @@ describe("end trigger", () => {
     expect(receipt).toMatchObject({
       eventType: "issue",
       trigger: "end",
-      cubeIssueIdentifier: "AGENT-1",
+      sourceIssueIdentifier: "AGENT-1",
       status: "accepted",
     });
   });
@@ -464,12 +464,12 @@ describe("event filtering", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      cubeIssueIdentifier: "CUBE-2600",
+      sourceIssueIdentifier: "CUBE-2600",
     });
 
     const row = await prisma.linearWebhookReceipt.findFirst();
     expect(row?.status).toBe("accepted");
-    expect(row?.cubeIssueIdentifier).toBe("CUBE-2600");
+    expect(row?.sourceIssueIdentifier).toBe("CUBE-2600");
     expect(row?.eventType).toBe("comment");
     expect(row?.trigger).toBe("mention");
   });
@@ -483,7 +483,7 @@ describe("event filtering", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      cubeIssueIdentifier: "CUBE-2600",
+      sourceIssueIdentifier: "CUBE-2600",
     });
   });
 
@@ -494,7 +494,7 @@ describe("event filtering", () => {
     expect(response.status).toBe(202);
 
     const row = await prisma.linearWebhookReceipt.findFirst();
-    expect(row?.cubeIssueIdentifier).toBe("CUBE-2600");
+    expect(row?.sourceIssueIdentifier).toBe("CUBE-2600");
     expect(await prisma.linearWebhookReceipt.count()).toBe(1);
   });
 });

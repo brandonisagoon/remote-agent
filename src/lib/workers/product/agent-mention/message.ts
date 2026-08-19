@@ -6,13 +6,13 @@ export function excerpt(text: string, limit = 240): string {
 }
 
 export function buildAgentMentionMessage(
-  cubeIssueIdentifier: string,
+  sourceIssueIdentifier: string,
   authorName: string | null,
   body: string,
   context: MessageContext = {},
 ): string {
   const who = authorName ? ` — ${authorName}` : "";
-  const parts = [`[Linear ${cubeIssueIdentifier}${who}]`];
+  const parts = [`[Linear ${sourceIssueIdentifier}${who}]`];
   if (context.quotedText) {
     parts.push(`(on: "${excerpt(context.quotedText)}")`);
   } else if (context.parentBody) {

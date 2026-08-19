@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import type { MessageDispatchResult } from "../../../../types/messages/index.ts";
-import { Reaction } from "../../../integrations/linear/index.ts";
+import { TrackerReaction } from "../../../integrations/tracker/index.ts";
 import { selectOutcomeReactions } from "./reactions.ts";
 
 function result(
@@ -24,7 +24,7 @@ function result(
 
 describe("selectOutcomeReactions", () => {
   test("uses only eyes for a delivered FYI", () => {
-    expect(selectOutcomeReactions(result())).toEqual([Reaction.Delivered]);
+    expect(selectOutcomeReactions(result())).toEqual([TrackerReaction.Delivered]);
   });
 
   test("maps a delivered action set in stable order", () => {
@@ -37,17 +37,17 @@ describe("selectOutcomeReactions", () => {
         replyToCommentId: "comment-1",
       },
     }))).toEqual([
-      Reaction.Delivered,
-      Reaction.Reply,
-      Reaction.PlanUpdate,
-      Reaction.CodeChange,
+      TrackerReaction.Delivered,
+      TrackerReaction.Reply,
+      TrackerReaction.PlanUpdate,
+      TrackerReaction.CodeChange,
     ]);
   });
 
   test("uses warning for unrouted outcomes", () => {
     for (const status of ["no_candidate", "ambiguous", "ignored"] as const) {
       expect(selectOutcomeReactions(result({ status }))).toEqual([
-        Reaction.Unrouted,
+        TrackerReaction.Unrouted,
       ]);
     }
   });
@@ -60,7 +60,7 @@ describe("selectOutcomeReactions", () => {
       "stale_target",
     ] as const) {
       expect(selectOutcomeReactions(result({ status }))).toEqual([
-        Reaction.Failed,
+        TrackerReaction.Failed,
       ]);
     }
   });

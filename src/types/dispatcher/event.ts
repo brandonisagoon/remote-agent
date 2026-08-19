@@ -1,28 +1,28 @@
 import type {
-  LinearCommentWebhook,
-  LinearIssueWebhook,
-  LinearReactionWebhook,
-} from "../webhooks/linear/index.ts";
+  TrackerCommentWebhook,
+  TrackerIssueWebhook,
+  TrackerReactionWebhook,
+} from "../../lib/integrations/tracker/index.ts";
 
 export const DispatchEventType = {
-  LinearCommentMentioned: "linear.comment.mentioned",
-  LinearIssueReflectionRequested:
-    "linear.issue.reflection-requested",
-  LinearIssueOrchestrationRequested:
-    "linear.issue.orchestration-requested",
-  LinearIssueDescribeRequested: "linear.issue.describe-requested",
-  LinearIssueEndRequested: "linear.issue.end-requested",
+  TrackerCommentMentioned: "tracker.comment.mentioned",
+  TrackerIssueReflectionRequested:
+    "tracker.issue.reflection-requested",
+  TrackerIssueOrchestrationRequested:
+    "tracker.issue.orchestration-requested",
+  TrackerIssueDescribeRequested: "tracker.issue.describe-requested",
+  TrackerIssueEndRequested: "tracker.issue.end-requested",
 } as const;
 
 export type DispatchEventTypeValue =
   (typeof DispatchEventType)[keyof typeof DispatchEventType];
 
 interface DispatchEventPayloadByType {
-  [DispatchEventType.LinearCommentMentioned]: LinearCommentWebhook;
-  [DispatchEventType.LinearIssueReflectionRequested]: LinearIssueWebhook;
-  [DispatchEventType.LinearIssueOrchestrationRequested]: LinearIssueWebhook;
-  [DispatchEventType.LinearIssueDescribeRequested]: LinearReactionWebhook;
-  [DispatchEventType.LinearIssueEndRequested]: LinearIssueWebhook;
+  [DispatchEventType.TrackerCommentMentioned]: TrackerCommentWebhook;
+  [DispatchEventType.TrackerIssueReflectionRequested]: TrackerIssueWebhook;
+  [DispatchEventType.TrackerIssueOrchestrationRequested]: TrackerIssueWebhook;
+  [DispatchEventType.TrackerIssueDescribeRequested]: TrackerReactionWebhook;
+  [DispatchEventType.TrackerIssueEndRequested]: TrackerIssueWebhook;
 }
 
 export type DispatchEvent = {

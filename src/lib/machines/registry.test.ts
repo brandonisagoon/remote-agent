@@ -1,33 +1,61 @@
-import { describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, test } from "bun:test";
 
 import {
-  DEFAULT_MACHINE_ID,
+  configureMachines,
   findMachine,
+  getDefaultMachineId,
   getMachine,
   getMachines,
   MachineSchema,
 } from "./index.ts";
 
+const HOSTS = [
+  {
+    id: "studio-mac",
+    label: "Studio Mac",
+    bbHostId: "host_studio",
+    zedConnection: "local" as const,
+    acceptsTrackerInput: true,
+    default: true,
+  },
+  {
+    id: "build-mac",
+    label: "Build Mac",
+    bbHostId: "host_build",
+    zedConnection: "ssh" as const,
+    acceptsTrackerInput: false,
+    default: false,
+  },
+];
+
+beforeEach(() => configureMachines(HOSTS));
+
 describe("machine registry", () => {
-  test("defines every supported machine exactly once", () => {
-    expect(getMachines().map((machine) => machine.id)).toEqual(
-      MachineSchema.options,
+  test("accepts arbitrary kebab-case machine ids", () => {
+    expect(MachineSchema.parse("studio-mac")).toBe("studio-mac");
+    expect(MachineSchema.safeParse("Studio Mac").success).toBe(false);
+  });
+
+  test("owns tracker labels, bb ids, capabilities, and the default", () => {
+    expect(getMachines()).toHaveLength(2);
+    expect(getDefaultMachineId()).toBe("studio-mac");
+    expect(getMachine({ id: "studio-mac" })).toEqual(HOSTS[0]);
+    expect(findMachine({ trackerLabels: ["Build Mac"] })?.id).toBe(
+      "build-mac",
     );
   });
 
-  test("owns Linear labels and machine capabilities", () => {
-    expect(getMachine({ id: DEFAULT_MACHINE_ID })).toEqual({
-      id: "macbook-air",
-      linearLabel: "Brandon's MacBook Air",
-      zedConnection: "ssh",
-      acceptsLinearInput: true,
-    });
-    expect(
-      findMachine({ linearLabels: ["Brandon's MacBook Pro"] })?.id,
-    ).toBe("macbook-pro");
+  test("rejects duplicate fields and ambiguous defaults", () => {
+    expect(() =>
+      configureMachines([
+        HOSTS[0],
+        { ...HOSTS[1], id: "studio-mac", default: true },
+      ]),
+    ).toThrow();
   });
 
-  test("returns null when labels do not identify a machine", () => {
-    expect(findMachine({ linearLabels: ["Codex"] })).toBeNull();
+  test("fails closed for unknown machines and labels", () => {
+    expect(() => getMachine({ id: "unknown" })).toThrow("unknown machine");
+    expect(findMachine({ trackerLabels: ["Codex"] })).toBeNull();
   });
 });

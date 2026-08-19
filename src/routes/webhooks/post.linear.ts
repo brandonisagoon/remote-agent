@@ -3,19 +3,17 @@ import { Hono } from "hono";
 import { MAX_REQUEST_BYTES } from "../../lib/config.ts";
 import {
   IssueWebhookResultKind,
-  LinearCommentWebhookSchema,
-  LinearIssueWebhookSchema,
-  LinearReactionWebhookSchema,
-  LinearWebhookEnvelopeSchema,
+  TrackerCommentWebhookSchema,
+  TrackerIssueWebhookSchema,
+  TrackerReactionWebhookSchema,
+  TrackerWebhookEnvelopeSchema,
   ReactionWebhookResultKind,
-} from "../../types/webhooks/linear/index.ts";
-import { verifyLinearSignature } from "../../lib/security.ts";
-import {
+  verifyTrackerWebhookSignature,
   WebhookReceiptError,
   handleCommentWebhook,
   handleIssueWebhook,
   handleReactionWebhook,
-} from "../../lib/services/webhooks/index.ts";
+} from "../../lib/integrations/tracker/index.ts";
 import type { AppEnv } from "../../middleware/context.ts";
 
 const route = new Hono<AppEnv>();
@@ -34,7 +32,7 @@ route.post("/", async (c) => {
       return c.json({ error: "Payload Too Large" }, 413);
     }
     if (
-      !verifyLinearSignature(
+      !verifyTrackerWebhookSignature(
         rawBody,
         c.req.header("linear-signature") ?? null,
         config.webhookSecret,
@@ -50,7 +48,7 @@ route.post("/", async (c) => {
       return c.json({ error: "Invalid JSON" }, 400);
     }
 
-    const envelope = LinearWebhookEnvelopeSchema.safeParse(parsed);
+    const envelope = TrackerWebhookEnvelopeSchema.safeParse(parsed);
     if (!envelope.success) {
       return c.json({ error: "Unrecognized webhook envelope" }, 400);
     }
@@ -63,7 +61,7 @@ route.post("/", async (c) => {
       return c.json({ error: "Missing Linear-Delivery header" }, 400);
     }
 
-    const issue = LinearIssueWebhookSchema.safeParse(parsed);
+    const issue = TrackerIssueWebhookSchema.safeParse(parsed);
     if (issue.success) {
       const result = await handleIssueWebhook({
         prisma,
@@ -87,7 +85,7 @@ route.post("/", async (c) => {
       return c.json({ accepted: true, reflecting: true }, 202);
     }
 
-    const reaction = LinearReactionWebhookSchema.safeParse(parsed);
+    const reaction = TrackerReactionWebhookSchema.safeParse(parsed);
     if (reaction.success) {
       try {
         const result = await handleReactionWebhook({
@@ -135,7 +133,7 @@ route.post("/", async (c) => {
       );
     }
 
-    const comment = LinearCommentWebhookSchema.safeParse(parsed);
+    const comment = TrackerCommentWebhookSchema.safeParse(parsed);
     if (!comment.success) {
       return c.json({ accepted: true, ignored: true }, 200);
     }
@@ -166,7 +164,7 @@ route.post("/", async (c) => {
         {
           accepted: true,
           deliveryId: result.deliveryId,
-          cubeIssueIdentifier: result.cubeIssueIdentifier,
+          sourceIssueIdentifier: result.sourceIssueIdentifier,
         },
         202,
       );

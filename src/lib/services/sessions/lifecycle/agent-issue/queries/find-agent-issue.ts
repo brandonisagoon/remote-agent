@@ -3,7 +3,7 @@ import type { AgentIssue } from "../../../../../../types/sessions/index.ts";
 import {
   AgentIssueNotFoundError,
   getAgentIssue,
-} from "../../../registry/index.ts";
+} from "../../../../../integrations/tracker/index.ts";
 
 export async function findAgentIssue(
   config: ServerConfig,

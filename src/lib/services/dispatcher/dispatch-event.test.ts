@@ -9,7 +9,7 @@ import {
   type WorkerResult,
 } from "../../../types/dispatcher/index.ts";
 import type { CommandClient } from "../../../types/runtime/index.ts";
-import { Reaction } from "../../integrations/linear/index.ts";
+import { TrackerReaction } from "../../integrations/tracker/index.ts";
 import {
   dispatchEvent,
   type DispatchEventDependencies,
@@ -22,7 +22,7 @@ const commandClient: CommandClient = {
 
 function issueEvent(): DispatchEvent {
   return {
-    type: DispatchEventType.LinearIssueOrchestrationRequested,
+    type: DispatchEventType.TrackerIssueOrchestrationRequested,
     webhook: {
       type: "Issue",
       action: "update",
@@ -82,7 +82,7 @@ describe("dispatch event failure reaction", () => {
     );
 
     expect(events).toEqual([
-      `react:issue-id:${Reaction.Failed}`,
+      `react:issue-id:${TrackerReaction.Failed}`,
       "finish:run-id:failed:bb launch failed",
     ]);
   });
@@ -106,7 +106,7 @@ describe("dispatch event failure reaction", () => {
     );
 
     expect(events).toEqual([
-      `react:issue-id:${Reaction.Failed}`,
+      `react:issue-id:${TrackerReaction.Failed}`,
       "finish:run-id:failed:launcher exploded",
     ]);
   });

@@ -18,6 +18,7 @@ const directories = [
   "20260731180904_rename_issue_entities",
   "20260812210949_bb_transport",
   "20260813222942_bb_error_threading",
+  "20260819120739_rename_cube_issue_to_source_issue",
 ];
 
 function statements(directory: string): string[] {
@@ -57,7 +58,7 @@ describe("receipt and worker-run migration", () => {
         ('ignored-1', 'mention', 'CUBE-1', 'comment-1', NULL, 'ignored', 'self_authored', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
         ('delivered-1', 'reflection', 'CUBE-2', NULL, 'AGENT-9', 'delivered', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    for (const migration of directories.slice(4, -3)) {
+    for (const migration of directories.slice(4, -4)) {
       for (const statement of statements(migration)) {
         await prisma.$executeRawUnsafe(statement);
       }
@@ -68,7 +69,7 @@ describe("receipt and worker-run migration", () => {
       VALUES
         ('record-1', 'session-1', 'agent-issue-id', 'AGENT-9', 'macbook-air', 'tmux-1', '%1', 'event-1', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
-    for (const migration of directories.slice(-3)) {
+    for (const migration of directories.slice(-4)) {
       for (const statement of statements(migration)) {
         await prisma.$executeRawUnsafe(statement);
       }
@@ -82,7 +83,7 @@ describe("receipt and worker-run migration", () => {
       linearDeliveryId: "delivered-1",
       eventType: "issue",
       trigger: "reflection",
-      cubeIssueIdentifier: "CUBE-2",
+      sourceIssueIdentifier: "CUBE-2",
       status: "accepted",
     });
     expect(receipts[1]).toMatchObject({

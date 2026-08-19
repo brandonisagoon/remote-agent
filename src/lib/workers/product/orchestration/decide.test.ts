@@ -5,15 +5,15 @@ import {
   agentIssueRuntimeDescription,
 } from "../../../../test-support/agent-issue.ts";
 import type { AgentIssue } from "../../../../types/sessions/index.ts";
-import type { CubeIssueWithAgentIssues } from "../../../services/sessions/registry/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
 import {
   decideOrchestration,
   isSafeBranchName,
 } from "./decide.ts";
 
 function issue(
-  overrides: Partial<CubeIssueWithAgentIssues> = {},
-): CubeIssueWithAgentIssues {
+  overrides: Partial<SourceIssueWithAgentIssues> = {},
+): SourceIssueWithAgentIssues {
   return {
     id: "issue-id",
     identifier: "CUBE-2774",
@@ -28,7 +28,7 @@ function issue(
   };
 }
 
-function decide(issueOverride: Partial<CubeIssueWithAgentIssues> = {}) {
+function decide(issueOverride: Partial<SourceIssueWithAgentIssues> = {}) {
   return decideOrchestration({
     issue: issue(issueOverride),
     agentTeamKey: "AGENT",

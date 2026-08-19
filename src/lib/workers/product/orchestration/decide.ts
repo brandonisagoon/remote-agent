@@ -1,7 +1,7 @@
 import {
   parseAgentIssueRuntime,
-  type CubeIssueWithAgentIssues,
-} from "../../../services/sessions/registry/index.ts";
+  type SourceIssueWithAgentIssues,
+} from "../../../integrations/tracker/index.ts";
 import {
   AgentIssueStateSchema,
   isTerminalAgentIssueState,
@@ -21,7 +21,7 @@ function checkAgentIssueBlock(agentIssue: AgentIssue): boolean {
 }
 
 function uniqueRelatedAgentIssues(
-  issue: CubeIssueWithAgentIssues,
+  issue: SourceIssueWithAgentIssues,
 ): AgentIssue[] {
   const relations = [
     ...issue.relations.nodes,
@@ -35,7 +35,7 @@ function uniqueRelatedAgentIssues(
 }
 
 export function decideOrchestration(input: {
-  issue: CubeIssueWithAgentIssues;
+  issue: SourceIssueWithAgentIssues;
   agentTeamKey: string;
   orchestrateOnState: string;
 }): OrchestrationDecision {
@@ -61,7 +61,7 @@ export function decideOrchestration(input: {
 
   const branchName = issue.branchName?.trim();
   if (!branchName) {
-    return { kind: "failed", detail: "cube issue has no branch name" };
+    return { kind: "failed", detail: "source issue has no branch name" };
   }
   if (!isSafeBranchName(branchName)) {
     return { kind: "failed", detail: `unsafe branch name: ${branchName}` };

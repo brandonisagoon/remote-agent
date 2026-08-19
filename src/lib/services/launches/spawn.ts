@@ -10,6 +10,7 @@ import type {
   SessionRole,
 } from "../../../types/sessions/index.ts";
 import { upsertAgentIssueFromEvent } from "../sessions/index.ts";
+import { getMachine } from "../../machines/index.ts";
 import { resolveLaunchModel } from "./resolve-model.ts";
 
 export interface SpawnAgentThreadInput {
@@ -55,7 +56,7 @@ export function launchExecutionSettings(
  * it is not on the critical path for routability. */
 export async function spawnAgentThread(input: SpawnAgentThreadInput) {
   const providerId = input.harness === "claude" ? "claude-code" : "codex";
-  const hostId = input.config.bbHostIds[input.machine];
+  const hostId = getMachine({ id: input.machine }).bbHostId;
   const model = await resolveLaunchModel({
     bbClient: input.bbClient,
     providerId,
@@ -94,7 +95,7 @@ export async function spawnAgentThread(input: SpawnAgentThreadInput) {
           machine: input.machine,
           role: input.role,
           lifecycle: input.lifecycle,
-          cubeIssueIdentifier: input.issueIdentifier,
+          sourceIssueIdentifier: input.issueIdentifier,
           bbThreadId: thread.id,
         },
       },

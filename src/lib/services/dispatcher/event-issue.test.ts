@@ -9,11 +9,11 @@ import { eventIssueId } from "./event-issue.ts";
 describe("event issue id", () => {
   test("extracts the issue UUID from issue and reaction events", () => {
     const issueEvent = {
-      type: DispatchEventType.LinearIssueOrchestrationRequested,
+      type: DispatchEventType.TrackerIssueOrchestrationRequested,
       webhook: { data: { id: "issue-uuid" } },
     } as DispatchEvent;
     const reactionEvent = {
-      type: DispatchEventType.LinearIssueDescribeRequested,
+      type: DispatchEventType.TrackerIssueDescribeRequested,
       webhook: { data: { issueId: "reaction-issue-uuid" } },
     } as DispatchEvent;
 
@@ -23,7 +23,7 @@ describe("event issue id", () => {
 
   test("falls back to the reaction issue object", () => {
     const event = {
-      type: DispatchEventType.LinearIssueDescribeRequested,
+      type: DispatchEventType.TrackerIssueDescribeRequested,
       webhook: { data: { issue: { id: "nested-issue-uuid" } } },
     } as DispatchEvent;
 

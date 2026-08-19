@@ -6,23 +6,23 @@ import {
   createThreadedIssueComment,
   fetchIssueCommentBody,
   updateIssueComment,
-} from "../../../integrations/linear/index.ts";
+  agentIssueLabelIdsWithRouting,
+  agentIssueRuntimeWithLabels,
+  getAgentCatalog,
+  getAgentStateId,
+  parseAgentIssueRuntime,
+  updateAgentIssue,
+  getSourceIssue,
+  parseAgentIssueSourceIdentifier,
+} from "../../../integrations/tracker/index.ts";
 import { buildBbThreadOpenLink } from "../../../transports/bb/thread-link.ts";
 import {
   AgentIssueState,
   type AgentIssueStateValue,
 } from "../../../../types/sessions/index.ts";
 import {
-  agentIssueLabelIdsWithRouting,
-  agentIssueRuntimeWithLabels,
   clearAgentIssueRecordErrorNotice,
   findAgentIssueRecordByBbThreadId,
-  getAgentCatalog,
-  getAgentStateId,
-  parseAgentIssueRuntime,
-  updateAgentIssue,
-  getCubeIssue,
-  parseAgentIssueSourceIdentifier,
   setAgentIssueRecordErrorNotice,
   setAgentIssueRecordSessionRoot,
 } from "../registry/index.ts";
@@ -83,7 +83,7 @@ export interface ProjectBbEventDependencies {
   updateComment?: typeof updateIssueComment;
   getCommentBody?: typeof fetchIssueCommentBody;
   findIssue?: typeof findAgentIssue;
-  getIssue?: typeof getCubeIssue;
+  getIssue?: typeof getSourceIssue;
   updateIssue?: typeof updateAgentIssue;
   getCatalog?: typeof getAgentCatalog;
 }
@@ -118,7 +118,7 @@ export async function projectBbEvent(
   });
   if (!issue) return;
   const parsed = parseAgentIssueRuntime(issue.description);
-  const cubeIssueIdentifier = parseAgentIssueSourceIdentifier(
+  const sourceIssueIdentifier = parseAgentIssueSourceIdentifier(
     issue.description,
   );
   const runtime = parsed ? agentIssueRuntimeWithLabels(issue, parsed) : null;
@@ -139,7 +139,7 @@ export async function projectBbEvent(
     );
   }
 
-  if (!cubeIssueIdentifier) return;
+  if (!sourceIssueIdentifier) return;
 
   const errorEvent = isBbErrorEvent(event);
   if (errorEvent && record.lastErrorEventId === event.id) return;
@@ -230,10 +230,10 @@ export async function projectBbEvent(
     });
   }
 
-  const cubeIssue = await (dependencies.getIssue ?? getCubeIssue)(config, {
-    id: cubeIssueIdentifier,
+  const sourceIssue = await (dependencies.getIssue ?? getSourceIssue)(config, {
+    id: sourceIssueIdentifier,
   });
-  if (!cubeIssue) return;
+  if (!sourceIssue) return;
 
   const createComment =
     dependencies.createComment ?? createThreadedIssueComment;
@@ -245,7 +245,7 @@ export async function projectBbEvent(
         ])
       : [null, null];
     const root = await createComment(config.linearApiKey, {
-      issueId: cubeIssue.id,
+      issueId: sourceIssue.id,
       body: buildSessionRootComment({
         ...noticeContext,
         provider: thread?.providerId ?? null,
@@ -264,14 +264,14 @@ export async function projectBbEvent(
 
   let rootCommentId = record.sessionRootCommentId ?? (await createRoot());
   let posted = await createComment(config.linearApiKey, {
-    issueId: cubeIssue.id,
+    issueId: sourceIssue.id,
     body,
     parentId: rootCommentId,
   });
   if (!posted) {
     rootCommentId = await createRoot();
     posted = await createComment(config.linearApiKey, {
-      issueId: cubeIssue.id,
+      issueId: sourceIssue.id,
       body,
       parentId: rootCommentId,
     });

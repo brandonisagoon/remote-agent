@@ -5,7 +5,7 @@ export interface MessageContext {
 }
 
 export interface Message {
-  cubeIssueIdentifier: string;
+  sourceIssueIdentifier: string;
   authorName: string | null;
   body: string;
   context?: MessageContext;

@@ -12,7 +12,7 @@ const thread: BbThread = {
   id: "thr_canonical",
   projectId: CONFIG.bbProjectId,
   environmentId: "env_worktree",
-  hostId: CONFIG.bbHostIds["macbook-air"] ?? null,
+  hostId: "host_air",
   providerId: "claude-code",
   title: "CUBE-1 · delegate",
   status: "active",
@@ -34,7 +34,7 @@ const lifecycleEvent: RuntimeSessionEvent = {
     machine: "macbook-air",
     role: "primary",
     lifecycle: null,
-    cubeIssueIdentifier: null,
+    sourceIssueIdentifier: null,
     bbThreadId: null,
   },
 };

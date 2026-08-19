@@ -11,10 +11,6 @@ export {
 export type { WorktreeLinkCommentOutcome } from "./comment.ts";
 export {
   buildOrchestrationSessionName,
-  OPEN_ISSUE_SCRIPT,
-  ORCHESTRATE_PLAN_LINEAR_ACTION,
-  ORCHESTRATE_PLAN_LINEAR_TUNNEL_ACTION,
-  orchestrationPaths,
 } from "./launch.ts";
 export { createOrchestrationWorker, orchestrationWorker } from "./worker.ts";
 export type { OrchestrationWorkerDependencies } from "./worker.ts";
