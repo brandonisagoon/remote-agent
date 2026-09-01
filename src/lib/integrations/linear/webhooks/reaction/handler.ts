@@ -67,25 +67,19 @@ export async function handleReactionWebhook(input: {
   }
 
   const sourceIssueIdentifier = data.issue?.identifier ?? null;
-  const agentIssue = sourceIssueIdentifier
-    ?.toUpperCase()
-    .startsWith(`${config.agentTeamKey.toUpperCase()}-`);
   const receipt = await createWebhookReceipt(prisma, {
+    webhookId: config.activeWebhookId,
+    connectionId: config.activeConnectionId,
+    repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "reaction",
     trigger: "describe",
     sourceIssueIdentifier,
     sourceCommentId: null,
-    status: agentIssue ? "ignored" : "accepted",
-    detail: agentIssue ? "agent_team_issue" : null,
+    status: "accepted",
+    detail: null,
   });
   if (!receipt) return { kind: ReactionWebhookResultKind.Duplicate };
-  if (agentIssue) {
-    return {
-      kind: ReactionWebhookResultKind.Ignored,
-      reason: "agent_team_issue",
-    };
-  }
 
   void dispatchEvent({
     prisma,

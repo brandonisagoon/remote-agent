@@ -9,7 +9,7 @@ import {
   agentIssueRuntimeDescription,
 } from "../../../../test-support/agent-issue.ts";
 import type { CommandClient } from "../../../../types/runtime/index.ts";
-import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
 import {
   DispatchEventType,
   WorkerRunStatus,
@@ -115,6 +115,7 @@ function createWorker(
       session: fakeRuntimeSession({ id: "runtime_orchestration" }),
       agentIssue: null,
     }),
+    hasLiveSession: async () => false,
     ...dependencies,
   });
 }
@@ -366,7 +367,7 @@ describe("orchestrationWorker", () => {
     expect(reaction.callCount()).toBe(0);
   });
 
-  test("does not launch or comment for a live related session", async () => {
+  test("does not launch or comment when the runtime registry has a live session", async () => {
     const root = fixtureRoot();
     let commentCalls = 0;
     const related = agentIssueFixture();
@@ -383,6 +384,7 @@ describe("orchestrationWorker", () => {
         commentCalls += 1;
         return "posted";
       },
+      hasLiveSession: async () => true,
     });
     const commands = commandClient([]);
 

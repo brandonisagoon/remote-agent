@@ -11,9 +11,16 @@ export {
   beginRuntimeSession,
   findRuntimeSession,
   getRuntimeEventCursor,
+  hasLivePersistentSessionForResource,
   listRuntimeSessions,
   listRuntimeLifecycleEvents,
   pruneRuntimeLifecycleEvents,
   runtimeScopeKey,
   updateRuntimeSessionState,
 } from "../runtime-registry.ts";
+export {
+  readSessionTags,
+  removeSessionTag,
+  resolveInitialSessionTags,
+  setSessionTag,
+} from "../session-metadata.ts";

@@ -2,6 +2,11 @@ import { Hono } from "hono";
 
 import { MAX_REQUEST_BYTES } from "../../lib/config.ts";
 import {
+  getWebhookConfig,
+  routeWebhookRepository,
+  scopeConfig,
+} from "../../lib/config.ts";
+import {
   IssueWebhookResultKind,
   TrackerCommentWebhookSchema,
   TrackerIssueWebhookSchema,
@@ -20,6 +25,14 @@ const route = new Hono<AppEnv>();
 
 route.post("/", async (c) => {
     const config = c.get("config");
+    const webhookId = c.req.param("webhookId");
+    if (!webhookId) return c.json({ error: "Unknown webhook" }, 404);
+    let webhookConfig;
+    try {
+      webhookConfig = getWebhookConfig(config, webhookId);
+    } catch {
+      return c.json({ error: "Unknown webhook" }, 404);
+    }
     const prisma = c.get("prisma");
     const agentRuntime = c.get("agentRuntime");
     const declaredLength = Number(c.req.header("content-length") ?? "0");
@@ -35,7 +48,7 @@ route.post("/", async (c) => {
       !verifyTrackerWebhookSignature(
         rawBody,
         c.req.header("linear-signature") ?? null,
-        config.webhookSecret,
+        webhookConfig.webhookSecret,
       )
     ) {
       return c.json({ error: "Invalid signature" }, 401);
@@ -52,9 +65,42 @@ route.post("/", async (c) => {
     if (!envelope.success) {
       return c.json({ error: "Unrecognized webhook envelope" }, 400);
     }
-    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > config.webhookMaxAgeMs) {
+    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
       return c.json({ error: "Stale webhook" }, 401);
     }
+
+    const record = parsed as Record<string, any>;
+    const data = record.data && typeof record.data === "object" ? record.data : {};
+    const issueRoutingData = data.issue && typeof data.issue === "object" ? data.issue : {};
+    const team = data.team && typeof data.team === "object"
+      ? data.team
+      : issueRoutingData.team && typeof issueRoutingData.team === "object"
+        ? issueRoutingData.team
+        : {};
+    const project = data.project && typeof data.project === "object"
+      ? data.project
+      : issueRoutingData.project && typeof issueRoutingData.project === "object"
+        ? issueRoutingData.project
+        : {};
+    let repository;
+    try {
+      repository = routeWebhookRepository(config, webhookId, {
+        "linear.organizationId": record.organizationId,
+        "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
+        "linear.teamKey": team.key,
+        "linear.projectId": data.projectId ?? issueRoutingData.projectId ?? project.id,
+      });
+    } catch (error) {
+      return c.json(
+        { error: error instanceof Error ? error.message : String(error) },
+        409,
+      );
+    }
+    const scopedConfig = scopeConfig(config, {
+      connectionId: webhookConfig.connectionId,
+      repositoryId: repository.id,
+      webhookId,
+    });
 
     const deliveryId = c.req.header("linear-delivery");
     if (!deliveryId) {
@@ -65,7 +111,7 @@ route.post("/", async (c) => {
     if (issue.success) {
       const result = await handleIssueWebhook({
         prisma,
-        config,
+        config: scopedConfig,
         agentRuntime,
         deliveryId,
         webhook: issue.data,
@@ -90,7 +136,7 @@ route.post("/", async (c) => {
       try {
         const result = await handleReactionWebhook({
           prisma,
-          config,
+          config: scopedConfig,
           agentRuntime,
           deliveryId,
           webhook: reaction.data,
@@ -141,7 +187,7 @@ route.post("/", async (c) => {
     try {
       const result = await handleCommentWebhook({
         prisma,
-        config,
+        config: scopedConfig,
         agentRuntime,
         deliveryId,
         webhook: comment.data,

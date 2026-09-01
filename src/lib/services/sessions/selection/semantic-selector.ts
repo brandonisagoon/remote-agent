@@ -10,10 +10,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import type { ServerConfig } from "../../../config.ts";
-import {
-  AgentIssueLabel,
-  type RouteCandidate,
-} from "../../../../types/sessions/index.ts";
+import type { RouteCandidate } from "../../../../types/sessions/index.ts";
 import {
   RouteActionSchema,
   RouteDecisionSchema,
@@ -27,19 +24,19 @@ export class RouterTimeoutError extends Error {}
 
 const ROLE_CATALOG = [
   {
-    name: AgentIssueLabel.Role.Primary,
+    name: "primary",
     routing: "May receive Linear input when all server eligibility checks pass.",
   },
   {
-    name: AgentIssueLabel.Role.Delegate,
+    name: "delegate",
     routing: "A subagent owned by another session; never receives Linear input.",
   },
   {
-    name: AgentIssueLabel.Role.Viewer,
+    name: "viewer",
     routing: "Observes work without owning it; never receives Linear input.",
   },
   {
-    name: AgentIssueLabel.Role.Unassigned,
+    name: "unassigned",
     routing: "Has no routing responsibility; never receives Linear input.",
   },
 ] as const;

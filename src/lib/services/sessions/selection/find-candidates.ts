@@ -1,68 +1,104 @@
+import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../config.ts";
 import { getMachine } from "../../../machines/index.ts";
-import {
-  agentIssueRuntimeWithLabels,
-  getSourceIssueWithAgentIssues,
-  parseAgentIssueRuntime,
-  parseAgentIssueSourceIdentifier,
-} from "../../../integrations/tracker/index.ts";
+import { getSourceIssueForRouting } from "../../../integrations/linear/session-store/source-issue/read.ts";
 import type {
   TrackerRoutingContext,
   RouteCandidate,
+  SessionRole,
 } from "../../../../types/sessions/index.ts";
-import {
-  AgentIssueLabel,
-  AgentIssueState,
-} from "../../../../types/sessions/index.ts";
+import { AgentIssueState } from "../../../../types/sessions/index.ts";
+
+function role(value: string | null): SessionRole | null {
+  return value === "primary" ||
+      value === "delegate" ||
+      value === "viewer" ||
+      value === "unassigned"
+    ? value
+    : null;
+}
+
+function trackerState(status: string): RouteCandidate["status"] {
+  if (status === "idle" || status === "active") return AgentIssueState.Connected;
+  if (status === "closed") return AgentIssueState.Ended;
+  if (status === "error") return AgentIssueState.Error;
+  return AgentIssueState.Disconnected;
+}
 
 export async function fetchRouteCandidates(
   config: ServerConfig,
+  prisma: PrismaClient,
   sourceIssueIdentifier: string,
 ): Promise<RouteCandidate[]> {
-  return (
-    (await fetchTrackerRoutingContext(config, sourceIssueIdentifier))
-      ?.candidates ?? []
+  const repository = config.repository;
+  const visibleKeys = new Set(
+    Object.entries(repository.metadata.tags)
+      .filter(([, definition]) => definition.routerVisible)
+      .map(([key]) => key),
   );
+  const links = await prisma.runtimeSessionResourceLink.findMany({
+    where: {
+      provider: "linear",
+      connectionId: config.activeConnectionId,
+      resourceType: "issue-identifier",
+      externalId: sourceIssueIdentifier,
+      relationship: "handles",
+      endedAt: null,
+      runtimeSession: { repositoryId: repository.id },
+    },
+    include: {
+      runtimeSession: { include: { tags: true } },
+    },
+  });
+  const unique = new Map(
+    links.map((link) => [link.runtimeSession.id, link.runtimeSession]),
+  );
+  return [...unique.values()].flatMap((session) => {
+    const sessionRole = role(session.role);
+    if (!sessionRole || !session.worktreePath) return [];
+    try {
+      getMachine({ id: session.machineId });
+    } catch {
+      return [];
+    }
+    return [{
+      // These compatibility names remain until the public worker result shape
+      // is renamed; both values are stable RuntimeSession IDs, not Linear
+      // Agent-team issue identities.
+      agentIssueId: session.id,
+      agentIssueIdentifier: session.id,
+      status: trackerState(session.status),
+      assigneeId: null,
+      labels: session.tags
+        .filter((tag) => visibleKeys.has(tag.key))
+        .map((tag) => `${tag.key}:${tag.value}`)
+        .sort(),
+      runtime: {
+        harnessSessionId: session.id,
+        parentSessionId: null,
+        worktreePath: session.worktreePath,
+        branchName: null,
+        harness: session.agentCommand === "claude" ? "claude" : "codex",
+        machine: session.machineId,
+        role: sessionRole,
+        lifecycle: null,
+        sourceIssueIdentifier,
+        runtimeSessionId: session.id,
+      },
+    }];
+  });
 }
 
 export async function fetchTrackerRoutingContext(
   config: ServerConfig,
+  prisma: PrismaClient,
   sourceIssueIdentifier: string,
 ): Promise<TrackerRoutingContext | null> {
-  const sourceIssue = await getSourceIssueWithAgentIssues(config, {
-    id: sourceIssueIdentifier,
-  });
+  const [sourceIssue, candidates] = await Promise.all([
+    getSourceIssueForRouting(config, { id: sourceIssueIdentifier }),
+    fetchRouteCandidates(config, prisma, sourceIssueIdentifier),
+  ]);
   if (!sourceIssue) return null;
-
-  const agentIssues = [
-    ...sourceIssue.relations.nodes.map((relation) => relation.agentIssue),
-    ...sourceIssue.inverseRelations.nodes.map((relation) => relation.agentIssue),
-  ];
-  const unique = new Map(
-    agentIssues.map((agentIssue) => [agentIssue.id, agentIssue]),
-  );
-
-  const candidates = [...unique.values()].flatMap((agentIssue) => {
-    if (agentIssue.team.key !== config.agentTeamKey) return [];
-    const parsed = parseAgentIssueRuntime(agentIssue.description);
-    if (!parsed) return [];
-    if (
-      parseAgentIssueSourceIdentifier(agentIssue.description) !==
-      sourceIssueIdentifier
-    ) {
-      return [];
-    }
-    return [
-      {
-        agentIssueId: agentIssue.id,
-        agentIssueIdentifier: agentIssue.identifier,
-        status: agentIssue.state.name,
-        assigneeId: agentIssue.assignee?.id ?? null,
-        labels: agentIssue.labels.nodes.map((label) => label.name),
-        runtime: agentIssueRuntimeWithLabels(agentIssue, parsed),
-      },
-    ];
-  });
   return {
     sourceIssue: {
       identifier: sourceIssue.identifier,
@@ -76,18 +112,14 @@ export async function fetchTrackerRoutingContext(
 }
 
 export function isEligibleCandidate(
-  config: ServerConfig,
+  _config: ServerConfig,
   candidate: RouteCandidate,
 ): boolean {
-  const labels = new Set(candidate.labels);
   const machine = getMachine({ id: candidate.runtime.machine });
   return (
     candidate.status === AgentIssueState.Connected &&
-    candidate.assigneeId === config.agentUserId &&
     machine.acceptsTrackerInput &&
     candidate.runtime.role === "primary" &&
-    labels.has(AgentIssueLabel.Routing.AcceptsInput) &&
-    labels.has(machine.label) &&
     Boolean(candidate.runtime.runtimeSessionId)
   );
 }

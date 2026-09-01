@@ -3,11 +3,11 @@ import {
   type DispatchEvent,
   type Worker,
 } from "../../../../types/dispatcher/index.ts";
+import { fetchCommentContext } from "../../../integrations/linear/comment-context.ts";
 import {
-  fetchCommentContext,
   TrackerReaction,
   reactToComment,
-} from "../../../integrations/tracker/index.ts";
+} from "../../../integrations/linear/reactions.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
 import { buildAgentMentionMessage, excerpt } from "./message.ts";
 import { selectOutcomeReactions } from "./reactions.ts";
@@ -91,6 +91,7 @@ export function createAgentMentionWorker({
 
       const result = await forward({
         config: context.config,
+        prisma: context.prisma,
         agentRuntime: context.agentRuntime!,
         sourceIssueIdentifier,
         workerContext: {

@@ -1,7 +1,10 @@
 /// Idempotency and intake audit record for an inbound Linear webhook.
 model LinearWebhookReceipt {
   id                    String  @id @default(cuid())
-  linearDeliveryId      String  @unique
+  linearDeliveryId      String
+  webhookId             String  @default("legacy")
+  connectionId          String  @default("legacy")
+  repositoryId          String  @default("legacy")
   eventType             String
   trigger               String?
   sourceIssueIdentifier String?
@@ -16,4 +19,5 @@ model LinearWebhookReceipt {
 
   @@index([sourceIssueIdentifier])
   @@index([createdAt])
+  @@unique([webhookId, linearDeliveryId])
 }

@@ -6,7 +6,6 @@ import type {
   SessionLifecycle,
   SessionRole,
 } from "../../../types/sessions/index.ts";
-import { upsertAgentIssueFromEvent } from "../sessions/index.ts";
 
 export interface SpawnAgentThreadInput {
   config: ServerConfig;
@@ -26,19 +25,10 @@ export interface SpawnAgentThreadInput {
   parentSessionId?: string;
 }
 
-export interface SpawnAgentThreadDependencies {
-  register: typeof upsertAgentIssueFromEvent;
-}
-
-const defaultDependencies: SpawnAgentThreadDependencies = {
-  register: upsertAgentIssueFromEvent,
-};
-
-/** Ensure one durable acpx session for this launch attempt, register its
- * canonical Linear mirror, and enqueue the initial prompt. */
+/** Ensure one durable, metadata-complete acpx session and enqueue its initial
+ * prompt. Linear is a linked input/output integration, not the registry. */
 export async function spawnAgentThread(
   input: SpawnAgentThreadInput,
-  dependencies: SpawnAgentThreadDependencies = defaultDependencies,
 ) {
   const session = await input.agentRuntime.ensureSession({
     sessionKey: input.launchKey,
@@ -47,42 +37,33 @@ export async function spawnAgentThread(
     cwd: input.worktreePath,
     worktreePath: input.worktreePath,
     executionTarget: input.machine,
+    repositoryId: input.config.activeRepositoryId,
+    machineId: input.machine,
+    role: input.role,
+    lifecycle: input.lifecycle,
+    relations: input.parentSessionId
+      ? [{ relationship: "spawned-by", targetSessionId: input.parentSessionId }]
+      : [],
+    resourceLinks: [{
+      provider: "linear",
+      connectionId: input.config.activeConnectionId,
+      resourceType: "issue-identifier",
+      externalId: input.issueIdentifier,
+      relationship: "handles",
+    }],
     model: input.model,
   });
 
-  const now = new Date();
   try {
-    const agentIssue = await dependencies.register(
-      input.config,
-      {
-        eventId: `runtime-launch:${session.id}`,
-        occurredAt: now.toISOString(),
-        generation: now.getTime(),
-        type: "session.started",
-        runtime: {
-          harnessSessionId: session.id,
-          parentSessionId: input.parentSessionId ?? null,
-          worktreePath: input.worktreePath,
-          branchName: input.branchName ?? null,
-          harness: input.harness,
-          machine: input.machine,
-          role: input.role,
-          lifecycle: input.lifecycle,
-          sourceIssueIdentifier: input.issueIdentifier,
-          runtimeSessionId: session.id,
-        },
-      },
-      input.prisma,
-    );
     await input.agentRuntime.enqueue({
       sessionId: session.id,
       text: input.prompt,
       requestId: `launch:${input.launchKey}`,
     });
-    return { session, agentIssue };
+    return { session, agentIssue: null };
   } catch (error) {
     await input.agentRuntime
-      .close(session.id, "Launch registration failed")
+      .close(session.id, "Initial launch enqueue failed")
       .catch(() => undefined);
     throw error;
   }

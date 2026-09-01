@@ -153,6 +153,9 @@ export class RemoteAgentAcpAgent implements acp.Agent {
       cwd: params.cwd,
       worktreePath: params.cwd,
       executionTarget: this.config.machine,
+      machineId: this.config.machine,
+      role: "primary",
+      lifecycle: "persistent",
       model: this.config.acp.model,
       systemPrompt: "A Zed ACP session was created. Wait for the user's request.",
     });

@@ -40,6 +40,9 @@ export async function handleCommentWebhook(input: {
       ? null
       : "no_agent_mention";
   const receipt = await createWebhookReceipt(prisma, {
+    webhookId: config.activeWebhookId,
+    connectionId: config.activeConnectionId,
+    repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "comment",
     trigger: "mention",

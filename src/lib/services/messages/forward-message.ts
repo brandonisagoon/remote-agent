@@ -1,4 +1,5 @@
 import type { ServerConfig } from "../../config.ts";
+import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../types/runtime/index.ts";
 import type { MessageDispatchResult } from "../../../types/messages/index.ts";
 import type {
@@ -24,6 +25,7 @@ export interface ReplyContext {
 export interface ForwardMessageOptions {
   config: ServerConfig;
   agentRuntime: AgentSessionRuntime;
+  prisma?: PrismaClient;
   sourceIssueIdentifier: string;
   message: string;
   workerContext: RoutingInput["workerContext"];
@@ -60,8 +62,10 @@ export async function forwardMessage(
 async function route(
   options: ForwardMessageOptions,
 ): Promise<MessageDispatchResult> {
-  const fetchCandidates = options.fetchCandidates ?? fetchRouteCandidates;
   const selectSession = options.selectSession ?? selectSessionWithCodex;
+  if (!options.fetchCandidates && !options.prisma) {
+    throw new Error("prisma is required for registry-backed session routing");
+  }
   const initial = options.fetchCandidates
     ? {
         sourceIssue: null,
@@ -72,6 +76,7 @@ async function route(
       }
     : await fetchTrackerRoutingContext(
         options.config,
+        options.prisma!,
         options.sourceIssueIdentifier,
       );
   const candidates = (initial?.candidates ?? []).filter((candidate) =>
@@ -107,10 +112,14 @@ async function route(
       decision,
     };
   }
-  const fresh = (await fetchCandidates(
-    options.config,
-    options.sourceIssueIdentifier,
-  )).find(
+  const freshCandidates = options.fetchCandidates
+    ? await options.fetchCandidates(options.config, options.sourceIssueIdentifier)
+    : await fetchRouteCandidates(
+        options.config,
+        options.prisma!,
+        options.sourceIssueIdentifier,
+      );
+  const fresh = freshCandidates.find(
     (candidate) =>
       candidate.agentIssueIdentifier === decision.targetAgentIssueIdentifier,
   );

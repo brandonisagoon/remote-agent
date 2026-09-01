@@ -7,9 +7,9 @@ import {
   type Worker,
   type WorkerResult,
 } from "../../../../types/dispatcher/index.ts";
-import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
-import { getSourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
-import { TrackerReaction, reactToIssue } from "../../../integrations/tracker/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
+import { getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
+import { TrackerReaction, reactToIssue } from "../../../integrations/linear/reactions.ts";
 import { postWorktreeLinkComment } from "./comment.ts";
 import { decideOrchestration } from "./decide.ts";
 import { buildOrchestrationSessionName } from "./launch.ts";
@@ -17,6 +17,7 @@ import {
   provisionWorktree,
   spawnAgentThread,
 } from "../../../services/launches/index.ts";
+import { hasLivePersistentSessionForResource } from "../../../services/sessions/runtime-registry.ts";
 import {
   renderWorkflowPrompt,
   workflowPromptPath,
@@ -31,19 +32,20 @@ export interface OrchestrationWorkerDependencies {
   exists: (file: string) => boolean;
   readPrompt: (file: string) => string;
   getIssue: (
-    config: Parameters<typeof getSourceIssueWithAgentIssues>[0],
+    config: Parameters<typeof getSourceIssueForWorkflow>[0],
     query: { id: string },
   ) => Promise<SourceIssueWithAgentIssues | null>;
   react: typeof reactToIssue;
   postWorktreeComment: typeof postWorktreeLinkComment;
   provision?: typeof provisionWorktree;
   launch?: typeof spawnAgentThread;
+  hasLiveSession?: typeof hasLivePersistentSessionForResource;
 }
 
 const defaultDependencies: OrchestrationWorkerDependencies = {
   exists: existsSync,
   readPrompt: (file) => readFileSync(file, "utf8").trimEnd(),
-  getIssue: getSourceIssueWithAgentIssues,
+  getIssue: getSourceIssueForWorkflow,
   react: reactToIssue,
   postWorktreeComment: postWorktreeLinkComment,
 };
@@ -91,11 +93,19 @@ export function createOrchestrationWorker(
 
       const decision = decideOrchestration({
         issue,
-        agentTeamKey: context.config.agentTeamKey,
         orchestrateOnState: context.config.orchestrateOnState,
       });
       if (decision.kind !== "launch") {
         return result(decision.kind, decision.detail);
+      }
+      if (await (dependencies.hasLiveSession ?? hasLivePersistentSessionForResource)(context.prisma, {
+        repositoryId: repository.id,
+        provider: "linear",
+        connectionId: context.config.activeConnectionId,
+        resourceType: "issue-identifier",
+        externalId: issueIdentifier,
+      })) {
+        return result("ignored", "a live persistent runtime session already handles this issue");
       }
 
       const branchResult = await context.commandClient.run("git", [

@@ -20,6 +20,10 @@ import type {
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../config.ts";
 import {
+  getRepositoryConfig,
+  resolveRepositoryForCwd,
+} from "../../config.ts";
+import {
   appendRuntimeLifecycleEvent,
   attachRuntimeSession,
   beginRuntimeSession,
@@ -28,6 +32,7 @@ import {
   prepareRuntimeAgentSwitch,
   updateRuntimeSessionState,
 } from "../../services/sessions/runtime-registry.ts";
+import { resolveInitialSessionTags } from "../../services/sessions/session-metadata.ts";
 import type {
   AgentRuntimeEvent,
   AgentRuntimeMessage,
@@ -141,11 +146,11 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
 
   constructor(
     private readonly prisma: PrismaClient,
-    config: ServerConfig,
+    private readonly config: ServerConfig,
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
     this.runtime = createAcpRuntime({
-      cwd: config.repository.root,
+      cwd: config.installRoot,
       sessionStore: this.store,
       agentRegistry: createAgentRegistry({
         overrides: config.acpxAgentCommands,
@@ -159,7 +164,23 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   async ensureSession(
     input: EnsureAgentSessionInput,
   ): Promise<AgentRuntimeSession> {
-    const row = await beginRuntimeSession(this.prisma, input);
+    const repository = input.repositoryId
+      ? getRepositoryConfig(this.config, input.repositoryId)
+      : resolveRepositoryForCwd(this.config, input.cwd);
+    const cwdRepository = resolveRepositoryForCwd(this.config, input.cwd);
+    if (cwdRepository.id !== repository.id) {
+      throw new Error(
+        `cwd resolves to repository ${cwdRepository.id}, not ${repository.id}`,
+      );
+    }
+    const normalizedInput: EnsureAgentSessionInput = {
+      ...input,
+      repositoryId: repository.id,
+      machineId: input.machineId ?? input.executionTarget ?? this.config.machine,
+    };
+    const row = await beginRuntimeSession(this.prisma, normalizedInput, {
+      tags: resolveInitialSessionTags(repository, input.tags),
+    });
     try {
       const handle = await this.runtime.ensureSession({
         sessionKey: row.id,
@@ -195,9 +216,17 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   listSessions(
-    input: { cwd?: string; includeClosed?: boolean } = {},
+    input: { cwd?: string; repositoryId?: string; includeClosed?: boolean } = {},
   ): Promise<AgentRuntimeSession[]> {
-    return listRuntimeSessions(this.prisma, input);
+    const repositoryId = input.repositoryId ?? (
+      input.cwd ? resolveRepositoryForCwd(this.config, input.cwd).id : undefined
+    );
+    return listRuntimeSessions(this.prisma, {
+      ...(repositoryId ? { repositoryId } : {}),
+      ...(input.includeClosed === undefined
+        ? {}
+        : { includeClosed: input.includeClosed }),
+    });
   }
 
   async history(sessionId: string): Promise<AgentRuntimeMessage[]> {

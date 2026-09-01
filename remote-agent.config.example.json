@@ -5,25 +5,33 @@
     "apiKey": "replace-with-a-long-random-api-key",
     "host": "127.0.0.1",
     "port": 9000,
-    "databaseUrl": "file:./remote-agent.sqlite"
+    "databaseUrl": "file:./remote-agent.sqlite",
+    "ipcPath": "~/Library/Application Support/remote-agent/daemon.sock",
+    "githubWebhookSecret": "replace-with-github-webhook-secret",
+    "webhooks": {
+      "linear-product": {
+        "connection": "linear-main",
+        "webhookSecret": "replace-with-linear-webhook-secret",
+        "webhookMaxAgeMs": 60000,
+        "repositoryRouting": {
+          "your-repository": {}
+        }
+      }
+    }
   },
   "acpx": {
     "stateDir": "~/Library/Application Support/remote-agent/acpx",
-    "reconcileIntervalMs": 60000,
     "permissionMode": "approve-all",
     "nonInteractivePermissions": "deny",
     "agents": {}
   },
-  "linear": {
-    "webhookSecret": "replace-with-linear-webhook-secret",
-    "apiKey": "replace-with-linear-api-key",
-    "agentUserId": "replace-with-linear-agent-user-id",
-    "agentHandle": "agent",
-    "agentTeamKey": "AGENT",
-    "webhookMaxAgeMs": 60000
-  },
-  "github": {
-    "webhookSecret": "replace-with-github-webhook-secret"
+  "connections": {
+    "linear-main": {
+      "provider": "linear",
+      "apiKey": "replace-with-linear-api-key",
+      "agentUserId": "replace-with-linear-agent-user-id",
+      "agentHandle": "agent"
+    }
   },
   "runtime": {
     "machine": "studio-mac",
@@ -32,12 +40,6 @@
   },
   "deployment": {
     "branch": "main"
-  },
-  "triggers": {
-    "reflectOnState": "Pull Request",
-    "orchestrateOnState": "Planning",
-    "endOnState": "End",
-    "describeOnReaction": "pencil2"
   },
   "acp": {
     "provider": "codex"
@@ -51,22 +53,41 @@
       "default": true
     }
   ],
-  "repository": {
-    "root": "~/checkouts/your-repository",
-    "worktreeRoot": "../.worktrees",
-    "bootstrapCommand": ["bash", "scripts/bootstrap.sh"],
-    "workflows": {
-      "describe": {
-        "prompt": "prompts/describe-issue.md",
-        "harness": "claude",
-        "model": "opus"
+  "repositories": {
+    "your-repository": {
+      "root": "~/checkouts/your-repository",
+      "worktreeRoot": "../.worktrees",
+      "bootstrapCommand": ["bash", "scripts/bootstrap.sh"],
+      "metadata": {
+        "tags": {
+          "example.workflow": {
+            "options": ["planning", "implementation", "review"],
+            "cardinality": "one",
+            "routerVisible": true
+          }
+        }
       },
-      "orchestrate": {
-        "prompt": "prompts/orchestrate-plan.md",
-        "harness": "codex"
+      "sessionDefaults": {
+        "tags": {}
       },
-      "reflect": {
-        "prompt": "prompts/reflect.md"
+      "triggers": {
+        "reflectOnState": "Pull Request",
+        "orchestrateOnState": "Planning",
+        "describeOnReaction": "pencil2"
+      },
+      "workflows": {
+        "describe": {
+          "prompt": "prompts/describe-issue.md",
+          "harness": "claude",
+          "model": "opus"
+        },
+        "orchestrate": {
+          "prompt": "prompts/orchestrate-plan.md",
+          "harness": "codex"
+        },
+        "reflect": {
+          "prompt": "prompts/reflect.md"
+        }
       }
     }
   }

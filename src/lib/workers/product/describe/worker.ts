@@ -7,10 +7,10 @@ import {
   type Worker,
   type WorkerResult,
 } from "../../../../types/dispatcher/index.ts";
-import { TrackerReaction, reactToIssue } from "../../../integrations/tracker/index.ts";
+import { TrackerReaction, reactToIssue } from "../../../integrations/linear/reactions.ts";
 import { spawnAgentThread } from "../../../services/launches/index.ts";
-import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
-import { getSourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
+import { getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
 import {
   renderWorkflowPrompt,
   workflowPromptPath,
@@ -26,7 +26,7 @@ export interface DescribeWorkerDependencies {
   exists: (file: string) => boolean;
   readPrompt: (file: string) => string;
   getIssue: (
-    config: Parameters<typeof getSourceIssueWithAgentIssues>[0],
+    config: Parameters<typeof getSourceIssueForWorkflow>[0],
     query: { id: string },
   ) => Promise<SourceIssueWithAgentIssues | null>;
   react: typeof reactToIssue;
@@ -36,7 +36,7 @@ export interface DescribeWorkerDependencies {
 const defaultDependencies: DescribeWorkerDependencies = {
   exists: existsSync,
   readPrompt: (file) => readFileSync(file, "utf8").trim(),
-  getIssue: getSourceIssueWithAgentIssues,
+  getIssue: getSourceIssueForWorkflow,
   react: reactToIssue,
 };
 
@@ -71,14 +71,6 @@ export function createDescribeWorker(
 
       const issue = await dependencies.getIssue(context.config, { id: issueRef });
       if (!issue) return result("failed", "source issue not found");
-      if (
-        issue.identifier
-          .toUpperCase()
-          .startsWith(`${context.config.agentTeamKey.toUpperCase()}-`)
-      ) {
-        return result("ignored", "agent_team_issue");
-      }
-
       const sourcePrompt = dependencies.readPrompt(promptFile).trim();
       if (!sourcePrompt) return result("failed", "describe workflow prompt is empty");
       const prompt = renderWorkflowPrompt(sourcePrompt, {

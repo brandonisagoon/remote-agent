@@ -9,6 +9,12 @@ model RuntimeSession {
   acpxSessionId       String?   @unique
   agentSessionId      String?
   agentCommand        String
+  repositoryId        String    @default("legacy")
+  machineId           String    @default("unknown")
+  role                String?
+  lifecycle           String?
+  creationMetadataHash String?
+  metadataRevision     Int       @default(0)
   cwd                 String
   name                String?
   worktreePath        String?
@@ -25,9 +31,85 @@ model RuntimeSession {
   agentIssueRecord   AgentIssueRecord?       @relation(fields: [agentIssueRecordId], references: [id], onDelete: SetNull)
   cursors            RuntimeEventCursor[]
   events             RuntimeLifecycleEvent[]
+  metadataEvents     RuntimeMetadataEvent[]
+  tags               RuntimeSessionTag[]
+  outgoingRelations  RuntimeSessionRelation[] @relation("runtime-relation-source")
+  incomingRelations  RuntimeSessionRelation[] @relation("runtime-relation-target")
+  resourceLinks      RuntimeSessionResourceLink[]
 
   @@index([status])
   @@index([agentCommand, cwd])
+  @@index([repositoryId, status])
+  @@index([machineId, status])
+}
+
+/// Repository-defined metadata. Keys and values are intentionally opaque
+/// strings; definitions, options, and cardinality live in JSON configuration.
+model RuntimeSessionTag {
+  id               String   @id @default(cuid())
+  runtimeSessionId String
+  key              String
+  value            String
+  source           String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([runtimeSessionId, key, value])
+  @@index([key, value])
+}
+
+/// Flexible session graph. Relationship vocabulary is application policy,
+/// not a database enum.
+model RuntimeSessionRelation {
+  id              String   @id @default(cuid())
+  sourceSessionId String
+  targetSessionId String
+  relationship    String
+  createdAt       DateTime @default(now())
+  endedAt         DateTime?
+
+  source RuntimeSession @relation("runtime-relation-source", fields: [sourceSessionId], references: [id], onDelete: Cascade)
+  target RuntimeSession @relation("runtime-relation-target", fields: [targetSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceSessionId, targetSessionId, relationship])
+  @@index([targetSessionId, relationship])
+}
+
+/// A session's association with a provider resource. connectionId prevents
+/// identifiers from different Linear workspaces (or future providers) from
+/// sharing a namespace.
+model RuntimeSessionResourceLink {
+  id               String   @id @default(cuid())
+  runtimeSessionId String
+  provider         String
+  connectionId     String
+  resourceType     String
+  externalId       String
+  relationship     String
+  createdAt        DateTime @default(now())
+  endedAt          DateTime?
+
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([runtimeSessionId, provider, connectionId, resourceType, externalId, relationship])
+  @@index([provider, connectionId, resourceType, externalId])
+}
+
+/// Append-only audit record for explicit metadata changes.
+model RuntimeMetadataEvent {
+  sequence         Int      @id @default(autoincrement())
+  runtimeSessionId String
+  action           String
+  key              String
+  value            String?
+  source           String
+  occurredAt       DateTime @default(now())
+
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@index([runtimeSessionId, sequence])
 }
 
 /// Durable low-volume lifecycle journal shared by ACP and HTTP processes.

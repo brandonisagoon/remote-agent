@@ -5,7 +5,7 @@ import type { ServerConfig } from "../../../config.ts";
 import {
   createIssueComment,
   issueHasCommentContaining,
-} from "../../../integrations/tracker/index.ts";
+} from "../../../integrations/linear/comments.ts";
 import {
   buildZedDeepLink,
   getMachine,

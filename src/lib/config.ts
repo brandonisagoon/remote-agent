@@ -20,6 +20,10 @@ export const MAX_REQUEST_BYTES = 1_000_000;
 
 const PositiveIntegerSchema = z.number().int().positive();
 const CommandSchema = z.array(z.string().min(1)).min(1);
+const ConfigIdSchema = z
+  .string()
+  .min(1)
+  .regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/);
 const RepositoryRelativePathSchema = z
   .string()
   .min(1)
@@ -29,6 +33,23 @@ const WorkflowSchema = z.object({
   harness: z.enum(["claude", "codex"]),
   model: z.string().min(1).optional(),
 });
+const TagDefinitionSchema = z.object({
+  description: z.string().min(1).optional(),
+  options: z.array(z.string().min(1)).min(1).optional(),
+  cardinality: z.enum(["one", "many"]).default("one"),
+  routerVisible: z.boolean().default(false),
+});
+const RepositoryTriggersSchema = z
+  .object({
+    reflectOnState: z.string().min(1).default("Pull Request"),
+    orchestrateOnState: z.string().min(1).default("Planning"),
+    describeOnReaction: z.string().min(1).default("pencil2"),
+  })
+  .default({
+    reflectOnState: "Pull Request",
+    orchestrateOnState: "Planning",
+    describeOnReaction: "pencil2",
+  });
 const RepositorySchema = z.object({
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
@@ -38,6 +59,38 @@ const RepositorySchema = z.object({
     orchestrate: WorkflowSchema,
     reflect: z.object({ prompt: RepositoryRelativePathSchema }),
   }),
+  metadata: z
+    .object({
+      tags: z.record(ConfigIdSchema, TagDefinitionSchema).default({}),
+    })
+    .default({ tags: {} }),
+  sessionDefaults: z
+    .object({
+      tags: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
+    })
+    .default({ tags: {} }),
+  triggers: RepositoryTriggersSchema,
+});
+const LinearConnectionSchema = z.object({
+  provider: z.literal("linear"),
+  apiKey: z.string().min(1),
+  agentUserId: z.string().min(1),
+  agentHandle: z.string().min(1).optional(),
+});
+const RoutingConditionSchema = z.record(
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+);
+const WebhookSchema = z.object({
+  connection: ConfigIdSchema,
+  webhookSecret: z.string().min(1),
+  webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
+  repositoryRouting: z.record(
+    ConfigIdSchema,
+    z.object({
+      when: z.array(RoutingConditionSchema).min(1).optional(),
+    }),
+  ),
 });
 const ServiceFileSchema = z.object({
   serviceName: z
@@ -50,11 +103,13 @@ const ServiceFileSchema = z.object({
     host: z.string().min(1).default("127.0.0.1"),
     port: PositiveIntegerSchema.default(9000),
     databaseUrl: z.string().min(1).optional(),
+    ipcPath: z.string().min(1).optional(),
+    githubWebhookSecret: z.string().min(1),
+    webhooks: z.record(ConfigIdSchema, WebhookSchema),
   }),
   acpx: z
     .object({
       stateDir: z.string().min(1).optional(),
-      reconcileIntervalMs: PositiveIntegerSchema.default(60_000),
       permissionMode: z
         .enum(["approve-all", "approve-reads", "deny-all"])
         .default("approve-all"),
@@ -69,18 +124,9 @@ const ServiceFileSchema = z.object({
     .default({
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
-      reconcileIntervalMs: 60_000,
       agents: {},
     }),
-  linear: z.object({
-    webhookSecret: z.string().min(1),
-    apiKey: z.string().min(1),
-    agentUserId: z.string().min(1),
-    agentHandle: z.string().min(1).optional(),
-    agentTeamKey: z.string().min(1).default("AGENT"),
-    webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
-  }),
-  github: z.object({ webhookSecret: z.string().min(1) }),
+  connections: z.record(ConfigIdSchema, LinearConnectionSchema),
   runtime: z
     .object({
       machine: MachineSchema.optional(),
@@ -100,19 +146,6 @@ const ServiceFileSchema = z.object({
       tunnelName: z.string().min(1).optional(),
     })
     .default({ branch: "main" }),
-  triggers: z
-    .object({
-      reflectOnState: z.string().min(1).default("Pull Request"),
-      orchestrateOnState: z.string().min(1).default("Planning"),
-      endOnState: z.string().min(1).default("End"),
-      describeOnReaction: z.string().min(1).default("pencil2"),
-    })
-    .default({
-      reflectOnState: "Pull Request",
-      orchestrateOnState: "Planning",
-      endOnState: "End",
-      describeOnReaction: "pencil2",
-    }),
   acp: z
     .object({
       hostId: z.string().min(1).optional(),
@@ -121,7 +154,54 @@ const ServiceFileSchema = z.object({
     })
     .default({ provider: "codex" }),
   hosts: z.array(MachineRecordSchema).min(1),
-  repository: RepositorySchema,
+  repositories: z.record(ConfigIdSchema, RepositorySchema),
+}).superRefine((file, context) => {
+  const repositoryIds = new Set(Object.keys(file.repositories));
+  if (repositoryIds.size === 0) {
+    context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
+  }
+  if (Object.keys(file.connections).length === 0) {
+    context.addIssue({ code: "custom", path: ["connections"], message: "at least one connection is required" });
+  }
+  for (const [webhookId, webhook] of Object.entries(file.server.webhooks)) {
+    if (webhookId === "github") {
+      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId], message: "github is reserved for the deployment webhook" });
+    }
+    if (!file.connections[webhook.connection]) {
+      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "connection"], message: `unknown connection: ${webhook.connection}` });
+    }
+    const targets = Object.entries(webhook.repositoryRouting);
+    if (targets.length === 0) {
+      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting"], message: "at least one repository routing target is required" });
+    }
+    for (const [repositoryId, target] of targets) {
+      if (!repositoryIds.has(repositoryId)) {
+        context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: `unknown repository: ${repositoryId}` });
+      }
+      if (targets.length > 1 && !target.when) {
+        context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: "an unconditional target must be the webhook's only repository" });
+      }
+    }
+  }
+  for (const [repositoryId, repository] of Object.entries(file.repositories)) {
+    for (const [key, values] of Object.entries(repository.sessionDefaults.tags)) {
+      const definition = repository.metadata.tags[key];
+      if (!definition) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: `unknown repository tag: ${key}` });
+        continue;
+      }
+      if (definition.cardinality === "one" && values.length > 1) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: "single-cardinality tag accepts at most one default" });
+      }
+      if (definition.options) {
+        for (const value of values) {
+          if (!definition.options.includes(value)) {
+            context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: `value is not configured: ${value}` });
+          }
+        }
+      }
+    }
+  }
 });
 
 export type ServiceFile = z.infer<typeof ServiceFileSchema>;
@@ -133,6 +213,7 @@ export interface WorkflowConfig {
 }
 
 export interface RepositoryConfig {
+  id: string;
   root: string;
   worktreeRoot: string;
   bootstrapCommand: string[];
@@ -141,6 +222,38 @@ export interface RepositoryConfig {
     orchestrate: WorkflowConfig;
     reflect: { prompt: string };
   };
+  metadata: {
+    tags: Record<string, TagDefinitionConfig>;
+  };
+  sessionDefaults: { tags: Record<string, string[]> };
+  triggers: {
+    reflectOnState: string;
+    orchestrateOnState: string;
+    describeOnReaction: string;
+  };
+}
+
+export interface TagDefinitionConfig {
+  description?: string;
+  options?: string[];
+  cardinality: "one" | "many";
+  routerVisible: boolean;
+}
+
+export interface LinearConnectionConfig {
+  id: string;
+  provider: "linear";
+  apiKey: string;
+  agentUserId: string;
+  agentHandle: string | null;
+}
+
+export interface WebhookConfig {
+  id: string;
+  connectionId: string;
+  webhookSecret: string;
+  webhookMaxAgeMs: number;
+  repositoryRouting: Record<string, { when?: Array<Record<string, string[]>> }>;
 }
 
 export interface ServerConfig {
@@ -151,6 +264,7 @@ export interface ServerConfig {
   port: number;
   publicUrl: string;
   databaseUrl: string;
+  acpIpcPath: string;
   webhookSecret: string;
   apiKey: string;
   githubWebhookSecret: string;
@@ -164,7 +278,6 @@ export interface ServerConfig {
   codexExecutable: string;
   routerModel: string | null;
   routerTimeoutMs: number;
-  acpxReconcileIntervalMs: number;
   acpxStateDir: string;
   acpxPermissionMode: "approve-all" | "approve-reads" | "deny-all";
   acpxNonInteractivePermissions: "deny" | "fail";
@@ -183,6 +296,15 @@ export interface ServerConfig {
     providerId: "codex" | "claude-code";
     model?: string;
   };
+  connections: Readonly<Record<string, LinearConnectionConfig>>;
+  webhooks: Readonly<Record<string, WebhookConfig>>;
+  repositories: Readonly<Record<string, RepositoryConfig>>;
+  /** Present only on an event/session-scoped view. */
+  activeConnectionId: string;
+  /** Present only on an inbound webhook-scoped view. */
+  activeWebhookId: string;
+  /** Present only on an event/session-scoped view. */
+  activeRepositoryId: string;
 }
 
 function expandHome(value: string): string {
@@ -236,8 +358,87 @@ export function readConfig(): ServerConfig {
     file.deployment.installRoot ??
       path.join("~/Library/Application Support", file.serviceName),
   );
-  const repositoryRoot = absolute(file.repository.root, path.dirname(configFile));
-  const worktreeRoot = absolute(file.repository.worktreeRoot, repositoryRoot);
+  const repositories = Object.fromEntries(
+    Object.entries(file.repositories).map(([id, repository]) => {
+      const root = absolute(repository.root, path.dirname(configFile));
+      const worktreeRoot = absolute(repository.worktreeRoot, root);
+      return [id, {
+        id,
+        root,
+        worktreeRoot,
+        bootstrapCommand: [...repository.bootstrapCommand],
+        workflows: {
+          describe: {
+            ...repository.workflows.describe,
+            model: repository.workflows.describe.model ?? null,
+          },
+          orchestrate: {
+            ...repository.workflows.orchestrate,
+            model: repository.workflows.orchestrate.model ?? null,
+          },
+          reflect: { ...repository.workflows.reflect },
+        },
+        metadata: {
+          tags: Object.fromEntries(
+            Object.entries(repository.metadata.tags).map(([key, definition]) => [
+              key,
+              {
+                ...(definition.description
+                  ? { description: definition.description }
+                  : {}),
+                ...(definition.options
+                  ? { options: [...definition.options] }
+                  : {}),
+                cardinality: definition.cardinality,
+                routerVisible: definition.routerVisible,
+              },
+            ]),
+          ),
+        },
+        sessionDefaults: {
+          tags: Object.fromEntries(
+            Object.entries(repository.sessionDefaults.tags).map(([key, values]) => [
+              key,
+              [...values],
+            ]),
+          ),
+        },
+        triggers: { ...repository.triggers },
+      } satisfies RepositoryConfig];
+    }),
+  );
+  const connections = Object.fromEntries(
+    Object.entries(file.connections).map(([id, connection]) => [id, {
+      id,
+      provider: connection.provider,
+      apiKey: connection.apiKey,
+      agentUserId: connection.agentUserId,
+      agentHandle: connection.agentHandle ?? null,
+    } satisfies LinearConnectionConfig]),
+  );
+  const webhooks = Object.fromEntries(
+    Object.entries(file.server.webhooks).map(([id, webhook]) => [id, {
+      id,
+      connectionId: webhook.connection,
+      webhookSecret: webhook.webhookSecret,
+      webhookMaxAgeMs: webhook.webhookMaxAgeMs,
+      repositoryRouting: Object.fromEntries(
+        Object.entries(webhook.repositoryRouting).map(([repositoryId, target]) => [
+          repositoryId,
+          target.when
+            ? {
+                when: target.when.map((condition) => Object.fromEntries(
+                  Object.entries(condition).map(([key, values]) => [key, [...values]]),
+                )),
+              }
+            : {},
+        ]),
+      ),
+    } satisfies WebhookConfig]),
+  );
+  const firstRepository = Object.values(repositories)[0]!;
+  const firstConnection = Object.values(connections)[0]!;
+  const firstWebhook = Object.values(webhooks)[0];
 
   return {
     serviceName: file.serviceName,
@@ -247,20 +448,25 @@ export function readConfig(): ServerConfig {
     port: file.server.port,
     publicUrl: file.server.publicUrl,
     databaseUrl: resolveDatabaseUrl(file.server.databaseUrl, path.dirname(configFile)),
-    webhookSecret: file.linear.webhookSecret,
+    acpIpcPath: absolute(
+      file.server.ipcPath ?? path.join(installRoot, "remote-agent.sock"),
+      path.dirname(configFile),
+    ),
+    webhookSecret: firstWebhook?.webhookSecret ?? "unused",
     apiKey: file.server.apiKey,
-    githubWebhookSecret: file.github.webhookSecret,
-    linearApiKey: file.linear.apiKey,
-    agentUserId: file.linear.agentUserId,
-    agentHandle: file.linear.agentHandle ?? null,
-    agentTeamKey: file.linear.agentTeamKey,
+    githubWebhookSecret: file.server.githubWebhookSecret,
+    linearApiKey: firstConnection.apiKey,
+    agentUserId: firstConnection.agentUserId,
+    agentHandle: firstConnection.agentHandle,
+    // Legacy, unmounted Agent-team projection helpers still compile against
+    // this alias. It is no longer configurable or used by production routes.
+    agentTeamKey: "AGENT",
     hosts,
     machine,
     zedRemoteHost,
     codexExecutable: file.runtime.codexExecutable,
     routerModel: file.runtime.routerModel ?? null,
     routerTimeoutMs: file.runtime.routerTimeoutMs,
-    acpxReconcileIntervalMs: file.acpx.reconcileIntervalMs,
     acpxStateDir: absolute(file.acpx.stateDir ?? path.join(installRoot, "acpx")),
     acpxPermissionMode: file.acpx.permissionMode,
     acpxNonInteractivePermissions: file.acpx.nonInteractivePermissions,
@@ -272,36 +478,146 @@ export function readConfig(): ServerConfig {
         ? { claude: [...file.acpx.agents.claude] }
         : {}),
     },
-    webhookMaxAgeMs: file.linear.webhookMaxAgeMs,
+    webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
     deployScript:
       file.deployment.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
     deployBranch: file.deployment.branch,
     deployJobLabel:
       file.deployment.jobLabel ?? `dev.${file.serviceName}.deploy`,
-    reflectOnState: file.triggers.reflectOnState,
-    orchestrateOnState: file.triggers.orchestrateOnState,
-    describeReactionEmoji: file.triggers.describeOnReaction,
-    repository: {
-      root: repositoryRoot,
-      worktreeRoot,
-      bootstrapCommand: [...file.repository.bootstrapCommand],
-      workflows: {
-        describe: {
-          ...file.repository.workflows.describe,
-          model: file.repository.workflows.describe.model ?? null,
-        },
-        orchestrate: {
-          ...file.repository.workflows.orchestrate,
-          model: file.repository.workflows.orchestrate.model ?? null,
-        },
-        reflect: { ...file.repository.workflows.reflect },
-      },
-    },
-    endOnState: file.triggers.endOnState,
+    reflectOnState: firstRepository.triggers.reflectOnState,
+    orchestrateOnState: firstRepository.triggers.orchestrateOnState,
+    describeReactionEmoji: firstRepository.triggers.describeOnReaction,
+    repository: firstRepository,
+    endOnState: "End",
     acp: {
       ...(file.acp.hostId ? { hostId: file.acp.hostId } : {}),
       providerId: file.acp.provider,
       ...(file.acp.model ? { model: file.acp.model } : {}),
     },
+    connections,
+    webhooks,
+    repositories,
+    activeConnectionId: firstConnection.id,
+    activeWebhookId: firstWebhook?.id ?? "",
+    activeRepositoryId: firstRepository.id,
+  };
+}
+
+export function getRepositoryConfig(
+  config: ServerConfig,
+  repositoryId: string,
+): RepositoryConfig {
+  const repository = config.repositories[repositoryId];
+  if (!repository) throw new Error(`unknown repository: ${repositoryId}`);
+  return repository;
+}
+
+export function getLinearConnection(
+  config: ServerConfig,
+  connectionId: string,
+): LinearConnectionConfig {
+  const connection = config.connections[connectionId];
+  if (!connection) throw new Error(`unknown Linear connection: ${connectionId}`);
+  return connection;
+}
+
+export function getWebhookConfig(
+  config: ServerConfig,
+  webhookId: string,
+): WebhookConfig {
+  const webhook = config.webhooks[webhookId];
+  if (!webhook) throw new Error(`unknown webhook: ${webhookId}`);
+  return webhook;
+}
+
+function pathContains(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function resolveRepositoryForCwd(
+  config: ServerConfig,
+  cwd: string,
+): RepositoryConfig {
+  const absoluteCwd = path.resolve(cwd);
+  const candidates = Object.values(config.repositories).flatMap((repository) => {
+    const roots = [repository.root, repository.worktreeRoot]
+      .filter((root) => pathContains(root, absoluteCwd))
+      .sort((a, b) => b.length - a.length);
+    return roots[0] ? [{ repository, matchLength: roots[0].length }] : [];
+  }).sort((a, b) => b.matchLength - a.matchLength);
+  if (candidates.length === 0) {
+    throw new Error(`cwd is not inside a configured repository: ${absoluteCwd}`);
+  }
+  if (
+    candidates[1] &&
+    candidates[1].matchLength === candidates[0]!.matchLength &&
+    candidates[1].repository.id !== candidates[0]!.repository.id
+  ) {
+    throw new Error(`cwd matches multiple configured repositories: ${absoluteCwd}`);
+  }
+  return candidates[0]!.repository;
+}
+
+export function routeWebhookRepository(
+  config: ServerConfig,
+  webhookId: string,
+  attributes: Readonly<Record<string, string | readonly string[] | null | undefined>>,
+): RepositoryConfig {
+  const webhook = getWebhookConfig(config, webhookId);
+  const matchingRepositoryIds = new Set(
+    Object.entries(webhook.repositoryRouting)
+      .filter(([, target]) =>
+        !target.when || target.when.some((condition) =>
+          Object.entries(condition).every(([key, expected]) => {
+            const actual = attributes[key];
+            const values: readonly string[] = Array.isArray(actual)
+              ? actual
+              : typeof actual === "string"
+                ? [actual]
+                : [];
+            return values.some((value) => expected.includes(value));
+          }),
+        ),
+      )
+      .map(([repositoryId]) => repositoryId),
+  );
+  if (matchingRepositoryIds.size !== 1) {
+    throw new Error(
+      matchingRepositoryIds.size === 0
+        ? `webhook ${webhookId} did not match a repository routing rule`
+        : `webhook ${webhookId} matched multiple repositories`,
+    );
+  }
+  const repositoryId = [...matchingRepositoryIds][0]!;
+  return getRepositoryConfig(config, repositoryId);
+}
+
+/**
+ * Produces an immutable event/session-scoped view for legacy integration
+ * helpers while the Agent-team projection is being removed. Every alias is
+ * derived from explicit connection and repository IDs, so concurrent events
+ * from different Linear workspaces cannot share credentials or workflows.
+ */
+export function scopeConfig(
+  config: ServerConfig,
+  input: { connectionId: string; repositoryId: string; webhookId?: string },
+): ServerConfig {
+  const connection = getLinearConnection(config, input.connectionId);
+  const repository = getRepositoryConfig(config, input.repositoryId);
+  return {
+    ...config,
+    activeConnectionId: connection.id,
+    activeWebhookId: input.webhookId ?? config.activeWebhookId,
+    activeRepositoryId: repository.id,
+    linearApiKey: connection.apiKey,
+    agentUserId: connection.agentUserId,
+    agentHandle: connection.agentHandle,
+    agentTeamKey: config.agentTeamKey,
+    repository,
+    reflectOnState: repository.triggers.reflectOnState,
+    orchestrateOnState: repository.triggers.orchestrateOnState,
+    describeReactionEmoji: repository.triggers.describeOnReaction,
+    endOnState: config.endOnState,
   };
 }

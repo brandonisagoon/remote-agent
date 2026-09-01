@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 
 import { createApp } from "../../app.ts";
+import { createFakeAgentRuntime } from "../../test-support/agent-runtime.ts";
 import type { ServerConfig } from "../../lib/config.ts";
 import type { PrismaClient } from "../../generated/prisma/client.ts";
 import { testConfig } from "../../test-support/config.ts";
@@ -98,17 +99,6 @@ function issuePayload({
   };
 }
 
-function agentIssuePayload(
-  overrides: Parameters<typeof issuePayload>[0] = {},
-) {
-  return issuePayload({
-    identifier: "AGENT-1",
-    state: "End",
-    team: "AGENT",
-    ...overrides,
-  });
-}
-
 function reactionPayload({
   action = "create",
   emoji = "pencil2",
@@ -163,7 +153,7 @@ function post(
   };
   if (deliveryId) headers["linear-delivery"] = deliveryId;
 
-  return createApp({ config, prisma }).request("/webhooks/linear", {
+  return createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/linear-test", {
     method: "POST",
     headers,
     body: raw,
@@ -180,8 +170,8 @@ describe("signature verification", () => {
 
   test("rejects a missing signature", async () => {
     const raw = JSON.stringify(commentPayload());
-    const response = await createApp({ config, prisma }).request(
-      "/webhooks/linear",
+    const response = await createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request(
+      "/webhooks/linear-test",
       {
         method: "POST",
         headers: { "linear-delivery": "d1" },
@@ -303,22 +293,20 @@ describe("description reaction trigger", () => {
     expect(await prisma.linearWebhookReceipt.count()).toBe(0);
   });
 
-  test("records an ignored receipt for an Agents issue", async () => {
+  test("does not reserve AGENT-prefixed identifiers", async () => {
     const response = await post(
       reactionPayload({ identifier: "AGENT-42" }),
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
-      ignored: true,
-      reason: "agent_team_issue",
+      accepted: true,
     });
     expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
       eventType: "reaction",
       trigger: "describe",
       sourceIssueIdentifier: "AGENT-42",
-      status: "ignored",
-      detail: "agent_team_issue",
+      status: "accepted",
     });
   });
 
@@ -339,48 +327,7 @@ describe("description reaction trigger", () => {
   });
 });
 
-describe("end trigger", () => {
-  test("accepts an Agents issue transition into End", async () => {
-    const response = await post(agentIssuePayload());
-
-    expect(response.status).toBe(202);
-    expect(await response.json()).toMatchObject({ accepted: true, ending: true });
-    const receipt = await prisma.linearWebhookReceipt.findFirst();
-    expect(receipt).toMatchObject({
-      eventType: "issue",
-      trigger: "end",
-      sourceIssueIdentifier: "AGENT-1",
-      status: "accepted",
-    });
-  });
-
-  test("deduplicates repeated End deliveries", async () => {
-    const payload = agentIssuePayload();
-    const first = await post(payload, { deliveryId: "end-delivery" });
-    const second = await post(payload, { deliveryId: "end-delivery" });
-
-    expect(first.status).toBe(202);
-    expect(second.status).toBe(200);
-    expect(await second.json()).toMatchObject({ duplicate: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
-  });
-
-  test("ignores other Agents workflow updates", async () => {
-    const response = await post(agentIssuePayload({ state: "Connected" }));
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
-  });
-
-  test("ignores End payloads without a state transition", async () => {
-    const response = await post(agentIssuePayload({ updatedFrom: null }));
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
-  });
-
+describe("issue triggers", () => {
   test("does not treat a product issue state named End as a session trigger", async () => {
     const response = await post(
       issuePayload({ identifier: "CUBE-2801", state: "End" }),
@@ -525,12 +472,15 @@ describe("issue state changes", () => {
     expect(await prisma.linearWebhookReceipt.count()).toBe(0);
   });
 
-  test("ignores Agents-team issue transitions", async () => {
+  test("does not reserve the AGENT team for runtime state", async () => {
     const response = await post(issuePayload({ team: "AGENT" }));
 
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(response.status).toBe(202);
+    expect(await response.json()).toMatchObject({
+      accepted: true,
+      orchestrating: true,
+    });
+    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
   });
 
   test("keeps Pull Request reflection behavior", async () => {

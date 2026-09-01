@@ -21,6 +21,8 @@ export {
   getAgentIssues,
   getAgentStateId,
   getSourceIssue,
+  getSourceIssueForRouting,
+  getSourceIssueForWorkflow,
   getSourceIssueWithAgentIssues,
   handleCommentWebhook,
   handleIssueWebhook,

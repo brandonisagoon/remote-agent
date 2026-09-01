@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import { createApp } from "../../app.ts";
+import { createFakeAgentRuntime } from "../../test-support/agent-runtime.ts";
 import type { ServerConfig } from "../../lib/config.ts";
 import type { PrismaClient } from "../../generated/prisma/client.ts";
 import { testConfig } from "../../test-support/config.ts";
@@ -33,7 +34,7 @@ function post(
   { event = "push", secret = GH_SECRET }: { event?: string; secret?: string } = {},
 ) {
   const raw = typeof body === "string" ? body : JSON.stringify(body);
-  return createApp({ config, prisma }).request("/webhooks/github", {
+  return createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/github", {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -51,7 +52,7 @@ describe("signature verification", () => {
   });
 
   test("rejects a missing signature header", async () => {
-    const response = await createApp({ config, prisma }).request("/webhooks/github", {
+    const response = await createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/github", {
       method: "POST",
       headers: { "x-github-event": "push" },
       body: JSON.stringify({ ref: "refs/heads/main" }),
@@ -61,7 +62,7 @@ describe("signature verification", () => {
 
   test("rejects a signature without the sha256= prefix", async () => {
     const raw = JSON.stringify({ ref: "refs/heads/main" });
-    const response = await createApp({ config, prisma }).request("/webhooks/github", {
+    const response = await createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/github", {
       method: "POST",
       headers: {
         "x-github-event": "push",

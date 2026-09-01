@@ -29,6 +29,50 @@ export function testConfig(
   overrides: Partial<ServerConfig> = {},
 ): ServerConfig {
   configureMachines(overrides.hosts ?? TEST_HOSTS);
+  const repository = overrides.repository ?? {
+    id: "test-repository",
+    root: "/nonexistent/repository",
+    worktreeRoot: "/nonexistent/.worktrees",
+    bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
+    workflows: {
+      describe: {
+        prompt: "prompts/describe-issue.md",
+        harness: "claude" as const,
+        model: "opus",
+      },
+      orchestrate: {
+        prompt: "prompts/orchestrate-plan.md",
+        harness: "codex" as const,
+        model: null,
+      },
+      reflect: { prompt: "prompts/reflect.md" },
+    },
+    metadata: { tags: {} },
+    sessionDefaults: { tags: {} },
+    triggers: {
+      reflectOnState: "Pull Request",
+      orchestrateOnState: "Planning",
+      describeOnReaction: "pencil2",
+    },
+  };
+  const connections = overrides.connections ?? {
+    "linear-test": {
+      id: "linear-test",
+      provider: "linear" as const,
+      apiKey: "test-linear-key",
+      agentUserId: "11111111-2222-3333-4444-555555555555",
+      agentHandle: "cubic-agent",
+    },
+  };
+  const webhooks = overrides.webhooks ?? {
+    "linear-test": {
+      id: "linear-test",
+      connectionId: "linear-test",
+      webhookSecret: "test-webhook-secret",
+      webhookMaxAgeMs: 60_000,
+      repositoryRouting: { [repository.id]: {} },
+    },
+  };
   return {
     serviceName: "remote-agent-test",
     configFile: "/nonexistent/remote-agent.config.json",
@@ -37,6 +81,7 @@ export function testConfig(
     port: 9000,
     publicUrl: "https://agents.example.com",
     databaseUrl: "file::memory:",
+    acpIpcPath: "/nonexistent/remote-agent/daemon.sock",
     webhookSecret: "test-webhook-secret",
     apiKey: "test-api-key",
     githubWebhookSecret: "test-github-secret",
@@ -50,7 +95,6 @@ export function testConfig(
     codexExecutable: "codex",
     routerModel: null,
     routerTimeoutMs: 30_000,
-    acpxReconcileIntervalMs: 60_000,
     webhookMaxAgeMs: 60_000,
     deployScript: "/nonexistent/deploy.sh",
     deployBranch: "main",
@@ -58,24 +102,7 @@ export function testConfig(
     reflectOnState: "Pull Request",
     orchestrateOnState: "Planning",
     describeReactionEmoji: "pencil2",
-    repository: {
-      root: "/nonexistent/repository",
-      worktreeRoot: "/nonexistent/.worktrees",
-      bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
-      workflows: {
-        describe: {
-          prompt: "prompts/describe-issue.md",
-          harness: "claude",
-          model: "opus",
-        },
-        orchestrate: {
-          prompt: "prompts/orchestrate-plan.md",
-          harness: "codex",
-          model: null,
-        },
-        reflect: { prompt: "prompts/reflect.md" },
-      },
-    },
+    repository,
     endOnState: "End",
     ...overrides,
     acpxStateDir:
@@ -85,5 +112,11 @@ export function testConfig(
       overrides.acpxNonInteractivePermissions ?? "deny",
     acpxAgentCommands: overrides.acpxAgentCommands ?? {},
     acp: overrides.acp ?? { providerId: "codex" },
+    connections,
+    webhooks,
+    repositories: overrides.repositories ?? { [repository.id]: repository },
+    activeConnectionId: overrides.activeConnectionId ?? "linear-test",
+    activeWebhookId: overrides.activeWebhookId ?? "linear-test",
+    activeRepositoryId: overrides.activeRepositoryId ?? repository.id,
   };
 }

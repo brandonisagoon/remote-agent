@@ -128,18 +128,27 @@ describe("delivery eligibility", () => {
     },
   };
 
-  test("requires every server-owned routing invariant", () => {
+  test("uses runtime state rather than Linear ownership metadata", () => {
     expect(isEligibleCandidate(config, candidate)).toBeTrue();
     expect(
       isEligibleCandidate(config, { ...candidate, status: "Disconnected" }),
     ).toBeFalse();
     expect(
       isEligibleCandidate(config, { ...candidate, assigneeId: "someone-else" }),
-    ).toBeFalse();
+    ).toBeTrue();
+    expect(
+      isEligibleCandidate(config, { ...candidate, labels: [] }),
+    ).toBeTrue();
     expect(
       isEligibleCandidate(config, {
         ...candidate,
         runtime: { ...candidate.runtime, runtimeSessionId: null },
+      }),
+    ).toBeFalse();
+    expect(
+      isEligibleCandidate(config, {
+        ...candidate,
+        runtime: { ...candidate.runtime, role: "delegate" },
       }),
     ).toBeFalse();
   });

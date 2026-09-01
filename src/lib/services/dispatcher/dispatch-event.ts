@@ -6,7 +6,7 @@ import type {
   Worker,
   WorkerResult,
 } from "../../../types/dispatcher/index.ts";
-import { TrackerReaction, reactToIssue } from "../../integrations/tracker/index.ts";
+import { TrackerReaction, reactToIssue } from "../../integrations/linear/reactions.ts";
 import { eventIssueId } from "./event-issue.ts";
 import { workers } from "./worker-registry.ts";
 import { finishWorkerRun, startWorkerRun } from "./worker-run-store.ts";

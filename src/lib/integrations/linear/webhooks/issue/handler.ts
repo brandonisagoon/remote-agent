@@ -26,30 +26,6 @@ export async function handleIssueWebhook(input: {
     return { kind: IssueWebhookResultKind.Ignored };
   }
 
-  if (data.team?.key === config.agentTeamKey) {
-    if (data.state?.name !== config.endOnState) {
-      return { kind: IssueWebhookResultKind.Ignored };
-    }
-    const receipt = await createWebhookReceipt(prisma, {
-      linearDeliveryId: deliveryId,
-      eventType: "issue",
-      trigger: "end",
-      sourceIssueIdentifier: data.identifier,
-      sourceCommentId: null,
-      status: "accepted",
-    });
-    if (!receipt) return { kind: IssueWebhookResultKind.Duplicate };
-    void dispatchEvent({
-      prisma,
-      config,
-      commandClient: bunCommandClient,
-      agentRuntime,
-      receiptId: receipt.id,
-      event: { type: DispatchEventType.TrackerIssueEndRequested, webhook },
-    });
-    return { kind: IssueWebhookResultKind.Ending };
-  }
-
   const stateName = data.state?.name;
   const trigger =
     stateName === config.reflectOnState
@@ -60,6 +36,9 @@ export async function handleIssueWebhook(input: {
   if (!trigger) return { kind: IssueWebhookResultKind.Ignored };
 
   const receipt = await createWebhookReceipt(prisma, {
+    webhookId: config.activeWebhookId,
+    connectionId: config.activeConnectionId,
+    repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "issue",
     trigger,

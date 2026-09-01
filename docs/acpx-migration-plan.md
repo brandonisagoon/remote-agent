@@ -5,6 +5,10 @@
 - Scope: replace bb as Remote Agent's session runtime while preserving the
   Linear, HTTP, worker, and Zed workflows.
 
+Follow-on architecture work for multi-repository configuration, string-only
+session tags, Linear Agent-team removal, and a single acpx owner per machine is
+specified in the [multi-repository session metadata plan](./multi-repository-session-metadata-plan.md).
+
 ## Decision direction
 
 Use `acpx/runtime` as the provider-neutral session, queue, reconnect, and ACP
@@ -12,11 +16,11 @@ client layer. Remote Agent will own the durable mapping between its issues and
 acpx sessions, worktree placement, event projection cursors, and the ACP server
 surface presented to Zed.
 
-The Zed adapter and the acpx-backed runtime should be one Remote Agent process
-and one session service. Zed must still connect to an ACP **agent** endpoint;
-acpx is an ACP **client/runtime**, so the protocol boundary cannot disappear.
-It can, however, become a direct in-process proxy instead of a separate bb
-bridge with its own session model.
+The Zed adapter and acpx-backed runtime form one logical Remote Agent session
+service. Zed must still connect to an ACP **agent** endpoint; acpx is an ACP
+**client/runtime**, so the protocol boundary cannot disappear. The long-lived
+daemon owns acpx and SQLite, while Zed launches a stateless stdio bridge to the
+daemon's Unix socket. The bridge has no session model of its own.
 
 ## bb functionality currently used
 

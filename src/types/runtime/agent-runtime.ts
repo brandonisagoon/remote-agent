@@ -17,6 +17,10 @@ export interface AgentRuntimeSession {
   acpxSessionId: string | null;
   agentSessionId: string | null;
   agent: "codex" | "claude";
+  repositoryId: string;
+  machineId: string;
+  role: string | null;
+  lifecycle: string | null;
   cwd: string;
   name: string | null;
   worktreePath: string | null;
@@ -85,6 +89,22 @@ export interface EnsureAgentSessionInput {
   model?: string;
   systemPrompt?: string;
   agentEnv?: Record<string, string>;
+  repositoryId?: string;
+  machineId?: string;
+  role?: string;
+  lifecycle?: "one-shot" | "persistent";
+  tags?: Record<string, string[]>;
+  relations?: Array<{
+    relationship: string;
+    targetSessionId: string;
+  }>;
+  resourceLinks?: Array<{
+    provider: string;
+    connectionId: string;
+    resourceType: string;
+    externalId: string;
+    relationship: string;
+  }>;
 }
 
 export interface AgentSessionRuntime {
@@ -92,6 +112,7 @@ export interface AgentSessionRuntime {
   getSession(sessionId: string): Promise<AgentRuntimeSession | null>;
   listSessions(input?: {
     cwd?: string;
+    repositoryId?: string;
     includeClosed?: boolean;
   }): Promise<AgentRuntimeSession[]>;
   history(sessionId: string): Promise<AgentRuntimeMessage[]>;

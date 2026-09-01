@@ -7,6 +7,6 @@ import postLinear from "./post.linear.ts";
 const routes = new Hono<AppEnv>();
 
 routes.route("/github", postGithub);
-routes.route("/linear", postLinear);
+routes.route("/:webhookId", postLinear);
 
 export default routes;

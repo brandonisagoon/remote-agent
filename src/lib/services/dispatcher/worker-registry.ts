@@ -1,5 +1,4 @@
 import type { Worker } from "../../../types/dispatcher/index.ts";
-import { endSessionWorker } from "../../workers/agents/end-session/index.ts";
 import { agentMentionWorker } from "../../workers/product/agent-mention/index.ts";
 import { describeWorker } from "../../workers/product/describe/index.ts";
 import { orchestrationWorker } from "../../workers/product/orchestration/index.ts";
@@ -10,5 +9,4 @@ export const workers: Worker[] = [
   describeWorker,
   reflectionWorker,
   orchestrationWorker,
-  endSessionWorker,
 ];

@@ -1,61 +1,19 @@
-import {
-  parseAgentIssueRuntime,
-  type SourceIssueWithAgentIssues,
-} from "../../../integrations/tracker/index.ts";
-import {
-  AgentIssueStateSchema,
-  isTerminalAgentIssueState,
-  type AgentIssue,
-} from "../../../../types/sessions/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
 
 export type OrchestrationDecision =
   | { kind: "launch"; branchName: string }
   | { kind: "ignored"; detail: string }
   | { kind: "failed"; detail: string };
 
-function checkAgentIssueBlock(agentIssue: AgentIssue): boolean {
-  const state = AgentIssueStateSchema.safeParse(agentIssue.state.name);
-  if (!state.success) return true;
-  if (isTerminalAgentIssueState(state.data)) return false;
-  return parseAgentIssueRuntime(agentIssue.description)?.lifecycle !== "one-shot";
-}
-
-function uniqueRelatedAgentIssues(
-  issue: SourceIssueWithAgentIssues,
-): AgentIssue[] {
-  const relations = [
-    ...issue.relations.nodes,
-    ...issue.inverseRelations.nodes,
-  ];
-  return [
-    ...new Map(
-      relations.map(({ agentIssue }) => [agentIssue.id, agentIssue]),
-    ).values(),
-  ];
-}
-
 export function decideOrchestration(input: {
   issue: SourceIssueWithAgentIssues;
-  agentTeamKey: string;
   orchestrateOnState: string;
 }): OrchestrationDecision {
-  const { issue, agentTeamKey, orchestrateOnState } = input;
+  const { issue, orchestrateOnState } = input;
   if (issue.state.name !== orchestrateOnState) {
     return {
       kind: "ignored",
       detail: `issue state is ${issue.state.name}, not ${orchestrateOnState}`,
-    };
-  }
-
-  const blockingAgentIssue = uniqueRelatedAgentIssues(issue).find(
-    (agentIssue) =>
-      agentIssue.team.key === agentTeamKey &&
-      checkAgentIssueBlock(agentIssue),
-  );
-  if (blockingAgentIssue) {
-    return {
-      kind: "ignored",
-      detail: `related Agents issue ${blockingAgentIssue.identifier} may hold a live session (state: ${blockingAgentIssue.state.name})`,
     };
   }
 

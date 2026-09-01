@@ -21,6 +21,7 @@ export const reflectionWorker: Worker<ReflectionEvent> = {
     const issue = event.webhook.data;
     return forwardMessage({
       config: context.config,
+      prisma: context.prisma,
       agentRuntime: context.agentRuntime!,
       sourceIssueIdentifier: issue.identifier,
       workerContext: {

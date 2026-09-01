@@ -1,34 +1,32 @@
 #!/usr/bin/env bun
 
-import { Readable, Writable } from "node:stream";
-import * as acp from "@agentclientprotocol/sdk";
+import { createConnection } from "node:net";
 
-import { RemoteAgentAcpAgent } from "./agent.ts";
-import { acpLog } from "./log.ts";
 import { readConfig } from "../lib/config.ts";
-import { applyPragmas, createPrismaClient } from "../lib/prisma.ts";
-import { createAcpxSessionRuntime } from "../lib/transports/acpx/index.ts";
+import { acpLog } from "./log.ts";
 
-export async function startAcpAgent(): Promise<acp.AgentSideConnection> {
+/** Stateless Zed ACP stdio bridge. The machine daemon is the sole runtime and
+ * database owner; this process only forwards framed NDJSON bytes. */
+export async function startAcpBridge(): Promise<void> {
   const config = readConfig();
-  const prisma = createPrismaClient(config.databaseUrl);
-  await applyPragmas(prisma);
-  const runtime = createAcpxSessionRuntime(prisma, config);
-  const stream = acp.ndJsonStream(
-    Writable.toWeb(process.stdout),
-    Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
-  );
-  return new acp.AgentSideConnection(
-    (connection) => new RemoteAgentAcpAgent(connection, runtime, config),
-    stream,
-  );
+  const socket = createConnection(config.acpIpcPath);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  process.stdin.pipe(socket);
+  socket.pipe(process.stdout);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("close", resolve);
+    socket.once("error", reject);
+  });
 }
 
 if (import.meta.main) {
   try {
-    await startAcpAgent();
+    await startAcpBridge();
   } catch (error) {
-    acpLog("startup failed", error);
+    acpLog("bridge failed", error);
     process.exitCode = 1;
   }
 }

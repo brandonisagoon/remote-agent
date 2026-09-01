@@ -23,6 +23,9 @@ export async function createWebhookReceipt(
     sourceCommentId: string | null;
     status: "accepted" | "ignored";
     detail?: string | null;
+    webhookId: string;
+    connectionId: string;
+    repositoryId: string;
   },
 ) {
   try {

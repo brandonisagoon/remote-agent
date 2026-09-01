@@ -12,6 +12,7 @@ import type {
 } from "../../../types/runtime/index.ts";
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import { Prisma } from "../../../generated/prisma/client.ts";
+import type { ResolvedSessionTag } from "./session-metadata.ts";
 
 function json<T>(value: unknown): T | null {
   return value == null ? null : (value as T);
@@ -40,9 +41,12 @@ export function runtimeScopeKey(input: {
   sessionKey: string;
   agent: string;
   cwd: string;
+  repositoryId?: string;
 }): string {
   return createHash("sha256")
-    .update("remote-agent-runtime:v1\0")
+    .update("remote-agent-runtime:v2\0")
+    .update(input.repositoryId ?? "legacy")
+    .update("\0")
     .update(input.agent)
     .update("\0")
     .update(path.resolve(input.cwd))
@@ -63,6 +67,10 @@ export function toAgentRuntimeSession(row: NonNullable<RuntimeRow>): AgentRuntim
     acpxSessionId: row.acpxSessionId,
     agentSessionId: row.agentSessionId,
     agent: agent(row.agentCommand),
+    repositoryId: row.repositoryId,
+    machineId: row.machineId,
+    role: row.role,
+    lifecycle: row.lifecycle,
     cwd: row.cwd,
     name: row.name,
     worktreePath: row.worktreePath,
@@ -78,31 +86,71 @@ export function toAgentRuntimeSession(row: NonNullable<RuntimeRow>): AgentRuntim
 export async function beginRuntimeSession(
   prisma: PrismaClient,
   input: EnsureAgentSessionInput,
+  metadata: { tags?: ResolvedSessionTag[] } = {},
 ): Promise<AgentRuntimeSession> {
   const cwd = path.resolve(input.cwd);
+  const repositoryId = input.repositoryId ?? "legacy";
+  const machineId = input.machineId ?? input.executionTarget ?? "unknown";
+  const role = input.role ?? null;
+  const lifecycle = input.lifecycle ?? null;
+  const tags = [...(metadata.tags ?? [])].sort(
+    (a, b) => a.key.localeCompare(b.key) || a.value.localeCompare(b.value),
+  );
+  const relations = [...(input.relations ?? [])].sort((a, b) =>
+    a.relationship.localeCompare(b.relationship) ||
+    a.targetSessionId.localeCompare(b.targetSessionId)
+  );
+  const resourceLinks = [...(input.resourceLinks ?? [])].sort((a, b) =>
+    JSON.stringify(a).localeCompare(JSON.stringify(b))
+  );
   const scopeKey = runtimeScopeKey({
     sessionKey: input.sessionKey,
     agent: input.agent,
     cwd,
+    repositoryId,
   });
+  const creationMetadataHash = createHash("sha256")
+    .update(JSON.stringify({
+      repositoryId,
+      machineId,
+      role,
+      lifecycle,
+      tags: tags.map(({ key, value }) => ({ key, value })),
+      relations,
+      resourceLinks,
+    }))
+    .digest("hex");
   const row = await prisma.runtimeSession.upsert({
     where: { scopeKey },
     create: {
       scopeKey,
       agentCommand: input.agent,
+      repositoryId,
+      machineId,
+      role,
+      lifecycle,
+      creationMetadataHash,
       cwd,
       name: input.name ?? input.sessionKey,
       worktreePath: input.worktreePath ?? cwd,
       executionTarget: input.executionTarget,
       status: "provisioning",
+      tags: tags.length ? { create: tags } : undefined,
+      outgoingRelations: relations.length
+        ? { create: relations.map((relation) => ({
+            relationship: relation.relationship,
+            targetSessionId: relation.targetSessionId,
+          })) }
+        : undefined,
+      resourceLinks: resourceLinks.length ? { create: resourceLinks } : undefined,
     },
-    update: {
-      worktreePath: input.worktreePath ?? cwd,
-      executionTarget: input.executionTarget,
-      recoveryDetail: null,
-      ...(input.name ? { name: input.name } : {}),
-    },
+    update: {},
   });
+  if (row.creationMetadataHash && row.creationMetadataHash !== creationMetadataHash) {
+    throw new Error(
+      `runtime session scope conflicts with its original identity or metadata: ${input.sessionKey}`,
+    );
+  }
   if (row.status === "closed") {
     throw new Error(
       `runtime session scope is closed; use a new session key: ${input.sessionKey}`,
@@ -197,16 +245,44 @@ export async function findRuntimeSession(
 
 export async function listRuntimeSessions(
   prisma: PrismaClient,
-  input: { cwd?: string; includeClosed?: boolean } = {},
+  input: { cwd?: string; repositoryId?: string; includeClosed?: boolean } = {},
 ): Promise<AgentRuntimeSession[]> {
   const rows = await prisma.runtimeSession.findMany({
     where: {
       ...(input.cwd ? { cwd: path.resolve(input.cwd) } : {}),
+      ...(input.repositoryId ? { repositoryId: input.repositoryId } : {}),
       ...(!input.includeClosed ? { status: { not: "closed" } } : {}),
     },
     orderBy: { updatedAt: "desc" },
   });
   return rows.map(toAgentRuntimeSession);
+}
+
+export async function hasLivePersistentSessionForResource(
+  prisma: PrismaClient,
+  input: {
+    repositoryId: string;
+    provider: string;
+    connectionId: string;
+    resourceType: string;
+    externalId: string;
+  },
+): Promise<boolean> {
+  return (await prisma.runtimeSessionResourceLink.count({
+    where: {
+      provider: input.provider,
+      connectionId: input.connectionId,
+      resourceType: input.resourceType,
+      externalId: input.externalId,
+      relationship: "handles",
+      endedAt: null,
+      runtimeSession: {
+        repositoryId: input.repositoryId,
+        lifecycle: { not: "one-shot" },
+        status: { notIn: ["closed", "error"] },
+      },
+    },
+  })) > 0;
 }
 
 export async function attachRuntimeSessionToAgentIssue(

@@ -20,6 +20,12 @@ const directories = [
   "20260813222942_bb_error_threading",
   "20260819120739_rename_cube_issue_to_source_issue",
 ];
+const runtimeDirectories = [
+  "20260901150237_acpx_runtime_sessions",
+  "20260901152401_remove_bb_registry",
+  "20260901152917_runtime_lifecycle_journal",
+  "20260901170000_multi_repo_session_metadata",
+];
 
 function statements(directory: string): string[] {
   return readFileSync(path.join(MIGRATIONS, directory, "migration.sql"), "utf8")
@@ -70,6 +76,11 @@ describe("receipt and worker-run migration", () => {
         ('record-1', 'session-1', 'agent-issue-id', 'AGENT-9', 'macbook-air', 'tmux-1', '%1', 'event-1', 2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
     `);
     for (const migration of directories.slice(-4)) {
+      for (const statement of statements(migration)) {
+        await prisma.$executeRawUnsafe(statement);
+      }
+    }
+    for (const migration of runtimeDirectories) {
       for (const statement of statements(migration)) {
         await prisma.$executeRawUnsafe(statement);
       }

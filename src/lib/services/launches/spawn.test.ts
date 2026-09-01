@@ -26,18 +26,9 @@ function launchInput(
 }
 
 describe("spawnAgentThread", () => {
-  test("ensures, registers, and enqueues one acpx session", async () => {
+  test("ensures a metadata-complete session and enqueues it", async () => {
     const runtime = createFakeAgentRuntime();
-    let registeredRuntime: unknown;
-    const launched = await spawnAgentThread(
-      launchInput({ agentRuntime: runtime }),
-      {
-        register: async (_config, event) => {
-          registeredRuntime = event.runtime;
-          return null;
-        },
-      },
-    );
+    const launched = await spawnAgentThread(launchInput({ agentRuntime: runtime }));
 
     expect(runtime.ensureInputs).toEqual([
       expect.objectContaining({
@@ -45,14 +36,19 @@ describe("spawnAgentThread", () => {
         agent: "claude",
         cwd: "/tmp/cube-3278",
         model: "fable",
+        repositoryId: "test-repository",
+        machineId: "macbook-air",
+        role: "delegate",
+        resourceLinks: [{
+          provider: "linear",
+          connectionId: "linear-test",
+          resourceType: "issue-identifier",
+          externalId: "CUBE-3278",
+          relationship: "handles",
+        }],
       }),
     ]);
-    expect(registeredRuntime).toMatchObject({
-      harnessSessionId: launched.session.id,
-      runtimeSessionId: launched.session.id,
-      lifecycle: "persistent",
-      role: "delegate",
-    });
+    expect(launched.agentIssue).toBeNull();
     expect(runtime.sentMessages).toEqual([
       {
         sessionId: launched.session.id,
@@ -62,15 +58,14 @@ describe("spawnAgentThread", () => {
     ]);
   });
 
-  test("closes the acpx session when Linear registration fails", async () => {
+  test("closes the acpx session when its initial enqueue fails", async () => {
     const runtime = createFakeAgentRuntime();
+    runtime.enqueue = async () => {
+      throw new Error("enqueue failed");
+    };
     await expect(
-      spawnAgentThread(launchInput({ agentRuntime: runtime }), {
-        register: async () => {
-          throw new Error("registration failed");
-        },
-      }),
-    ).rejects.toThrow("registration failed");
+      spawnAgentThread(launchInput({ agentRuntime: runtime })),
+    ).rejects.toThrow("enqueue failed");
     expect(runtime.closedSessionIds).toEqual(["runtime-1"]);
     expect(runtime.sentMessages).toHaveLength(0);
   });

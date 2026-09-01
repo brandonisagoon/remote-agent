@@ -33,6 +33,8 @@ export {
   getAgentIssues,
   getAgentStateId,
   getSourceIssue,
+  getSourceIssueForRouting,
+  getSourceIssueForWorkflow,
   getSourceIssueWithAgentIssues,
   mergeAgentIssueLabelIds,
   parseAgentIssueRuntime,

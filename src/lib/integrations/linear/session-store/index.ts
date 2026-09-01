@@ -34,6 +34,8 @@ export type {
 export {
   sourceIssueIdentifierFromBranch,
   getSourceIssue,
+  getSourceIssueForRouting,
+  getSourceIssueForWorkflow,
   getSourceIssueWithAgentIssues,
 } from "./source-issue/index.ts";
 export type { SourceIssueWithAgentIssues } from "./source-issue/index.ts";

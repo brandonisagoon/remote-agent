@@ -4,6 +4,12 @@ import { Hono } from "hono";
 import { z } from "zod";
 
 import type { AppEnv } from "../../middleware/context.ts";
+import {
+  getLinearConnection,
+  getRepositoryConfig,
+  resolveRepositoryForCwd,
+  scopeConfig,
+} from "../../lib/config.ts";
 import { getMachine, MachineSchema } from "../../lib/machines/index.ts";
 import { spawnAgentThread } from "../../lib/services/launches/index.ts";
 import {
@@ -26,6 +32,8 @@ const LaunchSchema = z.object({
   title: z.string().min(1).max(512).optional(),
   parentSessionId: z.string().min(1).max(256).optional(),
   launchKey: z.string().min(1).max(512).optional(),
+  repositoryId: z.string().min(1).max(128).optional(),
+  connectionId: z.string().min(1).max(128).optional(),
 });
 
 const route = new Hono<AppEnv>();
@@ -40,6 +48,25 @@ route.post("/", async (c) => {
   }
 
   const config = c.get("config");
+  let repository;
+  let connectionId: string;
+  try {
+    repository = parsed.data.repositoryId
+      ? getRepositoryConfig(config, parsed.data.repositoryId)
+      : resolveRepositoryForCwd(config, parsed.data.worktreePath);
+    const cwdRepository = resolveRepositoryForCwd(config, parsed.data.worktreePath);
+    if (cwdRepository.id !== repository.id) {
+      return c.json({ error: "worktreePath does not belong to repositoryId" }, 409);
+    }
+    connectionId = parsed.data.connectionId ?? config.activeConnectionId;
+    getLinearConnection(config, connectionId);
+  } catch (error) {
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
+  const scopedConfig = scopeConfig(config, {
+    connectionId,
+    repositoryId: repository.id,
+  });
   try {
     getMachine({ id: parsed.data.machine });
   } catch {
@@ -55,7 +82,7 @@ route.post("/", async (c) => {
       launchKey:
         parsed.data.launchKey ??
         `api:${parsed.data.issueIdentifier}:${parsed.data.role}:${parsed.data.branchName ?? parsed.data.worktreePath}`,
-      config,
+      config: scopedConfig,
       prisma: c.get("prisma"),
       agentRuntime: c.get("agentRuntime"),
     });
@@ -64,7 +91,7 @@ route.post("/", async (c) => {
         sessionId: launched.session.id,
         machine: parsed.data.machine,
         acpxRecordId: launched.session.acpxRecordId,
-        agentIssueIdentifier: launched.agentIssue?.identifier ?? null,
+        repositoryId: repository.id,
       },
       201,
     );

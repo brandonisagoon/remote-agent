@@ -53,6 +53,7 @@ function fixture(): RepositoryConfig {
   git(root, "commit", "-m", "fixture");
 
   return {
+    id: "fixture",
     root,
     worktreeRoot: path.join(directory, "worktrees"),
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
@@ -64,6 +65,13 @@ function fixture(): RepositoryConfig {
         model: null,
       },
       reflect: { prompt: "prompts/reflect.md" },
+    },
+    metadata: { tags: {} },
+    sessionDefaults: { tags: {} },
+    triggers: {
+      reflectOnState: "Pull Request",
+      orchestrateOnState: "Planning",
+      describeOnReaction: "pencil2",
     },
   };
 }

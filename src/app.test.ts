@@ -64,7 +64,7 @@ describe("unknown routes", () => {
 
 describe("/api authentication", () => {
   test("rejects a missing Authorization header", async () => {
-    const response = await app().request("/api/session-events", {
+    const response = await app().request("/api/launches", {
       method: "POST",
     });
     expect(response.status).toBe(401);
@@ -87,7 +87,7 @@ describe("/api authentication", () => {
   });
 
   test("a correct token reaches validation", async () => {
-    const response = await app().request("/api/session-events", {
+    const response = await app().request("/api/launches", {
       method: "POST",
       headers: { authorization: `Bearer ${API_KEY}` },
     });

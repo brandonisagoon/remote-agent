@@ -3,7 +3,6 @@ import { Hono } from "hono";
 import type { ServerConfig } from "./lib/config.ts";
 import type { PrismaClient } from "./generated/prisma/client.ts";
 import { bunCommandClient } from "./lib/transports/command/index.ts";
-import { createAcpxSessionRuntime } from "./lib/transports/acpx/index.ts";
 import { apiAuthMiddleware } from "./middleware/api-auth.ts";
 import { cacheControlMiddleware } from "./middleware/cache-control.ts";
 import {
@@ -17,7 +16,7 @@ import type { AgentSessionRuntime, CommandClient } from "./types/runtime/index.t
 export interface CreateAppOptions {
   config: ServerConfig;
   commandClient?: CommandClient;
-  agentRuntime?: AgentSessionRuntime;
+  agentRuntime: AgentSessionRuntime;
   prisma: PrismaClient;
 }
 
@@ -28,12 +27,10 @@ export function createApp({
   prisma,
 }: CreateAppOptions): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
-  const runtime = agentRuntime ?? createAcpxSessionRuntime(prisma, config);
-
   app.use("*", contextMiddleware({
     config,
     commandClient,
-    agentRuntime: runtime,
+    agentRuntime,
     prisma,
   }));
   app.use("*", cacheControlMiddleware());

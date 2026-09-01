@@ -17,9 +17,12 @@ acpx record IDs and provider session IDs are replaceable mappings. This solves
 duplicate registration after Zed/SSH reconnects: reconnecting loads the stable
 row and reattaches the runtime rather than creating a new product session.
 
-The Zed endpoint remains a protocol adapter in the same process, not an
-independent session owner. It normalizes provider-specific controls into stable
-ACP IDs and follows ACP client capability negotiation for boolean options.
+The long-lived machine daemon is the sole Prisma and acpx owner. It exposes a
+local Unix-socket ACP endpoint. Zed launches a stateless stdio bridge that
+forwards ACP frames to that endpoint; restarting the bridge or its SSH
+transport cannot create another runtime owner or logical session. The adapter
+normalizes provider-specific controls into stable ACP IDs and follows ACP
+client capability negotiation for boolean options.
 
 Turn lifecycle events are projected directly from the runtime. Streaming
 deltas remain in ACP and the transcript. Projection cursors are consumer-scoped
