@@ -1,4 +1,6 @@
 node_modules/
+out/
+dist/
 src/generated/prisma/
 *.sqlite
 *.sqlite-journal

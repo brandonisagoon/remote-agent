@@ -31,6 +31,7 @@ export function testConfig(
   configureMachines(overrides.hosts ?? TEST_HOSTS);
   const repository = overrides.repository ?? {
     id: "test-repository",
+    name: "Test Repository",
     root: "/nonexistent/repository",
     worktreeRoot: "/nonexistent/.worktrees",
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
@@ -59,6 +60,7 @@ export function testConfig(
     "linear-test": {
       id: "linear-test",
       provider: "linear" as const,
+      name: "Linear Test",
       apiKey: "test-linear-key",
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
@@ -67,6 +69,7 @@ export function testConfig(
   const webhooks = overrides.webhooks ?? {
     "linear-test": {
       id: "linear-test",
+      provider: "linear" as const,
       connectionId: "linear-test",
       webhookSecret: "test-webhook-secret",
       webhookMaxAgeMs: 60_000,
@@ -82,6 +85,7 @@ export function testConfig(
     publicUrl: "https://agents.example.com",
     databaseUrl: "file::memory:",
     acpIpcPath: "/nonexistent/remote-agent/daemon.sock",
+    controlIpcPath: "/nonexistent/remote-agent/control.sock",
     webhookSecret: "test-webhook-secret",
     apiKey: "test-api-key",
     githubWebhookSecret: "test-github-secret",

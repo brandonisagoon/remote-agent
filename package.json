@@ -10,20 +10,58 @@
   },
   "homepage": "https://github.com/brandonisagoon/remote-agent#readme",
   "type": "module",
+  "main": "out/main/index.js",
+  "bin": {
+    "remote-agent": "src/cli/main.ts"
+  },
   "packageManager": "bun@1.3.14",
   "engines": {
     "bun": ">=1.3.14"
   },
   "scripts": {
     "acp": "bun src/acp/main.ts",
+    "cli": "bun src/cli/main.ts",
+    "desktop:dev": "electron-vite dev",
+    "desktop:build": "electron-vite build",
+    "desktop:package": "bun run config:schema && bun run desktop:build && electron-builder --dir",
+    "config:schema": "bun scripts/generate-config-schema.ts",
     "serve": "bun --watch src/server.ts",
-    "build": "prisma generate && tsc --noEmit",
-    "lint": "prisma generate && tsc --noEmit",
+    "build": "prisma generate && bun run config:schema && tsc --noEmit && electron-vite build",
+    "lint": "prisma generate && bun run config:schema && tsc --noEmit",
     "start": "bun src/server.ts",
     "test": "bun test",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:generate": "prisma generate"
+  },
+  "build": {
+    "appId": "dev.remote-agent.desktop",
+    "productName": "Remote Agent",
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "scripts",
+        "to": "scripts"
+      },
+      {
+        "from": "remote-agent.config.example.json",
+        "to": "remote-agent.config.example.json"
+      },
+      {
+        "from": "remote-agent.config.schema.json",
+        "to": "remote-agent.config.schema.json"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    }
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "1.4.0",
@@ -31,12 +69,30 @@
     "@prisma/adapter-libsql": "7.9.1",
     "@prisma/client": "7.9.1",
     "acpx": "0.13.2",
+    "chokidar": "^5.0.0",
+    "commander": "^15.0.0",
     "hono": "4.12.32",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@radix-ui/react-slot": "^1.3.3",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/bun": "1.3.14",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "5",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "electron": "^44.1.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "lucide-react": "^1.39.0",
     "prisma": "7.9.1",
-    "typescript": "5.9.3"
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "5.9.3",
+    "vite": "7"
   }
 }

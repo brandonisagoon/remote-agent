@@ -24,22 +24,23 @@ config_value() {
 }
 
 SERVICE_NAME="$(config_value serviceName)"
-ROOT="$(config_value deployment.installRoot)"
+ROOT="$(config_value machine.installation.root)"
 [ -n "$ROOT" ] || ROOT="$HOME/Library/Application Support/$SERVICE_NAME"
 case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 REPO="$ROOT/repo"
 APP="$ROOT/app"
 STATE="$ROOT/state"
 BACKUPS="$STATE/backups"
-LABEL="dev.$SERVICE_NAME.service"
+LABEL="$(config_value machine.installation.jobLabel)"
+[ -n "$LABEL" ] || LABEL="dev.$SERVICE_NAME.service"
 
 export REMOTE_AGENT_CONFIG="$CONFIG_SOURCE"
 
-BRANCH="$(config_value deployment.branch)"
+BRANCH="$(config_value machine.installation.branch)"
 [ -n "$BRANCH" ] || BRANCH="main"
-PORT="$(config_value server.port)"
+PORT="$(config_value machine.server.listen.port)"
 [ -n "$PORT" ] || PORT="9000"
-DATABASE_PATH="$(bun -e 'import path from "node:path"; const file = process.argv[1]; const value = await Bun.file(file).json(); const url = value.server?.databaseUrl; if (url && !url.startsWith("file:")) process.exit(0); const db = url ? url.slice(5) : "remote-agent.sqlite"; process.stdout.write(path.resolve(path.dirname(file), db))' "$CONFIG_SOURCE")"
+DATABASE_PATH="$(bun -e 'import path from "node:path"; const file = process.argv[1]; const value = await Bun.file(file).json(); const url = value.machine?.server?.databaseUrl; if (url && !url.startsWith("file:")) process.exit(0); const db = url ? url.slice(5) : "remote-agent.sqlite"; process.stdout.write(path.resolve(path.dirname(file), db))' "$CONFIG_SOURCE")"
 HEALTH="http://127.0.0.1:$PORT/health"
 LOG="$STATE/deploy.log"
 DEPLOY_DB_SNAPSHOT=""

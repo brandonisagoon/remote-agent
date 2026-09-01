@@ -13,7 +13,7 @@ describe("remote-agent deployment scripts", () => {
       "utf8",
     );
     const configIndex = script.indexOf('CONFIG_SOURCE="${REMOTE_AGENT_CONFIG:-remote-agent.config.json}"');
-    const branchIndex = script.indexOf('BRANCH="$(config_value deployment.branch)"');
+    const branchIndex = script.indexOf('BRANCH="$(config_value machine.installation.branch)"');
 
     expect(configIndex).toBeGreaterThan(-1);
     expect(branchIndex).toBeGreaterThan(configIndex);
@@ -53,7 +53,8 @@ describe("remote-agent deployment scripts", () => {
     }
     expect(install).not.toContain("REMOTE_AGENT_ENV_FILE");
     expect(install).not.toContain("remote-agent.env");
-    expect(install).toContain('chmod 600 "$STATE/remote-agent.config.json"');
+    expect(install).toContain('chmod 600 "$CONFIG_SOURCE"');
+    expect(install).not.toContain('cp "$CONFIG_SOURCE" "$STATE/remote-agent.config.json"');
     expect(install).toContain('"$REPO/" "$APP/"');
   });
 

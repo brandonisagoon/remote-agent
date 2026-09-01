@@ -40,7 +40,7 @@ export async function startAcpIpcServer(input: {
   const server = createServer((socket) => {
     const stream = acp.ndJsonStream(
       Writable.toWeb(socket),
-      Readable.toWeb(socket) as ReadableStream<Uint8Array>,
+      Readable.toWeb(socket) as unknown as ReadableStream<Uint8Array>,
     );
     const connection = new acp.AgentSideConnection(
       (client) => new RemoteAgentAcpAgent(client, input.runtime, input.config),

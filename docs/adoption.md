@@ -36,26 +36,31 @@ config use an `example.*` prefix deliberately; they are examples, not built-in
 Remote Agent vocabulary.
 
 Named Linear credentials live in `connections`. Each inbound definition under
-`server.webhooks` references one connection and contains its own
+`machine.server.webhooks` references one connection and contains its own
 `repositoryRouting` map. Those map keys are the webhook's repository allowlist.
 Within `when`, objects are OR alternatives, keys in an object are AND
 conditions, and each key's values are OR choices. Ambiguous or unmatched events
 fail closed.
 
-Execution targets in `hosts` have an arbitrary kebab-case ID, a unique Linear
-label, a Zed connection kind (`local` or `ssh`), routing capability, and exactly
-one default. If any target uses SSH, configure `runtime.zedRemoteHost`.
+The singular `machine` object owns the local server, Zed connection (`local` or
+`ssh`), runtime, acpx, installation, and update settings. Remote Agent does not
+orchestrate a fleet in this version.
 
 ## Configuration lifecycle
 
-1. Copy `remote-agent.config.example.json` to
-   `remote-agent.config.json` next to the deployment checkout.
-2. Set the repository paths, credentials, target labels, and optional acpx agent
+1. Launch the desktop app with `bun run desktop:dev`, or copy
+   `remote-agent.config.example.json` to `remote-agent.config.json`.
+2. Set the repository paths, credentials, machine settings, and optional acpx agent
    command overrides.
 3. Run `bun run db:deploy`, then start the machine daemon with `bun run start`.
 4. Configure Zed to run `bun run acp`; this is a stateless stdio bridge to the
    daemon socket, not a second runtime.
 5. Persist both the SQLite file and `acpx.stateDir` across deploys.
+
+The desktop app and CLI operate on exactly this JSON file. The app watches the
+file and surfaces external changes without overwriting an unsaved UI draft.
+Its **Open in Code Editor** action opens the file directly, and the adjacent
+committed JSON Schema provides field completion and validation.
 
 No dotenv file is read. `REMOTE_AGENT_CONFIG` may point to a differently named
 JSON file when required by deployment layout.

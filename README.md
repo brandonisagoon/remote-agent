@@ -28,12 +28,31 @@ independent projection cursors.
 
 ## Setup
 
+### Desktop app
+
+The Electron app is the primary configuration and management surface:
+
+```sh
+bun install
+bun run desktop:dev
+```
+
+It edits the canonical JSON file, watches for edits made by agents or code
+editors, displays local session state, and exposes install, health, restart,
+and update actions. Use **Open in Code Editor** to open the settings file
+directly. Production app bundles are created with `bun run desktop:package`.
+
+### CLI
+
 ```sh
 cp remote-agent.config.example.json remote-agent.config.json
 bun install
 bun run db:deploy
 bun run start
 ```
+
+The same management operations are scriptable with `bun run cli -- install`,
+`status`, `doctor`, `check-update`, `update`, and `restart`.
 
 `remote-agent.config.json` is intentionally gitignored. All service settings,
 including credentials and acpx command overrides, live in that one JSON file.
@@ -47,7 +66,8 @@ bun run acp
 ```
 
 The command is the Zed-facing ACP adapter; the machine daemon must already be
-running. The bridge connects to `server.ipcPath` and never opens SQLite or acpx.
+running. The bridge connects to `machine.server.acpSocketPath` and never opens
+SQLite or acpx.
 Zed receives stable controls for harness, model, mode, thinking level, and fast
 mode. Fast mode is exposed as a boolean when the client advertises boolean
 config support, while context usage is restored with `usage_update` after load
@@ -62,9 +82,10 @@ One machine config can declare several managed repositories:
 - `repositories.<id>.bootstrapCommand` prepares each new worktree.
 - workflow prompt paths and custom metadata definitions are repository-scoped.
 - `connections.<id>` defines a reusable Linear identity.
-- `server.webhooks.<id>` selects a connection and embeds its own
+- `machine.server.webhooks.<id>` selects a connection and embeds its own
   `repositoryRouting` allowlist/rules.
-- `hosts` describe execution-target labels and how Zed should open a worktree.
+- `machine` describes this installation, its daemon, Zed transport, acpx state,
+  and update settings. Multi-machine orchestration is intentionally out of scope.
 
 The managed repository supplies the bootstrap script and prompt files; it does
 not import this package or maintain a second environment file. See

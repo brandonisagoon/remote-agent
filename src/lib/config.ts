@@ -6,9 +6,6 @@ import { z } from "zod";
 
 import {
   configureMachines,
-  getDefaultMachineId,
-  getMachine,
-  MachineRecordSchema,
   MachineSchema,
   type Machine,
   type MachineRecord,
@@ -51,6 +48,7 @@ const RepositoryTriggersSchema = z
     describeOnReaction: "pencil2",
   });
 const RepositorySchema = z.object({
+  name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
   bootstrapCommand: CommandSchema,
@@ -73,113 +71,137 @@ const RepositorySchema = z.object({
 });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
+  name: z.string().min(1),
   apiKey: z.string().min(1),
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
 });
+const GithubConnectionSchema = z.object({
+  provider: z.literal("github"),
+  name: z.string().min(1),
+  apiToken: z.string().min(1).optional(),
+});
+const ConnectionSchema = z.discriminatedUnion("provider", [
+  LinearConnectionSchema,
+  GithubConnectionSchema,
+]);
 const RoutingConditionSchema = z.record(
   z.string().min(1),
   z.array(z.string().min(1)).min(1),
 );
 const WebhookSchema = z.object({
   connection: ConfigIdSchema,
-  webhookSecret: z.string().min(1),
+  secret: z.string().min(1),
   webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
   repositoryRouting: z.record(
     ConfigIdSchema,
     z.object({
       when: z.array(RoutingConditionSchema).min(1).optional(),
     }),
-  ),
+  ).default({}),
 });
-const ServiceFileSchema = z.object({
+const AcpxSchema = z
+  .object({
+    stateDir: z.string().min(1).optional(),
+    permissionMode: z
+      .enum(["approve-all", "approve-reads", "deny-all"])
+      .default("approve-all"),
+    nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
+    agents: z
+      .object({
+        codex: CommandSchema.optional(),
+        claude: CommandSchema.optional(),
+      })
+      .default({}),
+  })
+  .default({
+    permissionMode: "approve-all",
+    nonInteractivePermissions: "deny",
+    agents: {},
+  });
+
+export const ServiceFileSchema = z.object({
+  $schema: z.string().optional(),
+  schemaVersion: z.literal(2),
   serviceName: z
     .string()
     .min(1)
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  server: z.object({
-    publicUrl: z.string().min(1),
-    apiKey: z.string().min(1),
-    host: z.string().min(1).default("127.0.0.1"),
-    port: PositiveIntegerSchema.default(9000),
-    databaseUrl: z.string().min(1).optional(),
-    ipcPath: z.string().min(1).optional(),
-    githubWebhookSecret: z.string().min(1),
-    webhooks: z.record(ConfigIdSchema, WebhookSchema),
-  }),
-  acpx: z
-    .object({
-      stateDir: z.string().min(1).optional(),
-      permissionMode: z
-        .enum(["approve-all", "approve-reads", "deny-all"])
-        .default("approve-all"),
-      nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
-      agents: z
-        .object({
-          codex: CommandSchema.optional(),
-          claude: CommandSchema.optional(),
-        })
-        .default({}),
-    })
-    .default({
-      permissionMode: "approve-all",
-      nonInteractivePermissions: "deny",
-      agents: {},
+  machine: z.object({
+    id: MachineSchema,
+    name: z.string().min(1),
+    acceptsTrackerInput: z.boolean().default(true),
+    server: z.object({
+      publicUrl: z.string().min(1),
+      apiKey: z.string().min(1),
+      listen: z.object({
+        host: z.string().min(1).default("127.0.0.1"),
+        port: PositiveIntegerSchema.default(9000),
+      }).default({ host: "127.0.0.1", port: 9000 }),
+      databaseUrl: z.string().min(1).optional(),
+      acpSocketPath: z.string().min(1).optional(),
+      controlSocketPath: z.string().min(1).optional(),
+      webhooks: z.record(ConfigIdSchema, WebhookSchema).default({}),
     }),
-  connections: z.record(ConfigIdSchema, LinearConnectionSchema),
-  runtime: z
-    .object({
-      machine: MachineSchema.optional(),
-      zedRemoteHost: z.string().min(1).optional(),
+    zed: z.object({
+      connection: z.enum(["local", "ssh"]).default("local"),
+      remoteHost: z.string().min(1).optional(),
+    }).default({ connection: "local" }),
+    acpx: AcpxSchema,
+    runtime: z.object({
       codexExecutable: z.string().min(1).default("codex"),
       routerModel: z.string().min(1).optional(),
       routerTimeoutMs: PositiveIntegerSchema.default(30_000),
-    })
-    .default({ codexExecutable: "codex", routerTimeoutMs: 30_000 }),
-  deployment: z
-    .object({
-      installRoot: z.string().min(1).optional(),
+    }).default({ codexExecutable: "codex", routerTimeoutMs: 30_000 }),
+    acp: z.object({
+      hostId: z.string().min(1).optional(),
+      provider: z.enum(["codex", "claude-code"]).default("codex"),
+      model: z.string().min(1).optional(),
+    }).default({ provider: "codex" }),
+    installation: z.object({
+      root: z.string().min(1).optional(),
       gitRemote: z.string().min(1).optional(),
       branch: z.string().min(1).default("main"),
       script: z.string().min(1).optional(),
       jobLabel: z.string().min(1).optional(),
       tunnelName: z.string().min(1).optional(),
-    })
-    .default({ branch: "main" }),
-  acp: z
-    .object({
-      hostId: z.string().min(1).optional(),
-      provider: z.enum(["codex", "claude-code"]).default("codex"),
-      model: z.string().min(1).optional(),
-    })
-    .default({ provider: "codex" }),
-  hosts: z.array(MachineRecordSchema).min(1),
+    }).default({ branch: "main" }),
+    updates: z.object({
+      channel: z.enum(["stable", "beta"]).default("stable"),
+    }).default({ channel: "stable" }),
+  }),
+  connections: z.record(ConfigIdSchema, ConnectionSchema),
   repositories: z.record(ConfigIdSchema, RepositorySchema),
 }).superRefine((file, context) => {
   const repositoryIds = new Set(Object.keys(file.repositories));
   if (repositoryIds.size === 0) {
     context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
   }
-  if (Object.keys(file.connections).length === 0) {
-    context.addIssue({ code: "custom", path: ["connections"], message: "at least one connection is required" });
+  if (!Object.values(file.connections).some((connection) => connection.provider === "linear")) {
+    context.addIssue({ code: "custom", path: ["connections"], message: "at least one Linear connection is required" });
   }
-  for (const [webhookId, webhook] of Object.entries(file.server.webhooks)) {
-    if (webhookId === "github") {
-      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId], message: "github is reserved for the deployment webhook" });
-    }
-    if (!file.connections[webhook.connection]) {
-      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "connection"], message: `unknown connection: ${webhook.connection}` });
+  if (file.machine.zed.connection === "ssh" && !file.machine.zed.remoteHost) {
+    context.addIssue({ code: "custom", path: ["machine", "zed", "remoteHost"], message: "remoteHost is required for an SSH Zed connection" });
+  }
+  for (const [webhookId, webhook] of Object.entries(file.machine.server.webhooks)) {
+    const connection = file.connections[webhook.connection];
+    if (!connection) {
+      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "connection"], message: `unknown connection: ${webhook.connection}` });
+      continue;
     }
     const targets = Object.entries(webhook.repositoryRouting);
-    if (targets.length === 0) {
-      context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting"], message: "at least one repository routing target is required" });
+    if (connection.provider === "linear" && targets.length === 0) {
+      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting"], message: "a Linear webhook requires at least one repository routing target" });
+    }
+    if (connection.provider === "github" && targets.length > 0) {
+      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting"], message: "a GitHub deployment webhook does not use repository routing" });
     }
     for (const [repositoryId, target] of targets) {
       if (!repositoryIds.has(repositoryId)) {
-        context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: `unknown repository: ${repositoryId}` });
+        context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: `unknown repository: ${repositoryId}` });
       }
       if (targets.length > 1 && !target.when) {
-        context.addIssue({ code: "custom", path: ["server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: "an unconditional target must be the webhook's only repository" });
+        context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: "an unconditional target must be the webhook's only repository" });
       }
     }
   }
@@ -214,6 +236,7 @@ export interface WorkflowConfig {
 
 export interface RepositoryConfig {
   id: string;
+  name: string;
   root: string;
   worktreeRoot: string;
   bootstrapCommand: string[];
@@ -243,13 +266,24 @@ export interface TagDefinitionConfig {
 export interface LinearConnectionConfig {
   id: string;
   provider: "linear";
+  name: string;
   apiKey: string;
   agentUserId: string;
   agentHandle: string | null;
 }
 
+export interface GithubConnectionConfig {
+  id: string;
+  provider: "github";
+  name: string;
+  apiToken: string | null;
+}
+
+export type ConnectionConfig = LinearConnectionConfig | GithubConnectionConfig;
+
 export interface WebhookConfig {
   id: string;
+  provider: "linear" | "github";
   connectionId: string;
   webhookSecret: string;
   webhookMaxAgeMs: number;
@@ -265,6 +299,7 @@ export interface ServerConfig {
   publicUrl: string;
   databaseUrl: string;
   acpIpcPath: string;
+  controlIpcPath: string;
   webhookSecret: string;
   apiKey: string;
   githubWebhookSecret: string;
@@ -296,7 +331,7 @@ export interface ServerConfig {
     providerId: "codex" | "claude-code";
     model?: string;
   };
-  connections: Readonly<Record<string, LinearConnectionConfig>>;
+  connections: Readonly<Record<string, ConnectionConfig>>;
   webhooks: Readonly<Record<string, WebhookConfig>>;
   repositories: Readonly<Record<string, RepositoryConfig>>;
   /** Present only on an event/session-scoped view. */
@@ -325,12 +360,25 @@ export function configFilePath(): string {
 
 export function readServiceFile(file: string = configFilePath()): ServiceFile {
   try {
-    return ServiceFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
+    return parseServiceFile(JSON.parse(readFileSync(file, "utf8")));
   } catch (error) {
     throw new Error(
       `invalid remote-agent config ${file}: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
+}
+
+export function parseServiceFile(value: unknown): ServiceFile {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !("schemaVersion" in value)
+  ) {
+    throw new Error(
+      "schemaVersion 2 is required; migrate server/runtime/hosts into the singular machine object",
+    );
+  }
+  return ServiceFileSchema.parse(value);
 }
 
 function resolveDatabaseUrl(value: string | undefined, stateRoot: string): string {
@@ -343,19 +391,18 @@ function resolveDatabaseUrl(value: string | undefined, stateRoot: string): strin
 export function readConfig(): ServerConfig {
   const configFile = configFilePath();
   const file = readServiceFile(configFile);
-  const hosts = configureMachines(file.hosts);
-  const machine = file.runtime.machine ?? getDefaultMachineId();
-  getMachine({ id: machine });
-
-  const zedRemoteHost = file.runtime.zedRemoteHost ?? null;
-  if (hosts.some((host) => host.zedConnection === "ssh") && !zedRemoteHost) {
-    throw new Error(
-      "runtime.zedRemoteHost is required when an SSH host is configured",
-    );
-  }
+  const machine = file.machine.id;
+  const hosts = configureMachines([{
+    id: machine,
+    label: file.machine.name,
+    zedConnection: file.machine.zed.connection,
+    acceptsTrackerInput: file.machine.acceptsTrackerInput,
+    default: true,
+  }]);
+  const zedRemoteHost = file.machine.zed.remoteHost ?? null;
 
   const installRoot = absolute(
-    file.deployment.installRoot ??
+    file.machine.installation.root ??
       path.join("~/Library/Application Support", file.serviceName),
   );
   const repositories = Object.fromEntries(
@@ -364,6 +411,7 @@ export function readConfig(): ServerConfig {
       const worktreeRoot = absolute(repository.worktreeRoot, root);
       return [id, {
         id,
+        name: repository.name ?? id,
         root,
         worktreeRoot,
         bootstrapCommand: [...repository.bootstrapCommand],
@@ -408,19 +456,30 @@ export function readConfig(): ServerConfig {
     }),
   );
   const connections = Object.fromEntries(
-    Object.entries(file.connections).map(([id, connection]) => [id, {
-      id,
-      provider: connection.provider,
-      apiKey: connection.apiKey,
-      agentUserId: connection.agentUserId,
-      agentHandle: connection.agentHandle ?? null,
-    } satisfies LinearConnectionConfig]),
+    Object.entries(file.connections).map(([id, connection]) => [id,
+      connection.provider === "linear"
+        ? {
+            id,
+            provider: "linear" as const,
+            name: connection.name,
+            apiKey: connection.apiKey,
+            agentUserId: connection.agentUserId,
+            agentHandle: connection.agentHandle ?? null,
+          } satisfies LinearConnectionConfig
+        : {
+            id,
+            provider: "github" as const,
+            name: connection.name,
+            apiToken: connection.apiToken ?? null,
+          } satisfies GithubConnectionConfig,
+    ]),
   );
   const webhooks = Object.fromEntries(
-    Object.entries(file.server.webhooks).map(([id, webhook]) => [id, {
+    Object.entries(file.machine.server.webhooks).map(([id, webhook]) => [id, {
       id,
+      provider: file.connections[webhook.connection]!.provider,
       connectionId: webhook.connection,
-      webhookSecret: webhook.webhookSecret,
+      webhookSecret: webhook.secret,
       webhookMaxAgeMs: webhook.webhookMaxAgeMs,
       repositoryRouting: Object.fromEntries(
         Object.entries(webhook.repositoryRouting).map(([repositoryId, target]) => [
@@ -437,24 +496,35 @@ export function readConfig(): ServerConfig {
     } satisfies WebhookConfig]),
   );
   const firstRepository = Object.values(repositories)[0]!;
-  const firstConnection = Object.values(connections)[0]!;
-  const firstWebhook = Object.values(webhooks)[0];
+  const firstConnection = Object.values(connections).find(
+    (connection): connection is LinearConnectionConfig => connection.provider === "linear",
+  )!;
+  const firstWebhook = Object.values(webhooks).find(
+    (webhook) => webhook.provider === "linear",
+  );
+  const githubWebhook = Object.values(webhooks).find(
+    (webhook) => webhook.provider === "github",
+  );
 
   return {
     serviceName: file.serviceName,
     configFile,
     installRoot,
-    hostname: file.server.host,
-    port: file.server.port,
-    publicUrl: file.server.publicUrl,
-    databaseUrl: resolveDatabaseUrl(file.server.databaseUrl, path.dirname(configFile)),
+    hostname: file.machine.server.listen.host,
+    port: file.machine.server.listen.port,
+    publicUrl: file.machine.server.publicUrl,
+    databaseUrl: resolveDatabaseUrl(file.machine.server.databaseUrl, path.dirname(configFile)),
     acpIpcPath: absolute(
-      file.server.ipcPath ?? path.join(installRoot, "remote-agent.sock"),
+      file.machine.server.acpSocketPath ?? path.join(installRoot, "remote-agent.sock"),
+      path.dirname(configFile),
+    ),
+    controlIpcPath: absolute(
+      file.machine.server.controlSocketPath ?? path.join(installRoot, "control.sock"),
       path.dirname(configFile),
     ),
     webhookSecret: firstWebhook?.webhookSecret ?? "unused",
-    apiKey: file.server.apiKey,
-    githubWebhookSecret: file.server.githubWebhookSecret,
+    apiKey: file.machine.server.apiKey,
+    githubWebhookSecret: githubWebhook?.webhookSecret ?? "unused",
     linearApiKey: firstConnection.apiKey,
     agentUserId: firstConnection.agentUserId,
     agentHandle: firstConnection.agentHandle,
@@ -464,35 +534,35 @@ export function readConfig(): ServerConfig {
     hosts,
     machine,
     zedRemoteHost,
-    codexExecutable: file.runtime.codexExecutable,
-    routerModel: file.runtime.routerModel ?? null,
-    routerTimeoutMs: file.runtime.routerTimeoutMs,
-    acpxStateDir: absolute(file.acpx.stateDir ?? path.join(installRoot, "acpx")),
-    acpxPermissionMode: file.acpx.permissionMode,
-    acpxNonInteractivePermissions: file.acpx.nonInteractivePermissions,
+    codexExecutable: file.machine.runtime.codexExecutable,
+    routerModel: file.machine.runtime.routerModel ?? null,
+    routerTimeoutMs: file.machine.runtime.routerTimeoutMs,
+    acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
+    acpxPermissionMode: file.machine.acpx.permissionMode,
+    acpxNonInteractivePermissions: file.machine.acpx.nonInteractivePermissions,
     acpxAgentCommands: {
-      ...(file.acpx.agents.codex
-        ? { codex: [...file.acpx.agents.codex] }
+      ...(file.machine.acpx.agents.codex
+        ? { codex: [...file.machine.acpx.agents.codex] }
         : {}),
-      ...(file.acpx.agents.claude
-        ? { claude: [...file.acpx.agents.claude] }
+      ...(file.machine.acpx.agents.claude
+        ? { claude: [...file.machine.acpx.agents.claude] }
         : {}),
     },
     webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
     deployScript:
-      file.deployment.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
-    deployBranch: file.deployment.branch,
+      file.machine.installation.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
+    deployBranch: file.machine.installation.branch,
     deployJobLabel:
-      file.deployment.jobLabel ?? `dev.${file.serviceName}.deploy`,
+      file.machine.installation.jobLabel ?? `dev.${file.serviceName}.deploy`,
     reflectOnState: firstRepository.triggers.reflectOnState,
     orchestrateOnState: firstRepository.triggers.orchestrateOnState,
     describeReactionEmoji: firstRepository.triggers.describeOnReaction,
     repository: firstRepository,
     endOnState: "End",
     acp: {
-      ...(file.acp.hostId ? { hostId: file.acp.hostId } : {}),
-      providerId: file.acp.provider,
-      ...(file.acp.model ? { model: file.acp.model } : {}),
+      ...(file.machine.acp.hostId ? { hostId: file.machine.acp.hostId } : {}),
+      providerId: file.machine.acp.provider,
+      ...(file.machine.acp.model ? { model: file.machine.acp.model } : {}),
     },
     connections,
     webhooks,
@@ -517,7 +587,9 @@ export function getLinearConnection(
   connectionId: string,
 ): LinearConnectionConfig {
   const connection = config.connections[connectionId];
-  if (!connection) throw new Error(`unknown Linear connection: ${connectionId}`);
+  if (!connection || connection.provider !== "linear") {
+    throw new Error(`unknown Linear connection: ${connectionId}`);
+  }
   return connection;
 }
 

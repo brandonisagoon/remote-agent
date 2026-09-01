@@ -10,44 +10,55 @@ let previousConfig: string | undefined;
 
 function serviceFile(zedConnection: "local" | "ssh" = "local") {
   return {
+    schemaVersion: 2,
     serviceName: "example-agent",
-    server: {
-      publicUrl: "https://agents.example.com",
-      apiKey: "api-secret",
-      databaseUrl: "file:./state.sqlite",
-      githubWebhookSecret: "github-secret",
-      webhooks: {
-        "linear-main": {
-          connection: "linear-main",
-          webhookSecret: "webhook-secret",
-          repositoryRouting: { example: {} },
+    machine: {
+      id: "build-host",
+      name: "Build Host",
+      acceptsTrackerInput: true,
+      server: {
+        publicUrl: "https://agents.example.com",
+        apiKey: "api-secret",
+        databaseUrl: "file:./state.sqlite",
+        webhooks: {
+          "linear-main": {
+            connection: "linear-main",
+            secret: "webhook-secret",
+            repositoryRouting: { example: {} },
+          },
+          github: {
+            connection: "github-main",
+            secret: "github-secret",
+          },
         },
       },
+      zed: {
+        connection: zedConnection,
+        ...(zedConnection === "ssh" ? {} : {}),
+      },
+      acpx: {},
     },
-    acpx: {},
     connections: {
       "linear-main": {
         provider: "linear",
+        name: "Linear Main",
         apiKey: "linear-secret",
         agentUserId: "agent-user",
       },
       "linear-second": {
         provider: "linear",
+        name: "Linear Second",
         apiKey: "linear-secret-2",
         agentUserId: "agent-user-2",
       },
-    },
-    hosts: [
-      {
-        id: "build-host",
-        label: "Build Host",
-        zedConnection,
-        acceptsTrackerInput: true,
-        default: true,
+      "github-main": {
+        provider: "github",
+        name: "GitHub Main",
       },
-    ],
+    },
     repositories: {
       example: {
+        name: "Example",
         root: "repository",
         worktreeRoot: "../worktrees",
         bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
@@ -108,7 +119,7 @@ describe("readConfig", () => {
     expect(config.publicUrl).toBe("https://agents.example.com");
     expect(config.linearApiKey).toBe("linear-secret");
     expect(config.deployJobLabel).toBe("dev.example-agent.deploy");
-    expect(Object.keys(config.connections)).toEqual(["linear-main", "linear-second"]);
+    expect(Object.keys(config.connections)).toEqual(["linear-main", "linear-second", "github-main"]);
     expect(config.activeConnectionId).toBe("linear-main");
     expect(config.repository.id).toBe("example");
     expect(config.repository.root).toBe(path.join(directory, "repository"));
@@ -119,7 +130,7 @@ describe("readConfig", () => {
   test("requires settings formerly supplied by the environment", () => {
     const value = serviceFile();
     // @ts-expect-error exercising runtime validation
-    delete value.server.publicUrl;
+    delete value.machine.server.publicUrl;
     writeConfig(value);
     expect(() => readConfig()).toThrow("publicUrl");
   });
@@ -127,18 +138,19 @@ describe("readConfig", () => {
   test("requires a Zed host only for SSH execution hosts", () => {
     const value = serviceFile("ssh");
     writeConfig(value);
-    expect(() => readConfig()).toThrow("runtime.zedRemoteHost is required");
+    expect(() => readConfig()).toThrow("remoteHost is required");
 
-    writeConfig({
-      ...value,
-      runtime: { zedRemoteHost: "build-host.example" },
-    });
+    (value.machine.zed as { connection: "ssh"; remoteHost?: string }).remoteHost =
+      "build-host.example";
+    writeConfig(value);
     expect(readConfig().zedRemoteHost).toBe("build-host.example");
   });
 
-  test("rejects a selected machine absent from the host registry", () => {
-    writeConfig({ ...serviceFile(), runtime: { machine: "unknown-host" } });
-    expect(() => readConfig()).toThrow("unknown machine: unknown-host");
+  test("rejects the legacy fleet-shaped config with migration guidance", () => {
+    const value: any = serviceFile();
+    delete value.schemaVersion;
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("schemaVersion 2 is required");
   });
 
   test("keeps tag definitions repository-specific", () => {
@@ -171,7 +183,7 @@ describe("readConfig", () => {
 
   test("rejects routing outside a webhook repository allowlist", () => {
     const value: any = serviceFile();
-    value.server.webhooks["linear-main"].repositoryRouting = {
+    value.machine.server.webhooks["linear-main"].repositoryRouting = {
       missing: { when: [{ "linear.teamId": ["team"] }] },
     };
     writeConfig(value);
@@ -185,7 +197,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.server.webhooks["linear-main"].repositoryRouting = {
+    value.machine.server.webhooks["linear-main"].repositoryRouting = {
       example: {
         when: [
           {
@@ -219,7 +231,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.server.webhooks["linear-main"].repositoryRouting = {
+    value.machine.server.webhooks["linear-main"].repositoryRouting = {
       example: { when: [{ "linear.teamId": ["shared"] }] },
       second: { when: [{ "linear.teamId": ["shared"] }] },
     };
@@ -237,7 +249,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.server.webhooks["linear-main"].repositoryRouting.second = {
+    value.machine.server.webhooks["linear-main"].repositoryRouting.second = {
       when: [{ "linear.teamId": ["team-second"] }],
     };
     writeConfig(value);
@@ -247,8 +259,8 @@ describe("readConfig", () => {
   test("keeps multiple Linear connection credentials independent", () => {
     writeConfig();
     const config = readConfig();
-    expect(config.connections["linear-main"]?.apiKey).toBe("linear-secret");
-    expect(config.connections["linear-second"]?.apiKey).toBe("linear-secret-2");
+    expect(config.connections["linear-main"]).toMatchObject({ apiKey: "linear-secret" });
+    expect(config.connections["linear-second"]).toMatchObject({ apiKey: "linear-secret-2" });
     expect(config.connections["linear-main"]).not.toHaveProperty("agentTeamKey");
   });
 });

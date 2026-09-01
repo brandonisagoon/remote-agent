@@ -14,7 +14,7 @@ config_value() {
   bun -e 'let value = await Bun.file(process.argv[1]).json(); for (const key of process.argv[2].split(".")) value = value?.[key]; if (value != null) process.stdout.write(String(value))' "$CONFIG_SOURCE" "$1"
 }
 SERVICE_NAME="$(config_value serviceName)"
-ROOT="$(config_value deployment.installRoot)"
+ROOT="$(config_value machine.installation.root)"
 [ -n "$ROOT" ] || ROOT="$HOME/Library/Application Support/$SERVICE_NAME"
 case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 LABEL="dev.$SERVICE_NAME.service"

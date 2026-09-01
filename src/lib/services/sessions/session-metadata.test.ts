@@ -27,6 +27,7 @@ function repository(
 ): RepositoryConfig {
   return {
     id,
+    name: id,
     root: `/tmp/${id}`,
     worktreeRoot: `/tmp/${id}-worktrees`,
     bootstrapCommand: ["true"],

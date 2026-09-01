@@ -54,6 +54,7 @@ function fixture(): RepositoryConfig {
 
   return {
     id: "fixture",
+    name: "Fixture",
     root,
     worktreeRoot: path.join(directory, "worktrees"),
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
