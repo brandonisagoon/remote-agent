@@ -15,23 +15,31 @@ set -euo pipefail
 FORCE=0
 [ "${1:-}" = "--force" ] && FORCE=1
 
-SERVICE_NAME="${REMOTE_AGENT_SERVICE_NAME:-remote-agent}"
-ROOT="${REMOTE_AGENT_INSTALL_ROOT:-${REMOTE_AGENT_HOME:-$HOME/Library/Application Support/$SERVICE_NAME}}"
+CONFIG_SOURCE="${REMOTE_AGENT_CONFIG:-remote-agent.config.json}"
+[ -f "$CONFIG_SOURCE" ] || { echo "REMOTE_AGENT_CONFIG must point to a config file" >&2; exit 1; }
+CONFIG_SOURCE="$(cd "$(dirname "$CONFIG_SOURCE")" && pwd)/$(basename "$CONFIG_SOURCE")"
+
+config_value() {
+  bun -e 'let value = await Bun.file(process.argv[1]).json(); for (const key of process.argv[2].split(".")) value = value?.[key]; if (value != null) process.stdout.write(String(value))' "$CONFIG_SOURCE" "$1"
+}
+
+SERVICE_NAME="$(config_value serviceName)"
+ROOT="$(config_value deployment.installRoot)"
+[ -n "$ROOT" ] || ROOT="$HOME/Library/Application Support/$SERVICE_NAME"
+case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 REPO="$ROOT/repo"
 APP="$ROOT/app"
 STATE="$ROOT/state"
 BACKUPS="$STATE/backups"
 LABEL="dev.$SERVICE_NAME.service"
 
-# Machine-local, non-secret config (ports, paths). Sourced by the launchd
-# wrapper too, so both see identical values.
-[ -f "$STATE/remote-agent.env" ] && { set -a; . "$STATE/remote-agent.env"; set +a; }
-export REMOTE_AGENT_CONFIG="${REMOTE_AGENT_CONFIG:-$STATE/remote-agent.config.json}"
-export REMOTE_AGENT_INSTALL_ROOT="$ROOT"
-export REMOTE_AGENT_SERVICE_NAME="$SERVICE_NAME"
+export REMOTE_AGENT_CONFIG="$CONFIG_SOURCE"
 
-BRANCH="${REMOTE_AGENT_DEPLOY_BRANCH:-main}"
-PORT="${REMOTE_AGENT_PORT:-9000}"
+BRANCH="$(config_value deployment.branch)"
+[ -n "$BRANCH" ] || BRANCH="main"
+PORT="$(config_value server.port)"
+[ -n "$PORT" ] || PORT="9000"
+DATABASE_PATH="$(bun -e 'import path from "node:path"; const file = process.argv[1]; const value = await Bun.file(file).json(); const url = value.server?.databaseUrl; if (url && !url.startsWith("file:")) process.exit(0); const db = url ? url.slice(5) : "remote-agent.sqlite"; process.stdout.write(path.resolve(path.dirname(file), db))' "$CONFIG_SOURCE")"
 HEALTH="http://127.0.0.1:$PORT/health"
 LOG="$STATE/deploy.log"
 DEPLOY_DB_SNAPSHOT=""
@@ -104,8 +112,8 @@ snapshot_database() {
     return
   fi
 
-  database_path="${REMOTE_AGENT_DATABASE_URL#file:}"
-  if [ "$database_path" = "$REMOTE_AGENT_DATABASE_URL" ] || [ ! -f "$database_path" ]; then
+  database_path="$DATABASE_PATH"
+  if [ ! -f "$database_path" ]; then
     log "SQLite database not found; no pre-migration snapshot created"
     DEPLOY_DB_SNAPSHOT="absent"
     return
@@ -123,7 +131,7 @@ restore_database_snapshot() {
     return
   fi
 
-  database_path="${REMOTE_AGENT_DATABASE_URL#file:}"
+  database_path="$DATABASE_PATH"
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
   cp -p "$DEPLOY_DB_SNAPSHOT" "$database_path"
   chmod 600 "$database_path"

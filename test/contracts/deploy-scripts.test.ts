@@ -12,15 +12,11 @@ describe("remote-agent deployment scripts", () => {
       path.join(REMOTE_AGENT, "scripts/deploy.sh"),
       "utf8",
     );
-    const environmentIndex = script.indexOf(
-      '[ -f "$STATE/remote-agent.env" ]',
-    );
-    const branchIndex = script.indexOf(
-      'BRANCH="${REMOTE_AGENT_DEPLOY_BRANCH:-main}"',
-    );
+    const configIndex = script.indexOf('CONFIG_SOURCE="${REMOTE_AGENT_CONFIG:-remote-agent.config.json}"');
+    const branchIndex = script.indexOf('BRANCH="$(config_value deployment.branch)"');
 
-    expect(environmentIndex).toBeGreaterThan(-1);
-    expect(branchIndex).toBeGreaterThan(environmentIndex);
+    expect(configIndex).toBeGreaterThan(-1);
+    expect(branchIndex).toBeGreaterThan(configIndex);
   });
 
   test("refreshes an existing deployment clone to the selected branch", () => {
@@ -55,7 +51,9 @@ describe("remote-agent deployment scripts", () => {
       expect(script).not.toContain("dev.cubicsurveys");
       expect(script).not.toContain("cubic-remote-agent");
     }
-    expect(install).toContain('REMOTE_AGENT_ENV_FILE must point to a secrets env file');
+    expect(install).not.toContain("REMOTE_AGENT_ENV_FILE");
+    expect(install).not.toContain("remote-agent.env");
+    expect(install).toContain('chmod 600 "$STATE/remote-agent.config.json"');
     expect(install).toContain('"$REPO/" "$APP/"');
   });
 

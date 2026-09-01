@@ -8,8 +8,15 @@
 #   --purge   also delete $ROOT, including the database
 set -euo pipefail
 
-SERVICE_NAME="${REMOTE_AGENT_SERVICE_NAME:-remote-agent}"
-ROOT="${REMOTE_AGENT_INSTALL_ROOT:-${REMOTE_AGENT_HOME:-$HOME/Library/Application Support/$SERVICE_NAME}}"
+CONFIG_SOURCE="${REMOTE_AGENT_CONFIG:-remote-agent.config.json}"
+[ -f "$CONFIG_SOURCE" ] || { echo "REMOTE_AGENT_CONFIG must point to a config file" >&2; exit 1; }
+config_value() {
+  bun -e 'let value = await Bun.file(process.argv[1]).json(); for (const key of process.argv[2].split(".")) value = value?.[key]; if (value != null) process.stdout.write(String(value))' "$CONFIG_SOURCE" "$1"
+}
+SERVICE_NAME="$(config_value serviceName)"
+ROOT="$(config_value deployment.installRoot)"
+[ -n "$ROOT" ] || ROOT="$HOME/Library/Application Support/$SERVICE_NAME"
+case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 LABEL="dev.$SERVICE_NAME.service"
 POLL_LABEL="dev.$SERVICE_NAME.deploy"
 

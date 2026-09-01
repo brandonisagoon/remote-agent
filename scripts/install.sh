@@ -11,18 +11,23 @@ set -euo pipefail
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_SOURCE="${REMOTE_AGENT_CONFIG:-$SOURCE_ROOT/remote-agent.config.json}"
-ENV_SOURCE="${REMOTE_AGENT_ENV_FILE:-}"
 [ -f "$CONFIG_SOURCE" ] || { echo "REMOTE_AGENT_CONFIG must point to a config file" >&2; exit 1; }
-[ -f "$ENV_SOURCE" ] || { echo "REMOTE_AGENT_ENV_FILE must point to a secrets env file" >&2; exit 1; }
 
-SERVICE_NAME="${REMOTE_AGENT_SERVICE_NAME:-$(bun -e 'const value = await Bun.file(process.argv[1]).json(); process.stdout.write(value.serviceName)' "$CONFIG_SOURCE")}"
-ROOT="${REMOTE_AGENT_INSTALL_ROOT:-$HOME/Library/Application Support/$SERVICE_NAME}"
+config_value() {
+  bun -e 'let value = await Bun.file(process.argv[1]).json(); for (const key of process.argv[2].split(".")) value = value?.[key]; if (value != null) process.stdout.write(String(value))' "$CONFIG_SOURCE" "$1"
+}
+
+SERVICE_NAME="$(config_value serviceName)"
+ROOT="$(config_value deployment.installRoot)"
+[ -n "$ROOT" ] || ROOT="$HOME/Library/Application Support/$SERVICE_NAME"
+case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 REPO="$ROOT/repo"
 APP="$ROOT/app"
 STATE="$ROOT/state"
 LABEL="dev.$SERVICE_NAME.service"
 POLL_LABEL="dev.$SERVICE_NAME.deploy"
-TUNNEL="${REMOTE_AGENT_TUNNEL_NAME:-$SERVICE_NAME}"
+TUNNEL="$(config_value deployment.tunnelName)"
+[ -n "$TUNNEL" ] || TUNNEL="$SERVICE_NAME"
 # Inherit the remote URL from the checkout this script is run from, so the
 # deploy clone authenticates the same way your working checkout already does.
 # Hardcoding an SSH URL breaks on a machine set up with HTTPS + the gh
@@ -32,10 +37,13 @@ default_remote() {
     remote get-url origin 2>/dev/null \
     || true
 }
-GIT_REMOTE="${REMOTE_AGENT_GIT_REMOTE:-$(default_remote)}"
-[ -n "$GIT_REMOTE" ] || { echo "REMOTE_AGENT_GIT_REMOTE is required when the source checkout has no origin" >&2; exit 1; }
-BRANCH="${REMOTE_AGENT_DEPLOY_BRANCH:-main}"
-PORT="${REMOTE_AGENT_PORT:-9000}"
+GIT_REMOTE="$(config_value deployment.gitRemote)"
+[ -n "$GIT_REMOTE" ] || GIT_REMOTE="$(default_remote)"
+[ -n "$GIT_REMOTE" ] || { echo "deployment.gitRemote is required when the source checkout has no origin" >&2; exit 1; }
+BRANCH="$(config_value deployment.branch)"
+[ -n "$BRANCH" ] || BRANCH="main"
+PORT="$(config_value server.port)"
+[ -n "$PORT" ] || PORT="9000"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
@@ -66,10 +74,9 @@ fi
 say "Configuration"
 # ---------------------------------------------------------------------------
 cp "$CONFIG_SOURCE" "$STATE/remote-agent.config.json"
-cp "$ENV_SOURCE" "$STATE/remote-agent.env"
-chmod 600 "$STATE/remote-agent.config.json" "$STATE/remote-agent.env"
+chmod 600 "$STATE/remote-agent.config.json"
 printf '%s\n' "$SERVICE_NAME" > "$STATE/service-name"
-echo "  installed config and environment"
+echo "  installed private configuration"
 
 # ---------------------------------------------------------------------------
 say "First build"
@@ -78,18 +85,11 @@ mkdir -p "$APP"
 rsync -a --delete --exclude 'node_modules' --exclude 'src/generated' \
   --exclude '.git' "$REPO/" "$APP/"
 
-# Source the machine config BEFORE migrating. Without REMOTE_AGENT_DATABASE_URL
-# in the environment, prisma.config.ts falls back to a dev.sqlite inside the app
-# directory — which is the rsync --delete target, so the next deploy would
-# silently destroy the database.
-set -a; . "$STATE/remote-agent.env"; set +a
 export REMOTE_AGENT_CONFIG="$STATE/remote-agent.config.json"
-export REMOTE_AGENT_INSTALL_ROOT="$ROOT"
-export REMOTE_AGENT_SERVICE_NAME="$SERVICE_NAME"
 
 ( cd "$APP" && bun install --silent && bunx prisma generate && bunx prisma migrate deploy )
-chmod 600 "$STATE/remote-agent.sqlite" 2>/dev/null || true
-echo "  built  (db: $REMOTE_AGENT_DATABASE_URL)"
+chmod 600 "$STATE"/*.sqlite 2>/dev/null || true
+echo "  built"
 
 # ---------------------------------------------------------------------------
 say "launchd user agents"
@@ -109,7 +109,7 @@ cat > "$HOME/Library/LaunchAgents/$LABEL.plist" <<EOF
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>set -a; . "$STATE/remote-agent.env"; set +a; export REMOTE_AGENT_CONFIG="$STATE/remote-agent.config.json" REMOTE_AGENT_INSTALL_ROOT="$ROOT" REMOTE_AGENT_SERVICE_NAME="$SERVICE_NAME"; cd "$APP"; exec /opt/homebrew/bin/bun "$APP/src/server.ts"</string>
+		<string>export REMOTE_AGENT_CONFIG="$STATE/remote-agent.config.json"; cd "$APP"; exec /opt/homebrew/bin/bun "$APP/src/server.ts"</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -140,8 +140,7 @@ cat > "$HOME/Library/LaunchAgents/$POLL_LABEL.plist" <<EOF
 	<dict>
 		<key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin</string>
 		<key>HOME</key><string>$HOME</string>
-		<key>REMOTE_AGENT_HOME</key><string>$ROOT</string>
-		<key>REMOTE_AGENT_SERVICE_NAME</key><string>$SERVICE_NAME</string>
+		<key>REMOTE_AGENT_CONFIG</key><string>$STATE/remote-agent.config.json</string>
 	</dict>
 	<key>StartInterval</key><integer>300</integer>
 	<key>StandardOutPath</key><string>$STATE/deploy.log</string>
@@ -167,7 +166,8 @@ for _ in $(seq 1 30); do
   fi
 done
 
-PUBLIC_URL="${REMOTE_AGENT_PUBLIC_URL%/}"
+PUBLIC_URL="$(config_value server.publicUrl)"
+PUBLIC_URL="${PUBLIC_URL%/}"
 curl -fsS -o /dev/null "$PUBLIC_URL/health" \
   && echo "  public health OK  ($PUBLIC_URL)" \
   || echo "  public health FAILED — check: cloudflared tunnel info $TUNNEL"
@@ -184,6 +184,6 @@ Installed.
 Remaining manual step: add the GitHub webhook
   URL          $PUBLIC_URL/webhooks/github
   Content type application/json
-  Secret       the GITHUB_WEBHOOK_SECRET value from $STATE/remote-agent.env
+  Secret       the github.webhookSecret value from $STATE/remote-agent.config.json
   Events       Just the push event
 EOF

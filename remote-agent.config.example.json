@@ -1,5 +1,45 @@
 {
   "serviceName": "remote-agent",
+  "server": {
+    "publicUrl": "https://agents.example.com",
+    "apiKey": "replace-with-a-long-random-api-key",
+    "host": "127.0.0.1",
+    "port": 9000,
+    "databaseUrl": "file:./remote-agent.sqlite"
+  },
+  "bb": {
+    "url": "http://127.0.0.1:38886",
+    "projectId": "replace-with-bb-project-id",
+    "reconcileIntervalMs": 60000
+  },
+  "linear": {
+    "webhookSecret": "replace-with-linear-webhook-secret",
+    "apiKey": "replace-with-linear-api-key",
+    "agentUserId": "replace-with-linear-agent-user-id",
+    "agentHandle": "agent",
+    "agentTeamKey": "AGENT",
+    "webhookMaxAgeMs": 60000
+  },
+  "github": {
+    "webhookSecret": "replace-with-github-webhook-secret"
+  },
+  "runtime": {
+    "machine": "studio-mac",
+    "codexExecutable": "codex",
+    "routerTimeoutMs": 30000
+  },
+  "deployment": {
+    "branch": "main"
+  },
+  "triggers": {
+    "reflectOnState": "Pull Request",
+    "orchestrateOnState": "Planning",
+    "endOnState": "End",
+    "describeOnReaction": "pencil2"
+  },
+  "acp": {
+    "provider": "codex"
+  },
   "hosts": [
     {
       "id": "studio-mac",

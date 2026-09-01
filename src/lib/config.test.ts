@@ -5,26 +5,24 @@ import path from "node:path";
 
 import { readConfig } from "./config.ts";
 
-const MANAGED_ENV = [
-  "REMOTE_AGENT_CONFIG",
-  "REMOTE_AGENT_PUBLIC_URL",
-  "REMOTE_AGENT_INSTALL_ROOT",
-  "REMOTE_AGENT_MACHINE",
-  "REMOTE_AGENT_ZED_HOST",
-  "LINEAR_WEBHOOK_SECRET",
-  "REMOTE_AGENT_API_KEY",
-  "GITHUB_WEBHOOK_SECRET",
-  "LINEAR_API_KEY",
-  "LINEAR_AGENT_USER_ID",
-  "REMOTE_AGENT_BB_PROJECT_ID",
-] as const;
-
 let directory: string;
-let previous: Partial<Record<(typeof MANAGED_ENV)[number], string>>;
+let previousConfig: string | undefined;
 
 function serviceFile(zedConnection: "local" | "ssh" = "local") {
   return {
     serviceName: "example-agent",
+    server: {
+      publicUrl: "https://agents.example.com",
+      apiKey: "api-secret",
+      databaseUrl: "file:./state.sqlite",
+    },
+    bb: { projectId: "bb-project" },
+    linear: {
+      webhookSecret: "webhook-secret",
+      apiKey: "linear-secret",
+      agentUserId: "agent-user",
+    },
+    github: { webhookSecret: "github-secret" },
     hosts: [
       {
         id: "build-host",
@@ -36,7 +34,7 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
       },
     ],
     repository: {
-      root: path.join(directory, "repository"),
+      root: "repository",
       worktreeRoot: "../worktrees",
       bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
       workflows: {
@@ -55,7 +53,7 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
   };
 }
 
-function writeConfig(value = serviceFile()) {
+function writeConfig(value: unknown = serviceFile()) {
   const file = path.join(directory, "remote-agent.config.json");
   writeFileSync(file, JSON.stringify(value));
   process.env.REMOTE_AGENT_CONFIG = file;
@@ -64,30 +62,18 @@ function writeConfig(value = serviceFile()) {
 
 beforeEach(() => {
   directory = mkdtempSync(path.join(tmpdir(), "remote-agent-config-"));
-  previous = {};
-  for (const name of MANAGED_ENV) {
-    if (process.env[name] !== undefined) previous[name] = process.env[name];
-    delete process.env[name];
-  }
-  Object.assign(process.env, {
-    REMOTE_AGENT_PUBLIC_URL: "https://agents.example.com",
-    LINEAR_WEBHOOK_SECRET: "webhook-secret",
-    REMOTE_AGENT_API_KEY: "api-secret",
-    GITHUB_WEBHOOK_SECRET: "github-secret",
-    LINEAR_API_KEY: "linear-secret",
-    LINEAR_AGENT_USER_ID: "agent-user",
-    REMOTE_AGENT_BB_PROJECT_ID: "bb-project",
-  });
+  previousConfig = process.env.REMOTE_AGENT_CONFIG;
+  delete process.env.REMOTE_AGENT_CONFIG;
 });
 
 afterEach(() => {
-  for (const name of MANAGED_ENV) delete process.env[name];
-  Object.assign(process.env, previous);
+  if (previousConfig === undefined) delete process.env.REMOTE_AGENT_CONFIG;
+  else process.env.REMOTE_AGENT_CONFIG = previousConfig;
   rmSync(directory, { recursive: true, force: true });
 });
 
 describe("readConfig", () => {
-  test("loads arbitrary hosts and derives neutral service paths", () => {
+  test("loads all settings from one JSON file and derives neutral paths", () => {
     writeConfig();
     const config = readConfig();
 
@@ -97,28 +83,37 @@ describe("readConfig", () => {
       label: "Build Host",
       bbHostId: "bb_host_1",
     });
+    expect(config.publicUrl).toBe("https://agents.example.com");
+    expect(config.linearApiKey).toBe("linear-secret");
+    expect(config.bbProjectId).toBe("bb-project");
     expect(config.deployJobLabel).toBe("dev.example-agent.deploy");
-    expect(config.repository.worktreeRoot).toBe(
-      path.join(directory, "worktrees"),
-    );
+    expect(config.repository.root).toBe(path.join(directory, "repository"));
+    expect(config.repository.worktreeRoot).toBe(path.join(directory, "worktrees"));
+    expect(config.databaseUrl).toBe(`file:${path.join(directory, "state.sqlite")}`);
   });
 
-  test("requires an explicit public URL", () => {
-    writeConfig();
-    delete process.env.REMOTE_AGENT_PUBLIC_URL;
-    expect(() => readConfig()).toThrow("REMOTE_AGENT_PUBLIC_URL is required");
+  test("requires settings formerly supplied by the environment", () => {
+    const value = serviceFile();
+    // @ts-expect-error exercising runtime validation
+    delete value.server.publicUrl;
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("publicUrl");
   });
 
   test("requires a Zed host only for SSH execution hosts", () => {
-    writeConfig(serviceFile("ssh"));
-    expect(() => readConfig()).toThrow("REMOTE_AGENT_ZED_HOST is required");
-    process.env.REMOTE_AGENT_ZED_HOST = "build-host.example";
+    const value = serviceFile("ssh");
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("runtime.zedRemoteHost is required");
+
+    writeConfig({
+      ...value,
+      runtime: { zedRemoteHost: "build-host.example" },
+    });
     expect(readConfig().zedRemoteHost).toBe("build-host.example");
   });
 
   test("rejects a selected machine absent from the host registry", () => {
-    writeConfig();
-    process.env.REMOTE_AGENT_MACHINE = "unknown-host";
+    writeConfig({ ...serviceFile(), runtime: { machine: "unknown-host" } });
     expect(() => readConfig()).toThrow("unknown machine: unknown-host");
   });
 });

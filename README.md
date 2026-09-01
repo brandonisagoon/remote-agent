@@ -21,12 +21,10 @@ bun install
 cp remote-agent.config.example.json remote-agent.config.json
 ```
 
-Edit `remote-agent.config.json`, create a local environment file, and export it before starting:
+Edit `remote-agent.config.json`, restrict it because it contains secrets, and start:
 
 ```bash
-set -a
-. ./remote-agent.env
-set +a
+chmod 600 remote-agent.config.json
 bun run db:migrate
 bun run start
 ```
@@ -44,36 +42,16 @@ bun test
 
 `REMOTE_AGENT_CONFIG` selects the JSON service configuration; it defaults to `remote-agent.config.json` in the current directory. See [the example configuration](remote-agent.config.example.json) and [the adoption guide](docs/adoption.md).
 
-The file declares:
+The file is the single source of service configuration. It declares:
 
 - `serviceName`, used for install paths and launchd labels;
+- server, bb, Linear, and GitHub credentials and connection settings;
 - one or more arbitrary execution hosts, each mapped to a bb host ID;
 - the host repository root and worktree root;
 - the bootstrap command used after worktree creation;
 - prompt, harness, and optional model settings for describe, orchestrate, and reflect workflows.
 
-Secrets and machine-local settings stay in the environment:
-
-| Variable | Required | Purpose |
-| --- | --- | --- |
-| `REMOTE_AGENT_PUBLIC_URL` | yes | Public HTTPS origin for signed links and webhooks |
-| `REMOTE_AGENT_API_KEY` | yes | Bearer token for `/api/*` |
-| `REMOTE_AGENT_BB_PROJECT_ID` | yes | bb project containing the managed repository |
-| `LINEAR_WEBHOOK_SECRET` | yes | Linear webhook signature secret |
-| `LINEAR_API_KEY` | yes | Linear GraphQL access |
-| `LINEAR_AGENT_USER_ID` | yes | Agent identity and assignee |
-| `GITHUB_WEBHOOK_SECRET` | yes | Deployment webhook signature secret |
-| `LINEAR_AGENT_HANDLE` | no | Mention handle fallback |
-| `LINEAR_AGENT_TEAM_KEY` | no | Session-mirror team; defaults to `AGENT` |
-| `REMOTE_AGENT_MACHINE` | no | Configured host ID; defaults to the host marked `default` |
-| `REMOTE_AGENT_ZED_HOST` | conditional | SSH host used by Zed links when any configured host is remote |
-| `REMOTE_AGENT_BB_URL` | no | bb server URL; defaults to `http://127.0.0.1:38886` |
-| `REMOTE_AGENT_DATABASE_URL` | no | SQLite URL; defaults under the service install root |
-| `REMOTE_AGENT_HOST` / `REMOTE_AGENT_PORT` | no | Listener; defaults to `127.0.0.1:9000` |
-| `REMOTE_AGENT_REFLECT_ON_STATE` | no | Reflection trigger; defaults to `Pull Request` |
-| `REMOTE_AGENT_ORCHESTRATE_ON_STATE` | no | Orchestration trigger; defaults to `Planning` |
-| `REMOTE_AGENT_END_ON_STATE` | no | Session-end trigger; defaults to `End` |
-| `REMOTE_AGENT_DESCRIBE_ON_REACTION` | no | Describe reaction; defaults to `pencil2` |
+`REMOTE_AGENT_CONFIG` is the only environment variable read for service setup; it merely selects a non-default JSON path. The real file is gitignored and should be mode `0600`; the committed example contains redacted placeholders.
 
 bb currently has no application bearer token. Keep it on loopback or a trusted private network; that network boundary is its access-control boundary.
 
@@ -99,9 +77,7 @@ Example Zed configuration:
       "command": "/absolute/path/to/bun",
       "args": ["/absolute/path/to/remote-agent/src/acp/main.ts"],
       "env": {
-        "REMOTE_AGENT_BB_URL": "http://127.0.0.1:38886",
-        "REMOTE_AGENT_BB_PROJECT_ID": "replace-with-project-id",
-        "BB_CWD_MAP": "{\"replace-with-project-id\":\"/absolute/path/to/host-repository\"}"
+        "REMOTE_AGENT_CONFIG": "/absolute/path/to/remote-agent.config.json"
       }
     }
   }
@@ -112,15 +88,14 @@ stdout is reserved for ACP JSON-RPC; diagnostics go to stderr.
 
 ## Install on macOS
 
-Prepare a secrets file and configuration outside the repository, then run:
+Prepare the private JSON configuration, then run:
 
 ```bash
 REMOTE_AGENT_CONFIG=/absolute/path/to/remote-agent.config.json \
-REMOTE_AGENT_ENV_FILE=/absolute/path/to/remote-agent.env \
 bash scripts/install.sh
 ```
 
-The installer clones this repository, copies configuration into `~/Library/Application Support/<serviceName>`, applies SQLite migrations, and installs service and deployment launch agents derived from `serviceName`. Set `REMOTE_AGENT_GIT_REMOTE` to install from a fork or another remote.
+The installer clones this repository, copies the configuration with mode `0600` into `~/Library/Application Support/<serviceName>`, applies SQLite migrations, and installs service and deployment launch agents derived from `serviceName`. Set `deployment.gitRemote` to install from a fork or another remote.
 
 ## Source layout
 

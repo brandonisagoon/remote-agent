@@ -18,6 +18,7 @@ import type { Harness } from "../types/runtime/index.ts";
 /** Linear caps webhook payloads well below this size. */
 export const MAX_REQUEST_BYTES = 1_000_000;
 
+const PositiveIntegerSchema = z.number().int().positive();
 const CommandSchema = z.array(z.string().min(1)).min(1);
 const RepositoryRelativePathSchema = z
   .string()
@@ -43,9 +44,71 @@ const ServiceFileSchema = z.object({
     .string()
     .min(1)
     .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  server: z.object({
+    publicUrl: z.string().min(1),
+    apiKey: z.string().min(1),
+    host: z.string().min(1).default("127.0.0.1"),
+    port: PositiveIntegerSchema.default(9000),
+    databaseUrl: z.string().min(1).optional(),
+  }),
+  bb: z.object({
+    projectId: z.string().min(1),
+    url: z.string().min(1).default("http://127.0.0.1:38886"),
+    reconcileIntervalMs: PositiveIntegerSchema.default(60_000),
+  }),
+  linear: z.object({
+    webhookSecret: z.string().min(1),
+    apiKey: z.string().min(1),
+    agentUserId: z.string().min(1),
+    agentHandle: z.string().min(1).optional(),
+    agentTeamKey: z.string().min(1).default("AGENT"),
+    webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
+  }),
+  github: z.object({ webhookSecret: z.string().min(1) }),
+  runtime: z
+    .object({
+      machine: MachineSchema.optional(),
+      zedRemoteHost: z.string().min(1).optional(),
+      codexExecutable: z.string().min(1).default("codex"),
+      routerModel: z.string().min(1).optional(),
+      routerTimeoutMs: PositiveIntegerSchema.default(30_000),
+    })
+    .default({ codexExecutable: "codex", routerTimeoutMs: 30_000 }),
+  deployment: z
+    .object({
+      installRoot: z.string().min(1).optional(),
+      gitRemote: z.string().min(1).optional(),
+      branch: z.string().min(1).default("main"),
+      script: z.string().min(1).optional(),
+      jobLabel: z.string().min(1).optional(),
+      tunnelName: z.string().min(1).optional(),
+    })
+    .default({ branch: "main" }),
+  triggers: z
+    .object({
+      reflectOnState: z.string().min(1).default("Pull Request"),
+      orchestrateOnState: z.string().min(1).default("Planning"),
+      endOnState: z.string().min(1).default("End"),
+      describeOnReaction: z.string().min(1).default("pencil2"),
+    })
+    .default({
+      reflectOnState: "Pull Request",
+      orchestrateOnState: "Planning",
+      endOnState: "End",
+      describeOnReaction: "pencil2",
+    }),
+  acp: z
+    .object({
+      hostId: z.string().min(1).optional(),
+      provider: z.enum(["codex", "claude-code"]).default("codex"),
+      model: z.string().min(1).optional(),
+    })
+    .default({ provider: "codex" }),
   hosts: z.array(MachineRecordSchema).min(1),
   repository: RepositorySchema,
 });
+
+export type ServiceFile = z.infer<typeof ServiceFileSchema>;
 
 export interface WorkflowConfig {
   prompt: string;
@@ -97,26 +160,11 @@ export interface ServerConfig {
   describeReactionEmoji: string;
   repository: RepositoryConfig;
   endOnState: string;
-}
-
-function required(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
-}
-
-function optional(name: string): string | null {
-  return process.env[name]?.trim() || null;
-}
-
-function integer(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) return fallback;
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-  return value;
+  acp: {
+    hostId?: string;
+    providerId: "codex" | "claude-code";
+    model?: string;
+  };
 }
 
 function expandHome(value: string): string {
@@ -131,7 +179,11 @@ function absolute(value: string, base: string = process.cwd()): string {
   return path.resolve(base, expandHome(value));
 }
 
-function readServiceFile(file: string) {
+export function configFilePath(): string {
+  return absolute(process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json");
+}
+
+export function readServiceFile(file: string = configFilePath()): ServiceFile {
   try {
     return ServiceFileSchema.parse(JSON.parse(readFileSync(file, "utf8")));
   } catch (error) {
@@ -141,74 +193,67 @@ function readServiceFile(file: string) {
   }
 }
 
+function resolveDatabaseUrl(value: string | undefined, stateRoot: string): string {
+  if (!value) return `file:${path.join(stateRoot, "remote-agent.sqlite")}`;
+  if (!value.startsWith("file:")) return value;
+  const file = value.slice("file:".length);
+  return `file:${absolute(file, stateRoot)}`;
+}
+
 export function readConfig(): ServerConfig {
-  const configFile = absolute(
-    optional("REMOTE_AGENT_CONFIG") ?? "remote-agent.config.json",
-  );
+  const configFile = configFilePath();
   const file = readServiceFile(configFile);
   const hosts = configureMachines(file.hosts);
-  const machineValue = optional("REMOTE_AGENT_MACHINE") ?? getDefaultMachineId();
-  const parsedMachine = MachineSchema.safeParse(machineValue);
-  if (!parsedMachine.success) {
-    throw new Error(`REMOTE_AGENT_MACHINE ${parsedMachine.error.message}`);
-  }
-  getMachine({ id: parsedMachine.data });
+  const machine = file.runtime.machine ?? getDefaultMachineId();
+  getMachine({ id: machine });
 
-  const zedRemoteHost = optional("REMOTE_AGENT_ZED_HOST");
+  const zedRemoteHost = file.runtime.zedRemoteHost ?? null;
   if (hosts.some((host) => host.zedConnection === "ssh") && !zedRemoteHost) {
     throw new Error(
-      "REMOTE_AGENT_ZED_HOST is required when an SSH host is configured",
+      "runtime.zedRemoteHost is required when an SSH host is configured",
     );
   }
 
   const installRoot = absolute(
-    optional("REMOTE_AGENT_INSTALL_ROOT") ??
+    file.deployment.installRoot ??
       path.join("~/Library/Application Support", file.serviceName),
   );
-  const repositoryRoot = absolute(file.repository.root);
+  const repositoryRoot = absolute(file.repository.root, path.dirname(configFile));
   const worktreeRoot = absolute(file.repository.worktreeRoot, repositoryRoot);
 
   return {
     serviceName: file.serviceName,
     configFile,
     installRoot,
-    hostname: optional("REMOTE_AGENT_HOST") ?? "127.0.0.1",
-    port: integer("REMOTE_AGENT_PORT", 9000),
-    publicUrl: required("REMOTE_AGENT_PUBLIC_URL"),
-    databaseUrl:
-      optional("REMOTE_AGENT_DATABASE_URL") ??
-      `file:${path.join(installRoot, "state", "remote-agent.sqlite")}`,
-    webhookSecret: required("LINEAR_WEBHOOK_SECRET"),
-    apiKey: required("REMOTE_AGENT_API_KEY"),
-    githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
-    linearApiKey: required("LINEAR_API_KEY"),
-    agentUserId: required("LINEAR_AGENT_USER_ID"),
-    agentHandle: optional("LINEAR_AGENT_HANDLE"),
-    agentTeamKey: optional("LINEAR_AGENT_TEAM_KEY") ?? "AGENT",
-    bbBaseUrl: optional("REMOTE_AGENT_BB_URL") ?? "http://127.0.0.1:38886",
-    bbProjectId: required("REMOTE_AGENT_BB_PROJECT_ID"),
+    hostname: file.server.host,
+    port: file.server.port,
+    publicUrl: file.server.publicUrl,
+    databaseUrl: resolveDatabaseUrl(file.server.databaseUrl, path.dirname(configFile)),
+    webhookSecret: file.linear.webhookSecret,
+    apiKey: file.server.apiKey,
+    githubWebhookSecret: file.github.webhookSecret,
+    linearApiKey: file.linear.apiKey,
+    agentUserId: file.linear.agentUserId,
+    agentHandle: file.linear.agentHandle ?? null,
+    agentTeamKey: file.linear.agentTeamKey,
+    bbBaseUrl: file.bb.url,
+    bbProjectId: file.bb.projectId,
     hosts,
-    machine: parsedMachine.data,
+    machine,
     zedRemoteHost,
-    codexExecutable: optional("REMOTE_AGENT_CODEX_EXECUTABLE") ?? "codex",
-    routerModel: optional("REMOTE_AGENT_ROUTER_MODEL"),
-    routerTimeoutMs: integer("REMOTE_AGENT_ROUTER_TIMEOUT_MS", 30_000),
-    bbReconcileIntervalMs: integer(
-      "REMOTE_AGENT_BB_RECONCILE_INTERVAL_MS",
-      60_000,
-    ),
-    webhookMaxAgeMs: integer("LINEAR_WEBHOOK_MAX_AGE_MS", 60_000),
+    codexExecutable: file.runtime.codexExecutable,
+    routerModel: file.runtime.routerModel ?? null,
+    routerTimeoutMs: file.runtime.routerTimeoutMs,
+    bbReconcileIntervalMs: file.bb.reconcileIntervalMs,
+    webhookMaxAgeMs: file.linear.webhookMaxAgeMs,
     deployScript:
-      optional("REMOTE_AGENT_DEPLOY_SCRIPT") ??
-      path.join(installRoot, "app", "scripts", "deploy.sh"),
-    deployBranch: optional("REMOTE_AGENT_DEPLOY_BRANCH") ?? "main",
+      file.deployment.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
+    deployBranch: file.deployment.branch,
     deployJobLabel:
-      optional("REMOTE_AGENT_DEPLOY_JOB") ?? `dev.${file.serviceName}.deploy`,
-    reflectOnState: optional("REMOTE_AGENT_REFLECT_ON_STATE") ?? "Pull Request",
-    orchestrateOnState:
-      optional("REMOTE_AGENT_ORCHESTRATE_ON_STATE") ?? "Planning",
-    describeReactionEmoji:
-      optional("REMOTE_AGENT_DESCRIBE_ON_REACTION") ?? "pencil2",
+      file.deployment.jobLabel ?? `dev.${file.serviceName}.deploy`,
+    reflectOnState: file.triggers.reflectOnState,
+    orchestrateOnState: file.triggers.orchestrateOnState,
+    describeReactionEmoji: file.triggers.describeOnReaction,
     repository: {
       root: repositoryRoot,
       worktreeRoot,
@@ -225,6 +270,11 @@ export function readConfig(): ServerConfig {
         reflect: { ...file.repository.workflows.reflect },
       },
     },
-    endOnState: optional("REMOTE_AGENT_END_ON_STATE") ?? "End",
+    endOnState: file.triggers.endOnState,
+    acp: {
+      ...(file.acp.hostId ? { hostId: file.acp.hostId } : {}),
+      providerId: file.acp.provider,
+      ...(file.acp.model ? { model: file.acp.model } : {}),
+    },
   };
 }

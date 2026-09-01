@@ -82,5 +82,6 @@ export function testConfig(
     },
     endOnState: "End",
     ...overrides,
+    acp: overrides.acp ?? { providerId: "codex" },
   };
 }

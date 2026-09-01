@@ -19,7 +19,7 @@ Every host record in `remote-agent.config.json` has:
 - `acceptsTrackerInput`: whether tracker routing may target the host;
 - `default`: exactly one host must be the default.
 
-IDs, labels, and bb host IDs must be unique. Set `REMOTE_AGENT_MACHINE` when one configuration is shared across several service hosts. If any host uses `ssh`, provide `REMOTE_AGENT_ZED_HOST`.
+IDs, labels, and bb host IDs must be unique. Set `runtime.machine` when one configuration is shared across several service hosts. If any host uses `ssh`, provide `runtime.zedRemoteHost`.
 
 ## Tracker port
 
@@ -30,7 +30,7 @@ Workers depend on the structural `TrackerPort` in `src/lib/integrations/tracker/
 - reactions and mention matching/context lookup;
 - the agent catalog and session-mirror registry;
 - source-issue reads and related mirror issues;
-- environment-driven state/reaction triggers.
+- configured state/reaction triggers.
 
 `src/lib/integrations/tracker/index.ts` is the worker-facing facade. The only implementation is Linear, contained in `src/lib/integrations/linear/`, including webhook schemas/handlers and the GraphQL-backed session store. A second tracker implementation is not part of the initial extraction.
 
@@ -107,9 +107,6 @@ Those paths are examples owned by that adopter; none are defaults or referenced 
 
 ## Installer inputs
 
-The macOS installer requires:
+The macOS installer takes one input: `REMOTE_AGENT_CONFIG`, the private service JSON path. The file contains credentials and must be kept out of Git; copy the committed example and set mode `0600`.
 
-- `REMOTE_AGENT_CONFIG`: service JSON path;
-- `REMOTE_AGENT_ENV_FILE`: secrets environment file path.
-
-It derives launchd labels and install locations from `serviceName`, inherits the current checkout's Git remote by default, and accepts `REMOTE_AGENT_GIT_REMOTE` and `REMOTE_AGENT_DEPLOY_BRANCH` overrides. It never reads a host repository dotenv or encryption-key file.
+It derives launchd labels and install locations from `serviceName`, inherits the current checkout's Git remote by default, and accepts `deployment.gitRemote`, `deployment.branch`, and `deployment.installRoot` in the same file. It never reads a host-repository dotenv or encryption-key file.
