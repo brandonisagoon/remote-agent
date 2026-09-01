@@ -17,31 +17,27 @@ afterEach(() => {
 });
 
 describe("orchestration worktree link comment", () => {
-  test("builds SSH and bb links without hidden metadata", () => {
+  test("builds an SSH worktree link with the runtime session", () => {
     const body = buildWorktreeLinkComment({
-      config: testConfig(),
       machine: getMachine({ id: "macbook-air" }),
       zedRemoteHost: "test-remote",
       worktreePath: "/srv/worktrees/foo-cube-2829",
-      bbThreadId: "thr_2829",
+      runtimeSessionId: "runtime_2829",
     });
     expect(body).toContain(
       "[Open Worktree in Zed](zed://ssh/test-remote/srv/worktrees/foo-cube-2829)",
     );
-    expect(body).toContain(
-      "[Open Thread in bb](https://agents.example.com/session-links/bb/thr_2829?signature=",
-    );
+    expect(body).toContain("Remote Agent session `runtime_2829`");
     expect(body).not.toContain("<!--");
   });
 
   test("builds the exact local-machine comment body", () => {
     expect(
       buildWorktreeLinkComment({
-        config: testConfig(),
         machine: getMachine({ id: "macbook-pro" }),
         zedRemoteHost: "unused",
         worktreePath: "/srv/worktrees/foo cube",
-        bbThreadId: "thr_local",
+        runtimeSessionId: "runtime_local",
       }),
     ).toContain(
       "[Open Worktree in Zed](zed://file/srv/worktrees/foo%20cube)",
@@ -145,7 +141,7 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         issueId: "issue-id",
         branchName: "feature-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
       },
       {
         waitForReady: async () => true,
@@ -175,7 +171,7 @@ describe("orchestration worktree link comment", () => {
         }),
         issueId: "issue-id",
         branchName: "feature/deep-link-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
       },
       {
         waitForReady: async ({ worktreePath, branchName }) => {
@@ -203,7 +199,7 @@ describe("orchestration worktree link comment", () => {
     expect(created).toHaveLength(1);
     expect(created[0]?.issueId).toBe("issue-id");
     expect(created[0]?.body).toContain(WORKTREE_LINK_SEARCH_TEXT);
-    expect(created[0]?.body).toContain("Open Thread in bb");
+    expect(created[0]?.body).toContain("Remote Agent session `runtime_2829`");
     expect(created[0]?.body).not.toContain("<!--");
   });
 
@@ -214,7 +210,7 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         issueId: "issue-id",
         branchName: "feature-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
         timeoutMs: 0,
         pollIntervalMs: 0,
       },
@@ -242,7 +238,7 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         issueId: "issue-id",
         branchName: "feature-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
       },
       {
         waitForReady: async () => true,
@@ -261,7 +257,7 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         issueId: "issue-id",
         branchName: "feature-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
       },
       {
         waitForReady: async () => true,
@@ -283,7 +279,7 @@ describe("orchestration worktree link comment", () => {
         config: testConfig(),
         issueId: "issue-id",
         branchName: "feature-cube-2829",
-        bbThreadId: "thr_2829",
+        runtimeSessionId: "runtime_2829",
       },
       {
         waitForReady: async () => false,

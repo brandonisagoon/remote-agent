@@ -51,11 +51,27 @@ const ServiceFileSchema = z.object({
     port: PositiveIntegerSchema.default(9000),
     databaseUrl: z.string().min(1).optional(),
   }),
-  bb: z.object({
-    projectId: z.string().min(1),
-    url: z.string().min(1).default("http://127.0.0.1:38886"),
-    reconcileIntervalMs: PositiveIntegerSchema.default(60_000),
-  }),
+  acpx: z
+    .object({
+      stateDir: z.string().min(1).optional(),
+      reconcileIntervalMs: PositiveIntegerSchema.default(60_000),
+      permissionMode: z
+        .enum(["approve-all", "approve-reads", "deny-all"])
+        .default("approve-all"),
+      nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
+      agents: z
+        .object({
+          codex: CommandSchema.optional(),
+          claude: CommandSchema.optional(),
+        })
+        .default({}),
+    })
+    .default({
+      permissionMode: "approve-all",
+      nonInteractivePermissions: "deny",
+      reconcileIntervalMs: 60_000,
+      agents: {},
+    }),
   linear: z.object({
     webhookSecret: z.string().min(1),
     apiKey: z.string().min(1),
@@ -142,15 +158,17 @@ export interface ServerConfig {
   agentUserId: string;
   agentHandle: string | null;
   agentTeamKey: string;
-  bbBaseUrl: string;
-  bbProjectId: string;
   hosts: readonly MachineRecord[];
   machine: Machine;
   zedRemoteHost: string | null;
   codexExecutable: string;
   routerModel: string | null;
   routerTimeoutMs: number;
-  bbReconcileIntervalMs: number;
+  acpxReconcileIntervalMs: number;
+  acpxStateDir: string;
+  acpxPermissionMode: "approve-all" | "approve-reads" | "deny-all";
+  acpxNonInteractivePermissions: "deny" | "fail";
+  acpxAgentCommands: Partial<Record<"codex" | "claude", string[]>>;
   webhookMaxAgeMs: number;
   deployScript: string;
   deployBranch: string;
@@ -236,15 +254,24 @@ export function readConfig(): ServerConfig {
     agentUserId: file.linear.agentUserId,
     agentHandle: file.linear.agentHandle ?? null,
     agentTeamKey: file.linear.agentTeamKey,
-    bbBaseUrl: file.bb.url,
-    bbProjectId: file.bb.projectId,
     hosts,
     machine,
     zedRemoteHost,
     codexExecutable: file.runtime.codexExecutable,
     routerModel: file.runtime.routerModel ?? null,
     routerTimeoutMs: file.runtime.routerTimeoutMs,
-    bbReconcileIntervalMs: file.bb.reconcileIntervalMs,
+    acpxReconcileIntervalMs: file.acpx.reconcileIntervalMs,
+    acpxStateDir: absolute(file.acpx.stateDir ?? path.join(installRoot, "acpx")),
+    acpxPermissionMode: file.acpx.permissionMode,
+    acpxNonInteractivePermissions: file.acpx.nonInteractivePermissions,
+    acpxAgentCommands: {
+      ...(file.acpx.agents.codex
+        ? { codex: [...file.acpx.agents.codex] }
+        : {}),
+      ...(file.acpx.agents.claude
+        ? { claude: [...file.acpx.agents.claude] }
+        : {}),
+    },
     webhookMaxAgeMs: file.linear.webhookMaxAgeMs,
     deployScript:
       file.deployment.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),

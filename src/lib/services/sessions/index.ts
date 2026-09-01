@@ -2,7 +2,7 @@ export {
   endOneShotSession,
   endSessionGroup,
   endWorktreeSessions,
-  terminateBbThreads,
+  terminateRuntimeSessions,
   ONE_SHOT_KILL_DELAY_MS,
   upsertAgentIssueFromEvent,
 } from "./lifecycle/index.ts";
@@ -26,13 +26,7 @@ export {
   RouterTimeoutError,
   selectSessionWithCodex,
 } from "./selection/index.ts";
-export {
-  advanceBbEventCursor,
-  agentIssueStateForBbEvent,
-  getBbEventCursor,
-  projectBbEvent,
-  startBbEventIngestion,
-} from "./bb-events/index.ts";
+export { startRuntimeEventProjection } from "./runtime-events/index.ts";
 export {
   HarnessSchema,
   MachineSchema,

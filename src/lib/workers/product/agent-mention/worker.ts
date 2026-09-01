@@ -9,7 +9,6 @@ import {
   reactToComment,
 } from "../../../integrations/tracker/index.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
-import { createBbClient } from "../../../transports/bb/index.ts";
 import { buildAgentMentionMessage, excerpt } from "./message.ts";
 import { selectOutcomeReactions } from "./reactions.ts";
 
@@ -92,7 +91,7 @@ export function createAgentMentionWorker({
 
       const result = await forward({
         config: context.config,
-        bbClient: context.bbClient ?? createBbClient(context.config.bbBaseUrl),
+        agentRuntime: context.agentRuntime!,
         sourceIssueIdentifier,
         workerContext: {
           key: "product.agent-mention",

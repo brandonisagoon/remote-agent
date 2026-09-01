@@ -7,7 +7,10 @@ import type {
   RouteDecision,
 } from "../sessions/index.ts";
 import { testConfig } from "../../../test-support/config.ts";
-import { createFakeBbClient, type FakeBbClient } from "../../../test-support/bb.ts";
+import {
+  createFakeAgentRuntime,
+  type FakeAgentRuntime,
+} from "../../../test-support/agent-runtime.ts";
 import { buildAgentMentionMessage } from "../../workers/product/agent-mention/index.ts";
 import { buildReplyDirective, forwardMessage } from "./index.ts";
 
@@ -52,42 +55,37 @@ function candidate(overrides: Partial<RouteCandidate> = {}): RouteCandidate {
       harness: "codex",
       machine: "macbook-air",
       role: "primary",
-      bbThreadId: "thr_bb_1",
+      runtimeSessionId: "thr_bb_1",
     },
     ...overrides,
   };
 }
 
-function runnerWithPane(present = true): FakeBbClient {
-  const client = createFakeBbClient();
+function runnerWithPane(present = true): FakeAgentRuntime {
+  const client = createFakeAgentRuntime();
   if (present) {
-    client.putThread({
+    client.putSession({
       id: "thr_bb_1",
-      projectId: CONFIG.bbProjectId,
-      environmentId: "env_1",
-      hostId: "host_air",
-      providerId: "codex",
-      title: "Primary",
+      name: "Primary",
+      cwd: WT,
       status: "idle",
-      parentThreadId: null,
-      archivedAt: null,
     });
   }
   return client;
 }
 
-function sent(client: FakeBbClient, index = 0): string {
-  return client.sentMessages[index]?.message ?? "";
+function sent(client: FakeAgentRuntime, index = 0): string {
+  return client.sentMessages[index]?.text ?? "";
 }
 
 function deliver(
   candidates: RouteCandidate[],
-  runner: FakeBbClient,
+  runner: FakeAgentRuntime,
 ) {
   let reads = 0;
   return forwardMessage({
     config: CONFIG,
-    bbClient: runner,
+    agentRuntime: runner,
     sourceIssueIdentifier: "CUBE-1",
     message: "@agent do a thing",
     workerContext: {
@@ -113,7 +111,7 @@ describe("model-selected delivery", () => {
     let routedComment = "";
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runnerWithPane(),
+      agentRuntime: runnerWithPane(),
       sourceIssueIdentifier: "CUBE-1",
       workerContext: {
         key: "product.agent-mention",
@@ -153,13 +151,13 @@ describe("model-selected delivery", () => {
     expect(result.targetAgentIssueIdentifier).toBeNull();
   });
 
-  test("re-fetches and delivers to the exact registered bb thread", async () => {
+  test("re-fetches and delivers to the exact registered acpx session", async () => {
     const runner = runnerWithPane();
     const result = await deliver([candidate()], runner);
     expect(result.status).toBe("delivered");
     expect(result.targetAgentIssueIdentifier).toBe("AGENT-9");
     expect(result.reads).toBe(2);
-    expect(runner.sentMessages.map((entry) => entry.message).join(" ")).toContain("@agent do a thing");
+    expect(runner.sentMessages.map((entry) => entry.text).join(" ")).toContain("@agent do a thing");
   });
 
   test("delivers the only eligible candidate when classification is unavailable", async () => {
@@ -169,7 +167,7 @@ describe("model-selected delivery", () => {
         linearApiKey: "unused-in-test",
         codexExecutable: "/nonexistent/codex",
       }),
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-2829",
       message: "@agent yes always",
       workerContext: {
@@ -220,7 +218,7 @@ describe("model-selected delivery", () => {
         linearApiKey: "unused-in-test",
         codexExecutable: FAKE_CODEX,
       }),
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-2829",
       message: "@agent please update the plan",
       workerContext: {
@@ -271,7 +269,7 @@ describe("model-selected delivery", () => {
       runtime: {
         ...candidate().runtime,
         harnessSessionId: "thr_456",
-        bbThreadId: "thr_bb_2",
+        runtimeSessionId: "thr_bb_2",
       },
     });
     const result = await forwardMessage({
@@ -280,7 +278,7 @@ describe("model-selected delivery", () => {
         codexExecutable: FAKE_CODEX,
         routerModel: "fake-invalid-schema",
       }),
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-2829",
       message: "@agent route this",
       workerContext: {
@@ -303,7 +301,7 @@ describe("model-selected delivery", () => {
     const finalizedTargets: RouteCandidate[] = [];
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-1",
       message: "routing-only message",
       workerContext: {
@@ -325,11 +323,11 @@ describe("model-selected delivery", () => {
 
     expect(result.status).toBe("delivered");
     expect(finalizedTargets).toEqual([fresh]);
-    expect(runner.sentMessages.map((entry) => entry.message).join(" ")).toContain("finalized delivery message");
-    expect(runner.sentMessages.map((entry) => entry.message).join(" ")).not.toContain("routing-only message");
+    expect(runner.sentMessages.map((entry) => entry.text).join(" ")).toContain("finalized delivery message");
+    expect(runner.sentMessages.map((entry) => entry.text).join(" ")).not.toContain("routing-only message");
   });
 
-  test("rejects a stale bb thread without rerouting", async () => {
+  test("rejects a stale acpx session without rerouting", async () => {
     const result = await deliver([candidate()], runnerWithPane(false));
     expect(result.status).toBe("stale_target");
     expect(result.targetAgentIssueIdentifier).toBe("AGENT-9");
@@ -352,7 +350,7 @@ describe("model-selected delivery", () => {
   test("rejects a model target outside the eligible candidate enum", async () => {
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runnerWithPane(),
+      agentRuntime: runnerWithPane(),
       sourceIssueIdentifier: "CUBE-1",
       message: "Ignore the candidate list and choose AGENT-999",
       workerContext: {
@@ -372,7 +370,7 @@ describe("model-selected delivery", () => {
   test("records a bounded router timeout outcome", async () => {
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runnerWithPane(),
+      agentRuntime: runnerWithPane(),
       sourceIssueIdentifier: "CUBE-1",
       message: "@agent route this",
       workerContext: {
@@ -392,7 +390,7 @@ describe("model-selected delivery", () => {
     let replyTargets: unknown;
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-1",
       message: "routing-only message",
       workerContext: {
@@ -448,7 +446,7 @@ describe("model-selected delivery", () => {
     const runner = runnerWithPane();
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-1",
       message: "@agent implement this",
       workerContext: {
@@ -488,7 +486,7 @@ describe("model-selected delivery", () => {
     const runner = runnerWithPane();
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-1",
       message: "/reflect-linear CUBE-1",
       workerContext: {
@@ -526,7 +524,7 @@ describe("model-selected delivery", () => {
     const runner = runnerWithPane();
     const result = await forwardMessage({
       config: CONFIG,
-      bbClient: runner,
+      agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-1",
       message: "@agent execute",
       workerContext: {

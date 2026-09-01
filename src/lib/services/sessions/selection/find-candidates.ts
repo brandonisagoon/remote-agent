@@ -88,6 +88,6 @@ export function isEligibleCandidate(
     candidate.runtime.role === "primary" &&
     labels.has(AgentIssueLabel.Routing.AcceptsInput) &&
     labels.has(machine.label) &&
-    Boolean(candidate.runtime.bbThreadId)
+    Boolean(candidate.runtime.runtimeSessionId)
   );
 }

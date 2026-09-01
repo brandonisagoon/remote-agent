@@ -4,7 +4,6 @@ import {
   type Worker,
 } from "../../../../types/dispatcher/index.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
-import { createBbClient } from "../../../transports/bb/index.ts";
 import { readWorkflowPrompt } from "../../../workflows/repository.ts";
 import { buildReflectionMessage } from "./message.ts";
 
@@ -22,7 +21,7 @@ export const reflectionWorker: Worker<ReflectionEvent> = {
     const issue = event.webhook.data;
     return forwardMessage({
       config: context.config,
-      bbClient: context.bbClient ?? createBbClient(context.config.bbBaseUrl),
+      agentRuntime: context.agentRuntime!,
       sourceIssueIdentifier: issue.identifier,
       workerContext: {
         key: "product.reflection",

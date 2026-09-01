@@ -15,7 +15,10 @@ import {
   WorkerRunStatus,
 } from "../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../test-support/config.ts";
-import { createFakeBbClient } from "../../../../test-support/bb.ts";
+import {
+  createFakeAgentRuntime,
+  fakeRuntimeSession,
+} from "../../../../test-support/agent-runtime.ts";
 import {
   createOrchestrationWorker,
   type OrchestrationWorkerDependencies,
@@ -96,7 +99,7 @@ function context(root: string, client: CommandClient) {
       },
     },
     commandClient: client,
-    bbClient: createFakeBbClient(),
+    agentRuntime: createFakeAgentRuntime(),
     runId: "run-id",
   };
 }
@@ -109,17 +112,7 @@ function createWorker(
     react: async () => true,
     provision: async () => "/tmp/provisioned-worktree",
     launch: async () => ({
-      thread: {
-        id: "thr_orchestration",
-        projectId: "proj_test",
-        environmentId: "env_test",
-        hostId: "host_air",
-        providerId: "codex",
-        title: "linear-orchestrate-cube-2774",
-        status: "starting",
-        parentThreadId: null,
-        archivedAt: null,
-      },
+      session: fakeRuntimeSession({ id: "runtime_orchestration" }),
       agentIssue: null,
     }),
     ...dependencies,
@@ -253,7 +246,7 @@ describe("orchestrationWorker", () => {
     expect(reaction.callCount()).toBe(0);
   });
 
-  test("fails closed when bb rejects the launch", async () => {
+  test("fails closed when acpx rejects the launch", async () => {
     const root = fixtureRoot();
     const reaction = reactionSpy();
     let commentCalls = 0;
@@ -266,7 +259,7 @@ describe("orchestrationWorker", () => {
         commentCalls += 1;
         return "posted";
       },
-      launch: async () => { throw new Error("bb spawn rejected"); },
+      launch: async () => { throw new Error("acpx spawn rejected"); },
     });
     const commands = commandClient([
       { ok: false, stdout: "", stderr: "" },
@@ -283,12 +276,12 @@ describe("orchestrationWorker", () => {
     );
 
     expect(result.status).toBe("failed");
-    expect(result.detail).toContain("bb spawn rejected");
+    expect(result.detail).toContain("acpx spawn rejected");
     expect(commentCalls).toBe(0);
     expect(reaction.callCount()).toBe(0);
   });
 
-  test("launches through bb after all guards pass", async () => {
+  test("launches through acpx after all guards pass", async () => {
     const root = fixtureRoot();
     const commentCalls: Array<{
       issueId: string;
@@ -325,7 +318,7 @@ describe("orchestrationWorker", () => {
     expect(result).toEqual({
       status: "delivered",
       detail:
-        "bb_thread:thr_orchestration started; memo reaction posted; worktree link comment posted",
+        "runtime_session:runtime_orchestration started; memo reaction posted; worktree link comment posted",
       targetAgentIssueIdentifier: "CUBE-2774",
     });
     expect(reactionCalls).toEqual([
@@ -433,7 +426,7 @@ describe("orchestrationWorker", () => {
     expect(commentCalls).toBe(1);
   });
 
-  test("does not post a comment when bb launch fails", async () => {
+  test("does not post a comment when acpx launch fails", async () => {
     const root = fixtureRoot();
     const reaction = reactionSpy();
     let commentCalls = 0;
@@ -446,7 +439,7 @@ describe("orchestrationWorker", () => {
         commentCalls += 1;
         return "posted";
       },
-      launch: async () => { throw new Error("bb unavailable"); },
+      launch: async () => { throw new Error("acpx unavailable"); },
     });
     const commands = commandClient([
       { ok: false, stdout: "", stderr: "" },
@@ -486,7 +479,7 @@ describe("orchestrationWorker", () => {
     expect(result).toMatchObject({
       status: "delivered",
       detail:
-        "bb_thread:thr_orchestration started; memo reaction failed; worktree link comment posted",
+        "runtime_session:runtime_orchestration started; memo reaction failed; worktree link comment posted",
     });
     expect(commentCalls).toBe(1);
   });
@@ -512,7 +505,7 @@ describe("orchestrationWorker", () => {
     expect(result).toMatchObject({
       status: "delivered",
       detail:
-        "bb_thread:thr_orchestration started; memo reaction posted; worktree link comment failed",
+        "runtime_session:runtime_orchestration started; memo reaction posted; worktree link comment failed",
     });
   });
 });

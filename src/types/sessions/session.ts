@@ -34,7 +34,7 @@ const RuntimeSchema = z.object({
   role: SessionRoleSchema.default("primary"),
   lifecycle: SessionLifecycleSchema.nullish(),
   sourceIssueIdentifier: SourceIssueIdentifierSchema.nullish(),
-  bbThreadId: z.string().min(1).max(256).nullish(),
+  runtimeSessionId: z.string().min(1).max(256).nullish(),
 });
 
 const EventBaseSchema = z.object({

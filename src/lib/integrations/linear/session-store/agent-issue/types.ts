@@ -7,12 +7,6 @@ export interface QueryAgentIssueInput {
 export type QueryAgentIssuesInput =
   | { searchTerm: string }
   | { harnessSessionId: string }
-  | {
-      locator: {
-        machine: Machine;
-        bbThreadId: string;
-      };
-    }
   | { machine: Machine };
 
 export type {

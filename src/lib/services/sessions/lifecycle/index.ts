@@ -5,7 +5,7 @@ export {
 } from "./end-one-shot-session.ts";
 export {
   endSessionGroup,
-  terminateBbThreads,
+  terminateRuntimeSessions,
 } from "./terminate-session-group.ts";
 export type { EndSessionGroupResult } from "./terminate-session-group.ts";
 export {

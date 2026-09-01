@@ -5,7 +5,6 @@ export const TEST_HOSTS = [
   {
     id: "macbook-air",
     label: "Test MacBook Air",
-    bbHostId: "host_air",
     zedConnection: "ssh" as const,
     acceptsTrackerInput: true,
     default: true,
@@ -13,7 +12,6 @@ export const TEST_HOSTS = [
   {
     id: "macbook-pro",
     label: "Test MacBook Pro",
-    bbHostId: "host_pro",
     zedConnection: "local" as const,
     acceptsTrackerInput: false,
     default: false,
@@ -46,15 +44,13 @@ export function testConfig(
     agentUserId: "11111111-2222-3333-4444-555555555555",
     agentHandle: "cubic-agent",
     agentTeamKey: "AGENT",
-    bbBaseUrl: "http://127.0.0.1:38886",
-    bbProjectId: "proj_test",
     hosts: TEST_HOSTS,
     machine: "macbook-air",
     zedRemoteHost: "test-remote",
     codexExecutable: "codex",
     routerModel: null,
     routerTimeoutMs: 30_000,
-    bbReconcileIntervalMs: 60_000,
+    acpxReconcileIntervalMs: 60_000,
     webhookMaxAgeMs: 60_000,
     deployScript: "/nonexistent/deploy.sh",
     deployBranch: "main",
@@ -82,6 +78,12 @@ export function testConfig(
     },
     endOnState: "End",
     ...overrides,
+    acpxStateDir:
+      overrides.acpxStateDir ?? "/nonexistent/remote-agent/acpx",
+    acpxPermissionMode: overrides.acpxPermissionMode ?? "approve-all",
+    acpxNonInteractivePermissions:
+      overrides.acpxNonInteractivePermissions ?? "deny",
+    acpxAgentCommands: overrides.acpxAgentCommands ?? {},
     acp: overrides.acp ?? { providerId: "codex" },
   };
 }

@@ -2,7 +2,6 @@ import { afterEach, describe, expect, test } from "bun:test";
 
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import {
-  findAgentIssueRecordByBbThreadId,
   findAgentIssueRecordByHarnessSessionId,
   updateAgentIssueRecord,
   upsertAgentIssueRecord,
@@ -16,20 +15,17 @@ afterEach(async () => {
 });
 
 describe("AgentIssueRecord", () => {
-  test("records and refreshes a canonical bb thread", async () => {
+  test("records and refreshes a canonical session mirror", async () => {
     database = await createTestDatabase();
     await upsertAgentIssueRecord(database.prisma, {
       harnessSessionId: "session-1",
       agentIssueId: "linear-1",
       agentIssueIdentifier: "AGENT-1",
       machine: "macbook-air",
-      bbThreadId: "thr_initial",
     });
     await updateAgentIssueRecord(database.prisma, {
       harnessSessionId: "session-1",
       machine: "macbook-air",
-      bbThreadId: "thr_current",
-      lastBbEventSeq: 42,
       lastEventId: "event-2",
       lastGeneration: 2,
     });
@@ -41,8 +37,6 @@ describe("AgentIssueRecord", () => {
     ).toMatchObject({
       agentIssueId: "linear-1",
       agentIssueIdentifier: "AGENT-1",
-      bbThreadId: "thr_current",
-      lastBbEventSeq: 42n,
       lastEventId: "event-2",
       lastGeneration: 2n,
     });
@@ -63,32 +57,17 @@ describe("AgentIssueRecord", () => {
     expect(new Set(claims.map((claim) => claim.agentIssueId)).size).toBe(1);
   });
 
-  test("looks up the unique bb thread locator", async () => {
-    database = await createTestDatabase();
-    await upsertAgentIssueRecord(database.prisma, {
-      harnessSessionId: "session-1",
-      agentIssueId: "linear-1",
-      bbThreadId: "thr_lookup",
-    });
-    expect(
-      await findAgentIssueRecordByBbThreadId(database.prisma, {
-        bbThreadId: "thr_lookup",
-      }),
-    ).toMatchObject({ harnessSessionId: "session-1" });
-  });
-
-  test("subagent records deliberately carry no bb locator", async () => {
+  test("subagent records deliberately carry no machine locator", async () => {
     database = await createTestDatabase();
     await upsertAgentIssueRecord(database.prisma, {
       harnessSessionId: "root:delegate",
       agentIssueId: "linear-subagent",
       machine: null,
-      bbThreadId: null,
     });
     expect(
       await findAgentIssueRecordByHarnessSessionId(database.prisma, {
         harnessSessionId: "root:delegate",
       }),
-    ).toMatchObject({ machine: null, bbThreadId: null });
+    ).toMatchObject({ machine: null });
   });
 });

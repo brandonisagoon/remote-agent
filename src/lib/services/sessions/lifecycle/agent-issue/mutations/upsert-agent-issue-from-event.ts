@@ -1,6 +1,5 @@
 import type { ServerConfig } from "../../../../../config.ts";
 import type { PrismaClient } from "../../../../../../generated/prisma/client.ts";
-import { createBbClient } from "../../../../../transports/bb/index.ts";
 import {
   agentIssueRuntimeWithLabels,
   buildAgentIssueDescription,
@@ -23,6 +22,7 @@ import {
 import {
   deleteAgentIssueRecord,
   findAgentIssueRecordByHarnessSessionId,
+  attachRuntimeSessionToAgentIssue,
   updateAgentIssueRecord,
   upsertAgentIssueRecord,
 } from "../../../registry/index.ts";
@@ -32,30 +32,18 @@ import {
   type AgentIssueSyncMetadata,
   type RuntimeSessionEvent,
 } from "../../../../../../types/sessions/index.ts";
-import {
-  buildAgentIssueTitle,
-  locatorConflict,
-  threadStillOwnsSession,
-  resolveAgentIssueState,
-} from "../rules/index.ts";
+import { buildAgentIssueTitle, resolveAgentIssueState } from "../rules/index.ts";
 import { enqueueAgentIssueWrite } from "./enqueue-agent-issue-write.ts";
 import { findAgentIssue } from "../queries/index.ts";
-import type { AgentIssueMutationDependencies } from "../types.ts";
-import { resolveBbBackedEvent } from "./resolve-bb-backed-event.ts";
 
 export async function upsertAgentIssueFromEvent(
   config: ServerConfig,
   event: RuntimeSessionEvent,
   prisma: PrismaClient,
-  dependencies: AgentIssueMutationDependencies = {},
+  _dependencies: Record<string, never> = {},
 ): Promise<AgentIssue | null> {
-  const bbClient = dependencies.bbClient ?? createBbClient(config.bbBaseUrl);
-  const resolvedEvent = await resolveBbBackedEvent(config, event, bbClient);
-  return enqueueAgentIssueWrite(resolvedEvent.runtime.harnessSessionId, () =>
-    upsertAgentIssue(config, resolvedEvent, prisma, {
-      ...dependencies,
-      bbClient,
-    }),
+  return enqueueAgentIssueWrite(event.runtime.harnessSessionId, () =>
+    upsertAgentIssue(config, event, prisma),
   );
 }
 
@@ -63,7 +51,6 @@ async function upsertAgentIssue(
   config: ServerConfig,
   event: RuntimeSessionEvent,
   prisma: PrismaClient,
-  dependencies: AgentIssueMutationDependencies,
 ): Promise<AgentIssue | null> {
   const catalog = await getAgentCatalog(config);
   let agentIssueRecord = await findAgentIssueRecordByHarnessSessionId(prisma, {
@@ -109,7 +96,6 @@ async function upsertAgentIssue(
   const recordRuntime = {
     harnessSessionId: event.runtime.harnessSessionId,
     machine: isRootSession ? event.runtime.machine : null,
-    bbThreadId: isRootSession ? (event.runtime.bbThreadId ?? null) : null,
   };
   if (existingAgentIssue && !agentIssueRecord) {
     agentIssueRecord = await upsertAgentIssueRecord(prisma, {
@@ -156,40 +142,8 @@ async function upsertAgentIssue(
     return existingAgentIssue;
   }
 
-  if (existingAgentIssue) {
-    const parsedRuntime = parseAgentIssueRuntime(
-      existingAgentIssue.description,
-    );
-    const registered = parsedRuntime
-      ? agentIssueRuntimeWithLabels(existingAgentIssue, parsedRuntime)
-      : null;
-    const conflict = locatorConflict(
-      existingAgentIssue,
-      registered,
-      event.runtime,
-    );
-    if (
-      conflict &&
-      registered &&
-      event.runtime.machine === config.machine &&
-      registered.machine === config.machine
-    ) {
-      const thread = await (
-        dependencies.bbClient ?? createBbClient(config.bbBaseUrl)
-      ).getThread(conflict.bbThreadId);
-      if (threadStillOwnsSession(thread, registered)) {
-        console.warn(
-          `[sessions] ignoring ${event.type} for ${event.runtime.harnessSessionId}: registered bb thread ${conflict.bbThreadId} is still live`,
-        );
-        return existingAgentIssue;
-      }
-    }
-  }
-
-  // bb-backed launch registration is authoritative for policy metadata that
-  // provider hooks cannot receive through bb's environment contract. Preserve
-  // that explicit role/lifecycle/source when a later compatibility hook emits
-  // its defaults for the same BB_THREAD_ID.
+  // Launch registration is authoritative for policy metadata that provider
+  // hooks may omit. Preserve it when compatibility hooks emit defaults.
   if (existingAgentIssue) {
     const registered = parseAgentIssueRuntime(existingAgentIssue.description);
     if (registered) {
@@ -232,7 +186,7 @@ async function upsertAgentIssue(
     ? await getSourceIssue(config, { id: sourceIssueIdentifier })
     : null;
   const hasCompleteRuntime =
-    Boolean(sourceIssue) && Boolean(event.runtime.bbThreadId);
+    Boolean(sourceIssue) && Boolean(event.runtime.runtimeSessionId);
   const stateName = resolveAgentIssueState(
     event,
     hasCompleteRuntime,
@@ -340,11 +294,17 @@ async function upsertAgentIssue(
     });
   }
 
-  await updateAgentIssueRecord(prisma, {
+  const updatedRecord = await updateAgentIssueRecord(prisma, {
     ...recordRuntime,
     lastEventId: event.eventId,
     lastGeneration: event.generation,
   });
+  if (isRootSession && event.runtime.runtimeSessionId) {
+    await attachRuntimeSessionToAgentIssue(prisma, {
+      runtimeSessionId: event.runtime.runtimeSessionId,
+      agentIssueRecordId: updatedRecord.id,
+    });
+  }
 
   return agentIssue;
 }

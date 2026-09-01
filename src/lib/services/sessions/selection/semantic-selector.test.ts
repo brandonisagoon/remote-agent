@@ -62,7 +62,6 @@ function candidate(
       harness: "codex",
       machine: "macbook-air",
       role: "primary",
-      bbThreadId: `bb-${identifier.toLowerCase()}`,
     },
   };
 }

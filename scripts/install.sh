@@ -95,10 +95,10 @@ echo "  built"
 say "launchd user agents"
 # ---------------------------------------------------------------------------
 # User agents keep the service in the same login context as the workspace and
-# provider credentials used by bb execution hosts.
+# provider credentials used by acpx agent processes.
 mkdir -p "$HOME/Library/LaunchAgents"
 
-# Retire the pre-bb pane reconciliation job if an older install created it.
+# Retire the legacy pane reconciliation job if an older install created it.
 cat > "$HOME/Library/LaunchAgents/$LABEL.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

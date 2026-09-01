@@ -6,10 +6,9 @@ import {
 } from "../../../../types/dispatcher/index.ts";
 import { isTerminalAgentIssueState } from "../../../../types/sessions/index.ts";
 import { getMachine } from "../../../machines/index.ts";
-import { createBbClient } from "../../../transports/bb/index.ts";
 import {
   endSessionGroup,
-  terminateBbThreads,
+  terminateRuntimeSessions,
 } from "../../../services/sessions/lifecycle/index.ts";
 import { findAgentIssue } from "../../../services/sessions/lifecycle/agent-issue/queries/index.ts";
 
@@ -44,13 +43,13 @@ export const endSessionWorker: Worker<EndSessionEvent> = {
     }
 
     const group = await endSessionGroup(context.config, target);
-    const terminated = await terminateBbThreads(
-      context.bbClient ?? createBbClient(context.config.bbBaseUrl),
-      group.bbThreadIds,
+    const terminated = await terminateRuntimeSessions(
+      context.agentRuntime!,
+      group.runtimeSessionIds,
     );
     return result(
       "delivered",
-      `ended ${group.ended} issue(s); terminated ${terminated} bb thread(s)`,
+      `ended ${group.ended} issue(s); terminated ${terminated} acpx session(s)`,
       target.identifier,
     );
   },

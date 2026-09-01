@@ -16,7 +16,6 @@ describe("resolveAgentIssueState", () => {
     harness: "claude",
     machine: "macbook-air",
     role: "primary",
-    bbThreadId: null,
   };
   const event = (type: RuntimeSessionEvent["type"]): RuntimeSessionEvent =>
     ({

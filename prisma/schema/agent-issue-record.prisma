@@ -1,31 +1,18 @@
 /// Durable idempotency index from a harness session to its canonical Linear issue.
 /// Linear remains the session registry; this table avoids search-index races.
 model AgentIssueRecord {
-  id                    String   @id @default(cuid())
-  harnessSessionId      String   @unique
-  agentIssueId          String
-  agentIssueIdentifier  String?
-  machine               String?
-  bbThreadId            String?  @unique
-  lastBbEventSeq        BigInt?
-  lastEventId           String?
-  lastGeneration        BigInt?
-  sessionRootCommentId  String?
-  lastErrorCommentId    String?
-  lastErrorEventId      String?
-  lastErrorTurnId       String?
-  lastErrorAt           DateTime?
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  id                   String   @id @default(cuid())
+  harnessSessionId     String   @unique
+  agentIssueId         String
+  agentIssueIdentifier String?
+  machine              String?
+  lastEventId          String?
+  lastGeneration       BigInt?
+  sessionRootCommentId String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  runtimeSession RuntimeSession?
 
   @@index([machine])
-}
-
-/// Durable replay cursor for bb event-log projection. A separate row lets the
-/// ingestor resume a thread before its canonical Linear issue is established.
-model BbEventCursor {
-  bbThreadId String   @id
-  lastSeq    BigInt   @default(0)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
 }

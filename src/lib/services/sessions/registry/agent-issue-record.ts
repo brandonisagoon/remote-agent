@@ -7,8 +7,6 @@ interface AgentIssueRecordInput {
   agentIssueId: string;
   agentIssueIdentifier?: string | null;
   machine?: string | null;
-  bbThreadId?: string | null;
-  lastBbEventSeq?: number | bigint | null;
   lastEventId?: string | null;
   lastGeneration?: number | bigint | null;
 }
@@ -35,15 +33,6 @@ export function findAgentIssueRecordByHarnessSessionId(
   });
 }
 
-export function findAgentIssueRecordByBbThreadId(
-  prisma: PrismaClient,
-  query: { bbThreadId: string },
-) {
-  return prisma.agentIssueRecord.findUnique({
-    where: { bbThreadId: query.bbThreadId },
-  });
-}
-
 /**
  * Claim the canonical Linear issue for a harness session. The update branch
  * intentionally preserves the existing issue identity: a concurrent creator
@@ -53,19 +42,13 @@ export async function upsertAgentIssueRecord(
   prisma: PrismaClient,
   input: AgentIssueRecordInput,
 ) {
-  const runtime = {
-    machine: input.machine ?? null,
-    bbThreadId: input.bbThreadId ?? null,
-  };
+  const runtime = { machine: input.machine ?? null };
   const eventUpdate = {
     ...(input.lastEventId !== undefined
       ? { lastEventId: input.lastEventId }
       : {}),
     ...(input.lastGeneration !== undefined
       ? { lastGeneration: generation(input.lastGeneration) }
-      : {}),
-    ...(input.lastBbEventSeq !== undefined
-      ? { lastBbEventSeq: generation(input.lastBbEventSeq) }
       : {}),
   };
 
@@ -77,7 +60,6 @@ export async function upsertAgentIssueRecord(
         agentIssueId: input.agentIssueId,
         agentIssueIdentifier: input.agentIssueIdentifier ?? null,
         ...runtime,
-        lastBbEventSeq: generation(input.lastBbEventSeq),
         lastEventId: input.lastEventId ?? null,
         lastGeneration: generation(input.lastGeneration),
       },
@@ -101,56 +83,8 @@ export function updateAgentIssueRecord(
     where: { harnessSessionId: input.harnessSessionId },
     data: {
       machine: input.machine ?? null,
-      bbThreadId: input.bbThreadId ?? null,
-      lastBbEventSeq: generation(input.lastBbEventSeq),
       lastEventId: input.lastEventId ?? null,
       lastGeneration: generation(input.lastGeneration),
-    },
-  });
-}
-
-export function setAgentIssueRecordSessionRoot(
-  prisma: PrismaClient,
-  input: { bbThreadId: string; sessionRootCommentId: string },
-) {
-  return prisma.agentIssueRecord.update({
-    where: { bbThreadId: input.bbThreadId },
-    data: { sessionRootCommentId: input.sessionRootCommentId },
-  });
-}
-
-export function setAgentIssueRecordErrorNotice(
-  prisma: PrismaClient,
-  input: {
-    bbThreadId: string;
-    lastErrorCommentId: string;
-    lastErrorEventId: string;
-    lastErrorTurnId: string | null;
-    lastErrorAt: Date;
-  },
-) {
-  return prisma.agentIssueRecord.update({
-    where: { bbThreadId: input.bbThreadId },
-    data: {
-      lastErrorCommentId: input.lastErrorCommentId,
-      lastErrorEventId: input.lastErrorEventId,
-      lastErrorTurnId: input.lastErrorTurnId,
-      lastErrorAt: input.lastErrorAt,
-    },
-  });
-}
-
-export function clearAgentIssueRecordErrorNotice(
-  prisma: PrismaClient,
-  input: { bbThreadId: string },
-) {
-  return prisma.agentIssueRecord.update({
-    where: { bbThreadId: input.bbThreadId },
-    data: {
-      lastErrorCommentId: null,
-      lastErrorEventId: null,
-      lastErrorTurnId: null,
-      lastErrorAt: null,
     },
   });
 }

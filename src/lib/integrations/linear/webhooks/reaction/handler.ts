@@ -1,6 +1,6 @@
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../config.ts";
-import type { BbClient } from "../../../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../../../types/runtime/index.ts";
 import { bunCommandClient } from "../../../../transports/command/index.ts";
 import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
 import {
@@ -21,11 +21,11 @@ function reactionTarget(data: LinearReactionWebhook["data"]): string {
 export async function handleReactionWebhook(input: {
   prisma: PrismaClient;
   config: ServerConfig;
-  bbClient: BbClient;
+  agentRuntime: AgentSessionRuntime;
   deliveryId: string;
   webhook: LinearReactionWebhook;
 }): Promise<ReactionWebhookResult> {
-  const { prisma, config, bbClient, deliveryId, webhook } = input;
+  const { prisma, config, agentRuntime, deliveryId, webhook } = input;
   const data = webhook.data;
   const authorId = data.userId ?? data.user?.id ?? null;
   const target = reactionTarget(data);
@@ -91,7 +91,7 @@ export async function handleReactionWebhook(input: {
     prisma,
     config,
     commandClient: bunCommandClient,
-    bbClient,
+    agentRuntime,
     receiptId: receipt.id,
     event: {
       type: DispatchEventType.TrackerIssueDescribeRequested,

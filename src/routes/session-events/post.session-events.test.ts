@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createApp } from "../../app.ts";
 import { testConfig } from "../../test-support/config.ts";
 import {
+  createFakeAgentRuntime,
+  type FakeAgentRuntime,
+} from "../../test-support/agent-runtime.ts";
+import {
   createTestDatabase,
   type TestDatabase,
 } from "../../test-support/db.ts";
@@ -10,7 +14,7 @@ import {
   parseAgentIssueSourceIdentifier,
   reconcileMachineSnapshot,
 } from "../../lib/services/sessions/index.ts";
-import type { BbClient, CommandClient } from "../../types/runtime/index.ts";
+import type { CommandClient } from "../../types/runtime/index.ts";
 
 const originalFetch = globalThis.fetch;
 let database: TestDatabase | null = null;
@@ -192,68 +196,19 @@ function recordingCommandClient(): CommandClient & { kills: string[] } {
   };
 }
 
-function recordingBbClient(
-  present = true,
-): BbClient & { archivedThreadIds: string[] } {
-  const archivedThreadIds: string[] = [];
-  return {
-    archivedThreadIds,
-    async getThread(id) {
-      if (!present) return null;
-      return {
-        id,
-        projectId: "proj_test",
-        environmentId: "env_test",
-        hostId: "host_air",
-        providerId: "codex",
-        title: null,
-        status: "idle",
-        parentThreadId: null,
-        archivedAt: null,
-      };
-    },
-    async openThread() {
-      return 1;
-    },
-    async getThreadOutput() {
-      return null;
-    },
-    async getThreadExecutionOptions() {
-      return null;
-    },
-    async getEnvironment() {
-      return null;
-    },
-    async listThreads() {
-      return [];
-    },
-    async listProviders() {
-      return [];
-    },
-    async listModels() {
-      return [];
-    },
-    async listEvents() {
-      return [];
-    },
-    async listInteractions() {
-      return [];
-    },
-    async resolveInteraction() {},
-    async sendMessage() {},
-    async spawnThread() {
-      throw new Error("not used");
-    },
-    async updateThreadExecutionOptions() {},
-    async stopThread() {},
-    async archiveThread(id) {
-      archivedThreadIds.push(id);
-    },
-    async listMachines() {
-      return [];
-    },
-    async *streamEvents() {},
-  };
+function recordingAgentRuntime(present = true): FakeAgentRuntime {
+  return createFakeAgentRuntime(
+    present
+      ? [
+          "test-session",
+          "main-session",
+          "one-shot-thread",
+          "clean-one-shot-thread",
+          "one-shot-reconcile-thread",
+          "persistent-reconcile-thread",
+        ].map((id) => ({ id }))
+      : [],
+  );
 }
 
 beforeEach(async () => {
@@ -359,7 +314,7 @@ describe("POST /api/session-events", () => {
 
     const app = createApp({
       config: testConfig(),
-      bbClient: recordingBbClient(),
+      agentRuntime: recordingAgentRuntime(),
       prisma: database!.prisma,
     });
     const event = (eventId: string, generation: number) => ({
@@ -375,7 +330,7 @@ describe("POST /api/session-events", () => {
         harness: "claude",
         machine: "macbook-air",
         role: "primary",
-        bbThreadId: "test-session",
+        runtimeSessionId: "test-session",
       },
     });
     const request = (body: object) =>
@@ -525,11 +480,11 @@ describe("POST /api/session-events", () => {
     }) as typeof fetch;
 
     const commandClient = recordingCommandClient();
-    const bbClient = recordingBbClient();
+    const agentRuntime = recordingAgentRuntime();
     const app = createApp({
       config: testConfig(),
       commandClient,
-      bbClient,
+      agentRuntime,
       prisma: database!.prisma,
     });
     const runtime = {
@@ -542,7 +497,7 @@ describe("POST /api/session-events", () => {
       role: "primary",
       lifecycle: "persistent",
       sourceIssueIdentifier: "CUBE-2999",
-      bbThreadId: "main-session",
+      runtimeSessionId: "main-session",
     };
     const request = (body: object) =>
       app.request("/api/session-events", {
@@ -565,7 +520,7 @@ describe("POST /api/session-events", () => {
     expect(issue?.state.name).toBe("Connected");
     expect(issue?.title).toContain("CUBE-2999");
     expect(relationAttached).toBeTrue();
-    expect(bbClient.archivedThreadIds).toHaveLength(0);
+    expect(agentRuntime.closedSessionIds).toHaveLength(0);
 
     const workflowStarted = await request({
       eventId: "event-workflow-started",
@@ -741,11 +696,11 @@ describe("POST /api/session-events", () => {
     }) as typeof fetch;
 
     const commandClient = recordingCommandClient();
-    const bbClient = recordingBbClient();
+    const agentRuntime = recordingAgentRuntime();
     const app = createApp({
       config: testConfig(),
       commandClient,
-      bbClient,
+      agentRuntime,
       prisma: database!.prisma,
     });
     const runtime = {
@@ -757,7 +712,7 @@ describe("POST /api/session-events", () => {
       machine: "macbook-air",
       role: "primary",
       lifecycle: "one-shot",
-      bbThreadId: "one-shot-thread",
+      runtimeSessionId: "one-shot-thread",
     };
     const request = (body: object) =>
       app.request("/api/session-events", {
@@ -808,28 +763,25 @@ describe("POST /api/session-events", () => {
       "Does Not Accept Linear Input",
     );
     expect(relationAttached).toBeFalse();
-    expect(bbClient.archivedThreadIds).toHaveLength(0);
+    expect(agentRuntime.closedSessionIds).toHaveLength(0);
 
     await Bun.sleep(400);
-    expect(bbClient.archivedThreadIds).toEqual(["one-shot-thread"]);
+    expect(agentRuntime.closedSessionIds).toEqual(["one-shot-thread"]);
 
     expect((await request(endedEvent)).status).toBe(200);
     await Bun.sleep(400);
     expect(issue.state.name).toBe("Ended");
-    expect(bbClient.archivedThreadIds).toEqual([
-      "one-shot-thread",
-      "one-shot-thread",
-    ]);
+    expect(agentRuntime.closedSessionIds).toEqual(["one-shot-thread"]);
   });
 
   test("tears down one-shot session.ended but not subagent.ended", async () => {
     installLinearSessionFixture();
     const commandClient = recordingCommandClient();
-    const bbClient = recordingBbClient();
+    const agentRuntime = recordingAgentRuntime();
     const app = createApp({
       config: testConfig(),
       commandClient,
-      bbClient,
+      agentRuntime,
       prisma: database!.prisma,
     });
     const request = (body: object) =>
@@ -851,7 +803,7 @@ describe("POST /api/session-events", () => {
       role: "primary",
       lifecycle: "one-shot",
       sourceIssueIdentifier: "CUBE-2999",
-      bbThreadId: "clean-one-shot-thread",
+      runtimeSessionId: "clean-one-shot-thread",
     };
 
     expect(
@@ -877,7 +829,7 @@ describe("POST /api/session-events", () => {
       ).status,
     ).toBe(200);
     await Bun.sleep(400);
-    expect(bbClient.archivedThreadIds).toEqual(["clean-one-shot-thread"]);
+    expect(agentRuntime.closedSessionIds).toEqual(["clean-one-shot-thread"]);
 
     expect(
       (
@@ -896,17 +848,17 @@ describe("POST /api/session-events", () => {
       ).status,
     ).toBe(200);
     await Bun.sleep(400);
-    expect(bbClient.archivedThreadIds).toEqual(["clean-one-shot-thread"]);
+    expect(agentRuntime.closedSessionIds).toEqual(["clean-one-shot-thread"]);
   });
 
   test("reconciliation ends dead one-shot sessions and disconnects persistent ones", async () => {
     const fixture = installLinearSessionFixture();
     const commandClient = recordingCommandClient();
-    const bbClient = recordingBbClient();
+    const agentRuntime = recordingAgentRuntime();
     const app = createApp({
       config: testConfig(),
       commandClient,
-      bbClient,
+      agentRuntime,
       prisma: database!.prisma,
     });
     const request = (body: object) =>
@@ -928,7 +880,7 @@ describe("POST /api/session-events", () => {
       role: "primary",
       lifecycle,
       sourceIssueIdentifier: "CUBE-2999",
-      bbThreadId: `${lifecycle}-reconcile-thread`,
+      runtimeSessionId: `${lifecycle}-reconcile-thread`,
     });
 
     for (const [generation, sessionRuntime] of [
@@ -961,6 +913,6 @@ describe("POST /api/session-events", () => {
     expect(
       fixture.issueForSession("persistent-reconcile-session")?.state.name,
     ).toBe("Disconnected");
-    expect(bbClient.archivedThreadIds).toHaveLength(0);
+    expect(agentRuntime.closedSessionIds).toHaveLength(0);
   });
 });

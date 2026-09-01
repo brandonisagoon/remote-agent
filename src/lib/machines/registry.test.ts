@@ -13,7 +13,6 @@ const HOSTS = [
   {
     id: "studio-mac",
     label: "Studio Mac",
-    bbHostId: "host_studio",
     zedConnection: "local" as const,
     acceptsTrackerInput: true,
     default: true,
@@ -21,7 +20,6 @@ const HOSTS = [
   {
     id: "build-mac",
     label: "Build Mac",
-    bbHostId: "host_build",
     zedConnection: "ssh" as const,
     acceptsTrackerInput: false,
     default: false,
@@ -36,7 +34,7 @@ describe("machine registry", () => {
     expect(MachineSchema.safeParse("Studio Mac").success).toBe(false);
   });
 
-  test("owns tracker labels, bb ids, capabilities, and the default", () => {
+  test("owns tracker labels, capabilities, and the default", () => {
     expect(getMachines()).toHaveLength(2);
     expect(getDefaultMachineId()).toBe("studio-mac");
     expect(getMachine({ id: "studio-mac" })).toEqual(HOSTS[0]);

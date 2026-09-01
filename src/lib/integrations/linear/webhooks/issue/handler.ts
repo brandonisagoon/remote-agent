@@ -1,6 +1,6 @@
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../config.ts";
-import type { BbClient } from "../../../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../../../types/runtime/index.ts";
 import { bunCommandClient } from "../../../../transports/command/index.ts";
 import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
 import {
@@ -16,11 +16,11 @@ export type { IssueWebhookResult } from "../../webhook-types/index.ts";
 export async function handleIssueWebhook(input: {
   prisma: PrismaClient;
   config: ServerConfig;
-  bbClient: BbClient;
+  agentRuntime: AgentSessionRuntime;
   deliveryId: string;
   webhook: LinearIssueWebhook;
 }): Promise<IssueWebhookResult> {
-  const { prisma, config, bbClient, deliveryId, webhook } = input;
+  const { prisma, config, agentRuntime, deliveryId, webhook } = input;
   const data = webhook.data;
   if (!webhook.updatedFrom?.stateId) {
     return { kind: IssueWebhookResultKind.Ignored };
@@ -43,7 +43,7 @@ export async function handleIssueWebhook(input: {
       prisma,
       config,
       commandClient: bunCommandClient,
-      bbClient,
+      agentRuntime,
       receiptId: receipt.id,
       event: { type: DispatchEventType.TrackerIssueEndRequested, webhook },
     });
@@ -72,7 +72,7 @@ export async function handleIssueWebhook(input: {
     prisma,
     config,
     commandClient: bunCommandClient,
-    bbClient,
+    agentRuntime,
     receiptId: receipt.id,
     event: {
       type:

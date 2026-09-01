@@ -13,7 +13,6 @@ export type Machine = z.infer<typeof MachineSchema>;
 export const MachineRecordSchema = z.object({
   id: MachineSchema,
   label: z.string().trim().min(1),
-  bbHostId: z.string().trim().min(1),
   zedConnection: z.enum(["local", "ssh"]),
   acceptsTrackerInput: z.boolean(),
   default: z.boolean(),
@@ -25,7 +24,7 @@ const MachineRecordsSchema = z
   .array(MachineRecordSchema)
   .min(1)
   .superRefine((records, context) => {
-    for (const field of ["id", "label", "bbHostId"] as const) {
+    for (const field of ["id", "label"] as const) {
       const seen = new Set<string>();
       for (const [index, record] of records.entries()) {
         if (seen.has(record[field])) {

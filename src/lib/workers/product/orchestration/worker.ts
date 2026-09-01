@@ -138,7 +138,8 @@ export function createOrchestrationWorker(
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma,
-          bbClient: context.bbClient!,
+          agentRuntime: context.agentRuntime!,
+          launchKey: context.runId,
           machine: context.config.machine,
           worktreePath,
           issueIdentifier,
@@ -153,7 +154,7 @@ export function createOrchestrationWorker(
       } catch (error) {
         return result(
           "failed",
-          `bb launch failed: ${error instanceof Error ? error.message : String(error)}`,
+          `acpx launch failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
       const reacted = await dependencies.react(
@@ -165,11 +166,11 @@ export function createOrchestrationWorker(
         config: context.config,
         issueId: issue.id,
         branchName: decision.branchName,
-        bbThreadId: launched.thread.id,
+        runtimeSessionId: launched.session.id,
       });
       return result(
         "delivered",
-        `bb_thread:${launched.thread.id} started; memo reaction ${reacted ? "posted" : "failed"}; worktree link comment ${commentOutcome}`,
+        `runtime_session:${launched.session.id} started; memo reaction ${reacted ? "posted" : "failed"}; worktree link comment ${commentOutcome}`,
         issue.identifier,
       );
     },

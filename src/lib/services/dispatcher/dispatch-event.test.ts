@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import { testConfig } from "../../../test-support/config.ts";
+import { createFakeAgentRuntime } from "../../../test-support/agent-runtime.ts";
 import {
   DispatchEventType,
   type DispatchEvent,
@@ -68,13 +69,14 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },
       dependencies(
         worker("product.orchestration", async () => ({
           status: "failed",
-          detail: "bb launch failed",
+          detail: "acpx launch failed",
           targetAgentIssueIdentifier: null,
         })),
         events,
@@ -83,7 +85,7 @@ describe("dispatch event failure reaction", () => {
 
     expect(events).toEqual([
       `react:issue-id:${TrackerReaction.Failed}`,
-      "finish:run-id:failed:bb launch failed",
+      "finish:run-id:failed:acpx launch failed",
     ]);
   });
 
@@ -94,6 +96,7 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },
@@ -118,6 +121,7 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },

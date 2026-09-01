@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
-import { createFakeBbClient } from "../../../../test-support/bb.ts";
+import {
+  createFakeAgentRuntime,
+  fakeRuntimeSession,
+} from "../../../../test-support/agent-runtime.ts";
 import { DispatchEventType } from "../../../../types/dispatcher/index.ts";
 import type { CommandClient } from "../../../../types/runtime/index.ts";
 import type { SourceIssueWithAgentIssues } from "../../../integrations/tracker/index.ts";
@@ -48,7 +51,7 @@ function context() {
     prisma: {} as PrismaClient,
     config: testConfig(),
     commandClient: {} as CommandClient,
-    bbClient: createFakeBbClient(),
+    agentRuntime: createFakeAgentRuntime(),
     runId: "run-id",
   };
 }
@@ -62,17 +65,7 @@ function dependencies(
     getIssue: async () => SOURCE_ISSUE,
     react: async () => true,
     launch: async () => ({
-      thread: {
-        id: "thr_describe",
-        projectId: "proj_test",
-        environmentId: "env_test",
-        hostId: "host_air",
-        providerId: "claude-code",
-        title: "tracker-describe-demo-42",
-        status: "starting",
-        parentThreadId: null,
-        archivedAt: null,
-      },
+      session: fakeRuntimeSession({ id: "runtime_describe" }),
       agentIssue: null,
     }),
     ...overrides,
@@ -129,12 +122,12 @@ describe("describeWorker", () => {
     const failed = createDescribeWorker(
       dependencies({
         launch: async () => {
-          throw new Error("bb unavailable");
+          throw new Error("acpx unavailable");
         },
       }),
     );
     expect((await failed.execute(EVENT, context())).detail).toContain(
-      "bb launch failed: bb unavailable",
+      "acpx launch failed: acpx unavailable",
     );
   });
 });

@@ -1,6 +1,6 @@
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../config.ts";
-import type { BbClient } from "../../../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../../../types/runtime/index.ts";
 import { mentionsAgent } from "../../index.ts";
 import { bunCommandClient } from "../../../../transports/command/index.ts";
 import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
@@ -20,11 +20,11 @@ export type CommentWebhookResult =
 export async function handleCommentWebhook(input: {
   prisma: PrismaClient;
   config: ServerConfig;
-  bbClient: BbClient;
+  agentRuntime: AgentSessionRuntime;
   deliveryId: string;
   webhook: LinearCommentWebhook;
 }): Promise<CommentWebhookResult> {
-  const { prisma, config, bbClient, deliveryId, webhook } = input;
+  const { prisma, config, agentRuntime, deliveryId, webhook } = input;
   const data = webhook.data;
   const authorId = data.userId ?? data.user?.id ?? null;
   const selfAuthored = authorId === config.agentUserId;
@@ -55,7 +55,7 @@ export async function handleCommentWebhook(input: {
     prisma,
     config,
     commandClient: bunCommandClient,
-    bbClient,
+    agentRuntime,
     receiptId: receipt.id,
     event: { type: DispatchEventType.TrackerCommentMentioned, webhook },
   });

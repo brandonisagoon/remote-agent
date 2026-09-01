@@ -5,9 +5,8 @@ import { createApp } from "./app.ts";
 import type { ServerConfig } from "./lib/config.ts";
 import type { PrismaClient } from "./generated/prisma/client.ts";
 import { testConfig } from "./test-support/config.ts";
-import { createFakeBbClient } from "./test-support/bb.ts";
+import { createFakeAgentRuntime } from "./test-support/agent-runtime.ts";
 import { createTestDatabase, type TestDatabase } from "./test-support/db.ts";
-import { buildBbThreadOpenLink } from "./lib/transports/bb/thread-link.ts";
 import {
   verifyBearerToken,
   verifyGithubSignature,
@@ -34,8 +33,8 @@ afterAll(async () => {
   await db.cleanup();
 });
 
-function app(bbClient?: ReturnType<typeof createFakeBbClient>) {
-  return createApp({ config, prisma, bbClient });
+function app() {
+  return createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() });
 }
 
 function sign(body: string, secret = SECRET): string {
@@ -60,60 +59,6 @@ describe("unknown routes", () => {
   test("404 rather than falling through", async () => {
     const response = await app().request("/nope");
     expect(response.status).toBe(404);
-  });
-});
-
-describe("bb session links", () => {
-  const thread = {
-    id: "thr_open_me",
-    projectId: config.bbProjectId,
-    environmentId: "env_test",
-    hostId: "host_air",
-    providerId: "codex",
-    title: "Test thread",
-    status: "idle" as const,
-    parentThreadId: null,
-    archivedAt: null,
-  };
-
-  test("opens a signed project thread on explicit browser navigation", async () => {
-    const bbClient = createFakeBbClient([thread]);
-    const link = buildBbThreadOpenLink(config, thread.id);
-    const response = await app(bbClient).request(link, {
-      headers: { "sec-fetch-mode": "navigate", "sec-fetch-user": "?1" },
-    });
-
-    expect(response.status).toBe(200);
-    expect(bbClient.openedThreadIds).toEqual([thread.id]);
-  });
-
-  test("does not let a link preview open the desktop app", async () => {
-    const bbClient = createFakeBbClient([thread]);
-    const response = await app(bbClient).request(
-      buildBbThreadOpenLink(config, thread.id),
-    );
-
-    expect(response.status).toBe(200);
-    expect(await response.text()).toContain("Open in bb");
-    expect(bbClient.openedThreadIds).toHaveLength(0);
-  });
-
-  test("rejects invalid signatures and threads from other projects", async () => {
-    const bbClient = createFakeBbClient([
-      { ...thread, id: "thr_other", projectId: "proj_other" },
-    ]);
-    const invalid = await app(bbClient).request(
-      `/session-links/bb/${thread.id}?signature=${"0".repeat(64)}`,
-      { headers: { "sec-fetch-mode": "navigate", "sec-fetch-user": "?1" } },
-    );
-    const other = await app(bbClient).request(
-      buildBbThreadOpenLink(config, "thr_other"),
-      { headers: { "sec-fetch-mode": "navigate", "sec-fetch-user": "?1" } },
-    );
-
-    expect(invalid.status).toBe(404);
-    expect(other.status).toBe(404);
-    expect(bbClient.openedThreadIds).toHaveLength(0);
   });
 });
 

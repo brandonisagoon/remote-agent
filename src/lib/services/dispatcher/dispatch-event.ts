@@ -1,6 +1,6 @@
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../config.ts";
-import type { BbClient, CommandClient } from "../../../types/runtime/index.ts";
+import type { AgentSessionRuntime, CommandClient } from "../../../types/runtime/index.ts";
 import type {
   DispatchEvent,
   Worker,
@@ -10,7 +10,6 @@ import { TrackerReaction, reactToIssue } from "../../integrations/tracker/index.
 import { eventIssueId } from "./event-issue.ts";
 import { workers } from "./worker-registry.ts";
 import { finishWorkerRun, startWorkerRun } from "./worker-run-store.ts";
-import { createBbClient } from "../../transports/bb/index.ts";
 
 const FAILURE_REACTION_WORKERS = new Set([
   "product.describe",
@@ -44,7 +43,7 @@ export async function dispatchEvent(
     prisma: PrismaClient;
     config: ServerConfig;
     commandClient: CommandClient;
-    bbClient?: BbClient;
+    agentRuntime: AgentSessionRuntime;
     receiptId: string;
     event: DispatchEvent;
   },
@@ -64,7 +63,7 @@ export async function dispatchEvent(
         prisma: input.prisma,
         config: input.config,
         commandClient: input.commandClient,
-        bbClient: input.bbClient ?? createBbClient(input.config.bbBaseUrl),
+        agentRuntime: input.agentRuntime,
         runId: run.id,
       });
     } catch (error) {

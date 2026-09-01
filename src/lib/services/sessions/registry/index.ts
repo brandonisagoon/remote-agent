@@ -1,10 +1,19 @@
 export {
-  clearAgentIssueRecordErrorNotice,
   deleteAgentIssueRecord,
   findAgentIssueRecordByHarnessSessionId,
-  findAgentIssueRecordByBbThreadId,
-  setAgentIssueRecordErrorNotice,
-  setAgentIssueRecordSessionRoot,
   updateAgentIssueRecord,
   upsertAgentIssueRecord,
 } from "./agent-issue-record.ts";
+export {
+  advanceRuntimeEventCursor,
+  appendRuntimeLifecycleEvent,
+  attachRuntimeSessionToAgentIssue,
+  beginRuntimeSession,
+  findRuntimeSession,
+  getRuntimeEventCursor,
+  listRuntimeSessions,
+  listRuntimeLifecycleEvents,
+  pruneRuntimeLifecycleEvents,
+  runtimeScopeKey,
+  updateRuntimeSessionState,
+} from "../runtime-registry.ts";

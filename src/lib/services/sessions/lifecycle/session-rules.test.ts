@@ -17,8 +17,8 @@ const DESCRIPTION = `<!-- remote-agent-session:v1 -->
 | Harness session ID | \`thr_abc123\` |
 | Worktree | \`/srv/worktrees/example-cube-2600\` |
 | Lifecycle | — |
-| bb thread ID | \`ztt-example-codex-1\` |
-| bb machine | \`Test MacBook Air\` |
+| Runtime session ID | \`runtime-example-1\` |
+| Execution target | \`Test MacBook Air\` |
 <!-- /remote-agent-session:v1 -->
 <!-- remote-agent-sync:v1 {"eventId":"evt-1","generation":42,"occurredAt":"2026-07-28T12:00:00.000Z","sourceKey":"Q1VCRS0yNjAw"} -->
 
@@ -37,7 +37,7 @@ describe("agent issue description", () => {
       machine: "macbook-air",
       role: "primary",
       lifecycle: null,
-      bbThreadId: "ztt-example-codex-1",
+      runtimeSessionId: "runtime-example-1",
     });
   });
 
@@ -65,7 +65,7 @@ describe("agent issue description", () => {
         machine: "macbook-air",
         role: "primary",
         lifecycle: "one-shot",
-        bbThreadId: "ztt-example-codex-2600",
+        runtimeSessionId: "runtime-2600",
       },
       {
         eventId: "evt-2",
@@ -84,9 +84,7 @@ describe("agent issue description", () => {
     expect(description).toContain(
       "[Open Worktree in Zed](zed://ssh/test-remote/srv/worktrees/example-cube-2600)",
     );
-    expect(description).toContain(
-      "[Open Thread in bb](https://agents.example.com/",
-    );
+    expect(description).toContain("acpx session `runtime-2600`");
     expect(description).not.toContain("<!-- remote-agent-");
     expect(description).not.toContain("| Machine |");
     expect(description).not.toContain("| Branch |");
@@ -126,7 +124,7 @@ describe("delivery eligibility", () => {
       harness: "codex",
       machine: "macbook-air",
       role: "primary",
-      bbThreadId: "agent",
+      runtimeSessionId: "runtime-agent",
     },
   };
 
@@ -141,7 +139,7 @@ describe("delivery eligibility", () => {
     expect(
       isEligibleCandidate(config, {
         ...candidate,
-        runtime: { ...candidate.runtime, bbThreadId: null },
+        runtime: { ...candidate.runtime, runtimeSessionId: null },
       }),
     ).toBeFalse();
   });

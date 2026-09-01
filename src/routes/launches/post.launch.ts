@@ -5,10 +5,7 @@ import { z } from "zod";
 
 import type { AppEnv } from "../../middleware/context.ts";
 import { getMachine, MachineSchema } from "../../lib/machines/index.ts";
-import {
-  ModelResolutionError,
-  spawnAgentThread,
-} from "../../lib/services/launches/index.ts";
+import { spawnAgentThread } from "../../lib/services/launches/index.ts";
 import {
   HarnessSchema,
   SourceIssueIdentifierSchema,
@@ -27,7 +24,8 @@ const LaunchSchema = z.object({
   lifecycle: SessionLifecycleSchema,
   role: SessionRoleSchema,
   title: z.string().min(1).max(512).optional(),
-  parentThreadId: z.string().min(1).max(256).optional(),
+  parentSessionId: z.string().min(1).max(256).optional(),
+  launchKey: z.string().min(1).max(512).optional(),
 });
 
 const route = new Hono<AppEnv>();
@@ -46,7 +44,7 @@ route.post("/", async (c) => {
     getMachine({ id: parsed.data.machine });
   } catch {
     return c.json(
-      { error: `No bb host is configured for ${parsed.data.machine}` },
+      { error: `No execution target is configured for ${parsed.data.machine}` },
       409,
     );
   }
@@ -54,30 +52,23 @@ route.post("/", async (c) => {
   try {
     const launched = await spawnAgentThread({
       ...parsed.data,
+      launchKey:
+        parsed.data.launchKey ??
+        `api:${parsed.data.issueIdentifier}:${parsed.data.role}:${parsed.data.branchName ?? parsed.data.worktreePath}`,
       config,
       prisma: c.get("prisma"),
-      bbClient: c.get("bbClient"),
+      agentRuntime: c.get("agentRuntime"),
     });
     return c.json(
       {
-        threadId: launched.thread.id,
+        sessionId: launched.session.id,
         machine: parsed.data.machine,
-        environmentId: launched.thread.environmentId,
+        acpxRecordId: launched.session.acpxRecordId,
         agentIssueIdentifier: launched.agentIssue?.identifier ?? null,
       },
       201,
     );
   } catch (error) {
-    if (error instanceof ModelResolutionError) {
-      return c.json(
-        {
-          error: error.message,
-          requestedModel: error.requestedModel,
-          availableModels: error.availableModelIds,
-        },
-        422,
-      );
-    }
     throw error;
   }
 });

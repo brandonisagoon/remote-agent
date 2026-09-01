@@ -7,10 +7,12 @@
     "port": 9000,
     "databaseUrl": "file:./remote-agent.sqlite"
   },
-  "bb": {
-    "url": "http://127.0.0.1:38886",
-    "projectId": "replace-with-bb-project-id",
-    "reconcileIntervalMs": 60000
+  "acpx": {
+    "stateDir": "~/Library/Application Support/remote-agent/acpx",
+    "reconcileIntervalMs": 60000,
+    "permissionMode": "approve-all",
+    "nonInteractivePermissions": "deny",
+    "agents": {}
   },
   "linear": {
     "webhookSecret": "replace-with-linear-webhook-secret",
@@ -44,7 +46,6 @@
     {
       "id": "studio-mac",
       "label": "Studio Mac",
-      "bbHostId": "replace-with-bb-host-id",
       "zedConnection": "local",
       "acceptsTrackerInput": true,
       "default": true

@@ -3,26 +3,30 @@
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 
-import { BbAcpAgent } from "./agent.ts";
-import { readAcpConfig } from "./config.ts";
+import { RemoteAgentAcpAgent } from "./agent.ts";
 import { acpLog } from "./log.ts";
-import { createBbClient } from "../lib/transports/bb/index.ts";
+import { readConfig } from "../lib/config.ts";
+import { applyPragmas, createPrismaClient } from "../lib/prisma.ts";
+import { createAcpxSessionRuntime } from "../lib/transports/acpx/index.ts";
 
-export function startAcpAgent(): acp.AgentSideConnection {
-  const config = readAcpConfig();
+export async function startAcpAgent(): Promise<acp.AgentSideConnection> {
+  const config = readConfig();
+  const prisma = createPrismaClient(config.databaseUrl);
+  await applyPragmas(prisma);
+  const runtime = createAcpxSessionRuntime(prisma, config);
   const stream = acp.ndJsonStream(
     Writable.toWeb(process.stdout),
     Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
   );
   return new acp.AgentSideConnection(
-    (connection) => new BbAcpAgent(connection, createBbClient(config.bbBaseUrl), config),
+    (connection) => new RemoteAgentAcpAgent(connection, runtime, config),
     stream,
   );
 }
 
 if (import.meta.main) {
   try {
-    startAcpAgent();
+    await startAcpAgent();
   } catch (error) {
     acpLog("startup failed", error);
     process.exitCode = 1;

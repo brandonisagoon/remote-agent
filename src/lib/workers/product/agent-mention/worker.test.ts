@@ -218,7 +218,7 @@ describe("createAgentMentionWorker", () => {
       }),
       forward: async () => ({
         status: "failed",
-        detail: "bb rejected the exact registered thread",
+        detail: "acpx rejected the exact registered thread",
         targetAgentIssueIdentifier: "AGENT-9",
         decision: null,
       }),

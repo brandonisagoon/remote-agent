@@ -67,12 +67,9 @@ export async function getAgentIssues(
     return AgentIssueSchema.array().parse(data.issues.nodes);
   }
 
-  const searchTerm =
-    "searchTerm" in query
-      ? query.searchTerm
-      : "harnessSessionId" in query
-        ? query.harnessSessionId
-        : query.locator.bbThreadId;
+  const searchTerm = "searchTerm" in query
+    ? query.searchTerm
+    : query.harnessSessionId;
   const data = await linearGraphql<{
     searchIssues: { nodes: unknown[] };
   }>(config.linearApiKey, SEARCH_AGENT_ISSUES, {
@@ -88,18 +85,6 @@ export async function getAgentIssues(
         parseAgentIssueRuntime(issue.description)?.harnessSessionId ===
         query.harnessSessionId,
     );
-  }
-  if ("locator" in query) {
-    const machine = getMachine({ id: query.locator.machine });
-    return candidates.filter((issue) => {
-      const runtime = parseAgentIssueRuntime(issue.description);
-      return (
-        runtime?.bbThreadId === query.locator.bbThreadId &&
-        issue.labels.nodes.some(
-          (label) => label.name === machine.label,
-        )
-      );
-    });
   }
   return candidates;
 }

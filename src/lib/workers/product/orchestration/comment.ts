@@ -11,7 +11,6 @@ import {
   getMachine,
   type MachineRecord,
 } from "../../../machines/index.ts";
-import { buildBbThreadOpenLink } from "../../../transports/bb/thread-link.ts";
 import { worktreePathForBranch } from "../../../services/launches/index.ts";
 
 export const WORKTREE_LINK_SEARCH_TEXT = "Open Worktree in Zed";
@@ -58,21 +57,19 @@ export function predictWorktreePath(
 }
 
 export function buildWorktreeLinkComment(input: {
-  config: Pick<ServerConfig, "apiKey" | "publicUrl">;
   machine: MachineRecord;
   zedRemoteHost: string | null;
   worktreePath: string;
-  bbThreadId: string;
+  runtimeSessionId: string;
 }): string {
   const link = buildZedDeepLink(
     input.machine,
     input.zedRemoteHost,
     input.worktreePath,
   );
-  const bbLink = buildBbThreadOpenLink(input.config, input.bbThreadId);
   return [
     `[Open Worktree in Zed](${link})`,
-    `[Open Thread in bb](${bbLink})`,
+    `Remote Agent session \`${input.runtimeSessionId}\``,
   ].join(" · ");
 }
 
@@ -120,7 +117,7 @@ export async function postWorktreeLinkComment(
     config: ServerConfig;
     issueId: string;
     branchName: string;
-    bbThreadId: string;
+    runtimeSessionId: string;
     timeoutMs?: number;
     pollIntervalMs?: number;
   },
@@ -156,11 +153,10 @@ export async function postWorktreeLinkComment(
     }
 
     const body = buildWorktreeLinkComment({
-      config: input.config,
       machine,
       zedRemoteHost: input.config.zedRemoteHost,
       worktreePath,
-      bbThreadId: input.bbThreadId,
+      runtimeSessionId: input.runtimeSessionId,
     });
     return (await dependencies.createComment(
       input.config.linearApiKey,

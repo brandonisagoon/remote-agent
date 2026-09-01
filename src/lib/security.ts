@@ -39,25 +39,3 @@ export function verifyBearerToken(
     createHash("sha256").update(expectedToken).digest(),
   );
 }
-
-function bbThreadLinkDigest(threadId: string, secret: string): Buffer {
-  return createHmac("sha256", secret)
-    .update(`bb-thread-open:v1:${threadId}`)
-    .digest();
-}
-
-export function signBbThreadLink(threadId: string, secret: string): string {
-  return bbThreadLinkDigest(threadId, secret).toString("hex");
-}
-
-export function verifyBbThreadLink(
-  threadId: string,
-  signature: string | null,
-  secret: string,
-): boolean {
-  if (!signature || !/^[a-f0-9]{64}$/i.test(signature)) return false;
-  return safeEqual(
-    bbThreadLinkDigest(threadId, secret),
-    Buffer.from(signature, "hex"),
-  );
-}

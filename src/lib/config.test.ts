@@ -16,7 +16,7 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
       apiKey: "api-secret",
       databaseUrl: "file:./state.sqlite",
     },
-    bb: { projectId: "bb-project" },
+    acpx: { reconcileIntervalMs: 45_000 },
     linear: {
       webhookSecret: "webhook-secret",
       apiKey: "linear-secret",
@@ -27,7 +27,6 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
       {
         id: "build-host",
         label: "Build Host",
-        bbHostId: "bb_host_1",
         zedConnection,
         acceptsTrackerInput: true,
         default: true,
@@ -79,13 +78,10 @@ describe("readConfig", () => {
 
     expect(config.serviceName).toBe("example-agent");
     expect(config.machine).toBe("build-host");
-    expect(config.hosts[0]).toMatchObject({
-      label: "Build Host",
-      bbHostId: "bb_host_1",
-    });
+    expect(config.hosts[0]).toMatchObject({ label: "Build Host" });
     expect(config.publicUrl).toBe("https://agents.example.com");
     expect(config.linearApiKey).toBe("linear-secret");
-    expect(config.bbProjectId).toBe("bb-project");
+    expect(config.acpxReconcileIntervalMs).toBe(45_000);
     expect(config.deployJobLabel).toBe("dev.example-agent.deploy");
     expect(config.repository.root).toBe(path.join(directory, "repository"));
     expect(config.repository.worktreeRoot).toBe(path.join(directory, "worktrees"));

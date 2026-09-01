@@ -1,5 +1,5 @@
 import type { ServerConfig } from "../../../config.ts";
-import type { BbClient } from "../../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import {
   AgentIssueState,
   isTerminalAgentIssueState,
@@ -24,7 +24,7 @@ interface SessionGroupMember {
 
 export interface EndSessionGroupResult {
   ended: number;
-  bbThreadIds: string[];
+  runtimeSessionIds: string[];
 }
 
 export async function endSessionGroup(
@@ -65,22 +65,22 @@ export async function endSessionGroup(
 
   return {
     ended,
-    bbThreadIds: threadsForTermination(ordered, target.id),
+    runtimeSessionIds: sessionsForTermination(ordered, target.id),
   };
 }
 
-export async function terminateBbThreads(
-  bbClient: BbClient,
-  bbThreadIds: string[],
+export async function terminateRuntimeSessions(
+  runtime: AgentSessionRuntime,
+  runtimeSessionIds: string[],
 ): Promise<number> {
   let terminated = 0;
-  for (const bbThreadId of bbThreadIds) {
-    const thread = await bbClient.getThread(bbThreadId);
-    if (!thread) continue;
-    if (thread.status === "active" || thread.status === "starting") {
-      await bbClient.stopThread(bbThreadId);
+  for (const runtimeSessionId of runtimeSessionIds) {
+    const session = await runtime.getSession(runtimeSessionId);
+    if (!session || session.status === "closed") continue;
+    if (session.status === "active") {
+      await runtime.cancel(runtimeSessionId, "Session ended from Linear");
     }
-    await bbClient.archiveThread(bbThreadId);
+    await runtime.close(runtimeSessionId, "Session ended from Linear");
     terminated += 1;
   }
   return terminated;
@@ -139,8 +139,8 @@ function belongsToSessionGroup(
     candidate.runtime.harnessSessionId.startsWith(
       `${runtime.harnessSessionId}:`,
     ) ||
-    (candidate.runtime.bbThreadId !== null &&
-      candidate.runtime.bbThreadId === runtime.bbThreadId) ||
+    (candidate.runtime.runtimeSessionId !== null &&
+      candidate.runtime.runtimeSessionId === runtime.runtimeSessionId) ||
     (candidate.runtime.role === "delegate" &&
       candidate.runtime.worktreePath === runtime.worktreePath)
   );
@@ -169,21 +169,21 @@ function orderForTermination(
   });
 }
 
-function threadsForTermination(
+function sessionsForTermination(
   ordered: SessionGroupMember[],
   targetId: string,
 ): string[] {
-  const targetThread = ordered.find((entry) => entry.issue.id === targetId)
-    ?.runtime?.bbThreadId;
-  const threads = new Set(
+  const targetSession = ordered.find((entry) => entry.issue.id === targetId)
+    ?.runtime?.runtimeSessionId;
+  const sessions = new Set(
     ordered
       .filter((entry) => entry.issue.id !== targetId)
-      .map((entry) => entry.runtime?.bbThreadId)
+      .map((entry) => entry.runtime?.runtimeSessionId)
       .filter((value): value is string => Boolean(value)),
   );
-  if (targetThread) {
-    threads.delete(targetThread);
-    threads.add(targetThread);
+  if (targetSession) {
+    sessions.delete(targetSession);
+    sessions.add(targetSession);
   }
-  return [...threads];
+  return [...sessions];
 }

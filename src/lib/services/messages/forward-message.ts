@@ -1,6 +1,5 @@
 import type { ServerConfig } from "../../config.ts";
-import { mapBbErrorToDispatchStatus } from "../../transports/bb/index.ts";
-import type { BbClient } from "../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../types/runtime/index.ts";
 import type { MessageDispatchResult } from "../../../types/messages/index.ts";
 import type {
   ReplyTarget,
@@ -24,7 +23,7 @@ export interface ReplyContext {
 
 export interface ForwardMessageOptions {
   config: ServerConfig;
-  bbClient: BbClient;
+  agentRuntime: AgentSessionRuntime;
   sourceIssueIdentifier: string;
   message: string;
   workerContext: RoutingInput["workerContext"];
@@ -123,11 +122,14 @@ async function route(
       decision,
     };
   }
-  const thread = await options.bbClient.getThread(fresh.runtime.bbThreadId!);
-  if (!thread || thread.archivedAt != null || thread.status === "error") {
+  const runtimeSessionId = fresh.runtime.runtimeSessionId;
+  const session = runtimeSessionId
+    ? await options.agentRuntime.getSession(runtimeSessionId)
+    : null;
+  if (!session || session.status === "closed" || session.status === "error") {
     return {
       status: "stale_target",
-      detail: "the registered bb thread is no longer live",
+      detail: "the registered acpx session is no longer live",
       targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
       decision,
     };
@@ -142,14 +144,13 @@ async function route(
       )}`
     : baseMessage;
   try {
-    await options.bbClient.sendMessage({
-      threadId: thread.id,
-      message,
-      mode: "queue-if-active",
+    await options.agentRuntime.enqueue({
+      sessionId: session.id,
+      text: message,
     });
   } catch (error) {
     return {
-      status: mapBbErrorToDispatchStatus(error),
+      status: "failed",
       detail: error instanceof Error ? error.message : String(error),
       targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
       decision,

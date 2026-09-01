@@ -21,7 +21,7 @@ const route = new Hono<AppEnv>();
 route.post("/", async (c) => {
     const config = c.get("config");
     const prisma = c.get("prisma");
-    const bbClient = c.get("bbClient");
+    const agentRuntime = c.get("agentRuntime");
     const declaredLength = Number(c.req.header("content-length") ?? "0");
     if (declaredLength > MAX_REQUEST_BYTES) {
       return c.json({ error: "Payload Too Large" }, 413);
@@ -66,7 +66,7 @@ route.post("/", async (c) => {
       const result = await handleIssueWebhook({
         prisma,
         config,
-        bbClient,
+        agentRuntime,
         deliveryId,
         webhook: issue.data,
       });
@@ -91,7 +91,7 @@ route.post("/", async (c) => {
         const result = await handleReactionWebhook({
           prisma,
           config,
-          bbClient,
+          agentRuntime,
           deliveryId,
           webhook: reaction.data,
         });
@@ -142,7 +142,7 @@ route.post("/", async (c) => {
       const result = await handleCommentWebhook({
         prisma,
         config,
-        bbClient,
+        agentRuntime,
         deliveryId,
         webhook: comment.data,
       });

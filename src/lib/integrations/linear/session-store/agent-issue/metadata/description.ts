@@ -5,7 +5,6 @@ import {
   getDefaultMachineId,
   getMachine,
 } from "../../../../../machines/index.ts";
-import { buildBbThreadOpenLink } from "../../../../../transports/bb/thread-link.ts";
 import {
   AgentIssueLabel,
   type AgentIssue,
@@ -55,7 +54,7 @@ export function parseAgentIssueRuntime(
     storedLifecycle === "one-shot" || storedLifecycle === "persistent"
       ? storedLifecycle
       : null;
-  const bbThreadId = emptyToNull(values.get("bb thread ID"));
+  const runtimeSessionId = emptyToNull(values.get("Runtime session ID"));
   if (!harnessSessionId || !worktreePath) return null;
 
   const labels = labelsFromDescription(description);
@@ -81,7 +80,7 @@ export function parseAgentIssueRuntime(
     machine,
     role,
     lifecycle,
-    bbThreadId,
+    runtimeSessionId,
   };
 }
 
@@ -211,25 +210,21 @@ export function buildAgentIssueDescription(
     config.zedRemoteHost,
     runtime.worktreePath,
   );
-  const bbLink = runtime.bbThreadId
-    ? buildBbThreadOpenLink(config, runtime.bbThreadId)
-    : null;
-
   return `| Runtime field | Value |
 | --- | --- |
 | Harness session ID | ${markdownCell(runtime.harnessSessionId)} |
 | Worktree | ${markdownCell(runtime.worktreePath)} |
 | Lifecycle | ${markdownCell(runtime.lifecycle)} |
-| bb thread ID | ${markdownCell(runtime.bbThreadId)} |
-| bb machine | ${markdownCell(machine.label)} |
+| Runtime session ID | ${markdownCell(runtime.runtimeSessionId)} |
+| Execution target | ${markdownCell(machine.label)} |
 | Source issue | ${markdownCell(sync.sourceIssueIdentifier)} |
 
 +++ Open Session
 ### Zed
 [Open Worktree in Zed](${zed})
 
-### bb
-${bbLink ? `[Open Thread in bb](${bbLink})` : "bb thread unavailable"}
+### Agent runtime
+${runtime.runtimeSessionId ? `acpx session \`${runtime.runtimeSessionId}\`` : "runtime session unavailable"}
 +++`;
 }
 

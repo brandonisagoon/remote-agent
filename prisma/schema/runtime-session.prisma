@@ -1,0 +1,63 @@
+/// Application-owned identity and routing record for an acpx-backed session.
+/// The transcript and provider reconnect state remain owned by acpx/provider.
+model RuntimeSession {
+  /// Stable Remote Agent ID, also exposed to Zed as the ACP session ID.
+  id                  String    @id @default(cuid())
+  /// Deterministic key for agent command + absolute cwd + optional name.
+  scopeKey            String    @unique
+  acpxRecordId        String?   @unique
+  acpxSessionId       String?   @unique
+  agentSessionId      String?
+  agentCommand        String
+  cwd                 String
+  name                String?
+  worktreePath        String?
+  executionTarget     String?
+  status              String
+  latestConfigOptions Json?
+  latestUsage         Json?
+  recoveryDetail      String?
+  closedAt            DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  agentIssueRecordId String?                 @unique
+  agentIssueRecord   AgentIssueRecord?       @relation(fields: [agentIssueRecordId], references: [id], onDelete: SetNull)
+  cursors            RuntimeEventCursor[]
+  events             RuntimeLifecycleEvent[]
+
+  @@index([status])
+  @@index([agentCommand, cwd])
+}
+
+/// Durable low-volume lifecycle journal shared by ACP and HTTP processes.
+model RuntimeLifecycleEvent {
+  sequence         Int      @id @default(autoincrement())
+  id               String   @unique
+  runtimeSessionId String
+  requestId        String
+  phase            String
+  error            String?
+  occurredAt       DateTime
+  createdAt        DateTime @default(now())
+
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@index([runtimeSessionId, sequence])
+}
+
+/// Consumer-specific checkpoint into the acpx/Remote Agent event journal.
+/// sourceCursor is opaque so consumers do not assume numeric event sequences.
+model RuntimeEventCursor {
+  id               String   @id @default(cuid())
+  runtimeSessionId String
+  consumer         String
+  sourceCursor     String?
+  generation       BigInt   @default(0)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([runtimeSessionId, consumer])
+}

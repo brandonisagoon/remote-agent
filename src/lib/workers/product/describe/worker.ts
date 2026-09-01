@@ -92,7 +92,8 @@ export function createDescribeWorker(
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma as PrismaClient,
-          bbClient: context.bbClient!,
+          agentRuntime: context.agentRuntime!,
+          launchKey: context.runId,
           machine: context.config.machine,
           worktreePath: repository.root,
           issueIdentifier: issue.identifier,
@@ -106,7 +107,7 @@ export function createDescribeWorker(
       } catch (error) {
         return result(
           "failed",
-          `bb launch failed: ${error instanceof Error ? error.message : String(error)}`,
+          `acpx launch failed: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
       const reacted = await dependencies.react(
@@ -116,7 +117,7 @@ export function createDescribeWorker(
       );
       return result(
         "delivered",
-        `bb_thread:${launched.thread.id} started from ${promptFile}; pencil reaction ${reacted ? "posted" : "failed"}`,
+        `runtime_session:${launched.session.id} started from ${promptFile}; pencil reaction ${reacted ? "posted" : "failed"}`,
         issue.identifier,
       );
     },
