@@ -7,10 +7,7 @@ import type { PrismaClient } from "./generated/prisma/client.ts";
 import { testConfig } from "./test-support/config.ts";
 import { createFakeAgentRuntime } from "./test-support/agent-runtime.ts";
 import { createTestDatabase, type TestDatabase } from "./test-support/db.ts";
-import {
-  verifyBearerToken,
-  verifyGithubSignature,
-} from "./lib/security.ts";
+import { verifyBearerToken } from "./lib/security.ts";
 import { verifyTrackerWebhookSignature } from "./lib/integrations/tracker/index.ts";
 
 const SECRET = "test-webhook-secret";
@@ -130,25 +127,6 @@ describe("verifyTrackerWebhookSignature", () => {
     for (const bad of ["", "abc", "z".repeat(64), `${sign(body)}00`]) {
       expect(verifyTrackerWebhookSignature(body, bad, SECRET)).toBe(false);
     }
-  });
-});
-
-describe("verifyGithubSignature", () => {
-  const body = JSON.stringify({ ref: "refs/heads/main" });
-  const secret = "test-github-secret";
-
-  test("accepts a correctly prefixed signature", () => {
-    const signature = `sha256=${createHmac("sha256", secret).update(body).digest("hex")}`;
-    expect(verifyGithubSignature(body, signature, secret)).toBe(true);
-  });
-
-  test("rejects a signature missing the sha256= prefix", () => {
-    const bare = createHmac("sha256", secret).update(body).digest("hex");
-    expect(verifyGithubSignature(body, bare, secret)).toBe(false);
-  });
-
-  test("rejects a malformed signature", () => {
-    expect(verifyGithubSignature(body, "sha256=nope", secret)).toBe(false);
   });
 });
 

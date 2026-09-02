@@ -24,8 +24,9 @@ case "$ROOT" in "~/"*) ROOT="$HOME/${ROOT#\~/}" ;; esac
 REPO="$ROOT/repo"
 APP="$ROOT/app"
 STATE="$ROOT/state"
-LABEL="$(config_value machine.installation.jobLabel)"
-[ -n "$LABEL" ] || LABEL="dev.$SERVICE_NAME.service"
+LABEL="dev.$SERVICE_NAME.service"
+# Legacy label: older installs ran deploy.sh on a 5-minute poller. Updates are
+# now applied only via the desktop app or `remote-agent update`.
 POLL_LABEL="dev.$SERVICE_NAME.deploy"
 TUNNEL="$(config_value machine.installation.tunnelName)"
 [ -n "$TUNNEL" ] || TUNNEL="$SERVICE_NAME"
@@ -125,35 +126,13 @@ cat > "$HOME/Library/LaunchAgents/$LABEL.plist" <<EOF
 </plist>
 EOF
 
-cat > "$HOME/Library/LaunchAgents/$POLL_LABEL.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key><string>$POLL_LABEL</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/bin/bash</string>
-		<string>$APP/scripts/deploy.sh</string>
-	</array>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin</string>
-		<key>HOME</key><string>$HOME</string>
-		<key>REMOTE_AGENT_CONFIG</key><string>$CONFIG_SOURCE</string>
-	</dict>
-	<key>StartInterval</key><integer>300</integer>
-	<key>StandardOutPath</key><string>$STATE/deploy.log</string>
-	<key>StandardErrorPath</key><string>$STATE/deploy.log</string>
-</dict>
-</plist>
-EOF
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$LABEL.plist"
+echo "  loaded $LABEL"
 
-for label in "$LABEL" "$POLL_LABEL"; do
-  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/$label.plist"
-  echo "  loaded $label"
-done
+# Retire the legacy auto-deploy poller if an older install created it.
+launchctl bootout "gui/$(id -u)/$POLL_LABEL" 2>/dev/null || true
+rm -f "$HOME/Library/LaunchAgents/$POLL_LABEL.plist"
 
 # ---------------------------------------------------------------------------
 say "Verify"
@@ -178,12 +157,6 @@ Installed.
 
   service   launchctl print gui/$(id -u)/$LABEL
   logs      tail -f $STATE/remote-agent.log
-  deploys   tail -f $STATE/deploy.log
-  redeploy  bash $APP/scripts/deploy.sh --force
-
-Remaining manual step: add the GitHub webhook
-  URL          $PUBLIC_URL/webhooks/github
-  Content type application/json
-  Secret       machine.server.webhooks.github.secret in $CONFIG_SOURCE
-  Events       Just the push event
+  updates   tail -f $STATE/deploy.log
+  update    bash $APP/scripts/deploy.sh --force  (or the desktop app's Install Update)
 EOF

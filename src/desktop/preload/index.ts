@@ -3,6 +3,19 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi } from "../shared.ts";
 
 const api: DesktopApi = {
+  window: {
+    syncTrafficLights: () => ipcRenderer.send("window:sync-traffic-lights"),
+  },
+  keybindings: {
+    get: () => ipcRenderer.invoke("keybindings:get"),
+    onChange: (listener) => {
+      const handler = (_event: Electron.IpcRendererEvent, bindings: Parameters<typeof listener>[0]) =>
+        listener(bindings);
+      ipcRenderer.on("keybindings:changed", handler);
+      return () => ipcRenderer.off("keybindings:changed", handler);
+    },
+    openInEditor: () => ipcRenderer.invoke("keybindings:open-in-editor"),
+  },
   config: {
     get: () => ipcRenderer.invoke("config:get"),
     save: (input) => ipcRenderer.invoke("config:save", input),

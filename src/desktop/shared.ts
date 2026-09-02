@@ -22,7 +22,19 @@ export interface SessionSummary {
   }>;
 }
 
+/** Action id → TanStack Hotkeys chord string (e.g. "Mod+B"). */
+export type Keybindings = Record<string, string>;
+
 export interface DesktopApi {
+  window: {
+    /** Re-center the native traffic lights against the zoom-scaled header. */
+    syncTrafficLights(): void;
+  };
+  keybindings: {
+    get(): Promise<Keybindings>;
+    onChange(listener: (bindings: Keybindings) => void): () => void;
+    openInEditor(): Promise<string | null>;
+  };
   config: {
     get(): Promise<ConfigDocument>;
     save(input: { expectedRevision: string; value: unknown }): Promise<ConfigDocument>;

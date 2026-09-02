@@ -20,17 +20,6 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
         publicUrl: "https://agents.example.com",
         apiKey: "api-secret",
         databaseUrl: "file:./state.sqlite",
-        webhooks: {
-          "linear-main": {
-            connection: "linear-main",
-            secret: "webhook-secret",
-            repositoryRouting: { example: {} },
-          },
-          github: {
-            connection: "github-main",
-            secret: "github-secret",
-          },
-        },
       },
       zed: {
         connection: zedConnection,
@@ -44,16 +33,18 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
         name: "Linear Main",
         apiKey: "linear-secret",
         agentUserId: "agent-user",
+        webhook: {
+          machineId: "build-host",
+          slug: "linear-main",
+          secret: "webhook-secret",
+          repositories: { example: {} },
+        },
       },
       "linear-second": {
         provider: "linear",
         name: "Linear Second",
         apiKey: "linear-secret-2",
         agentUserId: "agent-user-2",
-      },
-      "github-main": {
-        provider: "github",
-        name: "GitHub Main",
       },
     },
     repositories: {
@@ -118,8 +109,7 @@ describe("readConfig", () => {
     expect(config.hosts[0]).toMatchObject({ label: "Build Host" });
     expect(config.publicUrl).toBe("https://agents.example.com");
     expect(config.linearApiKey).toBe("linear-secret");
-    expect(config.deployJobLabel).toBe("dev.example-agent.deploy");
-    expect(Object.keys(config.connections)).toEqual(["linear-main", "linear-second", "github-main"]);
+    expect(Object.keys(config.connections)).toEqual(["linear-main", "linear-second"]);
     expect(config.activeConnectionId).toBe("linear-main");
     expect(config.repository.id).toBe("example");
     expect(config.repository.root).toBe(path.join(directory, "repository"));
@@ -183,7 +173,7 @@ describe("readConfig", () => {
 
   test("rejects routing outside a webhook repository allowlist", () => {
     const value: any = serviceFile();
-    value.machine.server.webhooks["linear-main"].repositoryRouting = {
+    value.connections["linear-main"].webhook.repositories = {
       missing: { when: [{ "linear.teamId": ["team"] }] },
     };
     writeConfig(value);
@@ -197,7 +187,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.machine.server.webhooks["linear-main"].repositoryRouting = {
+    value.connections["linear-main"].webhook.repositories = {
       example: {
         when: [
           {
@@ -231,7 +221,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.machine.server.webhooks["linear-main"].repositoryRouting = {
+    value.connections["linear-main"].webhook.repositories = {
       example: { when: [{ "linear.teamId": ["shared"] }] },
       second: { when: [{ "linear.teamId": ["shared"] }] },
     };
@@ -242,18 +232,24 @@ describe("readConfig", () => {
     })).toThrow("matched multiple repositories");
   });
 
-  test("allows an unconditional target only when it is the sole target", () => {
+  test("allows unconditional targets alongside conditional ones", () => {
     const value: any = serviceFile();
     value.repositories.second = {
       ...value.repositories.example,
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.machine.server.webhooks["linear-main"].repositoryRouting.second = {
+    value.connections["linear-main"].webhook.repositories.second = {
       when: [{ "linear.teamId": ["team-second"] }],
     };
     writeConfig(value);
-    expect(() => readConfig()).toThrow("unconditional target");
+    const config = readConfig();
+    expect(routeWebhookRepository(config, "linear-main", {
+      "linear.teamId": "team-other",
+    }).id).toBe("example");
+    expect(() => routeWebhookRepository(config, "linear-main", {
+      "linear.teamId": "team-second",
+    })).toThrow("matched multiple repositories");
   });
 
   test("keeps multiple Linear connection credentials independent", () => {

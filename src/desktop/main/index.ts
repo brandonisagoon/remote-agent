@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, writeFileSync, chmodSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import path from "node:path";
+import { watch } from "chokidar";
 import { app, BrowserWindow, ipcMain, shell } from "electron";
 
 import example from "../../../remote-agent.config.example.json";
@@ -17,11 +18,68 @@ import {
   restartService,
   serviceStatus,
 } from "../../management/service.ts";
-import type { DesktopApi, SessionSummary } from "../shared.ts";
+import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
 
 let mainWindow: BrowserWindow | null = null;
 let stopWatching: (() => Promise<void>) | null = null;
+let stopWatchingKeybindings: (() => Promise<void>) | null = null;
 let ipcRegistered = false;
+
+// Keep the traffic lights vertically centered in the renderer's 48px header
+// (h-12), which scales with page zoom while the native buttons do not.
+const HEADER_HEIGHT = 48;
+const TRAFFIC_LIGHT_HEIGHT = 16;
+const TRAFFIC_LIGHT_X = 16;
+
+function trafficLightPositionForZoom(zoom: number): { x: number; y: number } {
+  return {
+    x: TRAFFIC_LIGHT_X * zoom,
+    y: (HEADER_HEIGHT * zoom - TRAFFIC_LIGHT_HEIGHT) / 2,
+  };
+}
+
+const DEFAULT_KEYBINDINGS: Keybindings = {
+  "toggle-sidebar": "Mod+B",
+  "back": "Mod+[",
+  "forward": "Mod+]",
+  "save": "Mod+S",
+  "revert": "Escape",
+  "toggle-secrets": "Mod+Shift+.",
+  "prev-item": "Mod+Alt+ArrowUp",
+  "next-item": "Mod+Alt+ArrowDown",
+  // Modifier prefix: the sidebar item's number 1-9 is appended (Mod+1..Mod+9).
+  "jump-item": "Mod",
+};
+
+function keybindingsPath(configFile: string): string {
+  return path.join(path.dirname(configFile), "keybindings.json");
+}
+
+function ensureKeybindings(file: string): void {
+  if (!existsSync(file)) {
+    writeFileSync(file, `${JSON.stringify(DEFAULT_KEYBINDINGS, null, 2)}\n`, { mode: 0o644 });
+    return;
+  }
+  // Additive migration: newly introduced actions get their defaults appended
+  // without touching the user's existing chords.
+  const current = readKeybindings(file);
+  const missing = Object.entries(DEFAULT_KEYBINDINGS).filter(([action]) => !(action in current));
+  if (missing.length > 0) {
+    writeFileSync(file, `${JSON.stringify({ ...current, ...Object.fromEntries(missing) }, null, 2)}\n`, { mode: 0o644 });
+  }
+}
+
+function readKeybindings(file: string): Keybindings {
+  try {
+    const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, value]) => typeof value === "string" && value.length > 0),
+    ) as Keybindings;
+  } catch {
+    return {};
+  }
+}
 
 function desktopConfigPath(): string {
   const explicit = process.env.REMOTE_AGENT_CONFIG?.trim();
@@ -82,6 +140,16 @@ function registerIpc(file: string): void {
     return error || null;
   });
   ipcMain.handle("config:reveal", () => shell.showItemInFolder(file));
+  ipcMain.handle("keybindings:get", () => readKeybindings(keybindingsPath(file)));
+  ipcMain.on("window:sync-traffic-lights", (event) => {
+    if (process.platform !== "darwin") return;
+    const window = BrowserWindow.fromWebContents(event.sender);
+    window?.setWindowButtonPosition(trafficLightPositionForZoom(event.sender.getZoomFactor()));
+  });
+  ipcMain.handle("keybindings:open-in-editor", async () => {
+    const error = await shell.openPath(keybindingsPath(file));
+    return error || null;
+  });
   ipcMain.handle("sessions:list", (_event, repositoryId?: string) => listSessions(repositoryId));
   const actions: Record<string, () => Promise<unknown>> = {
     status: serviceStatus,
@@ -105,14 +173,19 @@ async function createWindow(): Promise<void> {
   registerIpc(file);
 
   await stopWatching?.();
+  await stopWatchingKeybindings?.();
 
   mainWindow = new BrowserWindow({
-    width: 1440,
+    width: 1120,
     height: 920,
     minWidth: 1040,
     minHeight: 700,
-    titleBarStyle: "hiddenInset",
-    backgroundColor: "#0a0a0b",
+    titleBarStyle: "hidden",
+    trafficLightPosition: trafficLightPositionForZoom(1),
+    // Native sidebar translucency: an NSVisualEffectView behind the window;
+    // the renderer keeps the sidebar region transparent so it shows through.
+    vibrancy: "sidebar",
+    backgroundColor: "#00000000",
     webPreferences: {
       preload: path.join(import.meta.dirname, "../preload/index.cjs"),
       contextIsolation: true,
@@ -121,9 +194,23 @@ async function createWindow(): Promise<void> {
     },
   });
 
+  // Renderer links (target=_blank) open in the system browser.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    void shell.openExternal(url);
+    return { action: "deny" };
+  });
+
   stopWatching = watchConfigDocument(file, (document) => {
     mainWindow?.webContents.send("config:changed", document);
   });
+
+  const bindingsFile = keybindingsPath(file);
+  ensureKeybindings(bindingsFile);
+  const keybindingsWatcher = watch(bindingsFile, { ignoreInitial: true });
+  keybindingsWatcher.on("all", () => {
+    mainWindow?.webContents.send("keybindings:changed", readKeybindings(bindingsFile));
+  });
+  stopWatchingKeybindings = () => keybindingsWatcher.close();
 
   mainWindow.on("closed", () => {
     mainWindow = null;
@@ -149,4 +236,5 @@ app.on("window-all-closed", () => {
 
 app.on("before-quit", () => {
   void stopWatching?.();
+  void stopWatchingKeybindings?.();
 });

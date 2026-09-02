@@ -2,9 +2,8 @@
 #
 # Pull origin/<branch>, rebuild, migrate, restart, verify — roll back on failure.
 #
-# Invoked three ways, all of which can overlap:
-#   - the GitHub push webhook (POST /webhooks/github)
-#   - the launchd poller, every 5 minutes
+# Invoked two ways, which can overlap:
+#   - the desktop app / CLI "Install Update" action (runs with --force)
 #   - by hand, optionally with --force
 #
 # It restarts the very service that may have spawned it, so it must be safe to

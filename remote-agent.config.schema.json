@@ -77,83 +77,12 @@
             "controlSocketPath": {
               "type": "string",
               "minLength": 1
-            },
-            "webhooks": {
-              "default": {},
-              "type": "object",
-              "propertyNames": {
-                "type": "string",
-                "minLength": 1,
-                "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
-              },
-              "additionalProperties": {
-                "type": "object",
-                "properties": {
-                  "connection": {
-                    "type": "string",
-                    "minLength": 1,
-                    "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
-                  },
-                  "secret": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "webhookMaxAgeMs": {
-                    "default": 60000,
-                    "type": "integer",
-                    "exclusiveMinimum": 0,
-                    "maximum": 9007199254740991
-                  },
-                  "repositoryRouting": {
-                    "default": {},
-                    "type": "object",
-                    "propertyNames": {
-                      "type": "string",
-                      "minLength": 1,
-                      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
-                    },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {
-                        "when": {
-                          "minItems": 1,
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "propertyNames": {
-                              "type": "string",
-                              "minLength": 1
-                            },
-                            "additionalProperties": {
-                              "minItems": 1,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "minLength": 1
-                              }
-                            }
-                          }
-                        }
-                      },
-                      "additionalProperties": false
-                    }
-                  }
-                },
-                "required": [
-                  "connection",
-                  "secret",
-                  "webhookMaxAgeMs",
-                  "repositoryRouting"
-                ],
-                "additionalProperties": false
-              }
             }
           },
           "required": [
             "publicUrl",
             "apiKey",
-            "listen",
-            "webhooks"
+            "listen"
           ],
           "additionalProperties": false
         },
@@ -321,10 +250,6 @@
               "type": "string",
               "minLength": 1
             },
-            "jobLabel": {
-              "type": "string",
-              "minLength": 1
-            },
             "tunnelName": {
               "type": "string",
               "minLength": 1
@@ -378,62 +303,111 @@
         "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
       },
       "additionalProperties": {
-        "oneOf": [
-          {
-            "type": "object",
-            "properties": {
-              "provider": {
-                "type": "string",
-                "const": "linear"
-              },
-              "name": {
-                "type": "string",
-                "minLength": 1
-              },
-              "apiKey": {
-                "type": "string",
-                "minLength": 1
-              },
-              "agentUserId": {
-                "type": "string",
-                "minLength": 1
-              },
-              "agentHandle": {
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "required": [
-              "provider",
-              "name",
-              "apiKey",
-              "agentUserId"
-            ],
-            "additionalProperties": false
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "const": "linear"
           },
-          {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "apiKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agentUserId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agentHandle": {
+            "type": "string",
+            "minLength": 1
+          },
+          "webhook": {
             "type": "object",
             "properties": {
-              "provider": {
+              "machineId": {
                 "type": "string",
-                "const": "github"
+                "minLength": 1,
+                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
               },
-              "name": {
+              "slug": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+              },
+              "secret": {
                 "type": "string",
                 "minLength": 1
               },
-              "apiToken": {
-                "type": "string",
-                "minLength": 1
+              "webhookMaxAgeMs": {
+                "default": 60000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "repositories": {
+                "default": "*",
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "const": "*"
+                  },
+                  {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "minLength": 1,
+                      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                    },
+                    "additionalProperties": {
+                      "type": "object",
+                      "properties": {
+                        "when": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "propertyNames": {
+                              "type": "string",
+                              "minLength": 1
+                            },
+                            "additionalProperties": {
+                              "minItems": 1,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "minLength": 1
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "additionalProperties": false
+                    }
+                  }
+                ]
               }
             },
             "required": [
-              "provider",
-              "name"
+              "machineId",
+              "slug",
+              "secret",
+              "webhookMaxAgeMs",
+              "repositories"
             ],
             "additionalProperties": false
           }
-        ]
+        },
+        "required": [
+          "provider",
+          "name",
+          "apiKey",
+          "agentUserId"
+        ],
+        "additionalProperties": false
       }
     },
     "repositories": {

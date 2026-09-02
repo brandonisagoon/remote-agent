@@ -15,21 +15,7 @@
       },
       "databaseUrl": "file:./remote-agent.sqlite",
       "acpSocketPath": "~/Library/Application Support/remote-agent/acp.sock",
-      "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock",
-      "webhooks": {
-        "linear-product": {
-          "connection": "linear-main",
-          "secret": "replace-with-linear-webhook-secret",
-          "webhookMaxAgeMs": 60000,
-          "repositoryRouting": {
-            "your-repository": {}
-          }
-        },
-        "github": {
-          "connection": "github-main",
-          "secret": "replace-with-github-webhook-secret"
-        }
-      }
+      "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock"
     },
     "zed": {
       "connection": "local"
@@ -61,11 +47,14 @@
       "name": "Linear Product",
       "apiKey": "replace-with-linear-api-key",
       "agentUserId": "replace-with-linear-agent-user-id",
-      "agentHandle": "agent"
-    },
-    "github-main": {
-      "provider": "github",
-      "name": "GitHub Deploy"
+      "agentHandle": "agent",
+      "webhook": {
+        "machineId": "studio-mac",
+        "slug": "linear-product",
+        "secret": "replace-with-linear-webhook-secret",
+        "webhookMaxAgeMs": 60000,
+        "repositories": "*"
+      }
     }
   },
   "repositories": {
@@ -73,11 +62,18 @@
       "name": "Your Repository",
       "root": "~/checkouts/your-repository",
       "worktreeRoot": "../.worktrees/your-repository",
-      "bootstrapCommand": ["bash", "scripts/bootstrap.sh"],
+      "bootstrapCommand": [
+        "bash",
+        "scripts/bootstrap.sh"
+      ],
       "metadata": {
         "tags": {
           "example.workflow": {
-            "options": ["planning", "implementation", "review"],
+            "options": [
+              "planning",
+              "implementation",
+              "review"
+            ],
             "cardinality": "one",
             "routerVisible": true
           }

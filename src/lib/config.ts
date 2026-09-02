@@ -69,37 +69,37 @@ const RepositorySchema = z.object({
     .default({ tags: {} }),
   triggers: RepositoryTriggersSchema,
 });
+const RoutingConditionSchema = z.record(
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+);
+const WebhookSchema = z.object({
+  /** The machine whose daemon serves this endpoint. */
+  machineId: MachineSchema,
+  /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
+  slug: ConfigIdSchema,
+  secret: z.string().min(1),
+  webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
+  /** "*" subscribes every repository, present and future. */
+  repositories: z.union([
+    z.literal("*"),
+    z.record(
+      ConfigIdSchema,
+      z.object({
+        when: z.array(RoutingConditionSchema).min(1).optional(),
+      }),
+    ),
+  ]).default("*"),
+});
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
   apiKey: z.string().min(1),
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
+  webhook: WebhookSchema.optional(),
 });
-const GithubConnectionSchema = z.object({
-  provider: z.literal("github"),
-  name: z.string().min(1),
-  apiToken: z.string().min(1).optional(),
-});
-const ConnectionSchema = z.discriminatedUnion("provider", [
-  LinearConnectionSchema,
-  GithubConnectionSchema,
-]);
-const RoutingConditionSchema = z.record(
-  z.string().min(1),
-  z.array(z.string().min(1)).min(1),
-);
-const WebhookSchema = z.object({
-  connection: ConfigIdSchema,
-  secret: z.string().min(1),
-  webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
-  repositoryRouting: z.record(
-    ConfigIdSchema,
-    z.object({
-      when: z.array(RoutingConditionSchema).min(1).optional(),
-    }),
-  ).default({}),
-});
+const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
   .object({
     stateDir: z.string().min(1).optional(),
@@ -141,7 +141,6 @@ export const ServiceFileSchema = z.object({
       databaseUrl: z.string().min(1).optional(),
       acpSocketPath: z.string().min(1).optional(),
       controlSocketPath: z.string().min(1).optional(),
-      webhooks: z.record(ConfigIdSchema, WebhookSchema).default({}),
     }),
     zed: z.object({
       connection: z.enum(["local", "ssh"]).default("local"),
@@ -163,7 +162,6 @@ export const ServiceFileSchema = z.object({
       gitRemote: z.string().min(1).optional(),
       branch: z.string().min(1).default("main"),
       script: z.string().min(1).optional(),
-      jobLabel: z.string().min(1).optional(),
       tunnelName: z.string().min(1).optional(),
     }).default({ branch: "main" }),
     updates: z.object({
@@ -177,31 +175,29 @@ export const ServiceFileSchema = z.object({
   if (repositoryIds.size === 0) {
     context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
   }
-  if (!Object.values(file.connections).some((connection) => connection.provider === "linear")) {
-    context.addIssue({ code: "custom", path: ["connections"], message: "at least one Linear connection is required" });
-  }
   if (file.machine.zed.connection === "ssh" && !file.machine.zed.remoteHost) {
     context.addIssue({ code: "custom", path: ["machine", "zed", "remoteHost"], message: "remoteHost is required for an SSH Zed connection" });
   }
-  for (const [webhookId, webhook] of Object.entries(file.machine.server.webhooks)) {
-    const connection = file.connections[webhook.connection];
-    if (!connection) {
-      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "connection"], message: `unknown connection: ${webhook.connection}` });
-      continue;
+  const webhookSlugs = new Set<string>();
+  for (const [connectionId, connection] of Object.entries(file.connections)) {
+    const webhook = connection.webhook;
+    if (!webhook) continue;
+    if (webhook.machineId !== file.machine.id) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "machineId"], message: `unknown machine: ${webhook.machineId}` });
     }
-    const targets = Object.entries(webhook.repositoryRouting);
-    if (connection.provider === "linear" && targets.length === 0) {
-      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting"], message: "a Linear webhook requires at least one repository routing target" });
+    if (webhookSlugs.has(webhook.slug)) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "slug"], message: `duplicate webhook slug: ${webhook.slug}` });
     }
-    if (connection.provider === "github" && targets.length > 0) {
-      context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting"], message: "a GitHub deployment webhook does not use repository routing" });
-    }
-    for (const [repositoryId, target] of targets) {
-      if (!repositoryIds.has(repositoryId)) {
-        context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: `unknown repository: ${repositoryId}` });
+    webhookSlugs.add(webhook.slug);
+    if (webhook.repositories !== "*") {
+      const targets = Object.keys(webhook.repositories);
+      if (targets.length === 0) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "repositories"], message: "a webhook requires at least one repository (or \"*\")" });
       }
-      if (targets.length > 1 && !target.when) {
-        context.addIssue({ code: "custom", path: ["machine", "server", "webhooks", webhookId, "repositoryRouting", repositoryId], message: "an unconditional target must be the webhook's only repository" });
+      for (const repositoryId of targets) {
+        if (!repositoryIds.has(repositoryId)) {
+          context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });
+        }
       }
     }
   }
@@ -272,18 +268,11 @@ export interface LinearConnectionConfig {
   agentHandle: string | null;
 }
 
-export interface GithubConnectionConfig {
-  id: string;
-  provider: "github";
-  name: string;
-  apiToken: string | null;
-}
-
-export type ConnectionConfig = LinearConnectionConfig | GithubConnectionConfig;
+export type ConnectionConfig = LinearConnectionConfig;
 
 export interface WebhookConfig {
   id: string;
-  provider: "linear" | "github";
+  provider: "linear";
   connectionId: string;
   webhookSecret: string;
   webhookMaxAgeMs: number;
@@ -302,7 +291,6 @@ export interface ServerConfig {
   controlIpcPath: string;
   webhookSecret: string;
   apiKey: string;
-  githubWebhookSecret: string;
   linearApiKey: string;
   agentUserId: string;
   agentHandle: string | null;
@@ -320,7 +308,6 @@ export interface ServerConfig {
   webhookMaxAgeMs: number;
   deployScript: string;
   deployBranch: string;
-  deployJobLabel: string;
   reflectOnState: string;
   orchestrateOnState: string;
   describeReactionEmoji: string;
@@ -456,55 +443,47 @@ export function readConfig(): ServerConfig {
     }),
   );
   const connections = Object.fromEntries(
-    Object.entries(file.connections).map(([id, connection]) => [id,
-      connection.provider === "linear"
-        ? {
-            id,
-            provider: "linear" as const,
-            name: connection.name,
-            apiKey: connection.apiKey,
-            agentUserId: connection.agentUserId,
-            agentHandle: connection.agentHandle ?? null,
-          } satisfies LinearConnectionConfig
-        : {
-            id,
-            provider: "github" as const,
-            name: connection.name,
-            apiToken: connection.apiToken ?? null,
-          } satisfies GithubConnectionConfig,
-    ]),
-  );
-  const webhooks = Object.fromEntries(
-    Object.entries(file.machine.server.webhooks).map(([id, webhook]) => [id, {
+    Object.entries(file.connections).map(([id, connection]) => [id, {
       id,
-      provider: file.connections[webhook.connection]!.provider,
-      connectionId: webhook.connection,
-      webhookSecret: webhook.secret,
-      webhookMaxAgeMs: webhook.webhookMaxAgeMs,
-      repositoryRouting: Object.fromEntries(
-        Object.entries(webhook.repositoryRouting).map(([repositoryId, target]) => [
-          repositoryId,
-          target.when
-            ? {
-                when: target.when.map((condition) => Object.fromEntries(
-                  Object.entries(condition).map(([key, values]) => [key, [...values]]),
-                )),
-              }
-            : {},
-        ]),
-      ),
-    } satisfies WebhookConfig]),
+      provider: "linear" as const,
+      name: connection.name,
+      apiKey: connection.apiKey,
+      agentUserId: connection.agentUserId,
+      agentHandle: connection.agentHandle ?? null,
+    } satisfies LinearConnectionConfig]),
+  );
+  // Webhooks nest inside connections in the file; the resolved view stays a
+  // slug-keyed map so routing lookups are unchanged. "*" expands to every
+  // repository as an unconditional target.
+  const webhooks = Object.fromEntries(
+    Object.entries(file.connections).flatMap(([connectionId, connection]) => {
+      const webhook = connection.webhook;
+      if (!webhook) return [];
+      const targets = webhook.repositories === "*"
+        ? Object.keys(file.repositories).map((repositoryId) => [repositoryId, {}] as const)
+        : Object.entries(webhook.repositories).map(([repositoryId, target]) => [
+            repositoryId,
+            target.when
+              ? {
+                  when: target.when.map((condition) => Object.fromEntries(
+                    Object.entries(condition).map(([key, values]) => [key, [...values]]),
+                  )),
+                }
+              : {},
+          ] as const);
+      return [[webhook.slug, {
+        id: webhook.slug,
+        provider: connection.provider,
+        connectionId,
+        webhookSecret: webhook.secret,
+        webhookMaxAgeMs: webhook.webhookMaxAgeMs,
+        repositoryRouting: Object.fromEntries(targets),
+      } satisfies WebhookConfig]];
+    }),
   );
   const firstRepository = Object.values(repositories)[0]!;
-  const firstConnection = Object.values(connections).find(
-    (connection): connection is LinearConnectionConfig => connection.provider === "linear",
-  )!;
-  const firstWebhook = Object.values(webhooks).find(
-    (webhook) => webhook.provider === "linear",
-  );
-  const githubWebhook = Object.values(webhooks).find(
-    (webhook) => webhook.provider === "github",
-  );
+  const firstConnection = Object.values(connections)[0];
+  const firstWebhook = Object.values(webhooks)[0];
 
   return {
     serviceName: file.serviceName,
@@ -524,10 +503,9 @@ export function readConfig(): ServerConfig {
     ),
     webhookSecret: firstWebhook?.webhookSecret ?? "unused",
     apiKey: file.machine.server.apiKey,
-    githubWebhookSecret: githubWebhook?.webhookSecret ?? "unused",
-    linearApiKey: firstConnection.apiKey,
-    agentUserId: firstConnection.agentUserId,
-    agentHandle: firstConnection.agentHandle,
+    linearApiKey: firstConnection?.apiKey ?? "unused",
+    agentUserId: firstConnection?.agentUserId ?? "unused",
+    agentHandle: firstConnection?.agentHandle ?? null,
     // Legacy, unmounted Agent-team projection helpers still compile against
     // this alias. It is no longer configurable or used by production routes.
     agentTeamKey: "AGENT",
@@ -552,8 +530,6 @@ export function readConfig(): ServerConfig {
     deployScript:
       file.machine.installation.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
     deployBranch: file.machine.installation.branch,
-    deployJobLabel:
-      file.machine.installation.jobLabel ?? `dev.${file.serviceName}.deploy`,
     reflectOnState: firstRepository.triggers.reflectOnState,
     orchestrateOnState: firstRepository.triggers.orchestrateOnState,
     describeReactionEmoji: firstRepository.triggers.describeOnReaction,
@@ -567,7 +543,7 @@ export function readConfig(): ServerConfig {
     connections,
     webhooks,
     repositories,
-    activeConnectionId: firstConnection.id,
+    activeConnectionId: firstConnection?.id ?? "",
     activeWebhookId: firstWebhook?.id ?? "",
     activeRepositoryId: firstRepository.id,
   };
