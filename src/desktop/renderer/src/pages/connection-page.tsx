@@ -220,6 +220,7 @@ function WebhookEditor({
           </InputGroupAddon>
           <InputGroupInput
             value={slug}
+            className="pl-0!"
             onChange={(event) => setSlug(event.target.value)}
             onBlur={renameWebhook}
             onKeyDown={(event) => event.key === "Enter" && event.currentTarget.blur()}
