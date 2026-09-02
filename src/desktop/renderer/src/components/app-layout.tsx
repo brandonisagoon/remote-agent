@@ -53,6 +53,7 @@ export function AppLayout() {
               name: "New Linear Connection",
               apiKey: "replace-me",
               agentUserId: "replace-me",
+              router: { executable: "codex", timeoutMs: 30_000 },
               webhook: {
                 machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,

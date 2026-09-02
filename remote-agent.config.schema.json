@@ -170,35 +170,6 @@
           ],
           "additionalProperties": false
         },
-        "runtime": {
-          "default": {
-            "codexExecutable": "codex",
-            "routerTimeoutMs": 30000
-          },
-          "type": "object",
-          "properties": {
-            "codexExecutable": {
-              "default": "codex",
-              "type": "string",
-              "minLength": 1
-            },
-            "routerModel": {
-              "type": "string",
-              "minLength": 1
-            },
-            "routerTimeoutMs": {
-              "default": 30000,
-              "type": "integer",
-              "exclusiveMinimum": 0,
-              "maximum": 9007199254740991
-            }
-          },
-          "required": [
-            "codexExecutable",
-            "routerTimeoutMs"
-          ],
-          "additionalProperties": false
-        },
         "acp": {
           "default": {
             "provider": "codex"
@@ -288,7 +259,6 @@
         "server",
         "zed",
         "acpx",
-        "runtime",
         "acp",
         "installation",
         "updates"
@@ -399,13 +369,43 @@
               "repositories"
             ],
             "additionalProperties": false
+          },
+          "router": {
+            "default": {
+              "executable": "codex",
+              "timeoutMs": 30000
+            },
+            "type": "object",
+            "properties": {
+              "executable": {
+                "default": "codex",
+                "type": "string",
+                "minLength": 1
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1
+              },
+              "timeoutMs": {
+                "default": 30000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "executable",
+              "timeoutMs"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
           "provider",
           "name",
           "apiKey",
-          "agentUserId"
+          "agentUserId",
+          "router"
         ],
         "additionalProperties": false
       }

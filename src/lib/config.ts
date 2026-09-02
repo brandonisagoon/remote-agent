@@ -91,6 +91,14 @@ const WebhookSchema = z.object({
     ),
   ]).default("*"),
 });
+const RouterSchema = z
+  .object({
+    /** CLI that runs the session-routing prompt (Codex-compatible). */
+    executable: z.string().min(1).default("codex"),
+    model: z.string().min(1).optional(),
+    timeoutMs: PositiveIntegerSchema.default(30_000),
+  })
+  .default({ executable: "codex", timeoutMs: 30_000 });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
@@ -98,6 +106,8 @@ const LinearConnectionSchema = z.object({
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
   webhook: WebhookSchema.optional(),
+  /** Routes this connection's incoming events to sessions. */
+  router: RouterSchema,
 });
 const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
@@ -147,11 +157,6 @@ export const ServiceFileSchema = z.object({
       remoteHost: z.string().min(1).optional(),
     }).default({ connection: "local" }),
     acpx: AcpxSchema,
-    runtime: z.object({
-      codexExecutable: z.string().min(1).default("codex"),
-      routerModel: z.string().min(1).optional(),
-      routerTimeoutMs: PositiveIntegerSchema.default(30_000),
-    }).default({ codexExecutable: "codex", routerTimeoutMs: 30_000 }),
     acp: z.object({
       hostId: z.string().min(1).optional(),
       provider: z.enum(["codex", "claude-code"]).default("codex"),
@@ -266,6 +271,7 @@ export interface LinearConnectionConfig {
   apiKey: string;
   agentUserId: string;
   agentHandle: string | null;
+  router: { executable: string; model: string | null; timeoutMs: number };
 }
 
 export type ConnectionConfig = LinearConnectionConfig;
@@ -450,6 +456,11 @@ export function readConfig(): ServerConfig {
       apiKey: connection.apiKey,
       agentUserId: connection.agentUserId,
       agentHandle: connection.agentHandle ?? null,
+      router: {
+        executable: connection.router.executable,
+        model: connection.router.model ?? null,
+        timeoutMs: connection.router.timeoutMs,
+      },
     } satisfies LinearConnectionConfig]),
   );
   // Webhooks nest inside connections in the file; the resolved view stays a
@@ -512,9 +523,9 @@ export function readConfig(): ServerConfig {
     hosts,
     machine,
     zedRemoteHost,
-    codexExecutable: file.machine.runtime.codexExecutable,
-    routerModel: file.machine.runtime.routerModel ?? null,
-    routerTimeoutMs: file.machine.runtime.routerTimeoutMs,
+    codexExecutable: firstConnection?.router.executable ?? "codex",
+    routerModel: firstConnection?.router.model ?? null,
+    routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
     acpxPermissionMode: file.machine.acpx.permissionMode,
     acpxNonInteractivePermissions: file.machine.acpx.nonInteractivePermissions,
@@ -661,6 +672,9 @@ export function scopeConfig(
     linearApiKey: connection.apiKey,
     agentUserId: connection.agentUserId,
     agentHandle: connection.agentHandle,
+    codexExecutable: connection.router.executable,
+    routerModel: connection.router.model,
+    routerTimeoutMs: connection.router.timeoutMs,
     agentTeamKey: config.agentTeamKey,
     repository,
     reflectOnState: repository.triggers.reflectOnState,

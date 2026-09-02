@@ -34,7 +34,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
   const connection = value.connections[id];
   if (!connection) return <PageHeading title="Connection not found" description={id} />;
   return (
-    <Accordion type="multiple" defaultValue={["general", "authentication", "agent"]} className="-mt-4">
+    <Accordion type="multiple" defaultValue={["general", "authentication", "agent", "router"]} className="-mt-4">
       <SettingsSection value="general" title="General">
         <SettingsCard>
           <Field label="Display name" value={connection.name} onChange={(next) => mutate((file) => { file.connections[id]!.name = next; })} />
@@ -67,6 +67,21 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
           {connection.webhook && (
             <WebhookEditor connectionId={id} webhook={connection.webhook} value={value} mutate={mutate} />
           )}
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection
+        value="router"
+        title="Session Router"
+        description="The Codex invocation that decides which session this connection's incoming events belong to."
+      >
+        <SettingsCard>
+          <Field label="Router executable" value={connection.router.executable} onChange={(next) => mutate((file) => { file.connections[id]!.router.executable = next; })} />
+          <Field
+            label="Router model"
+            value={connection.router.model ?? ""}
+            description="Optional; the executable's default model when empty."
+            onChange={(next) => mutate((file) => { file.connections[id]!.router.model = next || undefined; })}
+          />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection

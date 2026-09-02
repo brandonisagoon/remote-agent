@@ -33,7 +33,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   return (
     <Accordion
       type="multiple"
-      defaultValue={["service", "identity", "server", "runtime"]}
+      defaultValue={["service", "identity", "server", "acp", "storage", "editor", "sessions"]}
       className="-mt-4"
     >
       <SettingsSection value="service" title="Service" description="Install, inspect, and update the local daemon.">
@@ -74,19 +74,17 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection value="identity" title="Identity & storage">
+      <SettingsSection value="identity" title="Identity">
         <SettingsCard>
           <Field label="Machine ID" value={machine.id} onChange={(next) => mutate((file) => { file.machine.id = next; })} />
           <Field label="Display name" value={machine.name} onChange={(next) => mutate((file) => { file.machine.name = next; })} />
-          <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
-          <Field label="acpx state directory" value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
         </SettingsCard>
       </SettingsSection>
 
       <SettingsSection
         value="server"
         title="Server"
-        description="Where the daemon listens. Changing these requires a daemon restart."
+        description="Where the daemon listens for HTTP. Changing these requires a daemon restart."
       >
         <SettingsCard>
           <div className="grid gap-4 sm:grid-cols-2">
@@ -94,11 +92,32 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             <Field label="Port" type="number" value={machine.server.listen.port} onChange={(next) => mutate((file) => { file.machine.server.listen.port = Number(next); })} />
           </div>
           <Field label="Public URL" value={machine.server.publicUrl} onChange={(next) => mutate((file) => { file.machine.server.publicUrl = next; })} />
-          <Field label="ACP socket" value={machine.server.acpSocketPath ?? ""} onChange={(next) => mutate((file) => { file.machine.server.acpSocketPath = next; })} />
         </SettingsCard>
       </SettingsSection>
 
-      <SettingsSection value="runtime" title="Zed & runtime">
+      <SettingsSection
+        value="acp"
+        title="ACP"
+        description="Unix sockets for the Agent Client Protocol bridge and its control channel."
+      >
+        <SettingsCard>
+          <Field label="ACP socket" value={machine.server.acpSocketPath ?? ""} onChange={(next) => mutate((file) => { file.machine.server.acpSocketPath = next; })} />
+          <Field label="Control socket" value={machine.server.controlSocketPath ?? ""} onChange={(next) => mutate((file) => { file.machine.server.controlSocketPath = next; })} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection value="storage" title="Storage">
+        <SettingsCard>
+          <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
+          <Field label="acpx state directory" value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        value="editor"
+        title="Editor"
+        description="How “Open in Zed” links reach this machine's checkouts."
+      >
         <SettingsCard>
           <div className="grid gap-2">
             <Label>Connection</Label>
@@ -118,7 +137,15 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
           {machine.zed.connection === "ssh" && (
             <Field label="SSH host" value={machine.zed.remoteHost ?? ""} onChange={(next) => mutate((file) => { file.machine.zed.remoteHost = next; })} />
           )}
-          <Field label="Codex executable" value={machine.runtime.codexExecutable} onChange={(next) => mutate((file) => { file.machine.runtime.codexExecutable = next; })} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        value="sessions"
+        title="Sessions"
+        description="Defaults for agent sessions run by this machine."
+      >
+        <SettingsCard>
           <div className="grid gap-2">
             <Label>Permission mode</Label>
             <Select

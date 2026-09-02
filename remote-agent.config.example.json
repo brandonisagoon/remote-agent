@@ -26,10 +26,6 @@
       "nonInteractivePermissions": "deny",
       "agents": {}
     },
-    "runtime": {
-      "codexExecutable": "codex",
-      "routerTimeoutMs": 30000
-    },
     "acp": {
       "provider": "codex"
     },
@@ -54,6 +50,10 @@
         "secret": "replace-with-linear-webhook-secret",
         "webhookMaxAgeMs": 60000,
         "repositories": "*"
+      },
+      "router": {
+        "executable": "codex",
+        "timeoutMs": 30000
       }
     }
   },

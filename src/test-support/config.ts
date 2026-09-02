@@ -64,6 +64,7 @@ export function testConfig(
       apiKey: "test-linear-key",
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
+      router: { executable: "codex", model: null, timeoutMs: 30_000 },
     },
   };
   const webhooks = overrides.webhooks ?? {
