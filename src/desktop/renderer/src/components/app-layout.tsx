@@ -61,14 +61,14 @@ export function AppLayout() {
               name: "New Linear Connection",
               apiKey: "replace-me",
               agentUserId: "replace-me",
+              machineId: value.machine.id,
+              repositories: "*",
               router: { providerId: "codex", timeoutMs: 30_000 },
-              editors: [{ name: "Zed", scheme: "zed", connection: "local" }],
+              editors: [{ name: "Zed", scheme: "zed" }],
               webhook: {
-                machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,
                 secret: randomHex(16),
                 webhookMaxAgeMs: 60_000,
-                repositories: "*",
               },
             };
           };

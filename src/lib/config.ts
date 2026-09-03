@@ -75,22 +75,10 @@ const RoutingConditionSchema = z.record(
   z.array(z.string().min(1)).min(1),
 );
 const WebhookSchema = z.object({
-  /** The machine whose daemon serves this endpoint. */
-  machineId: MachineSchema,
   /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
   slug: ConfigIdSchema,
   secret: z.string().min(1),
   webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
-  /** "*" subscribes every repository, present and future. */
-  repositories: z.union([
-    z.literal("*"),
-    z.record(
-      ConfigIdSchema,
-      z.object({
-        when: z.array(RoutingConditionSchema).min(1).optional(),
-      }),
-    ),
-  ]).default("*"),
 });
 const RouterSchema = z
   .object({
@@ -101,14 +89,10 @@ const RouterSchema = z
   })
   .default({ providerId: "codex", timeoutMs: 30_000 });
 const EditorSchema = z.object({
-  /** Display name of the chosen editor app (e.g. "Zed"). */
+  /** Display name of the editor app (e.g. "Zed"). */
   name: z.string().min(1).default("Zed"),
   /** URL scheme used for worktree deep links. */
   scheme: z.string().min(1).default("zed"),
-  /** The picked .app bundle, when chosen via the file selector. */
-  appPath: z.string().min(1).optional(),
-  connection: z.enum(["local", "ssh"]).default("local"),
-  remoteHost: z.string().min(1).optional(),
 });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
@@ -116,11 +100,24 @@ const LinearConnectionSchema = z.object({
   apiKey: z.string().min(1),
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
+  /** The machine that serves this connection's webhook and runs its sessions. */
+  machineId: MachineSchema.optional(),
+  /** Repositories this connection's sessions may work in; "*" subscribes
+      every repository, present and future. */
+  repositories: z.union([
+    z.literal("*"),
+    z.record(
+      ConfigIdSchema,
+      z.object({
+        when: z.array(RoutingConditionSchema).min(1).optional(),
+      }),
+    ),
+  ]).default("*"),
   webhook: WebhookSchema.optional(),
   /** Routes this connection's incoming events to sessions. */
   router: RouterSchema,
   /** The editors worktree deep links open for this workspace's viewers. */
-  editors: z.array(EditorSchema).default([{ name: "Zed", scheme: "zed", connection: "local" }]),
+  editors: z.array(EditorSchema).default([{ name: "Zed", scheme: "zed" }]),
 });
 const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
@@ -158,6 +155,8 @@ export const ServiceFileSchema = z.object({
       acpSocketPath: z.string().min(1).optional(),
       controlSocketPath: z.string().min(1).optional(),
     }),
+    /** How editors reach this machine over SSH (e.g. user@host). */
+    sshHost: z.string().min(1).optional(),
     acpx: AcpxSchema,
     acp: z.object({
       hostId: z.string().min(1).optional(),
@@ -190,11 +189,22 @@ export const ServiceFileSchema = z.object({
         context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "scheme"], message: `duplicate editor scheme: ${editor.scheme}` });
       }
       schemes.add(editor.scheme);
-      if (editor.connection === "ssh" && !editor.remoteHost) {
-        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "remoteHost"], message: "remoteHost is required for an SSH editor connection" });
+      if (file.machine.sshHost && !sshLinkSupported(editor.scheme)) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "scheme"], message: `editor scheme ${editor.scheme} has no SSH link format` });
       }
-      if (editor.connection === "ssh" && !sshLinkSupported(editor.scheme)) {
-        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "connection"], message: `editor scheme ${editor.scheme} has no SSH link format` });
+    }
+    if (connection.machineId !== undefined && connection.machineId !== file.machine.id) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "machineId"], message: `unknown machine: ${connection.machineId}` });
+    }
+    if (connection.repositories !== "*") {
+      const targets = Object.keys(connection.repositories);
+      if (targets.length === 0) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories"], message: "a connection requires at least one repository (or \"*\")" });
+      }
+      for (const repositoryId of targets) {
+        if (!repositoryIds.has(repositoryId)) {
+          context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });
+        }
       }
     }
   }
@@ -202,24 +212,10 @@ export const ServiceFileSchema = z.object({
   for (const [connectionId, connection] of Object.entries(file.connections)) {
     const webhook = connection.webhook;
     if (!webhook) continue;
-    if (webhook.machineId !== file.machine.id) {
-      context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "machineId"], message: `unknown machine: ${webhook.machineId}` });
-    }
     if (webhookSlugs.has(webhook.slug)) {
       context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "slug"], message: `duplicate webhook slug: ${webhook.slug}` });
     }
     webhookSlugs.add(webhook.slug);
-    if (webhook.repositories !== "*") {
-      const targets = Object.keys(webhook.repositories);
-      if (targets.length === 0) {
-        context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "repositories"], message: "a webhook requires at least one repository (or \"*\")" });
-      }
-      for (const repositoryId of targets) {
-        if (!repositoryIds.has(repositoryId)) {
-          context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });
-        }
-      }
-    }
   }
   for (const [repositoryId, repository] of Object.entries(file.repositories)) {
     for (const [key, values] of Object.entries(repository.sessionDefaults.tags)) {
@@ -483,8 +479,8 @@ export function readConfig(): ServerConfig {
       editors: connection.editors.map((editor) => ({
         name: editor.name,
         scheme: editor.scheme,
-        connection: editor.connection,
-        remoteHost: editor.remoteHost ?? null,
+        connection: file.machine.sshHost ? ("ssh" as const) : ("local" as const),
+        remoteHost: file.machine.sshHost ?? null,
       })),
     } satisfies LinearConnectionConfig]),
   );
@@ -495,9 +491,9 @@ export function readConfig(): ServerConfig {
     Object.entries(file.connections).flatMap(([connectionId, connection]) => {
       const webhook = connection.webhook;
       if (!webhook) return [];
-      const targets = webhook.repositories === "*"
+      const targets = connection.repositories === "*"
         ? Object.keys(file.repositories).map((repositoryId) => [repositoryId, {}] as const)
-        : Object.entries(webhook.repositories).map(([repositoryId, target]) => [
+        : Object.entries(connection.repositories).map(([repositoryId, target]) => [
             repositoryId,
             target.when
               ? {

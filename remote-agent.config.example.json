@@ -39,11 +39,9 @@
       "agentUserId": "replace-with-linear-agent-user-id",
       "agentHandle": "agent",
       "webhook": {
-        "machineId": "studio-mac",
         "slug": "linear-product",
         "secret": "replace-with-linear-webhook-secret",
-        "webhookMaxAgeMs": 60000,
-        "repositories": "*"
+        "webhookMaxAgeMs": 60000
       },
       "router": {
         "providerId": "codex",
@@ -52,10 +50,11 @@
       "editors": [
         {
           "name": "Zed",
-          "scheme": "zed",
-          "connection": "local"
+          "scheme": "zed"
         }
-      ]
+      ],
+      "machineId": "studio-mac",
+      "repositories": "*"
     }
   },
   "repositories": {

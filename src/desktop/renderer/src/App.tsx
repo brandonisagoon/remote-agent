@@ -19,18 +19,21 @@ function clone<T>(value: T): T {
 }
 
 /** Repairs invariants the schema allows but the UI assumes; returns whether
-    anything changed. Currently: every connection owns exactly one webhook. */
+    anything changed. Currently: every connection owns exactly one webhook and
+    is bound to the machine. */
 function healConfig(value: ServiceFile): boolean {
   let changed = false;
   for (const connection of Object.values(value.connections)) {
     if (!connection.webhook) {
       connection.webhook = {
-        machineId: value.machine.id,
         slug: `wh-${randomHex(6)}`,
         secret: randomHex(16),
         webhookMaxAgeMs: 60_000,
-        repositories: "*",
       };
+      changed = true;
+    }
+    if (connection.machineId === undefined) {
+      connection.machineId = value.machine.id;
       changed = true;
     }
   }

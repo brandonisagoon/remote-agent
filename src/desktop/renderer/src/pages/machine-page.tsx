@@ -34,7 +34,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   return (
     <Accordion
       type="multiple"
-      defaultValue={["service", "identity", "server", "acp", "storage"]}
+      defaultValue={["service", "identity", "server", "remote-access", "acp", "storage"]}
       className="-mt-4"
     >
       <SettingsSection value="service" title="Service" description="Install, inspect, and update the local daemon.">
@@ -112,6 +112,21 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         <SettingsCard>
           <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
           <Field label="Session State Directory" description="Where acpx persists each session's conversation state." value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection
+        value="remote-access"
+        title="Remote Access"
+        description="The SSH address editors use to open this machine's worktrees. Leave blank if your editors run on this machine."
+      >
+        <SettingsCard>
+          <Field
+            label="SSH Host"
+            placeholder="user@host"
+            value={machine.sshHost ?? ""}
+            onChange={(next) => mutate((file) => { file.machine.sshHost = next || undefined; })}
+          />
         </SettingsCard>
       </SettingsSection>
 

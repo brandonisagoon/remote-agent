@@ -4,7 +4,7 @@ import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 
 import type { ServiceFile } from "../../../../lib/config.ts";
-import { buildEditorDeepLink, sshLinkSupported } from "../../../../lib/machines/editor-link.ts";
+import { sshLinkSupported } from "../../../../lib/machines/editor-link.ts";
 import { CopyField } from "@renderer/components/copy-field.tsx";
 import { JsonBlock } from "@renderer/components/json-block.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -14,8 +14,6 @@ import { SecretField } from "@renderer/components/secret-field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
-import { Input } from "@renderer/components/ui/input.tsx";
-import { RadioGroup, RadioGroupItem } from "@renderer/components/ui/radio-group.tsx";
 import {
   Table,
   TableBody,
@@ -26,6 +24,7 @@ import {
 } from "@renderer/components/ui/table.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
+import { Input } from "@renderer/components/ui/input.tsx";
 import {
   InputGroup,
   InputGroupAddon,
@@ -56,21 +55,6 @@ function useProviderModels(providerId: string, currentModel: string | null): str
   return models;
 }
 
-type ConnectionEditor = ServiceFile["connections"][string]["editors"][number];
-
-function editorLinkPreview(editor: ConnectionEditor): string {
-  try {
-    return buildEditorDeepLink(
-      editor.connection,
-      editor.scheme,
-      editor.remoteHost ?? (editor.connection === "ssh" ? "host" : null),
-      "/…/worktree",
-    );
-  } catch {
-    return "—";
-  }
-}
-
 export function ConnectionPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const connection = value.connections[id];
   const routerModels = useProviderModels(
@@ -79,11 +63,20 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
   );
   if (!connection) return <PageHeading title="Connection not found" description={id} />;
   return (
-    <Accordion type="multiple" defaultValue={["general", "authentication", "agent", "router", "editor"]} className="-mt-4">
+    <Accordion type="multiple" defaultValue={["general", "machine", "authentication", "agent", "router", "editor"]} className="-mt-4">
       <SettingsSection value="general" title="General">
         <SettingsCard>
           <Field label="Display name" value={connection.name} onChange={(next) => mutate((file) => { file.connections[id]!.name = next; })} />
           <CopyField label="Connection ID" value={id} />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection
+        value="machine"
+        title="Machine"
+        description="Where this workspace's sessions run, and which repositories they may work in."
+      >
+        <SettingsCard>
+          <MachineScopeEditor connectionId={id} value={value} mutate={mutate} />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection
@@ -100,8 +93,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
             >
               Linear API settings
             </a>
-            , then register the webhook URL and secret below in the same place. The webhook is
-            served by the selected machine and only accepts events for the checked repositories.
+            , then register the webhook URL and secret below in the same place.
           </>
         }
       >
@@ -193,60 +185,54 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
       </SettingsSection>
       <SettingsSection
         value="editor"
-        title="Editors"
-        description="Where worktree deep links posted to this workspace open — one link per editor."
+        title="Editor Deep Links"
+        description="Open a session's worktree in your editor straight from Linear."
       >
         <SettingsCard>
           <div className="bg-background rounded-md border">
-            <Table>
+            <Table className="table-fixed">
               <TableHeader>
                 <TableRow>
-                  <TableHead>Editor</TableHead>
-                  <TableHead>Location</TableHead>
-                  <TableHead>Link Preview</TableHead>
-                  <TableHead className="w-10" />
+                  <TableHead className="w-[45%]">Editor</TableHead>
+                  <TableHead>Deep Link</TableHead>
+                  <TableHead className="w-12" />
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {connection.editors.map((editor, index) => (
-                  <TableRow key={`${editor.scheme}-${index}`}>
-                    <TableCell>{editor.name}</TableCell>
+                  <TableRow key={index}>
                     <TableCell>
-                      <div className="grid gap-2">
-                        <RadioGroup
-                          className="flex items-center gap-4"
-                          value={editor.connection}
-                          onValueChange={(next) =>
+                      <Input
+                        className="h-8"
+                        placeholder="Code Editor"
+                        aria-invalid={!editor.name}
+                        value={editor.name}
+                        onChange={(event) =>
+                          mutate((file) => {
+                            file.connections[id]!.editors[index]!.name = event.target.value;
+                          })
+                        }
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <InputGroup className="h-8">
+                        <InputGroupInput
+                          className="w-auto flex-none pr-0! font-mono field-sizing-content"
+                          placeholder="scheme"
+                          aria-invalid={!editor.scheme}
+                          value={editor.scheme}
+                          onChange={(event) =>
                             mutate((file) => {
-                              file.connections[id]!.editors[index]!.connection = next as "local" | "ssh";
+                              file.connections[id]!.editors[index]!.scheme = event.target.value;
                             })
                           }
-                        >
-                          <label className="flex items-center gap-1.5 text-sm">
-                            <RadioGroupItem value="local" />
-                            Local
-                          </label>
-                          <label className="flex items-center gap-1.5 text-sm">
-                            <RadioGroupItem value="ssh" disabled={!sshLinkSupported(editor.scheme)} />
-                            SSH
-                          </label>
-                        </RadioGroup>
-                        {editor.connection === "ssh" && (
-                          <Input
-                            className="h-8"
-                            placeholder="ssh host"
-                            value={editor.remoteHost ?? ""}
-                            onChange={(event) =>
-                              mutate((file) => {
-                                file.connections[id]!.editors[index]!.remoteHost = event.target.value || undefined;
-                              })
-                            }
-                          />
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-muted-foreground max-w-48 truncate font-mono text-xs">
-                      {editorLinkPreview(editor)}
+                        />
+                        {/* Content-sized input keeps :// attached to the typed
+                            scheme; the addon fills the rest so clicks focus. */}
+                        <InputGroupAddon align="inline-end" className="flex-1 justify-start pl-0">
+                          <InputGroupText className="font-mono">://</InputGroupText>
+                        </InputGroupAddon>
+                      </InputGroup>
                     </TableCell>
                     <TableCell>
                       <Button
@@ -273,26 +259,11 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
             <Button
               variant="outline"
               size="sm"
-              onClick={async () => {
-                const picked = await window.remoteAgent.editor.pick();
-                if (!picked) return;
-                if ("error" in picked) {
-                  toast.error("That app has no URL scheme, so it can't open deep links");
-                  return;
-                }
-                if (connection.editors.some((editor) => editor.scheme === picked.editor.scheme)) {
-                  toast.error(`${picked.editor.name} is already configured`);
-                  return;
-                }
+              onClick={() =>
                 mutate((file) => {
-                  file.connections[id]!.editors.push({
-                    name: picked.editor.name,
-                    scheme: picked.editor.scheme,
-                    appPath: picked.editor.appPath,
-                    connection: "local",
-                  });
-                });
-              }}
+                  file.connections[id]!.editors.push({ name: "", scheme: "" });
+                })
+              }
             >
               <F7Icon name="plus" />
               Add Editor
@@ -304,53 +275,29 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
   );
 }
 
-type ConnectionWebhook = NonNullable<ServiceFile["connections"][string]["webhook"]>;
-
-function WebhookEditor({
+function MachineScopeEditor({
   connectionId,
-  webhook,
   value,
   mutate,
 }: {
   connectionId: string;
-  webhook: ConnectionWebhook;
   value: ServiceFile;
   mutate: Mutate;
 }) {
-  const routingMode = webhook.repositories === "*" ? "all" : "select";
+  const connection = value.connections[connectionId]!;
+  const repositories = connection.repositories;
+  const routingMode = repositories === "*" ? "all" : "select";
   const routingTargets =
-    webhook.repositories === "*" ? Object.keys(value.repositories) : Object.keys(webhook.repositories);
-  const urlPrefix = `${value.machine.server.publicUrl.replace(/\/$/, "")}/webhooks/`;
-
-  const [slug, setSlug] = useState(webhook.slug);
-  useEffect(() => setSlug(webhook.slug), [webhook.slug]);
-  const renameWebhook = () => {
-    const next = slug.trim();
-    if (next === webhook.slug) return;
-    const valid = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(next);
-    const taken = Object.values(value.connections).some((other) => other.webhook?.slug === next);
-    if (!valid || taken) {
-      setSlug(webhook.slug);
-      toast.error(valid ? "A webhook with this slug already exists" : "Slug must be lowercase letters, digits, and ._-");
-      return;
-    }
-    mutate((file) => {
-      file.connections[connectionId]!.webhook!.slug = next;
-    });
-  };
-  const copyUrl = async () => {
-    await navigator.clipboard.writeText(`${urlPrefix}${webhook.slug}`);
-    toast.success("Webhook URL copied");
-  };
+    repositories === "*" ? Object.keys(value.repositories) : Object.keys(repositories);
   const toggleRepository = (repositoryId: string, checked: boolean) => {
     mutate((file) => {
-      const hook = file.connections[connectionId]!.webhook!;
-      const routing = hook.repositories === "*"
+      const scope = file.connections[connectionId]!;
+      const routing = scope.repositories === "*"
         ? Object.fromEntries(Object.keys(file.repositories).map((repo) => [repo, {}]))
-        : hook.repositories;
+        : scope.repositories;
       if (checked) routing[repositoryId] = routing[repositoryId] ?? {};
       else delete routing[repositoryId];
-      hook.repositories = routing;
+      scope.repositories = routing;
     });
   };
   return (
@@ -363,12 +310,12 @@ function WebhookEditor({
           <Tooltip>
             <TooltipTrigger asChild>
               <span className="flex-1">
-                <Select value={webhook.machineId} disabled>
+                <Select value={connection.machineId ?? value.machine.id} disabled>
                   <SelectTrigger className="w-full border-0 bg-transparent shadow-none dark:bg-transparent">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    <SelectItem value={webhook.machineId}>{value.machine.name}</SelectItem>
+                    <SelectItem value={connection.machineId ?? value.machine.id}>{value.machine.name}</SelectItem>
                   </SelectContent>
                 </Select>
               </span>
@@ -396,11 +343,11 @@ function WebhookEditor({
           value={routingMode}
           onValueChange={(mode) => {
             mutate((file) => {
-              const hook = file.connections[connectionId]!.webhook!;
+              const scope = file.connections[connectionId]!;
               if (mode === "all") {
-                hook.repositories = "*";
-              } else if (hook.repositories === "*") {
-                hook.repositories = Object.fromEntries(
+                scope.repositories = "*";
+              } else if (scope.repositories === "*") {
+                scope.repositories = Object.fromEntries(
                   Object.keys(file.repositories).map((repositoryId) => [repositoryId, {}]),
                 );
               }
@@ -417,7 +364,7 @@ function WebhookEditor({
             {Object.entries(value.repositories).map(([repositoryId, repository]) => {
               const checked = routingTargets.includes(repositoryId);
               const conditional =
-                webhook.repositories !== "*" && (webhook.repositories[repositoryId]?.when?.length ?? 0) > 0;
+                repositories !== "*" && (repositories[repositoryId]?.when?.length ?? 0) > 0;
               return (
                 <label key={repositoryId} className="flex items-center gap-2 text-sm">
                   <Checkbox
@@ -433,6 +380,47 @@ function WebhookEditor({
           </div>
         )}
       </div>
+    </>
+  );
+}
+
+type ConnectionWebhook = NonNullable<ServiceFile["connections"][string]["webhook"]>;
+
+function WebhookEditor({
+  connectionId,
+  webhook,
+  value,
+  mutate,
+}: {
+  connectionId: string;
+  webhook: ConnectionWebhook;
+  value: ServiceFile;
+  mutate: Mutate;
+}) {
+  const urlPrefix = `${value.machine.server.publicUrl.replace(/\/$/, "")}/webhooks/`;
+
+  const [slug, setSlug] = useState(webhook.slug);
+  useEffect(() => setSlug(webhook.slug), [webhook.slug]);
+  const renameWebhook = () => {
+    const next = slug.trim();
+    if (next === webhook.slug) return;
+    const valid = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(next);
+    const taken = Object.values(value.connections).some((other) => other.webhook?.slug === next);
+    if (!valid || taken) {
+      setSlug(webhook.slug);
+      toast.error(valid ? "A webhook with this slug already exists" : "Slug must be lowercase letters, digits, and ._-");
+      return;
+    }
+    mutate((file) => {
+      file.connections[connectionId]!.webhook!.slug = next;
+    });
+  };
+  const copyUrl = async () => {
+    await navigator.clipboard.writeText(`${urlPrefix}${webhook.slug}`);
+    toast.success("Webhook URL copied");
+  };
+  return (
+    <>
       <div className="grid gap-2">
         <Label>Webhook URL</Label>
         <InputGroup>

@@ -20,7 +20,7 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         apiKey: "api-secret",
         databaseUrl: "file:./state.sqlite",
       },
-
+      ...(editorConnection === "ssh" ? { sshHost: "build-host.example" } : {}),
       acpx: {},
     },
     connections: {
@@ -29,12 +29,12 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         name: "Linear Main",
         apiKey: "linear-secret",
         agentUserId: "agent-user",
-        editors: [{ connection: editorConnection }],
+        machineId: "build-host",
+        repositories: { example: {} },
+        editors: [{}],
         webhook: {
-          machineId: "build-host",
           slug: "linear-main",
           secret: "webhook-secret",
-          repositories: { example: {} },
         },
       },
       "linear-second": {
@@ -122,15 +122,22 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("publicUrl");
   });
 
-  test("requires an editor host only for SSH execution hosts", () => {
-    const value = serviceFile("ssh");
-    writeConfig(value);
-    expect(() => readConfig()).toThrow("remoteHost is required");
+  test("derives editor links from the machine's SSH host", () => {
+    writeConfig(serviceFile("local"));
+    expect(readConfig().editors[0]).toMatchObject({ connection: "local", remoteHost: null });
 
-    (value.connections["linear-main"].editors[0] as { connection: "ssh"; remoteHost?: string }).remoteHost =
-      "build-host.example";
+    writeConfig(serviceFile("ssh"));
+    expect(readConfig().editors[0]).toMatchObject({
+      connection: "ssh",
+      remoteHost: "build-host.example",
+    });
+  });
+
+  test("rejects editors without an SSH link format on SSH machines", () => {
+    const value: any = serviceFile("ssh");
+    value.connections["linear-main"].editors = [{ name: "Other", scheme: "other" }];
     writeConfig(value);
-    expect(readConfig().editors[0]?.remoteHost).toBe("build-host.example");
+    expect(() => readConfig()).toThrow("no SSH link format");
   });
 
   test("rejects the legacy fleet-shaped config with migration guidance", () => {
@@ -170,7 +177,7 @@ describe("readConfig", () => {
 
   test("rejects routing outside a webhook repository allowlist", () => {
     const value: any = serviceFile();
-    value.connections["linear-main"].webhook.repositories = {
+    value.connections["linear-main"].repositories = {
       missing: { when: [{ "linear.teamId": ["team"] }] },
     };
     writeConfig(value);
@@ -184,7 +191,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.connections["linear-main"].webhook.repositories = {
+    value.connections["linear-main"].repositories = {
       example: {
         when: [
           {
@@ -218,7 +225,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.connections["linear-main"].webhook.repositories = {
+    value.connections["linear-main"].repositories = {
       example: { when: [{ "linear.teamId": ["shared"] }] },
       second: { when: [{ "linear.teamId": ["shared"] }] },
     };
@@ -236,7 +243,7 @@ describe("readConfig", () => {
       root: "second",
       worktreeRoot: "../second-worktrees",
     };
-    value.connections["linear-main"].webhook.repositories.second = {
+    value.connections["linear-main"].repositories.second = {
       when: [{ "linear.teamId": ["team-second"] }],
     };
     writeConfig(value);

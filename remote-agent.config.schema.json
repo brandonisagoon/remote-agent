@@ -82,6 +82,10 @@
           ],
           "additionalProperties": false
         },
+        "sshHost": {
+          "type": "string",
+          "minLength": 1
+        },
         "acpx": {
           "default": {},
           "type": "object",
@@ -251,14 +255,56 @@
             "type": "string",
             "minLength": 1
           },
+          "machineId": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "repositories": {
+            "default": "*",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "*"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "when": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "additionalProperties": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
           "webhook": {
             "type": "object",
             "properties": {
-              "machineId": {
-                "type": "string",
-                "minLength": 1,
-                "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
-              },
               "slug": {
                 "type": "string",
                 "minLength": 1,
@@ -273,56 +319,12 @@
                 "type": "integer",
                 "exclusiveMinimum": 0,
                 "maximum": 9007199254740991
-              },
-              "repositories": {
-                "default": "*",
-                "anyOf": [
-                  {
-                    "type": "string",
-                    "const": "*"
-                  },
-                  {
-                    "type": "object",
-                    "propertyNames": {
-                      "type": "string",
-                      "minLength": 1,
-                      "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
-                    },
-                    "additionalProperties": {
-                      "type": "object",
-                      "properties": {
-                        "when": {
-                          "minItems": 1,
-                          "type": "array",
-                          "items": {
-                            "type": "object",
-                            "propertyNames": {
-                              "type": "string",
-                              "minLength": 1
-                            },
-                            "additionalProperties": {
-                              "minItems": 1,
-                              "type": "array",
-                              "items": {
-                                "type": "string",
-                                "minLength": 1
-                              }
-                            }
-                          }
-                        }
-                      },
-                      "additionalProperties": false
-                    }
-                  }
-                ]
               }
             },
             "required": [
-              "machineId",
               "slug",
               "secret",
-              "webhookMaxAgeMs",
-              "repositories"
+              "webhookMaxAgeMs"
             ],
             "additionalProperties": false
           },
@@ -362,8 +364,7 @@
             "default": [
               {
                 "name": "Zed",
-                "scheme": "zed",
-                "connection": "local"
+                "scheme": "zed"
               }
             ],
             "type": "array",
@@ -379,28 +380,11 @@
                   "default": "zed",
                   "type": "string",
                   "minLength": 1
-                },
-                "appPath": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "connection": {
-                  "default": "local",
-                  "type": "string",
-                  "enum": [
-                    "local",
-                    "ssh"
-                  ]
-                },
-                "remoteHost": {
-                  "type": "string",
-                  "minLength": 1
                 }
               },
               "required": [
                 "name",
-                "scheme",
-                "connection"
+                "scheme"
               ],
               "additionalProperties": false
             }
@@ -411,6 +395,7 @@
           "name",
           "apiKey",
           "agentUserId",
+          "repositories",
           "router",
           "editors"
         ],

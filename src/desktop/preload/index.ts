@@ -3,9 +3,6 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi } from "../shared.ts";
 
 const api: DesktopApi = {
-  editor: {
-    pick: () => ipcRenderer.invoke("editor:pick"),
-  },
   tunnel: {
     info: (name) => ipcRenderer.invoke("tunnel:info", name),
   },
