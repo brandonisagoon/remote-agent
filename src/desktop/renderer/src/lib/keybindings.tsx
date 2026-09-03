@@ -1,8 +1,10 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { formatForDisplay, parseHotkey } from "@tanstack/react-hotkeys";
 import type { Hotkey } from "@tanstack/react-hotkeys";
 
 import type { Keybindings } from "../../../shared.ts";
+import { keybindingsQueryOptions } from "@renderer/lib/queries/keybindings.ts";
 
 export type KeybindingAction =
   | "toggle-sidebar"
@@ -55,11 +57,8 @@ function merge(configured: Keybindings): Record<KeybindingAction, string> {
 const KeybindingsContext = createContext<Record<KeybindingAction, string>>(DEFAULT_KEYBINDINGS);
 
 export function KeybindingsProvider({ children }: { children: React.ReactNode }) {
-  const [bindings, setBindings] = useState(DEFAULT_KEYBINDINGS);
-  useEffect(() => {
-    void window.remoteAgent.keybindings.get().then((configured) => setBindings(merge(configured)));
-    return window.remoteAgent.keybindings.onChange((configured) => setBindings(merge(configured)));
-  }, []);
+  const { data: configured } = useQuery(keybindingsQueryOptions);
+  const bindings = useMemo(() => (configured ? merge(configured) : DEFAULT_KEYBINDINGS), [configured]);
   return <KeybindingsContext.Provider value={bindings}>{children}</KeybindingsContext.Provider>;
 }
 

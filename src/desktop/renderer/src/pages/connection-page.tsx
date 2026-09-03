@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 
@@ -30,22 +31,14 @@ import {
 import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
+import { providerModelsQueryOptions } from "@renderer/lib/queries/provider-models.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
 
 /** Live model options scanned from the installed provider binary (main
     process), so upgrading the CLI updates the list. Falls back to a curated
     set; the JSON accepts any string either way. */
 function useProviderModels(providerId: string, currentModel: string | null): string[] {
-  const [models, setModels] = useState<string[]>([]);
-  useEffect(() => {
-    let cancelled = false;
-    void window.remoteAgent.provider?.models(providerId).then((next) => {
-      if (!cancelled) setModels(next);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [providerId]);
+  const { data: models = [] } = useQuery(providerModelsQueryOptions(providerId));
   if (currentModel && !models.includes(currentModel)) return [currentModel, ...models];
   return models;
 }

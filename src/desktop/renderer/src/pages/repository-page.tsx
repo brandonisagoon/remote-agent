@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import type { ServiceFile } from "../../../../lib/config.ts";
-import type { SessionSummary } from "../../../shared.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
@@ -18,6 +18,7 @@ import {
   TableRow,
 } from "@renderer/components/ui/table.tsx";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
+import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
 
@@ -44,23 +45,10 @@ export function RepositoryPage({ id, value, mutate }: { id: string; value: Servi
 }
 
 function SessionsTab({ repositoryId }: { repositoryId: string }) {
-  const [sessions, setSessions] = useState<SessionSummary[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const load = async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      setSessions(await window.remoteAgent.sessions.list(repositoryId));
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-    } finally {
-      setLoading(false);
-    }
-  };
-  useEffect(() => {
-    void load();
-  }, [repositoryId]);
+  const query = useQuery(sessionsQueryOptions(repositoryId));
+  const sessions = query.data ?? [];
+  const loading = query.isFetching;
+  const error = query.error ? (query.error instanceof Error ? query.error.message : String(query.error)) : null;
   const counts = useMemo(
     () => ({
       active: sessions.filter((session) => session.status === "active").length,
@@ -74,7 +62,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
         <p className="text-muted-foreground text-sm">
           {counts.active} active · {counts.total} total
         </p>
-        <Button variant="outline" size="sm" onClick={() => void load()}>
+        <Button variant="outline" size="sm" onClick={() => void query.refetch()}>
           <F7Icon name="arrow_2_circlepath" className={cn(loading && "animate-spin")} />
           Refresh
         </Button>

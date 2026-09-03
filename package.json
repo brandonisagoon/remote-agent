@@ -72,6 +72,7 @@
     "@prisma/adapter-libsql": "7.9.1",
     "@prisma/client": "7.9.1",
     "@tanstack/react-hotkeys": "^0.10.0",
+    "@tanstack/react-query": "^5.102.8",
     "@tanstack/react-router": "^1.170.32",
     "acpx": "0.13.2",
     "chokidar": "^5.0.0",
