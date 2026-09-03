@@ -62,7 +62,7 @@ export function AppLayout() {
               apiKey: "replace-me",
               agentUserId: "replace-me",
               router: { providerId: "codex", timeoutMs: 30_000 },
-              editor: { name: "Zed", scheme: "zed", connection: "local" },
+              editors: [{ name: "Zed", scheme: "zed", connection: "local" }],
               webhook: {
                 machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,

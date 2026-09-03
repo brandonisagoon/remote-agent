@@ -4,8 +4,9 @@ import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 
 import type { ServiceFile } from "../../../../lib/config.ts";
-import { sshLinkSupported } from "../../../../lib/machines/editor-link.ts";
+import { buildEditorDeepLink, sshLinkSupported } from "../../../../lib/machines/editor-link.ts";
 import { CopyField } from "@renderer/components/copy-field.tsx";
+import { JsonBlock } from "@renderer/components/json-block.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
@@ -13,6 +14,16 @@ import { SecretField } from "@renderer/components/secret-field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
+import { Input } from "@renderer/components/ui/input.tsx";
+import { RadioGroup, RadioGroupItem } from "@renderer/components/ui/radio-group.tsx";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@renderer/components/ui/table.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
 import {
@@ -43,6 +54,21 @@ function useProviderModels(providerId: string, currentModel: string | null): str
   const { data: models = [] } = useQuery(providerModelsQueryOptions(providerId));
   if (currentModel && !models.includes(currentModel)) return [currentModel, ...models];
   return models;
+}
+
+type ConnectionEditor = ServiceFile["connections"][string]["editors"][number];
+
+function editorLinkPreview(editor: ConnectionEditor): string {
+  try {
+    return buildEditorDeepLink(
+      editor.connection,
+      editor.scheme,
+      editor.remoteHost ?? (editor.connection === "ssh" ? "host" : null),
+      "/…/worktree",
+    );
+  } catch {
+    return "—";
+  }
 }
 
 export function ConnectionPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
@@ -89,10 +115,40 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
         </SettingsCard>
       </SettingsSection>
       <SettingsSection
+        value="agent"
+        title="Agent"
+        description="The Linear user this agent acts as — assigning or mentioning it is what triggers sessions."
+      >
+        <SettingsCard>
+          <Field label="Agent user ID" value={connection.agentUserId} onChange={(next) => mutate((file) => { file.connections[id]!.agentUserId = next; })} />
+          <Field label="Agent handle" value={connection.agentHandle ?? ""} onChange={(next) => mutate((file) => { file.connections[id]!.agentHandle = next || undefined; })} />
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection
         value="router"
         title="Session Router"
-        description="The Codex invocation that decides which session this connection's incoming events belong to."
+        description="Several sessions can run at once. When a comment or event arrives from Linear, this model reads it alongside the session database and picks the matching session. The event is then delivered into that session as a prompt. Its only output is a routing decision — it has no tools or repository access, and never replies to Linear or starts sessions itself."
       >
+        <JsonBlock
+          label="Example Input from Linear"
+          json={`{
+  "comment": "@agent fix the flaky auth test",
+  "candidates": [
+    { "agentIssueIdentifier": "AGENT-130", "status": "Connected", "role": "primary" },
+    { "agentIssueIdentifier": "AGENT-131", "status": "Working",   "role": "primary" }
+  ]
+}`}
+        />
+        <JsonBlock
+          label="Example Routing Decision"
+          json={`{
+  "targetAgentIssueIdentifier": "AGENT-131",
+  "reasonCode": "primary_session",
+  "confidence": 0.9,
+  "expectedActions": ["code_change"],
+  "replyToCommentId": null
+}`}
+        />
         <SettingsCard>
           <div className="grid gap-2">
             <Label>Provider</Label>
@@ -137,69 +193,111 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
       </SettingsSection>
       <SettingsSection
         value="editor"
-        title="Editor"
-        description="Where worktree deep links posted to this workspace open."
+        title="Editors"
+        description="Where worktree deep links posted to this workspace open — one link per editor."
       >
         <SettingsCard>
-          <div className="grid gap-2">
-            <Label>Editor</Label>
-            <div className="flex items-center gap-2">
-              <Field label="" value={connection.editor.name} disabled onChange={() => {}} />
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  const picked = await window.remoteAgent.editor.pick();
-                  if (!picked) return;
-                  if ("error" in picked) {
-                    toast.error("That app has no URL scheme, so it can't open deep links");
-                    return;
-                  }
-                  mutate((file) => {
-                    const editor = file.connections[id]!.editor;
-                    editor.name = picked.editor.name;
-                    editor.scheme = picked.editor.scheme;
-                    editor.appPath = picked.editor.appPath;
-                    if (!sshLinkSupported(picked.editor.scheme)) editor.connection = "local";
+          <div className="bg-background rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Editor</TableHead>
+                  <TableHead>Location</TableHead>
+                  <TableHead>Link Preview</TableHead>
+                  <TableHead className="w-10" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {connection.editors.map((editor, index) => (
+                  <TableRow key={`${editor.scheme}-${index}`}>
+                    <TableCell>{editor.name}</TableCell>
+                    <TableCell>
+                      <div className="grid gap-2">
+                        <RadioGroup
+                          className="flex items-center gap-4"
+                          value={editor.connection}
+                          onValueChange={(next) =>
+                            mutate((file) => {
+                              file.connections[id]!.editors[index]!.connection = next as "local" | "ssh";
+                            })
+                          }
+                        >
+                          <label className="flex items-center gap-1.5 text-sm">
+                            <RadioGroupItem value="local" />
+                            Local
+                          </label>
+                          <label className="flex items-center gap-1.5 text-sm">
+                            <RadioGroupItem value="ssh" disabled={!sshLinkSupported(editor.scheme)} />
+                            SSH
+                          </label>
+                        </RadioGroup>
+                        {editor.connection === "ssh" && (
+                          <Input
+                            className="h-8"
+                            placeholder="ssh host"
+                            value={editor.remoteHost ?? ""}
+                            onChange={(event) =>
+                              mutate((file) => {
+                                file.connections[id]!.editors[index]!.remoteHost = event.target.value || undefined;
+                              })
+                            }
+                          />
+                        )}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-muted-foreground max-w-48 truncate font-mono text-xs">
+                      {editorLinkPreview(editor)}
+                    </TableCell>
+                    <TableCell>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground hover:text-destructive size-7"
+                        onClick={() => mutate((file) => { file.connections[id]!.editors.splice(index, 1); })}
+                      >
+                        <F7Icon name="trash" />
+                        <span className="sr-only">Remove Editor</span>
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            {connection.editors.length === 0 && (
+              <div className="text-muted-foreground p-6 text-center text-sm">
+                No editors — worktree links won't be posted.
+              </div>
+            )}
+          </div>
+          <div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                const picked = await window.remoteAgent.editor.pick();
+                if (!picked) return;
+                if ("error" in picked) {
+                  toast.error("That app has no URL scheme, so it can't open deep links");
+                  return;
+                }
+                if (connection.editors.some((editor) => editor.scheme === picked.editor.scheme)) {
+                  toast.error(`${picked.editor.name} is already configured`);
+                  return;
+                }
+                mutate((file) => {
+                  file.connections[id]!.editors.push({
+                    name: picked.editor.name,
+                    scheme: picked.editor.scheme,
+                    appPath: picked.editor.appPath,
+                    connection: "local",
                   });
-                }}
-              >
-                Choose…
-              </Button>
-            </div>
-            <p className="text-muted-foreground text-xs">
-              Links use the <code className="bg-muted rounded px-1 font-mono text-[11px]">{connection.editor.scheme}://</code> scheme.
-            </p>
-          </div>
-          <div className="grid gap-2">
-            <Label>Connection</Label>
-            <Select
-              value={connection.editor.connection}
-              onValueChange={(next) => mutate((file) => { file.connections[id]!.editor.connection = next as "local" | "ssh"; })}
+                });
+              }}
             >
-              <SelectTrigger className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="local">Local</SelectItem>
-                <SelectItem value="ssh" disabled={!sshLinkSupported(connection.editor.scheme)}>
-                  SSH{!sshLinkSupported(connection.editor.scheme) && " (unsupported by this editor)"}
-                </SelectItem>
-              </SelectContent>
-            </Select>
+              <F7Icon name="plus" />
+              Add Editor
+            </Button>
           </div>
-          {connection.editor.connection === "ssh" && (
-            <Field label="SSH Host" description="How your editor reaches this machine." value={connection.editor.remoteHost ?? ""} onChange={(next) => mutate((file) => { file.connections[id]!.editor.remoteHost = next; })} />
-          )}
-        </SettingsCard>
-      </SettingsSection>
-      <SettingsSection
-        value="agent"
-        title="Agent"
-        description="The Linear user this agent acts as — assigning or mentioning it is what triggers sessions."
-      >
-        <SettingsCard>
-          <Field label="Agent user ID" value={connection.agentUserId} onChange={(next) => mutate((file) => { file.connections[id]!.agentUserId = next; })} />
-          <Field label="Agent handle" value={connection.agentHandle ?? ""} onChange={(next) => mutate((file) => { file.connections[id]!.agentHandle = next || undefined; })} />
         </SettingsCard>
       </SettingsSection>
     </Accordion>

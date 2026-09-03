@@ -65,7 +65,7 @@ export function testConfig(
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
       router: { providerId: "codex", model: null, timeoutMs: 30_000 },
-      editor: { name: "Zed", scheme: "zed", connection: "local" as const, remoteHost: null },
+      editors: [{ name: "Zed", scheme: "zed", connection: "local" as const, remoteHost: null }],
     },
   };
   const webhooks = overrides.webhooks ?? {
@@ -96,9 +96,7 @@ export function testConfig(
     agentTeamKey: "AGENT",
     hosts: TEST_HOSTS,
     machine: "macbook-air",
-    editorScheme: "zed",
-    editorConnection: "local" as const,
-    editorRemoteHost: "test-remote",
+    editors: [{ name: "Zed", scheme: "zed", connection: "local" as const, remoteHost: null }],
     routerProviderId: "codex" as const,
     routerModel: null,
     routerTimeoutMs: 30_000,

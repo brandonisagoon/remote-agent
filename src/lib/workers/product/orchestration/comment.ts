@@ -13,7 +13,7 @@ import {
 } from "../../../machines/index.ts";
 import { worktreePathForBranch } from "../../../services/launches/index.ts";
 
-export const WORKTREE_LINK_SEARCH_TEXT = "Open Worktree in Zed";
+export const WORKTREE_LINK_SEARCH_TEXT = "Open Worktree in ";
 export const WORKTREE_READY_TIMEOUT_MS = 15 * 60_000;
 
 const WORKTREE_BRANCH_STAMP = path.join(".workspace-stamps", "branch");
@@ -57,22 +57,20 @@ export function predictWorktreePath(
 }
 
 export function buildWorktreeLinkComment(input: {
-  editorConnection: "local" | "ssh";
-  editorScheme: string;
-  editorRemoteHost: string | null;
+  editors: ReadonlyArray<{ name: string; scheme: string; connection: "local" | "ssh"; remoteHost: string | null }>;
   worktreePath: string;
   runtimeSessionId: string;
 }): string {
-  const link = buildEditorDeepLink(
-    input.editorConnection,
-    input.editorScheme,
-    input.editorRemoteHost,
-    input.worktreePath,
-  );
-  return [
-    `[Open Worktree in Zed](${link})`,
-    `Remote Agent session \`${input.runtimeSessionId}\``,
-  ].join(" · ");
+  const links = input.editors.map((editor) => {
+    const link = buildEditorDeepLink(
+      editor.connection,
+      editor.scheme,
+      editor.remoteHost,
+      input.worktreePath,
+    );
+    return `[Open Worktree in ${editor.name}](${link})`;
+  });
+  return [...links, `Remote Agent session \`${input.runtimeSessionId}\``].join(" · ");
 }
 
 export async function waitForWorktreeReady(
@@ -155,9 +153,7 @@ export async function postWorktreeLinkComment(
     }
 
     const body = buildWorktreeLinkComment({
-      editorConnection: input.config.editorConnection,
-      editorScheme: input.config.editorScheme,
-      editorRemoteHost: input.config.editorRemoteHost,
+      editors: input.config.editors,
       worktreePath,
       runtimeSessionId: input.runtimeSessionId,
     });

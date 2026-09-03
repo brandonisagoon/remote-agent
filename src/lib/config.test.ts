@@ -29,9 +29,7 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         name: "Linear Main",
         apiKey: "linear-secret",
         agentUserId: "agent-user",
-        editor: {
-          connection: editorConnection,
-        },
+        editors: [{ connection: editorConnection }],
         webhook: {
           machineId: "build-host",
           slug: "linear-main",
@@ -129,10 +127,10 @@ describe("readConfig", () => {
     writeConfig(value);
     expect(() => readConfig()).toThrow("remoteHost is required");
 
-    (value.connections["linear-main"].editor as { connection: "ssh"; remoteHost?: string }).remoteHost =
+    (value.connections["linear-main"].editors[0] as { connection: "ssh"; remoteHost?: string }).remoteHost =
       "build-host.example";
     writeConfig(value);
-    expect(readConfig().editorRemoteHost).toBe("build-host.example");
+    expect(readConfig().editors[0]?.remoteHost).toBe("build-host.example");
   });
 
   test("rejects the legacy fleet-shaped config with migration guidance", () => {

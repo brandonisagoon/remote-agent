@@ -358,47 +358,52 @@
             ],
             "additionalProperties": false
           },
-          "editor": {
-            "default": {
-              "name": "Zed",
-              "scheme": "zed",
-              "connection": "local"
-            },
-            "type": "object",
-            "properties": {
-              "name": {
-                "default": "Zed",
-                "type": "string",
-                "minLength": 1
-              },
-              "scheme": {
-                "default": "zed",
-                "type": "string",
-                "minLength": 1
-              },
-              "appPath": {
-                "type": "string",
-                "minLength": 1
-              },
-              "connection": {
-                "default": "local",
-                "type": "string",
-                "enum": [
-                  "local",
-                  "ssh"
-                ]
-              },
-              "remoteHost": {
-                "type": "string",
-                "minLength": 1
+          "editors": {
+            "default": [
+              {
+                "name": "Zed",
+                "scheme": "zed",
+                "connection": "local"
               }
-            },
-            "required": [
-              "name",
-              "scheme",
-              "connection"
             ],
-            "additionalProperties": false
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "default": "Zed",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "scheme": {
+                  "default": "zed",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "appPath": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "connection": {
+                  "default": "local",
+                  "type": "string",
+                  "enum": [
+                    "local",
+                    "ssh"
+                  ]
+                },
+                "remoteHost": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "name",
+                "scheme",
+                "connection"
+              ],
+              "additionalProperties": false
+            }
           }
         },
         "required": [
@@ -407,7 +412,7 @@
           "apiKey",
           "agentUserId",
           "router",
-          "editor"
+          "editors"
         ],
         "additionalProperties": false
       }

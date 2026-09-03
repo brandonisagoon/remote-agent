@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { z } from "zod";
 
+import { sshLinkSupported } from "./machines/editor-link.ts";
 import {
   configureMachines,
   MachineSchema,
@@ -99,18 +100,16 @@ const RouterSchema = z
     timeoutMs: PositiveIntegerSchema.default(30_000),
   })
   .default({ providerId: "codex", timeoutMs: 30_000 });
-const EditorSchema = z
-  .object({
-    /** Display name of the chosen editor app (e.g. "Zed"). */
-    name: z.string().min(1).default("Zed"),
-    /** URL scheme used for worktree deep links. */
-    scheme: z.string().min(1).default("zed"),
-    /** The picked .app bundle, when chosen via the file selector. */
-    appPath: z.string().min(1).optional(),
-    connection: z.enum(["local", "ssh"]).default("local"),
-    remoteHost: z.string().min(1).optional(),
-  })
-  .default({ name: "Zed", scheme: "zed", connection: "local" });
+const EditorSchema = z.object({
+  /** Display name of the chosen editor app (e.g. "Zed"). */
+  name: z.string().min(1).default("Zed"),
+  /** URL scheme used for worktree deep links. */
+  scheme: z.string().min(1).default("zed"),
+  /** The picked .app bundle, when chosen via the file selector. */
+  appPath: z.string().min(1).optional(),
+  connection: z.enum(["local", "ssh"]).default("local"),
+  remoteHost: z.string().min(1).optional(),
+});
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
@@ -120,8 +119,8 @@ const LinearConnectionSchema = z.object({
   webhook: WebhookSchema.optional(),
   /** Routes this connection's incoming events to sessions. */
   router: RouterSchema,
-  /** The editor worktree deep links open for this workspace's viewers. */
-  editor: EditorSchema,
+  /** The editors worktree deep links open for this workspace's viewers. */
+  editors: z.array(EditorSchema).default([{ name: "Zed", scheme: "zed", connection: "local" }]),
 });
 const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
@@ -185,8 +184,18 @@ export const ServiceFileSchema = z.object({
     context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
   }
   for (const [connectionId, connection] of Object.entries(file.connections)) {
-    if (connection.editor.connection === "ssh" && !connection.editor.remoteHost) {
-      context.addIssue({ code: "custom", path: ["connections", connectionId, "editor", "remoteHost"], message: "remoteHost is required for an SSH editor connection" });
+    const schemes = new Set<string>();
+    for (const [index, editor] of connection.editors.entries()) {
+      if (schemes.has(editor.scheme)) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "scheme"], message: `duplicate editor scheme: ${editor.scheme}` });
+      }
+      schemes.add(editor.scheme);
+      if (editor.connection === "ssh" && !editor.remoteHost) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "remoteHost"], message: "remoteHost is required for an SSH editor connection" });
+      }
+      if (editor.connection === "ssh" && !sshLinkSupported(editor.scheme)) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "connection"], message: `editor scheme ${editor.scheme} has no SSH link format` });
+      }
     }
   }
   const webhookSlugs = new Set<string>();
@@ -270,6 +279,13 @@ export interface TagDefinitionConfig {
   routerVisible: boolean;
 }
 
+export interface EditorConfig {
+  name: string;
+  scheme: string;
+  connection: "local" | "ssh";
+  remoteHost: string | null;
+}
+
 export interface LinearConnectionConfig {
   id: string;
   provider: "linear";
@@ -278,7 +294,7 @@ export interface LinearConnectionConfig {
   agentUserId: string;
   agentHandle: string | null;
   router: { providerId: "codex" | "claude"; model: string | null; timeoutMs: number };
-  editor: { name: string; scheme: string; connection: "local" | "ssh"; remoteHost: string | null };
+  editors: ReadonlyArray<EditorConfig>;
 }
 
 export type ConnectionConfig = LinearConnectionConfig;
@@ -310,9 +326,7 @@ export interface ServerConfig {
   agentTeamKey: string;
   hosts: readonly MachineRecord[];
   machine: Machine;
-  editorScheme: string;
-  editorConnection: "local" | "ssh";
-  editorRemoteHost: string | null;
+  editors: ReadonlyArray<EditorConfig>;
   routerProviderId: "codex" | "claude";
   routerModel: string | null;
   routerTimeoutMs: number;
@@ -466,12 +480,12 @@ export function readConfig(): ServerConfig {
         model: connection.router.model ?? null,
         timeoutMs: connection.router.timeoutMs,
       },
-      editor: {
-        name: connection.editor.name,
-        scheme: connection.editor.scheme,
-        connection: connection.editor.connection,
-        remoteHost: connection.editor.remoteHost ?? null,
-      },
+      editors: connection.editors.map((editor) => ({
+        name: editor.name,
+        scheme: editor.scheme,
+        connection: editor.connection,
+        remoteHost: editor.remoteHost ?? null,
+      })),
     } satisfies LinearConnectionConfig]),
   );
   // Webhooks nest inside connections in the file; the resolved view stays a
@@ -533,9 +547,7 @@ export function readConfig(): ServerConfig {
     agentTeamKey: "AGENT",
     hosts,
     machine,
-    editorScheme: firstConnection?.editor.scheme ?? "zed",
-    editorConnection: firstConnection?.editor.connection ?? "local",
-    editorRemoteHost: firstConnection?.editor.remoteHost ?? null,
+    editors: firstConnection?.editors ?? [],
     routerProviderId: firstConnection?.router.providerId ?? "codex",
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,

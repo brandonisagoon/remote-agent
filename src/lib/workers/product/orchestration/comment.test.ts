@@ -19,9 +19,7 @@ afterEach(() => {
 describe("orchestration worktree link comment", () => {
   test("builds an SSH worktree link with the runtime session", () => {
     const body = buildWorktreeLinkComment({
-      editorConnection: "ssh",
-      editorScheme: "zed",
-      editorRemoteHost: "test-remote",
+      editors: [{ name: "Zed", scheme: "zed", connection: "ssh", remoteHost: "test-remote" }],
       worktreePath: "/srv/worktrees/foo-cube-2829",
       runtimeSessionId: "runtime_2829",
     });
@@ -35,9 +33,7 @@ describe("orchestration worktree link comment", () => {
   test("builds the exact local-machine comment body", () => {
     expect(
       buildWorktreeLinkComment({
-        editorConnection: "local",
-        editorScheme: "zed",
-        editorRemoteHost: null,
+        editors: [{ name: "Zed", scheme: "zed", connection: "local", remoteHost: null }],
         worktreePath: "/srv/worktrees/foo cube",
         runtimeSessionId: "runtime_local",
       }),

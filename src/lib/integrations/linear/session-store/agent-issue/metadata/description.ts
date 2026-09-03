@@ -205,12 +205,17 @@ export function buildAgentIssueDescription(
   config: ServerConfig,
 ): string {
   const machine = getMachine({ id: runtime.machine });
-  const zed = buildEditorDeepLink(
-    config.editorConnection,
-    config.editorScheme,
-    config.editorRemoteHost,
-    runtime.worktreePath,
-  );
+  const editorSections = config.editors
+    .map((editor) => {
+      const link = buildEditorDeepLink(
+        editor.connection,
+        editor.scheme,
+        editor.remoteHost,
+        runtime.worktreePath,
+      );
+      return `### ${editor.name}\n[Open Worktree in ${editor.name}](${link})`;
+    })
+    .join("\n\n");
   return `| Runtime field | Value |
 | --- | --- |
 | Harness session ID | ${markdownCell(runtime.harnessSessionId)} |
@@ -221,8 +226,7 @@ export function buildAgentIssueDescription(
 | Source issue | ${markdownCell(sync.sourceIssueIdentifier)} |
 
 +++ Open Session
-### Zed
-[Open Worktree in Zed](${zed})
+${editorSections}
 
 ### Agent runtime
 ${runtime.runtimeSessionId ? `acpx session \`${runtime.runtimeSessionId}\`` : "runtime session unavailable"}
