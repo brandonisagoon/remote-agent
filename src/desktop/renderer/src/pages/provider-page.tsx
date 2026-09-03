@@ -3,6 +3,7 @@ import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
 
@@ -37,7 +38,19 @@ export function ProviderPage({ id, value, mutate }: { id: string; value: Service
                 <code className="bg-muted rounded px-1 py-0.5 font-mono text-[11px]">
                   {BUILTIN_ADAPTERS[id] ?? id}
                 </code>{" "}
-                via stdio.
+                via{" "}
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <span className="cursor-help underline decoration-dotted underline-offset-2">
+                      stdio
+                    </span>
+                  </TooltipTrigger>
+                  <TooltipContent className="max-w-64">
+                    ACP adapters exchange structured protocol messages over standard input/output
+                    streams, rather than an interactive CLI.
+                  </TooltipContent>
+                </Tooltip>
+                .
               </>
             }
             onChange={(next) =>
