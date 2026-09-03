@@ -19,6 +19,7 @@ import {
   serviceStatus,
 } from "../../management/service.ts";
 import { listProviderModels } from "./provider-models.ts";
+import { tunnelInfo } from "./tunnel-info.ts";
 import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
 
 let mainWindow: BrowserWindow | null = null;
@@ -142,6 +143,7 @@ function registerIpc(file: string): void {
   });
   ipcMain.handle("config:reveal", () => shell.showItemInFolder(file));
   ipcMain.handle("keybindings:get", () => readKeybindings(keybindingsPath(file)));
+  ipcMain.handle("tunnel:info", (_event, name: string) => tunnelInfo(name));
   ipcMain.handle("provider:models", (_event, providerId: string) => {
     const document = readConfigDocument(file);
     const agents = document.valid ? document.value.machine.acpx.agents : {};

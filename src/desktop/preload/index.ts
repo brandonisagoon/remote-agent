@@ -3,6 +3,9 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi } from "../shared.ts";
 
 const api: DesktopApi = {
+  tunnel: {
+    info: (name) => ipcRenderer.invoke("tunnel:info", name),
+  },
   provider: {
     models: (providerId) => ipcRenderer.invoke("provider:models", providerId),
   },

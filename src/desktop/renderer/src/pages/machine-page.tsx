@@ -2,6 +2,7 @@ import { useState } from "react";
 
 import type { ServiceFile } from "../../../../lib/config.ts";
 import type { ManagementResult } from "../../../../management/service.ts";
+import { DnsRecordsTable } from "@renderer/components/dns-records-table.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
@@ -92,6 +93,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             <Field label="Port" type="number" value={machine.server.listen.port} onChange={(next) => mutate((file) => { file.machine.server.listen.port = Number(next); })} />
           </div>
           <Field label="Public URL" value={machine.server.publicUrl} onChange={(next) => mutate((file) => { file.machine.server.publicUrl = next; })} />
+          <DnsRecordsTable value={value} />
         </SettingsCard>
       </SettingsSection>
 
