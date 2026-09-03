@@ -45,13 +45,13 @@ export function AppLayout() {
       />
       <AppSidebar
         value={draft}
-        onAddHarness={(harnessId) => {
+        onAddProvider={(providerId) => {
           const create = (value: typeof draft) => {
-            value.machine.acpx.agents[harnessId] = {};
+            value.machine.acpx.agents[providerId] = {};
           };
           if (dirty) mutate(create);
           else void commit(create);
-          void navigate({ to: "/harnesses/$harnessId", params: { harnessId } });
+          void navigate({ to: "/providers/$providerId", params: { providerId } });
         }}
         onAddConnection={() => {
           const id = generateConnectionId();
@@ -61,7 +61,7 @@ export function AppLayout() {
               name: "New Linear Connection",
               apiKey: "replace-me",
               agentUserId: "replace-me",
-              router: { harnessId: "codex", timeoutMs: 30_000 },
+              router: { providerId: "codex", timeoutMs: 30_000 },
               webhook: {
                 machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,
@@ -100,8 +100,8 @@ export function AppLayout() {
               worktreeRoot: `~/.worktrees/${id}`,
               bootstrapCommand: ["true"],
               workflows: {
-                describe: { prompt: "prompts/describe.md", harness: "claude" },
-                orchestrate: { prompt: "prompts/orchestrate.md", harness: "codex" },
+                describe: { prompt: "prompts/describe.md", provider: "claude" },
+                orchestrate: { prompt: "prompts/orchestrate.md", provider: "codex" },
                 reflect: { prompt: "prompts/reflect.md" },
               },
               metadata: { tags: {} },

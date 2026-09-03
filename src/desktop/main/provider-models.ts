@@ -80,8 +80,8 @@ function resolveBinary(command: string): string | null {
 }
 
 /** Extracts model-id-shaped ASCII tokens from the binary. */
-function scanBinary(file: string, harnessId: string): string[] {
-  const pattern = MODEL_PATTERNS[harnessId];
+function scanBinary(file: string, providerId: string): string[] {
+  const pattern = MODEL_PATTERNS[providerId];
   if (!pattern) return [];
   const buffer = readFileSync(file);
   const found = new Set<string>();
@@ -120,12 +120,12 @@ function byVersionDesc(a: string, b: string): number {
   return a.localeCompare(b);
 }
 
-export function listHarnessModels(
-  harnessId: string,
+export function listProviderModels(
+  providerId: string,
   agents: Record<string, { command?: string[] } | undefined>,
 ): string[] {
-  const fallback = FALLBACK_MODELS[harnessId] ?? [];
-  const command = agents[harnessId]?.command?.[0] ?? harnessId;
+  const fallback = FALLBACK_MODELS[providerId] ?? [];
+  const command = agents[providerId]?.command?.[0] ?? providerId;
   const binary = resolveBinary(command === "claude-code" ? "claude" : command);
   if (!binary) return fallback;
   try {
@@ -134,7 +134,7 @@ export function listHarnessModels(
     const key = `${stats.mtimeMs}:${stats.size}`;
     const cached = cache.get(binary);
     if (cached?.key === key) return cached.models;
-    const scanned = collapseDated(scanBinary(binary, harnessId).sort(byVersionDesc)).slice(0, 12);
+    const scanned = collapseDated(scanBinary(binary, providerId).sort(byVersionDesc)).slice(0, 12);
     const models = scanned.length > 0 ? scanned : fallback;
     cache.set(binary, { key, models });
     return models;

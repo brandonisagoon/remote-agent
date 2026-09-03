@@ -9,7 +9,7 @@ import { AppLayout } from "@renderer/components/app-layout.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
 import { ConnectionPage } from "@renderer/pages/connection-page.tsx";
-import { HarnessPage } from "@renderer/pages/harness-page.tsx";
+import { ProviderPage } from "@renderer/pages/provider-page.tsx";
 import { MachinePage } from "@renderer/pages/machine-page.tsx";
 import { RepositoryPage } from "@renderer/pages/repository-page.tsx";
 
@@ -27,13 +27,13 @@ const machineRoute = createRoute({
   },
 });
 
-const harnessRoute = createRoute({
+const providerRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/harnesses/$harnessId",
-  component: function Harness() {
-    const { harnessId } = harnessRoute.useParams();
+  path: "/providers/$providerId",
+  component: function Provider() {
+    const { providerId } = providerRoute.useParams();
     const { draft, mutate } = useConfig();
-    return <HarnessPage id={harnessId} value={draft} mutate={mutate} />;
+    return <ProviderPage id={providerId} value={draft} mutate={mutate} />;
   },
 });
 
@@ -57,7 +57,7 @@ const repositoryRoute = createRoute({
   },
 });
 
-const routeTree = rootRoute.addChildren([machineRoute, harnessRoute, connectionRoute, repositoryRoute]);
+const routeTree = rootRoute.addChildren([machineRoute, providerRoute, connectionRoute, repositoryRoute]);
 
 // Hash history: works under the file:// URL of a packaged Electron build.
 export const router = createRouter({ routeTree, history: createHashHistory() });

@@ -154,7 +154,7 @@ export function createOrchestrationWorker(
           worktreePath,
           issueIdentifier,
           branchName: decision.branchName,
-          harness: workflow.harness,
+          harness: workflow.provider,
           ...(workflow.model ? { model: workflow.model } : {}),
           lifecycle: "persistent",
           role: "primary",

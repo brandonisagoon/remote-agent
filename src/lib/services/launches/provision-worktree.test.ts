@@ -59,10 +59,10 @@ function fixture(): RepositoryConfig {
     worktreeRoot: path.join(directory, "worktrees"),
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
     workflows: {
-      describe: { prompt: "prompts/describe.md", harness: "claude", model: null },
+      describe: { prompt: "prompts/describe.md", provider: "claude", model: null },
       orchestrate: {
         prompt: "prompts/orchestrate.md",
-        harness: "codex",
+        provider: "codex",
         model: null,
       },
       reflect: { prompt: "prompts/reflect.md" },

@@ -38,12 +38,12 @@ export function testConfig(
     workflows: {
       describe: {
         prompt: "prompts/describe-issue.md",
-        harness: "claude" as const,
+        provider: "claude" as const,
         model: "opus",
       },
       orchestrate: {
         prompt: "prompts/orchestrate-plan.md",
-        harness: "codex" as const,
+        provider: "codex" as const,
         model: null,
       },
       reflect: { prompt: "prompts/reflect.md" },
@@ -64,7 +64,7 @@ export function testConfig(
       apiKey: "test-linear-key",
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
-      router: { harnessId: "codex", model: null, timeoutMs: 30_000 },
+      router: { providerId: "codex", model: null, timeoutMs: 30_000 },
     },
   };
   const webhooks = overrides.webhooks ?? {
@@ -96,7 +96,7 @@ export function testConfig(
     hosts: TEST_HOSTS,
     machine: "macbook-air",
     zedRemoteHost: "test-remote",
-    routerHarnessId: "codex" as const,
+    routerProviderId: "codex" as const,
     routerModel: null,
     routerTimeoutMs: 30_000,
     webhookMaxAgeMs: 60_000,

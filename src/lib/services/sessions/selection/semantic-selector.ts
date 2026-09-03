@@ -223,7 +223,7 @@ async function runRouter(
       String(Math.max(1, Math.ceil(config.routerTimeoutMs / 1000))),
     ];
     if (config.routerModel) args.push("--model", config.routerModel);
-    args.push(config.routerHarnessId, "exec", prompt);
+    args.push(config.routerProviderId, "exec", prompt);
 
     const child = Bun.spawn([process.execPath, acpxCliPath(), ...args], {
       cwd: runDir,

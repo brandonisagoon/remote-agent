@@ -29,31 +29,31 @@ import {
 } from "@renderer/components/ui/select.tsx";
 import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
-import { HARNESS_LABELS } from "@renderer/lib/sidebar-items.ts";
+import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
 
-/** Live model options scanned from the installed harness binary (main
+/** Live model options scanned from the installed provider binary (main
     process), so upgrading the CLI updates the list. Falls back to a curated
     set; the JSON accepts any string either way. */
-function useHarnessModels(harnessId: string, currentModel: string | null): string[] {
+function useProviderModels(providerId: string, currentModel: string | null): string[] {
   const [models, setModels] = useState<string[]>([]);
   useEffect(() => {
     let cancelled = false;
-    void window.remoteAgent.harness?.models(harnessId).then((next) => {
+    void window.remoteAgent.provider?.models(providerId).then((next) => {
       if (!cancelled) setModels(next);
     });
     return () => {
       cancelled = true;
     };
-  }, [harnessId]);
+  }, [providerId]);
   if (currentModel && !models.includes(currentModel)) return [currentModel, ...models];
   return models;
 }
 
 export function ConnectionPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const connection = value.connections[id];
-  const routerModels = useHarnessModels(
-    connection?.router.harnessId ?? "codex",
+  const routerModels = useProviderModels(
+    connection?.router.providerId ?? "codex",
     connection?.router.model ?? null,
   );
   if (!connection) return <PageHeading title="Connection not found" description={id} />;
@@ -100,22 +100,22 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
       >
         <SettingsCard>
           <div className="grid gap-2">
-            <Label>Harness</Label>
+            <Label>Provider</Label>
             <Select
-              value={connection.router.harnessId}
-              onValueChange={(next) => mutate((file) => { file.connections[id]!.router.harnessId = next as "codex" | "claude"; })}
+              value={connection.router.providerId}
+              onValueChange={(next) => mutate((file) => { file.connections[id]!.router.providerId = next as "codex" | "claude"; })}
             >
               <SelectTrigger className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="codex">{HARNESS_LABELS["codex"]}</SelectItem>
-                <SelectItem value="claude">{HARNESS_LABELS["claude"]}</SelectItem>
+                <SelectItem value="codex">{PROVIDER_LABELS["codex"]}</SelectItem>
+                <SelectItem value="claude">{PROVIDER_LABELS["claude"]}</SelectItem>
               </SelectContent>
             </Select>
-            {!(connection.router.harnessId in value.machine.acpx.agents) && (
+            {!(connection.router.providerId in value.machine.acpx.agents) && (
               <p className="text-muted-foreground text-xs">
-                Not configured as a harness yet — the default `codex` binary is used.
+                Not configured as a provider yet — the default `codex` binary is used.
               </p>
             )}
           </div>
@@ -129,7 +129,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="default">Harness default</SelectItem>
+                <SelectItem value="default">Provider default</SelectItem>
                 {routerModels.map((model) => (
                   <SelectItem key={model} value={model}>
                     {model}

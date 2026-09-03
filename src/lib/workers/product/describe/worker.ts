@@ -89,7 +89,7 @@ export function createDescribeWorker(
           machine: context.config.machine,
           worktreePath: repository.root,
           issueIdentifier: issue.identifier,
-          harness: workflow.harness,
+          harness: workflow.provider,
           ...(workflow.model ? { model: workflow.model } : {}),
           lifecycle: "one-shot",
           role: "primary",

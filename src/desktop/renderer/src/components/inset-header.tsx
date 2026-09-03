@@ -6,14 +6,14 @@ import { SidebarTrigger, useSidebar } from "@renderer/components/ui/sidebar.tsx"
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import { HARNESS_LABELS } from "@renderer/lib/sidebar-items.ts";
+import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import { useKeybindingLabel } from "@renderer/lib/keybindings.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 
 function useHeaderTitle(): string {
   const { draft } = useConfig();
   const params = useParams({ strict: false });
-  if (params.harnessId) return HARNESS_LABELS[params.harnessId] ?? params.harnessId;
+  if (params.providerId) return PROVIDER_LABELS[params.providerId] ?? params.providerId;
   if (params.connectionId) return draft.connections[params.connectionId]?.name ?? params.connectionId;
   if (params.repositoryId) return draft.repositories[params.repositoryId]?.name ?? params.repositoryId;
   return draft.machine.name;

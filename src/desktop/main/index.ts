@@ -18,7 +18,7 @@ import {
   restartService,
   serviceStatus,
 } from "../../management/service.ts";
-import { listHarnessModels } from "./harness-models.ts";
+import { listProviderModels } from "./provider-models.ts";
 import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
 
 let mainWindow: BrowserWindow | null = null;
@@ -142,10 +142,10 @@ function registerIpc(file: string): void {
   });
   ipcMain.handle("config:reveal", () => shell.showItemInFolder(file));
   ipcMain.handle("keybindings:get", () => readKeybindings(keybindingsPath(file)));
-  ipcMain.handle("harness:models", (_event, harnessId: string) => {
+  ipcMain.handle("provider:models", (_event, providerId: string) => {
     const document = readConfigDocument(file);
     const agents = document.valid ? document.value.machine.acpx.agents : {};
-    return listHarnessModels(harnessId, agents);
+    return listProviderModels(providerId, agents);
   });
   ipcMain.on("window:sync-traffic-lights", (event) => {
     if (process.platform !== "darwin") return;

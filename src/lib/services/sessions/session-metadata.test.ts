@@ -32,8 +32,8 @@ function repository(
     worktreeRoot: `/tmp/${id}-worktrees`,
     bootstrapCommand: ["true"],
     workflows: {
-      describe: { prompt: "describe.md", harness: "claude", model: null },
-      orchestrate: { prompt: "orchestrate.md", harness: "codex", model: null },
+      describe: { prompt: "describe.md", provider: "claude", model: null },
+      orchestrate: { prompt: "orchestrate.md", provider: "codex", model: null },
       reflect: { prompt: "reflect.md" },
     },
     metadata: {

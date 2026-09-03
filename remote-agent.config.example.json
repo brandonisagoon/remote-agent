@@ -52,7 +52,7 @@
         "repositories": "*"
       },
       "router": {
-        "harnessId": "codex",
+        "providerId": "codex",
         "timeoutMs": 30000
       }
     }
@@ -90,12 +90,12 @@
       "workflows": {
         "describe": {
           "prompt": "prompts/describe-issue.md",
-          "harness": "claude",
-          "model": "opus"
+          "model": "opus",
+          "provider": "claude"
         },
         "orchestrate": {
           "prompt": "prompts/orchestrate-plan.md",
-          "harness": "codex"
+          "provider": "codex"
         },
         "reflect": {
           "prompt": "prompts/reflect.md"

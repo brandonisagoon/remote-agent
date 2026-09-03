@@ -384,12 +384,12 @@
           },
           "router": {
             "default": {
-              "harnessId": "codex",
+              "providerId": "codex",
               "timeoutMs": 30000
             },
             "type": "object",
             "properties": {
-              "harnessId": {
+              "providerId": {
                 "default": "codex",
                 "type": "string",
                 "enum": [
@@ -409,7 +409,7 @@
               }
             },
             "required": [
-              "harnessId",
+              "providerId",
               "timeoutMs"
             ],
             "additionalProperties": false
@@ -465,7 +465,7 @@
                     "type": "string",
                     "minLength": 1
                   },
-                  "harness": {
+                  "provider": {
                     "type": "string",
                     "enum": [
                       "claude",
@@ -479,7 +479,7 @@
                 },
                 "required": [
                   "prompt",
-                  "harness"
+                  "provider"
                 ],
                 "additionalProperties": false
               },
@@ -490,7 +490,7 @@
                     "type": "string",
                     "minLength": 1
                   },
-                  "harness": {
+                  "provider": {
                     "type": "string",
                     "enum": [
                       "claude",
@@ -504,7 +504,7 @@
                 },
                 "required": [
                   "prompt",
-                  "harness"
+                  "provider"
                 ],
                 "additionalProperties": false
               },

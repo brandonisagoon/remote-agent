@@ -92,7 +92,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
                 <TableHead>Session</TableHead>
                 <TableHead>State</TableHead>
                 <TableHead>Role</TableHead>
-                <TableHead>Harness</TableHead>
+                <TableHead>Provider</TableHead>
                 <TableHead>Tags</TableHead>
                 <TableHead>Updated</TableHead>
               </TableRow>

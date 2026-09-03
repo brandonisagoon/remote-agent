@@ -27,7 +27,7 @@ const RepositoryRelativePathSchema = z
   .refine((value) => !path.isAbsolute(value), "must be relative to the repository");
 const WorkflowSchema = z.object({
   prompt: RepositoryRelativePathSchema,
-  harness: z.enum(["claude", "codex"]),
+  provider: z.enum(["claude", "codex"]),
   model: z.string().min(1).optional(),
 });
 const TagDefinitionSchema = z.object({
@@ -93,12 +93,12 @@ const WebhookSchema = z.object({
 });
 const RouterSchema = z
   .object({
-    /** Harness that runs the session-routing prompt (Codex-only today). */
-    harnessId: z.enum(["codex", "claude"]).default("codex"),
+    /** Provider that runs the session-routing prompt. */
+    providerId: z.enum(["codex", "claude"]).default("codex"),
     model: z.string().min(1).optional(),
     timeoutMs: PositiveIntegerSchema.default(30_000),
   })
-  .default({ harnessId: "codex", timeoutMs: 30_000 });
+  .default({ providerId: "codex", timeoutMs: 30_000 });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
@@ -117,7 +117,7 @@ const AcpxSchema = z
       .enum(["approve-all", "approve-reads", "deny-all"])
       .default("approve-all"),
     nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
-    // Presence enables the harness in the UI; command (optional) overrides
+    // Presence enables the provider in the UI; command (optional) overrides
     // acpx's built-in adapter launch profile.
     agents: z
       .object({
@@ -233,7 +233,7 @@ export type ServiceFile = z.infer<typeof ServiceFileSchema>;
 
 export interface WorkflowConfig {
   prompt: string;
-  harness: Harness;
+  provider: Harness;
   model: string | null;
 }
 
@@ -273,7 +273,7 @@ export interface LinearConnectionConfig {
   apiKey: string;
   agentUserId: string;
   agentHandle: string | null;
-  router: { harnessId: "codex" | "claude"; model: string | null; timeoutMs: number };
+  router: { providerId: "codex" | "claude"; model: string | null; timeoutMs: number };
 }
 
 export type ConnectionConfig = LinearConnectionConfig;
@@ -306,7 +306,7 @@ export interface ServerConfig {
   hosts: readonly MachineRecord[];
   machine: Machine;
   zedRemoteHost: string | null;
-  routerHarnessId: "codex" | "claude";
+  routerProviderId: "codex" | "claude";
   routerModel: string | null;
   routerTimeoutMs: number;
   acpxStateDir: string;
@@ -459,7 +459,7 @@ export function readConfig(): ServerConfig {
       agentUserId: connection.agentUserId,
       agentHandle: connection.agentHandle ?? null,
       router: {
-        harnessId: connection.router.harnessId,
+        providerId: connection.router.providerId,
         model: connection.router.model ?? null,
         timeoutMs: connection.router.timeoutMs,
       },
@@ -525,7 +525,7 @@ export function readConfig(): ServerConfig {
     hosts,
     machine,
     zedRemoteHost,
-    routerHarnessId: firstConnection?.router.harnessId ?? "codex",
+    routerProviderId: firstConnection?.router.providerId ?? "codex",
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
@@ -674,7 +674,7 @@ export function scopeConfig(
     linearApiKey: connection.apiKey,
     agentUserId: connection.agentUserId,
     agentHandle: connection.agentHandle,
-    routerHarnessId: connection.router.harnessId,
+    routerProviderId: connection.router.providerId,
     routerModel: connection.router.model,
     routerTimeoutMs: connection.router.timeoutMs,
     agentTeamKey: config.agentTeamKey,

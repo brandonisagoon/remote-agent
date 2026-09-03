@@ -66,12 +66,12 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
         workflows: {
           describe: {
             prompt: "prompts/describe.md",
-            harness: "claude",
+            provider: "claude",
             model: "opus",
           },
           orchestrate: {
             prompt: "prompts/orchestrate.md",
-            harness: "codex",
+            provider: "codex",
           },
           reflect: { prompt: "prompts/reflect.md" },
         },

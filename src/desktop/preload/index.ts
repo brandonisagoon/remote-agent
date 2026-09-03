@@ -3,8 +3,8 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { DesktopApi } from "../shared.ts";
 
 const api: DesktopApi = {
-  harness: {
-    models: (harnessId) => ipcRenderer.invoke("harness:models", harnessId),
+  provider: {
+    models: (providerId) => ipcRenderer.invoke("provider:models", providerId),
   },
   window: {
     syncTrafficLights: () => ipcRenderer.send("window:sync-traffic-lights"),
