@@ -26,6 +26,10 @@ export interface SessionSummary {
 export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
+  harness: {
+    /** Model ids advertised by the installed harness binary (with fallback). */
+    models(harnessId: string): Promise<string[]>;
+  };
   window: {
     /** Re-center the native traffic lights against the zoom-scaled header. */
     syncTrafficLights(): void;

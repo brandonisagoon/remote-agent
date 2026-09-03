@@ -64,7 +64,7 @@ export function testConfig(
       apiKey: "test-linear-key",
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
-      router: { executable: "codex", model: null, timeoutMs: 30_000 },
+      router: { harnessId: "codex", model: null, timeoutMs: 30_000 },
     },
   };
   const webhooks = overrides.webhooks ?? {
@@ -96,7 +96,7 @@ export function testConfig(
     hosts: TEST_HOSTS,
     machine: "macbook-air",
     zedRemoteHost: "test-remote",
-    codexExecutable: "codex",
+    routerHarnessId: "codex" as const,
     routerModel: null,
     routerTimeoutMs: 30_000,
     webhookMaxAgeMs: 60_000,

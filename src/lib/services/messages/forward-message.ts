@@ -13,7 +13,7 @@ import {
   fetchRouteCandidates,
   isEligibleCandidate,
   RouterTimeoutError,
-  selectSessionWithCodex,
+  selectSessionWithRouter,
 } from "../sessions/index.ts";
 import { buildReplyDirective } from "./reply-directive.ts";
 
@@ -62,7 +62,7 @@ export async function forwardMessage(
 async function route(
   options: ForwardMessageOptions,
 ): Promise<MessageDispatchResult> {
-  const selectSession = options.selectSession ?? selectSessionWithCodex;
+  const selectSession = options.selectSession ?? selectSessionWithRouter;
   if (!options.fetchCandidates && !options.prisma) {
     throw new Error("prisma is required for registry-backed session routing");
   }

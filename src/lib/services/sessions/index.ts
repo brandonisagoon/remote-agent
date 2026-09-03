@@ -24,7 +24,7 @@ export {
   fetchRouteCandidates,
   isEligibleCandidate,
   RouterTimeoutError,
-  selectSessionWithCodex,
+  selectSessionWithRouter,
 } from "./selection/index.ts";
 export { startRuntimeEventProjection } from "./runtime-events/index.ts";
 export {

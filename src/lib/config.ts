@@ -93,12 +93,12 @@ const WebhookSchema = z.object({
 });
 const RouterSchema = z
   .object({
-    /** CLI that runs the session-routing prompt (Codex-compatible). */
-    executable: z.string().min(1).default("codex"),
+    /** Harness that runs the session-routing prompt (Codex-only today). */
+    harnessId: z.enum(["codex", "claude"]).default("codex"),
     model: z.string().min(1).optional(),
     timeoutMs: PositiveIntegerSchema.default(30_000),
   })
-  .default({ executable: "codex", timeoutMs: 30_000 });
+  .default({ harnessId: "codex", timeoutMs: 30_000 });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
@@ -117,10 +117,12 @@ const AcpxSchema = z
       .enum(["approve-all", "approve-reads", "deny-all"])
       .default("approve-all"),
     nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
+    // Presence enables the harness in the UI; command (optional) overrides
+    // acpx's built-in adapter launch profile.
     agents: z
       .object({
-        codex: CommandSchema.optional(),
-        claude: CommandSchema.optional(),
+        codex: z.object({ command: CommandSchema.optional() }).optional(),
+        claude: z.object({ command: CommandSchema.optional() }).optional(),
       })
       .default({}),
   })
@@ -271,7 +273,7 @@ export interface LinearConnectionConfig {
   apiKey: string;
   agentUserId: string;
   agentHandle: string | null;
-  router: { executable: string; model: string | null; timeoutMs: number };
+  router: { harnessId: "codex" | "claude"; model: string | null; timeoutMs: number };
 }
 
 export type ConnectionConfig = LinearConnectionConfig;
@@ -304,7 +306,7 @@ export interface ServerConfig {
   hosts: readonly MachineRecord[];
   machine: Machine;
   zedRemoteHost: string | null;
-  codexExecutable: string;
+  routerHarnessId: "codex" | "claude";
   routerModel: string | null;
   routerTimeoutMs: number;
   acpxStateDir: string;
@@ -457,7 +459,7 @@ export function readConfig(): ServerConfig {
       agentUserId: connection.agentUserId,
       agentHandle: connection.agentHandle ?? null,
       router: {
-        executable: connection.router.executable,
+        harnessId: connection.router.harnessId,
         model: connection.router.model ?? null,
         timeoutMs: connection.router.timeoutMs,
       },
@@ -523,18 +525,18 @@ export function readConfig(): ServerConfig {
     hosts,
     machine,
     zedRemoteHost,
-    codexExecutable: firstConnection?.router.executable ?? "codex",
+    routerHarnessId: firstConnection?.router.harnessId ?? "codex",
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
     acpxPermissionMode: file.machine.acpx.permissionMode,
     acpxNonInteractivePermissions: file.machine.acpx.nonInteractivePermissions,
     acpxAgentCommands: {
-      ...(file.machine.acpx.agents.codex
-        ? { codex: [...file.machine.acpx.agents.codex] }
+      ...(file.machine.acpx.agents.codex?.command
+        ? { codex: [...file.machine.acpx.agents.codex.command] }
         : {}),
-      ...(file.machine.acpx.agents.claude
-        ? { claude: [...file.machine.acpx.agents.claude] }
+      ...(file.machine.acpx.agents.claude?.command
+        ? { claude: [...file.machine.acpx.agents.claude.command] }
         : {}),
     },
     webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
@@ -672,7 +674,7 @@ export function scopeConfig(
     linearApiKey: connection.apiKey,
     agentUserId: connection.agentUserId,
     agentHandle: connection.agentHandle,
-    codexExecutable: connection.router.executable,
+    routerHarnessId: connection.router.harnessId,
     routerModel: connection.router.model,
     routerTimeoutMs: connection.router.timeoutMs,
     agentTeamKey: config.agentTeamKey,

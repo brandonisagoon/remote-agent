@@ -6,6 +6,7 @@ import type {
   RouteCandidate,
   RouteDecision,
 } from "../sessions/index.ts";
+import { withAcpxCli } from "../../../test-support/acpx.ts";
 import { testConfig } from "../../../test-support/config.ts";
 import {
   createFakeAgentRuntime,
@@ -16,9 +17,9 @@ import { buildReplyDirective, forwardMessage } from "./index.ts";
 
 const WT = "/tmp/wt-guard";
 const CONFIG = testConfig({ linearApiKey: "unused-in-test" });
-const FAKE_CODEX = path.join(
+process.env.REMOTE_AGENT_ACPX_CLI = path.join(
   import.meta.dir,
-  "../../../test-support/fake-codex.ts",
+  "../../../test-support/fake-acpx.ts",
 );
 
 function decision(
@@ -162,10 +163,9 @@ describe("model-selected delivery", () => {
 
   test("delivers the only eligible candidate when classification is unavailable", async () => {
     const runner = runnerWithPane();
-    const result = await forwardMessage({
+    const result = await withAcpxCli("/nonexistent/acpx.ts", () => forwardMessage({
       config: testConfig({
         linearApiKey: "unused-in-test",
-        codexExecutable: "/nonexistent/codex",
       }),
       agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-2829",
@@ -194,7 +194,7 @@ describe("model-selected delivery", () => {
       fetchCandidates: async () => [candidate({
         agentIssueIdentifier: "AGENT-130",
       })],
-    });
+    }));
 
     expect(result).toMatchObject({
       status: "delivered",
@@ -216,7 +216,6 @@ describe("model-selected delivery", () => {
     const result = await forwardMessage({
       config: testConfig({
         linearApiKey: "unused-in-test",
-        codexExecutable: FAKE_CODEX,
       }),
       agentRuntime: runner,
       sourceIssueIdentifier: "CUBE-2829",
@@ -275,7 +274,6 @@ describe("model-selected delivery", () => {
     const result = await forwardMessage({
       config: testConfig({
         linearApiKey: "unused-in-test",
-        codexExecutable: FAKE_CODEX,
         routerModel: "fake-invalid-schema",
       }),
       agentRuntime: runner,

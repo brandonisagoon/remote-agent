@@ -144,20 +144,32 @@
               "type": "object",
               "properties": {
                 "codex": {
-                  "minItems": 1,
-                  "type": "array",
-                  "items": {
-                    "type": "string",
-                    "minLength": 1
-                  }
+                  "type": "object",
+                  "properties": {
+                    "command": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "additionalProperties": false
                 },
                 "claude": {
-                  "minItems": 1,
-                  "type": "array",
-                  "items": {
-                    "type": "string",
-                    "minLength": 1
-                  }
+                  "type": "object",
+                  "properties": {
+                    "command": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "additionalProperties": false
                 }
               },
               "additionalProperties": false
@@ -372,15 +384,18 @@
           },
           "router": {
             "default": {
-              "executable": "codex",
+              "harnessId": "codex",
               "timeoutMs": 30000
             },
             "type": "object",
             "properties": {
-              "executable": {
+              "harnessId": {
                 "default": "codex",
                 "type": "string",
-                "minLength": 1
+                "enum": [
+                  "codex",
+                  "claude"
+                ]
               },
               "model": {
                 "type": "string",
@@ -394,7 +409,7 @@
               }
             },
             "required": [
-              "executable",
+              "harnessId",
               "timeoutMs"
             ],
             "additionalProperties": false

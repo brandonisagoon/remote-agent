@@ -6,6 +6,7 @@ import type { ServiceFile } from "../../../../lib/config.ts";
 import { BrandIcon } from "@renderer/components/brand-icon.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { jumpChord, useKeybindings } from "@renderer/lib/keybindings.tsx";
+import { HARNESS_LABELS } from "@renderer/lib/sidebar-items.ts";
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
 import {
@@ -34,10 +35,12 @@ import {
 
 export function AppSidebar({
   value,
+  onAddHarness,
   onAddConnection,
   onAddRepository,
 }: {
   value: ServiceFile;
+  onAddHarness(id: "codex" | "claude"): void;
   onAddConnection(): void;
   onAddRepository(): void;
 }) {
@@ -47,10 +50,12 @@ export function AppSidebar({
   const heldKeys = useHeldKeys();
   const jumpModifiers = parseHotkey(`${bindings["jump-item"]}+1`).modifiers;
   const modHeld = jumpModifiers.length > 0 && jumpModifiers.every((key) => heldKeys.includes(key));
+  const harnesses = Object.keys(value.machine.acpx.agents);
   const connections = Object.entries(value.connections);
   const repositories = Object.entries(value.repositories);
-  const machineOrdinal = connections.length + 1;
-  const repositoryOrdinal = (index: number) => connections.length + 2 + index;
+  const connectionOrdinal = (index: number) => harnesses.length + 1 + index;
+  const machineOrdinal = harnesses.length + connections.length + 1;
+  const repositoryOrdinal = (index: number) => machineOrdinal + 1 + index;
   const jumpBadge = (ordinal: number) =>
     modHeld && ordinal <= 9 ? (
       <SidebarMenuBadge>
@@ -69,6 +74,44 @@ export function AppSidebar({
         <NavHistoryButtons />
       </SidebarHeader>
       <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupLabel>Harnesses</SidebarGroupLabel>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <SidebarGroupAction title="Add harness">
+                <F7Icon name="plus" />
+              </SidebarGroupAction>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="bottom" align="end">
+              <DropdownMenuItem disabled={harnesses.includes("codex")} onSelect={() => onAddHarness("codex")}>
+                <BrandIcon name="openai" />
+                Codex
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled={harnesses.includes("claude")} onSelect={() => onAddHarness("claude")}>
+                <BrandIcon name="claudecode" />
+                Claude Code
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              {harnesses.map((harnessId, index) => (
+                <SidebarMenuItem key={harnessId}>
+                  <SidebarMenuButton
+                    asChild
+                    isActive={!!matchRoute({ to: "/harnesses/$harnessId", params: { harnessId } })}
+                  >
+                    <Link to="/harnesses/$harnessId" params={{ harnessId }}>
+                      {harnessId === "claude" ? <BrandIcon name="claudecode" /> : <BrandIcon name="openai" />}
+                      <span>{HARNESS_LABELS[harnessId] ?? harnessId}</span>
+                    </Link>
+                  </SidebarMenuButton>
+                  {jumpBadge(index + 1)}
+                </SidebarMenuItem>
+              ))}
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
         <SidebarGroup>
           <SidebarGroupLabel>Connections</SidebarGroupLabel>
           <DropdownMenu>
@@ -111,7 +154,7 @@ export function AppSidebar({
                       <span>{connection.name}</span>
                     </Link>
                   </SidebarMenuButton>
-                  {jumpBadge(index + 1)}
+                  {jumpBadge(connectionOrdinal(index))}
                 </SidebarMenuItem>
               ))}
             </SidebarMenu>

@@ -52,7 +52,7 @@
         "repositories": "*"
       },
       "router": {
-        "executable": "codex",
+        "harnessId": "codex",
         "timeoutMs": 30000
       }
     }

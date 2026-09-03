@@ -45,6 +45,14 @@ export function AppLayout() {
       />
       <AppSidebar
         value={draft}
+        onAddHarness={(harnessId) => {
+          const create = (value: typeof draft) => {
+            value.machine.acpx.agents[harnessId] = {};
+          };
+          if (dirty) mutate(create);
+          else void commit(create);
+          void navigate({ to: "/harnesses/$harnessId", params: { harnessId } });
+        }}
         onAddConnection={() => {
           const id = generateConnectionId();
           const create = (value: typeof draft) => {
@@ -53,7 +61,7 @@ export function AppLayout() {
               name: "New Linear Connection",
               apiKey: "replace-me",
               agentUserId: "replace-me",
-              router: { executable: "codex", timeoutMs: 30_000 },
+              router: { harnessId: "codex", timeoutMs: 30_000 },
               webhook: {
                 machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,

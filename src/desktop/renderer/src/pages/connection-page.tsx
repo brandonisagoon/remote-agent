@@ -9,6 +9,7 @@ import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { SecretField } from "@renderer/components/secret-field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
+import { Badge } from "@renderer/components/ui/badge.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
 import {
@@ -28,10 +29,33 @@ import {
 } from "@renderer/components/ui/select.tsx";
 import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
+import { HARNESS_LABELS } from "@renderer/lib/sidebar-items.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
+
+/** Live model options scanned from the installed harness binary (main
+    process), so upgrading the CLI updates the list. Falls back to a curated
+    set; the JSON accepts any string either way. */
+function useHarnessModels(harnessId: string, currentModel: string | null): string[] {
+  const [models, setModels] = useState<string[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void window.remoteAgent.harness?.models(harnessId).then((next) => {
+      if (!cancelled) setModels(next);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [harnessId]);
+  if (currentModel && !models.includes(currentModel)) return [currentModel, ...models];
+  return models;
+}
 
 export function ConnectionPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const connection = value.connections[id];
+  const routerModels = useHarnessModels(
+    connection?.router.harnessId ?? "codex",
+    connection?.router.model ?? null,
+  );
   if (!connection) return <PageHeading title="Connection not found" description={id} />;
   return (
     <Accordion type="multiple" defaultValue={["general", "authentication", "agent", "router"]} className="-mt-4">
@@ -75,13 +99,45 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
         description="The Codex invocation that decides which session this connection's incoming events belong to."
       >
         <SettingsCard>
-          <Field label="Router executable" value={connection.router.executable} onChange={(next) => mutate((file) => { file.connections[id]!.router.executable = next; })} />
-          <Field
-            label="Router model"
-            value={connection.router.model ?? ""}
-            description="Optional; the executable's default model when empty."
-            onChange={(next) => mutate((file) => { file.connections[id]!.router.model = next || undefined; })}
-          />
+          <div className="grid gap-2">
+            <Label>Harness</Label>
+            <Select
+              value={connection.router.harnessId}
+              onValueChange={(next) => mutate((file) => { file.connections[id]!.router.harnessId = next as "codex" | "claude"; })}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="codex">{HARNESS_LABELS["codex"]}</SelectItem>
+                <SelectItem value="claude">{HARNESS_LABELS["claude"]}</SelectItem>
+              </SelectContent>
+            </Select>
+            {!(connection.router.harnessId in value.machine.acpx.agents) && (
+              <p className="text-muted-foreground text-xs">
+                Not configured as a harness yet — the default `codex` binary is used.
+              </p>
+            )}
+          </div>
+          <div className="grid gap-2">
+            <Label>Model</Label>
+            <Select
+              value={connection.router.model ?? "default"}
+              onValueChange={(next) => mutate((file) => { file.connections[id]!.router.model = next === "default" ? undefined : next; })}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="default">Harness default</SelectItem>
+                {routerModels.map((model) => (
+                  <SelectItem key={model} value={model}>
+                    {model}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </SettingsCard>
       </SettingsSection>
       <SettingsSection

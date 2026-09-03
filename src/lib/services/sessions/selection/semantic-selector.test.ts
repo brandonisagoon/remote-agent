@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import path from "node:path";
 
+import { FAKE_ACPX, withAcpxCli } from "../../../../test-support/acpx.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import {
   RouteActionSchema,
@@ -12,13 +13,10 @@ import {
 } from "../../../../types/sessions/index.ts";
 import {
   outputSchema,
-  selectSessionWithCodex,
+  selectSessionWithRouter,
 } from "./semantic-selector.ts";
 
-const FAKE_CODEX = path.join(
-  import.meta.dir,
-  "../../../../test-support/fake-codex.ts",
-);
+process.env.REMOTE_AGENT_ACPX_CLI = FAKE_ACPX;
 const REPLY_TARGETS: ReplyTarget[] = [
   {
     commentId: "comment-cube-2829-reply",
@@ -123,11 +121,11 @@ describe("Codex semantic selector", () => {
 
   describe("single-candidate routing", () => {
     const onlyCandidate = [candidate("AGENT-130", "%130")];
-    const fakeConfig = testConfig({ codexExecutable: FAKE_CODEX });
+    const fakeConfig = testConfig({});
 
     test("keeps target selection deterministic while classifying a reply", async () => {
       await expect(
-        selectSessionWithCodex(fakeConfig, routingInput(onlyCandidate)),
+        selectSessionWithRouter(fakeConfig, routingInput(onlyCandidate)),
       ).resolves.toEqual({
         targetAgentIssueIdentifier: "AGENT-130",
         reasonCode: "only_eligible_candidate",
@@ -141,7 +139,7 @@ describe("Codex semantic selector", () => {
       "classifies %s",
       async (comment, expectedActions) => {
         await expect(
-          selectSessionWithCodex(
+          selectSessionWithRouter(
             fakeConfig,
             routingInput(onlyCandidate, { comment }),
           ),
@@ -157,9 +155,11 @@ describe("Codex semantic selector", () => {
 
     test("skips classification when no reply targets exist", async () => {
       await expect(
-        selectSessionWithCodex(
-          testConfig({ codexExecutable: "/nonexistent/codex" }),
-          routingInput(onlyCandidate, { replyTargets: undefined }),
+        withAcpxCli("/nonexistent/acpx.ts", () =>
+          selectSessionWithRouter(
+            testConfig({}),
+            routingInput(onlyCandidate, { replyTargets: undefined }),
+          ),
         ),
       ).resolves.toEqual({
         targetAgentIssueIdentifier: "AGENT-130",
@@ -171,15 +171,17 @@ describe("Codex semantic selector", () => {
     });
 
     test.each([
-      ["missing executable", "/nonexistent/codex", undefined],
-      ["invalid router output", FAKE_CODEX, "fake-invalid-schema"],
+      ["missing acpx cli", "/nonexistent/acpx.ts", undefined],
+      ["invalid router output", FAKE_ACPX, "fake-invalid-schema"],
     ])(
       "falls back to reply for %s",
-      async (_name, codexExecutable, routerModel) => {
+      async (_name, acpxCli, routerModel) => {
         await expect(
-          selectSessionWithCodex(
-            testConfig({ codexExecutable, routerModel }),
-            routingInput(onlyCandidate),
+          withAcpxCli(acpxCli, () =>
+            selectSessionWithRouter(
+              testConfig({ routerModel }),
+              routingInput(onlyCandidate),
+            ),
           ),
         ).resolves.toEqual({
           targetAgentIssueIdentifier: "AGENT-130",
@@ -193,8 +195,8 @@ describe("Codex semantic selector", () => {
   });
 
   test("replays multi-candidate selection through the real routing MCP", async () => {
-    const decision = await selectSessionWithCodex(
-      testConfig({ codexExecutable: FAKE_CODEX }),
+    const decision = await selectSessionWithRouter(
+      testConfig({}),
       routingInput([
         candidate("AGENT-130", "%130"),
         candidate("AGENT-131", "%131"),
@@ -213,11 +215,8 @@ describe("Codex semantic selector", () => {
   test("keeps the actionable tail of multi-candidate router failures", async () => {
     let thrown: unknown;
     try {
-      await selectSessionWithCodex(
-        testConfig({
-          codexExecutable: FAKE_CODEX,
-          routerModel: "fake-invalid-schema",
-        }),
+      await selectSessionWithRouter(
+        testConfig({ routerModel: "fake-invalid-schema" }),
         routingInput([
           candidate("AGENT-130", "%130"),
           candidate("AGENT-131", "%131"),
