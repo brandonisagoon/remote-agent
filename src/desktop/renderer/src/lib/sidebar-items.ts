@@ -22,7 +22,7 @@ export interface SidebarItem {
 export function useSidebarItems(): SidebarItem[] {
   const { draft } = useConfig();
   return [
-    ...Object.keys(draft.machine.acpx.agents).map((id) => ({
+    ...Object.keys(draft.providers).map((id) => ({
       id: `provider:${id}`,
       label: PROVIDER_LABELS[id] ?? id,
       link: { to: "/providers/$providerId" as const, params: { providerId: id } },

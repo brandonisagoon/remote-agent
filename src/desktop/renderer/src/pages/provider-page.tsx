@@ -7,7 +7,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui
 import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
 
-type ProviderId = keyof ServiceFile["machine"]["acpx"]["agents"];
+type ProviderId = keyof ServiceFile["providers"];
 
 /** The adapter commands acpx's built-in launch profiles run when no override is set. */
 const BUILTIN_ADAPTERS: Record<string, string> = {
@@ -17,7 +17,7 @@ const BUILTIN_ADAPTERS: Record<string, string> = {
 
 export function ProviderPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const providerId = id as ProviderId;
-  const provider = value.machine.acpx.agents[providerId];
+  const provider = value.providers[providerId];
   if (!provider) return <PageHeading title="Provider not found" description={id} />;
   return (
     <Accordion type="multiple" defaultValue={["launch"]} className="-mt-4">
@@ -56,7 +56,7 @@ export function ProviderPage({ id, value, mutate }: { id: string; value: Service
             onChange={(next) =>
               mutate((file) => {
                 const parts = next.split(/\s+/).filter(Boolean);
-                file.machine.acpx.agents[providerId] = parts.length > 0 ? { command: parts } : {};
+                file.providers[providerId] = parts.length > 0 ? { command: parts } : {};
               })
             }
           />

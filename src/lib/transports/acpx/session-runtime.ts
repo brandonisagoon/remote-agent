@@ -155,8 +155,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       agentRegistry: createAgentRegistry({
         overrides: config.acpxAgentCommands,
       }),
-      permissionMode: config.acpxPermissionMode,
-      nonInteractivePermissions: config.acpxNonInteractivePermissions,
+      // Sessions run unattended; agents get their tool requests approved.
+      permissionMode: "approve-all",
+      nonInteractivePermissions: "deny",
       elicitationModes: ["form", "url"],
     });
   }

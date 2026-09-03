@@ -73,7 +73,7 @@ describe("agent issue description", () => {
         occurredAt: "2026-07-28T12:01:00.000Z",
         sourceIssueIdentifier: "CUBE-2600",
       },
-      testConfig(),
+      testConfig({ editorConnection: "ssh" }),
     );
     expect(description).toContain(
       "| Worktree | `/srv/worktrees/example-cube-2600` |",
@@ -104,7 +104,7 @@ describe("source issue resolution", () => {
 });
 
 describe("delivery eligibility", () => {
-  const config = testConfig();
+  const config = testConfig({ editorConnection: "ssh" });
   const candidate: RouteCandidate = {
     agentIssueId: "issue-id",
     agentIssueIdentifier: "AGENT-9",

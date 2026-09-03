@@ -13,14 +13,12 @@ const HOSTS = [
   {
     id: "studio-mac",
     label: "Studio Mac",
-    zedConnection: "local" as const,
     acceptsTrackerInput: true,
     default: true,
   },
   {
     id: "build-mac",
     label: "Build Mac",
-    zedConnection: "ssh" as const,
     acceptsTrackerInput: false,
     default: false,
   },

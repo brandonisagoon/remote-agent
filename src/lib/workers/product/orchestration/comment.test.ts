@@ -19,8 +19,9 @@ afterEach(() => {
 describe("orchestration worktree link comment", () => {
   test("builds an SSH worktree link with the runtime session", () => {
     const body = buildWorktreeLinkComment({
-      machine: getMachine({ id: "macbook-air" }),
-      zedRemoteHost: "test-remote",
+      editorConnection: "ssh",
+      editorScheme: "zed",
+      editorRemoteHost: "test-remote",
       worktreePath: "/srv/worktrees/foo-cube-2829",
       runtimeSessionId: "runtime_2829",
     });
@@ -34,8 +35,9 @@ describe("orchestration worktree link comment", () => {
   test("builds the exact local-machine comment body", () => {
     expect(
       buildWorktreeLinkComment({
-        machine: getMachine({ id: "macbook-pro" }),
-        zedRemoteHost: "unused",
+        editorConnection: "local",
+        editorScheme: "zed",
+        editorRemoteHost: null,
         worktreePath: "/srv/worktrees/foo cube",
         runtimeSessionId: "runtime_local",
       }),

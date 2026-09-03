@@ -8,23 +8,19 @@ import { readConfig, routeWebhookRepository } from "./config.ts";
 let directory: string;
 let previousConfig: string | undefined;
 
-function serviceFile(zedConnection: "local" | "ssh" = "local") {
+function serviceFile(editorConnection: "local" | "ssh" = "local") {
   return {
     schemaVersion: 2,
     serviceName: "example-agent",
     machine: {
       id: "build-host",
       name: "Build Host",
-      acceptsTrackerInput: true,
       server: {
         publicUrl: "https://agents.example.com",
         apiKey: "api-secret",
         databaseUrl: "file:./state.sqlite",
       },
-      zed: {
-        connection: zedConnection,
-        ...(zedConnection === "ssh" ? {} : {}),
-      },
+
       acpx: {},
     },
     connections: {
@@ -33,6 +29,9 @@ function serviceFile(zedConnection: "local" | "ssh" = "local") {
         name: "Linear Main",
         apiKey: "linear-secret",
         agentUserId: "agent-user",
+        editor: {
+          connection: editorConnection,
+        },
         webhook: {
           machineId: "build-host",
           slug: "linear-main",
@@ -125,15 +124,15 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("publicUrl");
   });
 
-  test("requires a Zed host only for SSH execution hosts", () => {
+  test("requires an editor host only for SSH execution hosts", () => {
     const value = serviceFile("ssh");
     writeConfig(value);
     expect(() => readConfig()).toThrow("remoteHost is required");
 
-    (value.machine.zed as { connection: "ssh"; remoteHost?: string }).remoteHost =
+    (value.connections["linear-main"].editor as { connection: "ssh"; remoteHost?: string }).remoteHost =
       "build-host.example";
     writeConfig(value);
-    expect(readConfig().zedRemoteHost).toBe("build-host.example");
+    expect(readConfig().editorRemoteHost).toBe("build-host.example");
   });
 
   test("rejects the legacy fleet-shaped config with migration guidance", () => {

@@ -28,11 +28,6 @@ function promptText(blocks: acp.ContentBlock[]): string {
     .trim();
 }
 
-function agentForProvider(provider: "codex" | "claude-code"):
-  "codex" | "claude" {
-  return provider === "claude-code" ? "claude" : "codex";
-}
-
 function isSelect(
   option: acp.SessionConfigOption,
 ): option is acp.SessionConfigOption & { type: "select" } {
@@ -149,7 +144,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
     const session = await this.runtime.ensureSession({
       sessionKey: logicalKey,
       name: `Zed · ${path.basename(params.cwd) || "session"}`,
-      agent: agentForProvider(this.config.acp.providerId),
+      agent: this.config.acp.providerId,
       cwd: params.cwd,
       worktreePath: params.cwd,
       executionTarget: this.config.machine,

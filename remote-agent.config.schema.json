@@ -26,10 +26,6 @@
           "type": "string",
           "minLength": 1
         },
-        "acceptsTrackerInput": {
-          "default": true,
-          "type": "boolean"
-        },
         "server": {
           "type": "object",
           "properties": {
@@ -86,105 +82,20 @@
           ],
           "additionalProperties": false
         },
-        "zed": {
-          "default": {
-            "connection": "local"
-          },
-          "type": "object",
-          "properties": {
-            "connection": {
-              "default": "local",
-              "type": "string",
-              "enum": [
-                "local",
-                "ssh"
-              ]
-            },
-            "remoteHost": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "required": [
-            "connection"
-          ],
-          "additionalProperties": false
-        },
         "acpx": {
-          "default": {
-            "permissionMode": "approve-all",
-            "nonInteractivePermissions": "deny",
-            "agents": {}
-          },
+          "default": {},
           "type": "object",
           "properties": {
             "stateDir": {
               "type": "string",
               "minLength": 1
-            },
-            "permissionMode": {
-              "default": "approve-all",
-              "type": "string",
-              "enum": [
-                "approve-all",
-                "approve-reads",
-                "deny-all"
-              ]
-            },
-            "nonInteractivePermissions": {
-              "default": "deny",
-              "type": "string",
-              "enum": [
-                "deny",
-                "fail"
-              ]
-            },
-            "agents": {
-              "default": {},
-              "type": "object",
-              "properties": {
-                "codex": {
-                  "type": "object",
-                  "properties": {
-                    "command": {
-                      "minItems": 1,
-                      "type": "array",
-                      "items": {
-                        "type": "string",
-                        "minLength": 1
-                      }
-                    }
-                  },
-                  "additionalProperties": false
-                },
-                "claude": {
-                  "type": "object",
-                  "properties": {
-                    "command": {
-                      "minItems": 1,
-                      "type": "array",
-                      "items": {
-                        "type": "string",
-                        "minLength": 1
-                      }
-                    }
-                  },
-                  "additionalProperties": false
-                }
-              },
-              "additionalProperties": false
             }
           },
-          "required": [
-            "permissionMode",
-            "nonInteractivePermissions",
-            "agents"
-          ],
           "additionalProperties": false
         },
         "acp": {
           "default": {
-            "provider": "codex"
+            "providerId": "codex"
           },
           "type": "object",
           "properties": {
@@ -192,12 +103,12 @@
               "type": "string",
               "minLength": 1
             },
-            "provider": {
+            "providerId": {
               "default": "codex",
               "type": "string",
               "enum": [
                 "codex",
-                "claude-code"
+                "claude"
               ]
             },
             "model": {
@@ -206,7 +117,7 @@
             }
           },
           "required": [
-            "provider"
+            "providerId"
           ],
           "additionalProperties": false
         },
@@ -267,14 +178,47 @@
       "required": [
         "id",
         "name",
-        "acceptsTrackerInput",
         "server",
-        "zed",
         "acpx",
         "acp",
         "installation",
         "updates"
       ],
+      "additionalProperties": false
+    },
+    "providers": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "codex": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "claude": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
       "additionalProperties": false
     },
     "connections": {
@@ -413,6 +357,48 @@
               "timeoutMs"
             ],
             "additionalProperties": false
+          },
+          "editor": {
+            "default": {
+              "name": "Zed",
+              "scheme": "zed",
+              "connection": "local"
+            },
+            "type": "object",
+            "properties": {
+              "name": {
+                "default": "Zed",
+                "type": "string",
+                "minLength": 1
+              },
+              "scheme": {
+                "default": "zed",
+                "type": "string",
+                "minLength": 1
+              },
+              "appPath": {
+                "type": "string",
+                "minLength": 1
+              },
+              "connection": {
+                "default": "local",
+                "type": "string",
+                "enum": [
+                  "local",
+                  "ssh"
+                ]
+              },
+              "remoteHost": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "name",
+              "scheme",
+              "connection"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [
@@ -420,7 +406,8 @@
           "name",
           "apiKey",
           "agentUserId",
-          "router"
+          "router",
+          "editor"
         ],
         "additionalProperties": false
       }
@@ -661,6 +648,7 @@
     "schemaVersion",
     "serviceName",
     "machine",
+    "providers",
     "connections",
     "repositories"
   ],

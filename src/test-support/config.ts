@@ -5,14 +5,14 @@ export const TEST_HOSTS = [
   {
     id: "macbook-air",
     label: "Test MacBook Air",
-    zedConnection: "ssh" as const,
+    editorConnection: "ssh" as const,
     acceptsTrackerInput: true,
     default: true,
   },
   {
     id: "macbook-pro",
     label: "Test MacBook Pro",
-    zedConnection: "local" as const,
+    editorConnection: "local" as const,
     acceptsTrackerInput: false,
     default: false,
   },
@@ -65,6 +65,7 @@ export function testConfig(
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
       router: { providerId: "codex", model: null, timeoutMs: 30_000 },
+      editor: { name: "Zed", scheme: "zed", connection: "local" as const, remoteHost: null },
     },
   };
   const webhooks = overrides.webhooks ?? {
@@ -95,7 +96,9 @@ export function testConfig(
     agentTeamKey: "AGENT",
     hosts: TEST_HOSTS,
     machine: "macbook-air",
-    zedRemoteHost: "test-remote",
+    editorScheme: "zed",
+    editorConnection: "local" as const,
+    editorRemoteHost: "test-remote",
     routerProviderId: "codex" as const,
     routerModel: null,
     routerTimeoutMs: 30_000,
@@ -110,9 +113,6 @@ export function testConfig(
     ...overrides,
     acpxStateDir:
       overrides.acpxStateDir ?? "/nonexistent/remote-agent/acpx",
-    acpxPermissionMode: overrides.acpxPermissionMode ?? "approve-all",
-    acpxNonInteractivePermissions:
-      overrides.acpxNonInteractivePermissions ?? "deny",
     acpxAgentCommands: overrides.acpxAgentCommands ?? {},
     acp: overrides.acp ?? { providerId: "codex" },
     connections,

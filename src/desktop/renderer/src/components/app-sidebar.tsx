@@ -50,7 +50,7 @@ export function AppSidebar({
   const heldKeys = useHeldKeys();
   const jumpModifiers = parseHotkey(`${bindings["jump-item"]}+1`).modifiers;
   const modHeld = jumpModifiers.length > 0 && jumpModifiers.every((key) => heldKeys.includes(key));
-  const providers = Object.keys(value.machine.acpx.agents);
+  const providers = Object.keys(value.providers);
   const connections = Object.entries(value.connections);
   const repositories = Object.entries(value.repositories);
   const connectionOrdinal = (index: number) => providers.length + 1 + index;

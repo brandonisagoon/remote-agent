@@ -26,6 +26,10 @@ export interface SessionSummary {
 export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
+  editor: {
+    /** Native .app picker; resolves the bundle's URL scheme, or why not. */
+    pick(): Promise<{ editor: { name: string; scheme: string; appPath: string } } | { error: "no-url-scheme" } | null>;
+  };
   tunnel: {
     /** Cloudflare tunnel UUID for a tunnel name, or null with a reason. */
     info(name: string): Promise<{ tunnelId: string | null; reason?: "cli-missing" | "not-found" }>;

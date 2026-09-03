@@ -99,6 +99,18 @@ const RouterSchema = z
     timeoutMs: PositiveIntegerSchema.default(30_000),
   })
   .default({ providerId: "codex", timeoutMs: 30_000 });
+const EditorSchema = z
+  .object({
+    /** Display name of the chosen editor app (e.g. "Zed"). */
+    name: z.string().min(1).default("Zed"),
+    /** URL scheme used for worktree deep links. */
+    scheme: z.string().min(1).default("zed"),
+    /** The picked .app bundle, when chosen via the file selector. */
+    appPath: z.string().min(1).optional(),
+    connection: z.enum(["local", "ssh"]).default("local"),
+    remoteHost: z.string().min(1).optional(),
+  })
+  .default({ name: "Zed", scheme: "zed", connection: "local" });
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
@@ -108,29 +120,23 @@ const LinearConnectionSchema = z.object({
   webhook: WebhookSchema.optional(),
   /** Routes this connection's incoming events to sessions. */
   router: RouterSchema,
+  /** The editor worktree deep links open for this workspace's viewers. */
+  editor: EditorSchema,
 });
 const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
   .object({
     stateDir: z.string().min(1).optional(),
-    permissionMode: z
-      .enum(["approve-all", "approve-reads", "deny-all"])
-      .default("approve-all"),
-    nonInteractivePermissions: z.enum(["deny", "fail"]).default("deny"),
-    // Presence enables the provider in the UI; command (optional) overrides
-    // acpx's built-in adapter launch profile.
-    agents: z
-      .object({
-        codex: z.object({ command: CommandSchema.optional() }).optional(),
-        claude: z.object({ command: CommandSchema.optional() }).optional(),
-      })
-      .default({}),
   })
-  .default({
-    permissionMode: "approve-all",
-    nonInteractivePermissions: "deny",
-    agents: {},
-  });
+  .default({});
+// Presence enables the provider in the UI; command (optional) overrides
+// acpx's built-in adapter launch profile.
+const ProvidersSchema = z
+  .object({
+    codex: z.object({ command: CommandSchema.optional() }).optional(),
+    claude: z.object({ command: CommandSchema.optional() }).optional(),
+  })
+  .default({});
 
 export const ServiceFileSchema = z.object({
   $schema: z.string().optional(),
@@ -142,7 +148,6 @@ export const ServiceFileSchema = z.object({
   machine: z.object({
     id: MachineSchema,
     name: z.string().min(1),
-    acceptsTrackerInput: z.boolean().default(true),
     server: z.object({
       publicUrl: z.string().min(1),
       apiKey: z.string().min(1),
@@ -154,16 +159,12 @@ export const ServiceFileSchema = z.object({
       acpSocketPath: z.string().min(1).optional(),
       controlSocketPath: z.string().min(1).optional(),
     }),
-    zed: z.object({
-      connection: z.enum(["local", "ssh"]).default("local"),
-      remoteHost: z.string().min(1).optional(),
-    }).default({ connection: "local" }),
     acpx: AcpxSchema,
     acp: z.object({
       hostId: z.string().min(1).optional(),
-      provider: z.enum(["codex", "claude-code"]).default("codex"),
+      providerId: z.enum(["codex", "claude"]).default("codex"),
       model: z.string().min(1).optional(),
-    }).default({ provider: "codex" }),
+    }).default({ providerId: "codex" }),
     installation: z.object({
       root: z.string().min(1).optional(),
       gitRemote: z.string().min(1).optional(),
@@ -175,6 +176,7 @@ export const ServiceFileSchema = z.object({
       channel: z.enum(["stable", "beta"]).default("stable"),
     }).default({ channel: "stable" }),
   }),
+  providers: ProvidersSchema,
   connections: z.record(ConfigIdSchema, ConnectionSchema),
   repositories: z.record(ConfigIdSchema, RepositorySchema),
 }).superRefine((file, context) => {
@@ -182,8 +184,10 @@ export const ServiceFileSchema = z.object({
   if (repositoryIds.size === 0) {
     context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
   }
-  if (file.machine.zed.connection === "ssh" && !file.machine.zed.remoteHost) {
-    context.addIssue({ code: "custom", path: ["machine", "zed", "remoteHost"], message: "remoteHost is required for an SSH Zed connection" });
+  for (const [connectionId, connection] of Object.entries(file.connections)) {
+    if (connection.editor.connection === "ssh" && !connection.editor.remoteHost) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "editor", "remoteHost"], message: "remoteHost is required for an SSH editor connection" });
+    }
   }
   const webhookSlugs = new Set<string>();
   for (const [connectionId, connection] of Object.entries(file.connections)) {
@@ -274,6 +278,7 @@ export interface LinearConnectionConfig {
   agentUserId: string;
   agentHandle: string | null;
   router: { providerId: "codex" | "claude"; model: string | null; timeoutMs: number };
+  editor: { name: string; scheme: string; connection: "local" | "ssh"; remoteHost: string | null };
 }
 
 export type ConnectionConfig = LinearConnectionConfig;
@@ -305,13 +310,13 @@ export interface ServerConfig {
   agentTeamKey: string;
   hosts: readonly MachineRecord[];
   machine: Machine;
-  zedRemoteHost: string | null;
+  editorScheme: string;
+  editorConnection: "local" | "ssh";
+  editorRemoteHost: string | null;
   routerProviderId: "codex" | "claude";
   routerModel: string | null;
   routerTimeoutMs: number;
   acpxStateDir: string;
-  acpxPermissionMode: "approve-all" | "approve-reads" | "deny-all";
-  acpxNonInteractivePermissions: "deny" | "fail";
   acpxAgentCommands: Partial<Record<"codex" | "claude", string[]>>;
   webhookMaxAgeMs: number;
   deployScript: string;
@@ -323,7 +328,7 @@ export interface ServerConfig {
   endOnState: string;
   acp: {
     hostId?: string;
-    providerId: "codex" | "claude-code";
+    providerId: "codex" | "claude";
     model?: string;
   };
   connections: Readonly<Record<string, ConnectionConfig>>;
@@ -390,11 +395,9 @@ export function readConfig(): ServerConfig {
   const hosts = configureMachines([{
     id: machine,
     label: file.machine.name,
-    zedConnection: file.machine.zed.connection,
-    acceptsTrackerInput: file.machine.acceptsTrackerInput,
+    acceptsTrackerInput: true,
     default: true,
   }]);
-  const zedRemoteHost = file.machine.zed.remoteHost ?? null;
 
   const installRoot = absolute(
     file.machine.installation.root ??
@@ -463,6 +466,12 @@ export function readConfig(): ServerConfig {
         model: connection.router.model ?? null,
         timeoutMs: connection.router.timeoutMs,
       },
+      editor: {
+        name: connection.editor.name,
+        scheme: connection.editor.scheme,
+        connection: connection.editor.connection,
+        remoteHost: connection.editor.remoteHost ?? null,
+      },
     } satisfies LinearConnectionConfig]),
   );
   // Webhooks nest inside connections in the file; the resolved view stays a
@@ -524,20 +533,16 @@ export function readConfig(): ServerConfig {
     agentTeamKey: "AGENT",
     hosts,
     machine,
-    zedRemoteHost,
+    editorScheme: firstConnection?.editor.scheme ?? "zed",
+    editorConnection: firstConnection?.editor.connection ?? "local",
+    editorRemoteHost: firstConnection?.editor.remoteHost ?? null,
     routerProviderId: firstConnection?.router.providerId ?? "codex",
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
-    acpxPermissionMode: file.machine.acpx.permissionMode,
-    acpxNonInteractivePermissions: file.machine.acpx.nonInteractivePermissions,
     acpxAgentCommands: {
-      ...(file.machine.acpx.agents.codex?.command
-        ? { codex: [...file.machine.acpx.agents.codex.command] }
-        : {}),
-      ...(file.machine.acpx.agents.claude?.command
-        ? { claude: [...file.machine.acpx.agents.claude.command] }
-        : {}),
+      ...(file.providers.codex?.command ? { codex: [...file.providers.codex.command] } : {}),
+      ...(file.providers.claude?.command ? { claude: [...file.providers.claude.command] } : {}),
     },
     webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
     deployScript:
@@ -550,7 +555,7 @@ export function readConfig(): ServerConfig {
     endOnState: "End",
     acp: {
       ...(file.machine.acp.hostId ? { hostId: file.machine.acp.hostId } : {}),
-      providerId: file.machine.acp.provider,
+      providerId: file.machine.acp.providerId,
       ...(file.machine.acp.model ? { model: file.machine.acp.model } : {}),
     },
     connections,

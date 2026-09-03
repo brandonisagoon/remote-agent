@@ -7,7 +7,7 @@ import {
   issueHasCommentContaining,
 } from "../../../integrations/linear/comments.ts";
 import {
-  buildZedDeepLink,
+  buildEditorDeepLink,
   getMachine,
   type MachineRecord,
 } from "../../../machines/index.ts";
@@ -57,14 +57,16 @@ export function predictWorktreePath(
 }
 
 export function buildWorktreeLinkComment(input: {
-  machine: MachineRecord;
-  zedRemoteHost: string | null;
+  editorConnection: "local" | "ssh";
+  editorScheme: string;
+  editorRemoteHost: string | null;
   worktreePath: string;
   runtimeSessionId: string;
 }): string {
-  const link = buildZedDeepLink(
-    input.machine,
-    input.zedRemoteHost,
+  const link = buildEditorDeepLink(
+    input.editorConnection,
+    input.editorScheme,
+    input.editorRemoteHost,
     input.worktreePath,
   );
   return [
@@ -153,8 +155,9 @@ export async function postWorktreeLinkComment(
     }
 
     const body = buildWorktreeLinkComment({
-      machine,
-      zedRemoteHost: input.config.zedRemoteHost,
+      editorConnection: input.config.editorConnection,
+      editorScheme: input.config.editorScheme,
+      editorRemoteHost: input.config.editorRemoteHost,
       worktreePath,
       runtimeSessionId: input.runtimeSessionId,
     });

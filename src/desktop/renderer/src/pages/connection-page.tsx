@@ -4,6 +4,7 @@ import { Link } from "@tanstack/react-router";
 import { toast } from "sonner";
 
 import type { ServiceFile } from "../../../../lib/config.ts";
+import { sshLinkSupported } from "../../../../lib/machines/editor-link.ts";
 import { CopyField } from "@renderer/components/copy-field.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
@@ -11,6 +12,7 @@ import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { SecretField } from "@renderer/components/secret-field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
+import { Button } from "@renderer/components/ui/button.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
 import {
@@ -51,7 +53,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
   );
   if (!connection) return <PageHeading title="Connection not found" description={id} />;
   return (
-    <Accordion type="multiple" defaultValue={["general", "authentication", "agent", "router"]} className="-mt-4">
+    <Accordion type="multiple" defaultValue={["general", "authentication", "agent", "router", "editor"]} className="-mt-4">
       <SettingsSection value="general" title="General">
         <SettingsCard>
           <Field label="Display name" value={connection.name} onChange={(next) => mutate((file) => { file.connections[id]!.name = next; })} />
@@ -106,7 +108,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
                 <SelectItem value="claude">{PROVIDER_LABELS["claude"]}</SelectItem>
               </SelectContent>
             </Select>
-            {!(connection.router.providerId in value.machine.acpx.agents) && (
+            {!(connection.router.providerId in value.providers) && (
               <p className="text-muted-foreground text-xs">
                 Not configured as a provider yet — the default `codex` binary is used.
               </p>
@@ -131,6 +133,63 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
               </SelectContent>
             </Select>
           </div>
+        </SettingsCard>
+      </SettingsSection>
+      <SettingsSection
+        value="editor"
+        title="Editor"
+        description="Where worktree deep links posted to this workspace open."
+      >
+        <SettingsCard>
+          <div className="grid gap-2">
+            <Label>Editor</Label>
+            <div className="flex items-center gap-2">
+              <Field label="" value={connection.editor.name} disabled onChange={() => {}} />
+              <Button
+                variant="outline"
+                onClick={async () => {
+                  const picked = await window.remoteAgent.editor.pick();
+                  if (!picked) return;
+                  if ("error" in picked) {
+                    toast.error("That app has no URL scheme, so it can't open deep links");
+                    return;
+                  }
+                  mutate((file) => {
+                    const editor = file.connections[id]!.editor;
+                    editor.name = picked.editor.name;
+                    editor.scheme = picked.editor.scheme;
+                    editor.appPath = picked.editor.appPath;
+                    if (!sshLinkSupported(picked.editor.scheme)) editor.connection = "local";
+                  });
+                }}
+              >
+                Choose…
+              </Button>
+            </div>
+            <p className="text-muted-foreground text-xs">
+              Links use the <code className="bg-muted rounded px-1 font-mono text-[11px]">{connection.editor.scheme}://</code> scheme.
+            </p>
+          </div>
+          <div className="grid gap-2">
+            <Label>Connection</Label>
+            <Select
+              value={connection.editor.connection}
+              onValueChange={(next) => mutate((file) => { file.connections[id]!.editor.connection = next as "local" | "ssh"; })}
+            >
+              <SelectTrigger className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="local">Local</SelectItem>
+                <SelectItem value="ssh" disabled={!sshLinkSupported(connection.editor.scheme)}>
+                  SSH{!sshLinkSupported(connection.editor.scheme) && " (unsupported by this editor)"}
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          {connection.editor.connection === "ssh" && (
+            <Field label="SSH Host" description="How your editor reaches this machine." value={connection.editor.remoteHost ?? ""} onChange={(next) => mutate((file) => { file.connections[id]!.editor.remoteHost = next; })} />
+          )}
         </SettingsCard>
       </SettingsSection>
       <SettingsSection

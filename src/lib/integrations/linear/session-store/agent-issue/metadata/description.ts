@@ -1,6 +1,6 @@
 import type { ServerConfig } from "../../../../../config.ts";
 import {
-  buildZedDeepLink,
+  buildEditorDeepLink,
   findMachine,
   getDefaultMachineId,
   getMachine,
@@ -205,9 +205,10 @@ export function buildAgentIssueDescription(
   config: ServerConfig,
 ): string {
   const machine = getMachine({ id: runtime.machine });
-  const zed = buildZedDeepLink(
-    machine,
-    config.zedRemoteHost,
+  const zed = buildEditorDeepLink(
+    config.editorConnection,
+    config.editorScheme,
+    config.editorRemoteHost,
     runtime.worktreePath,
   );
   return `| Runtime field | Value |

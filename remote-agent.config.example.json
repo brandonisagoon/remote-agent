@@ -5,7 +5,6 @@
   "machine": {
     "id": "studio-mac",
     "name": "Studio Mac",
-    "acceptsTrackerInput": true,
     "server": {
       "publicUrl": "https://agents.example.com",
       "apiKey": "replace-with-a-long-random-api-key",
@@ -17,17 +16,11 @@
       "acpSocketPath": "~/Library/Application Support/remote-agent/acp.sock",
       "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock"
     },
-    "zed": {
-      "connection": "local"
-    },
     "acpx": {
-      "stateDir": "~/Library/Application Support/remote-agent/acpx",
-      "permissionMode": "approve-all",
-      "nonInteractivePermissions": "deny",
-      "agents": {}
+      "stateDir": "~/Library/Application Support/remote-agent/acpx"
     },
     "acp": {
-      "provider": "codex"
+      "providerId": "codex"
     },
     "installation": {
       "gitRemote": "https://github.com/brandonisagoon/remote-agent.git",
@@ -37,6 +30,7 @@
       "channel": "stable"
     }
   },
+  "providers": {},
   "connections": {
     "linear-main": {
       "provider": "linear",
@@ -54,6 +48,11 @@
       "router": {
         "providerId": "codex",
         "timeoutMs": 30000
+      },
+      "editor": {
+        "name": "Zed",
+        "scheme": "zed",
+        "connection": "local"
       }
     }
   },

@@ -47,7 +47,7 @@ export function AppLayout() {
         value={draft}
         onAddProvider={(providerId) => {
           const create = (value: typeof draft) => {
-            value.machine.acpx.agents[providerId] = {};
+            value.providers[providerId] = {};
           };
           if (dirty) mutate(create);
           else void commit(create);
@@ -62,6 +62,7 @@ export function AppLayout() {
               apiKey: "replace-me",
               agentUserId: "replace-me",
               router: { providerId: "codex", timeoutMs: 30_000 },
+              editor: { name: "Zed", scheme: "zed", connection: "local" },
               webhook: {
                 machineId: value.machine.id,
                 slug: `wh-${randomHex(6)}`,

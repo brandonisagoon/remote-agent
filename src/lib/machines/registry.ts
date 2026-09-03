@@ -13,7 +13,6 @@ export type Machine = z.infer<typeof MachineSchema>;
 export const MachineRecordSchema = z.object({
   id: MachineSchema,
   label: z.string().trim().min(1),
-  zedConnection: z.enum(["local", "ssh"]),
   acceptsTrackerInput: z.boolean(),
   default: z.boolean(),
 });
