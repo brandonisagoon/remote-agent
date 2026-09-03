@@ -27,8 +27,8 @@ export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
   tunnel: {
-    /** Cloudflare tunnel UUID for a tunnel name, or null when unresolvable. */
-    info(name: string): Promise<{ tunnelId: string | null }>;
+    /** Cloudflare tunnel UUID for a tunnel name, or null with a reason. */
+    info(name: string): Promise<{ tunnelId: string | null; reason?: "cli-missing" | "not-found" }>;
   };
   provider: {
     /** Model ids advertised by the installed provider binary (with fallback). */

@@ -96,7 +96,7 @@ export function DnsRecordsTable({ value }: { value: ServiceFile }) {
                   </span>
                 ) : (
                   <span className="text-muted-foreground">
-                    tunnel “{tunnelName}” not found — is cloudflared set up?
+                    {tunnel?.reason === "cli-missing" ? "cloudflared not installed" : "tunnel not created"}
                   </span>
                 )}
               </TableCell>

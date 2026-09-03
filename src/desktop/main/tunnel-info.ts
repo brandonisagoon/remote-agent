@@ -13,27 +13,35 @@ function cloudflaredPath(): string | null {
   return null;
 }
 
-const cache = new Map<string, { at: number; tunnelId: string | null }>();
+export interface TunnelInfo {
+  tunnelId: string | null;
+  /** Why tunnelId is null. */
+  reason?: "cli-missing" | "not-found";
+}
+
+const cache = new Map<string, { at: number; info: TunnelInfo }>();
 const CACHE_TTL_MS = 60_000;
 
-/** Looks up the Cloudflare tunnel UUID for a tunnel name; null when
-    cloudflared is missing, not authenticated, or the tunnel doesn't exist. */
-export async function tunnelInfo(name: string): Promise<{ tunnelId: string | null }> {
+/** Looks up the Cloudflare tunnel UUID for a tunnel name. */
+export async function tunnelInfo(name: string): Promise<TunnelInfo> {
   const cached = cache.get(name);
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return { tunnelId: cached.tunnelId };
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return cached.info;
   const binary = cloudflaredPath();
-  if (!binary) return { tunnelId: null };
-  const tunnelId = await new Promise<string | null>((resolve) => {
-    execFile(binary, ["tunnel", "list", "--output", "json"], { timeout: 10_000 }, (error, stdout) => {
-      if (error) return resolve(null);
-      try {
-        const tunnels = JSON.parse(stdout) as Array<{ id?: string; name?: string }>;
-        resolve(tunnels.find((tunnel) => tunnel.name === name)?.id ?? null);
-      } catch {
-        resolve(null);
-      }
+  const info = await (async (): Promise<TunnelInfo> => {
+    if (!binary) return { tunnelId: null, reason: "cli-missing" };
+    return new Promise<TunnelInfo>((resolve) => {
+      execFile(binary, ["tunnel", "list", "--output", "json"], { timeout: 10_000 }, (error, stdout) => {
+        if (error) return resolve({ tunnelId: null, reason: "not-found" });
+        try {
+          const tunnels = JSON.parse(stdout) as Array<{ id?: string; name?: string }>;
+          const tunnelId = tunnels.find((tunnel) => tunnel.name === name)?.id ?? null;
+          resolve(tunnelId ? { tunnelId } : { tunnelId: null, reason: "not-found" });
+        } catch {
+          resolve({ tunnelId: null, reason: "not-found" });
+        }
+      });
     });
-  });
-  cache.set(name, { at: Date.now(), tunnelId });
-  return { tunnelId };
+  })();
+  cache.set(name, { at: Date.now(), info });
+  return info;
 }
