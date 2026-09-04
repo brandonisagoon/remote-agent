@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
-import { findExecutable } from "../../management/paths.ts";
+import { findExecutable, sourceRoot } from "../../management/paths.ts";
 import { skillComposerPath } from "./compose.ts";
 
 export interface SkillsetFlag {
@@ -80,7 +80,9 @@ export async function checkSkills(
   }
 
   const bun = findExecutable("bun");
-  const script = path.join(import.meta.dir, "list-skillsets.script.ts");
+  // Resolved from the source tree, not import.meta: the Electron main is a
+  // bundle and this script runs as a file in a child bun process.
+  const script = path.join(sourceRoot(), "src", "lib", "skills", "list-skillsets.script.ts");
   const inventory = bun ? await runJson(bun, [script, config], repositoryRoot) : null;
   const skillsets = inventory?.ok === true
     ? (inventory.skillsets as SkillsetSummary[])

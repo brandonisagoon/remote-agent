@@ -21,7 +21,7 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
   const skillsRoot = repository.skillsRoot;
   const queryClient = useQueryClient();
   const options = skillsQueryOptions(repository.root, skillsRoot);
-  const { data: scan, isFetching } = useQuery(options);
+  const { data: scan, isFetching, error } = useQuery(options);
   const refresh = () => void queryClient.invalidateQueries({ queryKey: options.queryKey });
   const skillsDirectory = `${repository.root.replace(/\/$/, "")}/${skillsRoot}`;
 
@@ -46,7 +46,12 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
         </Button>
       </div>
 
-      {!scan ? (
+      {error ? (
+        <div className="rounded-md border p-4 text-sm">
+          <span className="text-destructive font-medium">Scan failed:</span>{" "}
+          <span className="text-muted-foreground">{error instanceof Error ? error.message : String(error)}</span>
+        </div>
+      ) : !scan ? (
         <div className="text-muted-foreground rounded-md border border-dashed p-6 text-center text-sm">
           Scanning…
         </div>

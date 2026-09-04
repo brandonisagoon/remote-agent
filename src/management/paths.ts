@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import os from "node:os";
 import path from "node:path";
 
@@ -24,7 +25,9 @@ export function sourceRoot(): string {
   if (resourcesPath && existsSync(path.join(resourcesPath, "bin", "remote-agent"))) {
     return resourcesPath;
   }
-  return path.resolve(import.meta.dir, "..", "..");
+  // fileURLToPath form: import.meta.dir is Bun-only and undefined in the
+  // Electron (Node) main bundle.
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 }
 
 export interface InstallLayout {

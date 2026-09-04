@@ -52,6 +52,14 @@
         "to": "bin"
       },
       {
+        "from": "src",
+        "to": "src",
+        "filter": [
+          "**/*.ts",
+          "**/*.md"
+        ]
+      },
+      {
         "from": "remote-agent.config.example.json",
         "to": "remote-agent.config.example.json"
       },
