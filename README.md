@@ -96,8 +96,7 @@ mirrored exactly by the desktop app's pages:
   repository allowlist, webhook, router, editors.
 - `repositories.<id>` — a managed checkout: `root`, `worktreeRoot`,
   `bootstrapCommand`, its skill-composer `skillsRoot`, `workflows`
-  (trigger → conditions → skillset → delivery), and repository-scoped
-  metadata.
+  (trigger → conditions → skillset → delivery), and session label groups.
 
 See [remote-agent.config.example.json](remote-agent.config.example.json) for
 every setting and [docs/adoption.md](docs/adoption.md) for what a managed

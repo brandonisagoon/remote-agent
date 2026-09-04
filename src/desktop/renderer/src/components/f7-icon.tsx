@@ -11,6 +11,7 @@ import ChevronRight from "framework7-icons/react/esm/ChevronRight.js";
 import CubeBox from "framework7-icons/react/esm/CubeBox.js";
 import Desktopcomputer from "framework7-icons/react/esm/Desktopcomputer.js";
 import DocOnDoc from "framework7-icons/react/esm/DocOnDoc.js";
+import Ellipsis from "framework7-icons/react/esm/Ellipsis.js";
 import ExclamationmarkCircle from "framework7-icons/react/esm/ExclamationmarkCircle.js";
 import Eye from "framework7-icons/react/esm/Eye.js";
 import EyeSlash from "framework7-icons/react/esm/EyeSlash.js";
@@ -20,6 +21,7 @@ import Keyboard from "framework7-icons/react/esm/Keyboard.js";
 import Link from "framework7-icons/react/esm/Link.js";
 import Plus from "framework7-icons/react/esm/Plus.js";
 import SidebarLeft from "framework7-icons/react/esm/SidebarLeft.js";
+import Tag from "framework7-icons/react/esm/Tag.js";
 import Trash from "framework7-icons/react/esm/Trash.js";
 import TrayArrowDown from "framework7-icons/react/esm/TrayArrowDown.js";
 import SquareArrowDown from "framework7-icons/react/esm/SquareArrowDown.js";
@@ -31,6 +33,7 @@ import { cn } from "../lib/utils.ts";
 /* SVG components (not the ligature font): geometrically centered and sized
    like any other inline icon, avoiding font-baseline vertical drift. */
 const ICONS = {
+  ellipsis: Ellipsis,
   chevron_down: ChevronDown,
   arrow_2_circlepath: Arrow2Circlepath,
   arrow_clockwise: ArrowClockwise,
@@ -53,6 +56,7 @@ const ICONS = {
   link: Link,
   plus: Plus,
   sidebar_left: SidebarLeft,
+  tag: Tag,
   trash: Trash,
   tray_arrow_down: TrayArrowDown,
   square_arrow_down: SquareArrowDown,

@@ -54,8 +54,8 @@ export function AppLayout() {
         bootstrapCommand: ["true"],
         skillsRoot: "agent-skills",
         workflows: {},
-        metadata: { tags: {} },
-        sessionDefaults: { tags: {} },
+        labels: {},
+        sessionDefaults: { labels: {} },
       };
     };
     if (dirty) mutate(create);

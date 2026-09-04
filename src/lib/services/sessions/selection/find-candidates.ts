@@ -32,7 +32,7 @@ export async function fetchRouteCandidates(
 ): Promise<RouteCandidate[]> {
   const repository = config.repository;
   const visibleKeys = new Set(
-    Object.entries(repository.metadata.tags)
+    Object.entries(repository.labels)
       .filter(([, definition]) => definition.routerVisible)
       .map(([key]) => key),
   );

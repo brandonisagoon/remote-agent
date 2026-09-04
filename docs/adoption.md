@@ -32,12 +32,12 @@ Remote Agent owns:
   `message-session` composes in the running session's worktree and forwards);
 - worktree creation and skill composition (always the repository's own
   skill-composer binary, executed in a child process);
-- stable runtime identity, tags, relationships, and integration links in SQLite;
+- stable runtime identity, session labels, relationships, and integration links in SQLite;
 - acpx/provider execution and Zed ACP translation;
 - registry-backed routing and shutdown.
 
-Custom tag definitions and selector options live under the repository that
-owns them. SQLite stores only string keys and values. The names in the example
+Label groups and their allowed labels live under the repository that owns
+them. SQLite stores only string keys and values. The names in the example
 config use an `example.*` prefix deliberately; they are examples, not built-in
 Remote Agent vocabulary.
 

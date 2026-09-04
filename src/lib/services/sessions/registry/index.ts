@@ -19,8 +19,8 @@ export {
   updateRuntimeSessionState,
 } from "../runtime-registry.ts";
 export {
-  readSessionTags,
-  removeSessionTag,
-  resolveInitialSessionTags,
-  setSessionTag,
+  readSessionLabels,
+  removeSessionLabel,
+  resolveInitialSessionLabels,
+  setSessionLabel,
 } from "../session-metadata.ts";

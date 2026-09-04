@@ -528,68 +528,52 @@
               "additionalProperties": false
             }
           },
-          "metadata": {
-            "default": {
-              "tags": {}
-            },
+          "labels": {
+            "default": {},
             "type": "object",
-            "properties": {
-              "tags": {
-                "default": {},
-                "type": "object",
-                "propertyNames": {
-                  "type": "string",
-                  "minLength": 1,
-                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
-                },
-                "additionalProperties": {
-                  "type": "object",
-                  "properties": {
-                    "description": {
-                      "type": "string",
-                      "minLength": 1
-                    },
-                    "options": {
-                      "minItems": 1,
-                      "type": "array",
-                      "items": {
-                        "type": "string",
-                        "minLength": 1
-                      }
-                    },
-                    "cardinality": {
-                      "default": "one",
-                      "type": "string",
-                      "enum": [
-                        "one",
-                        "many"
-                      ]
-                    },
-                    "routerVisible": {
-                      "default": false,
-                      "type": "boolean"
-                    }
-                  },
-                  "required": [
-                    "cardinality",
-                    "routerVisible"
-                  ],
-                  "additionalProperties": false
-                }
-              }
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
             },
-            "required": [
-              "tags"
-            ],
-            "additionalProperties": false
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "labels": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "exclusive": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "routerVisible": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "exclusive",
+                "routerVisible"
+              ],
+              "additionalProperties": false
+            }
           },
           "sessionDefaults": {
             "default": {
-              "tags": {}
+              "labels": {}
             },
             "type": "object",
             "properties": {
-              "tags": {
+              "labels": {
                 "default": {},
                 "type": "object",
                 "propertyNames": {
@@ -607,7 +591,7 @@
               }
             },
             "required": [
-              "tags"
+              "labels"
             ],
             "additionalProperties": false
           }
@@ -618,7 +602,7 @@
           "bootstrapCommand",
           "skillsRoot",
           "workflows",
-          "metadata",
+          "labels",
           "sessionDefaults"
         ],
         "additionalProperties": false

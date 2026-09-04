@@ -133,7 +133,7 @@ async function listSessions(repositoryId?: string): Promise<SessionSummary[]> {
     cwd: String(session.cwd),
     worktreePath: typeof session.worktreePath === "string" ? session.worktreePath : null,
     updatedAt: String(session.updatedAt),
-    tags: Array.isArray(session.tags) ? session.tags : [],
+    labels: Array.isArray(session.tags) ? session.tags : [],
     resourceLinks: Array.isArray(session.resourceLinks) ? session.resourceLinks : [],
   }));
 }

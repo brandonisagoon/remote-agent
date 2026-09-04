@@ -15,8 +15,8 @@ description: Select exactly one eligible Remote Agent runtime session for an inc
    responsibilities.
 5. Read the reply or description-anchor context before interpreting a terse
    comment body. Prefer a connected Primary whose repository-defined,
-   router-visible tags best match that interaction. Apply the worker's routing
-   hint to those tags; otherwise prefer the only eligible Primary.
+   router-visible labels best match that interaction. Apply the worker's routing
+   hint to those labels; otherwise prefer the only eligible Primary.
 6. Delegate and Viewer sessions never accept input. Machine acceptance is
    already enforced by the service and must not be inferred here.
 7. If multiple candidates remain equally appropriate, return no target with

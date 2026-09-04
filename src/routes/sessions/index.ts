@@ -1,1 +1,1 @@
-export { default } from "./tags.ts";
+export { default } from "./labels.ts";

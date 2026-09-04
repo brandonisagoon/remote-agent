@@ -15,7 +15,7 @@ export interface SessionSummary {
   cwd: string;
   worktreePath: string | null;
   updatedAt: string;
-  tags: Array<{ key: string; value: string; source: string }>;
+  labels: Array<{ key: string; value: string; source: string }>;
   resourceLinks: Array<{
     provider: string;
     connectionId: string;

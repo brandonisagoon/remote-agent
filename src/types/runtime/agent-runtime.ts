@@ -93,7 +93,7 @@ export interface EnsureAgentSessionInput {
   machineId?: string;
   role?: string;
   lifecycle?: "one-shot" | "persistent";
-  tags?: Record<string, string[]>;
+  labels?: Record<string, string[]>;
   relations?: Array<{
     relationship: string;
     targetSessionId: string;

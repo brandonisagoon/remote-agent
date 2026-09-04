@@ -68,8 +68,8 @@ export function testConfig(
         model: "opus",
       },
     },
-    metadata: { tags: {} },
-    sessionDefaults: { tags: {} },
+    labels: {},
+    sessionDefaults: { labels: {} },
   };
   const connections = overrides.connections ?? {
     "linear-test": {

@@ -52,8 +52,8 @@ function fixture(): RepositoryConfig {
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
     skillsRoot: "agent-skills",
     workflows: {},
-    metadata: { tags: {} },
-    sessionDefaults: { tags: {} },
+    labels: {},
+    sessionDefaults: { labels: {} },
   };
 }
 

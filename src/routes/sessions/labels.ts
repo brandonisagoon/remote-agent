@@ -4,8 +4,8 @@ import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { getRepositoryConfig } from "../../lib/config.ts";
 import {
-  removeSessionTag,
-  setSessionTag,
+  removeSessionLabel,
+  setSessionLabel,
 } from "../../lib/services/sessions/session-metadata.ts";
 
 const SetTagSchema = z.object({
@@ -82,7 +82,7 @@ routes.post("/:sessionId/close", async (c) => {
   return c.json({ sessionId, closed });
 });
 
-routes.get("/:sessionId/tags", async (c) => {
+routes.get("/:sessionId/labels", async (c) => {
   const session = await c.get("prisma").runtimeSession.findUnique({
     where: { id: c.req.param("sessionId") },
     include: { tags: { orderBy: [{ key: "asc" }, { value: "asc" }] } },
@@ -93,28 +93,28 @@ routes.get("/:sessionId/tags", async (c) => {
     sessionId: session.id,
     repositoryId: session.repositoryId,
     revision: session.metadataRevision,
-    definitions: repository.metadata.tags,
-    tags: session.tags.map((tag) => {
-      const definition = repository.metadata.tags[tag.key];
+    groups: repository.labels,
+    labels: session.tags.map((tag) => {
+      const definition = repository.labels[tag.key];
       return {
         key: tag.key,
         value: tag.value,
         source: tag.source,
         unlisted:
           !definition ||
-          Boolean(definition.options && !definition.options.includes(tag.value)),
+          Boolean(definition.labels && !definition.labels.includes(tag.value)),
       };
     }),
   });
 });
 
-routes.put("/:sessionId/tags", async (c) => {
+routes.put("/:sessionId/labels", async (c) => {
   const parsed = SetTagSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) {
     return c.json({ error: "Invalid body", issues: parsed.error.issues }, 400);
   }
   try {
-    return c.json(await setSessionTag(c.get("prisma"), c.get("config"), {
+    return c.json(await setSessionLabel(c.get("prisma"), c.get("config"), {
       runtimeSessionId: c.req.param("sessionId"),
       key: parsed.data.key,
       values: parsed.data.values,
@@ -127,14 +127,14 @@ routes.put("/:sessionId/tags", async (c) => {
   }
 });
 
-routes.delete("/:sessionId/tags/:key", async (c) => {
+routes.delete("/:sessionId/labels/:key", async (c) => {
   const expected = c.req.query("expectedRevision");
   const expectedRevision = expected === undefined ? undefined : Number(expected);
   if (expected !== undefined && (!Number.isInteger(expectedRevision) || expectedRevision! < 0)) {
     return c.json({ error: "expectedRevision must be a non-negative integer" }, 400);
   }
   try {
-    return c.json(await removeSessionTag(c.get("prisma"), c.get("config"), {
+    return c.json(await removeSessionLabel(c.get("prisma"), c.get("config"), {
       runtimeSessionId: c.req.param("sessionId"),
       key: c.req.param("key"),
       value: c.req.query("value"),

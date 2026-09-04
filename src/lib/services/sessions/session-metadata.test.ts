@@ -8,10 +8,10 @@ import {
 } from "../../../test-support/db.ts";
 import { beginRuntimeSession } from "./runtime-registry.ts";
 import {
-  readSessionTags,
-  removeSessionTag,
-  resolveInitialSessionTags,
-  setSessionTag,
+  readSessionLabels,
+  removeSessionLabel,
+  resolveInitialSessionLabels,
+  setSessionLabel,
 } from "./session-metadata.ts";
 
 let database: TestDatabase | null = null;
@@ -33,21 +33,19 @@ function repository(
     bootstrapCommand: ["true"],
     skillsRoot: "agent-skills",
     workflows: {},
-    metadata: {
-      tags: {
-        "example.kind": {
-          options,
-          cardinality: "one",
-          routerVisible: true,
-        },
-        "example.skill": {
-          cardinality: "many",
-          routerVisible: true,
-        },
+    labels: {
+      "example.kind": {
+        labels: options,
+        exclusive: true,
+        routerVisible: true,
+      },
+      "example.skill": {
+        exclusive: false,
+        routerVisible: true,
       },
     },
     sessionDefaults: {
-      tags: { "example.kind": [options[0]!] },
+      labels: { "example.kind": [options[0]!] },
     },
   };
 }
@@ -56,7 +54,7 @@ describe("repository session metadata", () => {
   test("resolves defaults and explicit strings using only the owning repository", () => {
     const first = repository("first", ["planning", "implementation"]);
     const second = repository("second", ["review"]);
-    expect(resolveInitialSessionTags(first, {
+    expect(resolveInitialSessionLabels(first, {
       "example.kind": ["implementation"],
       "example.skill": ["typescript", "agents"],
     })).toEqual([
@@ -64,7 +62,7 @@ describe("repository session metadata", () => {
       { key: "example.skill", value: "agents", source: "launch" },
       { key: "example.skill", value: "typescript", source: "launch" },
     ]);
-    expect(() => resolveInitialSessionTags(second, {
+    expect(() => resolveInitialSessionLabels(second, {
       "example.kind": ["implementation"],
     })).toThrow("not configured for repository second");
   });
@@ -85,14 +83,14 @@ describe("repository session metadata", () => {
       machineId: "macbook-air",
       role: "primary",
     }, {
-      tags: resolveInitialSessionTags(repo),
+      labels: resolveInitialSessionLabels(repo),
     });
 
-    expect(await readSessionTags(database.prisma, session.id)).toEqual({
+    expect(await readSessionLabels(database.prisma, session.id)).toEqual({
       revision: 0,
       tags: { "example.kind": ["planning"] },
     });
-    const updated = await setSessionTag(database.prisma, config, {
+    const updated = await setSessionLabel(database.prisma, config, {
       runtimeSessionId: session.id,
       key: "example.kind",
       values: ["implementation"],
@@ -103,14 +101,14 @@ describe("repository session metadata", () => {
       revision: 1,
       tags: { "example.kind": ["implementation"] },
     });
-    await expect(setSessionTag(database.prisma, config, {
+    await expect(setSessionLabel(database.prisma, config, {
       runtimeSessionId: session.id,
       key: "example.kind",
       values: ["planning"],
       source: "operator-test",
       expectedRevision: 0,
     })).rejects.toThrow("revision conflict");
-    expect(await removeSessionTag(database.prisma, config, {
+    expect(await removeSessionLabel(database.prisma, config, {
       runtimeSessionId: session.id,
       key: "example.kind",
       source: "operator-test",

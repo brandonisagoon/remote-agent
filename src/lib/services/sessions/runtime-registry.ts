@@ -12,7 +12,7 @@ import type {
 } from "../../../types/runtime/index.ts";
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import { Prisma } from "../../../generated/prisma/client.ts";
-import type { ResolvedSessionTag } from "./session-metadata.ts";
+import type { ResolvedSessionLabel } from "./session-metadata.ts";
 
 function json<T>(value: unknown): T | null {
   return value == null ? null : (value as T);
@@ -86,14 +86,15 @@ export function toAgentRuntimeSession(row: NonNullable<RuntimeRow>): AgentRuntim
 export async function beginRuntimeSession(
   prisma: PrismaClient,
   input: EnsureAgentSessionInput,
-  metadata: { tags?: ResolvedSessionTag[] } = {},
+  metadata: { labels?: ResolvedSessionLabel[] } = {},
 ): Promise<AgentRuntimeSession> {
   const cwd = path.resolve(input.cwd);
   const repositoryId = input.repositoryId ?? "legacy";
   const machineId = input.machineId ?? input.executionTarget ?? "unknown";
   const role = input.role ?? null;
   const lifecycle = input.lifecycle ?? null;
-  const tags = [...(metadata.tags ?? [])].sort(
+  // Persisted under the storage-internal `tags` rows.
+  const tags = [...(metadata.labels ?? [])].sort(
     (a, b) => a.key.localeCompare(b.key) || a.value.localeCompare(b.value),
   );
   const relations = [...(input.relations ?? [])].sort((a, b) =>

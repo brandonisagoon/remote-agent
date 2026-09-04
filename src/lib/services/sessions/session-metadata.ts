@@ -2,11 +2,11 @@ import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import type {
   RepositoryConfig,
   ServerConfig,
-  TagDefinitionConfig,
+  LabelGroupConfig,
 } from "../../config.ts";
 import { getRepositoryConfig } from "../../config.ts";
 
-export interface ResolvedSessionTag {
+export interface ResolvedSessionLabel {
   key: string;
   value: string;
   source: string;
@@ -15,8 +15,8 @@ export interface ResolvedSessionTag {
 function definitionFor(
   repository: RepositoryConfig,
   key: string,
-): TagDefinitionConfig {
-  const definition = repository.metadata.tags[key];
+): LabelGroupConfig {
+  const definition = repository.labels[key];
   if (!definition) {
     throw new Error(`unknown tag for repository ${repository.id}: ${key}`);
   }
@@ -33,12 +33,12 @@ function validateValues(
   if (normalized.some((value) => value.length === 0)) {
     throw new Error(`tag ${key} contains an empty value`);
   }
-  if (definition.cardinality === "one" && normalized.length > 1) {
+  if (definition.exclusive && normalized.length > 1) {
     throw new Error(`tag ${key} accepts only one value`);
   }
-  if (definition.options) {
+  if (definition.labels) {
     for (const value of normalized) {
-      if (!definition.options.includes(value)) {
+      if (!definition.labels.includes(value)) {
         throw new Error(
           `tag ${key} value is not configured for repository ${repository.id}: ${value}`,
         );
@@ -49,12 +49,12 @@ function validateValues(
 }
 
 /** Resolve repository defaults and explicit launch values deterministically. */
-export function resolveInitialSessionTags(
+export function resolveInitialSessionLabels(
   repository: RepositoryConfig,
   explicit: Readonly<Record<string, readonly string[]>> = {},
-): ResolvedSessionTag[] {
+): ResolvedSessionLabel[] {
   const values = new Map<string, Map<string, string>>();
-  for (const [key, defaults] of Object.entries(repository.sessionDefaults.tags)) {
+  for (const [key, defaults] of Object.entries(repository.sessionDefaults.labels)) {
     values.set(
       key,
       new Map(validateValues(repository, key, defaults).map((value) => [value, "config-default"])),
@@ -63,7 +63,7 @@ export function resolveInitialSessionTags(
   for (const [key, requested] of Object.entries(explicit)) {
     const definition = definitionFor(repository, key);
     const validated = validateValues(repository, key, requested);
-    const current = definition.cardinality === "one"
+    const current = definition.exclusive
       ? new Map<string, string>()
       : (values.get(key) ?? new Map<string, string>());
     for (const value of validated) current.set(value, "launch");
@@ -78,7 +78,7 @@ export function resolveInitialSessionTags(
     .sort((a, b) => a.key.localeCompare(b.key) || a.value.localeCompare(b.value));
 }
 
-export async function readSessionTags(
+export async function readSessionLabels(
   prisma: PrismaClient,
   runtimeSessionId: string,
 ): Promise<{ revision: number; tags: Record<string, string[]> }> {
@@ -95,7 +95,7 @@ export async function readSessionTags(
   return { revision: session.metadataRevision, tags };
 }
 
-export async function setSessionTag(
+export async function setSessionLabel(
   prisma: PrismaClient,
   config: ServerConfig,
   input: {
@@ -153,10 +153,10 @@ export async function setSessionTag(
       });
     }
   });
-  return readSessionTags(prisma, input.runtimeSessionId);
+  return readSessionLabels(prisma, input.runtimeSessionId);
 }
 
-export async function removeSessionTag(
+export async function removeSessionLabel(
   prisma: PrismaClient,
   config: ServerConfig,
   input: {
@@ -197,5 +197,5 @@ export async function removeSessionTag(
       },
     });
   });
-  return readSessionTags(prisma, input.runtimeSessionId);
+  return readSessionLabels(prisma, input.runtimeSessionId);
 }

@@ -50,10 +50,13 @@ const RepositoryWorkflowSchema = z.object({
   providerId: z.enum(["codex", "claude"]).optional(),
   model: z.string().min(1).optional(),
 });
-const TagDefinitionSchema = z.object({
+/** One label group (Linear-style): a dimension sessions are labeled by.
+    `labels` lists the allowed labels (absent = free text); `exclusive` means
+    a session holds one label from the group at a time. */
+const LabelGroupSchema = z.object({
   description: z.string().min(1).optional(),
-  options: z.array(z.string().min(1)).min(1).optional(),
-  cardinality: z.enum(["one", "many"]).default("one"),
+  labels: z.array(z.string().min(1)).min(1).optional(),
+  exclusive: z.boolean().default(true),
   routerVisible: z.boolean().default(false),
 });
 
@@ -65,16 +68,14 @@ const RepositorySchema = z.object({
   /** Where the skill-composer inputs live, relative to root. */
   skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
   workflows: z.record(ConfigIdSchema, RepositoryWorkflowSchema).default({}),
-  metadata: z
-    .object({
-      tags: z.record(ConfigIdSchema, TagDefinitionSchema).default({}),
-    })
-    .default({ tags: {} }),
+  /** Label groups sessions in this repository are labeled by. */
+  labels: z.record(ConfigIdSchema, LabelGroupSchema).default({}),
+  /** Labels stamped on every new session, keyed by group. */
   sessionDefaults: z
     .object({
-      tags: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
+      labels: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
     })
-    .default({ tags: {} }),
+    .default({ labels: {} }),
 });
 const WebhookSchema = z.object({
   /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
@@ -225,19 +226,19 @@ export const ServiceFileSchema = z.object({
         context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "connectionId"], message: `unknown connection: ${workflow.connectionId}` });
       }
     }
-    for (const [key, values] of Object.entries(repository.sessionDefaults.tags)) {
-      const definition = repository.metadata.tags[key];
-      if (!definition) {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: `unknown repository tag: ${key}` });
+    for (const [key, values] of Object.entries(repository.sessionDefaults.labels)) {
+      const group = repository.labels[key];
+      if (!group) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `unknown label group: ${key}` });
         continue;
       }
-      if (definition.cardinality === "one" && values.length > 1) {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: "single-cardinality tag accepts at most one default" });
+      if (group.exclusive && values.length > 1) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: "an exclusive group accepts at most one default" });
       }
-      if (definition.options) {
+      if (group.labels) {
         for (const value of values) {
-          if (!definition.options.includes(value)) {
-            context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "tags", key], message: `value is not configured: ${value}` });
+          if (!group.labels.includes(value)) {
+            context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `label is not configured: ${value}` });
           }
         }
       }
@@ -267,16 +268,14 @@ export interface RepositoryConfig {
   bootstrapCommand: string[];
   skillsRoot: string;
   workflows: Readonly<Record<string, WorkflowConfig>>;
-  metadata: {
-    tags: Record<string, TagDefinitionConfig>;
-  };
-  sessionDefaults: { tags: Record<string, string[]> };
+  labels: Record<string, LabelGroupConfig>;
+  sessionDefaults: { labels: Record<string, string[]> };
 }
 
-export interface TagDefinitionConfig {
+export interface LabelGroupConfig {
   description?: string;
-  options?: string[];
-  cardinality: "one" | "many";
+  labels?: string[];
+  exclusive: boolean;
   routerVisible: boolean;
 }
 
@@ -424,26 +423,20 @@ export function readConfig(): ServerConfig {
         root,
         worktreeRoot,
         bootstrapCommand: [...repository.bootstrapCommand],
-        metadata: {
-          tags: Object.fromEntries(
-            Object.entries(repository.metadata.tags).map(([key, definition]) => [
-              key,
-              {
-                ...(definition.description
-                  ? { description: definition.description }
-                  : {}),
-                ...(definition.options
-                  ? { options: [...definition.options] }
-                  : {}),
-                cardinality: definition.cardinality,
-                routerVisible: definition.routerVisible,
-              },
-            ]),
-          ),
-        },
+        labels: Object.fromEntries(
+          Object.entries(repository.labels).map(([key, group]) => [
+            key,
+            {
+              ...(group.description ? { description: group.description } : {}),
+              ...(group.labels ? { labels: [...group.labels] } : {}),
+              exclusive: group.exclusive,
+              routerVisible: group.routerVisible,
+            },
+          ]),
+        ),
         sessionDefaults: {
-          tags: Object.fromEntries(
-            Object.entries(repository.sessionDefaults.tags).map(([key, values]) => [
+          labels: Object.fromEntries(
+            Object.entries(repository.sessionDefaults.labels).map(([key, values]) => [
               key,
               [...values],
             ]),

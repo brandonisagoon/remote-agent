@@ -6,7 +6,7 @@ import { createFakeAgentRuntime } from "../../test-support/agent-runtime.ts";
 import { testConfig } from "../../test-support/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../test-support/db.ts";
 
-describe("session tag API", () => {
+describe("session label API", () => {
   let database: TestDatabase;
   let prisma: PrismaClient;
 
@@ -23,13 +23,11 @@ describe("session tag API", () => {
     const base = testConfig().repository;
     const repository = {
       ...base,
-      metadata: {
-        tags: {
-          "example.kind": {
-            options: ["planning", "implementation"],
-            cardinality: "one" as const,
-            routerVisible: true,
-          },
+      labels: {
+        "example.kind": {
+          labels: ["planning", "implementation"],
+          exclusive: true,
+          routerVisible: true,
         },
       },
     };
@@ -58,7 +56,7 @@ describe("session tag API", () => {
       "content-type": "application/json",
     };
 
-    const updated = await app.request("/api/sessions/session-one/tags", {
+    const updated = await app.request("/api/sessions/session-one/labels", {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -70,7 +68,7 @@ describe("session tag API", () => {
     expect(updated.status).toBe(200);
     expect(await updated.json()).toMatchObject({ revision: 1 });
 
-    const conflict = await app.request("/api/sessions/session-one/tags", {
+    const conflict = await app.request("/api/sessions/session-one/labels", {
       method: "PUT",
       headers,
       body: JSON.stringify({
@@ -81,12 +79,12 @@ describe("session tag API", () => {
     });
     expect(conflict.status).toBe(409);
 
-    const listed = await app.request("/api/sessions/session-one/tags", {
+    const listed = await app.request("/api/sessions/session-one/labels", {
       headers: { authorization: `Bearer ${config.apiKey}` },
     });
     expect(await listed.json()).toMatchObject({
       revision: 1,
-      tags: [{ key: "example.kind", value: "implementation", unlisted: false }],
+      labels: [{ key: "example.kind", value: "implementation", unlisted: false }],
     });
 
     const inspected = await app.request("/api/sessions/session-one", {

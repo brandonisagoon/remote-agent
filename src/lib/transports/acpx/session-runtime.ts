@@ -32,7 +32,7 @@ import {
   prepareRuntimeAgentSwitch,
   updateRuntimeSessionState,
 } from "../../services/sessions/runtime-registry.ts";
-import { resolveInitialSessionTags } from "../../services/sessions/session-metadata.ts";
+import { resolveInitialSessionLabels } from "../../services/sessions/session-metadata.ts";
 import type {
   AgentRuntimeEvent,
   AgentRuntimeMessage,
@@ -180,7 +180,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       machineId: input.machineId ?? input.executionTarget ?? this.config.machine,
     };
     const row = await beginRuntimeSession(this.prisma, normalizedInput, {
-      tags: resolveInitialSessionTags(repository, input.tags),
+      labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
       const handle = await this.runtime.ensureSession({

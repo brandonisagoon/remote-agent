@@ -50,16 +50,14 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         root: "repository",
         worktreeRoot: "../worktrees",
         bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
-        metadata: {
-          tags: {
-            "example.kind": {
-              options: ["planning", "implementation"],
-              cardinality: "one",
-              routerVisible: true,
-            },
+        labels: {
+          "example.kind": {
+            labels: ["planning", "implementation"],
+            exclusive: true,
+            routerVisible: true,
           },
         },
-        sessionDefaults: { tags: { "example.kind": ["planning"] } },
+        sessionDefaults: { labels: { "example.kind": ["planning"] } },
         workflows: {
           plan: {
             on: "issue.state-changed",
@@ -143,30 +141,28 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("schemaVersion 2 is required");
   });
 
-  test("keeps tag definitions repository-specific", () => {
+  test("keeps label groups repository-specific", () => {
     const value: any = serviceFile();
     value.repositories.second = {
       ...value.repositories.example,
       root: "second",
       worktreeRoot: "../second-worktrees",
-      metadata: {
-        tags: {
-          "example.kind": {
-            options: ["review"],
-            cardinality: "many",
-            routerVisible: false,
-          },
+      labels: {
+        "example.kind": {
+          labels: ["review"],
+          exclusive: false,
+          routerVisible: false,
         },
       },
-      sessionDefaults: { tags: { "example.kind": ["review"] } },
+      sessionDefaults: { labels: { "example.kind": ["review"] } },
     };
     writeConfig(value);
     const config = readConfig();
-    expect(config.repositories.example.metadata.tags["example.kind"]?.options).toEqual([
+    expect(config.repositories.example.labels["example.kind"]?.labels).toEqual([
       "planning",
       "implementation",
     ]);
-    expect(config.repositories.second.metadata.tags["example.kind"]?.options).toEqual([
+    expect(config.repositories.second.labels["example.kind"]?.labels).toEqual([
       "review",
     ]);
   });

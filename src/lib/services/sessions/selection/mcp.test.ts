@@ -88,7 +88,7 @@ describe("read-only routing MCP", () => {
       "utf8",
     );
     expect(embedded).toContain("returned `workerContext`");
-    expect(embedded).toContain("router-visible tags");
+    expect(embedded).toContain("router-visible labels");
     expect(embedded).toContain("Reply & action decision");
   });
 });

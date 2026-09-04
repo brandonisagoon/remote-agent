@@ -66,21 +66,8 @@
         "bash",
         "scripts/bootstrap.sh"
       ],
-      "metadata": {
-        "tags": {
-          "example.workflow": {
-            "options": [
-              "planning",
-              "implementation",
-              "review"
-            ],
-            "cardinality": "one",
-            "routerVisible": true
-          }
-        }
-      },
       "sessionDefaults": {
-        "tags": {}
+        "labels": {}
       },
       "skillsRoot": "agent-skills",
       "workflows": {
@@ -131,6 +118,17 @@
           "deliver": "start-session",
           "providerId": "claude",
           "model": "opus"
+        }
+      },
+      "labels": {
+        "example.workflow": {
+          "labels": [
+            "planning",
+            "implementation",
+            "review"
+          ],
+          "exclusive": true,
+          "routerVisible": true
         }
       }
     }

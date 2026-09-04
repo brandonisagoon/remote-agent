@@ -23,11 +23,9 @@ function repo(): RepositoryConfig {
     id: "repo-one",
     root: "/tmp/repo-one",
     worktreeRoot: "/tmp/repo-one-worktrees",
-    metadata: {
-      tags: {
-        "example.visible": { cardinality: "many", routerVisible: true },
-        "example.private": { cardinality: "many", routerVisible: false },
-      },
+    labels: {
+      "example.visible": { exclusive: false, routerVisible: true },
+      "example.private": { exclusive: false, routerVisible: false },
     },
   };
 }
@@ -57,7 +55,7 @@ describe("registry-backed route candidates", () => {
         relationship: "handles",
       }],
     }, {
-      tags: [
+      labels: [
         { key: "example.visible", value: "runtime", source: "launch" },
         { key: "example.private", value: "secret", source: "launch" },
       ],

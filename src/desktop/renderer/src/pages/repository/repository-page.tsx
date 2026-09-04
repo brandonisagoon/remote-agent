@@ -21,6 +21,7 @@ import {
 import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
 import type { RepositoryTab } from "@renderer/router.tsx";
 import { SkillsTab } from "./skills-tab.tsx";
+import { LabelsSection } from "./labels-section.tsx";
 import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
@@ -74,7 +75,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
                 <TableHead>State</TableHead>
                 <TableHead>Role</TableHead>
                 <TableHead>Provider</TableHead>
-                <TableHead>Tags</TableHead>
+                <TableHead>Labels</TableHead>
                 <TableHead>Updated</TableHead>
               </TableRow>
             </TableHeader>
@@ -92,7 +93,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
                   <TableCell>{session.agentCommand}</TableCell>
                   <TableCell>
                     <div className="flex max-w-[260px] flex-wrap gap-1">
-                      {session.tags.map((tag) => (
+                      {session.labels.map((tag) => (
                         <Badge key={`${tag.key}:${tag.value}`} variant="outline">
                           {tag.key}:{tag.value}
                         </Badge>
@@ -118,7 +119,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
 function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id]!;
   return (
-    <Accordion type="multiple" defaultValue={["paths", "workflows", "metadata"]} className="-mt-3">
+    <Accordion type="multiple" defaultValue={["paths", "workflows", "labels"]} className="-mt-3">
       <SettingsSection
         value="paths"
         title="Paths & bootstrap"
@@ -139,27 +140,11 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         <WorkflowsSection id={id} value={value} mutate={mutate} />
       </SettingsSection>
       <SettingsSection
-        value="metadata"
-        title="Metadata definitions"
-        description="String-only tags configured for this repository. Use the JSON editor for advanced editing."
+        value="labels"
+        title="Labels"
+        description="Label groups for sessions, exactly like Linear's issue labels: each group is one dimension (a phase, an area), its labels are the states a session can be in. New sessions start with the group's default label; skills instruct sessions to relabel themselves as work progresses, and router-visible groups help the session router match incoming comments to the right session."
       >
-        <SettingsCard>
-          {Object.entries(repository.metadata.tags).map(([key, definition]) => (
-            <div key={key} className="bg-background flex items-center gap-3 rounded-md border px-4 py-3">
-              <code className="text-xs">{key}</code>
-              <Badge variant="secondary">{definition.cardinality}</Badge>
-              {definition.routerVisible && <Badge variant="outline">router visible</Badge>}
-              <span className="text-muted-foreground ml-auto text-xs">
-                {definition.options?.join(", ") ?? "free text"}
-              </span>
-            </div>
-          ))}
-          {Object.keys(repository.metadata.tags).length === 0 && (
-            <div className="text-muted-foreground rounded-md border border-dashed p-6 text-center text-sm">
-              No custom metadata definitions.
-            </div>
-          )}
-        </SettingsCard>
+        <LabelsSection id={id} value={value} mutate={mutate} />
       </SettingsSection>
     </Accordion>
   );
