@@ -23,6 +23,7 @@ const api: DesktopApi = {
     openInEditor: () => ipcRenderer.invoke("keybindings:open-in-editor"),
   },
   config: {
+    path: () => ipcRenderer.invoke("config:path"),
     get: () => ipcRenderer.invoke("config:get"),
     save: (input) => ipcRenderer.invoke("config:save", input),
     onChange: (listener) => {

@@ -186,6 +186,7 @@ function registerIpc(file: string): void {
     if (!existsSync(path.join(root, ".git"))) return { error: "not-a-repository" as const };
     return { repository: { root, name: path.basename(root) } };
   });
+  ipcMain.handle("config:path", () => desktopConfigPath());
   ipcMain.handle("management:checks", () => runChecks());
   ipcMain.handle("editors:detect", () => detectEditors());
   ipcMain.handle("skills:pick-root", async (_event, defaultPath: string) => {

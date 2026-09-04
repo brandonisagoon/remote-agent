@@ -47,9 +47,11 @@ export interface DesktopApi {
     openInEditor(): Promise<string | null>;
   };
   config: {
+    path(): Promise<string>;
     get(): Promise<ConfigDocument>;
     save(input: { expectedRevision: string; value: unknown }): Promise<ConfigDocument>;
     onChange(listener: (document: ConfigDocument) => void): () => void;
+    path(): Promise<string>;
     openInEditor(): Promise<string | null>;
     reveal(): Promise<void>;
   };

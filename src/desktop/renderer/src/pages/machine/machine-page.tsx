@@ -5,6 +5,7 @@ import type { ServiceFile } from "../../../../../lib/config.ts";
 import type { ManagementResult } from "../../../../../management/service.ts";
 import { DnsRecordsTable } from "./dns-records-table.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
+import { CopyField } from "@renderer/components/copy-field.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { StatusDot } from "@renderer/components/status-dot.tsx";
@@ -28,6 +29,20 @@ import {
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
 
+/** The stdio bridge an ACP app runs to reach the daemon: the deployed copy
+    under the install root, pointed at this config file. */
+function useAcpBridgeCommand(file: ServiceFile): string {
+  const { data: configFile = "" } = useQuery({
+    queryKey: ["config-path"],
+    queryFn: () => window.remoteAgent.config.path(),
+    staleTime: Infinity,
+  });
+  const root =
+    file.machine.installation.root ??
+    `~/Library/Application Support/${file.serviceName}`;
+  return `REMOTE_AGENT_CONFIG='${configFile}' bun '${root.replace(/\/$/, "")}/app/src/acp/main.ts'`;
+}
+
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {
   const [result, setResult] = useState<ManagementResult | null>(null);
   const [working, setWorking] = useState<string | null>(null);
@@ -40,6 +55,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
     }
   };
   const machine = value.machine;
+  const bridgeCommand = useAcpBridgeCommand(value);
   const queryClient = useQueryClient();
   const { data: checks = [] } = useQuery(checksQueryOptions);
   const check = (id: string) => checks.find((entry) => entry.id === id);
@@ -54,7 +70,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
     check("service"),
     check("tunnel"),
   ].filter((entry) => entry !== undefined);
-  const statusRows = [check("daemon"), check("config"), check("repositories")].filter(
+  const statusRows = [check("daemon"), check("acp"), check("config"), check("repositories")].filter(
     (entry) => entry !== undefined,
   );
   // Remedies are "run: <cmd>" / "install with: <cmd>"; the button hands the
@@ -207,9 +223,10 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
       <SettingsSection
         value="acp"
         title="ACP"
-        description="Unix sockets for the Agent Client Protocol bridge and its control channel."
+        description="ACP apps — Zed, bb, T3 Code — attach to this machine's running sessions through the ACP socket. Configure the app to run the bridge command below as its agent server: it speaks ACP over stdio and forwards everything to the daemon, which must be running."
       >
         <SettingsCard>
+          <CopyField label="Bridge Command" value={bridgeCommand} />
           <Field label="ACP socket" value={machine.server.acpSocketPath ?? ""} onChange={(next) => mutate((file) => { file.machine.server.acpSocketPath = next; })} />
           <Field label="Control socket" value={machine.server.controlSocketPath ?? ""} onChange={(next) => mutate((file) => { file.machine.server.controlSocketPath = next; })} />
         </SettingsCard>

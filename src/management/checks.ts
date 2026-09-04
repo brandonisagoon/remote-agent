@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { createConnection } from "node:net";
 
 import { configFilePath, readConfig, type ServerConfig } from "../lib/config.ts";
 import { findExecutable, installLayout } from "./paths.ts";
@@ -43,6 +44,7 @@ export async function runChecks(): Promise<CheckResult[]> {
 
   results.push(await serviceCheck(config));
   results.push(await daemonCheck(config));
+  results.push(await acpSocketCheck(config));
   results.push(repositoriesCheck(config));
   results.push(await tunnelCheck(config));
   results.push(...providerChecks());
@@ -100,6 +102,38 @@ async function daemonCheck(config: ServerConfig): Promise<CheckResult> {
       remedy: `check ${installLayout(config.installRoot).serviceLog}`,
     };
   }
+}
+
+/** The socket ACP clients (Zed, bb, T3 Code) reach sessions through. */
+async function acpSocketCheck(config: ServerConfig): Promise<CheckResult> {
+  if (!existsSync(config.acpIpcPath)) {
+    return {
+      id: "acp",
+      label: "ACP Socket",
+      status: "fail",
+      detail: config.acpIpcPath,
+      remedy: "start the daemon; it creates the socket on boot",
+    };
+  }
+  const listening = await new Promise<boolean>((resolve) => {
+    const socket = createConnection(config.acpIpcPath);
+    const done = (ok: boolean) => {
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+    setTimeout(() => done(false), 1_000);
+  });
+  return listening
+    ? { id: "acp", label: "ACP Socket", status: "ok", detail: config.acpIpcPath }
+    : {
+        id: "acp",
+        label: "ACP Socket",
+        status: "fail",
+        detail: `socket exists but is not accepting connections: ${config.acpIpcPath}`,
+        remedy: "restart the daemon",
+      };
 }
 
 function repositoriesCheck(config: ServerConfig): CheckResult {
