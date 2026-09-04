@@ -37,6 +37,9 @@ const api: DesktopApi = {
   sessions: {
     list: (repositoryId) => ipcRenderer.invoke("sessions:list", repositoryId),
   },
+  repository: {
+    pick: () => ipcRenderer.invoke("repository:pick"),
+  },
   management: {
     checks: () => ipcRenderer.invoke("management:checks"),
     openTerminal: (commandLine) => ipcRenderer.invoke("management:open-terminal", commandLine),

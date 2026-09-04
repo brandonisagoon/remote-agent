@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import path from "node:path";
 import { watch } from "chokidar";
-import { app, BrowserWindow, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 
 import example from "../../../remote-agent.config.example.json";
 import schema from "../../../remote-agent.config.schema.json";
@@ -54,6 +54,7 @@ const DEFAULT_KEYBINDINGS: Keybindings = {
   "next-item": "Mod+Alt+ArrowDown",
   // Modifier prefix: the sidebar item's number 1-9 is appended (Mod+1..Mod+9).
   "jump-item": "Mod",
+  "add-repository": "Mod+O",
 };
 
 function keybindingsPath(configFile: string): string {
@@ -171,6 +172,17 @@ function registerIpc(file: string): void {
     update: installUpdate,
     restart: restartService,
   };
+  ipcMain.handle("repository:pick", async () => {
+    const result = await dialog.showOpenDialog({
+      title: "Add Repository",
+      buttonLabel: "Add Repository",
+      properties: ["openDirectory"],
+    });
+    const root = result.filePaths[0];
+    if (result.canceled || !root) return null;
+    if (!existsSync(path.join(root, ".git"))) return { error: "not-a-repository" as const };
+    return { repository: { root, name: path.basename(root) } };
+  });
   ipcMain.handle("management:checks", () => runChecks());
   ipcMain.handle("management:open-terminal", (_event, commandLine: string) => openInTerminal(commandLine));
   ipcMain.handle("management:run", (_event, action: keyof typeof actions) => {

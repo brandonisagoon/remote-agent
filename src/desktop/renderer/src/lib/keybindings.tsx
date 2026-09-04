@@ -15,7 +15,8 @@ export type KeybindingAction =
   | "toggle-secrets"
   | "prev-item"
   | "next-item"
-  | "jump-item";
+  | "jump-item"
+  | "add-repository";
 
 /**
  * Mirrors DEFAULT_KEYBINDINGS in the main process (the seed for keybindings.json).
@@ -32,6 +33,7 @@ export const DEFAULT_KEYBINDINGS: Record<KeybindingAction, string> = {
   "prev-item": "Mod+Alt+ArrowUp",
   "next-item": "Mod+Alt+ArrowDown",
   "jump-item": "Mod",
+  "add-repository": "Mod+O",
 };
 
 export function jumpChord(bindings: Record<KeybindingAction, string>, ordinal: number): Hotkey {

@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { Outlet, useNavigate } from "@tanstack/react-router";
+import { toast } from "sonner";
+import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 
-import { AddRepositoryDialog } from "@renderer/components/add-repository-dialog.tsx";
 import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
@@ -33,12 +33,81 @@ function storedSidebarWidth(): number {
 export function AppLayout() {
   const { draft, mutate, commit, dirty } = useConfig();
   const navigate = useNavigate();
-  const [addDialog, setAddDialog] = useState<"repository" | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
+
+  // Adding a repository is a file pick, not a form: the ID is an opaque key,
+  // the name comes from the folder, and everything else has editable defaults.
+  const addRepository = async () => {
+    const picked = await window.remoteAgent.repository.pick();
+    if (!picked) return;
+    if ("error" in picked) {
+      toast.error("That folder is not a git repository");
+      return;
+    }
+    const id = `repo-${randomHex(6)}`;
+    const create = (value: typeof draft) => {
+      value.repositories[id] = {
+        name: picked.repository.name,
+        root: picked.repository.root,
+        worktreeRoot: `../.worktrees/${picked.repository.name}`,
+        bootstrapCommand: ["true"],
+        workflows: {
+          describe: { prompt: "prompts/describe.md", provider: "claude" },
+          orchestrate: { prompt: "prompts/orchestrate.md", provider: "codex" },
+          reflect: { prompt: "prompts/reflect.md" },
+        },
+        metadata: { tags: {} },
+        sessionDefaults: { tags: {} },
+        triggers: {
+          reflectOnState: "Pull Request",
+          orchestrateOnState: "Planning",
+          describeOnReaction: "pencil2",
+        },
+      };
+    };
+    if (dirty) mutate(create);
+    else void commit(create);
+    void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id } });
+  };
+
+  // Removal is confirmed by the sidebar's alert dialog; write through
+  // directly unless draft edits are pending (same rule as creation).
+  const applyRemoval = (remove: (value: typeof draft) => void, wasActive: boolean) => {
+    if (dirty) mutate(remove);
+    else void commit(remove);
+    if (wasActive) void navigate({ to: "/" });
+  };
+  const params = useParams({ strict: false });
+  const removeProvider = (id: string) => {
+    applyRemoval((value) => {
+      delete value.providers[id as keyof typeof value.providers];
+    }, params.providerId === id);
+  };
+  const removeConnection = (id: string) => {
+    applyRemoval((value) => {
+      delete value.connections[id];
+    }, params.connectionId === id);
+  };
+  const removeRepository = (id: string) => {
+    if (Object.keys(draft.repositories).length <= 1) {
+      toast.error("At least one repository is required");
+      return;
+    }
+    applyRemoval((value) => {
+      delete value.repositories[id];
+      // Heal connection allowlists that referenced it; an emptied allowlist
+      // falls back to every repository.
+      for (const connection of Object.values(value.connections)) {
+        if (connection.repositories === "*") continue;
+        delete connection.repositories[id];
+        if (Object.keys(connection.repositories).length === 0) connection.repositories = "*";
+      }
+    }, params.repositoryId === id);
+  };
 
   return (
     <SidebarProvider style={{ "--sidebar-width": `${sidebarWidth}px` } as React.CSSProperties}>
-      <KeyboardShortcuts />
+      <KeyboardShortcuts onAddRepository={() => void addRepository()} />
       <SidebarResizeHandle
         onResize={setSidebarWidth}
         onCommit={(width) => localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(width))}
@@ -79,7 +148,10 @@ export function AppLayout() {
           else void commit(create);
           void navigate({ to: "/connections/$connectionId", params: { connectionId: id } });
         }}
-        onAddRepository={() => setAddDialog("repository")}
+        onAddRepository={() => void addRepository()}
+        onRemoveProvider={removeProvider}
+        onRemoveConnection={removeConnection}
+        onRemoveRepository={removeRepository}
       />
 
       <SidebarInset className="h-svh min-w-0 overflow-hidden">
@@ -93,34 +165,6 @@ export function AppLayout() {
         </div>
       </SidebarInset>
 
-      <AddRepositoryDialog
-        open={addDialog === "repository"}
-        onOpenChange={(open) => setAddDialog(open ? "repository" : null)}
-        existingIds={Object.keys(draft.repositories)}
-        onCreate={(id) => {
-          mutate((value) => {
-            value.repositories[id] = {
-              name: "New Repository",
-              root: `~/checkouts/${id}`,
-              worktreeRoot: `~/.worktrees/${id}`,
-              bootstrapCommand: ["true"],
-              workflows: {
-                describe: { prompt: "prompts/describe.md", provider: "claude" },
-                orchestrate: { prompt: "prompts/orchestrate.md", provider: "codex" },
-                reflect: { prompt: "prompts/reflect.md" },
-              },
-              metadata: { tags: {} },
-              sessionDefaults: { tags: {} },
-              triggers: {
-                reflectOnState: "Pull Request",
-                orchestrateOnState: "Planning",
-                describeOnReaction: "pencil2",
-              },
-            };
-          });
-          void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id } });
-        }}
-      />
     </SidebarProvider>
   );
 }

@@ -5,7 +5,7 @@ import { MessagesSquareIcon } from "lucide-react";
 import type { ServiceFile } from "../../../../lib/config.ts";
 import { BrandIcon } from "@renderer/components/brand-icon.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
-import { jumpChord, useKeybindings } from "@renderer/lib/keybindings.tsx";
+import { jumpChord, useKeybindings, useKeybindingLabel } from "@renderer/lib/keybindings.tsx";
 import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
@@ -17,6 +17,7 @@ import {
 } from "@renderer/components/ui/dropdown-menu.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { NavHistoryButtons } from "@renderer/components/nav-history-buttons.tsx";
+import { RemovableSidebarItem } from "@renderer/components/removable-sidebar-item.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import {
   Sidebar,
@@ -38,12 +39,19 @@ export function AppSidebar({
   onAddProvider,
   onAddConnection,
   onAddRepository,
+  onRemoveProvider,
+  onRemoveConnection,
+  onRemoveRepository,
 }: {
   value: ServiceFile;
   onAddProvider(id: "codex" | "claude"): void;
   onAddConnection(): void;
   onAddRepository(): void;
+  onRemoveProvider(id: string): void;
+  onRemoveConnection(id: string): void;
+  onRemoveRepository(id: string): void;
 }) {
+  const addRepositoryLabel = useKeybindingLabel("add-repository");
   const matchRoute = useMatchRoute();
   // While the configured jump-item modifiers are held, items show their number.
   const bindings = useKeybindings();
@@ -102,18 +110,25 @@ export function AppSidebar({
           <SidebarGroupContent>
             <SidebarMenu>
               {providers.map((providerId, index) => (
-                <SidebarMenuItem key={providerId}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={!!matchRoute({ to: "/providers/$providerId", params: { providerId } })}
-                  >
-                    <Link to="/providers/$providerId" params={{ providerId }}>
-                      {providerId === "claude" ? <BrandIcon name="claudecode" /> : <BrandIcon name="openai" />}
-                      <span>{PROVIDER_LABELS[providerId] ?? providerId}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                  {jumpBadge(index + 1)}
-                </SidebarMenuItem>
+                <RemovableSidebarItem
+                  key={providerId}
+                  label={PROVIDER_LABELS[providerId] ?? providerId}
+                  description="Sessions can no longer use this provider until it is added again."
+                  onRemove={() => onRemoveProvider(providerId)}
+                >
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={!!matchRoute({ to: "/providers/$providerId", params: { providerId } })}
+                    >
+                      <Link to="/providers/$providerId" params={{ providerId }}>
+                        {providerId === "claude" ? <BrandIcon name="claudecode" /> : <BrandIcon name="openai" />}
+                        <span>{PROVIDER_LABELS[providerId] ?? providerId}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                    {jumpBadge(index + 1)}
+                  </SidebarMenuItem>
+                </RemovableSidebarItem>
               ))}
             </SidebarMenu>
           </SidebarGroupContent>
@@ -156,18 +171,27 @@ export function AppSidebar({
           <SidebarGroupContent>
             <SidebarMenu>
               {connections.map(([id, connection], index) => (
-                <SidebarMenuItem key={id}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={!!matchRoute({ to: "/connections/$connectionId", params: { connectionId: id } })}
-                  >
-                    <Link to="/connections/$connectionId" params={{ connectionId: id }}>
-                      <BrandIcon name="linear" />
-                      <span>{connection.name}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                  {jumpBadge(connectionOrdinal(index))}
-                </SidebarMenuItem>
+                <RemovableSidebarItem
+                  key={id}
+                  label={connection.name}
+                  description={connection.webhook
+                    ? "Its credentials and webhook endpoint will be removed."
+                    : "Its credentials will be removed."}
+                  onRemove={() => onRemoveConnection(id)}
+                >
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={!!matchRoute({ to: "/connections/$connectionId", params: { connectionId: id } })}
+                    >
+                      <Link to="/connections/$connectionId" params={{ connectionId: id }}>
+                        <BrandIcon name="linear" />
+                        <span>{connection.name}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                    {jumpBadge(connectionOrdinal(index))}
+                  </SidebarMenuItem>
+                </RemovableSidebarItem>
               ))}
             </SidebarMenu>
           </SidebarGroupContent>
@@ -177,8 +201,8 @@ export function AppSidebar({
           <SidebarGroupContent>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton asChild isActive={!!matchRoute({ to: "/" })}>
-                  <Link to="/">
+                <SidebarMenuButton asChild isActive={!!matchRoute({ to: "/machine" })}>
+                  <Link to="/machine">
                     <F7Icon name="desktopcomputer" />
                     <span>{value.machine.name}</span>
                   </Link>
@@ -197,23 +221,37 @@ export function AppSidebar({
                 <span className="sr-only">Add a Repository</span>
               </SidebarGroupAction>
             </TooltipTrigger>
-            <TooltipContent side="right">Add a Repository</TooltipContent>
+            <TooltipContent side="right" className="flex items-center gap-1.5">
+              Add a Repository{" "}
+              <KbdGroup>
+                {addRepositoryLabel.split(" ").map((key) => (
+                  <Kbd key={key}>{key}</Kbd>
+                ))}
+              </KbdGroup>
+            </TooltipContent>
           </Tooltip>
           <SidebarGroupContent>
             <SidebarMenu>
               {repositories.map(([id, repository], index) => (
-                <SidebarMenuItem key={id}>
-                  <SidebarMenuButton
-                    asChild
-                    isActive={!!matchRoute({ to: "/repositories/$repositoryId", params: { repositoryId: id } })}
-                  >
-                    <Link to="/repositories/$repositoryId" params={{ repositoryId: id }}>
-                      <F7Icon name="folder" />
-                      <span>{repository.name ?? id}</span>
-                    </Link>
-                  </SidebarMenuButton>
-                  {jumpBadge(repositoryOrdinal(index))}
-                </SidebarMenuItem>
+                <RemovableSidebarItem
+                  key={id}
+                  label={repository.name ?? id}
+                  description="The checkout and its worktrees stay on disk; only the configuration entry is removed."
+                  onRemove={() => onRemoveRepository(id)}
+                >
+                  <SidebarMenuItem>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={!!matchRoute({ to: "/repositories/$repositoryId", params: { repositoryId: id } })}
+                    >
+                      <Link to="/repositories/$repositoryId" params={{ repositoryId: id }}>
+                        <F7Icon name="folder" />
+                        <span>{repository.name ?? id}</span>
+                      </Link>
+                    </SidebarMenuButton>
+                    {jumpBadge(repositoryOrdinal(index))}
+                  </SidebarMenuItem>
+                </RemovableSidebarItem>
               ))}
             </SidebarMenu>
           </SidebarGroupContent>

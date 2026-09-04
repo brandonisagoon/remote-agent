@@ -20,6 +20,7 @@ import Link from "framework7-icons/react/esm/Link.js";
 import Plus from "framework7-icons/react/esm/Plus.js";
 import SidebarLeft from "framework7-icons/react/esm/SidebarLeft.js";
 import Trash from "framework7-icons/react/esm/Trash.js";
+import Xmark from "framework7-icons/react/esm/Xmark.js";
 
 import { cn } from "../lib/utils.ts";
 
@@ -48,6 +49,7 @@ const ICONS = {
   plus: Plus,
   sidebar_left: SidebarLeft,
   trash: Trash,
+  xmark: Xmark,
 } as const;
 
 export type F7IconName = keyof typeof ICONS;

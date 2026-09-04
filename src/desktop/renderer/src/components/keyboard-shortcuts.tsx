@@ -13,7 +13,7 @@ import { navigateToItem, useCurrentSidebarIndex, useSidebarItems } from "@render
  * inside the layout (needs the sidebar and router contexts). preventDefault
  * matters: Electron otherwise handles Mod+[ / Mod+] as webContents history.
  */
-export function KeyboardShortcuts() {
+export function KeyboardShortcuts({ onAddRepository }: { onAddRepository(): void }) {
   const bindings = useKeybindings();
   const { history } = useRouter();
   const { toggleSidebar } = useSidebar();
@@ -30,6 +30,7 @@ export function KeyboardShortcuts() {
   // No preventDefault: Radix overlays also listen for Escape to close.
   useHotkey(bindings["revert"] as Hotkey, () => revert(), { enabled: dirty });
   useHotkey(bindings["toggle-secrets"] as Hotkey, () => toggleAllSecrets(), { preventDefault: true });
+  useHotkey(bindings["add-repository"] as Hotkey, () => onAddRepository(), { preventDefault: true });
   useHotkey(
     bindings["prev-item"] as Hotkey,
     () => {

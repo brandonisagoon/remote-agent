@@ -71,7 +71,7 @@ export function MachineScopeEditor({
             <Tooltip>
               <TooltipTrigger asChild>
                 <InputGroupButton size="icon-xs" asChild>
-                  <Link to="/">
+                  <Link to="/machine">
                     <F7Icon name="desktopcomputer" />
                     <span className="sr-only">Open machine settings</span>
                   </Link>

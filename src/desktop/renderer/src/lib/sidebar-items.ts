@@ -12,7 +12,7 @@ export interface SidebarItem {
   id: string;
   label: string;
   link:
-    | { to: "/" }
+    | { to: "/machine" }
     | { to: "/providers/$providerId"; params: { providerId: string } }
     | { to: "/connections/$connectionId"; params: { connectionId: string } }
     | { to: "/repositories/$repositoryId"; params: { repositoryId: string } };
@@ -32,7 +32,7 @@ export function useSidebarItems(): SidebarItem[] {
       label: connection.name,
       link: { to: "/connections/$connectionId" as const, params: { connectionId: id } },
     })),
-    { id: "machine", label: draft.machine.name, link: { to: "/" as const } },
+    { id: "machine", label: draft.machine.name, link: { to: "/machine" as const } },
     ...Object.entries(draft.repositories).map(([id, repository]) => ({
       id: `repository:${id}`,
       label: repository.name ?? id,
@@ -50,8 +50,8 @@ export function useCurrentSidebarIndex(items: SidebarItem[]): number {
 }
 
 export function navigateToItem(navigate: ReturnType<typeof useNavigate>, item: SidebarItem): void {
-  if (item.link.to === "/") {
-    void navigate({ to: "/" });
+  if (item.link.to === "/machine") {
+    void navigate({ to: "/machine" });
   } else if (item.link.to === "/providers/$providerId") {
     void navigate({ to: item.link.to, params: item.link.params });
   } else if (item.link.to === "/connections/$connectionId") {

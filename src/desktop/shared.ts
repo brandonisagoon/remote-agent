@@ -54,6 +54,9 @@ export interface DesktopApi {
   sessions: {
     list(repositoryId?: string): Promise<SessionSummary[]>;
   };
+  repository: {
+    pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
+  };
   management: {
     checks(): Promise<CheckResult[]>;
     openTerminal(commandLine: string): Promise<ManagementResult>;
