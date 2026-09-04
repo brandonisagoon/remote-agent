@@ -199,7 +199,7 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
                 </TableRow>
                   </TooltipTrigger>
                   {skillset.description && (
-                    <TooltipContent side="bottom" className="max-w-80">{skillset.description}</TooltipContent>
+                    <TooltipContent side="left" className="max-w-80">{skillset.description}</TooltipContent>
                   )}
                 </Tooltip>
               ))}
