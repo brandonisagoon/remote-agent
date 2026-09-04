@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 
@@ -70,6 +70,50 @@ export function AppLayout() {
     void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id } });
   };
 
+  const addProvider = (providerId: "codex" | "claude") => {
+    const create = (value: typeof draft) => {
+      value.providers[providerId] = {};
+    };
+    if (dirty) mutate(create);
+    else void commit(create);
+    void navigate({ to: "/providers/$providerId", params: { providerId } });
+  };
+  const addConnection = () => {
+    const id = generateConnectionId();
+    const create = (value: typeof draft) => {
+      value.connections[id] = {
+        provider: "linear",
+        name: "New Linear Connection",
+        apiKey: "replace-me",
+        agentUserId: "replace-me",
+        machineId: value.machine.id,
+        repositories: "*",
+        router: { providerId: "codex", timeoutMs: 30_000 },
+        editors: [{ name: "Zed", scheme: "zed" }],
+        webhook: {
+          slug: `wh-${randomHex(6)}`,
+          secret: randomHex(16),
+          webhookMaxAgeMs: 60_000,
+        },
+      };
+    };
+    // A default connection is self-contained: write it through directly.
+    // With unsaved edits pending it joins the draft instead, so those are
+    // never silently saved along with it.
+    if (dirty) mutate(create);
+    else void commit(create);
+    void navigate({ to: "/connections/$connectionId", params: { connectionId: id } });
+  };
+
+  // The macOS File menu mirrors the sidebar's add controls.
+  useEffect(() =>
+    window.remoteAgent.menu.onAction((payload) => {
+      if (payload.action === "add-repository") void addRepository();
+      else if (payload.action === "add-connection") addConnection();
+      else addProvider(payload.providerId);
+    }),
+  );
+
   // Removal is confirmed by the sidebar's alert dialog; write through
   // directly unless draft edits are pending (same rule as creation).
   const applyRemoval = (remove: (value: typeof draft) => void, wasActive: boolean) => {
@@ -114,40 +158,8 @@ export function AppLayout() {
       />
       <AppSidebar
         value={draft}
-        onAddProvider={(providerId) => {
-          const create = (value: typeof draft) => {
-            value.providers[providerId] = {};
-          };
-          if (dirty) mutate(create);
-          else void commit(create);
-          void navigate({ to: "/providers/$providerId", params: { providerId } });
-        }}
-        onAddConnection={() => {
-          const id = generateConnectionId();
-          const create = (value: typeof draft) => {
-            value.connections[id] = {
-              provider: "linear",
-              name: "New Linear Connection",
-              apiKey: "replace-me",
-              agentUserId: "replace-me",
-              machineId: value.machine.id,
-              repositories: "*",
-              router: { providerId: "codex", timeoutMs: 30_000 },
-              editors: [{ name: "Zed", scheme: "zed" }],
-              webhook: {
-                slug: `wh-${randomHex(6)}`,
-                secret: randomHex(16),
-                webhookMaxAgeMs: 60_000,
-              },
-            };
-          };
-          // A default connection is self-contained: write it through directly.
-          // With unsaved edits pending it joins the draft instead, so those
-          // are never silently saved along with it.
-          if (dirty) mutate(create);
-          else void commit(create);
-          void navigate({ to: "/connections/$connectionId", params: { connectionId: id } });
-        }}
+        onAddProvider={addProvider}
+        onAddConnection={addConnection}
         onAddRepository={() => void addRepository()}
         onRemoveProvider={removeProvider}
         onRemoveConnection={removeConnection}

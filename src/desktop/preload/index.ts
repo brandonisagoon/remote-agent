@@ -37,6 +37,13 @@ const api: DesktopApi = {
   sessions: {
     list: (repositoryId) => ipcRenderer.invoke("sessions:list", repositoryId),
   },
+  menu: {
+    onAction: (callback) => {
+      const listener = (_event: unknown, payload: unknown) => callback(payload as never);
+      ipcRenderer.on("menu:action", listener);
+      return () => ipcRenderer.removeListener("menu:action", listener);
+    },
+  },
   repository: {
     pick: () => ipcRenderer.invoke("repository:pick"),
   },

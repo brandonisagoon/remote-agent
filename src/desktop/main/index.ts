@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from "node:fs";
 import path from "node:path";
 import { watch } from "chokidar";
-import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from "electron";
 
 import example from "../../../remote-agent.config.example.json";
 import schema from "../../../remote-agent.config.schema.json";
@@ -232,9 +232,11 @@ async function createWindow(): Promise<void> {
 
   const bindingsFile = keybindingsPath(file);
   ensureKeybindings(bindingsFile);
+  buildApplicationMenu(bindingsFile);
   const keybindingsWatcher = watch(bindingsFile, { ignoreInitial: true });
   keybindingsWatcher.on("all", () => {
     mainWindow?.webContents.send("keybindings:changed", readKeybindings(bindingsFile));
+    buildApplicationMenu(bindingsFile);
   });
   stopWatchingKeybindings = () => keybindingsWatcher.close();
 
@@ -250,6 +252,47 @@ async function createWindow(): Promise<void> {
 }
 
 app.setName("Remote Agent");
+
+/** Mirrors the sidebar's add controls in the macOS File menu. Accelerators
+    come from keybindings.json so the menu stays in sync with in-app hotkeys. */
+function buildApplicationMenu(bindingsFile: string): void {
+  const bindings = readKeybindings(bindingsFile);
+  const send = (payload: unknown) => mainWindow?.webContents.send("menu:action", payload);
+  const accelerator = (chord: string | undefined) => chord?.replace("Mod", "CmdOrCtrl");
+  Menu.setApplicationMenu(Menu.buildFromTemplate([
+    { role: "appMenu" },
+    {
+      label: "File",
+      submenu: [
+        {
+          label: "Add Repository…",
+          accelerator: accelerator(bindings["add-repository"]) ?? "CmdOrCtrl+O",
+          click: () => send({ action: "add-repository" }),
+        },
+        {
+          label: "Add Connection",
+          submenu: [
+            { label: "Linear", click: () => send({ action: "add-connection" }) },
+            { label: "Slack", enabled: false },
+            { label: "GitHub", enabled: false },
+          ],
+        },
+        {
+          label: "Add Provider",
+          submenu: [
+            { label: "Codex", click: () => send({ action: "add-provider", providerId: "codex" }) },
+            { label: "Claude Code", click: () => send({ action: "add-provider", providerId: "claude" }) },
+          ],
+        },
+        { type: "separator" },
+        { role: "close" },
+      ],
+    },
+    { role: "editMenu" },
+    { role: "viewMenu" },
+    { role: "windowMenu" },
+  ]));
+}
 
 app.whenReady().then(async () => {
   // Dev runs the stock Electron binary; give the Dock our name and icon.

@@ -54,6 +54,16 @@ export interface DesktopApi {
   sessions: {
     list(repositoryId?: string): Promise<SessionSummary[]>;
   };
+  menu: {
+    onAction(
+      callback: (
+        payload:
+          | { action: "add-repository" }
+          | { action: "add-connection" }
+          | { action: "add-provider"; providerId: "codex" | "claude" },
+      ) => void,
+    ): () => void;
+  };
   repository: {
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
   };
