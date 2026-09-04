@@ -122,5 +122,17 @@ export async function detectEditors(): Promise<DetectedEditor[]> {
     const key = editor.scheme ?? editor.appPath;
     if (!byKey.has(key)) byKey.set(key, editor);
   }
+  // Finder closes the list: `open -a Finder <dir>` reveals the folder, so it
+  // rides the same open-with path as the AI apps.
+  const finder = "/System/Library/CoreServices/Finder.app";
+  if (existsSync(finder)) {
+    byKey.set(finder, {
+      name: "Finder",
+      scheme: null,
+      open: "app",
+      appPath: finder,
+      icon: await bundleIcon(finder),
+    });
+  }
   return (cache = [...byKey.values()]);
 }

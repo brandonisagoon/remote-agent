@@ -7,6 +7,7 @@ import { DnsRecordsTable } from "./dns-records-table.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
+import { StatusDot } from "@renderer/components/status-dot.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";
@@ -112,7 +113,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                       <div className="text-muted-foreground truncate text-xs">{step.remedy ?? step.detail}</div>
                     )}
                   </TableCell>
-                  <TableCell className="w-28"><CheckBadge status={step.status} /></TableCell>
+                  <TableCell className="w-28"><StatusDot status={step.status} /></TableCell>
                   <TableCell className="w-48 pr-4 text-right">{stepAction(step)}</TableCell>
                 </TableRow>
               ))}
@@ -138,7 +139,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                       <div className="text-muted-foreground truncate text-xs">{row.detail}</div>
                     )}
                   </TableCell>
-                  <TableCell className="w-28"><CheckBadge status={row.status} /></TableCell>
+                  <TableCell className="w-28"><StatusDot status={row.status} /></TableCell>
                   <TableCell className="w-48 pr-4 text-right">
                     {row.id === "daemon" && (
                       <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("restart")}>
@@ -241,18 +242,3 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   );
 }
 
-const STATUS_DOT = {
-  ok: { color: "bg-emerald-600/60 dark:bg-emerald-400/50", label: "OK" },
-  warn: { color: "bg-amber-600/60 dark:bg-amber-400/50", label: "Attention" },
-  fail: { color: "bg-red-600/60 dark:bg-red-400/50", label: "Missing" },
-} as const;
-
-function CheckBadge({ status }: { status: "ok" | "warn" | "fail" }) {
-  const { color, label } = STATUS_DOT[status];
-  return (
-    <span className="flex items-center gap-2">
-      <span className={cn("size-2 shrink-0 rounded-full", color)} />
-      <span className="text-muted-foreground/70 text-xs">{label}</span>
-    </span>
-  );
-}

@@ -52,6 +52,7 @@ const api: DesktopApi = {
   },
   skills: {
     check: (root, skillsRoot) => ipcRenderer.invoke("skills:check", root, skillsRoot),
+    pickRoot: (defaultPath) => ipcRenderer.invoke("skills:pick-root", defaultPath),
   },
   shell: {
     openPath: (target) => ipcRenderer.invoke("shell:open-path", target),

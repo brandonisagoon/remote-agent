@@ -188,6 +188,15 @@ function registerIpc(file: string): void {
   });
   ipcMain.handle("management:checks", () => runChecks());
   ipcMain.handle("editors:detect", () => detectEditors());
+  ipcMain.handle("skills:pick-root", async (_event, defaultPath: string) => {
+    const result = await dialog.showOpenDialog({
+      title: "Select Skills Root",
+      buttonLabel: "Select",
+      defaultPath,
+      properties: ["openDirectory", "createDirectory"],
+    });
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
   ipcMain.handle("skills:check", (_event, root: string, skillsRoot: string) => checkSkills(root, skillsRoot));
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:open-with", (_event, appPath: string, target: string) =>

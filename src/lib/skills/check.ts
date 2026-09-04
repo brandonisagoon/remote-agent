@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 import { findExecutable, sourceRoot } from "../../management/paths.ts";
@@ -12,21 +12,25 @@ export interface SkillsetFlag {
 
 export interface SkillsetSummary {
   id: string;
+  description?: string | null;
   harnesses: string[];
   snippets: string[];
   flags: SkillsetFlag[];
   hooks: string[];
 }
 
-export type SkillsCheck =
-  | { installed: false }
-  | {
-      installed: true;
-      /** `skill-composer check` verdict; problems are its errors+warnings. */
-      ok: boolean;
-      problems: string[];
-      skillsets: SkillsetSummary[];
-    };
+export interface SkillsCheck {
+  /** skill-composer present as the repository's own dependency. */
+  installed: boolean;
+  /** skillsRoot config file exists. */
+  configFound: boolean;
+  /** .gitignore covers the generated .claude/.agents skill outputs. */
+  gitignored: boolean;
+  /** `skill-composer check` verdict; problems are its errors+warnings. */
+  ok: boolean;
+  problems: string[];
+  skillsets: SkillsetSummary[];
+}
 
 async function runJson(
   executable: string,
@@ -47,6 +51,17 @@ async function runJson(
   }
 }
 
+/** Generated harness outputs must never be committed; a heuristic substring
+    check against the repo's .gitignore. */
+function outputsIgnored(repositoryRoot: string): boolean {
+  try {
+    const gitignore = readFileSync(path.join(repositoryRoot, ".gitignore"), "utf8");
+    return gitignore.includes(".claude/skills") && gitignore.includes(".agents/skills");
+  } catch {
+    return false;
+  }
+}
+
 function configPath(repositoryRoot: string, skillsRoot: string): string {
   const base = path.join(repositoryRoot, skillsRoot, "skill-composer.config");
   return existsSync(`${base}.ts`) ? `${base}.ts` : `${base}.mjs`;
@@ -61,9 +76,12 @@ export async function checkSkills(
   skillsRoot = "agent-skills",
 ): Promise<SkillsCheck> {
   const cli = skillComposerPath(repositoryRoot);
-  if (!cli) return { installed: false };
-
   const config = configPath(repositoryRoot, skillsRoot);
+  const configFound = existsSync(config);
+  const gitignored = outputsIgnored(repositoryRoot);
+  if (!cli || !configFound) {
+    return { installed: cli !== null, configFound, gitignored, ok: false, problems: [], skillsets: [] };
+  }
   const checkResult = await runJson(
     cli,
     ["check", "--root", repositoryRoot, "--config", config],
@@ -93,6 +111,8 @@ export async function checkSkills(
 
   return {
     installed: true,
+    configFound,
+    gitignored,
     ok: checkResult?.ok === true && (inventory?.ok === true || inventory === null),
     problems: messages,
     skillsets,

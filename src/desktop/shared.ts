@@ -74,6 +74,7 @@ export interface DesktopApi {
   };
   skills: {
     check(root: string, skillsRoot: string): Promise<SkillsCheck>;
+    pickRoot(defaultPath: string): Promise<string | null>;
   };
   shell: {
     openPath(target: string): Promise<string>;
