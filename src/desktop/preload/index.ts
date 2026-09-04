@@ -38,6 +38,7 @@ const api: DesktopApi = {
     list: (repositoryId) => ipcRenderer.invoke("sessions:list", repositoryId),
   },
   management: {
+    checks: () => ipcRenderer.invoke("management:checks"),
     run: (action) => ipcRenderer.invoke("management:run", action),
   },
 };

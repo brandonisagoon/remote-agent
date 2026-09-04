@@ -13,11 +13,13 @@ import {
 import {
   checkForUpdates,
   doctor,
+  installCli,
   installService,
   installUpdate,
   restartService,
   serviceStatus,
 } from "../../management/service.ts";
+import { runChecks } from "../../management/checks.ts";
 import { listProviderModels } from "./provider-models.ts";
 import { tunnelInfo } from "./tunnel-info.ts";
 import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
@@ -163,10 +165,12 @@ function registerIpc(file: string): void {
     status: serviceStatus,
     doctor,
     install: installService,
+    "install-cli": installCli,
     "check-update": checkForUpdates,
     update: installUpdate,
     restart: restartService,
   };
+  ipcMain.handle("management:checks", () => runChecks());
   ipcMain.handle("management:run", (_event, action: keyof typeof actions) => {
     const run = actions[action];
     if (!run) throw new Error(`unknown management action: ${action}`);

@@ -9,6 +9,7 @@ import {
   installUpdate,
   restartService,
   serviceStatus,
+  uninstallService,
 } from "../management/service.ts";
 
 function action(run: () => Promise<{ ok: boolean; summary: string; detail?: string }>) {
@@ -31,5 +32,10 @@ program.command("doctor").description("Validate config and local dependencies").
 program.command("check-update").description("Check the configured release branch").action(action(checkForUpdates));
 program.command("update").description("Install the latest configured release").action(action(installUpdate));
 program.command("restart").description("Restart the local daemon").action(action(restartService));
+program
+  .command("uninstall")
+  .description("Remove the local daemon (state is kept unless --purge)")
+  .option("--purge", "also delete the install root, including the database")
+  .action((options: { purge?: boolean }) => action(() => uninstallService(options))());
 
 await program.parseAsync();

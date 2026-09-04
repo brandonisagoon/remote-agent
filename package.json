@@ -35,7 +35,8 @@
     "test": "bun test",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "desktop:dist": "bun run config:schema && bun run desktop:build && electron-builder"
   },
   "build": {
     "appId": "dev.remote-agent.desktop",
@@ -46,8 +47,8 @@
     ],
     "extraResources": [
       {
-        "from": "scripts",
-        "to": "scripts"
+        "from": "bin",
+        "to": "bin"
       },
       {
         "from": "remote-agent.config.example.json",
@@ -63,7 +64,20 @@
       "target": [
         "dmg",
         "zip"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false
+    },
+    "win": {
+      "target": [
+        "nsis"
       ]
+    },
+    "directories": {
+      "output": "dist"
     }
   },
   "dependencies": {

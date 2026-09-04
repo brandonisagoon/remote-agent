@@ -3,19 +3,15 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { configFilePath, readConfig } from "../lib/config.ts";
+import { findExecutable, installLayout, sourceRoot } from "./paths.ts";
+import { runChecks } from "./checks.ts";
+import { provision } from "./provision.ts";
+import { daemonDefinition, supervisor } from "./supervisor/index.ts";
 
 export interface ManagementResult {
   ok: boolean;
   summary: string;
   detail?: string;
-}
-
-function sourceRoot(): string {
-  const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
-  if (resourcesPath && existsSync(path.join(resourcesPath, "scripts", "install.sh"))) {
-    return resourcesPath;
-  }
-  return path.resolve(import.meta.dir, "..", "..");
 }
 
 function updateCheckout(): string {
@@ -72,39 +68,33 @@ export async function serviceStatus(): Promise<ManagementResult> {
 }
 
 export async function doctor(): Promise<ManagementResult> {
-  try {
-    const config = readConfig();
-    const missing = Object.values(config.repositories)
-      .filter((repository) => !existsSync(repository.root))
-      .map((repository) => `${repository.id}: ${repository.root}`);
-    const status = await serviceStatus();
-    const lines = [
-      `Config: ${config.configFile}`,
-      `Machine: ${config.machine}`,
-      `Repositories: ${Object.keys(config.repositories).length}`,
-      `Daemon: ${status.ok ? "running" : "unavailable"}`,
-      ...(missing.length ? ["Missing repository roots:", ...missing] : []),
-    ];
-    return {
-      ok: missing.length === 0 && status.ok,
-      summary: missing.length === 0 ? "Configuration is valid" : "Configuration needs attention",
-      detail: lines.join("\n"),
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      summary: "Configuration is invalid",
-      detail: error instanceof Error ? error.message : String(error),
-    };
-  }
+  const checks = await runChecks();
+  const failed = checks.filter((check) => check.status === "fail");
+  const marks: Record<string, string> = { ok: "ok  ", warn: "warn", fail: "FAIL" };
+  const lines = checks.map((check) => {
+    const parts = [`${marks[check.status]}  ${check.label}`];
+    if (check.detail) parts.push(`      ${check.detail.replaceAll("\n", "\n      ")}`);
+    if (check.status !== "ok" && check.remedy) parts.push(`      → ${check.remedy}`);
+    return parts.join("\n");
+  });
+  return {
+    ok: failed.length === 0,
+    summary: failed.length === 0
+      ? "All checks passed"
+      : `${failed.length} check${failed.length === 1 ? "" : "s"} failing`,
+    detail: lines.join("\n"),
+  };
 }
 
 export async function installService(): Promise<ManagementResult> {
-  const root = sourceRoot();
-  return command("bash", [path.join(root, "scripts", "install.sh")], {
-    cwd: root,
-    env: { REMOTE_AGENT_CONFIG: configFilePath() },
-  });
+  const lines: string[] = [];
+  try {
+    await provision((line) => lines.push(line));
+    return { ok: true, summary: "Service installed", detail: lines.join("\n") };
+  } catch (error) {
+    lines.push(error instanceof Error ? error.message : String(error));
+    return { ok: false, summary: "Install failed", detail: lines.join("\n") };
+  }
 }
 
 export async function checkForUpdates(): Promise<ManagementResult> {
@@ -131,16 +121,95 @@ export async function checkForUpdates(): Promise<ManagementResult> {
 
 export async function installUpdate(): Promise<ManagementResult> {
   const config = readConfig();
-  return command("bash", [config.deployScript, "--force"], {
+  const bun = findExecutable("bun");
+  if (!bun) return { ok: false, summary: "bun was not found on PATH" };
+  const script = existsSync(config.deployScript)
+    ? config.deployScript
+    : path.join(sourceRoot(), "src", "management", "deploy.ts");
+  const result = await command(bun, [script, "--force"], {
     env: { REMOTE_AGENT_CONFIG: config.configFile },
   });
+  const deployLog = installLayout(config.installRoot).deployLog;
+  return result.ok
+    ? { ...result, summary: "Update complete" }
+    : { ...result, summary: `Update failed — see ${deployLog}` };
+}
+
+const CLI_LINK = "/usr/local/bin/remote-agent";
+
+/** The wrapper script the /usr/local/bin symlink should point at — the
+    deployment copy when the service is installed (deploy keeps it
+    current), this checkout otherwise. */
+export function cliEntryPath(): string {
+  let appRoot = sourceRoot();
+  try {
+    const deployed = path.join(readConfig().installRoot, "app");
+    if (existsSync(path.join(deployed, "bin", "remote-agent"))) appRoot = deployed;
+  } catch {
+    // Unreadable config: the checkout fallback still works.
+  }
+  return path.join(appRoot, "bin", "remote-agent");
+}
+
+export function cliInstalled(): boolean {
+  return existsSync(CLI_LINK);
+}
+
+/** Deliberately dumb: opens Terminal with the symlink command prefilled so
+    sudo runs in the user's own shell, instead of doing privileged writes
+    from the app. */
+export async function installCli(): Promise<ManagementResult> {
+  const entry = cliEntryPath();
+  if (!existsSync(entry)) {
+    return { ok: false, summary: "CLI source not found", detail: entry };
+  }
+  const install = `sudo ln -sf '${entry}' ${CLI_LINK}`;
+  const script = `tell application "Terminal"\n  activate\n  do script ${JSON.stringify(install)}\nend tell`;
+  const result = await command("osascript", ["-e", script]);
+  return result.ok
+    ? { ok: true, summary: "Continue in Terminal — the install command is ready to run", detail: install }
+    : { ...result, summary: "Could not open Terminal" };
+}
+
+/** Unregisters the daemon. Leaves state/ (database, keys, logs) and the
+    cloudflared daemon alone — losing session registrations to a reinstall
+    would be surprising, and the tunnel is shared infrastructure. `purge`
+    additionally deletes the whole install root, including the database. */
+export async function uninstallService(options: { purge?: boolean } = {}): Promise<ManagementResult> {
+  try {
+    const config = readConfig();
+    await supervisor().uninstall(`dev.${config.serviceName}.service`);
+    if (options.purge) {
+      const { rmSync } = await import("node:fs");
+      rmSync(config.installRoot, { recursive: true, force: true });
+      return { ok: true, summary: "Service removed and install root purged" };
+    }
+    return { ok: true, summary: "Service removed (state kept)" };
+  } catch (error) {
+    return {
+      ok: false,
+      summary: "Uninstall failed",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
 }
 
 export async function restartService(): Promise<ManagementResult> {
-  const config = readConfig();
-  return command("launchctl", [
-    "kickstart",
-    "-k",
-    `gui/${process.getuid?.() ?? 0}/dev.${config.serviceName}.service`,
-  ]);
+  try {
+    const config = readConfig();
+    const layout = installLayout(config.installRoot);
+    await supervisor().restart(daemonDefinition({
+      serviceName: config.serviceName,
+      appRoot: layout.app,
+      configFile: configFilePath(),
+      logFile: layout.serviceLog,
+    }));
+    return { ok: true, summary: "Service restarted" };
+  } catch (error) {
+    return {
+      ok: false,
+      summary: "Restart failed",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
 }

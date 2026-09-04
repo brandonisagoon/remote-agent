@@ -1,4 +1,5 @@
 import type { ConfigDocument } from "../lib/config-file.ts";
+import type { CheckResult } from "../management/checks.ts";
 import type { ManagementResult } from "../management/service.ts";
 
 export interface SessionSummary {
@@ -54,6 +55,7 @@ export interface DesktopApi {
     list(repositoryId?: string): Promise<SessionSummary[]>;
   };
   management: {
-    run(action: "status" | "doctor" | "install" | "check-update" | "update" | "restart"): Promise<ManagementResult>;
+    checks(): Promise<CheckResult[]>;
+    run(action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart"): Promise<ManagementResult>;
   };
 }

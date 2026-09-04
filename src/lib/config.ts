@@ -5,6 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 
 import { sshLinkSupported } from "./machines/editor-link.ts";
+import { defaultInstallRoot } from "../management/paths.ts";
 import {
   configureMachines,
   MachineSchema,
@@ -410,8 +411,7 @@ export function readConfig(): ServerConfig {
   }]);
 
   const installRoot = absolute(
-    file.machine.installation.root ??
-      path.join("~/Library/Application Support", file.serviceName),
+    file.machine.installation.root ?? defaultInstallRoot(file.serviceName),
   );
   const repositories = Object.fromEntries(
     Object.entries(file.repositories).map(([id, repository]) => {
@@ -554,7 +554,8 @@ export function readConfig(): ServerConfig {
     },
     webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
     deployScript:
-      file.machine.installation.script ?? path.join(installRoot, "app", "scripts", "deploy.sh"),
+      file.machine.installation.script ??
+      path.join(installRoot, "app", "src", "management", "deploy.ts"),
     deployBranch: file.machine.installation.branch,
     reflectOnState: firstRepository.triggers.reflectOnState,
     orchestrateOnState: firstRepository.triggers.orchestrateOnState,
