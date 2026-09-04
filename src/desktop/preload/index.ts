@@ -47,6 +47,12 @@ const api: DesktopApi = {
   repository: {
     pick: () => ipcRenderer.invoke("repository:pick"),
   },
+  skills: {
+    check: (root, skillsRoot) => ipcRenderer.invoke("skills:check", root, skillsRoot),
+  },
+  shell: {
+    openPath: (target) => ipcRenderer.invoke("shell:open-path", target),
+  },
   management: {
     checks: () => ipcRenderer.invoke("management:checks"),
     openTerminal: (commandLine) => ipcRenderer.invoke("management:open-terminal", commandLine),

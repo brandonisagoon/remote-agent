@@ -432,79 +432,101 @@
               "minLength": 1
             }
           },
+          "skillsRoot": {
+            "default": "agent-skills",
+            "type": "string",
+            "minLength": 1
+          },
           "workflows": {
+            "default": {},
             "type": "object",
-            "properties": {
-              "describe": {
-                "type": "object",
-                "properties": {
-                  "prompt": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "provider": {
-                    "type": "string",
-                    "enum": [
-                      "claude",
-                      "codex"
-                    ]
-                  },
-                  "model": {
-                    "type": "string",
-                    "minLength": 1
-                  }
-                },
-                "required": [
-                  "prompt",
-                  "provider"
-                ],
-                "additionalProperties": false
-              },
-              "orchestrate": {
-                "type": "object",
-                "properties": {
-                  "prompt": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "provider": {
-                    "type": "string",
-                    "enum": [
-                      "claude",
-                      "codex"
-                    ]
-                  },
-                  "model": {
-                    "type": "string",
-                    "minLength": 1
-                  }
-                },
-                "required": [
-                  "prompt",
-                  "provider"
-                ],
-                "additionalProperties": false
-              },
-              "reflect": {
-                "type": "object",
-                "properties": {
-                  "prompt": {
-                    "type": "string",
-                    "minLength": 1
-                  }
-                },
-                "required": [
-                  "prompt"
-                ],
-                "additionalProperties": false
-              }
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
             },
-            "required": [
-              "describe",
-              "orchestrate",
-              "reflect"
-            ],
-            "additionalProperties": false
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "connectionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                },
+                "on": {
+                  "type": "string",
+                  "enum": [
+                    "issue.state-changed",
+                    "issue.reaction"
+                  ]
+                },
+                "when": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "additionalProperties": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  }
+                },
+                "skill": {
+                  "type": "object",
+                  "properties": {
+                    "skillset": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "flags": {
+                      "default": [],
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "required": [
+                    "skillset",
+                    "flags"
+                  ],
+                  "additionalProperties": false
+                },
+                "deliver": {
+                  "type": "string",
+                  "enum": [
+                    "start-session",
+                    "message-session"
+                  ]
+                },
+                "providerId": {
+                  "type": "string",
+                  "enum": [
+                    "codex",
+                    "claude"
+                  ]
+                },
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "on",
+                "skill",
+                "deliver"
+              ],
+              "additionalProperties": false
+            }
           },
           "metadata": {
             "default": {
@@ -588,47 +610,16 @@
               "tags"
             ],
             "additionalProperties": false
-          },
-          "triggers": {
-            "default": {
-              "reflectOnState": "Pull Request",
-              "orchestrateOnState": "Planning",
-              "describeOnReaction": "pencil2"
-            },
-            "type": "object",
-            "properties": {
-              "reflectOnState": {
-                "default": "Pull Request",
-                "type": "string",
-                "minLength": 1
-              },
-              "orchestrateOnState": {
-                "default": "Planning",
-                "type": "string",
-                "minLength": 1
-              },
-              "describeOnReaction": {
-                "default": "pencil2",
-                "type": "string",
-                "minLength": 1
-              }
-            },
-            "required": [
-              "reflectOnState",
-              "orchestrateOnState",
-              "describeOnReaction"
-            ],
-            "additionalProperties": false
           }
         },
         "required": [
           "root",
           "worktreeRoot",
           "bootstrapCommand",
+          "skillsRoot",
           "workflows",
           "metadata",
-          "sessionDefaults",
-          "triggers"
+          "sessionDefaults"
         ],
         "additionalProperties": false
       }

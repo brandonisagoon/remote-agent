@@ -82,23 +82,55 @@
       "sessionDefaults": {
         "tags": {}
       },
-      "triggers": {
-        "reflectOnState": "Pull Request",
-        "orchestrateOnState": "Planning",
-        "describeOnReaction": "pencil2"
-      },
+      "skillsRoot": "agent-skills",
       "workflows": {
+        "plan": {
+          "on": "issue.state-changed",
+          "when": [
+            {
+              "issue.state": [
+                "Planning"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "orchestrate",
+            "flags": []
+          },
+          "deliver": "start-session",
+          "providerId": "codex"
+        },
+        "review": {
+          "on": "issue.state-changed",
+          "when": [
+            {
+              "issue.state": [
+                "Pull Request"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "reflect",
+            "flags": []
+          },
+          "deliver": "message-session"
+        },
         "describe": {
-          "prompt": "prompts/describe-issue.md",
-          "model": "opus",
-          "provider": "claude"
-        },
-        "orchestrate": {
-          "prompt": "prompts/orchestrate-plan.md",
-          "provider": "codex"
-        },
-        "reflect": {
-          "prompt": "prompts/reflect.md"
+          "on": "issue.reaction",
+          "when": [
+            {
+              "reaction.emoji": [
+                "pencil2"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "describe",
+            "flags": []
+          },
+          "deliver": "start-session",
+          "providerId": "claude",
+          "model": "opus"
         }
       }
     }

@@ -27,9 +27,27 @@ const RepositoryRelativePathSchema = z
   .string()
   .min(1)
   .refine((value) => !path.isAbsolute(value), "must be relative to the repository");
-const WorkflowSchema = z.object({
-  prompt: RepositoryRelativePathSchema,
-  provider: z.enum(["claude", "codex"]),
+const RoutingConditionSchema = z.record(
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+);
+/** Trigger -> conditions -> skill -> delivery. Skills are repo-owned
+    skill-composer skillsets; remote-agent only matches events and runs the
+    compose pipeline. */
+const RepositoryWorkflowSchema = z.object({
+  /** Restricts the workflow to events arriving via one connection. */
+  connectionId: ConfigIdSchema.optional(),
+  on: z.enum(["issue.state-changed", "issue.reaction"]),
+  /** OR of AND-groups over event fields (same semantics as connection
+      repository routing). Absent = always. */
+  when: z.array(RoutingConditionSchema).min(1).optional(),
+  skill: z.object({
+    skillset: z.string().min(1),
+    flags: z.array(z.string().min(1)).default([]),
+  }),
+  deliver: z.enum(["start-session", "message-session"]),
+  /** Session provider; defaults to the machine's ACP provider. */
+  providerId: z.enum(["codex", "claude"]).optional(),
   model: z.string().min(1).optional(),
 });
 const TagDefinitionSchema = z.object({
@@ -38,27 +56,15 @@ const TagDefinitionSchema = z.object({
   cardinality: z.enum(["one", "many"]).default("one"),
   routerVisible: z.boolean().default(false),
 });
-const RepositoryTriggersSchema = z
-  .object({
-    reflectOnState: z.string().min(1).default("Pull Request"),
-    orchestrateOnState: z.string().min(1).default("Planning"),
-    describeOnReaction: z.string().min(1).default("pencil2"),
-  })
-  .default({
-    reflectOnState: "Pull Request",
-    orchestrateOnState: "Planning",
-    describeOnReaction: "pencil2",
-  });
+
 const RepositorySchema = z.object({
   name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
   bootstrapCommand: CommandSchema,
-  workflows: z.object({
-    describe: WorkflowSchema,
-    orchestrate: WorkflowSchema,
-    reflect: z.object({ prompt: RepositoryRelativePathSchema }),
-  }),
+  /** Where the skill-composer inputs live, relative to root. */
+  skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
+  workflows: z.record(ConfigIdSchema, RepositoryWorkflowSchema).default({}),
   metadata: z
     .object({
       tags: z.record(ConfigIdSchema, TagDefinitionSchema).default({}),
@@ -69,12 +75,7 @@ const RepositorySchema = z.object({
       tags: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
     })
     .default({ tags: {} }),
-  triggers: RepositoryTriggersSchema,
 });
-const RoutingConditionSchema = z.record(
-  z.string().min(1),
-  z.array(z.string().min(1)).min(1),
-);
 const WebhookSchema = z.object({
   /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
   slug: ConfigIdSchema,
@@ -219,6 +220,11 @@ export const ServiceFileSchema = z.object({
     webhookSlugs.add(webhook.slug);
   }
   for (const [repositoryId, repository] of Object.entries(file.repositories)) {
+    for (const [workflowId, workflow] of Object.entries(repository.workflows)) {
+      if (workflow.connectionId !== undefined && !file.connections[workflow.connectionId]) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "connectionId"], message: `unknown connection: ${workflow.connectionId}` });
+      }
+    }
     for (const [key, values] of Object.entries(repository.sessionDefaults.tags)) {
       const definition = repository.metadata.tags[key];
       if (!definition) {
@@ -242,8 +248,14 @@ export const ServiceFileSchema = z.object({
 export type ServiceFile = z.infer<typeof ServiceFileSchema>;
 
 export interface WorkflowConfig {
-  prompt: string;
-  provider: Harness;
+  id: string;
+  /** null = events from any connection routing to this repository. */
+  connectionId: string | null;
+  on: "issue.state-changed" | "issue.reaction";
+  when: Array<Record<string, string[]>> | null;
+  skill: { skillset: string; flags: string[] };
+  deliver: "start-session" | "message-session";
+  providerId: "codex" | "claude" | null;
   model: string | null;
 }
 
@@ -253,20 +265,12 @@ export interface RepositoryConfig {
   root: string;
   worktreeRoot: string;
   bootstrapCommand: string[];
-  workflows: {
-    describe: WorkflowConfig;
-    orchestrate: WorkflowConfig;
-    reflect: { prompt: string };
-  };
+  skillsRoot: string;
+  workflows: Readonly<Record<string, WorkflowConfig>>;
   metadata: {
     tags: Record<string, TagDefinitionConfig>;
   };
   sessionDefaults: { tags: Record<string, string[]> };
-  triggers: {
-    reflectOnState: string;
-    orchestrateOnState: string;
-    describeOnReaction: string;
-  };
 }
 
 export interface TagDefinitionConfig {
@@ -332,9 +336,6 @@ export interface ServerConfig {
   webhookMaxAgeMs: number;
   deployScript: string;
   deployBranch: string;
-  reflectOnState: string;
-  orchestrateOnState: string;
-  describeReactionEmoji: string;
   repository: RepositoryConfig;
   endOnState: string;
   acp: {
@@ -423,17 +424,6 @@ export function readConfig(): ServerConfig {
         root,
         worktreeRoot,
         bootstrapCommand: [...repository.bootstrapCommand],
-        workflows: {
-          describe: {
-            ...repository.workflows.describe,
-            model: repository.workflows.describe.model ?? null,
-          },
-          orchestrate: {
-            ...repository.workflows.orchestrate,
-            model: repository.workflows.orchestrate.model ?? null,
-          },
-          reflect: { ...repository.workflows.reflect },
-        },
         metadata: {
           tags: Object.fromEntries(
             Object.entries(repository.metadata.tags).map(([key, definition]) => [
@@ -459,7 +449,23 @@ export function readConfig(): ServerConfig {
             ]),
           ),
         },
-        triggers: { ...repository.triggers },
+        skillsRoot: repository.skillsRoot,
+        workflows: Object.fromEntries(
+          Object.entries(repository.workflows).map(([workflowId, workflow]) => [workflowId, {
+            id: workflowId,
+            connectionId: workflow.connectionId ?? null,
+            on: workflow.on,
+            when: workflow.when
+              ? workflow.when.map((condition) => Object.fromEntries(
+                  Object.entries(condition).map(([key, values]) => [key, [...values]]),
+                ))
+              : null,
+            skill: { skillset: workflow.skill.skillset, flags: [...workflow.skill.flags] },
+            deliver: workflow.deliver,
+            providerId: workflow.providerId ?? null,
+            model: workflow.model ?? null,
+          } satisfies WorkflowConfig]),
+        ),
       } satisfies RepositoryConfig];
     }),
   );
@@ -557,9 +563,6 @@ export function readConfig(): ServerConfig {
       file.machine.installation.script ??
       path.join(installRoot, "app", "src", "management", "deploy.ts"),
     deployBranch: file.machine.installation.branch,
-    reflectOnState: firstRepository.triggers.reflectOnState,
-    orchestrateOnState: firstRepository.triggers.orchestrateOnState,
-    describeReactionEmoji: firstRepository.triggers.describeOnReaction,
     repository: firstRepository,
     endOnState: "End",
     acp: {
@@ -693,9 +696,6 @@ export function scopeConfig(
     routerTimeoutMs: connection.router.timeoutMs,
     agentTeamKey: config.agentTeamKey,
     repository,
-    reflectOnState: repository.triggers.reflectOnState,
-    orchestrateOnState: repository.triggers.orchestrateOnState,
-    describeReactionEmoji: repository.triggers.describeOnReaction,
     endOnState: config.endOnState,
   };
 }

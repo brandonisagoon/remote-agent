@@ -61,16 +61,12 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         },
         sessionDefaults: { tags: { "example.kind": ["planning"] } },
         workflows: {
-          describe: {
-            prompt: "prompts/describe.md",
-            provider: "claude",
-            model: "opus",
+          plan: {
+            on: "issue.state-changed",
+            when: [{ "issue.state": ["Planning"] }],
+            skill: { skillset: "orchestrate", flags: [] },
+            deliver: "start-session",
           },
-          orchestrate: {
-            prompt: "prompts/orchestrate.md",
-            provider: "codex",
-          },
-          reflect: { prompt: "prompts/reflect.md" },
         },
       },
     },

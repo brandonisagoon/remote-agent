@@ -8,16 +8,20 @@ import type {
 } from "../../../types/dispatcher/index.ts";
 import { TrackerReaction, reactToIssue } from "../../integrations/linear/reactions.ts";
 import { eventIssueId } from "./event-issue.ts";
-import { workers } from "./worker-registry.ts";
+// Loaded lazily at dispatch time: workers import broad service barrels that
+// can (via webhook handlers) import this dispatcher back. A static import
+// would put the registry inside that cycle and hit TDZ during module init.
+async function loadWorkers() {
+  const { workers } = await import("./worker-registry.ts");
+  return workers;
+}
 import { finishWorkerRun, startWorkerRun } from "./worker-run-store.ts";
 
-const FAILURE_REACTION_WORKERS = new Set([
-  "product.describe",
-  "product.orchestration",
-]);
+const FAILURE_REACTION_WORKERS = new Set(["product.workflow"]);
 
 export interface DispatchEventDependencies {
-  workers: Worker[];
+  /** Injected by tests; production loads the registry lazily. */
+  workers?: Worker[];
   startRun: (
     prisma: PrismaClient,
     receiptId: string,
@@ -32,7 +36,6 @@ export interface DispatchEventDependencies {
 }
 
 const defaultDependencies: DispatchEventDependencies = {
-  workers,
   startRun: startWorkerRun,
   finishRun: finishWorkerRun,
   react: reactToIssue,
@@ -49,7 +52,7 @@ export async function dispatchEvent(
   },
   dependencies: DispatchEventDependencies = defaultDependencies,
 ): Promise<void> {
-  for (const worker of dependencies.workers.filter((entry) =>
+  for (const worker of (dependencies.workers ?? (await loadWorkers())).filter((entry) =>
     entry.supports(input.event),
   )) {
     const run = await dependencies.startRun(

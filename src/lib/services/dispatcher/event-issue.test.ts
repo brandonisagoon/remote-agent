@@ -9,11 +9,13 @@ import { eventIssueId } from "./event-issue.ts";
 describe("event issue id", () => {
   test("extracts the issue UUID from issue and reaction events", () => {
     const issueEvent = {
-      type: DispatchEventType.TrackerIssueOrchestrationRequested,
+      type: DispatchEventType.TrackerWorkflowTriggered,
+      workflowId: "plan",
       webhook: { data: { id: "issue-uuid" } },
     } as DispatchEvent;
     const reactionEvent = {
-      type: DispatchEventType.TrackerIssueDescribeRequested,
+      type: DispatchEventType.TrackerWorkflowTriggered,
+      workflowId: "plan",
       webhook: { data: { issueId: "reaction-issue-uuid" } },
     } as DispatchEvent;
 
@@ -23,7 +25,8 @@ describe("event issue id", () => {
 
   test("falls back to the reaction issue object", () => {
     const event = {
-      type: DispatchEventType.TrackerIssueDescribeRequested,
+      type: DispatchEventType.TrackerWorkflowTriggered,
+      workflowId: "plan",
       webhook: { data: { issue: { id: "nested-issue-uuid" } } },
     } as DispatchEvent;
 

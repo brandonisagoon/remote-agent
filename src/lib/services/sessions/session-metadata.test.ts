@@ -31,11 +31,8 @@ function repository(
     root: `/tmp/${id}`,
     worktreeRoot: `/tmp/${id}-worktrees`,
     bootstrapCommand: ["true"],
-    workflows: {
-      describe: { prompt: "describe.md", provider: "claude", model: null },
-      orchestrate: { prompt: "orchestrate.md", provider: "codex", model: null },
-      reflect: { prompt: "reflect.md" },
-    },
+    skillsRoot: "agent-skills",
+    workflows: {},
     metadata: {
       tags: {
         "example.kind": {
@@ -51,11 +48,6 @@ function repository(
     },
     sessionDefaults: {
       tags: { "example.kind": [options[0]!] },
-    },
-    triggers: {
-      reflectOnState: "Pull Request",
-      orchestrateOnState: "Planning",
-      describeOnReaction: "pencil2",
     },
   };
 }

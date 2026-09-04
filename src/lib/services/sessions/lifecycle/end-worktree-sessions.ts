@@ -1,6 +1,5 @@
 import type { ServerConfig } from "../../../config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import { getMachine } from "../../../machines/index.ts";
 import {
   agentIssueDescriptionWithSync,
   agentIssueLabelIdsWithRouting,
@@ -10,7 +9,11 @@ import {
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   updateAgentIssue,
-} from "../../../integrations/tracker/index.ts";
+  // Imported from the session-store module directly, not the tracker barrel:
+  // the barrel re-exports webhook handlers, which import the dispatcher,
+  // which imports the worker registry — a cycle back into the workers.
+} from "../../../integrations/linear/session-store/index.ts";
+import { getMachine } from "../../../machines/index.ts";
 import {
   AgentIssueState,
   isTerminalAgentIssueState,

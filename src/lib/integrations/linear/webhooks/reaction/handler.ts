@@ -10,7 +10,8 @@ import {
 } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
 import { createWebhookReceipt } from "../receipt-store.ts";
-import { matchesReactionEmoji } from "./emoji.ts";
+import { reactionEmojiTokens } from "./emoji.ts";
+import { matchWorkflows } from "../../../../workflows/match.ts";
 
 function reactionTarget(data: LinearReactionWebhook["data"]): string {
   if (data.commentId || data.comment) return "comment";
@@ -59,10 +60,15 @@ export async function handleReactionWebhook(input: {
       reason: "self_authored",
     };
   }
-  if (!matchesReactionEmoji(data.emoji, config.describeReactionEmoji)) {
+  const matched = matchWorkflows({
+    config,
+    on: "issue.reaction",
+    fields: { "reaction.emoji": reactionEmojiTokens(data.emoji) },
+  });
+  if (matched.length === 0) {
     return {
       kind: ReactionWebhookResultKind.Ignored,
-      reason: "emoji_mismatch",
+      reason: "no_matching_workflow",
     };
   }
 
@@ -73,7 +79,7 @@ export async function handleReactionWebhook(input: {
     repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "reaction",
-    trigger: "describe",
+    trigger: matched.map((workflow) => workflow.id).join(","),
     sourceIssueIdentifier,
     sourceCommentId: null,
     status: "accepted",
@@ -81,16 +87,22 @@ export async function handleReactionWebhook(input: {
   });
   if (!receipt) return { kind: ReactionWebhookResultKind.Duplicate };
 
-  void dispatchEvent({
-    prisma,
-    config,
-    commandClient: bunCommandClient,
-    agentRuntime,
-    receiptId: receipt.id,
-    event: {
-      type: DispatchEventType.TrackerIssueDescribeRequested,
-      webhook,
-    },
-  });
-  return { kind: ReactionWebhookResultKind.Describing };
+  for (const workflow of matched) {
+    void dispatchEvent({
+      prisma,
+      config,
+      commandClient: bunCommandClient,
+      agentRuntime,
+      receiptId: receipt.id,
+      event: {
+        type: DispatchEventType.TrackerWorkflowTriggered,
+        webhook,
+        workflowId: workflow.id,
+      },
+    });
+  }
+  return {
+    kind: ReactionWebhookResultKind.Triggered,
+    workflowIds: matched.map((workflow) => workflow.id),
+  };
 }

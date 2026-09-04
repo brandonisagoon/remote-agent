@@ -9,6 +9,7 @@ import {
   type LinearIssueWebhook,
 } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
+import { matchWorkflows } from "../../../../workflows/match.ts";
 import { createWebhookReceipt } from "../receipt-store.ts";
 
 export type { IssueWebhookResult } from "../../webhook-types/index.ts";
@@ -27,13 +28,13 @@ export async function handleIssueWebhook(input: {
   }
 
   const stateName = data.state?.name;
-  const trigger =
-    stateName === config.reflectOnState
-      ? "reflection"
-      : stateName === config.orchestrateOnState
-        ? "orchestration"
-        : null;
-  if (!trigger) return { kind: IssueWebhookResultKind.Ignored };
+  if (!stateName) return { kind: IssueWebhookResultKind.Ignored };
+  const matched = matchWorkflows({
+    config,
+    on: "issue.state-changed",
+    fields: { "issue.state": stateName },
+  });
+  if (matched.length === 0) return { kind: IssueWebhookResultKind.Ignored };
 
   const receipt = await createWebhookReceipt(prisma, {
     webhookId: config.activeWebhookId,
@@ -41,30 +42,28 @@ export async function handleIssueWebhook(input: {
     repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "issue",
-    trigger,
+    trigger: matched.map((workflow) => workflow.id).join(","),
     sourceIssueIdentifier: data.identifier,
     sourceCommentId: null,
     status: "accepted",
   });
   if (!receipt) return { kind: IssueWebhookResultKind.Duplicate };
-  void dispatchEvent({
-    prisma,
-    config,
-    commandClient: bunCommandClient,
-    agentRuntime,
-    receiptId: receipt.id,
-    event: {
-      type:
-        trigger === "reflection"
-          ? DispatchEventType.TrackerIssueReflectionRequested
-          : DispatchEventType.TrackerIssueOrchestrationRequested,
-      webhook,
-    },
-  });
+  for (const workflow of matched) {
+    void dispatchEvent({
+      prisma,
+      config,
+      commandClient: bunCommandClient,
+      agentRuntime,
+      receiptId: receipt.id,
+      event: {
+        type: DispatchEventType.TrackerWorkflowTriggered,
+        webhook,
+        workflowId: workflow.id,
+      },
+    });
+  }
   return {
-    kind:
-      trigger === "reflection"
-        ? IssueWebhookResultKind.Reflecting
-        : IssueWebhookResultKind.Orchestrating,
+    kind: IssueWebhookResultKind.Triggered,
+    workflowIds: matched.map((workflow) => workflow.id),
   };
 }

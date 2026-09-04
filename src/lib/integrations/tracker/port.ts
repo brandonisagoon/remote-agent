@@ -2,10 +2,7 @@ import * as linear from "../linear/index.ts";
 
 /** Environment-driven workflow triggers consumed by the tracker adapter. */
 export interface TrackerTriggerConfig {
-  reflectOnState: string;
-  orchestrateOnState: string;
   endOnState: string;
-  describeReactionEmoji: string;
 }
 
 /**

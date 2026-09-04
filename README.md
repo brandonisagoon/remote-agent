@@ -74,7 +74,11 @@ rebuild, migrate, restart — rolls back on failure), `uninstall [--purge]`.
   picks the session to deliver them to), and the editors worktree links open
   in.
 - Each **repository** you manage gets sessions in isolated worktrees, prepared
-  by its own bootstrap command.
+  by its own bootstrap command. Optional **workflows** react to Linear events
+  (a state change, a reaction) by composing one of the repo's own
+  [skill-composer](https://github.com/brandonisagoon/skill-composer) skillsets
+  into the worktree and either starting a session or messaging the running
+  one.
 - When a session's worktree is ready, the Linear issue gets one deep link per
   configured editor — opening locally, or over SSH when your editors run on a
   different machine than the daemon.
@@ -91,7 +95,9 @@ mirrored exactly by the desktop app's pages:
 - `connections.<id>` — a Linear workspace: credentials, machine binding,
   repository allowlist, webhook, router, editors.
 - `repositories.<id>` — a managed checkout: `root`, `worktreeRoot`,
-  `bootstrapCommand`, workflow prompts, metadata.
+  `bootstrapCommand`, its skill-composer `skillsRoot`, `workflows`
+  (trigger → conditions → skillset → delivery), and repository-scoped
+  metadata.
 
 See [remote-agent.config.example.json](remote-agent.config.example.json) for
 every setting and [docs/adoption.md](docs/adoption.md) for what a managed

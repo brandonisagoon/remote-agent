@@ -34,7 +34,7 @@ export const LinearReactionWebhookSchema = z.object({
 export const ReactionWebhookResultKind = {
   Ignored: "ignored",
   Duplicate: "duplicate",
-  Describing: "describing",
+  Triggered: "triggered",
 } as const;
 
 export type ReactionWebhookResult =
@@ -43,7 +43,7 @@ export type ReactionWebhookResult =
       reason: string;
     }
   | { kind: typeof ReactionWebhookResultKind.Duplicate }
-  | { kind: typeof ReactionWebhookResultKind.Describing };
+  | { kind: typeof ReactionWebhookResultKind.Triggered; workflowIds: string[] };
 
 export type LinearReactionWebhook = z.infer<
   typeof LinearReactionWebhookSchema

@@ -1,5 +1,6 @@
 import type { ConfigDocument } from "../lib/config-file.ts";
 import type { CheckResult } from "../management/checks.ts";
+import type { SkillsCheck } from "../lib/skills/check.ts";
 import type { ManagementResult } from "../management/service.ts";
 
 export interface SessionSummary {
@@ -66,6 +67,12 @@ export interface DesktopApi {
   };
   repository: {
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
+  };
+  skills: {
+    check(root: string, skillsRoot: string): Promise<SkillsCheck>;
+  };
+  shell: {
+    openPath(target: string): Promise<string>;
   };
   management: {
     checks(): Promise<CheckResult[]>;

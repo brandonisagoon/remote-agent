@@ -254,7 +254,7 @@ describe("description reaction trigger", () => {
       expect(response.status).toBe(202);
       expect(await response.json()).toMatchObject({
         accepted: true,
-        describing: true,
+        workflows: ["describe"],
       });
       expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
         eventType: "reaction",
@@ -284,7 +284,7 @@ describe("description reaction trigger", () => {
       { userId: AGENT_USER_ID, emoji: "memo" },
       "self_authored",
     ],
-    ["different emoji", { emoji: "thumbsup" }, "emoji_mismatch"],
+    ["different emoji", { emoji: "thumbsup" }, "no_matching_workflow"],
   ])("ignores %s without a receipt", async (_name, overrides, reason) => {
     const response = await post(reactionPayload(overrides));
 
@@ -350,10 +350,10 @@ describe("issue triggers", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      reflecting: true,
+      workflows: ["review"],
     });
     const receipt = await prisma.linearWebhookReceipt.findFirst();
-    expect(receipt).toMatchObject({ trigger: "reflection" });
+    expect(receipt).toMatchObject({ trigger: "review" });
   });
 });
 
@@ -455,11 +455,11 @@ describe("issue state changes", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      orchestrating: true,
+      workflows: ["plan"],
     });
     const receipt = await prisma.linearWebhookReceipt.findFirstOrThrow();
     expect(receipt.eventType).toBe("issue");
-    expect(receipt.trigger).toBe("orchestration");
+    expect(receipt.trigger).toBe("plan");
   });
 
   test("ignores issue updates without a state transition", async () => {
@@ -478,7 +478,7 @@ describe("issue state changes", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      orchestrating: true,
+      workflows: ["plan"],
     });
     expect(await prisma.linearWebhookReceipt.count()).toBe(1);
   });
@@ -491,10 +491,10 @@ describe("issue state changes", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      reflecting: true,
+      workflows: ["review"],
     });
     const receipt = await prisma.linearWebhookReceipt.findFirstOrThrow();
-    expect(receipt.trigger).toBe("reflection");
+    expect(receipt.trigger).toBe("review");
   });
 
   test("deduplicates repeated Planning deliveries", async () => {

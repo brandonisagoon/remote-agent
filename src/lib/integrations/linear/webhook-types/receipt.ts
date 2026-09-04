@@ -6,9 +6,5 @@ export const WebhookReceiptStatus = {
 export type WebhookReceiptStatusValue =
   (typeof WebhookReceiptStatus)[keyof typeof WebhookReceiptStatus];
 
-export type LinearWebhookTrigger =
-  | "mention"
-  | "reflection"
-  | "orchestration"
-  | "describe"
-  | "end";
+/** "mention", "end", or a comma-joined list of triggered workflow IDs. */
+export type LinearWebhookTrigger = string;

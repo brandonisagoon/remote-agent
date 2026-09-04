@@ -17,8 +17,7 @@ export const LinearIssueWebhookSchema = z.object({
 export const IssueWebhookResultKind = {
   Ignored: "ignored",
   Duplicate: "duplicate",
-  Reflecting: "reflecting",
-  Orchestrating: "orchestrating",
+  Triggered: "triggered",
   Ending: "ending",
 } as const;
 
@@ -27,5 +26,7 @@ export type IssueWebhookResultKindValue =
 
 export interface IssueWebhookResult {
   kind: IssueWebhookResultKindValue;
+  /** IDs of the workflows this event triggered. */
+  workflowIds?: string[];
 }
 export type LinearIssueWebhook = z.infer<typeof LinearIssueWebhookSchema>;

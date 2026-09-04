@@ -51,18 +51,10 @@ export function AppLayout() {
         root: picked.repository.root,
         worktreeRoot: `../.worktrees/${picked.repository.name}`,
         bootstrapCommand: ["true"],
-        workflows: {
-          describe: { prompt: "prompts/describe.md", provider: "claude" },
-          orchestrate: { prompt: "prompts/orchestrate.md", provider: "codex" },
-          reflect: { prompt: "prompts/reflect.md" },
-        },
+        skillsRoot: "agent-skills",
+        workflows: {},
         metadata: { tags: {} },
         sessionDefaults: { tags: {} },
-        triggers: {
-          reflectOnState: "Pull Request",
-          orchestrateOnState: "Planning",
-          describeOnReaction: "pencil2",
-        },
       };
     };
     if (dirty) mutate(create);

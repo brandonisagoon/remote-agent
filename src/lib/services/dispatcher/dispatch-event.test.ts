@@ -23,7 +23,8 @@ const commandClient: CommandClient = {
 
 function issueEvent(): DispatchEvent {
   return {
-    type: DispatchEventType.TrackerIssueOrchestrationRequested,
+    type: DispatchEventType.TrackerWorkflowTriggered,
+      workflowId: "plan",
     webhook: {
       type: "Issue",
       action: "update",
@@ -74,7 +75,7 @@ describe("dispatch event failure reaction", () => {
         event: issueEvent(),
       },
       dependencies(
-        worker("product.orchestration", async () => ({
+        worker("product.workflow", async () => ({
           status: "failed",
           detail: "acpx launch failed",
           targetAgentIssueIdentifier: null,
@@ -101,7 +102,7 @@ describe("dispatch event failure reaction", () => {
         event: issueEvent(),
       },
       dependencies(
-        worker("product.describe", async () => {
+        worker("product.workflow", async () => {
           throw new Error("launcher exploded");
         }),
         events,

@@ -19,6 +19,8 @@ import {
 } from "@renderer/components/ui/table.tsx";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
+import { SkillsTab } from "./skills-tab.tsx";
+import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
 
@@ -31,10 +33,14 @@ export function RepositoryPage({ id, value, mutate }: { id: string; value: Servi
       <Tabs defaultValue="sessions">
         <TabsList>
           <TabsTrigger value="sessions">Sessions</TabsTrigger>
+          <TabsTrigger value="skills">Skills</TabsTrigger>
           <TabsTrigger value="settings">Repository Settings</TabsTrigger>
         </TabsList>
         <TabsContent value="sessions" className="pt-4">
           <SessionsTab repositoryId={id} />
+        </TabsContent>
+        <TabsContent value="skills" className="pt-4">
+          <SkillsTab id={id} value={value} mutate={mutate} />
         </TabsContent>
         <TabsContent value="settings" className="pt-4">
           <RepositorySettings id={id} value={value} mutate={mutate} />
@@ -125,7 +131,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
 function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id]!;
   return (
-    <Accordion type="multiple" defaultValue={["paths", "triggers", "prompts", "metadata"]} className="-mt-3">
+    <Accordion type="multiple" defaultValue={["paths", "workflows", "metadata"]} className="-mt-3">
       <SettingsSection
         value="paths"
         title="Paths & bootstrap"
@@ -139,26 +145,11 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         </SettingsCard>
       </SettingsSection>
       <SettingsSection
-        value="triggers"
-        title="Workflow triggers"
-        description="The Linear states and reaction that launch each workflow."
+        value="workflows"
+        title="Workflows"
+        description="When a Linear event matches a trigger, the selected skillset is composed into the session's worktree and delivered."
       >
-        <SettingsCard>
-          <Field label="Orchestrate on state" value={repository.triggers.orchestrateOnState} onChange={(next) => mutate((file) => { file.repositories[id]!.triggers.orchestrateOnState = next; })} />
-          <Field label="Reflect on state" value={repository.triggers.reflectOnState} onChange={(next) => mutate((file) => { file.repositories[id]!.triggers.reflectOnState = next; })} />
-          <Field label="Describe reaction" value={repository.triggers.describeOnReaction} onChange={(next) => mutate((file) => { file.repositories[id]!.triggers.describeOnReaction = next; })} />
-        </SettingsCard>
-      </SettingsSection>
-      <SettingsSection
-        value="prompts"
-        title="Workflow prompts"
-        description="Prompt files, relative to the repository root."
-      >
-        <SettingsCard>
-          <Field label="Describe prompt" value={repository.workflows.describe.prompt} onChange={(next) => mutate((file) => { file.repositories[id]!.workflows.describe.prompt = next; })} />
-          <Field label="Orchestrate prompt" value={repository.workflows.orchestrate.prompt} onChange={(next) => mutate((file) => { file.repositories[id]!.workflows.orchestrate.prompt = next; })} />
-          <Field label="Reflect prompt" value={repository.workflows.reflect.prompt} onChange={(next) => mutate((file) => { file.repositories[id]!.workflows.reflect.prompt = next; })} />
-        </SettingsCard>
+        <WorkflowsSection id={id} value={value} mutate={mutate} />
       </SettingsSection>
       <SettingsSection
         value="metadata"

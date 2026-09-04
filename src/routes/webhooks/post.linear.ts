@@ -122,13 +122,10 @@ route.post("/", async (c) => {
       if (result.kind === IssueWebhookResultKind.Duplicate) {
         return c.json({ accepted: true, duplicate: true }, 200);
       }
-      if (result.kind === IssueWebhookResultKind.Orchestrating) {
-        return c.json({ accepted: true, orchestrating: true }, 202);
-      }
       if (result.kind === IssueWebhookResultKind.Ending) {
         return c.json({ accepted: true, ending: true }, 202);
       }
-      return c.json({ accepted: true, reflecting: true }, 202);
+      return c.json({ accepted: true, workflows: result.workflowIds ?? [] }, 202);
     }
 
     const reaction = TrackerReactionWebhookSchema.safeParse(parsed);
@@ -154,7 +151,10 @@ route.post("/", async (c) => {
             200,
           );
         }
-        return c.json({ accepted: true, describing: true }, 202);
+        return c.json(
+          { accepted: true, workflows: "workflowIds" in result ? result.workflowIds : [] },
+          202,
+        );
       } catch (error) {
         if (error instanceof WebhookReceiptError) {
           return c.json({ error: "Failed to record delivery" }, 500);

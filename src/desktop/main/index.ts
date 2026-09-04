@@ -21,6 +21,7 @@ import {
   serviceStatus,
 } from "../../management/service.ts";
 import { runChecks } from "../../management/checks.ts";
+import { checkSkills } from "../../lib/skills/check.ts";
 import { listProviderModels } from "./provider-models.ts";
 import { tunnelInfo } from "./tunnel-info.ts";
 import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
@@ -184,6 +185,8 @@ function registerIpc(file: string): void {
     return { repository: { root, name: path.basename(root) } };
   });
   ipcMain.handle("management:checks", () => runChecks());
+  ipcMain.handle("skills:check", (_event, root: string, skillsRoot: string) => checkSkills(root, skillsRoot));
+  ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("management:open-terminal", (_event, commandLine: string) => openInTerminal(commandLine));
   ipcMain.handle("management:run", (_event, action: keyof typeof actions) => {
     const run = actions[action];
