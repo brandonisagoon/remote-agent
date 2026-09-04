@@ -50,68 +50,66 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
     }),
     [sessions],
   );
+
   return (
-    <div className="grid gap-4">
-      <div className="flex items-center justify-between">
-        <p className="text-muted-foreground text-sm">
-          {counts.active} active · {counts.total} total
-        </p>
-        <Button variant="outline" size="sm" onClick={() => void query.refetch()}>
-          <F7Icon name="arrow_2_circlepath" className={cn(loading && "animate-spin")} />
-          Refresh
-        </Button>
-      </div>
+    <div className="rounded-md border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Session</TableHead>
+            <TableHead>State</TableHead>
+            <TableHead>Role</TableHead>
+            <TableHead>Provider</TableHead>
+            <TableHead>Labels</TableHead>
+            <TableHead>Updated</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {sessions.map((session) => (
+            <TableRow key={session.id}>
+              <TableCell className="max-w-[260px]">
+                <div className="truncate font-medium">{session.name ?? session.id}</div>
+                <div className="text-muted-foreground truncate font-mono text-[10px]">{session.id}</div>
+              </TableCell>
+              <TableCell>
+                <Badge variant={session.status === "active" ? "default" : "secondary"}>{session.status}</Badge>
+              </TableCell>
+              <TableCell className="text-muted-foreground">{session.role ?? "—"}</TableCell>
+              <TableCell>{session.agentCommand}</TableCell>
+              <TableCell>
+                <div className="flex max-w-[260px] flex-wrap gap-1">
+                  {session.labels.map((tag) => (
+                    <Badge key={`${tag.key}:${tag.value}`} variant="outline">
+                      {tag.key}:{tag.value}
+                    </Badge>
+                  ))}
+                </div>
+              </TableCell>
+              <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                {new Date(session.updatedAt).toLocaleString()}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
       {error ? (
-        <div className="rounded-md border p-4 text-sm">
-          <span className="text-destructive font-medium">Daemon unavailable:</span>{" "}
-          <span className="text-muted-foreground">{error}</span>
+        <div className="flex flex-col items-center gap-3 py-20">
+          <F7Icon name="exclamationmark_circle" className="text-muted-foreground/40 size-8" />
+          <p className="text-muted-foreground text-sm">The daemon is unavailable.</p>
+          <p className="text-muted-foreground/70 max-w-md text-center text-xs">{error}</p>
         </div>
-      ) : (
-        <div className="rounded-md border">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Session</TableHead>
-                <TableHead>State</TableHead>
-                <TableHead>Role</TableHead>
-                <TableHead>Provider</TableHead>
-                <TableHead>Labels</TableHead>
-                <TableHead>Updated</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {sessions.map((session) => (
-                <TableRow key={session.id}>
-                  <TableCell className="max-w-[260px]">
-                    <div className="truncate font-medium">{session.name ?? session.id}</div>
-                    <div className="text-muted-foreground truncate font-mono text-[10px]">{session.id}</div>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant={session.status === "active" ? "default" : "secondary"}>{session.status}</Badge>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground">{session.role ?? "—"}</TableCell>
-                  <TableCell>{session.agentCommand}</TableCell>
-                  <TableCell>
-                    <div className="flex max-w-[260px] flex-wrap gap-1">
-                      {session.labels.map((tag) => (
-                        <Badge key={`${tag.key}:${tag.value}`} variant="outline">
-                          {tag.key}:{tag.value}
-                        </Badge>
-                      ))}
-                    </div>
-                  </TableCell>
-                  <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
-                    {new Date(session.updatedAt).toLocaleString()}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          {!loading && sessions.length === 0 && (
-            <div className="text-muted-foreground p-10 text-center text-sm">No sessions for this repository.</div>
-          )}
+      ) : !loading && sessions.length === 0 ? (
+        <div className="flex flex-col items-center gap-3 py-20">
+          <F7Icon name="moon_zzz" className="text-muted-foreground/40 size-8" />
+          <p className="text-muted-foreground text-sm">No sessions yet.</p>
+          <p className="text-muted-foreground/70 max-w-md text-center text-xs">
+            Mention or assign the agent on a Linear issue to start one.
+          </p>
         </div>
-      )}
+      ) : null}
+      <div className="text-muted-foreground/70 flex items-center border-t px-4 py-1.5 text-xs tabular-nums">
+        {counts.active} active · {counts.total} total
+      </div>
     </div>
   );
 }

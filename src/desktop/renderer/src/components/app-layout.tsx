@@ -6,6 +6,7 @@ import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
 import { RepositoryPathBar } from "@renderer/pages/repository/path-bar.tsx";
+import { cn } from "@renderer/lib/utils.ts";
 import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH,
@@ -164,7 +165,16 @@ export function AppLayout() {
         {/* The page scrolls in its own container so wheel events never chain
             into the sidebar (and vice versa). */}
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
-          <div className="mx-auto w-full max-w-3xl px-8 py-8">
+          {/* Sessions is a data table; let it use the full window width. */}
+          <div
+            className={cn(
+              "mx-auto w-full",
+              params.repositoryId && (params as { tab?: string }).tab === "sessions"
+                ? // Full-bleed data view: gutters match the window header's px-4.
+                  "max-w-none px-4 py-4"
+                : "max-w-3xl px-8 py-8",
+            )}
+          >
             <Outlet />
           </div>
         </div>

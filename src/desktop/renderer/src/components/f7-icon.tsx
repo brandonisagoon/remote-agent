@@ -19,6 +19,7 @@ import Folder from "framework7-icons/react/esm/Folder.js";
 import GearAlt from "framework7-icons/react/esm/GearAlt.js";
 import Keyboard from "framework7-icons/react/esm/Keyboard.js";
 import Link from "framework7-icons/react/esm/Link.js";
+import MoonZzz from "framework7-icons/react/esm/MoonZzz.js";
 import Plus from "framework7-icons/react/esm/Plus.js";
 import SidebarLeft from "framework7-icons/react/esm/SidebarLeft.js";
 import Tag from "framework7-icons/react/esm/Tag.js";
@@ -54,6 +55,7 @@ const ICONS = {
   gear_alt: GearAlt,
   keyboard: Keyboard,
   link: Link,
+  moon_zzz: MoonZzz,
   plus: Plus,
   sidebar_left: SidebarLeft,
   tag: Tag,
