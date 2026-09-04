@@ -201,6 +201,7 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
             </TooltipTrigger>
             <TooltipContent>Refresh</TooltipContent>
           </Tooltip>
+          <OpenInEditorMenu target={skillsDirectory} compact />
         </div>
         {error && (
           <div className="bg-background -mx-4 rounded-lg border p-3 text-sm">

@@ -19,10 +19,13 @@ import { detectedEditorsQueryOptions } from "@renderer/lib/queries/editors.ts";
 export function OpenInEditorMenu({
   target,
   align = "end",
+  compact = false,
 }: {
   /** Absolute path to open. */
   target: string;
   align?: "start" | "end";
+  /** size-6 trigger matching small toolbar icon buttons. */
+  compact?: boolean;
 }) {
   const { draft } = useConfig();
   const { data: editors = [] } = useQuery(detectedEditorsQueryOptions);
@@ -49,9 +52,16 @@ export function OpenInEditorMenu({
       <Tooltip>
         <TooltipTrigger asChild>
           <DropdownMenuTrigger asChild>
-            <Button variant="ghost" size="sm" className="h-7 gap-1 px-1.5">
-              <F7Icon name="chevron_left_slash_chevron_right" />
-              <F7Icon name="chevron_down" className="size-2.5 opacity-60" />
+            <Button
+              variant="ghost"
+              size="sm"
+              className={compact ? "h-6 gap-0.5 px-1" : "h-7 gap-1 px-1.5"}
+            >
+              <F7Icon
+                name="chevron_left_slash_chevron_right"
+                className={compact ? "size-3.5" : undefined}
+              />
+              <F7Icon name="chevron_down" className={compact ? "size-2 opacity-60" : "size-2.5 opacity-60"} />
               <span className="sr-only">Open in Editor</span>
             </Button>
           </DropdownMenuTrigger>
