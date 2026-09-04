@@ -1,117 +1,117 @@
 # Remote Agent
 
-Remote Agent turns Linear collaboration and Zed ACP conversations into durable
-coding-agent sessions. It uses [acpx](https://acpx.sh/) for ACP/provider
-execution and extends the existing Prisma/SQLite database with stable runtime
-identity, repository-scoped string metadata, cached controls/usage, and
-independent projection cursors.
+Run durable coding-agent sessions on your own machine, driven from Linear.
+Mention or assign the agent on an issue and Remote Agent starts a session in
+an isolated worktree, routes follow-up comments to the right session, and
+posts links that open the work in your editor. Sessions are executed by
+[acpx](https://acpx.sh/) using the provider CLIs you already have — Codex
+and/or Claude Code — with your own subscriptions and credentials.
 
-## What it owns
+## Install
 
-- `RuntimeSession.id` is the stable ID exposed to Zed and integrations.
-- acpx owns provider startup, ACP protocol handling, transcripts, and provider
-  reconnect state.
-- SQLite maps that stable ID to acpx and provider session IDs. Reconnecting Zed
-  loads the same row instead of registering another logical session.
-- Linear workers launch and route sessions through the application-owned
-  `AgentSessionRuntime` interface. Linear issues are resources linked to
-  sessions, not a shadow session registry.
-- One machine daemon owns Prisma, acpx, and all configured repositories. Zed's
-  ACP command is a stateless stdio bridge to that daemon.
+**1. Install the CLI** (this repo is its own Homebrew tap / Scoop bucket):
 
-## Requirements
-
-- Bun 1.3.14+
-- Codex and/or Claude agent commands supported by acpx
-- Linear and GitHub webhook credentials
-- checkouts of the repositories this service will operate on
-
-## Setup
-
-### Desktop app
-
-The Electron app is the primary configuration and management surface:
+macOS:
 
 ```sh
-bun install
-bun run desktop:dev
+brew tap brandonisagoon/remote-agent https://github.com/brandonisagoon/remote-agent
+brew install remote-agent
 ```
 
-It edits the canonical JSON file, watches for edits made by agents or code
-editors, displays local session state, and exposes install, health, restart,
-and update actions. Use **Open in Code Editor** to open the settings file
-directly. Production app bundles are created with `bun run desktop:package`.
+Windows:
 
-### CLI
+```powershell
+scoop bucket add remote-agent https://github.com/brandonisagoon/remote-agent
+scoop install remote-agent
+```
+
+This also installs the runtime dependencies, Bun and cloudflared.
+
+**2. Create your config and provision the daemon:**
 
 ```sh
-cp remote-agent.config.example.json remote-agent.config.json
-bun install
-bun run db:deploy
-bun run start
+remote-agent install
 ```
 
-The same management operations are scriptable with `bun run cli -- install`,
-`status`, `doctor`, `check-update`, `update`, and `restart`.
+This clones the repo into an app directory, builds it, migrates the database,
+and registers the daemon to start at login (a launchd user agent on macOS, a
+Task Scheduler logon task on Windows — your login session, because the agent
+sessions use your credentials).
 
-`remote-agent.config.json` is intentionally gitignored. All service settings,
-including credentials and acpx command overrides, live in that one JSON file.
-Set `REMOTE_AGENT_CONFIG` only when the file lives somewhere else; it is a file
-locator, not a second configuration surface.
-
-Run the Zed ACP stdio endpoint with:
+**3. Run the checklist and finish the manual steps:**
 
 ```sh
-bun run acp
+remote-agent doctor
 ```
 
-The command is the Zed-facing ACP adapter; the machine daemon must already be
-running. The bridge connects to `machine.server.acpSocketPath` and never opens
-SQLite or acpx.
-Zed receives stable controls for harness, model, mode, thinking level, and fast
-mode. Fast mode is exposed as a boolean when the client advertises boolean
-config support, while context usage is restored with `usage_update` after load
-or resume.
+`doctor` reports every prerequisite with what to do about it. The parts no
+installer can do for you:
 
-## Repository integration
+- **Cloudflare tunnel** — Linear needs a public URL to deliver webhooks:
+  `cloudflared tunnel login`, create a tunnel, and add the DNS record (the
+  desktop app's Server section shows the exact record to create).
+- **Linear** — an API key, plus the webhook URL and secret from your
+  connection settings pasted into Linear's webhook settings.
+- **Provider CLIs** — install and authenticate `codex` and/or `claude`
+  yourself; they are your identity and subscription, never installed for you.
+  Their presence enables the matching provider.
 
-One machine config can declare several managed repositories:
+**4. (Optional) Install the desktop app** from the
+[releases page](https://github.com/brandonisagoon/remote-agent/releases) —
+DMG on macOS, installer on Windows. It is the primary configuration surface:
+it edits the same JSON config with a full settings UI, shows the same
+checklist as `doctor` with buttons attached, and displays session state. Every
+release ships the CLI and app together, one version.
 
-- `repositories.<id>.root` points at a main checkout.
-- `repositories.<id>.worktreeRoot` selects where managed worktrees are created.
-- `repositories.<id>.bootstrapCommand` prepares each new worktree.
-- workflow prompt paths and custom metadata definitions are repository-scoped.
-- `connections.<id>` defines a reusable Linear identity.
-- `machine.server.webhooks.<id>` selects a connection and embeds its own
-  `repositoryRouting` allowlist/rules.
-- `machine` describes this installation, its daemon, Zed transport, acpx state,
-  and update settings. Multi-machine orchestration is intentionally out of scope.
+Day-to-day commands: `status`, `restart`, `check-update`, `update` (pull,
+rebuild, migrate, restart — rolls back on failure), `uninstall [--purge]`.
 
-The managed repository supplies the bootstrap script and prompt files; it does
-not import this package or maintain a second environment file. See
-[docs/adoption.md](docs/adoption.md) for the exact contract and
-[remote-agent.config.example.json](remote-agent.config.example.json) for every
-setting.
+## How it works
 
-## Persistence and reconnects
+- A **connection** binds a Linear workspace to this machine: which
+  repositories sessions may work in, one inbound webhook, the session router
+  (the model that reads incoming comments alongside the session database and
+  picks the session to deliver them to), and the editors worktree links open
+  in.
+- Each **repository** you manage gets sessions in isolated worktrees, prepared
+  by its own bootstrap command.
+- When a session's worktree is ready, the Linear issue gets one deep link per
+  configured editor — opening locally, or over SSH when your editors run on a
+  different machine than the daemon.
 
-The configured service database contains webhook receipts, worker runs,
-`RuntimeSession`, string tags, session relationships, resource links, and
-consumer cursors. acpx stores its own transcript/runtime records under
-`acpx.stateDir`. Both paths must be on persistent storage.
+## Configuration
 
-An SSH transport disconnect does not close a runtime session. Zed can call
-`session/resume` or `session/load` with the same Remote Agent session ID; the
-adapter reattaches acpx/provider state and returns the latest complete control
-state and context usage. Explicit close/end operations are what mark a session
-closed.
+Everything lives in one gitignored JSON file, `remote-agent.config.json`,
+mirrored exactly by the desktop app's pages:
 
-## Verification
+- `machine` — this installation: server, sockets, storage, SSH host for editor
+  links, install/update settings.
+- `providers.{codex,claude}` — presence enables a provider; optional `command`
+  overrides acpx's built-in adapter launch.
+- `connections.<id>` — a Linear workspace: credentials, machine binding,
+  repository allowlist, webhook, router, editors.
+- `repositories.<id>` — a managed checkout: `root`, `worktreeRoot`,
+  `bootstrapCommand`, workflow prompts, metadata.
 
-```sh
-bun run lint
-bun test
-```
+See [remote-agent.config.example.json](remote-agent.config.example.json) for
+every setting and [docs/adoption.md](docs/adoption.md) for what a managed
+repository must provide.
 
-The detailed migration inventory and design decisions are recorded in
-[docs/acpx-migration-plan.md](docs/acpx-migration-plan.md).
+## Editor integrations
+
+Worktree deep links support Zed, VS Code, and Cursor (any app with a URL
+scheme works for local links). Zed users can additionally attach to running
+sessions over ACP — the `bun run acp` stdio bridge connects Zed to the daemon
+with full controls (provider, model, mode, thinking level) and restored
+context usage across reconnects.
+
+## Data
+
+Session state lives in the service's SQLite database; acpx keeps transcripts
+under its own state directory. Both survive restarts — an editor or SSH
+disconnect never closes a session, and explicit close/end operations are what
+mark one closed.
+
+---
+
+Working on Remote Agent itself? See [DEVELOPMENT.md](DEVELOPMENT.md).
