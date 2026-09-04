@@ -257,14 +257,16 @@ export function AppSidebar({
           </SidebarGroupContent>
         </SidebarGroup>
       </SidebarContent>
-      <SidebarFooter>
+      {/* h-7 + no vertical padding: the icon row occupies the same 28px band
+          as the inset's path bar so the two footers align. */}
+      <SidebarFooter className="h-7 flex-row items-center justify-end gap-1 px-2 py-0">
         <div className="flex justify-end gap-1">
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
                 variant="ghost"
                 size="icon"
-                className="size-7"
+                className="size-6 [&_svg]:size-3.5"
                 onClick={() => void window.remoteAgent.keybindings.openInEditor()}
               >
                 <F7Icon name="keyboard" />
@@ -278,7 +280,7 @@ export function AppSidebar({
               <Button
                 variant="ghost"
                 size="icon"
-                className="size-7"
+                className="size-6 [&_svg]:size-3.5"
                 onClick={() => void window.remoteAgent.config.openInEditor()}
               >
                 <F7Icon name="gear_alt" />
