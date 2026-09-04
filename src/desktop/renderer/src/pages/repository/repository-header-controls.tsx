@@ -1,11 +1,9 @@
 import { OpenInEditorMenu } from "@renderer/components/open-in-editor-menu.tsx";
 import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
+import { useNavigate, useParams } from "@tanstack/react-router";
+
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import {
-  setRepositoryTab,
-  useRepositoryTab,
-  type RepositoryTab,
-} from "./tab-store.ts";
+import type { RepositoryTab } from "@renderer/router.tsx";
 
 const TABS: Array<{ id: RepositoryTab; label: string }> = [
   { id: "sessions", label: "Sessions" },
@@ -18,7 +16,9 @@ const TABS: Array<{ id: RepositoryTab; label: string }> = [
 export function RepositoryHeaderControls({ repositoryId }: { repositoryId: string }) {
   const { draft } = useConfig();
   const repository = draft.repositories[repositoryId];
-  const tab = useRepositoryTab(repositoryId);
+  const navigate = useNavigate();
+  const params = useParams({ strict: false }) as { tab?: string };
+  const tab = (params.tab as RepositoryTab | undefined) ?? "sessions";
   if (!repository) return null;
 
   return (
@@ -26,7 +26,12 @@ export function RepositoryHeaderControls({ repositoryId }: { repositoryId: strin
       {/* Absolutely centered in the header so left/right widgets don't shift it. */}
       <Tabs
         value={tab}
-        onValueChange={(next) => setRepositoryTab(repositoryId, next as RepositoryTab)}
+        onValueChange={(next) =>
+          void navigate({
+            to: "/repositories/$repositoryId/$tab",
+            params: { repositoryId, tab: next as RepositoryTab },
+          })
+        }
         className="absolute left-1/2 -translate-x-1/2"
       >
         <TabsList>

@@ -67,17 +67,52 @@ const connectionRoute = createRoute({
   },
 });
 
+const REPOSITORY_TABS = ["sessions", "settings", "skillsets"] as const;
+export type RepositoryTab = (typeof REPOSITORY_TABS)[number];
+
 const repositoryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/repositories/$repositoryId",
-  component: function Repository() {
-    const { repositoryId } = repositoryRoute.useParams();
-    const { draft, mutate } = useConfig();
-    return <RepositoryPage id={repositoryId} value={draft} mutate={mutate} />;
+});
+
+// Bare repository links land on Sessions.
+const repositoryIndexRoute = createRoute({
+  getParentRoute: () => repositoryRoute,
+  path: "/",
+  beforeLoad: ({ params }) => {
+    throw redirect({
+      to: "/repositories/$repositoryId/$tab",
+      params: { repositoryId: params.repositoryId, tab: "sessions" },
+    });
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, machineRoute, providerRoute, connectionRoute, repositoryRoute]);
+const repositoryTabRoute = createRoute({
+  getParentRoute: () => repositoryRoute,
+  path: "$tab",
+  beforeLoad: ({ params }) => {
+    if (!REPOSITORY_TABS.includes(params.tab as RepositoryTab)) {
+      throw redirect({
+        to: "/repositories/$repositoryId/$tab",
+        params: { repositoryId: params.repositoryId, tab: "sessions" },
+      });
+    }
+  },
+  component: function Repository() {
+    const { repositoryId, tab } = repositoryTabRoute.useParams();
+    const { draft, mutate } = useConfig();
+    return (
+      <RepositoryPage
+        id={repositoryId}
+        tab={tab as RepositoryTab}
+        value={draft}
+        mutate={mutate}
+      />
+    );
+  },
+});
+
+const routeTree = rootRoute.addChildren([indexRoute, machineRoute, providerRoute, connectionRoute, repositoryRoute.addChildren([repositoryIndexRoute, repositoryTabRoute])]);
 
 // Hash history: works under the file:// URL of a packaged Electron build.
 export const router = createRouter({ routeTree, history: createHashHistory() });

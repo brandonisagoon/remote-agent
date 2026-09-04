@@ -19,15 +19,14 @@ import {
 } from "@renderer/components/ui/table.tsx";
 
 import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
+import type { RepositoryTab } from "@renderer/router.tsx";
 import { SkillsTab } from "./skills-tab.tsx";
-import { useRepositoryTab } from "./tab-store.ts";
 import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
 
-export function RepositoryPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
+export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: RepositoryTab; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
-  const tab = useRepositoryTab(id);
   if (!repository) return <PageHeading title="Repository not found" description={id} />;
   return (
     <div className="grid gap-6">

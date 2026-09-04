@@ -242,7 +242,7 @@ export function AppSidebar({
                   <SidebarMenuItem>
                     <SidebarMenuButton
                       asChild
-                      isActive={!!matchRoute({ to: "/repositories/$repositoryId", params: { repositoryId: id } })}
+                      isActive={!!matchRoute({ to: "/repositories/$repositoryId", params: { repositoryId: id }, fuzzy: true })}
                     >
                       <Link to="/repositories/$repositoryId" params={{ repositoryId: id }}>
                         <F7Icon name="folder" />
