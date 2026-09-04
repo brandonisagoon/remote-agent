@@ -21,6 +21,9 @@ import Link from "framework7-icons/react/esm/Link.js";
 import Plus from "framework7-icons/react/esm/Plus.js";
 import SidebarLeft from "framework7-icons/react/esm/SidebarLeft.js";
 import Trash from "framework7-icons/react/esm/Trash.js";
+import TrayArrowDown from "framework7-icons/react/esm/TrayArrowDown.js";
+import SquareArrowDown from "framework7-icons/react/esm/SquareArrowDown.js";
+import WandStars from "framework7-icons/react/esm/WandStars.js";
 import Xmark from "framework7-icons/react/esm/Xmark.js";
 
 import { cn } from "../lib/utils.ts";
@@ -51,6 +54,9 @@ const ICONS = {
   plus: Plus,
   sidebar_left: SidebarLeft,
   trash: Trash,
+  tray_arrow_down: TrayArrowDown,
+  square_arrow_down: SquareArrowDown,
+  wand_stars: WandStars,
   xmark: Xmark,
 } as const;
 

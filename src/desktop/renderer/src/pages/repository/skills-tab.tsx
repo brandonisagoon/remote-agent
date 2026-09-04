@@ -22,6 +22,25 @@ import { cn } from "@renderer/lib/utils.ts";
 const INSTALL_CLI_COMMAND = "bun add --dev github:brandonisagoon/skill-composer";
 /** `init` scaffolds agent-skills/, the config, and a first skillset. */
 const INIT_COMMAND = "bunx skill-composer init my-first-skill";
+/** Handed to whatever agent the user pastes it into; translates the repo's
+    existing agent instructions into skill-composer skillsets. */
+function importPrompt(skillsRoot: string): string {
+  return `Translate this repository's existing agent skills and prompts into skill-composer skillsets.
+
+skill-composer is installed as this repo's dev dependency (\`node_modules/.bin/skill-composer\`). Its authored inputs live under \`${skillsRoot}/\`:
+
+- \`${skillsRoot}/skill-composer.config.ts\` registers every skillset via defineConfig({ skills: [...] }).
+- Each skillset is a directory \`${skillsRoot}/<kebab-id>/\` containing \`skill.ts\` (defineSkill(import.meta.url, { id, harnesses: ["claude", "codex"], frontmatter: "frontmatter.md", introduction, snippets, flags? })), a \`frontmatter.md\` (YAML name/description; \`.claude.md\`/\`.codex.md\` variants supported), and \`snippets/\` — markdown files or typed renderers built with defineSnippet/md from "skill-composer".
+- Snippets are the ordered instruction body; optional flags ({ id, afterSnippet, content }) splice in extra behavior when selected.
+
+Steps:
+1. Inventory the existing material: .claude/skills/*/SKILL.md, .claude/commands, .agents or AGENTS.md guidance, prompts/*.md — anything that instructs an agent.
+2. For each coherent skill, create a skillset directory: split its body into logically named snippets, write the frontmatter description, and register it in the config. Preserve wording; do not summarize away rules.
+3. Prefer one skillset per distinct job; use flags only for genuinely optional behavior variants.
+4. Validate with \`./node_modules/.bin/skill-composer check --root . --config ${skillsRoot}/skill-composer.config.ts\` and fix every error and warning.
+5. Do not commit generated output (.claude/skills/skill-composer-*/, .agents/skills/skill-composer-*/); those directories are build artifacts.`;
+}
+
 const GITIGNORE_COMMAND =
   "printf '\\n# generated skills (skill-composer)\\n/.claude/skills/skill-composer-*/\\n/.agents/skills/skill-composer-*/\\n' >> .gitignore";
 
@@ -152,7 +171,27 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
         title="Skillsets"
         description="Instruction sets authored in this repository. A workflow selects one and composes it into the session it launches."
       >
-        <div className="-mx-4 -mb-2 flex justify-end">
+        <div className="-mx-4 -mb-2 flex justify-end gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={async () => {
+                  await navigator.clipboard.writeText(importPrompt(skillsRoot));
+                  toast.success("Import Prompt Copied", {
+                    description:
+                      "Paste it to an agent working in this repository; it will translate your existing skills and prompts into skillsets.",
+                  });
+                }}
+              >
+                <F7Icon name="square_arrow_down" className="size-3.5" />
+                <span className="sr-only">Import Skills from This Repository</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Import Skills from This Repository</TooltipContent>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button variant="ghost" size="icon" className="size-6" onClick={refresh}>
