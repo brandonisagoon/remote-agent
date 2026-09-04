@@ -1,6 +1,7 @@
 import { useParams } from "@tanstack/react-router";
 
 import { DeleteConnectionButton } from "@renderer/components/delete-connection-button.tsx";
+import { RepositoryHeaderControls } from "@renderer/pages/repository/repository-header-controls.tsx";
 import { NavHistoryButtons } from "@renderer/components/nav-history-buttons.tsx";
 import { SidebarTrigger, useSidebar } from "@renderer/components/ui/sidebar.tsx";
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
@@ -45,6 +46,7 @@ export function InsetHeader() {
       </Tooltip>
       {(!open || isMobile) && <NavHistoryButtons />}
       <span className="truncate text-sm font-medium">{title}</span>
+      {params.repositoryId && <RepositoryHeaderControls repositoryId={params.repositoryId} />}
       {params.connectionId && <DeleteConnectionButton id={params.connectionId} className="ml-auto" />}
     </header>
   );

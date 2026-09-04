@@ -47,11 +47,15 @@ const api: DesktopApi = {
   repository: {
     pick: () => ipcRenderer.invoke("repository:pick"),
   },
+  editors: {
+    detect: () => ipcRenderer.invoke("editors:detect"),
+  },
   skills: {
     check: (root, skillsRoot) => ipcRenderer.invoke("skills:check", root, skillsRoot),
   },
   shell: {
     openPath: (target) => ipcRenderer.invoke("shell:open-path", target),
+    openWith: (appPath, target) => ipcRenderer.invoke("shell:open-with", appPath, target),
   },
   management: {
     checks: () => ipcRenderer.invoke("management:checks"),

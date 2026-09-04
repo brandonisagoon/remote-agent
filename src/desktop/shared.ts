@@ -1,6 +1,7 @@
 import type { ConfigDocument } from "../lib/config-file.ts";
 import type { CheckResult } from "../management/checks.ts";
 import type { SkillsCheck } from "../lib/skills/check.ts";
+import type { DetectedEditor } from "./main/editor-detect.ts";
 import type { ManagementResult } from "../management/service.ts";
 
 export interface SessionSummary {
@@ -68,11 +69,15 @@ export interface DesktopApi {
   repository: {
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
   };
+  editors: {
+    detect(): Promise<DetectedEditor[]>;
+  };
   skills: {
     check(root: string, skillsRoot: string): Promise<SkillsCheck>;
   };
   shell: {
     openPath(target: string): Promise<string>;
+    openWith(appPath: string, target: string): Promise<void>;
   };
   management: {
     checks(): Promise<CheckResult[]>;

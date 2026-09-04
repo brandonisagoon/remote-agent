@@ -5,6 +5,7 @@ import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
+import { RepositoryPathBar } from "@renderer/pages/repository/path-bar.tsx";
 import {
   SIDEBAR_DEFAULT_WIDTH,
   SIDEBAR_MAX_WIDTH,
@@ -167,6 +168,7 @@ export function AppLayout() {
             <Outlet />
           </div>
         </div>
+        {params.repositoryId && <RepositoryPathBar repositoryId={params.repositoryId} />}
       </SidebarInset>
 
     </SidebarProvider>

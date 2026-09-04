@@ -4,6 +4,7 @@ import ArrowUpRight from "framework7-icons/react/esm/ArrowUpRight.js";
 import ArrowUpRightSquare from "framework7-icons/react/esm/ArrowUpRightSquare.js";
 import BubbleLeftBubbleRight from "framework7-icons/react/esm/BubbleLeftBubbleRight.js";
 import CheckmarkCircle from "framework7-icons/react/esm/CheckmarkCircle.js";
+import ChevronDown from "framework7-icons/react/esm/ChevronDown.js";
 import ChevronLeft from "framework7-icons/react/esm/ChevronLeft.js";
 import ChevronLeftSlashChevronRight from "framework7-icons/react/esm/ChevronLeftSlashChevronRight.js";
 import ChevronRight from "framework7-icons/react/esm/ChevronRight.js";
@@ -27,6 +28,7 @@ import { cn } from "../lib/utils.ts";
 /* SVG components (not the ligature font): geometrically centered and sized
    like any other inline icon, avoiding font-baseline vertical drift. */
 const ICONS = {
+  chevron_down: ChevronDown,
   arrow_2_circlepath: Arrow2Circlepath,
   arrow_clockwise: ArrowClockwise,
   arrow_up_right: ArrowUpRight,

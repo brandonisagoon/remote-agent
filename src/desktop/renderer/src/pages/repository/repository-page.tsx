@@ -17,35 +17,23 @@ import {
   TableHeader,
   TableRow,
 } from "@renderer/components/ui/table.tsx";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
+
 import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
 import { SkillsTab } from "./skills-tab.tsx";
+import { useRepositoryTab } from "./tab-store.ts";
 import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { cn } from "@renderer/lib/utils.ts";
 
 export function RepositoryPage({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
+  const tab = useRepositoryTab(id);
   if (!repository) return <PageHeading title="Repository not found" description={id} />;
   return (
     <div className="grid gap-6">
-      <p className="text-muted-foreground truncate font-mono text-xs">{repository.root}</p>
-      <Tabs defaultValue="sessions">
-        <TabsList>
-          <TabsTrigger value="sessions">Sessions</TabsTrigger>
-          <TabsTrigger value="skills">Skills</TabsTrigger>
-          <TabsTrigger value="settings">Repository Settings</TabsTrigger>
-        </TabsList>
-        <TabsContent value="sessions" className="pt-4">
-          <SessionsTab repositoryId={id} />
-        </TabsContent>
-        <TabsContent value="skills" className="pt-4">
-          <SkillsTab id={id} value={value} mutate={mutate} />
-        </TabsContent>
-        <TabsContent value="settings" className="pt-4">
-          <RepositorySettings id={id} value={value} mutate={mutate} />
-        </TabsContent>
-      </Tabs>
+      {tab === "sessions" && <SessionsTab repositoryId={id} />}
+      {tab === "skillsets" && <SkillsTab id={id} value={value} mutate={mutate} />}
+      {tab === "settings" && <RepositorySettings id={id} value={value} mutate={mutate} />}
     </div>
   );
 }
