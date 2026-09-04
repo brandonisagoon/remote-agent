@@ -155,6 +155,23 @@ export function cliInstalled(): boolean {
   return existsSync(CLI_LINK);
 }
 
+/** Opens the user's terminal with a command prefilled, so privileged or
+    account-bound steps (sudo, brew, cloudflared login) run in their own
+    shell — never from the app. */
+export async function openInTerminal(commandLine: string): Promise<ManagementResult> {
+  if (process.platform === "win32") {
+    const result = await command("cmd.exe", ["/c", "start", "cmd.exe", "/k", commandLine]);
+    return result.ok
+      ? { ok: true, summary: "Continue in the terminal — the command is ready to run", detail: commandLine }
+      : { ...result, summary: "Could not open a terminal" };
+  }
+  const script = `tell application "Terminal"\n  activate\n  do script ${JSON.stringify(commandLine)}\nend tell`;
+  const result = await command("osascript", ["-e", script]);
+  return result.ok
+    ? { ok: true, summary: "Continue in Terminal — the command is ready to run", detail: commandLine }
+    : { ...result, summary: "Could not open Terminal" };
+}
+
 /** Deliberately dumb: opens Terminal with the symlink command prefilled so
     sudo runs in the user's own shell, instead of doing privileged writes
     from the app. */
@@ -163,12 +180,7 @@ export async function installCli(): Promise<ManagementResult> {
   if (!existsSync(entry)) {
     return { ok: false, summary: "CLI source not found", detail: entry };
   }
-  const install = `sudo ln -sf '${entry}' ${CLI_LINK}`;
-  const script = `tell application "Terminal"\n  activate\n  do script ${JSON.stringify(install)}\nend tell`;
-  const result = await command("osascript", ["-e", script]);
-  return result.ok
-    ? { ok: true, summary: "Continue in Terminal — the install command is ready to run", detail: install }
-    : { ...result, summary: "Could not open Terminal" };
+  return openInTerminal(`sudo ln -sf '${entry}' ${CLI_LINK}`);
 }
 
 /** Unregisters the daemon. Leaves state/ (database, keys, logs) and the

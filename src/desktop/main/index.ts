@@ -15,6 +15,7 @@ import {
   doctor,
   installCli,
   installService,
+  openInTerminal,
   installUpdate,
   restartService,
   serviceStatus,
@@ -171,6 +172,7 @@ function registerIpc(file: string): void {
     restart: restartService,
   };
   ipcMain.handle("management:checks", () => runChecks());
+  ipcMain.handle("management:open-terminal", (_event, commandLine: string) => openInTerminal(commandLine));
   ipcMain.handle("management:run", (_event, action: keyof typeof actions) => {
     const run = actions[action];
     if (!run) throw new Error(`unknown management action: ${action}`);
@@ -235,7 +237,18 @@ async function createWindow(): Promise<void> {
   }
 }
 
+app.setName("Remote Agent");
+
 app.whenReady().then(async () => {
+  // Dev runs the stock Electron binary; give the Dock our name and icon.
+  // (The packaged app gets both from the bundle.)
+  if (!app.isPackaged && process.platform === "darwin") {
+    try {
+      app.dock?.setIcon(path.join(app.getAppPath(), "build", "icon.png"));
+    } catch {
+      // Icon is cosmetic; never block startup on it.
+    }
+  }
   await createWindow();
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) void createWindow();

@@ -56,6 +56,7 @@ export interface DesktopApi {
   };
   management: {
     checks(): Promise<CheckResult[]>;
+    openTerminal(commandLine: string): Promise<ManagementResult>;
     run(action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart"): Promise<ManagementResult>;
   };
 }

@@ -69,7 +69,8 @@
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
       "entitlementsInherit": "build/entitlements.mac.plist",
-      "notarize": false
+      "notarize": false,
+      "icon": "build/icon.icns"
     },
     "win": {
       "target": [
@@ -77,6 +78,7 @@
       ]
     },
     "directories": {
+      "buildResources": "build",
       "output": "dist"
     }
   },

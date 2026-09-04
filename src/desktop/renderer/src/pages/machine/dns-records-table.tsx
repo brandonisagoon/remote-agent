@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
-import type { ServiceFile } from "../../../../lib/config.ts";
+import type { ServiceFile } from "../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";

@@ -8,10 +8,10 @@ import {
 import { AppLayout } from "@renderer/components/app-layout.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import { ConnectionPage } from "@renderer/pages/connection-page.tsx";
-import { ProviderPage } from "@renderer/pages/provider-page.tsx";
-import { MachinePage } from "@renderer/pages/machine-page.tsx";
-import { RepositoryPage } from "@renderer/pages/repository-page.tsx";
+import { ConnectionPage } from "@renderer/pages/connection/connection-page.tsx";
+import { ProviderPage } from "@renderer/pages/provider/provider-page.tsx";
+import { MachinePage } from "@renderer/pages/machine/machine-page.tsx";
+import { RepositoryPage } from "@renderer/pages/repository/repository-page.tsx";
 
 const rootRoute = createRootRoute({
   component: AppLayout,

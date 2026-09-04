@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import type { ServiceFile } from "../../../../lib/config.ts";
+import type { ServiceFile } from "../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";

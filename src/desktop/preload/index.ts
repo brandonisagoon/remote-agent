@@ -39,6 +39,7 @@ const api: DesktopApi = {
   },
   management: {
     checks: () => ipcRenderer.invoke("management:checks"),
+    openTerminal: (commandLine) => ipcRenderer.invoke("management:open-terminal", commandLine),
     run: (action) => ipcRenderer.invoke("management:run", action),
   },
 };

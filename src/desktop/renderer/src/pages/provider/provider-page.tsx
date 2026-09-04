@@ -1,4 +1,4 @@
-import type { ServiceFile } from "../../../../lib/config.ts";
+import type { ServiceFile } from "../../../../../lib/config.ts";
 import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";

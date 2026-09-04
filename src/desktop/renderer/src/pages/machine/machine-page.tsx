@@ -1,22 +1,19 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
-import type { ServiceFile } from "../../../../lib/config.ts";
-import type { ManagementResult } from "../../../../management/service.ts";
-import { DnsRecordsTable } from "@renderer/components/dns-records-table.tsx";
+import type { ServiceFile } from "../../../../../lib/config.ts";
+import type { ManagementResult } from "../../../../../management/service.ts";
+import { DnsRecordsTable } from "./dns-records-table.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
-import { Badge } from "@renderer/components/ui/badge.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";
 import {
   Table,
   TableBody,
   TableCell,
-  TableHead,
-  TableHeader,
   TableRow,
 } from "@renderer/components/ui/table.tsx";
 import { checksQueryOptions } from "@renderer/lib/queries/checks.ts";
@@ -52,7 +49,6 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const installSteps = [
     check("bun"),
     check("cloudflared"),
-    ...checks.filter((entry) => entry.id.startsWith("provider-")),
     check("cli"),
     check("service"),
     check("tunnel"),
@@ -60,22 +56,39 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const statusRows = [check("daemon"), check("config"), check("repositories")].filter(
     (entry) => entry !== undefined,
   );
-  const stepAction = (id: string) => {
-    if (id === "cli") {
+  // Remedies are "run: <cmd>" / "install with: <cmd>"; the button hands the
+  // command to the user's terminal rather than running it from the app.
+  const remedyCommand = (step: { remedy?: string }) =>
+    step.remedy?.match(/^(?:run|install with): (.+)$/)?.[1] ?? null;
+  const openTerminal = async (commandLine: string) => {
+    setResult(await window.remoteAgent.management.openTerminal(commandLine));
+  };
+  const stepAction = (step: NonNullable<ReturnType<typeof check>>) => {
+    if (step.id === "cli") {
       return (
-        <Button size="sm" variant="outline" disabled={working !== null || check("cli")?.status === "ok"} onClick={() => void act("install-cli")}>
+        <Button size="sm" variant="outline" disabled={working !== null || step.status === "ok"} onClick={() => void act("install-cli")}>
           Install
         </Button>
       );
     }
-    if (id === "service") {
+    if (step.id === "service") {
       return (
         <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("install")}>
-          {check("service")?.status === "ok" ? "Reinstall" : "Install"}
+          {step.status === "ok" ? "Reinstall" : "Install"}
         </Button>
       );
     }
-    return null;
+    const command = remedyCommand(step);
+    return (
+      <Button
+        size="sm"
+        variant="outline"
+        disabled={working !== null || step.status === "ok" || !command}
+        onClick={() => command && void openTerminal(command)}
+      >
+        {step.id === "tunnel" ? "Create" : "Install"}
+      </Button>
+    );
   };
   return (
     <Accordion
@@ -88,99 +101,84 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         title="Installation"
         description="Everything this machine needs, in order. Each step reports its own state."
       >
-        <SettingsCard>
-          <div className="bg-background rounded-md border">
-            <Table className="table-fixed">
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10">#</TableHead>
-                  <TableHead>Step</TableHead>
-                  <TableHead className="w-28">Status</TableHead>
-                  <TableHead className="w-28" />
+        <div className="bg-background -mx-4 rounded-lg border">
+          <Table className="table-fixed">
+            <TableBody>
+              {installSteps.map((step) => (
+                <TableRow key={step.id} className="h-14">
+                  <TableCell className="pl-4">
+                    <div>{step.label}</div>
+                    {(step.status === "ok" ? null : (step.remedy ?? step.detail)) && (
+                      <div className="text-muted-foreground truncate text-xs">{step.remedy ?? step.detail}</div>
+                    )}
+                  </TableCell>
+                  <TableCell className="w-28"><CheckBadge status={step.status} /></TableCell>
+                  <TableCell className="w-48 pr-4 text-right">{stepAction(step)}</TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {installSteps.map((step, index) => (
-                  <TableRow key={step.id}>
-                    <TableCell className="text-muted-foreground">{index + 1}</TableCell>
-                    <TableCell>
-                      <div>{step.label}</div>
-                      {(step.status === "ok" ? null : (step.remedy ?? step.detail)) && (
-                        <div className="text-muted-foreground truncate text-xs">{step.remedy ?? step.detail}</div>
-                      )}
-                    </TableCell>
-                    <TableCell><CheckBadge status={step.status} /></TableCell>
-                    <TableCell>{stepAction(step.id)}</TableCell>
-                  </TableRow>
-                ))}
-                {installSteps.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={4} className="text-muted-foreground text-center">Checking…</TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </SettingsCard>
+              ))}
+              {installSteps.length === 0 && (
+                <TableRow>
+                  <TableCell colSpan={3} className="text-muted-foreground text-center">Checking…</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
       </SettingsSection>
 
       <SettingsSection value="status" title="Status" description="The running system.">
-        <SettingsCard>
-          <div className="bg-background rounded-md border">
-            <Table className="table-fixed">
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Component</TableHead>
-                  <TableHead className="w-28">Status</TableHead>
-                  <TableHead className="w-40" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {statusRows.map((row) => (
-                  <TableRow key={row.id}>
-                    <TableCell>
-                      <div>{row.label}</div>
-                      {row.detail && (
-                        <div className="text-muted-foreground truncate text-xs">{row.detail}</div>
-                      )}
-                    </TableCell>
-                    <TableCell><CheckBadge status={row.status} /></TableCell>
-                    <TableCell>
-                      {row.id === "daemon" && (
-                        <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("restart")}>
-                          <F7Icon name="arrow_clockwise" className={cn(working === "restart" && "animate-spin")} />
-                          Restart
-                        </Button>
-                      )}
-                    </TableCell>
-                  </TableRow>
-                ))}
-                <TableRow>
-                  <TableCell>Updates</TableCell>
-                  <TableCell><span className="text-muted-foreground text-xs">—</span></TableCell>
-                  <TableCell>
-                    <div className="flex gap-2">
-                      <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("check-update")}>
-                        Check
+        <div className="bg-background -mx-4 rounded-lg border">
+          <Table className="table-fixed">
+            <TableBody>
+              {statusRows.map((row) => (
+                <TableRow key={row.id} className="h-14">
+                  <TableCell className="pl-4">
+                    <div>{row.label}</div>
+                    {row.detail && (
+                      <div className="text-muted-foreground truncate text-xs">{row.detail}</div>
+                    )}
+                  </TableCell>
+                  <TableCell className="w-28"><CheckBadge status={row.status} /></TableCell>
+                  <TableCell className="w-48 pr-4 text-right">
+                    {row.id === "daemon" && (
+                      <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("restart")}>
+                        <F7Icon name="arrow_clockwise" className={cn(working === "restart" && "animate-spin")} />
+                        Restart
                       </Button>
-                      <Button size="sm" disabled={working !== null} onClick={() => void act("update")}>
-                        Install
+                    )}
+                    {row.id === "config" && (
+                      <Button size="sm" variant="outline" onClick={() => void window.remoteAgent.config.openInEditor()}>
+                        Edit
                       </Button>
-                    </div>
+                    )}
                   </TableCell>
                 </TableRow>
-              </TableBody>
-            </Table>
+              ))}
+              <TableRow className="h-14">
+                <TableCell className="pl-4">Updates</TableCell>
+                <TableCell className="w-28"><span className="text-muted-foreground text-xs">—</span></TableCell>
+                <TableCell className="w-48 pr-4 text-right">
+                  <div className="flex justify-end gap-2">
+                    <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("check-update")}>
+                      Check
+                    </Button>
+                    <Button size="sm" disabled={working !== null} onClick={() => void act("update")}>
+                      Install
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            </TableBody>
+          </Table>
+        </div>
+        {result && (
+          <div className="bg-background -mx-4 rounded-lg border p-3 text-sm">
+            <div className={cn("font-medium", !result.ok && "text-destructive")}>{result.summary}</div>
+            {result.detail && (
+              <pre className="text-muted-foreground mt-2 text-xs whitespace-pre-wrap">{result.detail}</pre>
+            )}
           </div>
-          {result && (
-            <div className="bg-background rounded-md border p-3 text-sm">
-              <div className={cn("font-medium", !result.ok && "text-destructive")}>{result.summary}</div>
-              {result.detail && (
-                <pre className="text-muted-foreground mt-2 text-xs whitespace-pre-wrap">{result.detail}</pre>
-              )}
-            </div>
-          )}
-        </SettingsCard>
+        )}
       </SettingsSection>
 
       <SettingsSection value="identity" title="Identity">
@@ -243,8 +241,18 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   );
 }
 
+const STATUS_DOT = {
+  ok: { color: "bg-emerald-600/60 dark:bg-emerald-400/50", label: "OK" },
+  warn: { color: "bg-amber-600/60 dark:bg-amber-400/50", label: "Attention" },
+  fail: { color: "bg-red-600/60 dark:bg-red-400/50", label: "Missing" },
+} as const;
+
 function CheckBadge({ status }: { status: "ok" | "warn" | "fail" }) {
-  if (status === "ok") return <Badge variant="secondary">OK</Badge>;
-  if (status === "warn") return <Badge variant="outline">Attention</Badge>;
-  return <Badge variant="destructive">Missing</Badge>;
+  const { color, label } = STATUS_DOT[status];
+  return (
+    <span className="flex items-center gap-2">
+      <span className={cn("size-2 shrink-0 rounded-full", color)} />
+      <span className="text-muted-foreground/70 text-xs">{label}</span>
+    </span>
+  );
 }
