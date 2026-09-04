@@ -73,15 +73,21 @@ export function AppSidebar({
       <SidebarHeader className="titlebar-drag h-12 flex-row items-center justify-end pr-2">
         <NavHistoryButtons />
       </SidebarHeader>
-      <SidebarContent>
+      <SidebarContent className="overscroll-contain">
         <SidebarGroup>
           <SidebarGroupLabel>Providers</SidebarGroupLabel>
           <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <SidebarGroupAction title="Add provider">
-                <F7Icon name="plus" />
-              </SidebarGroupAction>
-            </DropdownMenuTrigger>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <SidebarGroupAction>
+                    <F7Icon name="plus" />
+                    <span className="sr-only">Add a Provider</span>
+                  </SidebarGroupAction>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="right">Add a Provider</TooltipContent>
+            </Tooltip>
             <DropdownMenuContent side="bottom" align="end">
               <DropdownMenuItem disabled={providers.includes("codex")} onSelect={() => onAddProvider("codex")}>
                 <BrandIcon name="openai" />
@@ -115,11 +121,17 @@ export function AppSidebar({
         <SidebarGroup>
           <SidebarGroupLabel>Connections</SidebarGroupLabel>
           <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <SidebarGroupAction title="Add connection">
-                <F7Icon name="plus" />
-              </SidebarGroupAction>
-            </DropdownMenuTrigger>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <SidebarGroupAction>
+                    <F7Icon name="plus" />
+                    <span className="sr-only">Add a Connection</span>
+                  </SidebarGroupAction>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="right">Add a Connection</TooltipContent>
+            </Tooltip>
             <DropdownMenuContent side="bottom" align="end">
               <DropdownMenuItem onSelect={onAddConnection}>
                 <BrandIcon name="linear" />
@@ -178,9 +190,15 @@ export function AppSidebar({
         </SidebarGroup>
         <SidebarGroup>
           <SidebarGroupLabel>Repositories</SidebarGroupLabel>
-          <SidebarGroupAction title="Add repository" onClick={onAddRepository}>
-            <F7Icon name="plus" />
-          </SidebarGroupAction>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <SidebarGroupAction onClick={onAddRepository}>
+                <F7Icon name="plus" />
+                <span className="sr-only">Add a Repository</span>
+              </SidebarGroupAction>
+            </TooltipTrigger>
+            <TooltipContent side="right">Add a Repository</TooltipContent>
+          </Tooltip>
           <SidebarGroupContent>
             <SidebarMenu>
               {repositories.map(([id, repository], index) => (

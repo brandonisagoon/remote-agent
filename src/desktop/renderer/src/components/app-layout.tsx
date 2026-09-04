@@ -82,10 +82,14 @@ export function AppLayout() {
         onAddRepository={() => setAddDialog("repository")}
       />
 
-      <SidebarInset className="min-w-0">
+      <SidebarInset className="h-svh min-w-0 overflow-hidden">
         <InsetHeader />
-        <div className="mx-auto w-full max-w-3xl px-8 py-8">
-          <Outlet />
+        {/* The page scrolls in its own container so wheel events never chain
+            into the sidebar (and vice versa). */}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+          <div className="mx-auto w-full max-w-3xl px-8 py-8">
+            <Outlet />
+          </div>
         </div>
       </SidebarInset>
 
