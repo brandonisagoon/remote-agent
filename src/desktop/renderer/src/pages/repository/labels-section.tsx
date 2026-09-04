@@ -318,23 +318,30 @@ export function LabelsSection({ id, value, mutate }: { id: string; value: Servic
             No label groups yet.
           </div>
         )}
-      </div>
-      <div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            let key = "new-group";
-            for (let index = 1; repository.labels[key]; index += 1) key = `new-group-${index}`;
-            mutate((file) => {
-              file.repositories[id]!.labels[key] = { exclusive: true, routerVisible: false };
-            });
-            setNewGroup(key);
-          }}
-        >
-          <F7Icon name="plus" />
-          New Group
-        </Button>
+        {/* macOS System Settings-style footer bar */}
+        <div className="flex items-center border-t px-1 py-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => {
+                  let key = "new-group";
+                  for (let index = 1; repository.labels[key]; index += 1) key = `new-group-${index}`;
+                  mutate((file) => {
+                    file.repositories[id]!.labels[key] = { exclusive: true, routerVisible: false };
+                  });
+                  setNewGroup(key);
+                }}
+              >
+                <F7Icon name="plus" className="size-3.5" />
+                <span className="sr-only">New Group</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>New Group</TooltipContent>
+          </Tooltip>
+        </div>
       </div>
     </>
   );

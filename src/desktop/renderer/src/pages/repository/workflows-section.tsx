@@ -27,6 +27,7 @@ import {
   TableCell,
   TableRow,
 } from "@renderer/components/ui/table.tsx";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { skillsQueryOptions } from "@renderer/lib/queries/skills.ts";
 import { randomHex } from "@renderer/lib/random.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
@@ -102,27 +103,34 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
             )}
           </TableBody>
         </Table>
-      </div>
-      <div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            const workflowId = `wf-${randomHex(4)}`;
-            mutate((file) => {
-              file.repositories[id]!.workflows[workflowId] = {
-                on: "issue.state-changed",
-                when: [{ "issue.state": ["Planning"] }],
-                skill: { skillset: "", flags: [] },
-                deliver: "start-session",
-              };
-            });
-            setEditing(workflowId);
-          }}
-        >
-          <F7Icon name="plus" />
-          Add Workflow
-        </Button>
+        {/* macOS System Settings-style footer bar */}
+        <div className="flex items-center border-t px-1 py-0.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-6"
+                onClick={() => {
+                  const workflowId = `wf-${randomHex(4)}`;
+                  mutate((file) => {
+                    file.repositories[id]!.workflows[workflowId] = {
+                      on: "issue.state-changed",
+                      when: [{ "issue.state": ["Planning"] }],
+                      skill: { skillset: "", flags: [] },
+                      deliver: "start-session",
+                    };
+                  });
+                  setEditing(workflowId);
+                }}
+              >
+                <F7Icon name="plus" className="size-3.5" />
+                <span className="sr-only">New Workflow</span>
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>New Workflow</TooltipContent>
+          </Tooltip>
+        </div>
       </div>
       {editing && repository.workflows[editing] && (
         <WorkflowEditor

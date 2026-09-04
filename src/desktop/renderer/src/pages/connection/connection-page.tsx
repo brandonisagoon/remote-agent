@@ -35,6 +35,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@renderer/components/ui/select.tsx";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
 import { providerModelsQueryOptions } from "@renderer/lib/queries/provider-models.ts";
 import type { Mutate } from "@renderer/lib/types.ts";
@@ -247,20 +248,27 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
                 No editors — worktree links won't be posted.
               </div>
             )}
-          </div>
-          <div>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                mutate((file) => {
-                  file.connections[id]!.editors.push({ name: "", scheme: "" });
-                })
-              }
-            >
-              <F7Icon name="plus" />
-              Add Editor
-            </Button>
+            {/* macOS System Settings-style footer bar */}
+            <div className="flex items-center border-t px-1 py-0.5">
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="size-6"
+                    onClick={() =>
+                      mutate((file) => {
+                        file.connections[id]!.editors.push({ name: "", scheme: "" });
+                      })
+                    }
+                  >
+                    <F7Icon name="plus" className="size-3.5" />
+                    <span className="sr-only">New Editor</span>
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>New Editor</TooltipContent>
+              </Tooltip>
+            </div>
           </div>
         </SettingsCard>
       </SettingsSection>
