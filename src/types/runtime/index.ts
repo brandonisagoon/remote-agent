@@ -1,5 +1,8 @@
 export type { Harness } from "./harness.ts";
 export type {
+  AgentElicitationHandler,
+  AgentPermissionDecision,
+  AgentPermissionInterceptor,
   AgentRuntimeEvent,
   AgentRuntimeLifecycleEvent,
   AgentRuntimeMessage,

@@ -1,4 +1,7 @@
 import type {
+  CreateElicitationRequest,
+  CreateElicitationResponse,
+  RequestPermissionRequest,
   SessionConfigOption,
   SessionNotification,
 } from "@agentclientprotocol/sdk";
@@ -21,6 +24,7 @@ export interface AgentRuntimeSession {
   machineId: string;
   role: string | null;
   lifecycle: string | null;
+  workflowId: string | null;
   cwd: string;
   name: string | null;
   worktreePath: string | null;
@@ -93,6 +97,8 @@ export interface EnsureAgentSessionInput {
   machineId?: string;
   role?: string;
   lifecycle?: "one-shot" | "persistent";
+  /** Launch provenance: the configured workflow that started this session. */
+  workflowId?: string;
   labels?: Record<string, string[]>;
   relations?: Array<{
     relationship: string;
@@ -122,6 +128,9 @@ export interface AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    /** Answers the agent's planning questions (ACP elicitation) for this
+        turn. Absent = headless; acpx resolves them non-interactively. */
+    onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn;
   enqueue(input: {
     sessionId: string;
@@ -150,3 +159,27 @@ export interface AgentSessionRuntime {
   ): () => void;
   shutdown(): Promise<void>;
 }
+
+export type AgentElicitationHandler = (
+  request: CreateElicitationRequest,
+  context: { signal: AbortSignal },
+) => Promise<CreateElicitationResponse>;
+
+export type AgentPermissionDecision = {
+  outcome:
+    | "allow_once"
+    | "allow_always"
+    | "reject_once"
+    | "reject_always"
+    | "cancel";
+};
+
+/** Consulted before the runtime's own permission policy answers an agent's
+    permission request. `sessionId` is the Remote Agent session ID. Returning
+    undefined defers to the policy (approve-all for unattended sessions), so
+    interceptors can observe a request — e.g. capture a plan on exit-plan-mode
+    approval — without owning the decision. */
+export type AgentPermissionInterceptor = (
+  input: { sessionId: string; raw: RequestPermissionRequest },
+  context: { signal: AbortSignal },
+) => Promise<AgentPermissionDecision | undefined>;

@@ -1,7 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
+import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../config.ts";
+import { registerThread } from "../../../services/sessions/threads.ts";
 import {
   createIssueComment,
   issueHasCommentContaining,
@@ -118,6 +120,7 @@ export async function postWorktreeLinkComment(
     issueId: string;
     branchName: string;
     runtimeSessionId: string;
+    prisma?: PrismaClient;
     timeoutMs?: number;
     pollIntervalMs?: number;
   },
@@ -157,13 +160,22 @@ export async function postWorktreeLinkComment(
       worktreePath,
       runtimeSessionId: input.runtimeSessionId,
     });
-    return (await dependencies.createComment(
+    const commentId = await dependencies.createComment(
       input.config.linearApiKey,
       input.issueId,
       body,
-    ))
-      ? "posted"
-      : "failed";
+    );
+    if (commentId && input.prisma) {
+      // The session owns its worktree-link thread from birth.
+      await registerThread(input.prisma, {
+        provider: "linear",
+        connectionId: input.config.activeConnectionId,
+        threadRootCommentId: commentId,
+        runtimeSessionId: input.runtimeSessionId,
+        relationship: "thread",
+      }).catch(() => undefined);
+    }
+    return commentId ? "posted" : "failed";
   } catch (error) {
     console.error(
       `Failed to post worktree link comment on issue ${input.issueId}:`,

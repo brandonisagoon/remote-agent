@@ -49,6 +49,16 @@ const RepositoryWorkflowSchema = z.object({
   /** Session provider; defaults to the machine's ACP provider. */
   providerId: z.enum(["codex", "claude"]).optional(),
   model: z.string().min(1).optional(),
+  /** start-session only: launch the session in plan mode; the daemon captures
+      the plan on exit-plan-mode approval, writes it into the source issue's
+      "## Implementation Plan" section, and (if thenState is set) transitions
+      the issue. Requires the claude provider — codex has no plan mode. */
+  plan: z
+    .object({
+      captureToIssue: z.literal(true),
+      thenState: z.string().min(1).optional(),
+    })
+    .optional(),
 });
 /** One label group (Linear-style): a dimension sessions are labeled by.
     `labels` lists the allowed labels (absent = free text); `exclusive` means
@@ -225,6 +235,12 @@ export const ServiceFileSchema = z.object({
       if (workflow.connectionId !== undefined && !file.connections[workflow.connectionId]) {
         context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "connectionId"], message: `unknown connection: ${workflow.connectionId}` });
       }
+      if (workflow.plan && workflow.deliver !== "start-session") {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires deliver: start-session" });
+      }
+      if (workflow.plan && workflow.providerId === "codex") {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires the claude provider (codex has no plan mode)" });
+      }
     }
     for (const [key, values] of Object.entries(repository.sessionDefaults.labels)) {
       const group = repository.labels[key];
@@ -258,6 +274,7 @@ export interface WorkflowConfig {
   deliver: "start-session" | "message-session";
   providerId: "codex" | "claude" | null;
   model: string | null;
+  plan: { captureToIssue: true; thenState: string | null } | null;
 }
 
 export interface RepositoryConfig {
@@ -457,6 +474,12 @@ export function readConfig(): ServerConfig {
             deliver: workflow.deliver,
             providerId: workflow.providerId ?? null,
             model: workflow.model ?? null,
+            plan: workflow.plan
+              ? {
+                  captureToIssue: workflow.plan.captureToIssue,
+                  thenState: workflow.plan.thenState ?? null,
+                }
+              : null,
           } satisfies WorkflowConfig]),
         ),
       } satisfies RepositoryConfig];

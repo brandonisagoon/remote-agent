@@ -53,6 +53,13 @@ schema with `bun run config:schema`.
   doctor checklist (`checks.ts`), and the `supervisor/` seam (launchd on
   macOS, a Task Scheduler logon task on Windows). There are no shell scripts;
   everything is TypeScript under Bun.
+- `src/lib/skills/` — the skill-composer boundary: `check.ts` scans a
+  repository's skillsets (exec + a sandboxed bun child process for the
+  inventory), `compose.ts` is the `{{SKILL:...}}` token pipeline workflows
+  compose sessions with.
+- `src/lib/workflows/` + `src/lib/workers/product/workflow/` — trigger
+  matching and the single workflow worker (start-session / message-session).
+- Conventions and vocabulary live in `CLAUDE.md` / `AGENTS.md` (mirrored).
 - `bin/remote-agent` (and `.cmd`) — the CLI wrappers package managers put on
   PATH.
 - `Formula/` and `bucket/` — this repo is its own Homebrew tap and Scoop

@@ -128,6 +128,7 @@ export function createWorkflowWorker(
               target.runtime.worktreePath,
               seed,
               harness,
+              repository.skillsRoot,
             );
           },
         });
@@ -179,6 +180,7 @@ export function createWorkflowWorker(
           worktreePath,
           seed,
           harness,
+          repository.skillsRoot,
         );
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
@@ -195,6 +197,10 @@ export function createWorkflowWorker(
           role: "primary",
           title: buildWorkflowSessionName(workflow.id, issue.identifier),
           prompt,
+          workflowId: workflow.id,
+          // Plan capture: the session plans in native plan mode; the daemon
+          // persists the plan on exit-plan-mode approval.
+          ...(workflow.plan?.captureToIssue ? { mode: "plan" } : {}),
         });
       } catch (error) {
         return result(
@@ -215,6 +221,7 @@ export function createWorkflowWorker(
         issueId: issue.id,
         branchName,
         runtimeSessionId: launched.session.id,
+        prisma: context.prisma,
       });
       return result(
         "delivered",

@@ -17,9 +17,13 @@ type MentionEvent = Extract<
   { type: typeof DispatchEventType.TrackerCommentMentioned }
 >;
 
-function event(parentId: string | null = "thread-root"): MentionEvent {
+function event(
+  parentId: string | null = "thread-root",
+  routed: { routedSessionId?: string; threadRelationship?: "thread" | "question" } = {},
+): MentionEvent {
   return {
     type: DispatchEventType.TrackerCommentMentioned,
+    ...routed,
     webhook: {
       type: "Comment" as const,
       action: "create" as const,
@@ -231,5 +235,91 @@ describe("createAgentMentionWorker", () => {
     await worker.execute(event(), context());
 
     expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Failed]);
+  });
+
+  test("registered threads route deterministically without the semantic router", async () => {
+    const forwarded: ForwardMessageOptions[] = [];
+    const worker = createAgentMentionWorker({
+      fetchContext: async () => ({
+        sourceIssueIdentifier: "CUBE-2827",
+        quotedText: null,
+        parentBody: "Should we ship?",
+        parentAuthor: "Agent",
+      }),
+      forward: async (options) => {
+        forwarded.push(options);
+        return delivered();
+      },
+      react: async () => true,
+    });
+
+    await worker.execute(
+      event("thread-root", { routedSessionId: "runtime-9" }),
+      context(),
+    );
+
+    const selectSession = forwarded[0]?.selectSession;
+    expect(selectSession).toBeDefined();
+    const decision = await selectSession!(context().config, {
+      sourceIssueIdentifier: "CUBE-2827",
+      sourceIssue: null,
+      comment: "ship it",
+      workerContext: { key: "product.agent-mention", routingHint: "" },
+      candidates: [
+        {
+          agentIssueId: "runtime-9",
+          agentIssueIdentifier: "runtime-9",
+          status: "Connected",
+          assigneeId: null,
+          labels: [],
+          runtime: {
+            harnessSessionId: "runtime-9",
+            parentSessionId: null,
+            worktreePath: "/wt",
+            branchName: null,
+            harness: "codex",
+            machine: "macbook-air",
+            role: "primary",
+            lifecycle: null,
+            sourceIssueIdentifier: "CUBE-2827",
+            runtimeSessionId: "runtime-9",
+          },
+        },
+      ],
+    });
+    expect(decision).toMatchObject({
+      targetAgentIssueIdentifier: "runtime-9",
+      reasonCode: "registered_thread",
+      confidence: 1,
+    });
+  });
+
+  test("question-thread replies are framed as answers", async () => {
+    const forwarded: ForwardMessageOptions[] = [];
+    const worker = createAgentMentionWorker({
+      fetchContext: async () => ({
+        sourceIssueIdentifier: "CUBE-2827",
+        quotedText: null,
+        parentBody: "Which approach?",
+        parentAuthor: "Agent",
+      }),
+      forward: async (options) => {
+        forwarded.push(options);
+        return delivered();
+      },
+      react: async () => true,
+    });
+
+    await worker.execute(
+      event("thread-root", {
+        routedSessionId: "runtime-9",
+        threadRelationship: "question",
+      }),
+      context(),
+    );
+
+    expect(forwarded[0]?.message).toStartWith(
+      "This answers your earlier question in this thread.",
+    );
   });
 });

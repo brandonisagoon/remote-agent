@@ -4,6 +4,7 @@ const CREATE_ISSUE_COMMENT = `
   mutation CreateIssueComment($issueId: String!, $body: String!) {
     commentCreate(input: { issueId: $issueId, body: $body }) {
       success
+      comment { id }
     }
   }
 `;
@@ -41,19 +42,21 @@ const ISSUE_COMMENTS = `
   }
 `;
 
+/** Returns the created comment's ID (so callers can register its thread),
+    or null on failure. */
 export async function createIssueComment(
   apiKey: string,
   issueId: string,
   body: string,
-): Promise<boolean> {
+): Promise<string | null> {
   try {
     const data = await linearGraphql<{
-      commentCreate: { success: boolean };
+      commentCreate: { success: boolean; comment: { id: string } | null };
     }>(apiKey, CREATE_ISSUE_COMMENT, { issueId, body });
-    return data.commentCreate.success;
+    return data.commentCreate.success ? (data.commentCreate.comment?.id ?? null) : null;
   } catch (error) {
     console.error(`Failed to create comment on issue ${issueId}:`, error);
-    return false;
+    return null;
   }
 }
 

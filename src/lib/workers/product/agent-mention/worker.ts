@@ -9,6 +9,10 @@ import {
   reactToComment,
 } from "../../../integrations/linear/reactions.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
+import {
+  registerThread,
+  resolveQuestionThread,
+} from "../../../services/sessions/threads.ts";
 import { buildAgentMentionMessage, excerpt } from "./message.ts";
 import { selectOutcomeReactions } from "./reactions.ts";
 
@@ -89,6 +93,26 @@ export function createAgentMentionWorker({
             ],
           };
 
+      const threadRootCommentId = data.parentId ?? data.id;
+      const routedSessionId = event.routedSessionId ?? null;
+      const answersQuestion = event.threadRelationship === "question";
+
+      let message = buildAgentMentionMessage(
+        sourceIssueIdentifier,
+        data.user?.name ?? null,
+        data.body,
+        {
+          quotedText: commentContext.quotedText,
+          parentBody: commentContext.parentBody,
+          parentAuthor: commentContext.parentAuthor,
+        },
+      );
+      if (answersQuestion) {
+        message = `This answers your earlier question in this thread.
+
+${message}`;
+      }
+
       const result = await forward({
         config: context.config,
         prisma: context.prisma,
@@ -100,17 +124,53 @@ export function createAgentMentionWorker({
             "Prefer the Primary session whose current activity owns the Linear thread. Planning replies belong to the active planning or orchestrated-planning session; description-augmentation replies belong to the active describe-linear-issue session; otherwise prefer the only eligible Primary.",
         },
         replyContext,
-        message: buildAgentMentionMessage(
-          sourceIssueIdentifier,
-          data.user?.name ?? null,
-          data.body,
-          {
-            quotedText: commentContext.quotedText,
-            parentBody: commentContext.parentBody,
-            parentAuthor: commentContext.parentAuthor,
-          },
-        ),
+        // Registered threads route deterministically; the semantic router is
+        // only the fallback when the registered session is no longer an
+        // eligible candidate (closed, role change).
+        ...(routedSessionId
+          ? {
+              selectSession: async (config, input) => {
+                const registered = input.candidates.find(
+                  (candidate) => candidate.runtime.runtimeSessionId === routedSessionId,
+                );
+                if (registered) {
+                  return {
+                    targetAgentIssueIdentifier: registered.agentIssueIdentifier,
+                    reasonCode: "registered_thread" as const,
+                    confidence: 1,
+                    expectedActions: [],
+                    replyToCommentId: null,
+                  };
+                }
+                const { selectSessionWithRouter } = await import(
+                  "../../../services/sessions/selection/index.ts"
+                );
+                return selectSessionWithRouter(config, input);
+              },
+            }
+          : {}),
+        message,
       });
+
+      // Keep the registry current: successful deliveries own their thread,
+      // and an answered question thread becomes a plain conversation.
+      if (result.status === "delivered" && result.targetAgentIssueIdentifier) {
+        await registerThread(context.prisma, {
+          provider: "linear",
+          connectionId: context.config.activeConnectionId,
+          threadRootCommentId,
+          runtimeSessionId: result.targetAgentIssueIdentifier,
+          relationship: "thread",
+        }).catch(() => undefined);
+        if (answersQuestion && routedSessionId) {
+          await resolveQuestionThread(context.prisma, {
+            provider: "linear",
+            connectionId: context.config.activeConnectionId,
+            threadRootCommentId,
+            runtimeSessionId: routedSessionId,
+          }).catch(() => undefined);
+        }
+      }
 
       for (const reaction of selectOutcomeReactions(result)) {
         await react(context.config.linearApiKey, data.id, reaction);

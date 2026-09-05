@@ -24,6 +24,7 @@ function baseSession(): AgentRuntimeSession {
     machineId: "macbook-air",
     role: null,
     lifecycle: null,
+    workflowId: null,
     cwd: "/repo",
     name: "Zed test",
     worktreePath: "/repo",
@@ -91,7 +92,9 @@ class FakeRuntime implements AgentSessionRuntime {
   async history() {
     return this.historyMessages;
   }
-  startTurn(): AgentRuntimeTurn {
+  lastTurnInput: Parameters<AgentSessionRuntime["startTurn"]>[0] | null = null;
+  startTurn(input: Parameters<AgentSessionRuntime["startTurn"]>[0]): AgentRuntimeTurn {
+    this.lastTurnInput = input;
     const events = this.turnEvents;
     return {
       requestId: "request-1",
@@ -164,10 +167,19 @@ class FakeRuntime implements AgentSessionRuntime {
   async shutdown() {}
 }
 
-function connection(updates: acp.SessionNotification[]) {
+function connection(
+  updates: acp.SessionNotification[],
+  options: {
+    elicit?: (request: acp.CreateElicitationRequest) => Promise<acp.CreateElicitationResponse>;
+  } = {},
+) {
   return {
     async sessionUpdate(notification: acp.SessionNotification) {
       updates.push(notification);
+    },
+    async createElicitation(request: acp.CreateElicitationRequest) {
+      if (!options.elicit) throw new Error("elicitation unsupported");
+      return options.elicit(request);
     },
   } as unknown as acp.AgentSideConnection;
 }
@@ -400,5 +412,52 @@ describe("Remote Agent ACP proxy", () => {
       acpxRecordId: "record-1",
     });
     expect(runtime.ensures).toHaveLength(0);
+  });
+
+  test("forwards planning questions to the client and relays the answer", async () => {
+    const runtime = new FakeRuntime();
+    const asked: acp.CreateElicitationRequest[] = [];
+    const agent = new RemoteAgentAcpAgent(
+      connection([], {
+        elicit: async (request) => {
+          asked.push(request);
+          return { action: "accept", content: { approach: "incremental" } };
+        },
+      }),
+      runtime,
+      testConfig(),
+    );
+    await initialize(agent);
+    await agent.prompt({
+      sessionId: "runtime-1",
+      prompt: [{ type: "text", text: "plan it" }],
+    });
+
+    const handler = runtime.lastTurnInput?.onElicitation;
+    expect(handler).toBeDefined();
+    const request = {
+      sessionId: "runtime-1",
+      mode: "form",
+      title: "Pick an approach",
+    } as unknown as acp.CreateElicitationRequest;
+    const answer = await handler!(request, { signal: new AbortController().signal });
+    expect(asked).toHaveLength(1);
+    expect(answer).toMatchObject({ action: "accept", content: { approach: "incremental" } });
+  });
+
+  test("cancels planning questions when the client cannot render them", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(agent);
+    await agent.prompt({
+      sessionId: "runtime-1",
+      prompt: [{ type: "text", text: "plan it" }],
+    });
+    const handler = runtime.lastTurnInput?.onElicitation;
+    const answer = await handler!(
+      { sessionId: "runtime-1" } as unknown as acp.CreateElicitationRequest,
+      { signal: new AbortController().signal },
+    );
+    expect(answer).toEqual({ action: "cancel" });
   });
 });

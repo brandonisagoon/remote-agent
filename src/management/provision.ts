@@ -34,11 +34,13 @@ export async function provision(log: (line: string) => void): Promise<void> {
   log(`  ${layout.root}`);
 
   log("==> Repository");
-  // Inherit the remote URL from the checkout this runs from, so the deploy
-  // clone authenticates the same way the working checkout already does.
+  // Prefer an explicit config remote, then the checkout's own origin (dev
+  // installs inherit its auth), then the canonical public repository — the
+  // brew/scoop-installed CLI runs from an unpacked tarball with no .git.
   const gitRemote =
-    file.machine?.installation?.gitRemote ??
-    (await run("git", ["-C", sourceRoot(), "remote", "get-url", "origin"])).output.trim();
+    file.machine?.installation?.gitRemote ||
+    (await run("git", ["-C", sourceRoot(), "remote", "get-url", "origin"])).output.trim() ||
+    "https://github.com/brandonisagoon/remote-agent.git";
   if (!existsSync(path.join(layout.repo, ".git"))) {
     if (!gitRemote) throw new Error("machine.installation.gitRemote is required when the source checkout has no origin");
     await runOrThrow("git", ["clone", "--quiet", "--depth=1", "--branch", branch, gitRemote, layout.repo]);

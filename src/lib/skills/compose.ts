@@ -78,6 +78,7 @@ async function runComposer(
 async function composeWorktreeSkill(
   worktreePath: string,
   selection: Pick<PromptSkillSelection, "skillset" | "flags">,
+  skillsRoot: string,
 ): Promise<ComposedSkill> {
   const cli = skillComposerPath(worktreePath);
   if (!cli) {
@@ -92,6 +93,8 @@ async function composeWorktreeSkill(
     ...selection.flags.flatMap((flag) => ["--flag", flag]),
     "--root",
     worktreePath,
+    "--config",
+    path.join(worktreePath, skillsRoot, "skill-composer.config.ts"),
   ];
   const { exitCode, stdout, stderr } = await runComposer(cli, args, worktreePath);
   let result: ComposeCliResult;
@@ -120,6 +123,7 @@ async function composeWorktreeSkill(
 export async function composeWorktreeSkills(
   worktreePath: string,
   selections: readonly PromptSkillSelection[],
+  skillsRoot = "agent-skills",
 ): Promise<Map<string, ComposedSkill>> {
   const composedBySelection = new Map<string, Promise<ComposedSkill>>();
   const entries = await Promise.all(
@@ -127,7 +131,7 @@ export async function composeWorktreeSkills(
       const key = [selection.skillset, ...selection.flags].join("+");
       let composed = composedBySelection.get(key);
       if (!composed) {
-        composed = composeWorktreeSkill(worktreePath, selection);
+        composed = composeWorktreeSkill(worktreePath, selection, skillsRoot);
         composedBySelection.set(key, composed);
       }
       return [selection.token, await composed] as const;
@@ -158,9 +162,10 @@ export async function composeForPrompt(
   worktreePath: string,
   prompt: string,
   harness: SkillHarness,
+  skillsRoot = "agent-skills",
 ): Promise<string> {
   const selections = skillsetsFromPrompt(prompt);
   if (selections.length === 0) return prompt;
-  const skills = await composeWorktreeSkills(worktreePath, selections);
+  const skills = await composeWorktreeSkills(worktreePath, selections, skillsRoot);
   return resolveSkillPlaceholders(prompt, harness, skills);
 }

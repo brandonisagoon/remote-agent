@@ -6,6 +6,7 @@ import { bunCommandClient } from "../../../../transports/command/index.ts";
 import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
 import type { LinearCommentWebhook } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
+import { findThreadSession } from "../../../../services/sessions/threads.ts";
 import { createWebhookReceipt } from "../receipt-store.ts";
 
 export type CommentWebhookResult =
@@ -34,9 +35,21 @@ export async function handleCommentWebhook(input: {
       agentUserId: config.agentUserId,
       agentHandle: config.agentHandle,
     });
+  // Registered threads are conversations: replies deliver without a mention,
+  // like replying to a person. Linear threads are single-level, so
+  // parentId ?? id is the thread root.
+  const threadRootCommentId = data.parentId ?? data.id;
+  const registration = selfAuthored
+    ? null
+    : await findThreadSession(prisma, {
+        provider: "linear",
+        connectionId: config.activeConnectionId,
+        threadRootCommentId,
+      });
+  const accepted = mentioned || registration !== null;
   const detail = selfAuthored
     ? "self_authored"
-    : mentioned
+    : accepted
       ? null
       : "no_agent_mention";
   const receipt = await createWebhookReceipt(prisma, {
@@ -45,14 +58,14 @@ export async function handleCommentWebhook(input: {
     repositoryId: config.activeRepositoryId,
     linearDeliveryId: deliveryId,
     eventType: "comment",
-    trigger: "mention",
+    trigger: mentioned ? "mention" : "thread",
     sourceIssueIdentifier: data.issue?.identifier ?? null,
     sourceCommentId: data.id,
-    status: mentioned ? "accepted" : "ignored",
+    status: accepted ? "accepted" : "ignored",
     detail,
   });
   if (!receipt) return { kind: "duplicate" };
-  if (!mentioned) return { kind: "ignored", reason: detail! };
+  if (!accepted) return { kind: "ignored", reason: detail! };
 
   void dispatchEvent({
     prisma,
@@ -60,7 +73,16 @@ export async function handleCommentWebhook(input: {
     commandClient: bunCommandClient,
     agentRuntime,
     receiptId: receipt.id,
-    event: { type: DispatchEventType.TrackerCommentMentioned, webhook },
+    event: {
+      type: DispatchEventType.TrackerCommentMentioned,
+      webhook,
+      ...(registration
+        ? {
+            routedSessionId: registration.runtimeSessionId,
+            threadRelationship: registration.relationship,
+          }
+        : {}),
+    },
   });
   return {
     kind: "accepted",

@@ -18,8 +18,10 @@ The managed repository provides:
 - any project-specific tools, dependencies, or authentication needed by the
   configured Codex/Claude commands.
 
-The bootstrap command should be idempotent and must create the workspace stamp
-files expected by the worktree readiness check.
+The bootstrap command should be idempotent, must create the workspace stamp
+files expected by the worktree readiness check, and must install the
+repository's dependencies — workflow skill composition runs the repository's
+own `node_modules/.bin/skill-composer` inside the fresh worktree.
 
 ## Service-owned contract
 
@@ -34,7 +36,18 @@ Remote Agent owns:
   skill-composer binary, executed in a child process);
 - stable runtime identity, session labels, relationships, and integration links in SQLite;
 - acpx/provider execution and Zed ACP translation;
-- registry-backed routing and shutdown.
+- registry-backed routing and shutdown;
+- conversation-thread registration: once a thread is routed to a session,
+  replies in it deliver deterministically without an @mention or a router
+  call. Sessions can register their own threads (and mark them as pending
+  questions) via `PUT /sessions/:id/threads`;
+- plan capture: a `start-session` workflow with
+  `plan: { captureToIssue: true, thenState? }` (claude provider only)
+  launches its session in plan mode; the daemon persists the plan into the
+  source issue's `## Implementation Plan` section on exit-plan-mode approval
+  — updated in place on re-plans — and transitions the issue only after the
+  write succeeded. Repository skills should not write the plan or move the
+  issue themselves.
 
 Label groups and their allowed labels live under the repository that owns
 them. SQLite stores only string keys and values. The names in the example

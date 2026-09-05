@@ -71,6 +71,7 @@ export function toAgentRuntimeSession(row: NonNullable<RuntimeRow>): AgentRuntim
     machineId: row.machineId,
     role: row.role,
     lifecycle: row.lifecycle,
+    workflowId: row.workflowId,
     cwd: row.cwd,
     name: row.name,
     worktreePath: row.worktreePath,
@@ -130,6 +131,9 @@ export async function beginRuntimeSession(
       machineId,
       role,
       lifecycle,
+      // Provenance, deliberately outside creationMetadataHash: it does not
+      // participate in scope-identity conflicts.
+      workflowId: input.workflowId ?? null,
       creationMetadataHash,
       cwd,
       name: input.name ?? input.sessionKey,

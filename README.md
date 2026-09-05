@@ -2,8 +2,9 @@
 
 Run durable coding-agent sessions on your own machine, driven from Linear.
 Mention or assign the agent on an issue and Remote Agent starts a session in
-an isolated worktree, routes follow-up comments to the right session, and
-posts links that open the work in your editor. Sessions are executed by
+an isolated worktree, routes follow-up comments to the right session (replies
+in an established thread need no re-mention), and posts links that open the
+work in your editor. Sessions are executed by
 [acpx](https://acpx.sh/) using the provider CLIs you already have — Codex
 and/or Claude Code — with your own subscriptions and credentials.
 
@@ -78,7 +79,11 @@ rebuild, migrate, restart — rolls back on failure), `uninstall [--purge]`.
   (a state change, a reaction) by composing one of the repo's own
   [skill-composer](https://github.com/brandonisagoon/skill-composer) skillsets
   into the worktree and either starting a session or messaging the running
-  one.
+  one. A workflow can also start its session in plan mode: the daemon
+  captures the finished plan when the agent asks to exit plan mode, writes it
+  into the source issue's description under `## Implementation Plan`, and
+  then moves the issue to a configured state — the agent never touches Linear
+  for either step.
 - When a session's worktree is ready, the Linear issue gets one deep link per
   configured editor — opening locally, or over SSH when your editors run on a
   different machine than the daemon.

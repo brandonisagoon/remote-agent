@@ -85,7 +85,11 @@
             "flags": []
           },
           "deliver": "start-session",
-          "providerId": "codex"
+          "providerId": "claude",
+          "plan": {
+            "captureToIssue": true,
+            "thenState": "Planned"
+          }
         },
         "review": {
           "on": "issue.state-changed",

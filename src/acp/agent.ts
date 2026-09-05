@@ -158,6 +158,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
     return {
       sessionId: session.id,
       configOptions: this.configOptions(session),
+      modes: this.sessionModes(session),
       _meta: this.sessionMeta(session),
     };
   }
@@ -181,6 +182,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
     this.publishUsageAfterSetup(session);
     return {
       configOptions: this.configOptions(session),
+      modes: this.sessionModes(session),
       _meta: this.sessionMeta(session),
     };
   }
@@ -289,6 +291,16 @@ export class RemoteAgentAcpAgent implements acp.Agent {
       sessionId: params.sessionId,
       text: message,
       mode: "prompt",
+      // Planning questions surface as ACP elicitations; forward them to this
+      // client and relay its answer. A client that can't render them (or
+      // errors) cancels the question rather than fabricating an answer.
+      onElicitation: async (request) => {
+        try {
+          return await this.connection.createElicitation(request);
+        } catch {
+          return { action: "cancel" };
+        }
+      },
     });
     this.activeTurns.set(params.sessionId, turn);
     try {
@@ -331,6 +343,27 @@ export class RemoteAgentAcpAgent implements acp.Agent {
         .cancel(params.sessionId, "Cancelled by Zed")
         .catch((error) => acpLog(`cancel failed for ${params.sessionId}`, error));
     }
+  }
+
+  /** First-class ACP mode state, derived from the provider's mode config
+      option so clients that render `modes` (rather than config options) get
+      the same picker. */
+  private sessionModes(
+    session: AgentRuntimeSession,
+  ): acp.SessionModeState | null {
+    const option = session.configOptions.find(optionIsMode);
+    if (!option || option.type !== "select") return null;
+    const flattened = option.options.flatMap((entry) =>
+      "options" in entry ? entry.options : [entry],
+    );
+    if (flattened.length === 0) return null;
+    return {
+      currentModeId: option.currentValue,
+      availableModes: flattened.map((entry) => ({
+        id: entry.value,
+        name: entry.name,
+      })),
+    };
   }
 
   private configOptions(session: AgentRuntimeSession): acp.SessionConfigOption[] {

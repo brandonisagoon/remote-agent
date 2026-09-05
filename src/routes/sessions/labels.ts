@@ -7,6 +7,10 @@ import {
   removeSessionLabel,
   setSessionLabel,
 } from "../../lib/services/sessions/session-metadata.ts";
+import {
+  registerThread,
+  unregisterThread,
+} from "../../lib/services/sessions/threads.ts";
 
 const SetTagSchema = z.object({
   key: z.string().min(1),
@@ -145,6 +149,42 @@ routes.delete("/:sessionId/labels/:key", async (c) => {
     const message = error instanceof Error ? error.message : String(error);
     return c.json({ error: message }, message.includes("revision conflict") ? 409 : 400);
   }
+});
+
+const RegisterThreadSchema = z.object({
+  commentId: z.string().min(1),
+  relationship: z.enum(["thread", "question"]).default("thread"),
+});
+
+// Sessions (via their hook scripts) register conversation threads they own —
+// e.g. "I asked a question in comment X" — so replies route deterministically
+// and question answers arrive explicitly framed.
+routes.put("/:sessionId/threads", async (c) => {
+  const parsed = RegisterThreadSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "commentId is required" }, 400);
+  const sessionId = c.req.param("sessionId");
+  const prisma = c.get("prisma");
+  const session = await prisma.runtimeSession.findUnique({ where: { id: sessionId } });
+  if (!session) return c.json({ error: "unknown session" }, 404);
+  await registerThread(prisma, {
+    provider: "linear",
+    connectionId: c.get("config").activeConnectionId,
+    threadRootCommentId: parsed.data.commentId,
+    runtimeSessionId: sessionId,
+    relationship: parsed.data.relationship,
+  });
+  return c.json({ registered: true });
+});
+
+routes.delete("/:sessionId/threads/:commentId", async (c) => {
+  const prisma = c.get("prisma");
+  await unregisterThread(prisma, {
+    provider: "linear",
+    connectionId: c.get("config").activeConnectionId,
+    threadRootCommentId: c.req.param("commentId"),
+    runtimeSessionId: c.req.param("sessionId"),
+  });
+  return c.json({ registered: false });
 });
 
 export default routes;

@@ -33,6 +33,7 @@ export interface RoutingInput {
 }
 
 export const RouteReasonSchema = z.enum([
+  "registered_thread",
   "workflow_match",
   "primary_session",
   "only_eligible_candidate",

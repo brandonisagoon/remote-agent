@@ -4,12 +4,15 @@ import { applyPragmas, createPrismaClient } from "./lib/prisma.ts";
 import { createAcpxSessionRuntime } from "./lib/transports/acpx/index.ts";
 import { startAcpIpcServer } from "./acp/ipc-server.ts";
 import { acquireRuntimeOwnership } from "./lib/services/sessions/runtime-owner.ts";
+import { createPlanCaptureInterceptor } from "./lib/services/sessions/plan-capture.ts";
 
 const config = readConfig();
 const runtimeOwnership = acquireRuntimeOwnership(config);
 const prisma = createPrismaClient(config.databaseUrl);
 await applyPragmas(prisma);
-const agentRuntime = createAcpxSessionRuntime(prisma, config);
+const agentRuntime = createAcpxSessionRuntime(prisma, config, {
+  onPermissionRequest: createPlanCaptureInterceptor({ prisma, config }),
+});
 const acpIpcServer = await startAcpIpcServer({ config, runtime: agentRuntime });
 
 const app = createApp({ config, agentRuntime, prisma });

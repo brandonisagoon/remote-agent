@@ -22,13 +22,13 @@ describe("Linear issue comments", () => {
     globalThis.fetch = (async (_input, init) => {
       requests.push(JSON.parse(String(init?.body)));
       return Response.json({
-        data: { commentCreate: { success: true } },
+        data: { commentCreate: { success: true, comment: { id: "comment-1" } } },
       });
     }) as typeof fetch;
 
     expect(
       await createIssueComment("linear-key", "issue-id", "comment body"),
-    ).toBe(true);
+    ).toBe("comment-1");
     expect(requests).toHaveLength(1);
     expect(requests[0]?.query).toContain("commentCreate");
     expect(requests[0]?.variables).toEqual({
@@ -44,7 +44,7 @@ describe("Linear issue comments", () => {
 
     expect(
       await createIssueComment("linear-key", "issue-id", "comment body"),
-    ).toBe(false);
+    ).toBeNull();
   });
 
   test("creates top-level and threaded comments and returns their ids", async () => {

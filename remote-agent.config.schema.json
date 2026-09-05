@@ -518,6 +518,23 @@
                 "model": {
                   "type": "string",
                   "minLength": 1
+                },
+                "plan": {
+                  "type": "object",
+                  "properties": {
+                    "captureToIssue": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "thenState": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "captureToIssue"
+                  ],
+                  "additionalProperties": false
                 }
               },
               "required": [

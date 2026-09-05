@@ -22,6 +22,7 @@ export interface SessionSummary {
     resourceType: string;
     externalId: string;
     relationship: string;
+    endedAt: string | null;
   }>;
 }
 

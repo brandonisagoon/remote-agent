@@ -31,6 +31,7 @@ export function fakeRuntimeSession(
     machineId: "macbook-air",
     role: null,
     lifecycle: null,
+    workflowId: null,
     cwd: "/tmp/repo",
     name: input.id,
     worktreePath: "/tmp/repo",

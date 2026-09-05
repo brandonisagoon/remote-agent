@@ -73,6 +73,14 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
               </TableCell>
               <TableCell>
                 <Badge variant={session.status === "active" ? "default" : "secondary"}>{session.status}</Badge>
+                {session.resourceLinks.some(
+                  (link) =>
+                    link.resourceType === "comment-thread" &&
+                    link.relationship === "question" &&
+                    !link.endedAt,
+                ) && (
+                  <div className="text-muted-foreground/70 mt-0.5 text-xs">awaiting reply</div>
+                )}
               </TableCell>
               <TableCell className="text-muted-foreground">{session.role ?? "—"}</TableCell>
               <TableCell>{session.agentCommand}</TableCell>

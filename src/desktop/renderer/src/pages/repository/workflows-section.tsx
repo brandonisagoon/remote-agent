@@ -266,7 +266,10 @@ function WorkflowEditor({
             <Label>Delivery</Label>
             <Select
               value={workflow.deliver}
-              onValueChange={(next) => edit((entry) => { entry.deliver = next as Workflow["deliver"]; })}
+              onValueChange={(next) => edit((entry) => {
+                entry.deliver = next as Workflow["deliver"];
+                if (entry.deliver !== "start-session") entry.plan = undefined;
+              })}
             >
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
@@ -275,6 +278,36 @@ function WorkflowEditor({
               </SelectContent>
             </Select>
           </div>
+          {workflow.deliver === "start-session" && (
+            <div className="grid gap-2">
+              <Label>Plan</Label>
+              <label className="flex items-center gap-2 text-sm">
+                <Checkbox
+                  checked={workflow.plan?.captureToIssue === true}
+                  onCheckedChange={(next) => edit((entry) => {
+                    entry.plan = next === true ? { captureToIssue: true } : undefined;
+                  })}
+                />
+                <span>Write the plan to the source issue</span>
+              </label>
+              {workflow.plan && (
+                <>
+                  <Input
+                    value={workflow.plan.thenState ?? ""}
+                    placeholder="Then move issue to state (optional)"
+                    onChange={(event) => edit((entry) => {
+                      const state = event.target.value.trim();
+                      entry.plan = { captureToIssue: true, ...(state ? { thenState: state } : {}) };
+                    })}
+                  />
+                  <p className="text-muted-foreground text-xs">
+                    The session starts in plan mode; the plan is saved under "## Implementation
+                    Plan" in the issue description before the state changes. Claude only.
+                  </p>
+                </>
+              )}
+            </div>
+          )}
         </div>
         <DialogFooter>
           <Button onClick={onClose}>Done</Button>

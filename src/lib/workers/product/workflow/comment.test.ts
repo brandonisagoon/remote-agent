@@ -146,7 +146,7 @@ describe("orchestration worktree link comment", () => {
         hasCommentContaining: async () => true,
         createComment: async (_key, _issueId, body) => {
           created.push(body);
-          return true;
+          return "comment-1";
         },
       },
     );
@@ -183,7 +183,7 @@ describe("orchestration worktree link comment", () => {
         createComment: async (_key, issueId, body) => {
           events.push("create");
           created.push({ issueId, body });
-          return true;
+          return "comment-1";
         },
       },
     );
@@ -218,7 +218,7 @@ describe("orchestration worktree link comment", () => {
           return true;
         },
         hasCommentContaining: async () => true,
-        createComment: async () => true,
+        createComment: async () => "comment-1",
       },
     );
 
@@ -241,7 +241,7 @@ describe("orchestration worktree link comment", () => {
       {
         waitForReady: async () => true,
         hasCommentContaining: async () => false,
-        createComment: async () => false,
+        createComment: async () => null,
       },
     );
 
@@ -262,7 +262,7 @@ describe("orchestration worktree link comment", () => {
         hasCommentContaining: async () => {
           throw new Error("unexpected");
         },
-        createComment: async () => true,
+        createComment: async () => "comment-1",
       },
     );
 
@@ -287,7 +287,7 @@ describe("orchestration worktree link comment", () => {
         },
         createComment: async () => {
           linearCalls += 1;
-          return true;
+          return "comment-1";
         },
       },
     );

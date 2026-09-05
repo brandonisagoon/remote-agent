@@ -23,6 +23,11 @@ export interface SpawnAgentThreadInput {
   role: SessionRole;
   title?: string;
   parentSessionId?: string;
+  /** Launch provenance recorded on the session (plan capture resolves the
+      live workflow configuration through it). */
+  workflowId?: string;
+  /** Session mode set before the initial prompt enqueues (e.g. "plan"). */
+  mode?: string;
 }
 
 /** Ensure one durable, metadata-complete acpx session and enqueue its initial
@@ -41,6 +46,7 @@ export async function spawnAgentThread(
     machineId: input.machine,
     role: input.role,
     lifecycle: input.lifecycle,
+    ...(input.workflowId ? { workflowId: input.workflowId } : {}),
     relations: input.parentSessionId
       ? [{ relationship: "spawned-by", targetSessionId: input.parentSessionId }]
       : [],
@@ -55,6 +61,9 @@ export async function spawnAgentThread(
   });
 
   try {
+    // Mode must land before the prompt: a plan-capture session that starts
+    // its turn outside plan mode never produces an exit-plan approval.
+    if (input.mode) await input.agentRuntime.setMode(session.id, input.mode);
     await input.agentRuntime.enqueue({
       sessionId: session.id,
       text: input.prompt,

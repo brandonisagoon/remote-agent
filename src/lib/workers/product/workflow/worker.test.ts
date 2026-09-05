@@ -172,6 +172,47 @@ describe("workflow worker", () => {
     expect(result.detail).toContain("no longer configured");
   });
 
+  test("launches carry workflow provenance and plan mode when capture is on", async () => {
+    const record = recorded();
+    const worker = createWorkflowWorker(dependencies(record));
+    const base = testConfig();
+    const repository = {
+      ...base.repository,
+      workflows: {
+        ...base.repository.workflows,
+        "plan-capture": {
+          id: "plan-capture",
+          connectionId: null,
+          on: "issue.state-changed" as const,
+          when: null,
+          skill: { skillset: "orchestrate", flags: [] },
+          deliver: "start-session" as const,
+          providerId: "claude" as const,
+          model: null,
+          plan: { captureToIssue: true as const, thenState: "Planned" },
+        },
+      },
+    };
+    const planContext = {
+      ...context(),
+      config: { ...base, repository, repositories: { [repository.id]: repository } },
+    };
+    const result = await worker.execute(issueEvent("plan-capture") as never, planContext);
+    expect(result.status).toBe("delivered");
+    const launch = record.launched[0]!;
+    expect(launch.workflowId).toBe("plan-capture");
+    expect(launch.mode).toBe("plan");
+  });
+
+  test("launches without plan capture set provenance but no mode", async () => {
+    const record = recorded();
+    const worker = createWorkflowWorker(dependencies(record));
+    await worker.execute(issueEvent("plan") as never, context());
+    const launch = record.launched[0]!;
+    expect(launch.workflowId).toBe("plan");
+    expect(launch.mode).toBeUndefined();
+  });
+
   test("seed prompts embed the flagged skill token", () => {
     const prompt = buildWorkflowSeedPrompt(
       {
@@ -183,6 +224,7 @@ describe("workflow worker", () => {
         deliver: "start-session",
         providerId: null,
         model: null,
+        plan: null,
       },
       { branchName: "feature/x" },
     );

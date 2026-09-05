@@ -46,6 +46,7 @@ export function testConfig(
         deliver: "start-session" as const,
         providerId: "codex" as const,
         model: null,
+        plan: null,
       },
       review: {
         id: "review",
@@ -56,6 +57,7 @@ export function testConfig(
         deliver: "message-session" as const,
         providerId: null,
         model: null,
+        plan: null,
       },
       describe: {
         id: "describe",
@@ -66,6 +68,7 @@ export function testConfig(
         deliver: "start-session" as const,
         providerId: "claude" as const,
         model: "opus",
+        plan: null,
       },
     },
     labels: {},

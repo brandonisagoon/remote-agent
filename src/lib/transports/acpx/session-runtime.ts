@@ -8,6 +8,9 @@ import type {
 } from "acpx/runtime";
 import {
   createAcpRuntime,
+  type AcpElicitationResponse,
+  type AcpPermissionDecision,
+  type AcpPermissionRequest,
   createAgentRegistry,
   createRuntimeStore,
 } from "acpx/runtime";
@@ -34,6 +37,8 @@ import {
 } from "../../services/sessions/runtime-registry.ts";
 import { resolveInitialSessionLabels } from "../../services/sessions/session-metadata.ts";
 import type {
+  AgentElicitationHandler,
+  AgentPermissionInterceptor,
   AgentRuntimeEvent,
   AgentRuntimeMessage,
   AgentRuntimeSession,
@@ -147,6 +152,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   constructor(
     private readonly prisma: PrismaClient,
     private readonly config: ServerConfig,
+    private readonly options: {
+      onPermissionRequest?: AgentPermissionInterceptor;
+    } = {},
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
     this.runtime = createAcpRuntime({
@@ -159,7 +167,57 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
       elicitationModes: ["form", "url"],
+      // Consulted before approve-all answers; undefined falls through to it.
+      ...(options.onPermissionRequest
+        ? {
+            onPermissionRequest: (request, context) =>
+              this.interceptPermissionRequest(request, context),
+          }
+        : {}),
     });
+  }
+
+  private async interceptPermissionRequest(
+    request: AcpPermissionRequest,
+    context: { signal: AbortSignal },
+  ): Promise<AcpPermissionDecision | undefined> {
+    const interceptor = this.options.onPermissionRequest;
+    if (!interceptor) return undefined;
+    try {
+      const sessionId = await this.sessionIdForAcpSession(request.sessionId);
+      if (!sessionId) return undefined;
+      const decision = await interceptor(
+        { sessionId, raw: request.raw },
+        context,
+      );
+      return decision ? { outcome: decision.outcome } : undefined;
+    } catch {
+      // Interception is observational; a broken interceptor must never
+      // block the turn — the runtime's own policy answers instead.
+      return undefined;
+    }
+  }
+
+  /** Maps the agent's ACP session ID (what permission requests carry) back
+      to the Remote Agent session ID: live handles first, database second. */
+  private async sessionIdForAcpSession(
+    acpSessionId: string,
+  ): Promise<string | null> {
+    for (const [sessionId, handle] of this.handles) {
+      if (handle.agentSessionId === acpSessionId) return sessionId;
+    }
+    const row = await this.prisma.runtimeSession.findFirst({
+      where: {
+        OR: [
+          { agentSessionId: acpSessionId },
+          { acpxSessionId: acpSessionId },
+          { id: acpSessionId },
+        ],
+        status: { not: "closed" },
+      },
+      select: { id: true },
+    });
+    return row?.id ?? null;
   }
 
   async ensureSession(
@@ -250,6 +308,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn {
     const requestId = input.requestId ?? randomUUID();
     const queue = new AsyncPushQueue<AgentRuntimeEvent>();
@@ -286,6 +345,27 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           mode: input.mode ?? "prompt",
           requestId,
           signal: input.signal,
+          // Planning questions: forwarded to the attached ACP client when a
+          // handler is provided; otherwise acpx resolves non-interactively.
+          // The SDK response allows open-ended actions; acpx accepts only
+          // accept/decline/cancel, so anything else degrades to cancel.
+          ...(input.onElicitation
+            ? {
+                onElicitation: async (request, context): Promise<AcpElicitationResponse> => {
+                  const response = await input.onElicitation!(request, {
+                    signal: context.signal,
+                  });
+                  if (response.action === "accept") {
+                    return {
+                      action: "accept",
+                      content: (response.content ?? null) as Extract<AcpElicitationResponse, { action: "accept" }>["content"],
+                    };
+                  }
+                  if (response.action === "decline") return { action: "decline" };
+                  return { action: "cancel" };
+                },
+              }
+            : {}),
         });
         this.activeTurns.set(session.id, current);
         let index = 0;
@@ -686,6 +766,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
 export function createAcpxSessionRuntime(
   prisma: PrismaClient,
   config: ServerConfig,
+  options: { onPermissionRequest?: AgentPermissionInterceptor } = {},
 ): AgentSessionRuntime {
-  return new AcpxSessionRuntime(prisma, config);
+  return new AcpxSessionRuntime(prisma, config, options);
 }

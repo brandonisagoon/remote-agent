@@ -18,6 +18,10 @@ export type DispatchEvent =
   | {
       type: typeof DispatchEventType.TrackerCommentMentioned;
       webhook: TrackerCommentWebhook;
+      /** Set when the comment's thread is registered to a session: delivery
+          bypasses the semantic router. */
+      routedSessionId?: string;
+      threadRelationship?: "thread" | "question";
     }
   | {
       type: typeof DispatchEventType.TrackerWorkflowTriggered;

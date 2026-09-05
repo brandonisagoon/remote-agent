@@ -134,6 +134,28 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("no SSH link format");
   });
 
+  test("resolves workflow plan capture and rejects invalid combinations", () => {
+    const value: any = serviceFile();
+    value.repositories.example.workflows.plan.plan = {
+      captureToIssue: true,
+      thenState: "Planned",
+    };
+    writeConfig(value);
+    expect(readConfig().repository.workflows.plan!.plan).toEqual({
+      captureToIssue: true,
+      thenState: "Planned",
+    });
+
+    value.repositories.example.workflows.plan.deliver = "message-session";
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("plan capture requires deliver: start-session");
+
+    value.repositories.example.workflows.plan.deliver = "start-session";
+    value.repositories.example.workflows.plan.providerId = "codex";
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("plan capture requires the claude provider");
+  });
+
   test("rejects the legacy fleet-shaped config with migration guidance", () => {
     const value: any = serviceFile();
     delete value.schemaVersion;

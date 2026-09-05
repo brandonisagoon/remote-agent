@@ -13,6 +13,9 @@ model RuntimeSession {
   machineId           String    @default("unknown")
   role                String?
   lifecycle           String?
+  /// Launch provenance: the configured workflow that started this session.
+  /// Resolved back to live workflow configuration (e.g. plan capture) later.
+  workflowId          String?
   creationMetadataHash String?
   metadataRevision     Int       @default(0)
   cwd                 String
