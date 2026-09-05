@@ -1,151 +1,717 @@
-import path from "node:path";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
+import path from "node:path";
 
+import { z } from "zod";
+
+import { sshLinkSupported } from "./machines/editor-link.ts";
+import { defaultInstallRoot } from "../management/paths.ts";
 import {
-  DEFAULT_MACHINE_ID,
+  configureMachines,
   MachineSchema,
   type Machine,
+  type MachineRecord,
 } from "./machines/index.ts";
+import type { Harness } from "../types/runtime/index.ts";
 
-// Read directly from env with explicit defaults, matching
-// apps/api/src/lib/config.ts.
-//
-// Every required value is resolved at startup so a misconfigured environment is
-// a loud boot failure. That is load-bearing for deploys: the service never
-// comes up half-configured, so the health-check gate fails and rolls back.
-
-/** Linear caps webhook payloads well below this; the limit stops an unbounded
- * body from being buffered before the signature is even checked. */
+/** Linear caps webhook payloads well below this size. */
 export const MAX_REQUEST_BYTES = 1_000_000;
 
+const PositiveIntegerSchema = z.number().int().positive();
+const CommandSchema = z.array(z.string().min(1)).min(1);
+const ConfigIdSchema = z
+  .string()
+  .min(1)
+  .regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/);
+const RepositoryRelativePathSchema = z
+  .string()
+  .min(1)
+  .refine((value) => !path.isAbsolute(value), "must be relative to the repository");
+const RoutingConditionSchema = z.record(
+  z.string().min(1),
+  z.array(z.string().min(1)).min(1),
+);
+/** Trigger -> conditions -> skill -> delivery. Skills are repo-owned
+    skill-composer skillsets; remote-agent only matches events and runs the
+    compose pipeline. */
+const RepositoryWorkflowSchema = z.object({
+  /** Restricts the workflow to events arriving via one connection. */
+  connectionId: ConfigIdSchema.optional(),
+  on: z.enum(["issue.state-changed", "issue.reaction"]),
+  /** OR of AND-groups over event fields (same semantics as connection
+      repository routing). Absent = always. */
+  when: z.array(RoutingConditionSchema).min(1).optional(),
+  skill: z.object({
+    skillset: z.string().min(1),
+    flags: z.array(z.string().min(1)).default([]),
+  }),
+  deliver: z.enum(["start-session", "message-session"]),
+  /** Session provider; defaults to the machine's ACP provider. */
+  providerId: z.enum(["codex", "claude"]).optional(),
+  model: z.string().min(1).optional(),
+  /** start-session only: launch the session in plan mode; the daemon captures
+      the plan on exit-plan-mode approval, writes it into the source issue's
+      "## Implementation Plan" section, and (if thenState is set) transitions
+      the issue. Requires the claude provider — codex has no plan mode. */
+  plan: z
+    .object({
+      captureToIssue: z.literal(true),
+      thenState: z.string().min(1).optional(),
+    })
+    .optional(),
+});
+/** One label group (Linear-style): a dimension sessions are labeled by.
+    `labels` lists the allowed labels (absent = free text); `exclusive` means
+    a session holds one label from the group at a time. */
+const LabelGroupSchema = z.object({
+  description: z.string().min(1).optional(),
+  labels: z.array(z.string().min(1)).min(1).optional(),
+  exclusive: z.boolean().default(true),
+  routerVisible: z.boolean().default(false),
+});
+
+const RepositorySchema = z.object({
+  name: z.string().min(1).optional(),
+  root: z.string().min(1),
+  worktreeRoot: z.string().min(1),
+  bootstrapCommand: CommandSchema,
+  /** Where the skill-composer inputs live, relative to root. */
+  skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
+  workflows: z.record(ConfigIdSchema, RepositoryWorkflowSchema).default({}),
+  /** Label groups sessions in this repository are labeled by. */
+  labels: z.record(ConfigIdSchema, LabelGroupSchema).default({}),
+  /** Labels stamped on every new session, keyed by group. */
+  sessionDefaults: z
+    .object({
+      labels: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
+    })
+    .default({ labels: {} }),
+});
+const WebhookSchema = z.object({
+  /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
+  slug: ConfigIdSchema,
+  secret: z.string().min(1),
+  webhookMaxAgeMs: PositiveIntegerSchema.default(60_000),
+});
+const RouterSchema = z
+  .object({
+    /** Provider that runs the session-routing prompt. */
+    providerId: z.enum(["codex", "claude"]).default("codex"),
+    model: z.string().min(1).optional(),
+    timeoutMs: PositiveIntegerSchema.default(30_000),
+  })
+  .default({ providerId: "codex", timeoutMs: 30_000 });
+const EditorSchema = z.object({
+  /** Display name of the editor app (e.g. "Zed"). */
+  name: z.string().min(1).default("Zed"),
+  /** URL scheme used for worktree deep links. */
+  scheme: z.string().min(1).default("zed"),
+});
+const LinearConnectionSchema = z.object({
+  provider: z.literal("linear"),
+  name: z.string().min(1),
+  apiKey: z.string().min(1),
+  agentUserId: z.string().min(1),
+  agentHandle: z.string().min(1).optional(),
+  /** The machine that serves this connection's webhook and runs its sessions. */
+  machineId: MachineSchema.optional(),
+  /** Repositories this connection's sessions may work in; "*" subscribes
+      every repository, present and future. */
+  repositories: z.union([
+    z.literal("*"),
+    z.record(
+      ConfigIdSchema,
+      z.object({
+        when: z.array(RoutingConditionSchema).min(1).optional(),
+      }),
+    ),
+  ]).default("*"),
+  webhook: WebhookSchema.optional(),
+  /** Routes this connection's incoming events to sessions. */
+  router: RouterSchema,
+  /** The editors worktree deep links open for this workspace's viewers. */
+  editors: z.array(EditorSchema).default([{ name: "Zed", scheme: "zed" }]),
+});
+const ConnectionSchema = LinearConnectionSchema;
+const AcpxSchema = z
+  .object({
+    stateDir: z.string().min(1).optional(),
+  })
+  .default({});
+// Presence enables the provider in the UI; command (optional) overrides
+// acpx's built-in adapter launch profile.
+const ProvidersSchema = z
+  .object({
+    codex: z.object({ command: CommandSchema.optional() }).optional(),
+    claude: z.object({ command: CommandSchema.optional() }).optional(),
+  })
+  .default({});
+
+export const ServiceFileSchema = z.object({
+  $schema: z.string().optional(),
+  schemaVersion: z.literal(2),
+  serviceName: z
+    .string()
+    .min(1)
+    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+  machine: z.object({
+    id: MachineSchema,
+    name: z.string().min(1),
+    server: z.object({
+      publicUrl: z.string().min(1),
+      apiKey: z.string().min(1),
+      listen: z.object({
+        host: z.string().min(1).default("127.0.0.1"),
+        port: PositiveIntegerSchema.default(9000),
+      }).default({ host: "127.0.0.1", port: 9000 }),
+      databaseUrl: z.string().min(1).optional(),
+      acpSocketPath: z.string().min(1).optional(),
+      controlSocketPath: z.string().min(1).optional(),
+    }),
+    /** How editors reach this machine over SSH (e.g. user@host). */
+    sshHost: z.string().min(1).optional(),
+    acpx: AcpxSchema,
+    acp: z.object({
+      hostId: z.string().min(1).optional(),
+      providerId: z.enum(["codex", "claude"]).default("codex"),
+      model: z.string().min(1).optional(),
+    }).default({ providerId: "codex" }),
+    installation: z.object({
+      root: z.string().min(1).optional(),
+      gitRemote: z.string().min(1).optional(),
+      branch: z.string().min(1).default("main"),
+      script: z.string().min(1).optional(),
+      tunnelName: z.string().min(1).optional(),
+    }).default({ branch: "main" }),
+    updates: z.object({
+      channel: z.enum(["stable", "beta"]).default("stable"),
+    }).default({ channel: "stable" }),
+  }),
+  providers: ProvidersSchema,
+  connections: z.record(ConfigIdSchema, ConnectionSchema),
+  repositories: z.record(ConfigIdSchema, RepositorySchema),
+}).superRefine((file, context) => {
+  const repositoryIds = new Set(Object.keys(file.repositories));
+  if (repositoryIds.size === 0) {
+    context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
+  }
+  for (const [connectionId, connection] of Object.entries(file.connections)) {
+    const schemes = new Set<string>();
+    for (const [index, editor] of connection.editors.entries()) {
+      if (schemes.has(editor.scheme)) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "scheme"], message: `duplicate editor scheme: ${editor.scheme}` });
+      }
+      schemes.add(editor.scheme);
+      if (file.machine.sshHost && !sshLinkSupported(editor.scheme)) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "editors", index, "scheme"], message: `editor scheme ${editor.scheme} has no SSH link format` });
+      }
+    }
+    if (connection.machineId !== undefined && connection.machineId !== file.machine.id) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "machineId"], message: `unknown machine: ${connection.machineId}` });
+    }
+    if (connection.repositories !== "*") {
+      const targets = Object.keys(connection.repositories);
+      if (targets.length === 0) {
+        context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories"], message: "a connection requires at least one repository (or \"*\")" });
+      }
+      for (const repositoryId of targets) {
+        if (!repositoryIds.has(repositoryId)) {
+          context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });
+        }
+      }
+    }
+  }
+  const webhookSlugs = new Set<string>();
+  for (const [connectionId, connection] of Object.entries(file.connections)) {
+    const webhook = connection.webhook;
+    if (!webhook) continue;
+    if (webhookSlugs.has(webhook.slug)) {
+      context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "slug"], message: `duplicate webhook slug: ${webhook.slug}` });
+    }
+    webhookSlugs.add(webhook.slug);
+  }
+  for (const [repositoryId, repository] of Object.entries(file.repositories)) {
+    for (const [workflowId, workflow] of Object.entries(repository.workflows)) {
+      if (workflow.connectionId !== undefined && !file.connections[workflow.connectionId]) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "connectionId"], message: `unknown connection: ${workflow.connectionId}` });
+      }
+      if (workflow.plan && workflow.deliver !== "start-session") {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires deliver: start-session" });
+      }
+      if (workflow.plan && workflow.providerId === "codex") {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires the claude provider (codex has no plan mode)" });
+      }
+    }
+    for (const [key, values] of Object.entries(repository.sessionDefaults.labels)) {
+      const group = repository.labels[key];
+      if (!group) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `unknown label group: ${key}` });
+        continue;
+      }
+      if (group.exclusive && values.length > 1) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: "an exclusive group accepts at most one default" });
+      }
+      if (group.labels) {
+        for (const value of values) {
+          if (!group.labels.includes(value)) {
+            context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `label is not configured: ${value}` });
+          }
+        }
+      }
+    }
+  }
+});
+
+export type ServiceFile = z.infer<typeof ServiceFileSchema>;
+
+export interface WorkflowConfig {
+  id: string;
+  /** null = events from any connection routing to this repository. */
+  connectionId: string | null;
+  on: "issue.state-changed" | "issue.reaction";
+  when: Array<Record<string, string[]>> | null;
+  skill: { skillset: string; flags: string[] };
+  deliver: "start-session" | "message-session";
+  providerId: "codex" | "claude" | null;
+  model: string | null;
+  plan: { captureToIssue: true; thenState: string | null } | null;
+}
+
+export interface RepositoryConfig {
+  id: string;
+  name: string;
+  root: string;
+  worktreeRoot: string;
+  bootstrapCommand: string[];
+  skillsRoot: string;
+  workflows: Readonly<Record<string, WorkflowConfig>>;
+  labels: Record<string, LabelGroupConfig>;
+  sessionDefaults: { labels: Record<string, string[]> };
+}
+
+export interface LabelGroupConfig {
+  description?: string;
+  labels?: string[];
+  exclusive: boolean;
+  routerVisible: boolean;
+}
+
+export interface EditorConfig {
+  name: string;
+  scheme: string;
+  connection: "local" | "ssh";
+  remoteHost: string | null;
+}
+
+export interface LinearConnectionConfig {
+  id: string;
+  provider: "linear";
+  name: string;
+  apiKey: string;
+  agentUserId: string;
+  agentHandle: string | null;
+  router: { providerId: "codex" | "claude"; model: string | null; timeoutMs: number };
+  editors: ReadonlyArray<EditorConfig>;
+}
+
+export type ConnectionConfig = LinearConnectionConfig;
+
+export interface WebhookConfig {
+  id: string;
+  provider: "linear";
+  connectionId: string;
+  webhookSecret: string;
+  webhookMaxAgeMs: number;
+  repositoryRouting: Record<string, { when?: Array<Record<string, string[]>> }>;
+}
+
 export interface ServerConfig {
+  serviceName: string;
+  configFile: string;
+  installRoot: string;
   hostname: string;
   port: number;
-  /** Public origin used for signed links back into this service. */
   publicUrl: string;
   databaseUrl: string;
+  acpIpcPath: string;
+  controlIpcPath: string;
   webhookSecret: string;
   apiKey: string;
-  githubWebhookSecret: string;
   linearApiKey: string;
   agentUserId: string;
   agentHandle: string | null;
-  /** Linear team key used as the durable session registry. */
   agentTeamKey: string;
-  /** bb server API used for durable session ownership. */
-  bbBaseUrl: string;
-  /** bb project containing Cubic agent threads. */
-  bbProjectId: string;
-  /** bb host IDs keyed by remote-agent machine identity. */
-  bbHostIds: Partial<Record<Machine, string>>;
-  /** Host identity used for sessions registered by this service. */
+  hosts: readonly MachineRecord[];
   machine: Machine;
-  /** SSH host used by Zed deep links for remote sessions. */
-  zedRemoteHost: string;
-  /** Codex executable used for the one-off semantic router. */
-  codexExecutable: string;
-  /** Optional model override for the one-off router. */
+  editors: ReadonlyArray<EditorConfig>;
+  routerProviderId: "codex" | "claude";
   routerModel: string | null;
   routerTimeoutMs: number;
-  bbReconcileIntervalMs: number;
+  acpxStateDir: string;
+  acpxAgentCommands: Partial<Record<"codex" | "claude", string[]>>;
   webhookMaxAgeMs: number;
   deployScript: string;
   deployBranch: string;
-  /** launchd job that runs deploys, independent of this service. */
-  deployJobLabel: string;
-  /** Linear workflow state name that opens a reflection thread. */
-  reflectOnState: string;
-  /** Linear workflow state name that starts planning orchestration. */
-  orchestrateOnState: string;
-  /** Linear issue-reaction emoji that starts description augmentation. */
-  describeReactionEmoji: string;
-  /** Full monorepo checkout used to create issue worktrees. */
-  workspaceRepoRoot: string;
-  /** Agents workflow state name that requests session termination. */
+  repository: RepositoryConfig;
   endOnState: string;
+  acp: {
+    hostId?: string;
+    providerId: "codex" | "claude";
+    model?: string;
+  };
+  connections: Readonly<Record<string, ConnectionConfig>>;
+  webhooks: Readonly<Record<string, WebhookConfig>>;
+  repositories: Readonly<Record<string, RepositoryConfig>>;
+  /** Present only on an event/session-scoped view. */
+  activeConnectionId: string;
+  /** Present only on an inbound webhook-scoped view. */
+  activeWebhookId: string;
+  /** Present only on an event/session-scoped view. */
+  activeRepositoryId: string;
 }
 
-function required(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`${name} is required`);
-  return value;
+function expandHome(value: string): string {
+  return value === "~"
+    ? homedir()
+    : value.startsWith("~/")
+      ? path.join(homedir(), value.slice(2))
+      : value;
 }
 
-function optional(name: string): string | null {
-  return process.env[name]?.trim() || null;
+function absolute(value: string, base: string = process.cwd()): string {
+  return path.resolve(base, expandHome(value));
 }
 
-function integer(name: string, fallback: number): number {
-  const raw = process.env[name]?.trim();
-  if (!raw) return fallback;
+export function configFilePath(): string {
+  return absolute(process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json");
+}
 
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
+export function readServiceFile(file: string = configFilePath()): ServiceFile {
+  try {
+    return parseServiceFile(JSON.parse(readFileSync(file, "utf8")));
+  } catch (error) {
+    throw new Error(
+      `invalid remote-agent config ${file}: ${error instanceof Error ? error.message : String(error)}`,
+    );
   }
-  return value;
+}
+
+export function parseServiceFile(value: unknown): ServiceFile {
+  if (
+    typeof value === "object" &&
+    value !== null &&
+    !("schemaVersion" in value)
+  ) {
+    throw new Error(
+      "schemaVersion 2 is required; migrate server/runtime/hosts into the singular machine object",
+    );
+  }
+  return ServiceFileSchema.parse(value);
+}
+
+function resolveDatabaseUrl(value: string | undefined, stateRoot: string): string {
+  if (!value) return `file:${path.join(stateRoot, "remote-agent.sqlite")}`;
+  if (!value.startsWith("file:")) return value;
+  const file = value.slice("file:".length);
+  return `file:${absolute(file, stateRoot)}`;
 }
 
 export function readConfig(): ServerConfig {
-  const home = homedir();
+  const configFile = configFilePath();
+  const file = readServiceFile(configFile);
+  const machine = file.machine.id;
+  const hosts = configureMachines([{
+    id: machine,
+    label: file.machine.name,
+    acceptsTrackerInput: true,
+    default: true,
+  }]);
+
+  const installRoot = absolute(
+    file.machine.installation.root ?? defaultInstallRoot(file.serviceName),
+  );
+  const repositories = Object.fromEntries(
+    Object.entries(file.repositories).map(([id, repository]) => {
+      const root = absolute(repository.root, path.dirname(configFile));
+      const worktreeRoot = absolute(repository.worktreeRoot, root);
+      return [id, {
+        id,
+        name: repository.name ?? id,
+        root,
+        worktreeRoot,
+        bootstrapCommand: [...repository.bootstrapCommand],
+        labels: Object.fromEntries(
+          Object.entries(repository.labels).map(([key, group]) => [
+            key,
+            {
+              ...(group.description ? { description: group.description } : {}),
+              ...(group.labels ? { labels: [...group.labels] } : {}),
+              exclusive: group.exclusive,
+              routerVisible: group.routerVisible,
+            },
+          ]),
+        ),
+        sessionDefaults: {
+          labels: Object.fromEntries(
+            Object.entries(repository.sessionDefaults.labels).map(([key, values]) => [
+              key,
+              [...values],
+            ]),
+          ),
+        },
+        skillsRoot: repository.skillsRoot,
+        workflows: Object.fromEntries(
+          Object.entries(repository.workflows).map(([workflowId, workflow]) => [workflowId, {
+            id: workflowId,
+            connectionId: workflow.connectionId ?? null,
+            on: workflow.on,
+            when: workflow.when
+              ? workflow.when.map((condition) => Object.fromEntries(
+                  Object.entries(condition).map(([key, values]) => [key, [...values]]),
+                ))
+              : null,
+            skill: { skillset: workflow.skill.skillset, flags: [...workflow.skill.flags] },
+            deliver: workflow.deliver,
+            providerId: workflow.providerId ?? null,
+            model: workflow.model ?? null,
+            plan: workflow.plan
+              ? {
+                  captureToIssue: workflow.plan.captureToIssue,
+                  thenState: workflow.plan.thenState ?? null,
+                }
+              : null,
+          } satisfies WorkflowConfig]),
+        ),
+      } satisfies RepositoryConfig];
+    }),
+  );
+  const connections = Object.fromEntries(
+    Object.entries(file.connections).map(([id, connection]) => [id, {
+      id,
+      provider: "linear" as const,
+      name: connection.name,
+      apiKey: connection.apiKey,
+      agentUserId: connection.agentUserId,
+      agentHandle: connection.agentHandle ?? null,
+      router: {
+        providerId: connection.router.providerId,
+        model: connection.router.model ?? null,
+        timeoutMs: connection.router.timeoutMs,
+      },
+      editors: connection.editors.map((editor) => ({
+        name: editor.name,
+        scheme: editor.scheme,
+        connection: file.machine.sshHost ? ("ssh" as const) : ("local" as const),
+        remoteHost: file.machine.sshHost ?? null,
+      })),
+    } satisfies LinearConnectionConfig]),
+  );
+  // Webhooks nest inside connections in the file; the resolved view stays a
+  // slug-keyed map so routing lookups are unchanged. "*" expands to every
+  // repository as an unconditional target.
+  const webhooks = Object.fromEntries(
+    Object.entries(file.connections).flatMap(([connectionId, connection]) => {
+      const webhook = connection.webhook;
+      if (!webhook) return [];
+      const targets = connection.repositories === "*"
+        ? Object.keys(file.repositories).map((repositoryId) => [repositoryId, {}] as const)
+        : Object.entries(connection.repositories).map(([repositoryId, target]) => [
+            repositoryId,
+            target.when
+              ? {
+                  when: target.when.map((condition) => Object.fromEntries(
+                    Object.entries(condition).map(([key, values]) => [key, [...values]]),
+                  )),
+                }
+              : {},
+          ] as const);
+      return [[webhook.slug, {
+        id: webhook.slug,
+        provider: connection.provider,
+        connectionId,
+        webhookSecret: webhook.secret,
+        webhookMaxAgeMs: webhook.webhookMaxAgeMs,
+        repositoryRouting: Object.fromEntries(targets),
+      } satisfies WebhookConfig]];
+    }),
+  );
+  const firstRepository = Object.values(repositories)[0]!;
+  const firstConnection = Object.values(connections)[0];
+  const firstWebhook = Object.values(webhooks)[0];
 
   return {
-    hostname: optional("REMOTE_AGENT_HOST") ?? "127.0.0.1",
-    port: integer("REMOTE_AGENT_PORT", 9000),
-    publicUrl:
-      optional("REMOTE_AGENT_PUBLIC_URL") ?? "https://agents.cubicsurveys.dev",
-    databaseUrl:
-      optional("REMOTE_AGENT_DATABASE_URL") ??
-      `file:${path.join(home, "Desktop", "remote-agent", "state", "remote-agent.sqlite")}`,
-    webhookSecret: required("LINEAR_WEBHOOK_SECRET"),
-    apiKey: required("REMOTE_AGENT_API_KEY"),
-    githubWebhookSecret: required("GITHUB_WEBHOOK_SECRET"),
-    linearApiKey: required("LINEAR_API_KEY"),
-    agentUserId: required("LINEAR_AGENT_USER_ID"),
-    agentHandle: optional("LINEAR_AGENT_HANDLE"),
-    agentTeamKey: optional("LINEAR_AGENT_TEAM_KEY") ?? "AGENT",
-    bbBaseUrl: optional("REMOTE_AGENT_BB_URL") ?? "http://127.0.0.1:38886",
-    bbProjectId: required("REMOTE_AGENT_BB_PROJECT_ID"),
-    bbHostIds: {
-      "macbook-air": required("REMOTE_AGENT_BB_HOST_MACBOOK_AIR"),
-      ...(optional("REMOTE_AGENT_BB_HOST_MACBOOK_PRO")
-        ? { "macbook-pro": optional("REMOTE_AGENT_BB_HOST_MACBOOK_PRO")! }
-        : {}),
-    },
-    machine: machine("REMOTE_AGENT_MACHINE"),
-    zedRemoteHost: optional("REMOTE_AGENT_ZED_HOST") ?? "cubic-remote",
-    codexExecutable: optional("REMOTE_AGENT_CODEX_EXECUTABLE") ?? "codex",
-    routerModel: optional("REMOTE_AGENT_ROUTER_MODEL"),
-    routerTimeoutMs: integer("REMOTE_AGENT_ROUTER_TIMEOUT_MS", 30_000),
-    bbReconcileIntervalMs: integer(
-      "REMOTE_AGENT_BB_RECONCILE_INTERVAL_MS",
-      60_000,
+    serviceName: file.serviceName,
+    configFile,
+    installRoot,
+    hostname: file.machine.server.listen.host,
+    port: file.machine.server.listen.port,
+    publicUrl: file.machine.server.publicUrl,
+    databaseUrl: resolveDatabaseUrl(file.machine.server.databaseUrl, path.dirname(configFile)),
+    acpIpcPath: absolute(
+      file.machine.server.acpSocketPath ?? path.join(installRoot, "remote-agent.sock"),
+      path.dirname(configFile),
     ),
-    webhookMaxAgeMs: integer("LINEAR_WEBHOOK_MAX_AGE_MS", 60_000),
+    controlIpcPath: absolute(
+      file.machine.server.controlSocketPath ?? path.join(installRoot, "control.sock"),
+      path.dirname(configFile),
+    ),
+    webhookSecret: firstWebhook?.webhookSecret ?? "unused",
+    apiKey: file.machine.server.apiKey,
+    linearApiKey: firstConnection?.apiKey ?? "unused",
+    agentUserId: firstConnection?.agentUserId ?? "unused",
+    agentHandle: firstConnection?.agentHandle ?? null,
+    // Legacy, unmounted Agent-team projection helpers still compile against
+    // this alias. It is no longer configurable or used by production routes.
+    agentTeamKey: "AGENT",
+    hosts,
+    machine,
+    editors: firstConnection?.editors ?? [],
+    routerProviderId: firstConnection?.router.providerId ?? "codex",
+    routerModel: firstConnection?.router.model ?? null,
+    routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
+    acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
+    acpxAgentCommands: {
+      ...(file.providers.codex?.command ? { codex: [...file.providers.codex.command] } : {}),
+      ...(file.providers.claude?.command ? { claude: [...file.providers.claude.command] } : {}),
+    },
+    webhookMaxAgeMs: firstWebhook?.webhookMaxAgeMs ?? 60_000,
     deployScript:
-      optional("REMOTE_AGENT_DEPLOY_SCRIPT") ??
-      path.join(home, "Desktop", "remote-agent", "app", "scripts", "deploy.sh"),
-    deployBranch: optional("REMOTE_AGENT_DEPLOY_BRANCH") ?? "main",
-    deployJobLabel:
-      optional("REMOTE_AGENT_DEPLOY_JOB") ??
-      "dev.cubicsurveys.remote-agent-poll",
-    reflectOnState: optional("REMOTE_AGENT_REFLECT_ON_STATE") ?? "Pull Request",
-    orchestrateOnState:
-      optional("REMOTE_AGENT_ORCHESTRATE_ON_STATE") ?? "Planning",
-    describeReactionEmoji:
-      optional("REMOTE_AGENT_DESCRIBE_ON_REACTION") ?? "pencil2",
-    workspaceRepoRoot:
-      optional("REMOTE_AGENT_WORKSPACE_REPO") ??
-      path.join(home, "Desktop", "cubic"),
-    endOnState: optional("REMOTE_AGENT_END_ON_STATE") ?? "End",
+      file.machine.installation.script ??
+      path.join(installRoot, "app", "src", "management", "deploy.ts"),
+    deployBranch: file.machine.installation.branch,
+    repository: firstRepository,
+    endOnState: "End",
+    acp: {
+      ...(file.machine.acp.hostId ? { hostId: file.machine.acp.hostId } : {}),
+      providerId: file.machine.acp.providerId,
+      ...(file.machine.acp.model ? { model: file.machine.acp.model } : {}),
+    },
+    connections,
+    webhooks,
+    repositories,
+    activeConnectionId: firstConnection?.id ?? "",
+    activeWebhookId: firstWebhook?.id ?? "",
+    activeRepositoryId: firstRepository.id,
   };
 }
 
-function machine(name: string): Machine {
-  const value = optional(name) ?? DEFAULT_MACHINE_ID;
-  const parsed = MachineSchema.safeParse(value);
-  if (!parsed.success) {
-    throw new Error(`${name} must be ${MachineSchema.options.join(" or ")}`);
+export function getRepositoryConfig(
+  config: ServerConfig,
+  repositoryId: string,
+): RepositoryConfig {
+  const repository = config.repositories[repositoryId];
+  if (!repository) throw new Error(`unknown repository: ${repositoryId}`);
+  return repository;
+}
+
+export function getLinearConnection(
+  config: ServerConfig,
+  connectionId: string,
+): LinearConnectionConfig {
+  const connection = config.connections[connectionId];
+  if (!connection || connection.provider !== "linear") {
+    throw new Error(`unknown Linear connection: ${connectionId}`);
   }
-  return parsed.data;
+  return connection;
+}
+
+export function getWebhookConfig(
+  config: ServerConfig,
+  webhookId: string,
+): WebhookConfig {
+  const webhook = config.webhooks[webhookId];
+  if (!webhook) throw new Error(`unknown webhook: ${webhookId}`);
+  return webhook;
+}
+
+function pathContains(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+export function resolveRepositoryForCwd(
+  config: ServerConfig,
+  cwd: string,
+): RepositoryConfig {
+  const absoluteCwd = path.resolve(cwd);
+  const candidates = Object.values(config.repositories).flatMap((repository) => {
+    const roots = [repository.root, repository.worktreeRoot]
+      .filter((root) => pathContains(root, absoluteCwd))
+      .sort((a, b) => b.length - a.length);
+    return roots[0] ? [{ repository, matchLength: roots[0].length }] : [];
+  }).sort((a, b) => b.matchLength - a.matchLength);
+  if (candidates.length === 0) {
+    throw new Error(`cwd is not inside a configured repository: ${absoluteCwd}`);
+  }
+  if (
+    candidates[1] &&
+    candidates[1].matchLength === candidates[0]!.matchLength &&
+    candidates[1].repository.id !== candidates[0]!.repository.id
+  ) {
+    throw new Error(`cwd matches multiple configured repositories: ${absoluteCwd}`);
+  }
+  return candidates[0]!.repository;
+}
+
+export function routeWebhookRepository(
+  config: ServerConfig,
+  webhookId: string,
+  attributes: Readonly<Record<string, string | readonly string[] | null | undefined>>,
+): RepositoryConfig {
+  const webhook = getWebhookConfig(config, webhookId);
+  const matchingRepositoryIds = new Set(
+    Object.entries(webhook.repositoryRouting)
+      .filter(([, target]) =>
+        !target.when || target.when.some((condition) =>
+          Object.entries(condition).every(([key, expected]) => {
+            const actual = attributes[key];
+            const values: readonly string[] = Array.isArray(actual)
+              ? actual
+              : typeof actual === "string"
+                ? [actual]
+                : [];
+            return values.some((value) => expected.includes(value));
+          }),
+        ),
+      )
+      .map(([repositoryId]) => repositoryId),
+  );
+  if (matchingRepositoryIds.size !== 1) {
+    throw new Error(
+      matchingRepositoryIds.size === 0
+        ? `webhook ${webhookId} did not match a repository routing rule`
+        : `webhook ${webhookId} matched multiple repositories`,
+    );
+  }
+  const repositoryId = [...matchingRepositoryIds][0]!;
+  return getRepositoryConfig(config, repositoryId);
+}
+
+/**
+ * Produces an immutable event/session-scoped view for legacy integration
+ * helpers while the Agent-team projection is being removed. Every alias is
+ * derived from explicit connection and repository IDs, so concurrent events
+ * from different Linear workspaces cannot share credentials or workflows.
+ */
+export function scopeConfig(
+  config: ServerConfig,
+  input: { connectionId: string; repositoryId: string; webhookId?: string },
+): ServerConfig {
+  const connection = getLinearConnection(config, input.connectionId);
+  const repository = getRepositoryConfig(config, input.repositoryId);
+  return {
+    ...config,
+    activeConnectionId: connection.id,
+    activeWebhookId: input.webhookId ?? config.activeWebhookId,
+    activeRepositoryId: repository.id,
+    linearApiKey: connection.apiKey,
+    agentUserId: connection.agentUserId,
+    agentHandle: connection.agentHandle,
+    routerProviderId: connection.router.providerId,
+    routerModel: connection.router.model,
+    routerTimeoutMs: connection.router.timeoutMs,
+    agentTeamKey: config.agentTeamKey,
+    repository,
+    endOnState: config.endOnState,
+  };
 }

@@ -1,6 +1,5 @@
 import type { ServerConfig } from "../../../config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import { getMachine } from "../../../machines/index.ts";
 import {
   agentIssueDescriptionWithSync,
   agentIssueLabelIdsWithRouting,
@@ -10,7 +9,11 @@ import {
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   updateAgentIssue,
-} from "../registry/index.ts";
+  // Imported from the session-store module directly, not the tracker barrel:
+  // the barrel re-exports webhook handlers, which import the dispatcher,
+  // which imports the worker registry — a cycle back into the workers.
+} from "../../../integrations/linear/session-store/index.ts";
+import { getMachine } from "../../../machines/index.ts";
 import {
   AgentIssueState,
   isTerminalAgentIssueState,
@@ -34,7 +37,7 @@ export async function endWorktreeSessions(
     const runtime = parseAgentIssueRuntime(issue.description);
     return (
       runtime?.worktreePath === event.locator.worktreePath &&
-      issue.labels.nodes.some((label) => label.name === machine.linearLabel) &&
+      issue.labels.nodes.some((label) => label.name === machine.label) &&
       !isTerminalAgentIssueState(issue.state.name)
     );
   });
@@ -42,7 +45,7 @@ export async function endWorktreeSessions(
     eventId: event.eventId,
     generation: event.generation,
     occurredAt: event.occurredAt,
-    cubeIssueIdentifier: null,
+    sourceIssueIdentifier: null,
   };
 
   let updated = 0;

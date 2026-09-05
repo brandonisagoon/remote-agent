@@ -1,9 +1,9 @@
 import type { ServerConfig } from "../../../config.ts";
-import type { BbClient } from "../../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { AgentIssue } from "../../../../types/sessions/index.ts";
 import {
   endSessionGroup,
-  terminateBbThreads,
+  terminateRuntimeSessions,
   type EndSessionGroupResult,
 } from "./terminate-session-group.ts";
 
@@ -17,18 +17,18 @@ interface EndOneShotSessionOptions {
 export async function endOneShotSession(
   config: ServerConfig,
   target: AgentIssue,
-  bbClient: BbClient,
+  runtime: AgentSessionRuntime,
   {
     kill,
     killDelayMs = ONE_SHOT_KILL_DELAY_MS,
   }: EndOneShotSessionOptions,
 ): Promise<EndSessionGroupResult> {
   const group = await endSessionGroup(config, target);
-  if (kill && group.bbThreadIds.length > 0) {
+  if (kill && group.runtimeSessionIds.length > 0) {
     setTimeout(() => {
-      void terminateBbThreads(bbClient, group.bbThreadIds).catch(
+      void terminateRuntimeSessions(runtime, group.runtimeSessionIds).catch(
         (error: unknown) => {
-          console.error("Failed to terminate one-shot bb threads:", error);
+          console.error("Failed to terminate one-shot acpx sessions:", error);
         },
       );
     }, killDelayMs);

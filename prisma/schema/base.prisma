@@ -2,8 +2,8 @@
 //
 // This app owns its own datasource (local SQLite), its own migrations, and its
 // own generated client. It must never reach the product Postgres database, so
-// the connection string comes from REMOTE_AGENT_DATABASE_URL rather than
-// DATABASE_URL — which is already a Neon Postgres URL in the dev environment.
+// prisma.config.ts reads the connection string from the private Remote Agent
+// JSON rather than DATABASE_URL from the host repository environment.
 //
 // The product schema's prisma-zod-generator is deliberately NOT run here.
 

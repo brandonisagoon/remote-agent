@@ -2,7 +2,7 @@
   "name": "remote-agent",
   "version": "0.1.0",
   "private": true,
-  "description": "Org-agnostic control plane for durable bb-backed coding-agent sessions",
+  "description": "Org-agnostic control plane for durable acpx-backed coding-agent sessions",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,34 +10,126 @@
   },
   "homepage": "https://github.com/brandonisagoon/remote-agent#readme",
   "type": "module",
+  "main": "out/main/index.js",
+  "bin": {
+    "remote-agent": "src/cli/main.ts"
+  },
   "packageManager": "bun@1.3.14",
+  "trustedDependencies": [
+    "electron"
+  ],
   "engines": {
     "bun": ">=1.3.14"
   },
   "scripts": {
     "acp": "bun src/acp/main.ts",
+    "cli": "bun src/cli/main.ts",
+    "desktop:dev": "electron-vite dev",
+    "desktop:build": "electron-vite build",
+    "desktop:package": "bun run config:schema && bun run desktop:build && electron-builder --dir",
+    "config:schema": "bun scripts/generate-config-schema.ts",
     "serve": "bun --watch src/server.ts",
-    "build": "prisma generate && tsc --noEmit",
-    "lint": "prisma generate && tsc --noEmit",
+    "build": "prisma generate && bun run config:schema && tsc --noEmit && electron-vite build",
+    "lint": "prisma generate && bun run config:schema && tsc --noEmit",
     "start": "bun src/server.ts",
     "test": "bun test",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:generate": "prisma generate"
+    "db:generate": "prisma generate",
+    "desktop:dist": "bun run config:schema && bun run desktop:build && electron-builder",
+    "postinstall": "bun scripts/patch-electron-name.ts"
+  },
+  "build": {
+    "appId": "dev.remote-agent.desktop",
+    "productName": "Remote Agent",
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "bin",
+        "to": "bin"
+      },
+      {
+        "from": "src",
+        "to": "src",
+        "filter": [
+          "**/*.ts",
+          "**/*.md"
+        ]
+      },
+      {
+        "from": "remote-agent.config.example.json",
+        "to": "remote-agent.config.example.json"
+      },
+      {
+        "from": "remote-agent.config.schema.json",
+        "to": "remote-agent.config.schema.json"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "notarize": false,
+      "icon": "build/icon.icns"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "directories": {
+      "buildResources": "build",
+      "output": "dist"
+    }
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.3.0",
-    "@dotenvx/dotenvx": "1.52.0",
+    "@agentclientprotocol/sdk": "1.4.0",
     "@libsql/client": "0.17.4",
     "@prisma/adapter-libsql": "7.9.1",
     "@prisma/client": "7.9.1",
-    "bb-app": "0.37.0",
+    "@tanstack/react-hotkeys": "^0.10.0",
+    "@tanstack/react-query": "^5.102.8",
+    "@tanstack/react-router": "^1.170.32",
+    "acpx": "0.13.2",
+    "chokidar": "^5.0.0",
+    "cn": "^0.2.5",
+    "commander": "^15.0.0",
+    "framework7-icons": "^5.0.5",
     "hono": "4.12.32",
+    "radix-ui": "^1.6.7",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "simple-icons": "^16.29.0",
+    "sonner": "^2.0.8",
     "zod": "4.4.3"
   },
   "devDependencies": {
+    "@radix-ui/react-slot": "^1.3.3",
+    "@tailwindcss/vite": "^4.3.3",
     "@types/bun": "1.3.14",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "5",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "electron": "^44.1.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "lucide-react": "^1.39.0",
     "prisma": "7.9.1",
-    "typescript": "5.9.3"
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss": "^4.3.3",
+    "tw-animate-css": "^1.4.0",
+    "typescript": "5.9.3",
+    "vite": "7"
   }
 }

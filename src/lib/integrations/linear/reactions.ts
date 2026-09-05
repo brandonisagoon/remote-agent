@@ -7,7 +7,7 @@ import { linearGraphql } from "./client.ts";
  * adding noise to the issue thread, and — critically — it cannot re-enter our
  * own webhook as a new comment, so there is no feedback loop to guard against.
  */
-export const Reaction = {
+export const TrackerReaction = {
   Received: "mailbox_with_mail",
   Delivered: "eyes",
   Reply: "speech_balloon",

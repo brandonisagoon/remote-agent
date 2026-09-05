@@ -1,16 +1,23 @@
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { defineConfig } from "prisma/config";
 
-// Deliberately isolated from the repository-root prisma.config.ts. The Prisma
-// CLI resolves this file from the current working directory, so every script
-// here must run with the remote-agent repository as cwd.
-//
-// REMOTE_AGENT_DATABASE_URL, never DATABASE_URL: the latter is already a Neon
-// Postgres URL in .env.development.local, and reusing it would aim this SQLite
-// datasource at the product database.
-const databaseUrl =
-  process.env.REMOTE_AGENT_DATABASE_URL?.trim() ||
-  `file:${path.join(__dirname, "dev.sqlite")}`;
+function databaseUrl(): string {
+  const selected = process.env.REMOTE_AGENT_CONFIG?.trim();
+  if (!selected) return `file:${path.join(__dirname, "dev.sqlite")}`;
+
+  const configFile = path.resolve(selected);
+  const config = JSON.parse(readFileSync(configFile, "utf8")) as {
+    server?: { databaseUrl?: string };
+  };
+  const configured = config.server?.databaseUrl;
+  if (!configured) {
+    return `file:${path.join(path.dirname(configFile), "remote-agent.sqlite")}`;
+  }
+  if (!configured.startsWith("file:")) return configured;
+  const file = configured.slice("file:".length);
+  return `file:${path.resolve(path.dirname(configFile), file)}`;
+}
 
 export default defineConfig({
   schema: path.join(__dirname, "prisma", "schema"),
@@ -18,6 +25,6 @@ export default defineConfig({
     path: path.join(__dirname, "prisma", "migrations"),
   },
   datasource: {
-    url: databaseUrl,
+    url: databaseUrl(),
   },
 });

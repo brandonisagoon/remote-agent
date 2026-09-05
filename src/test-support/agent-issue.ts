@@ -29,7 +29,6 @@ export function agentIssueRuntimeDescription(
 | Harness session ID | \`session-id\` |
 | Worktree | \`/tmp/worktree\` |
 | Lifecycle | ${storedLifecycle} |
-| bb thread ID | — |
-| bb machine | — |
+| Execution target | \`Test MacBook Air\` |
 <!-- /remote-agent-session:v1 -->`;
 }

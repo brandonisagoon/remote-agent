@@ -1,6 +1,6 @@
 import type { ServerConfig } from "../../config.ts";
-import { mapBbErrorToDispatchStatus } from "../../transports/bb/index.ts";
-import type { BbClient } from "../../../types/runtime/index.ts";
+import type { PrismaClient } from "../../../generated/prisma/client.ts";
+import type { AgentSessionRuntime } from "../../../types/runtime/index.ts";
 import type { MessageDispatchResult } from "../../../types/messages/index.ts";
 import type {
   ReplyTarget,
@@ -9,11 +9,11 @@ import type {
   RoutingInput,
 } from "../../../types/sessions/index.ts";
 import {
-  fetchLinearRoutingContext,
+  fetchTrackerRoutingContext,
   fetchRouteCandidates,
   isEligibleCandidate,
   RouterTimeoutError,
-  selectSessionWithCodex,
+  selectSessionWithRouter,
 } from "../sessions/index.ts";
 import { buildReplyDirective } from "./reply-directive.ts";
 
@@ -24,8 +24,9 @@ export interface ReplyContext {
 
 export interface ForwardMessageOptions {
   config: ServerConfig;
-  bbClient: BbClient;
-  cubeIssueIdentifier: string;
+  agentRuntime: AgentSessionRuntime;
+  prisma?: PrismaClient;
+  sourceIssueIdentifier: string;
   message: string;
   workerContext: RoutingInput["workerContext"];
   replyContext?: ReplyContext;
@@ -34,7 +35,7 @@ export interface ForwardMessageOptions {
   ) => string | Promise<string>;
   fetchCandidates?: (
     config: ServerConfig,
-    cubeIssueIdentifier: string,
+    sourceIssueIdentifier: string,
   ) => Promise<RouteCandidate[]>;
   selectSession?: (
     config: ServerConfig,
@@ -61,19 +62,22 @@ export async function forwardMessage(
 async function route(
   options: ForwardMessageOptions,
 ): Promise<MessageDispatchResult> {
-  const fetchCandidates = options.fetchCandidates ?? fetchRouteCandidates;
-  const selectSession = options.selectSession ?? selectSessionWithCodex;
+  const selectSession = options.selectSession ?? selectSessionWithRouter;
+  if (!options.fetchCandidates && !options.prisma) {
+    throw new Error("prisma is required for registry-backed session routing");
+  }
   const initial = options.fetchCandidates
     ? {
-        cubeIssue: null,
+        sourceIssue: null,
         candidates: await options.fetchCandidates(
           options.config,
-          options.cubeIssueIdentifier,
+          options.sourceIssueIdentifier,
         ),
       }
-    : await fetchLinearRoutingContext(
+    : await fetchTrackerRoutingContext(
         options.config,
-        options.cubeIssueIdentifier,
+        options.prisma!,
+        options.sourceIssueIdentifier,
       );
   const candidates = (initial?.candidates ?? []).filter((candidate) =>
     isEligibleCandidate(options.config, candidate),
@@ -87,8 +91,8 @@ async function route(
     };
   }
   const selectedDecision = await selectSession(options.config, {
-    cubeIssueIdentifier: options.cubeIssueIdentifier,
-    cubeIssue: initial?.cubeIssue ?? null,
+    sourceIssueIdentifier: options.sourceIssueIdentifier,
+    sourceIssue: initial?.sourceIssue ?? null,
     comment: options.message,
     workerContext: options.workerContext,
     candidates,
@@ -108,10 +112,14 @@ async function route(
       decision,
     };
   }
-  const fresh = (await fetchCandidates(
-    options.config,
-    options.cubeIssueIdentifier,
-  )).find(
+  const freshCandidates = options.fetchCandidates
+    ? await options.fetchCandidates(options.config, options.sourceIssueIdentifier)
+    : await fetchRouteCandidates(
+        options.config,
+        options.prisma!,
+        options.sourceIssueIdentifier,
+      );
+  const fresh = freshCandidates.find(
     (candidate) =>
       candidate.agentIssueIdentifier === decision.targetAgentIssueIdentifier,
   );
@@ -123,11 +131,14 @@ async function route(
       decision,
     };
   }
-  const thread = await options.bbClient.getThread(fresh.runtime.bbThreadId!);
-  if (!thread || thread.archivedAt != null || thread.status === "error") {
+  const runtimeSessionId = fresh.runtime.runtimeSessionId;
+  const session = runtimeSessionId
+    ? await options.agentRuntime.getSession(runtimeSessionId)
+    : null;
+  if (!session || session.status === "closed" || session.status === "error") {
     return {
       status: "stale_target",
-      detail: "the registered bb thread is no longer live",
+      detail: "the registered acpx session is no longer live",
       targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
       decision,
     };
@@ -137,19 +148,18 @@ async function route(
     : options.message;
   const message = normalized.replyRequested && options.replyContext
     ? `${baseMessage}\n\n${buildReplyDirective(
-        options.cubeIssueIdentifier,
+        options.sourceIssueIdentifier,
         options.replyContext.threadRootCommentId,
       )}`
     : baseMessage;
   try {
-    await options.bbClient.sendMessage({
-      threadId: thread.id,
-      message,
-      mode: "queue-if-active",
+    await options.agentRuntime.enqueue({
+      sessionId: session.id,
+      text: message,
     });
   } catch (error) {
     return {
-      status: mapBbErrorToDispatchStatus(error),
+      status: "failed",
       detail: error instanceof Error ? error.message : String(error),
       targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
       decision,

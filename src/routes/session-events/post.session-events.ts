@@ -32,7 +32,7 @@ route.post("/", async (c) => {
       config,
       parsed.data,
       c.get("prisma"),
-      { bbClient: c.get("bbClient") },
+      {},
     );
     if (!issue) {
       return c.json({ ignored: true }, 200);
@@ -43,7 +43,7 @@ route.post("/", async (c) => {
       parsed.data.runtime.lifecycle === "one-shot" &&
       parsed.data.runtime.parentSessionId == null
     ) {
-      await endOneShotSession(config, issue, c.get("bbClient"), {
+      await endOneShotSession(config, issue, c.get("agentRuntime"), {
         kill: parsed.data.runtime.machine === config.machine,
       });
     }

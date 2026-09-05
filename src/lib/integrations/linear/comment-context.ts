@@ -12,7 +12,7 @@ const COMMENT_CONTEXT = `
 `;
 
 export interface CommentContext {
-  cubeIssueIdentifier: string | null;
+  sourceIssueIdentifier: string | null;
   /** The description text this comment is anchored to, if any. */
   quotedText: string | null;
   /** The comment being replied to, if this is a threaded reply. */
@@ -36,7 +36,7 @@ export async function fetchCommentContext(
   commentId: string,
 ): Promise<CommentContext> {
   const empty: CommentContext = {
-    cubeIssueIdentifier: null,
+    sourceIssueIdentifier: null,
     quotedText: null,
     parentBody: null,
     parentAuthor: null,
@@ -56,7 +56,7 @@ export async function fetchCommentContext(
     if (!comment) return empty;
 
     return {
-      cubeIssueIdentifier:
+      sourceIssueIdentifier:
         comment.issue?.identifier ?? comment.documentContent?.issue?.identifier ?? null,
       quotedText: comment.quotedText?.trim() || null,
       parentBody: comment.parent?.body?.trim() || null,

@@ -1,21 +1,17 @@
 import type { ServerConfig } from "../../config.ts";
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
-import type {
-  BbClient,
-  BbSpawnThreadInput,
-} from "../../../types/runtime/index.ts";
+import type { AgentSessionRuntime } from "../../../types/runtime/index.ts";
 import type {
   Machine,
   SessionLifecycle,
   SessionRole,
 } from "../../../types/sessions/index.ts";
-import { upsertAgentIssueFromEvent } from "../sessions/index.ts";
-import { resolveLaunchModel } from "./resolve-model.ts";
 
 export interface SpawnAgentThreadInput {
   config: ServerConfig;
   prisma: PrismaClient;
-  bbClient: BbClient;
+  agentRuntime: AgentSessionRuntime;
+  launchKey: string;
   issueIdentifier: string;
   harness: "codex" | "claude";
   model?: string;
@@ -26,85 +22,58 @@ export interface SpawnAgentThreadInput {
   lifecycle: SessionLifecycle;
   role: SessionRole;
   title?: string;
-  parentThreadId?: string;
+  parentSessionId?: string;
+  /** Launch provenance recorded on the session (plan capture resolves the
+      live workflow configuration through it). */
+  workflowId?: string;
+  /** Session mode set before the initial prompt enqueues (e.g. "plan"). */
+  mode?: string;
 }
 
-export function launchExecutionSettings(
-  harness: SpawnAgentThreadInput["harness"],
-): Pick<
-  BbSpawnThreadInput,
-  "permissionMode" | "reasoningLevel" | "serviceTier"
-> {
-  if (harness === "codex") {
-    return {
-      permissionMode: "full",
-      reasoningLevel: "high",
-      serviceTier: "default",
-    };
-  }
-
-  return {
-    permissionMode: "auto",
-    reasoningLevel: "high",
-    serviceTier: undefined,
-  };
-}
-
-/** Spawn and immediately bind the canonical bb thread to its Agents mirror.
- * The in-session compatibility hook later enriches workflow/subagent metadata;
- * it is not on the critical path for routability. */
-export async function spawnAgentThread(input: SpawnAgentThreadInput) {
-  const providerId = input.harness === "claude" ? "claude-code" : "codex";
-  const hostId = input.config.bbHostIds[input.machine];
-  const model = await resolveLaunchModel({
-    bbClient: input.bbClient,
-    providerId,
-    hostId,
-    requested: input.model,
-  });
-  const thread = await input.bbClient.spawnThread({
-    projectId: input.config.bbProjectId,
-    hostId,
+/** Ensure one durable, metadata-complete acpx session and enqueue its initial
+ * prompt. Linear is a linked input/output integration, not the registry. */
+export async function spawnAgentThread(
+  input: SpawnAgentThreadInput,
+) {
+  const session = await input.agentRuntime.ensureSession({
+    sessionKey: input.launchKey,
+    name: input.title ?? `${input.issueIdentifier} · ${input.role}`,
+    agent: input.harness,
+    cwd: input.worktreePath,
     worktreePath: input.worktreePath,
-    providerId,
-    model,
-    parentThreadId: input.parentThreadId,
-    title: input.title ?? `${input.issueIdentifier} · ${input.role}`,
-    prompt: input.prompt,
-    ...launchExecutionSettings(input.harness),
+    executionTarget: input.machine,
+    repositoryId: input.config.activeRepositoryId,
+    machineId: input.machine,
+    role: input.role,
+    lifecycle: input.lifecycle,
+    ...(input.workflowId ? { workflowId: input.workflowId } : {}),
+    relations: input.parentSessionId
+      ? [{ relationship: "spawned-by", targetSessionId: input.parentSessionId }]
+      : [],
+    resourceLinks: [{
+      provider: "linear",
+      connectionId: input.config.activeConnectionId,
+      resourceType: "issue-identifier",
+      externalId: input.issueIdentifier,
+      relationship: "handles",
+    }],
+    model: input.model,
   });
 
-  const now = new Date();
   try {
-    const agentIssue = await upsertAgentIssueFromEvent(
-      input.config,
-      {
-        eventId: `bb-launch:${thread.id}`,
-        occurredAt: now.toISOString(),
-        generation: now.getTime(),
-        type: "session.started",
-        runtime: {
-          harnessSessionId: thread.id,
-          // bb parentage is canonical in bb. A launch through this API is a
-          // deliberately promoted/mirrored thread, not a harness subagent.
-          parentSessionId: null,
-          worktreePath: input.worktreePath,
-          branchName: input.branchName ?? null,
-          harness: input.harness,
-          machine: input.machine,
-          role: input.role,
-          lifecycle: input.lifecycle,
-          cubeIssueIdentifier: input.issueIdentifier,
-          bbThreadId: thread.id,
-        },
-      },
-      input.prisma,
-      { bbClient: input.bbClient },
-    );
-    return { thread, agentIssue };
+    // Mode must land before the prompt: a plan-capture session that starts
+    // its turn outside plan mode never produces an exit-plan approval.
+    if (input.mode) await input.agentRuntime.setMode(session.id, input.mode);
+    await input.agentRuntime.enqueue({
+      sessionId: session.id,
+      text: input.prompt,
+      requestId: `launch:${input.launchKey}`,
+    });
+    return { session, agentIssue: null };
   } catch (error) {
-    await input.bbClient.stopThread(thread.id).catch(() => undefined);
-    await input.bbClient.archiveThread(thread.id).catch(() => undefined);
+    await input.agentRuntime
+      .close(session.id, "Initial launch enqueue failed")
+      .catch(() => undefined);
     throw error;
   }
 }

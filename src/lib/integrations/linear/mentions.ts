@@ -1,7 +1,7 @@
 /**
  * Does this comment address our agent?
  *
- * Verified against a real Linear webhook (CUBE-2600, 2026-07-27). Linear sends
+ * Verified against a captured Linear comment webhook. Linear sends
  * the mention as a **plain `@handle` string** in `data.body`:
  *
  *     "body": "@agent this is a test"

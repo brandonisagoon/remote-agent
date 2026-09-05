@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs the CLI from the checkout this script lives in. /usr/local/bin gets a
+# symlink to this file (via the desktop app's Install CLI button or by hand),
+# so resolve the link back to the real checkout first.
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+exec bun "$ROOT/src/cli/main.ts" "$@"

@@ -2,7 +2,7 @@ import { z } from "zod";
 
 import type {
   RouteCandidate,
-  RouteCubeIssue,
+  RouteSourceIssue,
 } from "./session.ts";
 
 export const RouteActionSchema = z.enum([
@@ -21,8 +21,8 @@ export interface ReplyTarget {
 }
 
 export interface RoutingInput {
-  cubeIssueIdentifier: string;
-  cubeIssue: RouteCubeIssue | null;
+  sourceIssueIdentifier: string;
+  sourceIssue: RouteSourceIssue | null;
   comment: string;
   workerContext: {
     key: string;
@@ -33,6 +33,7 @@ export interface RoutingInput {
 }
 
 export const RouteReasonSchema = z.enum([
+  "registered_thread",
   "workflow_match",
   "primary_session",
   "only_eligible_candidate",

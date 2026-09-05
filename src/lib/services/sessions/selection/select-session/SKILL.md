@@ -1,6 +1,6 @@
 ---
 name: route-linear-session
-description: Select exactly one eligible Agents-team Linear session for an incoming Linear comment. Use only inside the remote-agent service's isolated one-off Codex router with the linear_session read-only MCP tool.
+description: Select exactly one eligible Remote Agent runtime session for an incoming Linear comment. Use only inside the remote-agent service's isolated one-off Codex router with the linear_session read-only MCP tool.
 ---
 
 # Route Linear Session
@@ -14,11 +14,11 @@ description: Select exactly one eligible Agents-team Linear session for an incom
    descriptions of the business worker's routing intent and agent
    responsibilities.
 5. Read the reply or description-anchor context before interpreting a terse
-   comment body. Prefer a Connected Primary whose current Workflow owns that
-   interaction. Apply the worker's routing hint to the candidates' current
-   labels; otherwise prefer the only eligible Primary.
-6. Delegate and Viewer sessions never accept input. Sessions on Brandon's
-   MacBook Pro never accept input in v1.
+   comment body. Prefer a connected Primary whose repository-defined,
+   router-visible labels best match that interaction. Apply the worker's routing
+   hint to those labels; otherwise prefer the only eligible Primary.
+6. Delegate and Viewer sessions never accept input. Machine acceptance is
+   already enforced by the service and must not be inferred here.
 7. If multiple candidates remain equally appropriate, return no target with
    `ambiguous`. Never guess.
 8. Return only the required JSON object. Do not include prose.

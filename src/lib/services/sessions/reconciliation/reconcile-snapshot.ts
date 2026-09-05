@@ -1,6 +1,9 @@
 import type { ServerConfig } from "../../../config.ts";
 import { getMachine, getMachines } from "../../../machines/index.ts";
-import type { BbClient, BbThread } from "../../../../types/runtime/index.ts";
+import type {
+  AgentRuntimeSession,
+  AgentSessionRuntime,
+} from "../../../../types/runtime/index.ts";
 import {
   getAgentCatalog,
   getAgentStateId,
@@ -9,7 +12,7 @@ import {
   getAgentIssues,
   parseAgentIssueRuntime,
   updateAgentIssue,
-} from "../registry/index.ts";
+} from "../../../integrations/tracker/index.ts";
 import {
   AgentIssueLabel,
   AgentIssueState,
@@ -20,7 +23,7 @@ import {
 export async function reconcileMachineSnapshot(
   config: ServerConfig,
   machine: Machine,
-  threads: BbThread[],
+  sessions: AgentRuntimeSession[],
 ): Promise<{ connected: number; disconnected: number; ended: number }> {
   const [agentIssues, catalog] = await Promise.all([
     getAgentIssues(config, { machine }),
@@ -34,9 +37,11 @@ export async function reconcileMachineSnapshot(
     const parsed = parseAgentIssueRuntime(agentIssue.description);
     if (!parsed || !isReconcilableAgentIssueState(agentIssue.state.name)) continue;
     const runtime = agentIssueRuntimeWithLabels(agentIssue, parsed);
-    const thread = threads.find((candidate) => candidate.id === runtime.bbThreadId);
+    const session = sessions.find(
+      (candidate) => candidate.id === runtime.runtimeSessionId,
+    );
     const live = Boolean(
-      thread && thread.archivedAt == null && thread.status !== "error",
+      session && session.status !== "closed" && session.status !== "error",
     );
     const next = live
       ? AgentIssueState.Connected
@@ -45,7 +50,7 @@ export async function reconcileMachineSnapshot(
         : AgentIssueState.Disconnected;
     const registeredMachine = getMachine({ id: runtime.machine });
     const desiredRouting =
-      live && registeredMachine.acceptsLinearInput && runtime.role === "primary";
+      live && registeredMachine.acceptsTrackerInput && runtime.role === "primary";
     const currentRouting = agentIssue.labels.nodes.some(
       (label) =>
         label.name ===
@@ -72,20 +77,15 @@ export async function reconcileMachineSnapshot(
 /** Change-driven repair pass used at service boot/restart. */
 export async function reconcileMachineSessions(
   config: ServerConfig,
-  bbClient: BbClient,
+  runtime: AgentSessionRuntime,
 ): Promise<{ connected: number; disconnected: number; ended: number }> {
-  const threads = await bbClient.listThreads({
-    projectId: config.bbProjectId,
-    archived: false,
-  });
+  const sessions = await runtime.listSessions();
   const totals = { connected: 0, disconnected: 0, ended: 0 };
   for (const machine of getMachines()) {
-    const hostId = config.bbHostIds[machine.id];
-    if (!hostId) continue;
     const result = await reconcileMachineSnapshot(
       config,
       machine.id,
-      threads.filter((thread) => thread.hostId === hostId),
+      sessions.filter((session) => session.executionTarget === machine.id),
     );
     totals.connected += result.connected;
     totals.disconnected += result.disconnected;

@@ -1,24 +1,27 @@
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../config.ts";
-import type { BbClient, CommandClient } from "../../../types/runtime/index.ts";
+import type { AgentSessionRuntime, CommandClient } from "../../../types/runtime/index.ts";
 import type {
   DispatchEvent,
   Worker,
   WorkerResult,
 } from "../../../types/dispatcher/index.ts";
-import { Reaction, reactToIssue } from "../../integrations/linear/index.ts";
+import { TrackerReaction, reactToIssue } from "../../integrations/linear/reactions.ts";
 import { eventIssueId } from "./event-issue.ts";
-import { workers } from "./worker-registry.ts";
+// Loaded lazily at dispatch time: workers import broad service barrels that
+// can (via webhook handlers) import this dispatcher back. A static import
+// would put the registry inside that cycle and hit TDZ during module init.
+async function loadWorkers() {
+  const { workers } = await import("./worker-registry.ts");
+  return workers;
+}
 import { finishWorkerRun, startWorkerRun } from "./worker-run-store.ts";
-import { createBbClient } from "../../transports/bb/index.ts";
 
-const FAILURE_REACTION_WORKERS = new Set([
-  "product.describe",
-  "product.orchestration",
-]);
+const FAILURE_REACTION_WORKERS = new Set(["product.workflow"]);
 
 export interface DispatchEventDependencies {
-  workers: Worker[];
+  /** Injected by tests; production loads the registry lazily. */
+  workers?: Worker[];
   startRun: (
     prisma: PrismaClient,
     receiptId: string,
@@ -33,7 +36,6 @@ export interface DispatchEventDependencies {
 }
 
 const defaultDependencies: DispatchEventDependencies = {
-  workers,
   startRun: startWorkerRun,
   finishRun: finishWorkerRun,
   react: reactToIssue,
@@ -44,13 +46,13 @@ export async function dispatchEvent(
     prisma: PrismaClient;
     config: ServerConfig;
     commandClient: CommandClient;
-    bbClient?: BbClient;
+    agentRuntime: AgentSessionRuntime;
     receiptId: string;
     event: DispatchEvent;
   },
   dependencies: DispatchEventDependencies = defaultDependencies,
 ): Promise<void> {
-  for (const worker of dependencies.workers.filter((entry) =>
+  for (const worker of (dependencies.workers ?? (await loadWorkers())).filter((entry) =>
     entry.supports(input.event),
   )) {
     const run = await dependencies.startRun(
@@ -64,7 +66,7 @@ export async function dispatchEvent(
         prisma: input.prisma,
         config: input.config,
         commandClient: input.commandClient,
-        bbClient: input.bbClient ?? createBbClient(input.config.bbBaseUrl),
+        agentRuntime: input.agentRuntime,
         runId: run.id,
       });
     } catch (error) {
@@ -81,7 +83,7 @@ export async function dispatchEvent(
       const issueId = eventIssueId(input.event);
       if (issueId) {
         await dependencies
-          .react(input.config.linearApiKey, issueId, Reaction.Failed)
+          .react(input.config.linearApiKey, issueId, TrackerReaction.Failed)
           .catch((error) => {
             console.error(`Failed to react to issue ${issueId}:`, error);
           });

@@ -1,170 +1,127 @@
 # Remote Agent
 
-Hono control plane that routes Linear collaboration into durable, server-owned
-bb threads. bb owns the canonical transcript, ordered events, execution host,
-and lifecycle. Linear is the asynchronous/mobile surface, Zed connects through
-the ACP adapter in this app, and the bb desktop/browser UI remains an optional
-operations surface.
+Run durable coding-agent sessions on your own machine, driven from Linear.
+Mention or assign the agent on an issue and Remote Agent starts a session in
+an isolated worktree, routes follow-up comments to the right session (replies
+in an established thread need no re-mention), and posts links that open the
+work in your editor. Sessions are executed by
+[acpx](https://acpx.sh/) using the provider CLIs you already have — Codex
+and/or Claude Code — with your own subscriptions and credentials.
 
-The service runs on the remote-agent host, not Vercel, and has its own isolated
-Prisma/SQLite database.
+## Install
 
-## Run and verify
+**1. Install the CLI** (this repo is its own Homebrew tap / Scoop bucket):
 
-```bash
-bun run dev:remote-agent
-cd apps/remote-agent
-bun run lint
-bun test
-bun run acp                    # stdio ACP server; normally started by Zed
+macOS:
+
+```sh
+brew tap brandonisagoon/remote-agent https://github.com/brandonisagoon/remote-agent
+brew install remote-agent
 ```
 
-The HTTP server binds to `127.0.0.1:9000` by default. Linear webhooks terminate
-at `/webhooks/linear`; authenticated compatibility and launch endpoints live
-under `/api/*`.
+Windows:
 
-## Ownership and persistence
-
-Each Agents-team Linear issue is a durable routing mirror for one bb thread. It
-stores the harness identity, worktree, bb thread ID, machine, role, workflow,
-lifecycle, state, and source-issue relation. The local `AgentIssueRecord` table
-indexes that mirror by harness session and bb thread; `BbEventCursor` and
-`lastBbEventSeq` make event projection replay-safe.
-
-If Linear and bb disagree, bb wins. Old v1 issue descriptions still parse, but
-an issue without a bb thread ID is intentionally ineligible after the hard
-cutover.
-
-This app never uses the product Postgres database:
-
-| Concern    | Product                 | remote-agent                       |
-| ---------- | ----------------------- | ---------------------------------- |
-| Schema     | `prisma/schema/`        | `apps/remote-agent/prisma/schema/` |
-| Provider   | Neon PostgreSQL         | local SQLite                       |
-| Connection | `DATABASE_URL`          | `REMOTE_AGENT_DATABASE_URL`        |
-| Client     | workspace Prisma client | `src/generated/prisma`             |
-
-Run Prisma commands with `apps/remote-agent` as the current directory.
-
-## Runtime flow
-
-Inbound comments follow this path:
-
-1. Verify the Linear signature, replay window, and delivery ID.
-2. Preserve the existing Agents-team semantic selection rules.
-3. Re-fetch and validate the exact selected mirror and its bb thread.
-4. Submit the comment with bb `queue-if-active` semantics.
-5. Keep the existing Linear reactions and threaded reply contract.
-
-The bb event ingestion loop discovers project threads, tails ordered events,
-advances a durable cursor only after projection, and repairs Agents issue state.
-A bounded startup reconciliation compares mirrored records with bb thread state.
-There is no pane inspection or detached-launch watchdog.
-
-`POST /api/launches` is the shared launch boundary for workspace launchers and
-product workers. It spawns the thread on the selected bb host and immediately
-creates/binds the Agents mirror; the compatibility hook is not on the critical
-path for routability.
-
-`scripts/workspace/agents/session-hook.ts` remains only for Cubic metadata bb
-does not know: workflow labels, provider hook identity, subagents, and explicit
-worktree cleanup. Its runtime payload carries `BB_THREAD_ID`. bb events own
-liveness and failure state.
-
-## Zed ACP adapter
-
-The adapter is part of this app at `src/acp/main.ts`. ACP session IDs are bb
-thread IDs. It supports new/load, replay, live event tailing, text prompts,
-cancel, tool/message/thought projection, and option-based pending questions.
-Zed exposes native selectors for harness, model, permission mode, reasoning
-effort, and service-tier speed. Harness changes keep the root ACP session stable while bb runs the
-selected harness in a hidden execution thread; reconnecting restores both the
-transcript and the selected execution options.
-The standard `session/list` response reports each root thread's bb environment
-path, so Zed groups and filters sessions by their actual worktree rather than
-the shared bb project path. `session/load` accepts a known bb thread ID.
-
-Example Zed configuration:
-
-```json
-{
-  "agent_servers": {
-    "bb": {
-      "type": "custom",
-      "command": "/absolute/path/to/bun",
-      "args": ["/absolute/path/to/apps/remote-agent/src/acp/main.ts"],
-      "env": {
-        "REMOTE_AGENT_BB_URL": "http://127.0.0.1:38886",
-        "REMOTE_AGENT_BB_PROJECT_ID": "<project-id>",
-        "BB_CWD_MAP": "{\"<project-id>\":\"/absolute/path/to/cubic\"}"
-      }
-    }
-  }
-}
+```powershell
+scoop bucket add remote-agent https://github.com/brandonisagoon/remote-agent
+scoop install remote-agent
 ```
 
-stdout is reserved for ACP JSON-RPC; diagnostics go to stderr.
+This also installs the runtime dependencies, Bun and cloudflared.
+
+**2. Create your config and provision the daemon:**
+
+```sh
+remote-agent install
+```
+
+This clones the repo into an app directory, builds it, migrates the database,
+and registers the daemon to start at login (a launchd user agent on macOS, a
+Task Scheduler logon task on Windows — your login session, because the agent
+sessions use your credentials).
+
+**3. Run the checklist and finish the manual steps:**
+
+```sh
+remote-agent doctor
+```
+
+`doctor` reports every prerequisite with what to do about it. The parts no
+installer can do for you:
+
+- **Cloudflare tunnel** — Linear needs a public URL to deliver webhooks:
+  `cloudflared tunnel login`, create a tunnel, and add the DNS record (the
+  desktop app's Server section shows the exact record to create).
+- **Linear** — an API key, plus the webhook URL and secret from your
+  connection settings pasted into Linear's webhook settings.
+- **Provider CLIs** — install and authenticate `codex` and/or `claude`
+  yourself; they are your identity and subscription, never installed for you.
+  Their presence enables the matching provider.
+
+**4. (Optional) Install the desktop app** from the
+[releases page](https://github.com/brandonisagoon/remote-agent/releases) —
+DMG on macOS, installer on Windows. It is the primary configuration surface:
+it edits the same JSON config with a full settings UI, shows the same
+checklist as `doctor` with buttons attached, and displays session state. Every
+release ships the CLI and app together, one version.
+
+Day-to-day commands: `status`, `restart`, `check-update`, `update` (pull,
+rebuild, migrate, restart — rolls back on failure), `uninstall [--purge]`.
+
+## How it works
+
+- A **connection** binds a Linear workspace to this machine: which
+  repositories sessions may work in, one inbound webhook, the session router
+  (the model that reads incoming comments alongside the session database and
+  picks the session to deliver them to), and the editors worktree links open
+  in.
+- Each **repository** you manage gets sessions in isolated worktrees, prepared
+  by its own bootstrap command. Optional **workflows** react to Linear events
+  (a state change, a reaction) by composing one of the repo's own
+  [skill-composer](https://github.com/brandonisagoon/skill-composer) skillsets
+  into the worktree and either starting a session or messaging the running
+  one. A workflow can also start its session in plan mode: the daemon
+  captures the finished plan when the agent asks to exit plan mode, writes it
+  into the source issue's description under `## Implementation Plan`, and
+  then moves the issue to a configured state — the agent never touches Linear
+  for either step.
+- When a session's worktree is ready, the Linear issue gets one deep link per
+  configured editor — opening locally, or over SSH when your editors run on a
+  different machine than the daemon.
 
 ## Configuration
 
-| Variable                                  | Default                           | Purpose                                |
-| ----------------------------------------- | --------------------------------- | -------------------------------------- |
-| `LINEAR_WEBHOOK_SECRET`                   | required                          | Linear webhook signature secret        |
-| `REMOTE_AGENT_API_KEY`                    | required                          | Bearer token for `/api/*`              |
-| `REMOTE_AGENT_PUBLIC_URL`                 | `https://agents.cubicsurveys.dev` | Public origin for signed session links |
-| `GITHUB_WEBHOOK_SECRET`                   | required                          | Deploy webhook signature secret        |
-| `LINEAR_API_KEY`                          | required                          | Linear GraphQL access                  |
-| `LINEAR_AGENT_USER_ID`                    | required                          | Agent identity/assignee                |
-| `LINEAR_AGENT_TEAM_KEY`                   | `AGENT`                           | Session mirror team                    |
-| `REMOTE_AGENT_BB_URL`                     | `http://127.0.0.1:38886`          | Canonical bb server                    |
-| `REMOTE_AGENT_BB_PROJECT_ID`              | required                          | Cubic bb project                       |
-| `REMOTE_AGENT_BB_HOST_MACBOOK_AIR`        | required                          | Air execution host ID                  |
-| `REMOTE_AGENT_BB_HOST_MACBOOK_PRO`        | —                                 | Pro execution host ID                  |
-| `REMOTE_AGENT_BB_RECONCILE_INTERVAL_MS`   | `60000`                           | Bounded bb/mirror repair interval      |
-| `REMOTE_AGENT_MACHINE`                    | `macbook-air`                     | This service's machine identity        |
-| `REMOTE_AGENT_WORKSPACE_REPO`             | `~/Desktop/cubic`                 | Full checkout for launch provisioning  |
-| `REMOTE_AGENT_DATABASE_URL`               | local SQLite                      | Isolated registry database             |
-| `REMOTE_AGENT_HOST` / `REMOTE_AGENT_PORT` | `127.0.0.1` / `9000`              | HTTP listener                          |
+Everything lives in one gitignored JSON file, `remote-agent.config.json`,
+mirrored exactly by the desktop app's pages:
 
-bb 0.37.0 has no application bearer token. Keep it on loopback/Tailscale; that
-network boundary is the access control boundary.
+- `machine` — this installation: server, sockets, storage, SSH host for editor
+  links, install/update settings.
+- `providers.{codex,claude}` — presence enables a provider; optional `command`
+  overrides acpx's built-in adapter launch.
+- `connections.<id>` — a Linear workspace: credentials, machine binding,
+  repository allowlist, webhook, router, editors.
+- `repositories.<id>` — a managed checkout: `root`, `worktreeRoot`,
+  `bootstrapCommand`, its skill-composer `skillsRoot`, `workflows`
+  (trigger → conditions → skillset → delivery), and session label groups.
 
-Agent issue descriptions and orchestration comments include a signed **Open
-Thread in bb** link. The public remote-agent route validates the signature and
-project, then broadcasts bb's native thread-open action to connected desktop
-clients. Linear link previews receive a confirmation page and cannot open a
-thread. If more than one bb desktop window is connected to the same server, bb
-may present the thread in each of them.
+See [remote-agent.config.example.json](remote-agent.config.example.json) for
+every setting and [docs/adoption.md](docs/adoption.md) for what a managed
+repository must provide.
 
-## MacBook Air deployment
+## Editor integrations
 
-```bash
-bash scripts/workspace/agents/install-bb-server.sh
-bash apps/remote-agent/scripts/install.sh
-```
+Worktree deep links support Zed, VS Code, and Cursor (any app with a URL
+scheme works for local links). Zed users can additionally attach to running
+sessions over ACP — the `bun run acp` stdio bridge connects Zed to the daemon
+with full controls (provider, model, mode, thinking level) and restored
+context usage across reconnects.
 
-`install-bb-server.sh` installs `bb-app@0.37.0` and a launchd user agent. Bind
-to a Tailscale address only when the Pro must reach the server. Then enroll the
-Air and Pro with `bb-host-daemon join`, create the Cubic project/baseline
-environment, and record the project/host IDs in the remote-agent environment.
+## Data
 
-`install.sh` deploys remote-agent from a sparse clone, applies its SQLite
-migrations, and installs the service/deploy launch agents. The legacy pane
-reconciliation launch agent is explicitly retired.
+Session state lives in the service's SQLite database; acpx keeps transcripts
+under its own state directory. Both survive restarts — an editor or SSH
+disconnect never closes a session, and explicit close/end operations are what
+mark one closed.
 
-## Source layout
+---
 
-```text
-src/
-  acp/                          Zed ACP executable and bb projection
-  routes/launches/              authenticated shared thread launch API
-  routes/session-events/        metadata compatibility bridge
-  lib/transports/bb/            official bb SDK adapter and errors
-  lib/transports/command/       generic subprocess adapter
-  lib/services/sessions/
-    bb-events/                  replay-safe ingestion and projection
-    reconciliation/             bb-to-Linear repair sweep
-    registry/                   Agents mirror + SQLite mapping
-    selection/                  unchanged semantic router
-  lib/workers/                  Linear business workflows
-```
+Working on Remote Agent itself? See [DEVELOPMENT.md](DEVELOPMENT.md).

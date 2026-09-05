@@ -1,0 +1,140 @@
+{
+  "$schema": "./remote-agent.config.schema.json",
+  "schemaVersion": 2,
+  "serviceName": "remote-agent",
+  "machine": {
+    "id": "studio-mac",
+    "name": "Studio Mac",
+    "server": {
+      "publicUrl": "https://agents.example.com",
+      "apiKey": "replace-with-a-long-random-api-key",
+      "listen": {
+        "host": "127.0.0.1",
+        "port": 9000
+      },
+      "databaseUrl": "file:./remote-agent.sqlite",
+      "acpSocketPath": "~/Library/Application Support/remote-agent/acp.sock",
+      "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock"
+    },
+    "acpx": {
+      "stateDir": "~/Library/Application Support/remote-agent/acpx"
+    },
+    "acp": {
+      "providerId": "codex"
+    },
+    "installation": {
+      "gitRemote": "https://github.com/brandonisagoon/remote-agent.git",
+      "branch": "main"
+    },
+    "updates": {
+      "channel": "stable"
+    }
+  },
+  "providers": {},
+  "connections": {
+    "linear-main": {
+      "provider": "linear",
+      "name": "Linear Product",
+      "apiKey": "replace-with-linear-api-key",
+      "agentUserId": "replace-with-linear-agent-user-id",
+      "agentHandle": "agent",
+      "webhook": {
+        "slug": "linear-product",
+        "secret": "replace-with-linear-webhook-secret",
+        "webhookMaxAgeMs": 60000
+      },
+      "router": {
+        "providerId": "codex",
+        "timeoutMs": 30000
+      },
+      "editors": [
+        {
+          "name": "Zed",
+          "scheme": "zed"
+        }
+      ],
+      "machineId": "studio-mac",
+      "repositories": "*"
+    }
+  },
+  "repositories": {
+    "your-repository": {
+      "name": "Your Repository",
+      "root": "~/checkouts/your-repository",
+      "worktreeRoot": "../.worktrees/your-repository",
+      "bootstrapCommand": [
+        "bash",
+        "scripts/bootstrap.sh"
+      ],
+      "sessionDefaults": {
+        "labels": {}
+      },
+      "skillsRoot": "agent-skills",
+      "workflows": {
+        "plan": {
+          "on": "issue.state-changed",
+          "when": [
+            {
+              "issue.state": [
+                "Planning"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "orchestrate",
+            "flags": []
+          },
+          "deliver": "start-session",
+          "providerId": "claude",
+          "plan": {
+            "captureToIssue": true,
+            "thenState": "Planned"
+          }
+        },
+        "review": {
+          "on": "issue.state-changed",
+          "when": [
+            {
+              "issue.state": [
+                "Pull Request"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "reflect",
+            "flags": []
+          },
+          "deliver": "message-session"
+        },
+        "describe": {
+          "on": "issue.reaction",
+          "when": [
+            {
+              "reaction.emoji": [
+                "pencil2"
+              ]
+            }
+          ],
+          "skill": {
+            "skillset": "describe",
+            "flags": []
+          },
+          "deliver": "start-session",
+          "providerId": "claude",
+          "model": "opus"
+        }
+      },
+      "labels": {
+        "example.workflow": {
+          "labels": [
+            "planning",
+            "implementation",
+            "review"
+          ],
+          "exclusive": true,
+          "routerVisible": true
+        }
+      }
+    }
+  }
+}

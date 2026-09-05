@@ -1,33 +1,34 @@
 import type {
-  LinearCommentWebhook,
-  LinearIssueWebhook,
-  LinearReactionWebhook,
-} from "../webhooks/linear/index.ts";
+  TrackerCommentWebhook,
+  TrackerIssueWebhook,
+  TrackerReactionWebhook,
+} from "../../lib/integrations/tracker/index.ts";
 
 export const DispatchEventType = {
-  LinearCommentMentioned: "linear.comment.mentioned",
-  LinearIssueReflectionRequested:
-    "linear.issue.reflection-requested",
-  LinearIssueOrchestrationRequested:
-    "linear.issue.orchestration-requested",
-  LinearIssueDescribeRequested: "linear.issue.describe-requested",
-  LinearIssueEndRequested: "linear.issue.end-requested",
+  TrackerCommentMentioned: "tracker.comment.mentioned",
+  /** A repository workflow's trigger matched an incoming event. */
+  TrackerWorkflowTriggered: "tracker.workflow.triggered",
+  TrackerIssueEndRequested: "tracker.issue.end-requested",
 } as const;
 
 export type DispatchEventTypeValue =
   (typeof DispatchEventType)[keyof typeof DispatchEventType];
 
-interface DispatchEventPayloadByType {
-  [DispatchEventType.LinearCommentMentioned]: LinearCommentWebhook;
-  [DispatchEventType.LinearIssueReflectionRequested]: LinearIssueWebhook;
-  [DispatchEventType.LinearIssueOrchestrationRequested]: LinearIssueWebhook;
-  [DispatchEventType.LinearIssueDescribeRequested]: LinearReactionWebhook;
-  [DispatchEventType.LinearIssueEndRequested]: LinearIssueWebhook;
-}
-
-export type DispatchEvent = {
-  [Type in DispatchEventTypeValue]: {
-    type: Type;
-    webhook: DispatchEventPayloadByType[Type];
-  };
-}[DispatchEventTypeValue];
+export type DispatchEvent =
+  | {
+      type: typeof DispatchEventType.TrackerCommentMentioned;
+      webhook: TrackerCommentWebhook;
+      /** Set when the comment's thread is registered to a session: delivery
+          bypasses the semantic router. */
+      routedSessionId?: string;
+      threadRelationship?: "thread" | "question";
+    }
+  | {
+      type: typeof DispatchEventType.TrackerWorkflowTriggered;
+      webhook: TrackerIssueWebhook | TrackerReactionWebhook;
+      workflowId: string;
+    }
+  | {
+      type: typeof DispatchEventType.TrackerIssueEndRequested;
+      webhook: TrackerIssueWebhook;
+    };

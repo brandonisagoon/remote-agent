@@ -1,27 +1,9 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
-import { createFakeBbClient } from "../../../test-support/bb.ts";
+import { createFakeAgentRuntime } from "../../../test-support/agent-runtime.ts";
 import { testConfig } from "../../../test-support/config.ts";
-import type { BbModel } from "../../../types/runtime/index.ts";
-import { ModelResolutionError } from "./resolve-model.ts";
-import {
-  launchExecutionSettings,
-  spawnAgentThread,
-  type SpawnAgentThreadInput,
-} from "./spawn.ts";
-
-function model(id: string): BbModel {
-  return {
-    id,
-    model: id,
-    displayName: id,
-    description: id,
-    supportedReasoningEfforts: [],
-    defaultReasoningEffort: "high",
-    isDefault: false,
-  };
-}
+import { spawnAgentThread, type SpawnAgentThreadInput } from "./spawn.ts";
 
 function launchInput(
   overrides: Partial<SpawnAgentThreadInput> = {},
@@ -29,7 +11,8 @@ function launchInput(
   return {
     config: testConfig(),
     prisma: {} as PrismaClient,
-    bbClient: createFakeBbClient(),
+    agentRuntime: createFakeAgentRuntime(),
+    launchKey: "run-3278",
     issueIdentifier: "CUBE-3278",
     harness: "claude",
     model: "fable",
@@ -42,64 +25,48 @@ function launchInput(
   };
 }
 
-describe("launchExecutionSettings", () => {
-  test("preserves the previous Codex primary execution mode", () => {
-    expect(launchExecutionSettings("codex")).toEqual({
-      permissionMode: "full",
-      reasoningLevel: "high",
-      serviceTier: "default",
-    });
+describe("spawnAgentThread", () => {
+  test("ensures a metadata-complete session and enqueues it", async () => {
+    const runtime = createFakeAgentRuntime();
+    const launched = await spawnAgentThread(launchInput({ agentRuntime: runtime }));
+
+    expect(runtime.ensureInputs).toEqual([
+      expect.objectContaining({
+        sessionKey: "run-3278",
+        agent: "claude",
+        cwd: "/tmp/cube-3278",
+        model: "fable",
+        repositoryId: "test-repository",
+        machineId: "macbook-air",
+        role: "delegate",
+        resourceLinks: [{
+          provider: "linear",
+          connectionId: "linear-test",
+          resourceType: "issue-identifier",
+          externalId: "CUBE-3278",
+          relationship: "handles",
+        }],
+      }),
+    ]);
+    expect(launched.agentIssue).toBeNull();
+    expect(runtime.sentMessages).toEqual([
+      {
+        sessionId: launched.session.id,
+        text: "Plan CUBE-3278",
+        requestId: "launch:run-3278",
+      },
+    ]);
   });
 
-  test("preserves the previous Claude delegate permission mode", () => {
-    expect(launchExecutionSettings("claude")).toEqual({
-      permissionMode: "auto",
-      reasoningLevel: "high",
-      serviceTier: undefined,
-    });
-  });
-});
-
-describe("spawnAgentThread model resolution", () => {
-  test("rejects an unknown model before spawning", async () => {
-    const bbClient = createFakeBbClient();
-    bbClient.setModels("claude-code", [model("claude-fable-5")]);
-
+  test("closes the acpx session when its initial enqueue fails", async () => {
+    const runtime = createFakeAgentRuntime();
+    runtime.enqueue = async () => {
+      throw new Error("enqueue failed");
+    };
     await expect(
-      spawnAgentThread(launchInput({ bbClient, model: "unknown-model" })),
-    ).rejects.toBeInstanceOf(ModelResolutionError);
-    expect(bbClient.spawnInputs).toHaveLength(0);
-  });
-
-  test("forwards the resolved catalog ID to bb", async () => {
-    const bbClient = createFakeBbClient();
-    bbClient.setModels("claude-code", [model("claude-fable-5")]);
-    bbClient.spawnThread = async (input) => {
-      bbClient.spawnInputs.push(input);
-      throw new Error("captured spawn input");
-    };
-
-    await expect(spawnAgentThread(launchInput({ bbClient }))).rejects.toThrow(
-      "captured spawn input",
-    );
-    expect(bbClient.spawnInputs[0]?.model).toBe("claude-fable-5");
-  });
-
-  test("preserves the requested alias when the catalog is unavailable", async () => {
-    const warning = spyOn(console, "warn").mockImplementation(() => {});
-    const bbClient = createFakeBbClient();
-    bbClient.spawnThread = async (input) => {
-      bbClient.spawnInputs.push(input);
-      throw new Error("captured spawn input");
-    };
-
-    try {
-      await expect(spawnAgentThread(launchInput({ bbClient }))).rejects.toThrow(
-        "captured spawn input",
-      );
-      expect(bbClient.spawnInputs[0]?.model).toBe("fable");
-    } finally {
-      warning.mockRestore();
-    }
+      spawnAgentThread(launchInput({ agentRuntime: runtime })),
+    ).rejects.toThrow("enqueue failed");
+    expect(runtime.closedSessionIds).toEqual(["runtime-1"]);
+    expect(runtime.sentMessages).toHaveLength(0);
   });
 });

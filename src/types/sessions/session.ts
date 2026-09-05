@@ -14,6 +14,9 @@ export const SessionRoleSchema = z.enum([
   "unassigned",
 ]);
 export const SessionLifecycleSchema = z.enum(["one-shot", "persistent"]);
+export const SourceIssueIdentifierSchema = z
+  .string()
+  .regex(/^[A-Z][A-Z0-9]*-\d+$/);
 export const WorkflowSchema = z.enum([
   AgentIssueLabel.Workflow.DescribeLinearIssue,
   AgentIssueLabel.Workflow.PlanLinear,
@@ -30,11 +33,8 @@ const RuntimeSchema = z.object({
   machine: MachineSchema,
   role: SessionRoleSchema.default("primary"),
   lifecycle: SessionLifecycleSchema.nullish(),
-  cubeIssueIdentifier: z
-    .string()
-    .regex(/^CUBE-\d+$/)
-    .nullish(),
-  bbThreadId: z.string().min(1).max(256).nullish(),
+  sourceIssueIdentifier: SourceIssueIdentifierSchema.nullish(),
+  runtimeSessionId: z.string().min(1).max(256).nullish(),
 });
 
 const EventBaseSchema = z.object({
@@ -59,10 +59,7 @@ export const SessionLifecycleEventSchema = z.discriminatedUnion("type", [
     type: z.enum(["workflow.started", "workflow.ended"]),
     runtime: RuntimeSchema,
     workflow: WorkflowSchema,
-    cubeIssueIdentifier: z
-      .string()
-      .regex(/^CUBE-\d+$/)
-      .nullish(),
+    sourceIssueIdentifier: SourceIssueIdentifierSchema.nullish(),
   }),
   EventBaseSchema.extend({
     type: z.literal("worktree.ended"),
@@ -83,7 +80,7 @@ export interface AgentIssueSyncMetadata {
   eventId: string;
   generation: number;
   occurredAt: string;
-  cubeIssueIdentifier: string | null;
+  sourceIssueIdentifier: string | null;
 }
 
 export interface RouteCandidate {
@@ -95,7 +92,7 @@ export interface RouteCandidate {
   runtime: SessionRuntime;
 }
 
-export interface RouteCubeIssue {
+export interface RouteSourceIssue {
   identifier: string;
   title: string;
   description: string | null;
@@ -103,8 +100,8 @@ export interface RouteCubeIssue {
   labels: string[];
 }
 
-export interface LinearRoutingContext {
-  cubeIssue: RouteCubeIssue;
+export interface TrackerRoutingContext {
+  sourceIssue: RouteSourceIssue;
   candidates: RouteCandidate[];
 }
 

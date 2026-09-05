@@ -1,19 +1,10 @@
-import {
-  cpSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type { ServerConfig } from "../../../config.ts";
-import {
-  AgentIssueLabel,
-  type RouteCandidate,
-} from "../../../../types/sessions/index.ts";
+import type { RouteCandidate } from "../../../../types/sessions/index.ts";
 import {
   RouteActionSchema,
   RouteDecisionSchema,
@@ -27,25 +18,33 @@ export class RouterTimeoutError extends Error {}
 
 const ROLE_CATALOG = [
   {
-    name: AgentIssueLabel.Role.Primary,
+    name: "primary",
     routing: "May receive Linear input when all server eligibility checks pass.",
   },
   {
-    name: AgentIssueLabel.Role.Delegate,
+    name: "delegate",
     routing: "A subagent owned by another session; never receives Linear input.",
   },
   {
-    name: AgentIssueLabel.Role.Viewer,
+    name: "viewer",
     routing: "Observes work without owning it; never receives Linear input.",
   },
   {
-    name: AgentIssueLabel.Role.Unassigned,
+    name: "unassigned",
     routing: "Has no routing responsibility; never receives Linear input.",
   },
 ] as const;
 
-function toml(value: string): string {
-  return JSON.stringify(value);
+const SKILL_TEXT = readFileSync(
+  path.join(import.meta.dir, "select-session", "SKILL.md"),
+  "utf8",
+);
+
+/** The acpx CLI entry; overridable so tests can substitute a fake agent. */
+function acpxCliPath(): string {
+  const override = process.env.REMOTE_AGENT_ACPX_CLI;
+  if (override) return override;
+  return fileURLToPath(new URL("dist/cli.js", import.meta.resolve("acpx/package.json")));
 }
 
 export function outputSchema(
@@ -107,10 +106,10 @@ function boundedTail(value: string, limit: number): string {
 
 /**
  * Let a one-off model make the semantic choice while exposing no Linear write
- * tools and no broad repository context. Candidate eligibility is established
+ * tools and no repository context. Candidate eligibility is established
  * before this call and revalidated after it.
  */
-export async function selectSessionWithCodex(
+export async function selectSessionWithRouter(
   config: ServerConfig,
   input: RoutingInput,
 ): Promise<RouteDecision> {
@@ -138,7 +137,7 @@ export async function selectSessionWithCodex(
     if (replyTargets.length === 0) return deterministic;
 
     try {
-      const classified = await runCodexRouter(config, input);
+      const classified = await runRouter(config, input);
       return {
         ...deterministic,
         expectedActions: classified.expectedActions,
@@ -152,129 +151,111 @@ export async function selectSessionWithCodex(
     }
   }
 
-  return runCodexRouter(config, input);
+  return runRouter(config, input);
 }
 
-async function runCodexRouter(
+/**
+ * Routes through acpx (one-shot `exec`, no session state) so any ACP-capable
+ * harness can act as the router — the daemon carries no per-CLI invocation
+ * knowledge. Context and the output schema travel in the prompt; the decision
+ * is the agent's final message, validated with zod.
+ */
+async function runRouter(
   config: ServerConfig,
   input: RoutingInput,
 ): Promise<RouteDecision> {
   const runDir = mkdtempSync(path.join(tmpdir(), "remote-agent-router-"));
-  const outputFile = path.join(runDir, "decision.json");
-  const schemaFile = path.join(runDir, "schema.json");
-  const contextFile = path.join(runDir, "context.json");
-  const skillDir = path.join(runDir, ".agents", "skills", "route-linear-session");
-  const sourceSkill = path.join(
-    import.meta.dir,
-    "select-session",
-    "SKILL.md",
-  );
-  const mcpScript = path.join(import.meta.dir, "mcp.ts");
 
   try {
-    mkdirSync(skillDir, { recursive: true });
-    cpSync(sourceSkill, path.join(skillDir, "SKILL.md"));
-    writeFileSync(
-      schemaFile,
-      JSON.stringify(
-        outputSchema(input.candidates, input.replyTargets ?? []),
-      ),
-    );
-    writeFileSync(
-      contextFile,
-      JSON.stringify({
-        cubeIssueIdentifier: input.cubeIssueIdentifier,
-        cubeIssue: input.cubeIssue
-          ? {
-              ...input.cubeIssue,
-              description: bounded(input.cubeIssue.description, 2_000),
-            }
-          : null,
-        comment: bounded(input.comment, 8_000),
-        workerContext: input.workerContext,
-        roleCatalog: ROLE_CATALOG,
-        candidates: input.candidates.map((candidate) => ({
-          agentIssueIdentifier: candidate.agentIssueIdentifier,
-          status: candidate.status,
-          labels: candidate.labels,
-          harness: candidate.runtime.harness,
-          role: candidate.runtime.role,
-          machine: candidate.runtime.machine,
-        })),
-        replyTargets: (input.replyTargets ?? []).map((target) => ({
-          ...target,
-          excerpt: bounded(target.excerpt, 500) ?? "",
-        })),
-      }),
-      { mode: 0o600 },
-    );
+    const schema = outputSchema(input.candidates, input.replyTargets ?? []);
+    const context = {
+      sourceIssueIdentifier: input.sourceIssueIdentifier,
+      sourceIssue: input.sourceIssue
+        ? {
+            ...input.sourceIssue,
+            description: bounded(input.sourceIssue.description, 2_000),
+          }
+        : null,
+      comment: bounded(input.comment, 8_000),
+      workerContext: input.workerContext,
+      roleCatalog: ROLE_CATALOG,
+      candidates: input.candidates.map((candidate) => ({
+        agentIssueIdentifier: candidate.agentIssueIdentifier,
+        status: candidate.status,
+        labels: candidate.labels,
+        harness: candidate.runtime.harness,
+        role: candidate.runtime.role,
+        machine: candidate.runtime.machine,
+      })),
+      replyTargets: (input.replyTargets ?? []).map((target) => ({
+        ...target,
+        excerpt: bounded(target.excerpt, 500) ?? "",
+      })),
+    };
+
+    const prompt = [
+      SKILL_TEXT,
+      "",
+      "<routing-context>",
+      JSON.stringify(context),
+      "</routing-context>",
+      "",
+      "<output-schema>",
+      JSON.stringify(schema),
+      "</output-schema>",
+      "",
+      "Select the best eligible session from the routing context. Respond with ONLY a JSON object conforming to the output schema — no prose, no code fences.",
+    ].join("\n");
 
     const args = [
-      "exec",
-      "--ephemeral",
-      "--ignore-user-config",
-      "--ignore-rules",
-      "--sandbox",
-      "read-only",
-      "--skip-git-repo-check",
-      "--cd",
+      "--format",
+      "quiet",
+      "--deny-all",
+      "--no-fs",
+      "--no-terminal",
+      "--allowed-tools",
+      "",
+      "--auth-policy",
+      "fail",
+      "--cwd",
       runDir,
-      "--output-schema",
-      schemaFile,
-      "--output-last-message",
-      outputFile,
-      "--config",
-      `mcp_servers.linear_session.command=${toml(process.execPath)}`,
-      "--config",
-      `mcp_servers.linear_session.args=[${toml(mcpScript)}]`,
-      "--config",
-      `mcp_servers.linear_session.env={REMOTE_AGENT_ROUTING_CONTEXT_FILE=${toml(contextFile)}}`,
-      "--config",
-      "mcp_servers.linear_session.required=true",
-      "--config",
-      'mcp_servers.linear_session.enabled_tools=["get_routing_context"]',
-      "--config",
-      'mcp_servers.linear_session.default_tools_approval_mode="approve"',
-      "--config",
-      "features.hooks=false",
+      "--timeout",
+      String(Math.max(1, Math.ceil(config.routerTimeoutMs / 1000))),
     ];
     if (config.routerModel) args.push("--model", config.routerModel);
-    args.push(
-      "Use $route-linear-session. Call get_routing_context, select the best eligible session, and return only the schema-conforming decision.",
-    );
+    args.push(config.routerProviderId, "exec", prompt);
 
-    const child = Bun.spawn([config.codexExecutable, ...args], {
+    const child = Bun.spawn([process.execPath, acpxCliPath(), ...args], {
       cwd: runDir,
-      env: {
-        HOME: process.env.HOME ?? "",
-        CODEX_HOME: process.env.CODEX_HOME ?? "",
-        PATH: process.env.PATH ?? "/usr/bin:/bin",
-        TMPDIR: process.env.TMPDIR ?? tmpdir(),
-        REMOTE_AGENT_SUPPRESS_HOOKS: "1",
-      },
+      env: { ...process.env, REMOTE_AGENT_SUPPRESS_HOOKS: "1" },
       stdin: "ignore",
-      stdout: "ignore",
+      stdout: "pipe",
       stderr: "pipe",
     });
 
-    const timer = setTimeout(() => child.kill(9), config.routerTimeoutMs);
-    const [exitCode, stderr] = await Promise.all([
+    // Backstop for a wedged acpx; its own --timeout should fire first.
+    const timer = setTimeout(() => child.kill(9), config.routerTimeoutMs + 5_000);
+    const [exitCode, stdout, stderr] = await Promise.all([
       child.exited,
+      new Response(child.stdout).text(),
       new Response(child.stderr).text(),
     ]).finally(() => clearTimeout(timer));
 
     if (exitCode === 137 || exitCode === 9) {
-      throw new RouterTimeoutError("Codex router timed out");
+      throw new RouterTimeoutError("session router timed out");
     }
     if (exitCode !== 0) {
       throw new Error(
-        `Codex router exited ${exitCode}: ${boundedTail(stderr, 2_000)}`,
+        `session router exited ${exitCode}: ${boundedTail(stderr || stdout, 2_000)}`,
       );
     }
 
-    return RouteDecisionSchema.parse(
-      JSON.parse(readFileSync(outputFile, "utf8")),
-    );
+    const start = stdout.indexOf("{");
+    const end = stdout.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      throw new Error(`session router returned no JSON: ${boundedTail(stdout, 500)}`);
+    }
+    return RouteDecisionSchema.parse(JSON.parse(stdout.slice(start, end + 1)));
   } finally {
     rmSync(runDir, { recursive: true, force: true });
   }

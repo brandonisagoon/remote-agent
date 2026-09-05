@@ -1,30 +1,32 @@
 #!/usr/bin/env bun
 
-import { Readable, Writable } from "node:stream";
-import * as acp from "@agentclientprotocol/sdk";
+import { createConnection } from "node:net";
 
-import { BbAcpAgent } from "./agent.ts";
-import { readAcpConfig } from "./config.ts";
+import { readConfig } from "../lib/config.ts";
 import { acpLog } from "./log.ts";
-import { createBbClient } from "../lib/transports/bb/index.ts";
 
-export function startAcpAgent(): acp.AgentSideConnection {
-  const config = readAcpConfig();
-  const stream = acp.ndJsonStream(
-    Writable.toWeb(process.stdout),
-    Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
-  );
-  return new acp.AgentSideConnection(
-    (connection) => new BbAcpAgent(connection, createBbClient(config.bbBaseUrl), config),
-    stream,
-  );
+/** Stateless Zed ACP stdio bridge. The machine daemon is the sole runtime and
+ * database owner; this process only forwards framed NDJSON bytes. */
+export async function startAcpBridge(): Promise<void> {
+  const config = readConfig();
+  const socket = createConnection(config.acpIpcPath);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("connect", resolve);
+    socket.once("error", reject);
+  });
+  process.stdin.pipe(socket);
+  socket.pipe(process.stdout);
+  await new Promise<void>((resolve, reject) => {
+    socket.once("close", resolve);
+    socket.once("error", reject);
+  });
 }
 
 if (import.meta.main) {
   try {
-    startAcpAgent();
+    await startAcpBridge();
   } catch (error) {
-    acpLog("startup failed", error);
+    acpLog("bridge failed", error);
     process.exitCode = 1;
   }
 }

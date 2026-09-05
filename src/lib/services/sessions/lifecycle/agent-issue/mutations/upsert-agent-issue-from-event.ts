@@ -1,10 +1,9 @@
 import type { ServerConfig } from "../../../../../config.ts";
 import type { PrismaClient } from "../../../../../../generated/prisma/client.ts";
-import { createBbClient } from "../../../../../transports/bb/index.ts";
 import {
   agentIssueRuntimeWithLabels,
   buildAgentIssueDescription,
-  cubeIssueIdentifierFromBranch,
+  sourceIssueIdentifierFromBranch,
   parseAgentIssueRuntime,
   parseAgentIssueSyncMetadata,
   parseAgentIssueSourceIdentifier,
@@ -17,10 +16,13 @@ import {
   getAgentStateId,
   getAgentIssueRelations,
   getAgentIssues,
-  getCubeIssue,
+  getSourceIssue,
   updateAgentIssue,
+} from "../../../../../integrations/tracker/index.ts";
+import {
   deleteAgentIssueRecord,
   findAgentIssueRecordByHarnessSessionId,
+  attachRuntimeSessionToAgentIssue,
   updateAgentIssueRecord,
   upsertAgentIssueRecord,
 } from "../../../registry/index.ts";
@@ -30,30 +32,18 @@ import {
   type AgentIssueSyncMetadata,
   type RuntimeSessionEvent,
 } from "../../../../../../types/sessions/index.ts";
-import {
-  buildAgentIssueTitle,
-  locatorConflict,
-  threadStillOwnsSession,
-  resolveAgentIssueState,
-} from "../rules/index.ts";
+import { buildAgentIssueTitle, resolveAgentIssueState } from "../rules/index.ts";
 import { enqueueAgentIssueWrite } from "./enqueue-agent-issue-write.ts";
 import { findAgentIssue } from "../queries/index.ts";
-import type { AgentIssueMutationDependencies } from "../types.ts";
-import { resolveBbBackedEvent } from "./resolve-bb-backed-event.ts";
 
 export async function upsertAgentIssueFromEvent(
   config: ServerConfig,
   event: RuntimeSessionEvent,
   prisma: PrismaClient,
-  dependencies: AgentIssueMutationDependencies = {},
+  _dependencies: Record<string, never> = {},
 ): Promise<AgentIssue | null> {
-  const bbClient = dependencies.bbClient ?? createBbClient(config.bbBaseUrl);
-  const resolvedEvent = await resolveBbBackedEvent(config, event, bbClient);
-  return enqueueAgentIssueWrite(resolvedEvent.runtime.harnessSessionId, () =>
-    upsertAgentIssue(config, resolvedEvent, prisma, {
-      ...dependencies,
-      bbClient,
-    }),
+  return enqueueAgentIssueWrite(event.runtime.harnessSessionId, () =>
+    upsertAgentIssue(config, event, prisma),
   );
 }
 
@@ -61,7 +51,6 @@ async function upsertAgentIssue(
   config: ServerConfig,
   event: RuntimeSessionEvent,
   prisma: PrismaClient,
-  dependencies: AgentIssueMutationDependencies,
 ): Promise<AgentIssue | null> {
   const catalog = await getAgentCatalog(config);
   let agentIssueRecord = await findAgentIssueRecordByHarnessSessionId(prisma, {
@@ -107,7 +96,6 @@ async function upsertAgentIssue(
   const recordRuntime = {
     harnessSessionId: event.runtime.harnessSessionId,
     machine: isRootSession ? event.runtime.machine : null,
-    bbThreadId: isRootSession ? (event.runtime.bbThreadId ?? null) : null,
   };
   if (existingAgentIssue && !agentIssueRecord) {
     agentIssueRecord = await upsertAgentIssueRecord(prisma, {
@@ -137,7 +125,7 @@ async function upsertAgentIssue(
   const previousMetadata = parseAgentIssueSyncMetadata(
     existingAgentIssue?.description ?? null,
   );
-  const previousCubeIssueIdentifier = parseAgentIssueSourceIdentifier(
+  const previousSourceIssueIdentifier = parseAgentIssueSourceIdentifier(
     existingAgentIssue?.description ?? null,
   );
   const storedGeneration = agentIssueRecord?.lastGeneration;
@@ -154,40 +142,8 @@ async function upsertAgentIssue(
     return existingAgentIssue;
   }
 
-  if (existingAgentIssue) {
-    const parsedRuntime = parseAgentIssueRuntime(
-      existingAgentIssue.description,
-    );
-    const registered = parsedRuntime
-      ? agentIssueRuntimeWithLabels(existingAgentIssue, parsedRuntime)
-      : null;
-    const conflict = locatorConflict(
-      existingAgentIssue,
-      registered,
-      event.runtime,
-    );
-    if (
-      conflict &&
-      registered &&
-      event.runtime.machine === config.machine &&
-      registered.machine === config.machine
-    ) {
-      const thread = await (
-        dependencies.bbClient ?? createBbClient(config.bbBaseUrl)
-      ).getThread(conflict.bbThreadId);
-      if (threadStillOwnsSession(thread, registered)) {
-        console.warn(
-          `[sessions] ignoring ${event.type} for ${event.runtime.harnessSessionId}: registered bb thread ${conflict.bbThreadId} is still live`,
-        );
-        return existingAgentIssue;
-      }
-    }
-  }
-
-  // bb-backed launch registration is authoritative for policy metadata that
-  // provider hooks cannot receive through bb's environment contract. Preserve
-  // that explicit role/lifecycle/source when a later compatibility hook emits
-  // its defaults for the same BB_THREAD_ID.
+  // Launch registration is authoritative for policy metadata that provider
+  // hooks may omit. Preserve it when compatibility hooks emit defaults.
   if (existingAgentIssue) {
     const registered = parseAgentIssueRuntime(existingAgentIssue.description);
     if (registered) {
@@ -200,12 +156,12 @@ async function upsertAgentIssue(
               ? registered.role
               : event.runtime.role,
           lifecycle: event.runtime.lifecycle ?? registered.lifecycle,
-          cubeIssueIdentifier:
-            event.runtime.cubeIssueIdentifier ??
+          sourceIssueIdentifier:
+            event.runtime.sourceIssueIdentifier ??
             (event.type === "workflow.started" ||
             event.type === "workflow.ended"
               ? null
-              : previousCubeIssueIdentifier) ??
+              : previousSourceIssueIdentifier) ??
             null,
         },
       };
@@ -220,17 +176,17 @@ async function upsertAgentIssue(
   // Linear replies.
   const workflowIssueIdentifier =
     event.type === "workflow.started" || event.type === "workflow.ended"
-      ? event.cubeIssueIdentifier
+      ? event.sourceIssueIdentifier
       : null;
-  const cubeIssueIdentifier =
+  const sourceIssueIdentifier =
     workflowIssueIdentifier ??
-    event.runtime.cubeIssueIdentifier ??
-    cubeIssueIdentifierFromBranch(event.runtime.branchName);
-  const cubeIssue = cubeIssueIdentifier
-    ? await getCubeIssue(config, { id: cubeIssueIdentifier })
+    event.runtime.sourceIssueIdentifier ??
+    sourceIssueIdentifierFromBranch(event.runtime.branchName);
+  const sourceIssue = sourceIssueIdentifier
+    ? await getSourceIssue(config, { id: sourceIssueIdentifier })
     : null;
   const hasCompleteRuntime =
-    Boolean(cubeIssue) && Boolean(event.runtime.bbThreadId);
+    Boolean(sourceIssue) && Boolean(event.runtime.runtimeSessionId);
   const stateName = resolveAgentIssueState(
     event,
     hasCompleteRuntime,
@@ -240,10 +196,10 @@ async function upsertAgentIssue(
     eventId: event.eventId,
     generation: event.generation,
     occurredAt: event.occurredAt,
-    cubeIssueIdentifier,
+    sourceIssueIdentifier,
   };
   const data = {
-    title: buildAgentIssueTitle(event.runtime, cubeIssueIdentifier),
+    title: buildAgentIssueTitle(event.runtime, sourceIssueIdentifier),
     description: buildAgentIssueDescription(event.runtime, metadata, config),
     assigneeId: config.agentUserId,
     stateId: getAgentStateId(catalog, { name: stateName }),
@@ -260,8 +216,8 @@ async function upsertAgentIssue(
 
   if (
     existingAgentIssue &&
-    previousCubeIssueIdentifier &&
-    previousCubeIssueIdentifier !== cubeIssueIdentifier
+    previousSourceIssueIdentifier &&
+    previousSourceIssueIdentifier !== sourceIssueIdentifier
   ) {
     const relations = await getAgentIssueRelations(config, {
       agentIssueId: existingAgentIssue.id,
@@ -269,7 +225,7 @@ async function upsertAgentIssue(
     const staleRelations = relations.filter(
       (relation) =>
         relation.type === "related" &&
-        relation.cubeIssue.identifier === previousCubeIssueIdentifier,
+        relation.sourceIssue.identifier === previousSourceIssueIdentifier,
     );
     await Promise.all(
       staleRelations.map((relation) =>
@@ -327,10 +283,10 @@ async function upsertAgentIssue(
     }
   }
 
-  if (cubeIssue) {
+  if (sourceIssue) {
     await createAgentIssueRelation(config, {
       agentIssueId: agentIssue.id,
-      cubeIssueId: cubeIssue.id,
+      sourceIssueId: sourceIssue.id,
       type: "related",
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -338,11 +294,17 @@ async function upsertAgentIssue(
     });
   }
 
-  await updateAgentIssueRecord(prisma, {
+  const updatedRecord = await updateAgentIssueRecord(prisma, {
     ...recordRuntime,
     lastEventId: event.eventId,
     lastGeneration: event.generation,
   });
+  if (isRootSession && event.runtime.runtimeSessionId) {
+    await attachRuntimeSessionToAgentIssue(prisma, {
+      runtimeSessionId: event.runtime.runtimeSessionId,
+      agentIssueRecordId: updatedRecord.id,
+    });
+  }
 
   return agentIssue;
 }

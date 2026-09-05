@@ -12,7 +12,6 @@ describe("buildAgentIssueTitle", () => {
     harness: "claude",
     machine: "macbook-air",
     role: "primary",
-    bbThreadId: "agent",
   };
 
   test("puts the source and role before the harness", () => {

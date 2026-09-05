@@ -1,319 +1,463 @@
 import { describe, expect, test } from "bun:test";
-import type * as acp from "@agentclientprotocol/sdk";
+import * as acp from "@agentclientprotocol/sdk";
 
-import { createFakeBbClient } from "../test-support/bb.ts";
-import type { BbEvent, BbModel, BbThread } from "../types/runtime/index.ts";
-import { BbAcpAgent } from "./agent.ts";
+import { testConfig } from "../test-support/config.ts";
+import type {
+  AgentRuntimeEvent,
+  AgentRuntimeMessage,
+  AgentRuntimeSession,
+  AgentRuntimeTurn,
+  AgentSessionRuntime,
+  EnsureAgentSessionInput,
+} from "../types/runtime/index.ts";
+import { RemoteAgentAcpAgent } from "./agent.ts";
 
-const thread: BbThread = {
-  id: "thr_acp",
-  projectId: "proj_1",
-  environmentId: "env_1",
-  hostId: "host_air",
-  providerId: "codex",
-  title: "ACP test",
-  status: "idle",
-  parentThreadId: null,
-  archivedAt: null,
-};
-
-function event(seq: number, type: string, data: unknown): BbEvent {
+function baseSession(): AgentRuntimeSession {
   return {
-    id: `evt_${seq}`,
-    threadId: thread.id,
-    seq,
-    createdAt: seq,
-    type,
-    scope: { kind: "thread" },
-    data,
-  };
-}
-
-function model(
-  id: string,
-  efforts: BbModel["supportedReasoningEfforts"],
-  isDefault = false,
-): BbModel {
-  return {
-    id,
-    model: id,
-    displayName: id,
-    description: `${id} model`,
-    supportedReasoningEfforts: efforts,
-    defaultReasoningEffort: efforts[0]!.reasoningEffort,
-    isDefault,
-  };
-}
-
-describe("bb ACP agent", () => {
-  test("lists, loads, replays, tails, prompts, and cancels one canonical thread", async () => {
-    const bb = createFakeBbClient([thread]);
-    bb.putEnvironment({
-      id: "env_1",
-      projectId: "proj_1",
-      hostId: "host_air",
-      path: "/worktrees/acp-test",
-      branchName: "acp-test",
-    });
-    bb.setModels("codex", [
-      model(
-        "gpt-test",
-        [{ reasoningEffort: "medium", description: "Medium" }],
-        true,
-      ),
-    ]);
-    bb.setExecutionOptions(thread.id, {
-      model: "gpt-test",
-      reasoningLevel: "medium",
-      permissionMode: "accept-edits",
-      serviceTier: "default",
-    });
-    bb.pushEvent(
-      event(1, "item/started", {
-        item: {
-          type: "userMessage",
-          content: [{ type: "text", text: "first" }],
-        },
-      }),
-    );
-    const updates: acp.SessionNotification[] = [];
-    const connection = {
-      async sessionUpdate(notification: acp.SessionNotification) {
-        updates.push(notification);
-      },
-      async requestPermission() {
-        return { outcome: { outcome: "cancelled" as const } };
-      },
-    } as unknown as acp.AgentSideConnection;
-    const agent = new BbAcpAgent(connection, bb, {
-      bbBaseUrl: "http://127.0.0.1:38886",
-      projectIds: ["proj_1"],
-      cwdByProject: { proj_1: "/repo" },
-      providerId: "codex",
-    });
-
-    const capabilities = (await agent.initialize()).agentCapabilities;
-    expect(capabilities?.loadSession).toBe(true);
-    expect(capabilities?.sessionCapabilities?.list).toEqual({});
-    expect(await agent.listSessions()).toMatchObject({
-      sessions: [{ sessionId: "thr_acp", cwd: "/worktrees/acp-test" }],
-    });
-    expect(await agent.listSessions({ cwd: "/other" })).toEqual({
-      sessions: [],
-    });
-    expect(await agent.listSessions({ cwd: "/repo" })).toEqual({
-      sessions: [],
-    });
-    expect(
-      await agent.listSessions({ cwd: "/worktrees/acp-test" }),
-    ).toMatchObject({
-      sessions: [{ sessionId: "thr_acp" }],
-    });
-    const loaded = await agent.loadSession({
-      sessionId: thread.id,
-      cwd: "/repo",
-      mcpServers: [],
-    });
-    expect(loaded._meta).toMatchObject({ cwd: "/worktrees/acp-test" });
-    expect(loaded.configOptions).toMatchObject([
-      { id: "harness:thr_acp", currentValue: "codex" },
-      { id: "model:codex", currentValue: "gpt-test" },
-      { id: "mode", currentValue: "accept-edits" },
-      { id: "effort:codex:gpt-test", currentValue: "medium" },
-      { id: "speed", currentValue: "default" },
-    ]);
-    expect(updates[0]).toMatchObject({
-      sessionId: thread.id,
-      update: { sessionUpdate: "user_message_chunk" },
-    });
-
-    const prompted = agent.prompt({
-      sessionId: thread.id,
-      prompt: [{ type: "text", text: "continue" }],
-    });
-    await Bun.sleep(0);
-    bb.pushEvent(
-      event(2, "client/turn/requested", {
-        input: [{ type: "text", text: "continue" }],
-      }),
-    );
-    bb.pushEvent(
-      event(3, "item/completed", {
-        item: { type: "agentMessage", text: "done" },
-      }),
-    );
-    bb.pushEvent(event(4, "turn/completed", { status: "completed" }));
-    expect(await prompted).toEqual({ stopReason: "end_turn" });
-    expect(bb.sentMessages).toEqual([
+    id: "runtime-1",
+    scopeKey: "scope-1",
+    acpxRecordId: "record-1",
+    acpxSessionId: "acp-1",
+    agentSessionId: "provider-1",
+    agent: "codex",
+    repositoryId: "test-repository",
+    machineId: "macbook-air",
+    role: null,
+    lifecycle: null,
+    workflowId: null,
+    cwd: "/repo",
+    name: "Zed test",
+    worktreePath: "/repo",
+    executionTarget: "macbook-air",
+    status: "idle",
+    closedAt: null,
+    usage: { used: 25_000, size: 100_000 },
+    configOptions: [
       {
-        threadId: thread.id,
-        message: "continue",
-        mode: "queue-if-active",
-        model: "gpt-test",
-        reasoningLevel: "medium",
-        permissionMode: "accept-edits",
-        serviceTier: "default",
+        id: "model:codex:gpt-5",
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: "gpt-5",
+        options: [
+          { value: "gpt-5", name: "GPT-5" },
+          { value: "gpt-6", name: "GPT-6" },
+        ],
       },
-    ]);
-    expect(updates.at(-1)).toMatchObject({
-      update: {
-        sessionUpdate: "agent_message_chunk",
-        content: { text: "done" },
+      {
+        id: "effort:codex:gpt-5",
+        name: "Thinking",
+        category: "thought_level",
+        type: "select",
+        currentValue: "medium",
+        options: [
+          { value: "medium", name: "Medium" },
+          { value: "high", name: "High" },
+        ],
       },
-    });
+      {
+        id: "service_tier",
+        name: "Service Tier",
+        category: "model_config",
+        type: "select",
+        currentValue: "default",
+        options: [
+          { value: "default", name: "Standard" },
+          { value: "fast", name: "Fast" },
+        ],
+      },
+    ],
+  };
+}
 
-    await agent.cancel({ sessionId: thread.id });
-    expect(bb.stoppedThreadIds).toEqual([thread.id]);
+class FakeRuntime implements AgentSessionRuntime {
+  session = baseSession();
+  historyMessages: AgentRuntimeMessage[] = [];
+  turnEvents: AgentRuntimeEvent[] = [];
+  ensures: EnsureAgentSessionInput[] = [];
+  configSets: Array<{ key: string; value: string }> = [];
+  cancelled = 0;
+
+  async ensureSession(input: EnsureAgentSessionInput) {
+    this.ensures.push(input);
+    this.session = { ...this.session, cwd: input.cwd };
+    return this.session;
+  }
+  async getSession(id: string) {
+    return id === this.session.id ? this.session : null;
+  }
+  async listSessions(input: { cwd?: string } = {}) {
+    return !input.cwd || input.cwd === this.session.cwd ? [this.session] : [];
+  }
+  async history() {
+    return this.historyMessages;
+  }
+  lastTurnInput: Parameters<AgentSessionRuntime["startTurn"]>[0] | null = null;
+  startTurn(input: Parameters<AgentSessionRuntime["startTurn"]>[0]): AgentRuntimeTurn {
+    this.lastTurnInput = input;
+    const events = this.turnEvents;
+    return {
+      requestId: "request-1",
+      events: {
+        async *[Symbol.asyncIterator]() {
+          yield* events;
+        },
+      },
+      result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+      cancel: async () => {
+        this.cancelled += 1;
+      },
+    };
+  }
+  async enqueue() {
+    return "request-1";
+  }
+  async setMode() {}
+  async setConfigOption(_sessionId: string, key: string, value: string) {
+    this.configSets.push({ key, value });
+    if (key.startsWith("model:")) {
+      this.session = {
+        ...this.session,
+        configOptions: [
+          ({
+            ...this.session.configOptions[0]!,
+            id: "model:codex:gpt-6",
+            currentValue: value,
+          } as acp.SessionConfigOption),
+          ({
+            ...this.session.configOptions[1]!,
+            id: "effort:codex:gpt-6",
+            currentValue: "high",
+            options: [{ value: "high", name: "High" }],
+          } as acp.SessionConfigOption),
+          this.session.configOptions[2]!,
+        ],
+      };
+    } else if (key === "service_tier") {
+      this.session = {
+        ...this.session,
+        configOptions: this.session.configOptions.map((option) =>
+          option.id === key && option.type === "select"
+            ? { ...option, currentValue: value }
+            : option,
+        ),
+      };
+    }
+    return this.session.configOptions;
+  }
+  async switchAgent(_sessionId: string, agent: "codex" | "claude") {
+    this.session = { ...this.session, agent };
+    return this.session;
+  }
+  async cancel() {
+    this.cancelled += 1;
+  }
+  async close() {
+    this.session = { ...this.session, status: "closed" };
+  }
+  async output() {
+    return null;
+  }
+  subscribe() {
+    return () => {};
+  }
+  subscribeAll() {
+    return () => {};
+  }
+  async shutdown() {}
+}
+
+function connection(
+  updates: acp.SessionNotification[],
+  options: {
+    elicit?: (request: acp.CreateElicitationRequest) => Promise<acp.CreateElicitationResponse>;
+  } = {},
+) {
+  return {
+    async sessionUpdate(notification: acp.SessionNotification) {
+      updates.push(notification);
+    },
+    async createElicitation(request: acp.CreateElicitationRequest) {
+      if (!options.elicit) throw new Error("elicitation unsupported");
+      return options.elicit(request);
+    },
+  } as unknown as acp.AgentSideConnection;
+}
+
+function initialize(agent: RemoteAgentAcpAgent, boolean = true) {
+  return agent.initialize({
+    protocolVersion: acp.PROTOCOL_VERSION,
+    clientCapabilities: boolean
+      ? { session: { configOptions: { boolean: {} } } }
+      : {},
+  });
+}
+
+describe("Remote Agent ACP proxy", () => {
+  test("creates one acpx mapping and advertises reconnect lifecycle", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(
+      connection([]),
+      runtime,
+      testConfig(),
+    );
+    const initialized = await initialize(agent);
+    expect(initialized.agentCapabilities).toMatchObject({
+      loadSession: true,
+      sessionCapabilities: { list: {}, resume: {}, close: {} },
+    });
+    const created = await agent.newSession({ cwd: "/repo", mcpServers: [] });
+    expect(created.sessionId).toBe("runtime-1");
+    expect(runtime.ensures).toHaveLength(1);
+    expect(runtime.ensures[0]).toMatchObject({
+      agent: "codex",
+      cwd: "/repo",
+      executionTarget: "macbook-air",
+    });
   });
 
-  test("selects harness, model, mode, effort, and speed and restores them on load", async () => {
-    const bb = createFakeBbClient([thread]);
-    bb.putEnvironment({
-      id: "env_1",
-      projectId: "proj_1",
-      hostId: "host_air",
-      path: "/worktrees/acp-test",
-      branchName: "acp-test",
-    });
-    bb.setModels("codex", [
-      model("gpt-fast", [{ reasoningEffort: "low", description: "Low" }], true),
-      model("gpt-deep", [
-        { reasoningEffort: "medium", description: "Medium" },
-        { reasoningEffort: "high", description: "High" },
-      ]),
-    ]);
-    bb.setModels("claude-code", [
-      model(
-        "claude-opus",
-        [
-          { reasoningEffort: "high", description: "High" },
-          { reasoningEffort: "max", description: "Maximum" },
-        ],
-        true,
-      ),
-    ]);
-    bb.setExecutionOptions(thread.id, {
-      model: "gpt-fast",
-      reasoningLevel: "low",
-      permissionMode: "accept-edits",
-      serviceTier: "default",
-    });
-    const updates: acp.SessionNotification[] = [];
-    const connection = {
-      async sessionUpdate(notification: acp.SessionNotification) {
-        updates.push(notification);
-      },
-      async requestPermission() {
-        return { outcome: { outcome: "cancelled" as const } };
-      },
-    } as unknown as acp.AgentSideConnection;
-    const config = {
-      bbBaseUrl: "http://127.0.0.1:38886",
-      projectIds: ["proj_1"],
-      cwdByProject: { proj_1: "/repo" },
-      providerId: "codex" as const,
-    };
-    const agent = new BbAcpAgent(connection, bb, config);
-    await agent.loadSession({
-      sessionId: thread.id,
-      cwd: "/repo",
-      mcpServers: [],
-    });
-
-    let response = await agent.setSessionConfigOption({
-      sessionId: thread.id,
-      configId: "model:codex",
-      value: "gpt-deep",
-    });
-    expect(response.configOptions).toMatchObject([
-      { id: "harness:thr_acp", currentValue: "codex" },
-      { id: "model:codex", currentValue: "gpt-deep" },
-      { id: "mode", currentValue: "accept-edits" },
-      { id: "effort:codex:gpt-deep", currentValue: "medium" },
-      { id: "speed", currentValue: "default" },
-    ]);
-    response = await agent.setSessionConfigOption({
-      sessionId: thread.id,
-      configId: "effort:codex:gpt-deep",
-      value: "high",
-    });
-    expect(response.configOptions[3]).toMatchObject({ currentValue: "high" });
-    response = await agent.setSessionConfigOption({
-      sessionId: thread.id,
-      configId: "speed",
-      value: "fast",
-    });
-    expect(response.configOptions[4]).toMatchObject({
-      id: "speed",
-      currentValue: "fast",
-    });
-    await agent.setSessionConfigOption({
-      sessionId: thread.id,
-      configId: "mode",
-      value: "full",
-    });
-    response = await agent.setSessionConfigOption({
-      sessionId: thread.id,
-      configId: "harness:thr_acp",
-      value: "claude-code",
-    });
-    expect(response.configOptions).toMatchObject([
-      { id: "harness:thr_acp", currentValue: "claude-code" },
-      { id: "model:claude-code", currentValue: "claude-opus" },
-      { id: "mode", currentValue: "full" },
-      { id: "effort:claude-code:claude-opus", currentValue: "high" },
-      { id: "speed", currentValue: "fast" },
-    ]);
-    expect(bb.spawnInputs.at(-1)).toMatchObject({
-      providerId: "claude-code",
-      model: "claude-opus",
-      reasoningLevel: "high",
-      permissionMode: "full",
-      serviceTier: "fast",
-      visibility: "hidden",
-      worktreePath: "/worktrees/acp-test",
-    });
-    expect(bb.spawnInputs.at(-1)?.parentThreadId).toBeUndefined();
-
-    const childId = `thr_fake_2`;
-    const prompted = agent.prompt({
-      sessionId: thread.id,
-      prompt: [{ type: "text", text: "continue with claude" }],
-    });
-    await Bun.sleep(0);
-    bb.pushEvent({
-      ...event(1, "client/turn/requested", {
-        input: [{ type: "text", text: "continue with claude" }],
-      }),
-      threadId: childId,
-    });
-    bb.pushEvent({
-      ...event(2, "turn/completed", { status: "completed" }),
-      threadId: childId,
-    });
-    expect(await prompted).toEqual({ stopReason: "end_turn" });
-    expect(bb.sentMessages.at(-1)).toEqual({
-      threadId: childId,
-      message: "continue with claude",
-      mode: "queue-if-active",
-      model: "claude-opus",
-      reasoningLevel: "high",
-      permissionMode: "full",
-      serviceTier: "fast",
-    });
-
-    const reconnected = new BbAcpAgent(connection, bb, config);
-    const loaded = await reconnected.loadSession({
-      sessionId: thread.id,
+  test("uses stable Zed IDs, thought category, and boolean fast mode", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(agent);
+    const loaded = await agent.resumeSession({
+      sessionId: "runtime-1",
       cwd: "/repo",
       mcpServers: [],
     });
     expect(loaded.configOptions).toMatchObject([
-      { id: "harness:thr_acp", currentValue: "claude-code" },
-      { id: "model:claude-code", currentValue: "claude-opus" },
-      { id: "mode", currentValue: "full" },
-      { id: "effort:claude-code:claude-opus", currentValue: "high" },
-      { id: "speed", currentValue: "fast" },
+      { id: "harness", currentValue: "codex" },
+      { id: "model", currentValue: "gpt-5", category: "model" },
+      {
+        id: "reasoning_effort",
+        currentValue: "medium",
+        category: "thought_level",
+      },
+      {
+        id: "fast_mode",
+        type: "boolean",
+        currentValue: false,
+        category: "model_config",
+      },
     ]);
+
+    const changed = await agent.setSessionConfigOption({
+      sessionId: "runtime-1",
+      configId: "model",
+      value: "gpt-6",
+    });
+    expect(runtime.configSets[0]).toEqual({
+      key: "model:codex:gpt-5",
+      value: "gpt-6",
+    });
+    expect(changed.configOptions).toMatchObject([
+      { id: "harness" },
+      { id: "model", currentValue: "gpt-6" },
+      { id: "reasoning_effort", currentValue: "high" },
+      { id: "fast_mode", currentValue: false },
+    ]);
+  });
+
+  test("translates Zed's fast boolean to the upstream select", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(agent);
+    const response = await agent.setSessionConfigOption({
+      sessionId: "runtime-1",
+      configId: "fast_mode",
+      type: "boolean",
+      value: true,
+    });
+    expect(runtime.configSets).toEqual([{ key: "service_tier", value: "fast" }]);
+    expect(response.configOptions.at(-1)).toMatchObject({
+      id: "fast_mode",
+      type: "boolean",
+      currentValue: true,
+    });
+  });
+
+  test("falls back to a select when boolean support is not advertised", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(agent, false);
+    const response = await agent.resumeSession({
+      sessionId: "runtime-1",
+      cwd: "/repo",
+      mcpServers: [],
+    });
+    expect(response.configOptions?.at(-1)).toMatchObject({
+      id: "fast_mode",
+      type: "select",
+      currentValue: "default",
+    });
+  });
+
+  test("replays load history and restores context usage after setup", async () => {
+    const runtime = new FakeRuntime();
+    runtime.historyMessages = [
+      { role: "user", text: "hello" },
+      { role: "agent", text: "hi" },
+    ];
+    const updates: acp.SessionNotification[] = [];
+    const agent = new RemoteAgentAcpAgent(
+      connection(updates),
+      runtime,
+      testConfig(),
+    );
+    await initialize(agent);
+    await agent.loadSession({
+      sessionId: "runtime-1",
+      cwd: "/repo",
+      mcpServers: [],
+    });
+    await Bun.sleep(0);
+    expect(updates.map((entry) => entry.update.sessionUpdate)).toEqual([
+      "user_message_chunk",
+      "agent_message_chunk",
+      "usage_update",
+    ]);
+    expect(updates.at(-1)?.update).toMatchObject({
+      sessionUpdate: "usage_update",
+      used: 25_000,
+      size: 100_000,
+    });
+  });
+
+  test("streams normalized updates and complete agent config changes", async () => {
+    const runtime = new FakeRuntime();
+    const changed = baseSession().configOptions.map((option) =>
+      option.category === "thought_level" && option.type === "select"
+        ? { ...option, id: "effort:changed", currentValue: "high" }
+        : option,
+    );
+    runtime.turnEvents = [
+      {
+        kind: "update",
+        id: "one",
+        sessionId: "runtime-1",
+        requestId: "request-1",
+        createdAt: 1,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "done" },
+        },
+      },
+      {
+        kind: "update",
+        id: "two",
+        sessionId: "runtime-1",
+        requestId: "request-1",
+        createdAt: 2,
+        update: {
+          sessionUpdate: "config_option_update",
+          configOptions: changed,
+        },
+      },
+      {
+        kind: "update",
+        id: "three",
+        sessionId: "runtime-1",
+        requestId: "request-1",
+        createdAt: 3,
+        update: { sessionUpdate: "usage_update", used: 40_000, size: 100_000 },
+      },
+    ];
+    const updates: acp.SessionNotification[] = [];
+    const agent = new RemoteAgentAcpAgent(
+      connection(updates),
+      runtime,
+      testConfig(),
+    );
+    await initialize(agent);
+    expect(
+      await agent.prompt({
+        sessionId: "runtime-1",
+        prompt: [{ type: "text", text: "continue" }],
+      }),
+    ).toEqual({ stopReason: "end_turn" });
+    expect(updates[1]?.update).toMatchObject({
+      sessionUpdate: "config_option_update",
+      configOptions: [
+        { id: "harness" },
+        { id: "model" },
+        { id: "reasoning_effort", currentValue: "high" },
+        { id: "fast_mode", type: "boolean" },
+      ],
+    });
+    expect(updates[2]?.update).toMatchObject({
+      sessionUpdate: "usage_update",
+      used: 40_000,
+      size: 100_000,
+    });
+  });
+
+  test("a fresh ACP transport loads the same logical session", async () => {
+    const runtime = new FakeRuntime();
+    const first = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(first);
+    await first.resumeSession({
+      sessionId: "runtime-1",
+      cwd: "/repo",
+      mcpServers: [],
+    });
+    const second = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(second);
+    const resumed = await second.resumeSession({
+      sessionId: "runtime-1",
+      cwd: "/repo",
+      mcpServers: [],
+    });
+    expect(resumed._meta).toMatchObject({
+      remoteAgentSessionId: "runtime-1",
+      acpxRecordId: "record-1",
+    });
+    expect(runtime.ensures).toHaveLength(0);
+  });
+
+  test("forwards planning questions to the client and relays the answer", async () => {
+    const runtime = new FakeRuntime();
+    const asked: acp.CreateElicitationRequest[] = [];
+    const agent = new RemoteAgentAcpAgent(
+      connection([], {
+        elicit: async (request) => {
+          asked.push(request);
+          return { action: "accept", content: { approach: "incremental" } };
+        },
+      }),
+      runtime,
+      testConfig(),
+    );
+    await initialize(agent);
+    await agent.prompt({
+      sessionId: "runtime-1",
+      prompt: [{ type: "text", text: "plan it" }],
+    });
+
+    const handler = runtime.lastTurnInput?.onElicitation;
+    expect(handler).toBeDefined();
+    const request = {
+      sessionId: "runtime-1",
+      mode: "form",
+      title: "Pick an approach",
+    } as unknown as acp.CreateElicitationRequest;
+    const answer = await handler!(request, { signal: new AbortController().signal });
+    expect(asked).toHaveLength(1);
+    expect(answer).toMatchObject({ action: "accept", content: { approach: "incremental" } });
+  });
+
+  test("cancels planning questions when the client cannot render them", async () => {
+    const runtime = new FakeRuntime();
+    const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
+    await initialize(agent);
+    await agent.prompt({
+      sessionId: "runtime-1",
+      prompt: [{ type: "text", text: "plan it" }],
+    });
+    const handler = runtime.lastTurnInput?.onElicitation;
+    const answer = await handler!(
+      { sessionId: "runtime-1" } as unknown as acp.CreateElicitationRequest,
+      { signal: new AbortController().signal },
+    );
+    expect(answer).toEqual({ action: "cancel" });
   });
 });

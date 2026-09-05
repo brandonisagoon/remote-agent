@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { PrismaClient } from "../../../generated/prisma/client.ts";
 import { testConfig } from "../../../test-support/config.ts";
+import { createFakeAgentRuntime } from "../../../test-support/agent-runtime.ts";
 import {
   DispatchEventType,
   type DispatchEvent,
@@ -9,7 +10,7 @@ import {
   type WorkerResult,
 } from "../../../types/dispatcher/index.ts";
 import type { CommandClient } from "../../../types/runtime/index.ts";
-import { Reaction } from "../../integrations/linear/index.ts";
+import { TrackerReaction } from "../../integrations/tracker/index.ts";
 import {
   dispatchEvent,
   type DispatchEventDependencies,
@@ -22,7 +23,8 @@ const commandClient: CommandClient = {
 
 function issueEvent(): DispatchEvent {
   return {
-    type: DispatchEventType.LinearIssueOrchestrationRequested,
+    type: DispatchEventType.TrackerWorkflowTriggered,
+      workflowId: "plan",
     webhook: {
       type: "Issue",
       action: "update",
@@ -68,13 +70,14 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },
       dependencies(
-        worker("product.orchestration", async () => ({
+        worker("product.workflow", async () => ({
           status: "failed",
-          detail: "bb launch failed",
+          detail: "acpx launch failed",
           targetAgentIssueIdentifier: null,
         })),
         events,
@@ -82,8 +85,8 @@ describe("dispatch event failure reaction", () => {
     );
 
     expect(events).toEqual([
-      `react:issue-id:${Reaction.Failed}`,
-      "finish:run-id:failed:bb launch failed",
+      `react:issue-id:${TrackerReaction.Failed}`,
+      "finish:run-id:failed:acpx launch failed",
     ]);
   });
 
@@ -94,11 +97,12 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },
       dependencies(
-        worker("product.describe", async () => {
+        worker("product.workflow", async () => {
           throw new Error("launcher exploded");
         }),
         events,
@@ -106,7 +110,7 @@ describe("dispatch event failure reaction", () => {
     );
 
     expect(events).toEqual([
-      `react:issue-id:${Reaction.Failed}`,
+      `react:issue-id:${TrackerReaction.Failed}`,
       "finish:run-id:failed:launcher exploded",
     ]);
   });
@@ -118,6 +122,7 @@ describe("dispatch event failure reaction", () => {
         prisma,
         config: testConfig(),
         commandClient,
+        agentRuntime: createFakeAgentRuntime(),
         receiptId: "receipt-id",
         event: issueEvent(),
       },

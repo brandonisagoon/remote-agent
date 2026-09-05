@@ -1,0 +1,638 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "type": "number",
+      "const": 2
+    },
+    "serviceName": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+    },
+    "machine": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "server": {
+          "type": "object",
+          "properties": {
+            "publicUrl": {
+              "type": "string",
+              "minLength": 1
+            },
+            "apiKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "listen": {
+              "default": {
+                "host": "127.0.0.1",
+                "port": 9000
+              },
+              "type": "object",
+              "properties": {
+                "host": {
+                  "default": "127.0.0.1",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "port": {
+                  "default": 9000,
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "host",
+                "port"
+              ],
+              "additionalProperties": false
+            },
+            "databaseUrl": {
+              "type": "string",
+              "minLength": 1
+            },
+            "acpSocketPath": {
+              "type": "string",
+              "minLength": 1
+            },
+            "controlSocketPath": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "publicUrl",
+            "apiKey",
+            "listen"
+          ],
+          "additionalProperties": false
+        },
+        "sshHost": {
+          "type": "string",
+          "minLength": 1
+        },
+        "acpx": {
+          "default": {},
+          "type": "object",
+          "properties": {
+            "stateDir": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "acp": {
+          "default": {
+            "providerId": "codex"
+          },
+          "type": "object",
+          "properties": {
+            "hostId": {
+              "type": "string",
+              "minLength": 1
+            },
+            "providerId": {
+              "default": "codex",
+              "type": "string",
+              "enum": [
+                "codex",
+                "claude"
+              ]
+            },
+            "model": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "providerId"
+          ],
+          "additionalProperties": false
+        },
+        "installation": {
+          "default": {
+            "branch": "main"
+          },
+          "type": "object",
+          "properties": {
+            "root": {
+              "type": "string",
+              "minLength": 1
+            },
+            "gitRemote": {
+              "type": "string",
+              "minLength": 1
+            },
+            "branch": {
+              "default": "main",
+              "type": "string",
+              "minLength": 1
+            },
+            "script": {
+              "type": "string",
+              "minLength": 1
+            },
+            "tunnelName": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "required": [
+            "branch"
+          ],
+          "additionalProperties": false
+        },
+        "updates": {
+          "default": {
+            "channel": "stable"
+          },
+          "type": "object",
+          "properties": {
+            "channel": {
+              "default": "stable",
+              "type": "string",
+              "enum": [
+                "stable",
+                "beta"
+              ]
+            }
+          },
+          "required": [
+            "channel"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "server",
+        "acpx",
+        "acp",
+        "installation",
+        "updates"
+      ],
+      "additionalProperties": false
+    },
+    "providers": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "codex": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "claude": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "minItems": 1,
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "connections": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "provider": {
+            "type": "string",
+            "const": "linear"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "apiKey": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agentUserId": {
+            "type": "string",
+            "minLength": 1
+          },
+          "agentHandle": {
+            "type": "string",
+            "minLength": 1
+          },
+          "machineId": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "repositories": {
+            "default": "*",
+            "anyOf": [
+              {
+                "type": "string",
+                "const": "*"
+              },
+              {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                },
+                "additionalProperties": {
+                  "type": "object",
+                  "properties": {
+                    "when": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "additionalProperties": {
+                          "minItems": 1,
+                          "type": "array",
+                          "items": {
+                            "type": "string",
+                            "minLength": 1
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
+          "webhook": {
+            "type": "object",
+            "properties": {
+              "slug": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+              },
+              "secret": {
+                "type": "string",
+                "minLength": 1
+              },
+              "webhookMaxAgeMs": {
+                "default": 60000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "slug",
+              "secret",
+              "webhookMaxAgeMs"
+            ],
+            "additionalProperties": false
+          },
+          "router": {
+            "default": {
+              "providerId": "codex",
+              "timeoutMs": 30000
+            },
+            "type": "object",
+            "properties": {
+              "providerId": {
+                "default": "codex",
+                "type": "string",
+                "enum": [
+                  "codex",
+                  "claude"
+                ]
+              },
+              "model": {
+                "type": "string",
+                "minLength": 1
+              },
+              "timeoutMs": {
+                "default": 30000,
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "providerId",
+              "timeoutMs"
+            ],
+            "additionalProperties": false
+          },
+          "editors": {
+            "default": [
+              {
+                "name": "Zed",
+                "scheme": "zed"
+              }
+            ],
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "default": "Zed",
+                  "type": "string",
+                  "minLength": 1
+                },
+                "scheme": {
+                  "default": "zed",
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "name",
+                "scheme"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "provider",
+          "name",
+          "apiKey",
+          "agentUserId",
+          "repositories",
+          "router",
+          "editors"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "repositories": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "root": {
+            "type": "string",
+            "minLength": 1
+          },
+          "worktreeRoot": {
+            "type": "string",
+            "minLength": 1
+          },
+          "bootstrapCommand": {
+            "minItems": 1,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "skillsRoot": {
+            "default": "agent-skills",
+            "type": "string",
+            "minLength": 1
+          },
+          "workflows": {
+            "default": {},
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "connectionId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                },
+                "on": {
+                  "type": "string",
+                  "enum": [
+                    "issue.state-changed",
+                    "issue.reaction"
+                  ]
+                },
+                "when": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "additionalProperties": {
+                      "minItems": 1,
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  }
+                },
+                "skill": {
+                  "type": "object",
+                  "properties": {
+                    "skillset": {
+                      "type": "string",
+                      "minLength": 1
+                    },
+                    "flags": {
+                      "default": [],
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "minLength": 1
+                      }
+                    }
+                  },
+                  "required": [
+                    "skillset",
+                    "flags"
+                  ],
+                  "additionalProperties": false
+                },
+                "deliver": {
+                  "type": "string",
+                  "enum": [
+                    "start-session",
+                    "message-session"
+                  ]
+                },
+                "providerId": {
+                  "type": "string",
+                  "enum": [
+                    "codex",
+                    "claude"
+                  ]
+                },
+                "model": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "plan": {
+                  "type": "object",
+                  "properties": {
+                    "captureToIssue": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "thenState": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  },
+                  "required": [
+                    "captureToIssue"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "on",
+                "skill",
+                "deliver"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "labels": {
+            "default": {},
+            "type": "object",
+            "propertyNames": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "labels": {
+                  "minItems": 1,
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "exclusive": {
+                  "default": true,
+                  "type": "boolean"
+                },
+                "routerVisible": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "exclusive",
+                "routerVisible"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "sessionDefaults": {
+            "default": {
+              "labels": {}
+            },
+            "type": "object",
+            "properties": {
+              "labels": {
+                "default": {},
+                "type": "object",
+                "propertyNames": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                },
+                "additionalProperties": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            },
+            "required": [
+              "labels"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "root",
+          "worktreeRoot",
+          "bootstrapCommand",
+          "skillsRoot",
+          "workflows",
+          "labels",
+          "sessionDefaults"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "serviceName",
+    "machine",
+    "providers",
+    "connections",
+    "repositories"
+  ],
+  "additionalProperties": false
+}

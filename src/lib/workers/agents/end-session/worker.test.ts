@@ -3,9 +3,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentIssue, SessionRuntime } from "../../../../types/sessions/index.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import {
+  createFakeAgentRuntime,
+  type FakeAgentRuntime,
+} from "../../../../test-support/agent-runtime.ts";
+import {
   buildAgentIssueDescription,
-} from "../../../services/sessions/registry/index.ts";
-import { createFakeBbClient, type FakeBbClient } from "../../../../test-support/bb.ts";
+} from "../../../integrations/tracker/index.ts";
 import { endSessionWorker } from "./worker.ts";
 
 const originalFetch = globalThis.fetch;
@@ -25,8 +28,8 @@ const labelDefinitions = [
   ["Delegate", "Role"],
   ["Accepts Linear Input", "Routing"],
   ["Does Not Accept Linear Input", "Routing"],
-  ["Brandon's MacBook Air", "Machine"],
-  ["Brandon's MacBook Pro", "Machine"],
+  ["Test MacBook Air", "Machine"],
+  ["Test MacBook Pro", "Machine"],
   ["General", "Workflow"],
 ] as const;
 const labels = labelDefinitions.map(([name, parent]) => ({
@@ -47,7 +50,7 @@ function runtime(overrides: Partial<SessionRuntime> = {}): SessionRuntime {
     harness: "codex",
     machine: "macbook-air",
     role: "primary",
-    bbThreadId: "thr_primary",
+    runtimeSessionId: "runtime_primary",
     ...overrides,
   };
 }
@@ -64,7 +67,7 @@ function agentIssue(input: {
     input.runtime?.harness === "claude" ? "Claude Code" : "Codex",
     input.runtime?.role === "delegate" ? "Delegate" : "Primary",
     "Accepts Linear Input",
-    "Brandon's MacBook Air",
+    "Test MacBook Air",
     "General",
   ];
   return {
@@ -80,7 +83,7 @@ function agentIssue(input: {
               eventId: `event-${input.id}`,
               generation: 1,
               occurredAt: "2026-08-01T12:00:00.000Z",
-              cubeIssueIdentifier: "CUBE-2801",
+              sourceIssueIdentifier: "CUBE-2801",
             },
             config,
           ),
@@ -93,24 +96,14 @@ function agentIssue(input: {
   };
 }
 
-function commandClient(present = true): FakeBbClient {
-  const client = createFakeBbClient();
-  if (present) {
-    for (const id of ["thr_primary", "thr_planner", "thr_unrelated"]) {
-      client.putThread({
-        id,
-        projectId: config.bbProjectId,
-        environmentId: "env-1",
-        hostId: config.bbHostIds["macbook-air"] ?? null,
-        providerId: "codex",
-        title: null,
-        status: "idle",
-        parentThreadId: null,
-        archivedAt: null,
-      });
-    }
-  }
-  return client;
+function runtimeClient(present = true): FakeAgentRuntime {
+  return createFakeAgentRuntime(
+    present
+      ? ["runtime_primary", "runtime_planner", "runtime_unrelated"].map(
+          (id) => ({ id }),
+        )
+      : [],
+  );
 }
 
 function installLinear(issues: AgentIssue[]) {
@@ -180,7 +173,7 @@ function installLinear(issues: AgentIssue[]) {
 
 function event(target: AgentIssue) {
   return {
-    type: "linear.issue.end-requested" as const,
+    type: "tracker.issue.end-requested" as const,
     webhook: {
       type: "Issue" as const,
       action: "update" as const,
@@ -196,27 +189,27 @@ function event(target: AgentIssue) {
   };
 }
 
-async function execute(target: AgentIssue, client: FakeBbClient) {
+async function execute(target: AgentIssue, client: FakeAgentRuntime) {
   return endSessionWorker.execute(event(target), {
     prisma: null as never,
     config,
     commandClient: {} as never,
-    bbClient: client,
+    agentRuntime: client,
     runId: "run-1",
   });
 }
 
 describe("agents.end-session worker", () => {
-  test("ends a lone primary before terminating its exact bb thread", async () => {
+  test("ends a lone primary before terminating its exact acpx session", async () => {
     const target = agentIssue({ id: "target", identifier: "AGENT-1" });
     const linear = installLinear([target]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     const result = await execute(target, client);
 
     expect(result).toEqual({
       status: "delivered",
-      detail: "ended 1 issue(s); terminated 1 bb thread(s)",
+      detail: "ended 1 issue(s); terminated 1 acpx session(s)",
       targetAgentIssueIdentifier: "AGENT-1",
     });
     expect(linear.updates.map((update) => update.id)).toEqual(["target"]);
@@ -224,7 +217,7 @@ describe("agents.end-session worker", () => {
     expect(linear.byId.get("target")?.state.name).toBe("Ended");
     expect(linear.byId.get("target")?.labels.nodes.map((label) => label.name))
       .toContain("Does Not Accept Linear Input");
-    expect(client.archivedThreadIds).toEqual(["thr_primary"]);
+    expect(client.closedSessionIds).toEqual(["runtime_primary"]);
   });
 
   test("ends subagent and orchestrated delegates before the primary", async () => {
@@ -236,7 +229,7 @@ describe("agents.end-session worker", () => {
       runtime: runtime({
         harnessSessionId: "primary-session:subagent",
         role: "delegate",
-        bbThreadId: "thr_primary",
+        runtimeSessionId: "runtime_primary",
       }),
     });
     const planner = agentIssue({
@@ -247,7 +240,7 @@ describe("agents.end-session worker", () => {
         harnessSessionId: "planner-session",
         harness: "claude",
         role: "delegate",
-        bbThreadId: "thr_planner",
+        runtimeSessionId: "runtime_planner",
       }),
     });
     const unrelated = agentIssue({
@@ -257,11 +250,11 @@ describe("agents.end-session worker", () => {
       runtime: runtime({
         harnessSessionId: "unrelated-session",
         worktreePath: "/tmp/unrelated",
-        bbThreadId: "thr_unrelated",
+        runtimeSessionId: "runtime_unrelated",
       }),
     });
     const linear = installLinear([target, subagent, planner, unrelated]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     await execute(target, client);
 
@@ -271,7 +264,10 @@ describe("agents.end-session worker", () => {
       "target",
     ]);
     expect(linear.byId.get("unrelated")?.state.name).toBe("Connected");
-    expect(client.archivedThreadIds).toEqual(["thr_planner", "thr_primary"]);
+    expect(client.closedSessionIds).toEqual([
+      "runtime_planner",
+      "runtime_primary",
+    ]);
   });
 
   test("ignores a session owned by another machine", async () => {
@@ -282,19 +278,19 @@ describe("agents.end-session worker", () => {
         "Codex",
         "Primary",
         "Accepts Linear Input",
-        "Brandon's MacBook Pro",
+        "Test MacBook Pro",
         "General",
       ],
     });
     const linear = installLinear([target]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     expect(await execute(target, client)).toMatchObject({
       status: "ignored",
       detail: "different_machine",
     });
     expect(linear.updates).toHaveLength(0);
-    expect(client.archivedThreadIds).toHaveLength(0);
+    expect(client.closedSessionIds).toHaveLength(0);
   });
 
   test("retries an already Ended target without rewriting it", async () => {
@@ -304,23 +300,23 @@ describe("agents.end-session worker", () => {
       state: "Ended",
     });
     const linear = installLinear([target]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     expect(await execute(target, client)).toMatchObject({
       status: "delivered",
-      detail: "ended 0 issue(s); terminated 1 bb thread(s)",
+      detail: "ended 0 issue(s); terminated 1 acpx session(s)",
     });
     expect(linear.updates).toHaveLength(0);
-    expect(client.archivedThreadIds).toEqual(["thr_primary"]);
+    expect(client.closedSessionIds).toEqual(["runtime_primary"]);
   });
 
-  test("delivers when the bb thread is already gone", async () => {
+  test("delivers when the acpx session is already gone", async () => {
     const target = agentIssue({ id: "target", identifier: "AGENT-1" });
     const linear = installLinear([target]);
 
-    expect(await execute(target, commandClient(false))).toMatchObject({
+    expect(await execute(target, runtimeClient(false))).toMatchObject({
       status: "delivered",
-      detail: "ended 1 issue(s); terminated 0 bb thread(s)",
+      detail: "ended 1 issue(s); terminated 0 acpx session(s)",
     });
     expect(linear.byId.get("target")?.state.name).toBe("Ended");
   });
@@ -332,14 +328,14 @@ describe("agents.end-session worker", () => {
       state: "Connected",
     });
     const linear = installLinear([target]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     expect(await execute(target, client)).toMatchObject({
       status: "stale_target",
       detail: "issue_left_end_state",
     });
     expect(linear.updates).toHaveLength(0);
-    expect(client.archivedThreadIds).toHaveLength(0);
+    expect(client.closedSessionIds).toHaveLength(0);
   });
 
   test("marks an unparseable target Ended without attempting termination", async () => {
@@ -349,13 +345,13 @@ describe("agents.end-session worker", () => {
       runtime: null,
     });
     const linear = installLinear([target]);
-    const client = commandClient();
+    const client = runtimeClient();
 
     expect(await execute(target, client)).toMatchObject({
       status: "delivered",
-      detail: "ended 1 issue(s); terminated 0 bb thread(s)",
+      detail: "ended 1 issue(s); terminated 0 acpx session(s)",
     });
     expect(linear.byId.get("target")?.state.name).toBe("Ended");
-    expect(client.archivedThreadIds).toHaveLength(0);
+    expect(client.closedSessionIds).toHaveLength(0);
   });
 });

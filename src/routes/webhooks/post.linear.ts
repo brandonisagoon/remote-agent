@@ -2,28 +2,39 @@ import { Hono } from "hono";
 
 import { MAX_REQUEST_BYTES } from "../../lib/config.ts";
 import {
-  IssueWebhookResultKind,
-  LinearCommentWebhookSchema,
-  LinearIssueWebhookSchema,
-  LinearReactionWebhookSchema,
-  LinearWebhookEnvelopeSchema,
-  ReactionWebhookResultKind,
-} from "../../types/webhooks/linear/index.ts";
-import { verifyLinearSignature } from "../../lib/security.ts";
+  getWebhookConfig,
+  routeWebhookRepository,
+  scopeConfig,
+} from "../../lib/config.ts";
 import {
+  IssueWebhookResultKind,
+  TrackerCommentWebhookSchema,
+  TrackerIssueWebhookSchema,
+  TrackerReactionWebhookSchema,
+  TrackerWebhookEnvelopeSchema,
+  ReactionWebhookResultKind,
+  verifyTrackerWebhookSignature,
   WebhookReceiptError,
   handleCommentWebhook,
   handleIssueWebhook,
   handleReactionWebhook,
-} from "../../lib/services/webhooks/index.ts";
+} from "../../lib/integrations/tracker/index.ts";
 import type { AppEnv } from "../../middleware/context.ts";
 
 const route = new Hono<AppEnv>();
 
 route.post("/", async (c) => {
     const config = c.get("config");
+    const webhookId = c.req.param("webhookId");
+    if (!webhookId) return c.json({ error: "Unknown webhook" }, 404);
+    let webhookConfig;
+    try {
+      webhookConfig = getWebhookConfig(config, webhookId);
+    } catch {
+      return c.json({ error: "Unknown webhook" }, 404);
+    }
     const prisma = c.get("prisma");
-    const bbClient = c.get("bbClient");
+    const agentRuntime = c.get("agentRuntime");
     const declaredLength = Number(c.req.header("content-length") ?? "0");
     if (declaredLength > MAX_REQUEST_BYTES) {
       return c.json({ error: "Payload Too Large" }, 413);
@@ -34,10 +45,10 @@ route.post("/", async (c) => {
       return c.json({ error: "Payload Too Large" }, 413);
     }
     if (
-      !verifyLinearSignature(
+      !verifyTrackerWebhookSignature(
         rawBody,
         c.req.header("linear-signature") ?? null,
-        config.webhookSecret,
+        webhookConfig.webhookSecret,
       )
     ) {
       return c.json({ error: "Invalid signature" }, 401);
@@ -50,25 +61,58 @@ route.post("/", async (c) => {
       return c.json({ error: "Invalid JSON" }, 400);
     }
 
-    const envelope = LinearWebhookEnvelopeSchema.safeParse(parsed);
+    const envelope = TrackerWebhookEnvelopeSchema.safeParse(parsed);
     if (!envelope.success) {
       return c.json({ error: "Unrecognized webhook envelope" }, 400);
     }
-    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > config.webhookMaxAgeMs) {
+    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
       return c.json({ error: "Stale webhook" }, 401);
     }
+
+    const record = parsed as Record<string, any>;
+    const data = record.data && typeof record.data === "object" ? record.data : {};
+    const issueRoutingData = data.issue && typeof data.issue === "object" ? data.issue : {};
+    const team = data.team && typeof data.team === "object"
+      ? data.team
+      : issueRoutingData.team && typeof issueRoutingData.team === "object"
+        ? issueRoutingData.team
+        : {};
+    const project = data.project && typeof data.project === "object"
+      ? data.project
+      : issueRoutingData.project && typeof issueRoutingData.project === "object"
+        ? issueRoutingData.project
+        : {};
+    let repository;
+    try {
+      repository = routeWebhookRepository(config, webhookId, {
+        "linear.organizationId": record.organizationId,
+        "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
+        "linear.teamKey": team.key,
+        "linear.projectId": data.projectId ?? issueRoutingData.projectId ?? project.id,
+      });
+    } catch (error) {
+      return c.json(
+        { error: error instanceof Error ? error.message : String(error) },
+        409,
+      );
+    }
+    const scopedConfig = scopeConfig(config, {
+      connectionId: webhookConfig.connectionId,
+      repositoryId: repository.id,
+      webhookId,
+    });
 
     const deliveryId = c.req.header("linear-delivery");
     if (!deliveryId) {
       return c.json({ error: "Missing Linear-Delivery header" }, 400);
     }
 
-    const issue = LinearIssueWebhookSchema.safeParse(parsed);
+    const issue = TrackerIssueWebhookSchema.safeParse(parsed);
     if (issue.success) {
       const result = await handleIssueWebhook({
         prisma,
-        config,
-        bbClient,
+        config: scopedConfig,
+        agentRuntime,
         deliveryId,
         webhook: issue.data,
       });
@@ -78,22 +122,19 @@ route.post("/", async (c) => {
       if (result.kind === IssueWebhookResultKind.Duplicate) {
         return c.json({ accepted: true, duplicate: true }, 200);
       }
-      if (result.kind === IssueWebhookResultKind.Orchestrating) {
-        return c.json({ accepted: true, orchestrating: true }, 202);
-      }
       if (result.kind === IssueWebhookResultKind.Ending) {
         return c.json({ accepted: true, ending: true }, 202);
       }
-      return c.json({ accepted: true, reflecting: true }, 202);
+      return c.json({ accepted: true, workflows: result.workflowIds ?? [] }, 202);
     }
 
-    const reaction = LinearReactionWebhookSchema.safeParse(parsed);
+    const reaction = TrackerReactionWebhookSchema.safeParse(parsed);
     if (reaction.success) {
       try {
         const result = await handleReactionWebhook({
           prisma,
-          config,
-          bbClient,
+          config: scopedConfig,
+          agentRuntime,
           deliveryId,
           webhook: reaction.data,
         });
@@ -110,7 +151,10 @@ route.post("/", async (c) => {
             200,
           );
         }
-        return c.json({ accepted: true, describing: true }, 202);
+        return c.json(
+          { accepted: true, workflows: "workflowIds" in result ? result.workflowIds : [] },
+          202,
+        );
       } catch (error) {
         if (error instanceof WebhookReceiptError) {
           return c.json({ error: "Failed to record delivery" }, 500);
@@ -135,7 +179,7 @@ route.post("/", async (c) => {
       );
     }
 
-    const comment = LinearCommentWebhookSchema.safeParse(parsed);
+    const comment = TrackerCommentWebhookSchema.safeParse(parsed);
     if (!comment.success) {
       return c.json({ accepted: true, ignored: true }, 200);
     }
@@ -143,8 +187,8 @@ route.post("/", async (c) => {
     try {
       const result = await handleCommentWebhook({
         prisma,
-        config,
-        bbClient,
+        config: scopedConfig,
+        agentRuntime,
         deliveryId,
         webhook: comment.data,
       });
@@ -166,7 +210,7 @@ route.post("/", async (c) => {
         {
           accepted: true,
           deliveryId: result.deliveryId,
-          cubeIssueIdentifier: result.cubeIssueIdentifier,
+          sourceIssueIdentifier: result.sourceIssueIdentifier,
         },
         202,
       );
