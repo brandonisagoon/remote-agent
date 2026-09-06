@@ -290,16 +290,16 @@ export async function hasLivePersistentSessionForResource(
   })) > 0;
 }
 
-export async function attachRuntimeSessionToAgentIssue(
+export async function attachRuntimeSessionToMirror(
   prisma: PrismaClient,
-  input: { runtimeSessionId: string; agentIssueRecordId: string },
+  input: { runtimeSessionId: string; sessionMirrorId: string },
 ): Promise<void> {
   // Legacy webhook producers may report a runtime identity before this process
   // has imported it into the local registry. Linking is therefore best-effort;
   // sessions provisioned through acpx always have a matching row.
   await prisma.runtimeSession.updateMany({
     where: { id: input.runtimeSessionId },
-    data: { agentIssueRecordId: input.agentIssueRecordId },
+    data: { sessionMirrorId: input.sessionMirrorId },
   });
 }
 

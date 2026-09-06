@@ -210,7 +210,7 @@ route.post("/", async (c) => {
         {
           accepted: true,
           deliveryId: result.deliveryId,
-          sourceIssueIdentifier: result.sourceIssueIdentifier,
+          resourceId: result.resourceId,
         },
         202,
       );

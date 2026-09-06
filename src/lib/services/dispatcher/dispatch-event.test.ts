@@ -78,7 +78,7 @@ describe("dispatch event failure reaction", () => {
         worker("product.workflow", async () => ({
           status: "failed",
           detail: "acpx launch failed",
-          targetAgentIssueIdentifier: null,
+          targetResourceId: null,
         })),
         events,
       ),
@@ -130,7 +130,7 @@ describe("dispatch event failure reaction", () => {
         worker("product.agent-mention", async () => ({
           status: "failed",
           detail: "routing failed",
-          targetAgentIssueIdentifier: null,
+          targetResourceId: null,
         })),
         events,
       ),

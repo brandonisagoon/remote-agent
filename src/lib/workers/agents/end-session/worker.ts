@@ -58,7 +58,7 @@ export const endSessionWorker: Worker<EndSessionEvent> = {
 function result(
   status: WorkerResult["status"],
   detail: string,
-  targetAgentIssueIdentifier: string | null,
+  targetResourceId: string | null,
 ): WorkerResult {
-  return { status, detail, targetAgentIssueIdentifier };
+  return { status, detail, targetResourceId };
 }

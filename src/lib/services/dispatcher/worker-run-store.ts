@@ -23,7 +23,7 @@ export async function finishWorkerRun(
     data: {
       status: result.status,
       detail: result.detail,
-      targetAgentIssueIdentifier: result.targetAgentIssueIdentifier,
+      targetResourceId: result.targetResourceId,
     },
   });
 }

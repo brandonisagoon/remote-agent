@@ -43,7 +43,7 @@ afterEach(() => {
 });
 function runtime(overrides: Partial<SessionRuntime> = {}): SessionRuntime {
   return {
-    harnessSessionId: "primary-session",
+    sessionKey: "primary-session",
     parentSessionId: null,
     worktreePath: "/tmp/end-status-cube-2801",
     branchName: "end-status-cube-2801",
@@ -210,7 +210,7 @@ describe("agents.end-session worker", () => {
     expect(result).toEqual({
       status: "delivered",
       detail: "ended 1 issue(s); terminated 1 acpx session(s)",
-      targetAgentIssueIdentifier: "AGENT-1",
+      targetResourceId: "AGENT-1",
     });
     expect(linear.updates.map((update) => update.id)).toEqual(["target"]);
     expect(linear.updates[0]?.input).not.toHaveProperty("description");
@@ -227,7 +227,7 @@ describe("agents.end-session worker", () => {
       identifier: "AGENT-2",
       state: "Connected",
       runtime: runtime({
-        harnessSessionId: "primary-session:subagent",
+        sessionKey: "primary-session:subagent",
         role: "delegate",
         runtimeSessionId: "runtime_primary",
       }),
@@ -237,7 +237,7 @@ describe("agents.end-session worker", () => {
       identifier: "AGENT-3",
       state: "Connected",
       runtime: runtime({
-        harnessSessionId: "planner-session",
+        sessionKey: "planner-session",
         harness: "claude",
         role: "delegate",
         runtimeSessionId: "runtime_planner",
@@ -248,7 +248,7 @@ describe("agents.end-session worker", () => {
       identifier: "AGENT-4",
       state: "Connected",
       runtime: runtime({
-        harnessSessionId: "unrelated-session",
+        sessionKey: "unrelated-session",
         worktreePath: "/tmp/unrelated",
         runtimeSessionId: "runtime_unrelated",
       }),

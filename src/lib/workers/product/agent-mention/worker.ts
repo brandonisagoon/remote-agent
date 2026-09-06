@@ -59,7 +59,7 @@ export function createAgentMentionWorker({
         return {
           status: "ignored",
           detail: "unresolved_source_issue",
-          targetAgentIssueIdentifier: null,
+          targetResourceId: null,
         };
       }
 
@@ -135,7 +135,7 @@ ${message}`;
                 );
                 if (registered) {
                   return {
-                    targetAgentIssueIdentifier: registered.agentIssueIdentifier,
+                    targetResourceId: registered.agentIssueIdentifier,
                     reasonCode: "registered_thread" as const,
                     confidence: 1,
                     expectedActions: [],
@@ -154,12 +154,12 @@ ${message}`;
 
       // Keep the registry current: successful deliveries own their thread,
       // and an answered question thread becomes a plain conversation.
-      if (result.status === "delivered" && result.targetAgentIssueIdentifier) {
+      if (result.status === "delivered" && result.targetResourceId) {
         await registerThread(context.prisma, {
           provider: "linear",
           connectionId: context.config.activeConnectionId,
           threadRootCommentId,
-          runtimeSessionId: result.targetAgentIssueIdentifier,
+          runtimeSessionId: result.targetResourceId,
           relationship: "thread",
         }).catch(() => undefined);
         if (answersQuestion && routedSessionId) {
@@ -179,7 +179,7 @@ ${message}`;
       return {
         status: result.status,
         detail: result.detail,
-        targetAgentIssueIdentifier: result.targetAgentIssueIdentifier,
+        targetResourceId: result.targetResourceId,
       };
     },
   };

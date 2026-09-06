@@ -30,8 +30,8 @@ model RuntimeSession {
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
 
-  agentIssueRecordId String?                 @unique
-  agentIssueRecord   AgentIssueRecord?       @relation(fields: [agentIssueRecordId], references: [id], onDelete: SetNull)
+  sessionMirrorId String?                 @unique
+  sessionMirror   SessionMirror?          @relation(fields: [sessionMirrorId], references: [id], onDelete: SetNull)
   cursors            RuntimeEventCursor[]
   events             RuntimeLifecycleEvent[]
   metadataEvents     RuntimeMetadataEvent[]

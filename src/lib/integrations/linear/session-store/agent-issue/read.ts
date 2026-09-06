@@ -69,7 +69,7 @@ export async function getAgentIssues(
 
   const searchTerm = "searchTerm" in query
     ? query.searchTerm
-    : query.harnessSessionId;
+    : query.sessionKey;
   const data = await linearGraphql<{
     searchIssues: { nodes: unknown[] };
   }>(config.linearApiKey, SEARCH_AGENT_ISSUES, {
@@ -79,11 +79,11 @@ export async function getAgentIssues(
     .parse(data.searchIssues.nodes)
     .filter((issue) => issue.team.key === config.agentTeamKey);
 
-  if ("harnessSessionId" in query) {
+  if ("sessionKey" in query) {
     return candidates.filter(
       (issue) =>
-        parseAgentIssueRuntime(issue.description)?.harnessSessionId ===
-        query.harnessSessionId,
+        parseAgentIssueRuntime(issue.description)?.sessionKey ===
+        query.sessionKey,
     );
   }
   return candidates;

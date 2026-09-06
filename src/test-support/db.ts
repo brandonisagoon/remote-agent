@@ -11,7 +11,7 @@ const MIGRATIONS_DIR = path.join(import.meta.dir, "..", "..", "prisma", "migrati
  * A real, disposable SQLite database for tests.
  *
  * Deliberately not a mock: the behavior most worth testing here is the unique
- * constraint on LinearWebhookReceipt.linearDeliveryId, which makes Linear's
+ * constraint on WebhookReceipt.deliveryId, which makes a provider's
  * retries idempotent. A fake store would assert our own assumptions rather
  * than the database's actual guarantee.
  *

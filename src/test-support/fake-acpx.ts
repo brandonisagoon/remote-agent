@@ -66,7 +66,7 @@ if (!comment.includes("fyi")) {
 
 console.log(
   JSON.stringify({
-    targetAgentIssueIdentifier: candidate.agentIssueIdentifier,
+    targetResourceId: candidate.agentIssueIdentifier,
     reasonCode: "primary_session",
     confidence: 1,
     expectedActions,

@@ -53,7 +53,7 @@ export async function forwardMessage(
       status:
         error instanceof RouterTimeoutError ? "router_timeout" : "failed",
       detail: error instanceof Error ? error.message : String(error),
-      targetAgentIssueIdentifier: null,
+      targetResourceId: null,
       decision: null,
     };
   }
@@ -86,7 +86,7 @@ async function route(
     return {
       status: "no_candidate",
       detail: "no eligible related Agents session",
-      targetAgentIssueIdentifier: null,
+      targetResourceId: null,
       decision: null,
     };
   }
@@ -103,12 +103,12 @@ async function route(
     options.replyContext,
   );
   const decision = normalized.decision;
-  if (!decision.targetAgentIssueIdentifier) {
+  if (!decision.targetResourceId) {
     return {
       status:
         decision.reasonCode === "ambiguous" ? "ambiguous" : "no_candidate",
       detail: decision.reasonCode,
-      targetAgentIssueIdentifier: null,
+      targetResourceId: null,
       decision,
     };
   }
@@ -121,13 +121,13 @@ async function route(
       );
   const fresh = freshCandidates.find(
     (candidate) =>
-      candidate.agentIssueIdentifier === decision.targetAgentIssueIdentifier,
+      candidate.agentIssueIdentifier === decision.targetResourceId,
   );
   if (!fresh || !isEligibleCandidate(options.config, fresh)) {
     return {
       status: "rejected",
       detail: "router selected a candidate that failed post-selection validation",
-      targetAgentIssueIdentifier: decision.targetAgentIssueIdentifier,
+      targetResourceId: decision.targetResourceId,
       decision,
     };
   }
@@ -139,7 +139,7 @@ async function route(
     return {
       status: "stale_target",
       detail: "the registered acpx session is no longer live",
-      targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
+      targetResourceId: fresh.agentIssueIdentifier,
       decision,
     };
   }
@@ -161,14 +161,14 @@ async function route(
     return {
       status: "failed",
       detail: error instanceof Error ? error.message : String(error),
-      targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
+      targetResourceId: fresh.agentIssueIdentifier,
       decision,
     };
   }
   return {
     status: "delivered",
     detail: deliveredDetail(decision, normalized.replyDetail),
-    targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
+    targetResourceId: fresh.agentIssueIdentifier,
     decision,
   };
 }

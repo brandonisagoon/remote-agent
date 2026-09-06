@@ -74,7 +74,7 @@ export async function fetchRouteCandidates(
         .map((tag) => `${tag.key}:${tag.value}`)
         .sort(),
       runtime: {
-        harnessSessionId: session.id,
+        sessionKey: session.id,
         parentSessionId: null,
         worktreePath: session.worktreePath,
         branchName: null,

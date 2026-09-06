@@ -46,7 +46,6 @@ export {
   updateAgentIssue,
   updateIssueComment,
   verifyLinearSignature as verifyTrackerWebhookSignature,
-  WebhookReceiptError,
   workflowLabelForEvent,
 } from "../linear/index.ts";
 export type {
@@ -66,3 +65,4 @@ export type {
   LinearWebhookEnvelope as TrackerWebhookEnvelope,
   UpdateAgentIssueInput,
 } from "../linear/index.ts";
+export { WebhookReceiptError } from "../../services/receipts/store.ts";

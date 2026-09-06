@@ -1,13 +1,13 @@
 export {
-  deleteAgentIssueRecord,
-  findAgentIssueRecordByHarnessSessionId,
-  updateAgentIssueRecord,
-  upsertAgentIssueRecord,
-} from "./agent-issue-record.ts";
+  deleteSessionMirror,
+  findSessionMirrorBySessionKey,
+  updateSessionMirror,
+  upsertSessionMirror,
+} from "./session-mirror.ts";
 export {
   advanceRuntimeEventCursor,
   appendRuntimeLifecycleEvent,
-  attachRuntimeSessionToAgentIssue,
+  attachRuntimeSessionToMirror,
   beginRuntimeSession,
   findRuntimeSession,
   getRuntimeEventCursor,

@@ -53,7 +53,7 @@ function candidate(
       "Test MacBook Air",
     ],
     runtime: {
-      harnessSessionId: `session-${identifier}`,
+      sessionKey: `session-${identifier}`,
       parentSessionId: null,
       worktreePath: `/tmp/${identifier.toLowerCase()}`,
       branchName: `work-${identifier.toLowerCase()}`,
@@ -111,7 +111,7 @@ describe("Codex semantic selector", () => {
     expect(schema.properties.expectedActions.items.enum).toEqual(
       RouteActionSchema.options,
     );
-    expect(schema.properties.targetAgentIssueIdentifier.enum).toContain(
+    expect(schema.properties.targetResourceId.enum).toContain(
       "AGENT-130",
     );
     expect(schema.properties.replyToCommentId.enum).toContain(
@@ -127,7 +127,7 @@ describe("Codex semantic selector", () => {
       await expect(
         selectSessionWithRouter(fakeConfig, routingInput(onlyCandidate)),
       ).resolves.toEqual({
-        targetAgentIssueIdentifier: "AGENT-130",
+        targetResourceId: "AGENT-130",
         reasonCode: "only_eligible_candidate",
         confidence: 1,
         expectedActions: ["reply"],
@@ -144,7 +144,7 @@ describe("Codex semantic selector", () => {
             routingInput(onlyCandidate, { comment }),
           ),
         ).resolves.toEqual({
-          targetAgentIssueIdentifier: "AGENT-130",
+          targetResourceId: "AGENT-130",
           reasonCode: "only_eligible_candidate",
           confidence: 1,
           expectedActions,
@@ -162,7 +162,7 @@ describe("Codex semantic selector", () => {
           ),
         ),
       ).resolves.toEqual({
-        targetAgentIssueIdentifier: "AGENT-130",
+        targetResourceId: "AGENT-130",
         reasonCode: "only_eligible_candidate",
         confidence: 1,
         expectedActions: [],
@@ -184,7 +184,7 @@ describe("Codex semantic selector", () => {
             ),
           ),
         ).resolves.toEqual({
-          targetAgentIssueIdentifier: "AGENT-130",
+          targetResourceId: "AGENT-130",
           reasonCode: "only_eligible_candidate",
           confidence: 1,
           expectedActions: ["reply"],
@@ -204,7 +204,7 @@ describe("Codex semantic selector", () => {
     );
 
     expect(decision).toEqual({
-      targetAgentIssueIdentifier: "AGENT-130",
+      targetResourceId: "AGENT-130",
       reasonCode: "primary_session",
       confidence: 1,
       expectedActions: ["reply"],

@@ -9,7 +9,11 @@
   Zed loads the same row instead of registering another logical session.
 - Linear workers launch and route sessions through the application-owned
   `AgentSessionRuntime` interface. Linear issues are resources linked to
-  sessions, not a shadow session registry.
+  sessions, not a shadow session registry — the `SessionMirror` row maps a
+  session to whatever provider-side object mirrors it.
+- Storage vocabulary is provider-neutral (`WebhookReceipt`, `SessionMirror`,
+  resource links); provider-specific names live only under
+  `src/lib/integrations/<provider>/`.
 - One machine daemon owns Prisma, acpx, and all configured repositories.
   Zed's ACP command is a stateless stdio bridge to that daemon.
 

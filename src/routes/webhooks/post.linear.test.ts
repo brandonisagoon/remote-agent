@@ -165,7 +165,7 @@ describe("signature verification", () => {
     const response = await post(commentPayload(), { secret: "wrong" });
 
     expect(response.status).toBe(401);
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
   });
 
   test("rejects a missing signature", async () => {
@@ -229,14 +229,14 @@ describe("delivery deduplication", () => {
     expect(first.status).toBe(202);
     expect(second.status).toBe(200);
     expect(await second.json()).toMatchObject({ duplicate: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
+    expect(await prisma.webhookReceipt.count()).toBe(1);
   });
 
   test("distinct deliveries are both recorded", async () => {
     await post(commentPayload(), { deliveryId: "d-1" });
     await post(commentPayload(), { deliveryId: "d-2" });
 
-    expect(await prisma.linearWebhookReceipt.count()).toBe(2);
+    expect(await prisma.webhookReceipt.count()).toBe(2);
   });
 
   test("requires the Linear-Delivery header", async () => {
@@ -256,10 +256,10 @@ describe("description reaction trigger", () => {
         accepted: true,
         workflows: ["describe"],
       });
-      expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
+      expect(await prisma.webhookReceipt.findFirst()).toMatchObject({
         eventType: "reaction",
         trigger: "describe",
-        sourceIssueIdentifier: "CUBE-2804",
+        resourceId: "CUBE-2804",
         status: "accepted",
       });
     },
@@ -273,7 +273,7 @@ describe("description reaction trigger", () => {
     expect(first.status).toBe(202);
     expect(second.status).toBe(200);
     expect(await second.json()).toMatchObject({ duplicate: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
+    expect(await prisma.webhookReceipt.count()).toBe(1);
   });
 
   test.each([
@@ -290,7 +290,7 @@ describe("description reaction trigger", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true, reason });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
   });
 
   test("does not reserve AGENT-prefixed identifiers", async () => {
@@ -302,10 +302,10 @@ describe("description reaction trigger", () => {
     expect(await response.json()).toMatchObject({
       accepted: true,
     });
-    expect(await prisma.linearWebhookReceipt.findFirst()).toMatchObject({
+    expect(await prisma.webhookReceipt.findFirst()).toMatchObject({
       eventType: "reaction",
       trigger: "describe",
-      sourceIssueIdentifier: "AGENT-42",
+      resourceId: "AGENT-42",
       status: "accepted",
     });
   });
@@ -319,7 +319,7 @@ describe("description reaction trigger", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
     expect(warning).toHaveBeenCalledWith(
       expect.stringContaining("linear_reaction_schema_mismatch"),
     );
@@ -335,7 +335,7 @@ describe("issue triggers", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
   });
 
   test("keeps the product reflection trigger unchanged", async () => {
@@ -352,7 +352,7 @@ describe("issue triggers", () => {
       accepted: true,
       workflows: ["review"],
     });
-    const receipt = await prisma.linearWebhookReceipt.findFirst();
+    const receipt = await prisma.webhookReceipt.findFirst();
     expect(receipt).toMatchObject({ trigger: "review" });
   });
 });
@@ -368,7 +368,7 @@ describe("event filtering", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
   });
 
   test("ignores comment removal", async () => {
@@ -386,7 +386,7 @@ describe("event filtering", () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
 
-    const row = await prisma.linearWebhookReceipt.findFirst();
+    const row = await prisma.webhookReceipt.findFirst();
     expect(row?.status).toBe("ignored");
     expect(row?.detail).toBe("no_agent_mention");
   });
@@ -400,7 +400,7 @@ describe("event filtering", () => {
     const response = await post(payload);
 
     expect(response.status).toBe(200);
-    const row = await prisma.linearWebhookReceipt.findFirst();
+    const row = await prisma.webhookReceipt.findFirst();
     expect(row?.status).toBe("ignored");
     expect(row?.detail).toBe("self_authored");
   });
@@ -411,12 +411,12 @@ describe("event filtering", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      sourceIssueIdentifier: "CUBE-2600",
+      resourceId: "CUBE-2600",
     });
 
-    const row = await prisma.linearWebhookReceipt.findFirst();
+    const row = await prisma.webhookReceipt.findFirst();
     expect(row?.status).toBe("accepted");
-    expect(row?.sourceIssueIdentifier).toBe("CUBE-2600");
+    expect(row?.resourceId).toBe("CUBE-2600");
     expect(row?.eventType).toBe("comment");
     expect(row?.trigger).toBe("mention");
   });
@@ -430,7 +430,7 @@ describe("event filtering", () => {
     expect(response.status).toBe(202);
     expect(await response.json()).toMatchObject({
       accepted: true,
-      sourceIssueIdentifier: "CUBE-2600",
+      resourceId: "CUBE-2600",
     });
   });
 
@@ -440,9 +440,9 @@ describe("event filtering", () => {
     const response = await post(commentPayload());
     expect(response.status).toBe(202);
 
-    const row = await prisma.linearWebhookReceipt.findFirst();
-    expect(row?.sourceIssueIdentifier).toBe("CUBE-2600");
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
+    const row = await prisma.webhookReceipt.findFirst();
+    expect(row?.resourceId).toBe("CUBE-2600");
+    expect(await prisma.webhookReceipt.count()).toBe(1);
   });
 });
 
@@ -457,7 +457,7 @@ describe("issue state changes", () => {
       accepted: true,
       workflows: ["plan"],
     });
-    const receipt = await prisma.linearWebhookReceipt.findFirstOrThrow();
+    const receipt = await prisma.webhookReceipt.findFirstOrThrow();
     expect(receipt.eventType).toBe("issue");
     expect(receipt.trigger).toBe("plan");
   });
@@ -469,7 +469,7 @@ describe("issue state changes", () => {
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(0);
+    expect(await prisma.webhookReceipt.count()).toBe(0);
   });
 
   test("does not reserve the AGENT team for runtime state", async () => {
@@ -480,7 +480,7 @@ describe("issue state changes", () => {
       accepted: true,
       workflows: ["plan"],
     });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
+    expect(await prisma.webhookReceipt.count()).toBe(1);
   });
 
   test("keeps Pull Request reflection behavior", async () => {
@@ -493,7 +493,7 @@ describe("issue state changes", () => {
       accepted: true,
       workflows: ["review"],
     });
-    const receipt = await prisma.linearWebhookReceipt.findFirstOrThrow();
+    const receipt = await prisma.webhookReceipt.findFirstOrThrow();
     expect(receipt.trigger).toBe("review");
   });
 
@@ -505,7 +505,7 @@ describe("issue state changes", () => {
     expect(first.status).toBe(202);
     expect(second.status).toBe(200);
     expect(await second.json()).toMatchObject({ duplicate: true });
-    expect(await prisma.linearWebhookReceipt.count()).toBe(1);
+    expect(await prisma.webhookReceipt.count()).toBe(1);
   });
 });
 

@@ -45,7 +45,7 @@ export async function endSessionGroup(
   for (const member of ordered) {
     if (isTerminalAgentIssueState(member.issue.state.name)) continue;
     await enqueueAgentIssueWrite(
-      member.runtime?.harnessSessionId ?? member.issue.id,
+      member.runtime?.sessionKey ?? member.issue.id,
       () =>
         updateAgentIssue(
           config,
@@ -135,9 +135,9 @@ function belongsToSessionGroup(
   if (!runtime) return false;
 
   return (
-    candidate.runtime.harnessSessionId === runtime.harnessSessionId ||
-    candidate.runtime.harnessSessionId.startsWith(
-      `${runtime.harnessSessionId}:`,
+    candidate.runtime.sessionKey === runtime.sessionKey ||
+    candidate.runtime.sessionKey.startsWith(
+      `${runtime.sessionKey}:`,
     ) ||
     (candidate.runtime.runtimeSessionId !== null &&
       candidate.runtime.runtimeSessionId === runtime.runtimeSessionId) ||

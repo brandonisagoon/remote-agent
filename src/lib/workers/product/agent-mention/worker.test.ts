@@ -57,9 +57,9 @@ function delivered(): MessageDispatchResult {
   return {
     status: "delivered",
     detail: "actions:reply,code_change reply_to:thread-root",
-    targetAgentIssueIdentifier: "AGENT-9",
+    targetResourceId: "AGENT-9",
     decision: {
-      targetAgentIssueIdentifier: "AGENT-9",
+      targetResourceId: "AGENT-9",
       reasonCode: "workflow_match",
       confidence: 0.95,
       expectedActions: ["reply", "code_change"],
@@ -94,7 +94,7 @@ describe("createAgentMentionWorker", () => {
     expect(result).toEqual({
       status: "delivered",
       detail: "actions:reply,code_change reply_to:thread-root",
-      targetAgentIssueIdentifier: "AGENT-9",
+      targetResourceId: "AGENT-9",
     });
     expect(reactions).toEqual([
       TrackerReaction.Received,
@@ -179,7 +179,7 @@ describe("createAgentMentionWorker", () => {
     expect(result).toEqual({
       status: "ignored",
       detail: "unresolved_source_issue",
-      targetAgentIssueIdentifier: null,
+      targetResourceId: null,
     });
     expect(forwarded).toBeFalse();
     expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Unrouted]);
@@ -197,7 +197,7 @@ describe("createAgentMentionWorker", () => {
       forward: async () => ({
         status: "no_candidate",
         detail: "no eligible related Agents session",
-        targetAgentIssueIdentifier: null,
+        targetResourceId: null,
         decision: null,
       }),
       react: async (_key, _commentId, reaction) => {
@@ -223,7 +223,7 @@ describe("createAgentMentionWorker", () => {
       forward: async () => ({
         status: "failed",
         detail: "acpx rejected the exact registered thread",
-        targetAgentIssueIdentifier: "AGENT-9",
+        targetResourceId: "AGENT-9",
         decision: null,
       }),
       react: async (_key, _commentId, reaction) => {
@@ -273,7 +273,7 @@ describe("createAgentMentionWorker", () => {
           assigneeId: null,
           labels: [],
           runtime: {
-            harnessSessionId: "runtime-9",
+            sessionKey: "runtime-9",
             parentSessionId: null,
             worktreePath: "/wt",
             branchName: null,
@@ -288,7 +288,7 @@ describe("createAgentMentionWorker", () => {
       ],
     });
     expect(decision).toMatchObject({
-      targetAgentIssueIdentifier: "runtime-9",
+      targetResourceId: "runtime-9",
       reasonCode: "registered_thread",
       confidence: 1,
     });

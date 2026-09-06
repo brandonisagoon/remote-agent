@@ -54,7 +54,7 @@ export function outputSchema(
   return {
     type: "object",
     properties: {
-      targetAgentIssueIdentifier: {
+      targetResourceId: {
         type: ["string", "null"],
         enum: [
           null,
@@ -82,7 +82,7 @@ export function outputSchema(
       },
     },
     required: [
-      "targetAgentIssueIdentifier",
+      "targetResourceId",
       "reasonCode",
       "confidence",
       "expectedActions",
@@ -115,7 +115,7 @@ export async function selectSessionWithRouter(
 ): Promise<RouteDecision> {
   if (input.candidates.length === 0) {
     return {
-      targetAgentIssueIdentifier: null,
+      targetResourceId: null,
       reasonCode: "no_eligible_candidate",
       confidence: 1,
       expectedActions: [],
@@ -127,7 +127,7 @@ export async function selectSessionWithRouter(
     const candidate = input.candidates[0]!;
     const replyTargets = input.replyTargets ?? [];
     const deterministic: RouteDecision = {
-      targetAgentIssueIdentifier: candidate.agentIssueIdentifier,
+      targetResourceId: candidate.agentIssueIdentifier,
       reasonCode: "only_eligible_candidate",
       confidence: 1,
       expectedActions: replyTargets.length > 0 ? ["reply"] : [],

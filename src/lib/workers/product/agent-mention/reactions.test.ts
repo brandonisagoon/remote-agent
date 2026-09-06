@@ -10,9 +10,9 @@ function result(
   return {
     status: "delivered",
     detail: null,
-    targetAgentIssueIdentifier: "AGENT-9",
+    targetResourceId: "AGENT-9",
     decision: {
-      targetAgentIssueIdentifier: "AGENT-9",
+      targetResourceId: "AGENT-9",
       reasonCode: "only_eligible_candidate",
       confidence: 1,
       expectedActions: [],
@@ -30,7 +30,7 @@ describe("selectOutcomeReactions", () => {
   test("maps a delivered action set in stable order", () => {
     expect(selectOutcomeReactions(result({
       decision: {
-        targetAgentIssueIdentifier: "AGENT-9",
+        targetResourceId: "AGENT-9",
         reasonCode: "workflow_match",
         confidence: 0.9,
         expectedActions: ["code_change", "reply", "plan_update", "reply"],

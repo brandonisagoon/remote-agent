@@ -34,7 +34,10 @@ Remote Agent owns:
   `message-session` composes in the running session's worktree and forwards);
 - worktree creation and skill composition (always the repository's own
   skill-composer binary, executed in a child process);
-- stable runtime identity, session labels, relationships, and integration links in SQLite;
+- stable runtime identity, session labels, relationships, and integration
+  links in SQLite. Storage is provider-neutral: webhook receipts, session
+  mirrors, and resource links all carry a `provider` column, so future
+  Slack/GitHub connections reuse the same tables;
 - acpx/provider execution and Zed ACP translation;
 - registry-backed routing and shutdown;
 - conversation-thread registration: once a thread is routed to a session,

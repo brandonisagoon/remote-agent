@@ -42,7 +42,7 @@ export const RouteReasonSchema = z.enum([
 ]);
 
 export const RouteDecisionSchema = z.object({
-  targetAgentIssueIdentifier: z.string().nullable(),
+  targetResourceId: z.string().nullable(),
   reasonCode: RouteReasonSchema,
   confidence: z.number().min(0).max(1),
   expectedActions: z.array(RouteActionSchema).default([]),

@@ -10,7 +10,7 @@ import {
 } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
 import { matchWorkflows } from "../../../../workflows/match.ts";
-import { createWebhookReceipt } from "../receipt-store.ts";
+import { createWebhookReceipt } from "../../../../services/receipts/store.ts";
 
 export type { IssueWebhookResult } from "../../webhook-types/index.ts";
 
@@ -40,11 +40,12 @@ export async function handleIssueWebhook(input: {
     webhookId: config.activeWebhookId,
     connectionId: config.activeConnectionId,
     repositoryId: config.activeRepositoryId,
-    linearDeliveryId: deliveryId,
+    provider: "linear",
+    deliveryId,
     eventType: "issue",
     trigger: matched.map((workflow) => workflow.id).join(","),
-    sourceIssueIdentifier: data.identifier,
-    sourceCommentId: null,
+    resourceId: data.identifier,
+    commentId: null,
     status: "accepted",
   });
   if (!receipt) return { kind: IssueWebhookResultKind.Duplicate };

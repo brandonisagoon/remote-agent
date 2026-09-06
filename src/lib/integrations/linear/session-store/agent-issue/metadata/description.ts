@@ -47,7 +47,7 @@ export function parseAgentIssueRuntime(
     values.set(field, inlineCodeValue(value).replace(/\\\|/g, "|"));
   }
 
-  const harnessSessionId = values.get("Harness session ID");
+  const sessionKey = values.get("Harness session ID");
   const worktreePath = values.get("Worktree");
   const storedLifecycle = emptyToNull(values.get("Lifecycle"));
   const lifecycle =
@@ -55,7 +55,7 @@ export function parseAgentIssueRuntime(
       ? storedLifecycle
       : null;
   const runtimeSessionId = emptyToNull(values.get("Runtime session ID"));
-  if (!harnessSessionId || !worktreePath) return null;
+  if (!sessionKey || !worktreePath) return null;
 
   const labels = labelsFromDescription(description);
   const harness = labels.has(AgentIssueLabel.Harness.Claude)
@@ -72,7 +72,7 @@ export function parseAgentIssueRuntime(
         : "primary";
 
   return {
-    harnessSessionId,
+    sessionKey,
     parentSessionId: null,
     worktreePath,
     branchName: null,
@@ -218,7 +218,7 @@ export function buildAgentIssueDescription(
     .join("\n\n");
   return `| Runtime field | Value |
 | --- | --- |
-| Harness session ID | ${markdownCell(runtime.harnessSessionId)} |
+| Harness session ID | ${markdownCell(runtime.sessionKey)} |
 | Worktree | ${markdownCell(runtime.worktreePath)} |
 | Lifecycle | ${markdownCell(runtime.lifecycle)} |
 | Runtime session ID | ${markdownCell(runtime.runtimeSessionId)} |

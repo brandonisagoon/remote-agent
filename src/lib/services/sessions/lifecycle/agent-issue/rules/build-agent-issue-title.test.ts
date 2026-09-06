@@ -5,7 +5,7 @@ import { buildAgentIssueTitle } from "./index.ts";
 
 describe("buildAgentIssueTitle", () => {
   const runtime: SessionRuntime = {
-    harnessSessionId: "thr_a1b2c3d4",
+    sessionKey: "thr_a1b2c3d4",
     parentSessionId: null,
     worktreePath: "/tmp/worktree",
     branchName: "example-cube-2600",

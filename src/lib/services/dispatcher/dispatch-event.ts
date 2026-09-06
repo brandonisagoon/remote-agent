@@ -73,7 +73,7 @@ export async function dispatchEvent(
       result = {
         status: "failed",
         detail: error instanceof Error ? error.message : String(error),
-        targetAgentIssueIdentifier: null,
+        targetResourceId: null,
       };
     }
     if (

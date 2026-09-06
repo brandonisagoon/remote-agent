@@ -1,0 +1,21 @@
+/// Durable idempotency index from a session to the provider-side object that
+/// mirrors it (a Linear agent issue today; a Slack thread or GitHub comment
+/// thread tomorrow). The mirror is a linked resource, not a session registry.
+model SessionMirror {
+  id             String   @id @default(cuid())
+  sessionKey     String   @unique
+  provider       String   @default("linear")
+  connectionId   String   @default("legacy")
+  externalId     String
+  externalRef    String?
+  machineId      String?
+  lastEventId    String?
+  lastGeneration BigInt?
+  rootCommentId  String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  runtimeSession RuntimeSession?
+
+  @@index([machineId])
+}

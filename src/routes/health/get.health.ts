@@ -19,7 +19,7 @@ const route = new Hono<AppEnv>();
 route.get("/", async (c) => {
     try {
       await Promise.all([
-        c.get("prisma").linearWebhookReceipt.findFirst(),
+        c.get("prisma").webhookReceipt.findFirst(),
         c.get("prisma").workerRun.findFirst(),
       ]);
     } catch (error) {

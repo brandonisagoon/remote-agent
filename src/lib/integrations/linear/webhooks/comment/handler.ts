@@ -7,7 +7,7 @@ import { DispatchEventType } from "../../../../../types/dispatcher/index.ts";
 import type { LinearCommentWebhook } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
 import { findThreadSession } from "../../../../services/sessions/threads.ts";
-import { createWebhookReceipt } from "../receipt-store.ts";
+import { createWebhookReceipt } from "../../../../services/receipts/store.ts";
 
 export type CommentWebhookResult =
   | { kind: "duplicate" }
@@ -15,7 +15,7 @@ export type CommentWebhookResult =
   | {
       kind: "accepted";
       deliveryId: string;
-      sourceIssueIdentifier: string | null;
+      resourceId: string | null;
     };
 
 export async function handleCommentWebhook(input: {
@@ -56,11 +56,12 @@ export async function handleCommentWebhook(input: {
     webhookId: config.activeWebhookId,
     connectionId: config.activeConnectionId,
     repositoryId: config.activeRepositoryId,
-    linearDeliveryId: deliveryId,
+    provider: "linear",
+    deliveryId,
     eventType: "comment",
     trigger: mentioned ? "mention" : "thread",
-    sourceIssueIdentifier: data.issue?.identifier ?? null,
-    sourceCommentId: data.id,
+    resourceId: data.issue?.identifier ?? null,
+    commentId: data.id,
     status: accepted ? "accepted" : "ignored",
     detail,
   });
@@ -87,6 +88,6 @@ export async function handleCommentWebhook(input: {
   return {
     kind: "accepted",
     deliveryId,
-    sourceIssueIdentifier: data.issue?.identifier ?? null,
+    resourceId: data.issue?.identifier ?? null,
   };
 }

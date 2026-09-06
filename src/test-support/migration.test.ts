@@ -25,6 +25,8 @@ const runtimeDirectories = [
   "20260901152401_remove_bb_registry",
   "20260901152917_runtime_lifecycle_journal",
   "20260901170000_multi_repo_session_metadata",
+  "20260905153520_workflow_provenance",
+  "20260906154113_generalize_provider_vocabulary",
 ];
 
 function statements(directory: string): string[] {
@@ -86,19 +88,19 @@ describe("receipt and worker-run migration", () => {
       }
     }
 
-    const receipts = await prisma.linearWebhookReceipt.findMany({
-      orderBy: { linearDeliveryId: "asc" },
+    const receipts = await prisma.webhookReceipt.findMany({
+      orderBy: { deliveryId: "asc" },
     });
     expect(receipts).toHaveLength(2);
     expect(receipts[0]).toMatchObject({
-      linearDeliveryId: "delivered-1",
+      deliveryId: "delivered-1",
       eventType: "issue",
       trigger: "reflection",
-      sourceIssueIdentifier: "CUBE-2",
+      resourceId: "CUBE-2",
       status: "accepted",
     });
     expect(receipts[1]).toMatchObject({
-      linearDeliveryId: "ignored-1",
+      deliveryId: "ignored-1",
       eventType: "comment",
       trigger: "mention",
       status: "ignored",
@@ -109,14 +111,14 @@ describe("receipt and worker-run migration", () => {
         receiptId: "delivered-1",
         workerKey: "product.reflection",
         status: "delivered",
-        targetAgentIssueIdentifier: "AGENT-9",
+        targetResourceId: "AGENT-9",
       }),
     ]);
-    expect(await prisma.agentIssueRecord.findUnique({
-      where: { harnessSessionId: "session-1" },
+    expect(await prisma.sessionMirror.findUnique({
+      where: { sessionKey: "session-1" },
     })).toMatchObject({
-      agentIssueId: "agent-issue-id",
-      agentIssueIdentifier: "AGENT-9",
+      externalId: "agent-issue-id",
+      externalRef: "AGENT-9",
       lastEventId: "event-1",
       lastGeneration: 2n,
     });

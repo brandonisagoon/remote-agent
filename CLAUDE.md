@@ -56,6 +56,14 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `sessionDefaults.labels`; `exclusive` (not cardinality), `routerVisible`.
   The Prisma `tags` rows are the one storage-internal exception, mapped to
   `labels` at every seam.
+- **WebhookReceipt / SessionMirror** — provider-neutral storage: a receipt
+  records one inbound delivery (`provider`, `deliveryId`, `resourceId` +
+  `commentId` — container + threadable item); a session mirror is the
+  provider-side object mirroring a session (Linear agent issue today).
+  `WorkerRun.targetResourceId` names delivery targets. Provider-specific
+  vocabulary (AgentIssue, Linear webhook shapes) is allowed only inside
+  `src/lib/integrations/<provider>/`; the `"Harness session ID"` string in
+  agent-issue descriptions is Linear-side data format, not code vocabulary.
 - **connection** owns machineId, repository allowlist, one webhook, router,
   editors. **machine** is physical (server, sockets, sshHost, installation).
 - IDs are opaque (`wh-xxxx`, `repo-xxxx`); fields referencing them end in

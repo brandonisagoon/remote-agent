@@ -19,5 +19,5 @@ export type WorkerRunStatusValue =
 export interface WorkerResult {
   status: WorkerRunStatusValue;
   detail: string | null;
-  targetAgentIssueIdentifier: string | null;
+  targetResourceId: string | null;
 }

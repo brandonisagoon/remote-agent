@@ -52,8 +52,8 @@ export async function endWorktreeSessions(
   for (const issue of matches) {
     const runtime = parseAgentIssueRuntime(issue.description);
     const record = runtime
-      ? await prisma.agentIssueRecord.findUnique({
-          where: { harnessSessionId: runtime.harnessSessionId },
+      ? await prisma.sessionMirror.findUnique({
+          where: { sessionKey: runtime.sessionKey },
         })
       : null;
     const previous = parseAgentIssueSyncMetadata(issue.description);
@@ -74,8 +74,8 @@ export async function endWorktreeSessions(
       },
     );
     if (record) {
-      await prisma.agentIssueRecord.update({
-        where: { harnessSessionId: record.harnessSessionId },
+      await prisma.sessionMirror.update({
+        where: { sessionKey: record.sessionKey },
         data: {
           lastEventId: event.eventId,
           lastGeneration: BigInt(event.generation),

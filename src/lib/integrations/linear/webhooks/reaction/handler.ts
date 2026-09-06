@@ -9,7 +9,7 @@ import {
   type ReactionWebhookResult,
 } from "../../webhook-types/index.ts";
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
-import { createWebhookReceipt } from "../receipt-store.ts";
+import { createWebhookReceipt } from "../../../../services/receipts/store.ts";
 import { reactionEmojiTokens } from "./emoji.ts";
 import { matchWorkflows } from "../../../../workflows/match.ts";
 
@@ -77,11 +77,12 @@ export async function handleReactionWebhook(input: {
     webhookId: config.activeWebhookId,
     connectionId: config.activeConnectionId,
     repositoryId: config.activeRepositoryId,
-    linearDeliveryId: deliveryId,
+    provider: "linear",
+    deliveryId,
     eventType: "reaction",
     trigger: matched.map((workflow) => workflow.id).join(","),
-    sourceIssueIdentifier,
-    sourceCommentId: null,
+    resourceId: sourceIssueIdentifier,
+    commentId: null,
     status: "accepted",
     detail: null,
   });

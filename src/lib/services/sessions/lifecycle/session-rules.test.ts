@@ -29,7 +29,7 @@ details are intentionally ignored by the parser
 describe("agent issue description", () => {
   test("parses only the managed runtime table", () => {
     expect(parseAgentIssueRuntime(DESCRIPTION)).toEqual({
-      harnessSessionId: "thr_abc123",
+      sessionKey: "thr_abc123",
       parentSessionId: null,
       worktreePath: "/srv/worktrees/example-cube-2600",
       branchName: null,
@@ -57,7 +57,7 @@ describe("agent issue description", () => {
   test("writes lifecycle metadata and a collapsed open section", () => {
     const description = buildAgentIssueDescription(
       {
-        harnessSessionId: "thr_abc123",
+        sessionKey: "thr_abc123",
         parentSessionId: null,
         worktreePath: "/srv/worktrees/example-cube-2600",
         branchName: "example-cube-2600",
@@ -117,7 +117,7 @@ describe("delivery eligibility", () => {
       "Test MacBook Air",
     ],
     runtime: {
-      harnessSessionId: "thr_abc123",
+      sessionKey: "thr_abc123",
       parentSessionId: null,
       worktreePath: "/tmp/worktree",
       branchName: null,

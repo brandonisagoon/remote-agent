@@ -66,11 +66,11 @@ export async function projectRuntimeEvent(
 
   const session = await prisma.runtimeSession.findUnique({
     where: { id: event.sessionId },
-    include: { agentIssueRecord: true },
+    include: { sessionMirror: true },
   });
-  const record = session?.agentIssueRecord;
+  const record = session?.sessionMirror;
   if (!record) return;
-  const issue = await findAgentIssue(config, { id: record.agentIssueId });
+  const issue = await findAgentIssue(config, { id: record.externalId });
   if (!issue) return;
 
   const parsed = parseAgentIssueRuntime(issue.description);
@@ -94,7 +94,7 @@ export async function projectRuntimeEvent(
       ? await getSourceIssue(config, { id: sourceIdentifier })
       : null;
     if (source) {
-      let rootId = record.sessionRootCommentId;
+      let rootId = record.rootCommentId;
       if (!rootId) {
         const root = await createThreadedIssueComment(config.linearApiKey, {
           issueId: source.id,
@@ -102,9 +102,9 @@ export async function projectRuntimeEvent(
         });
         if (root) {
           rootId = root.id;
-          await prisma.agentIssueRecord.update({
+          await prisma.sessionMirror.update({
             where: { id: record.id },
-            data: { sessionRootCommentId: root.id },
+            data: { rootCommentId: root.id },
           });
         }
       }

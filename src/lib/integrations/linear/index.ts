@@ -74,10 +74,8 @@ export type {
   WebhookReceiptStatusValue,
 } from "./webhook-types/index.ts";
 export {
-  createWebhookReceipt,
   handleCommentWebhook,
   handleIssueWebhook,
   handleReactionWebhook,
-  WebhookReceiptError,
 } from "./webhooks/index.ts";
 export type { CommentWebhookResult } from "./webhooks/index.ts";

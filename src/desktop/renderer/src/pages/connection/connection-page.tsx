@@ -128,7 +128,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
         <JsonBlock
           label="Example Routing Decision"
           json={`{
-  "targetAgentIssueIdentifier": "AGENT-131",
+  "targetResourceId": "AGENT-131",
   "reasonCode": "primary_session",
   "confidence": 0.9,
   "expectedActions": ["code_change"],

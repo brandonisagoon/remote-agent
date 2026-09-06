@@ -6,7 +6,7 @@ export interface QueryAgentIssueInput {
 
 export type QueryAgentIssuesInput =
   | { searchTerm: string }
-  | { harnessSessionId: string }
+  | { sessionKey: string }
   | { machine: Machine };
 
 export type {

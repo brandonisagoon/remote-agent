@@ -77,7 +77,7 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
     }) as unknown as WorkflowWorkerDependencies["launch"],
     forward: (async (input: Record<string, unknown>) => {
       record.forwarded.push(input);
-      return { status: "delivered", detail: "forwarded", targetAgentIssueIdentifier: null };
+      return { status: "delivered", detail: "forwarded", targetResourceId: null };
     }) as unknown as WorkflowWorkerDependencies["forward"],
     hasLiveSession: async () => false,
     ...overrides,

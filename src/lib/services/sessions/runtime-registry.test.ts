@@ -4,7 +4,7 @@ import {
   advanceRuntimeEventCursor,
   appendRuntimeLifecycleEvent,
   attachRuntimeSession,
-  attachRuntimeSessionToAgentIssue,
+  attachRuntimeSessionToMirror,
   beginRuntimeSession,
   findRuntimeSession,
   getRuntimeEventCursor,
@@ -97,15 +97,15 @@ describe("runtime session registry", () => {
       agent: "claude",
       cwd: "/tmp/repo",
     });
-    const issue = await database.prisma.agentIssueRecord.create({
+    const issue = await database.prisma.sessionMirror.create({
       data: {
-        harnessSessionId: "harness-two",
-        agentIssueId: "linear-id",
+        sessionKey: "harness-two",
+        externalId: "linear-id",
       },
     });
-    await attachRuntimeSessionToAgentIssue(database.prisma, {
+    await attachRuntimeSessionToMirror(database.prisma, {
       runtimeSessionId: session.id,
-      agentIssueRecordId: issue.id,
+      sessionMirrorId: issue.id,
     });
     await advanceRuntimeEventCursor(database.prisma, {
       runtimeSessionId: session.id,
@@ -130,7 +130,7 @@ describe("runtime session registry", () => {
       await database.prisma.runtimeSession.findUnique({
         where: { id: session.id },
       }),
-    ).toMatchObject({ agentIssueRecordId: issue.id });
+    ).toMatchObject({ sessionMirrorId: issue.id });
   });
 
   test("does not silently reopen a closed logical scope", async () => {

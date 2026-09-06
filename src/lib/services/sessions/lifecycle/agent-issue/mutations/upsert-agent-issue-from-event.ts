@@ -20,11 +20,11 @@ import {
   updateAgentIssue,
 } from "../../../../../integrations/tracker/index.ts";
 import {
-  deleteAgentIssueRecord,
-  findAgentIssueRecordByHarnessSessionId,
-  attachRuntimeSessionToAgentIssue,
-  updateAgentIssueRecord,
-  upsertAgentIssueRecord,
+  deleteSessionMirror,
+  findSessionMirrorBySessionKey,
+  attachRuntimeSessionToMirror,
+  updateSessionMirror,
+  upsertSessionMirror,
 } from "../../../registry/index.ts";
 import {
   AgentIssueState,
@@ -42,7 +42,7 @@ export async function upsertAgentIssueFromEvent(
   prisma: PrismaClient,
   _dependencies: Record<string, never> = {},
 ): Promise<AgentIssue | null> {
-  return enqueueAgentIssueWrite(event.runtime.harnessSessionId, () =>
+  return enqueueAgentIssueWrite(event.runtime.sessionKey, () =>
     upsertAgentIssue(config, event, prisma),
   );
 }
@@ -53,18 +53,18 @@ async function upsertAgentIssue(
   prisma: PrismaClient,
 ): Promise<AgentIssue | null> {
   const catalog = await getAgentCatalog(config);
-  let agentIssueRecord = await findAgentIssueRecordByHarnessSessionId(prisma, {
-    harnessSessionId: event.runtime.harnessSessionId,
+  let agentIssueRecord = await findSessionMirrorBySessionKey(prisma, {
+    sessionKey: event.runtime.sessionKey,
   });
   let existingAgentIssue = agentIssueRecord
     ? await findAgentIssue(config, {
-        id: agentIssueRecord.agentIssueId,
+        id: agentIssueRecord.externalId,
       })
     : null;
   if (agentIssueRecord && !existingAgentIssue) {
-    await deleteAgentIssueRecord(prisma, {
-      harnessSessionId: agentIssueRecord.harnessSessionId,
-      agentIssueId: agentIssueRecord.agentIssueId,
+    await deleteSessionMirror(prisma, {
+      sessionKey: agentIssueRecord.sessionKey,
+      externalId: agentIssueRecord.externalId,
     });
     agentIssueRecord = null;
   }
@@ -72,7 +72,7 @@ async function upsertAgentIssue(
   const matches = existingAgentIssue
     ? [existingAgentIssue]
     : await getAgentIssues(config, {
-        harnessSessionId: event.runtime.harnessSessionId,
+        sessionKey: event.runtime.sessionKey,
       });
   if (matches.length > 1) {
     await Promise.allSettled(
@@ -94,16 +94,16 @@ async function upsertAgentIssue(
   existingAgentIssue = matches[0] ?? null;
   const isRootSession = event.runtime.parentSessionId == null;
   const recordRuntime = {
-    harnessSessionId: event.runtime.harnessSessionId,
-    machine: isRootSession ? event.runtime.machine : null,
+    sessionKey: event.runtime.sessionKey,
+    machineId: isRootSession ? event.runtime.machine : null,
   };
   if (existingAgentIssue && !agentIssueRecord) {
-    agentIssueRecord = await upsertAgentIssueRecord(prisma, {
+    agentIssueRecord = await upsertSessionMirror(prisma, {
       ...recordRuntime,
-      agentIssueId: existingAgentIssue.id,
-      agentIssueIdentifier: existingAgentIssue.identifier,
+      externalId: existingAgentIssue.id,
+      externalRef: existingAgentIssue.identifier,
     });
-    if (agentIssueRecord.agentIssueId !== existingAgentIssue.id) {
+    if (agentIssueRecord.externalId !== existingAgentIssue.id) {
       await updateAgentIssue(
         config,
         { id: existingAgentIssue.id },
@@ -114,7 +114,7 @@ async function upsertAgentIssue(
         },
       );
       existingAgentIssue = await findAgentIssue(config, {
-        id: agentIssueRecord.agentIssueId,
+        id: agentIssueRecord.externalId,
       });
       if (!existingAgentIssue) {
         throw new Error("stored Agents issue was not found");
@@ -250,12 +250,12 @@ async function upsertAgentIssue(
       }),
     });
 
-    agentIssueRecord = await upsertAgentIssueRecord(prisma, {
+    agentIssueRecord = await upsertSessionMirror(prisma, {
       ...recordRuntime,
-      agentIssueId: agentIssue.id,
-      agentIssueIdentifier: agentIssue.identifier,
+      externalId: agentIssue.id,
+      externalRef: agentIssue.identifier,
     });
-    if (agentIssueRecord.agentIssueId !== agentIssue.id) {
+    if (agentIssueRecord.externalId !== agentIssue.id) {
       await updateAgentIssue(
         config,
         { id: agentIssue.id },
@@ -266,7 +266,7 @@ async function upsertAgentIssue(
         },
       );
       const winner = await findAgentIssue(config, {
-        id: agentIssueRecord.agentIssueId,
+        id: agentIssueRecord.externalId,
       });
       if (!winner) {
         throw new Error("stored Agents issue was not found");
@@ -294,15 +294,15 @@ async function upsertAgentIssue(
     });
   }
 
-  const updatedRecord = await updateAgentIssueRecord(prisma, {
+  const updatedRecord = await updateSessionMirror(prisma, {
     ...recordRuntime,
     lastEventId: event.eventId,
     lastGeneration: event.generation,
   });
   if (isRootSession && event.runtime.runtimeSessionId) {
-    await attachRuntimeSessionToAgentIssue(prisma, {
+    await attachRuntimeSessionToMirror(prisma, {
       runtimeSessionId: event.runtime.runtimeSessionId,
-      agentIssueRecordId: updatedRecord.id,
+      sessionMirrorId: updatedRecord.id,
     });
   }
 

@@ -25,7 +25,7 @@ export const WorkflowSchema = z.enum([
 ]);
 
 const RuntimeSchema = z.object({
-  harnessSessionId: z.string().min(1).max(256),
+  sessionKey: z.string().min(1).max(256),
   parentSessionId: z.string().min(1).max(256).nullish(),
   worktreePath: z.string().min(1).max(4096),
   branchName: z.string().min(1).max(512).nullish(),

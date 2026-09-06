@@ -13,6 +13,6 @@ export function buildAgentIssueTitle(
       : AgentIssueLabel.Harness.Codex;
   const role =
     runtime.role[0]!.toUpperCase() + runtime.role.slice(1);
-  const suffix = runtime.harnessSessionId.slice(-8);
+  const suffix = runtime.sessionKey.slice(-8);
   return `${sourceIssueIdentifier ?? "Unrelated"} · ${role} · ${harness} · ${suffix}`;
 }

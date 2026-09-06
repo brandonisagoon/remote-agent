@@ -9,7 +9,7 @@ import { resolveAgentIssueState } from "./index.ts";
 
 describe("resolveAgentIssueState", () => {
   const runtime: SessionRuntime = {
-    harnessSessionId: "session-1",
+    sessionKey: "session-1",
     parentSessionId: null,
     worktreePath: "/tmp/worktree",
     branchName: "example-cube-2600",

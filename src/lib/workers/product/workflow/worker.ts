@@ -48,9 +48,9 @@ const defaultDependencies: WorkflowWorkerDependencies = {
 function result(
   status: WorkerResult["status"],
   detail: string,
-  targetAgentIssueIdentifier: string | null = null,
+  targetResourceId: string | null = null,
 ): WorkerResult {
-  return { status, detail, targetAgentIssueIdentifier };
+  return { status, detail, targetResourceId };
 }
 
 function commandFailure(

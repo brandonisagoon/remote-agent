@@ -26,7 +26,7 @@ function decision(
   overrides: Partial<RouteDecision> = {},
 ): RouteDecision {
   return {
-    targetAgentIssueIdentifier: "AGENT-9",
+    targetResourceId: "AGENT-9",
     reasonCode: "only_eligible_candidate",
     confidence: 1,
     expectedActions: [],
@@ -49,7 +49,7 @@ function candidate(overrides: Partial<RouteCandidate> = {}): RouteCandidate {
       "General",
     ],
     runtime: {
-      harnessSessionId: "thr_123",
+      sessionKey: "thr_123",
       parentSessionId: null,
       worktreePath: WT,
       branchName: "work-cube-1",
@@ -98,7 +98,7 @@ function deliver(
       return candidates;
     },
     selectSession: async (_config, input) => decision({
-      targetAgentIssueIdentifier:
+      targetResourceId:
         input.candidates[0]?.agentIssueIdentifier ?? null,
       reasonCode: input.candidates.length
         ? "only_eligible_candidate"
@@ -132,7 +132,7 @@ describe("model-selected delivery", () => {
       selectSession: async (_config, input) => {
         routedComment = input.comment;
         return decision({
-          targetAgentIssueIdentifier:
+          targetResourceId:
             input.candidates[0]!.agentIssueIdentifier,
           reasonCode: "workflow_match",
         });
@@ -149,14 +149,14 @@ describe("model-selected delivery", () => {
   test("fails closed when no eligible related session exists", async () => {
     const result = await deliver([], runnerWithPane());
     expect(result.status).toBe("no_candidate");
-    expect(result.targetAgentIssueIdentifier).toBeNull();
+    expect(result.targetResourceId).toBeNull();
   });
 
   test("re-fetches and delivers to the exact registered acpx session", async () => {
     const runner = runnerWithPane();
     const result = await deliver([candidate()], runner);
     expect(result.status).toBe("delivered");
-    expect(result.targetAgentIssueIdentifier).toBe("AGENT-9");
+    expect(result.targetResourceId).toBe("AGENT-9");
     expect(result.reads).toBe(2);
     expect(runner.sentMessages.map((entry) => entry.text).join(" ")).toContain("@agent do a thing");
   });
@@ -198,7 +198,7 @@ describe("model-selected delivery", () => {
 
     expect(result).toMatchObject({
       status: "delivered",
-      targetAgentIssueIdentifier: "AGENT-130",
+      targetResourceId: "AGENT-130",
       detail: "actions:reply reply_to:thread-root",
       decision: {
         reasonCode: "only_eligible_candidate",
@@ -248,7 +248,7 @@ describe("model-selected delivery", () => {
 
     expect(result).toMatchObject({
       status: "delivered",
-      targetAgentIssueIdentifier: "AGENT-130",
+      targetResourceId: "AGENT-130",
       detail: "actions:plan_update",
       decision: {
         reasonCode: "only_eligible_candidate",
@@ -267,7 +267,7 @@ describe("model-selected delivery", () => {
       agentIssueIdentifier: "AGENT-10",
       runtime: {
         ...candidate().runtime,
-        harnessSessionId: "thr_456",
+        sessionKey: "thr_456",
         runtimeSessionId: "thr_bb_2",
       },
     });
@@ -311,7 +311,7 @@ describe("model-selected delivery", () => {
         return reads === 1 ? [candidate()] : [fresh];
       },
       selectSession: async () => decision({
-        targetAgentIssueIdentifier: fresh.agentIssueIdentifier,
+        targetResourceId: fresh.agentIssueIdentifier,
       }),
       finalizeMessage: (target) => {
         finalizedTargets.push(target);
@@ -328,7 +328,7 @@ describe("model-selected delivery", () => {
   test("rejects a stale acpx session without rerouting", async () => {
     const result = await deliver([candidate()], runnerWithPane(false));
     expect(result.status).toBe("stale_target");
-    expect(result.targetAgentIssueIdentifier).toBe("AGENT-9");
+    expect(result.targetResourceId).toBe("AGENT-9");
   });
 
   test("filters Pro sessions before the model sees them", async () => {
@@ -357,12 +357,12 @@ describe("model-selected delivery", () => {
       },
       fetchCandidates: async () => [candidate()],
       selectSession: async () => decision({
-        targetAgentIssueIdentifier: "AGENT-999",
+        targetResourceId: "AGENT-999",
         reasonCode: "workflow_match",
       }),
     });
     expect(result.status).toBe("rejected");
-    expect(result.targetAgentIssueIdentifier).toBe("AGENT-999");
+    expect(result.targetResourceId).toBe("AGENT-999");
   });
 
   test("records a bounded router timeout outcome", async () => {

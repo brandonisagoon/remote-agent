@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
-import { createWebhookReceipt } from "./receipt-store.ts";
+import { createTestDatabase, type TestDatabase } from "../../../test-support/db.ts";
+import { createWebhookReceipt } from "./store.ts";
 
 describe("webhook-scoped delivery receipts", () => {
   let database: TestDatabase;
@@ -20,17 +20,18 @@ describe("webhook-scoped delivery receipts", () => {
         webhookId,
         connectionId,
         repositoryId: "repository-one",
-        linearDeliveryId: "shared-delivery-id",
+        provider: "linear",
+        deliveryId: "shared-delivery-id",
         eventType: "issue",
         trigger: "orchestration",
-        sourceIssueIdentifier: "ENG-1",
-        sourceCommentId: null,
+        resourceId: "ENG-1",
+        commentId: null,
         status: "accepted",
       });
 
     expect(await receipt("linear-one", "connection-one")).not.toBeNull();
     expect(await receipt("linear-one", "connection-one")).toBeNull();
     expect(await receipt("linear-two", "connection-two")).not.toBeNull();
-    expect(await database.prisma.linearWebhookReceipt.count()).toBe(2);
+    expect(await database.prisma.webhookReceipt.count()).toBe(2);
   });
 });
