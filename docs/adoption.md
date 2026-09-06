@@ -1,6 +1,6 @@
 # Multi-repository adoption
 
-Each machine runs one Remote Agent daemon configured by one
+Each machine runs one Remote Agent server configured by one
 `remote-agent.config.json`. That file can declare multiple repositories,
 Linear connections, and inbound webhooks. Copy the committed example and keep
 the credential-bearing file untracked.
@@ -46,7 +46,7 @@ Remote Agent owns:
   questions) via `PUT /sessions/:id/threads`;
 - plan capture: a `start-session` workflow with
   `plan: { captureToIssue: true, thenState? }` (claude provider only)
-  launches its session in plan mode; the daemon persists the plan into the
+  launches its session in plan mode; the server persists the plan into the
   source issue's `## Implementation Plan` section on exit-plan-mode approval
   — updated in place on re-plans — and transitions the issue only after the
   write succeeded. Repository skills should not write the plan or move the
@@ -74,9 +74,9 @@ does not orchestrate a fleet in this version.
    `remote-agent.config.example.json` to `remote-agent.config.json`.
 2. Set the repository paths, credentials, machine settings, and optional acpx agent
    command overrides.
-3. Run `bun run db:deploy`, then start the machine daemon with `bun run start`.
+3. Run `bun run db:deploy`, then start the machine server with `bun run start`.
 4. Configure Zed to run `bun run acp`; this is a stateless stdio bridge to the
-   daemon socket, not a second runtime.
+   server socket, not a second runtime.
 5. Persist both the SQLite file and `acpx.stateDir` across deploys.
 
 The desktop app and CLI operate on exactly this JSON file. The app watches the

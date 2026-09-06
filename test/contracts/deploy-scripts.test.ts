@@ -2,12 +2,12 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
 
-import { serviceLabel } from "../../src/management/supervisor/index.ts";
-import { repoRoot } from "../../src/test-support/repo.ts";
+import { serviceLabel } from "../../management/supervisor/index.ts";
+import { repoRoot } from "../../test-support/repo.ts";
 
 const REMOTE_AGENT = repoRoot();
-const deploySource = readFileSync(path.join(REMOTE_AGENT, "src/management/deploy.ts"), "utf8");
-const provisionSource = readFileSync(path.join(REMOTE_AGENT, "src/management/provision.ts"), "utf8");
+const deploySource = readFileSync(path.join(REMOTE_AGENT, "management/deploy.ts"), "utf8");
+const provisionSource = readFileSync(path.join(REMOTE_AGENT, "management/provision.ts"), "utf8");
 
 describe("remote-agent deployment modules", () => {
   test("the bash scripts are gone — deployment is TypeScript only", () => {

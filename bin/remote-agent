@@ -6,4 +6,4 @@ set -euo pipefail
 SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
-exec bun "$ROOT/src/cli/main.ts" "$@"
+exec bun "$ROOT/apps/cli/main.ts" "$@"

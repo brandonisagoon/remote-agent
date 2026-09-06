@@ -15,8 +15,7 @@
     "types": ["bun"],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"],
-      "@renderer/*": ["./src/desktop/renderer/src/*"]
+            "@renderer/*": ["./apps/desktop/renderer/src/*"]
     },
     "target": "ES2022"
   },

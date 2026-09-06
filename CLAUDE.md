@@ -5,34 +5,34 @@
 
 Control plane that turns Linear activity into durable coding-agent sessions,
 executed by acpx (Codex / Claude Code) in isolated git worktrees. One repo,
-three artifacts on a single release cadence: the CLI (`src/cli/`), the daemon
-(`src/server.ts`), and the Electron desktop app (`src/desktop/`). This repo is
+three artifacts on a single release cadence: the CLI (`apps/cli/`), the server
+(`apps/server/server.ts`), and the Electron desktop app (`apps/desktop/`). This repo is
 its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 
 ## Architecture
 
-- **Daemon** (Hono + Bun, port from config) — webhooks, session router,
+- **Server** (Hono + Bun, port from config) — webhooks, session router,
   workflow engine, acpx sessions, own Prisma/SQLite store. Reads config once
   at boot; runs from the deployed copy under the install root, supervised by
   launchd (macOS) / a Task Scheduler logon task (Windows).
 - **Desktop app** (electron-vite + React + Tailwind v4 + vanilla shadcn) — a
   pure control plane editing the config JSON. TanStack Router (hash history,
-  code-based routes in `src/desktop/renderer/src/router.tsx`) + TanStack
-  Query (`lib/queries/`; NO TanStack DB). Saves are explicit: draft state
+  code-based routes in `apps/desktop/renderer/src/router.tsx`) + TanStack
+  Query (`@renderer/lib/queries/`; NO TanStack DB). Saves are explicit: draft state
   over the `['config']` query, sonner save/revert — never save per keystroke.
-- **CLI** (`remote-agent`) — thin commander skin over `src/management/`.
-- **`src/management/`** — the platform layer shared by CLI and GUI:
+- **CLI** (`remote-agent`) — thin commander skin over `management/`.
+- **`management/`** — the platform layer shared by CLI and GUI:
   provisioning, self-updating deploy with rollback, the doctor checklist
   (`checks.ts` — single source for CLI doctor AND the GUI status tables), and
   the `supervisor/` seam. **No shell scripts** — everything is TypeScript.
-- **`src/lib/skills/`** — skill-composer boundary. Repos own skill-composer
+- **`lib/skills/`** — skill-composer boundary. Repos own skill-composer
   as their own dev dependency; we always **exec** their copy (or a bun child
   process for the inventory shim), never import repo-owned config in-process.
-- **Thread registry** (`src/lib/services/sessions/threads.ts`) — conversation
+- **Thread registry** (`apps/server/services/sessions/threads.ts`) — conversation
   threads live in `RuntimeSessionResourceLink` (`comment-thread`, relationship
   `thread`/`question`): registered threads deliver without a mention or a
   router call; `question` threads frame the next human reply as the answer.
-- **Plan capture** (`src/lib/services/sessions/plan-capture.ts`) — a
+- **Plan capture** (`apps/server/services/sessions/plan-capture.ts`) — a
   workflow with `plan: { captureToIssue, thenState? }` launches its session
   in plan mode (`RuntimeSession.workflowId` records provenance); the acpx
   `onPermissionRequest` hook intercepts the exit-plan-mode approval (tool
@@ -43,10 +43,21 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 - **Workflows** (`repositories.<id>.workflows`) — trigger (`on` +
   `when` conditions + optional `connectionId`) → skill (skillset + flags) →
   delivery (`start-session` | `message-session`). Matched in the webhook
-  handlers (`src/lib/workflows/match.ts`), executed by the single workflow
-  worker (`src/lib/workers/product/workflow/`), which composes
+  handlers (`apps/server/workflows/match.ts`), executed by the single workflow
+  worker (`apps/server/workers/product/workflow/`), which composes
   `{{SKILL:skillset+flags}}` tokens via `composeForPrompt` inside the
   session's worktree.
+
+## Layout
+
+- `apps/server` (Hono entry, routes, middleware, ACP, services,
+  integrations, workers, workflows, transports, Prisma), `apps/desktop`,
+  `apps/cli` — the three artifacts. The shared kernel at the repo root is
+  deliberately small: `lib/` (config, skills, machines), `management/`,
+  `types/` (+ `generated/`, `test-support/` as tooling).
+- The desktop app and CLI may import only `lib/`, `management/`, and
+  `types/` — enforced by `test/contracts/app-boundaries.test.ts`.
+  Everything under `apps/server` is server-only.
 
 ## Vocabulary (enforced across JSON, code, and UI)
 
@@ -62,7 +73,7 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   provider-side object mirroring a session (Linear agent issue today).
   `WorkerRun.targetResourceId` names delivery targets. Provider-specific
   vocabulary (AgentIssue, Linear webhook shapes) is allowed only inside
-  `src/lib/integrations/<provider>/`; the `"Harness session ID"` string in
+  `apps/server/integrations/<provider>/`; the `"Harness session ID"` string in
   agent-issue descriptions is Linear-side data format, not code vocabulary.
 - **connection** owns machineId, repository allowlist, one webhook, router,
   editors. **machine** is physical (server, sockets, sshHost, installation).
@@ -72,7 +83,7 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 ## Conventions
 
 - Kebab-case file names. Explicit named exports in barrels, no `export *`.
-- Zod v4 schemas in `src/lib/config.ts` are the single config source; the UI
+- Zod v4 schemas in `lib/config.ts` are the single config source; the UI
   mirrors the JSON shape exactly — when one changes, both change.
 - Share libraries within TypeScript; **exec across real boundaries** (repo
   scripts, skill-composer, launchctl/schtasks, cloudflared).
@@ -87,11 +98,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 
 ## Working on this repo
 
-- **Restart matrix**: renderer (`src/desktop/renderer/`) hot-reloads;
-  `src/desktop/main/`, `src/lib/`, `src/management/` need a full
-  `bun run desktop:dev` restart; daemon changes need a daemon restart.
+- **Restart matrix**: renderer (`apps/desktop/renderer/`) hot-reloads;
+  `apps/desktop/main/`, `lib/`, `management/` need a full
+  `bun run desktop:dev` restart; server changes need a server restart.
   Never kill the user's running dev app — tell them what needs restarting.
-- **TWO live configs on the dev machine**: the daemon's
+- **TWO live configs on the dev machine**: the server's
   `~/Library/Application Support/remote-agent/remote-agent.config.json` AND
   the dev desktop app's userData copy at
   `~/Library/Application Support/Remote Agent/remote-agent.config.json`.

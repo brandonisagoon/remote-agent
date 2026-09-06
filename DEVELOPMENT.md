@@ -13,9 +13,9 @@
   session to whatever provider-side object mirrors it.
 - Storage vocabulary is provider-neutral (`WebhookReceipt`, `SessionMirror`,
   resource links); provider-specific names live only under
-  `src/lib/integrations/<provider>/`.
-- One machine daemon owns Prisma, acpx, and all configured repositories.
-  Zed's ACP command is a stateless stdio bridge to that daemon.
+  `apps/server/integrations/<provider>/`.
+- One machine server owns Prisma, acpx, and all configured repositories.
+  Zed's ACP command is a stateless stdio bridge to that server.
 
 ## Running from a checkout
 
@@ -23,7 +23,7 @@
 cp remote-agent.config.example.json remote-agent.config.json
 bun install
 bun run db:deploy
-bun run start        # the daemon
+bun run start        # the server
 ```
 
 The CLI is runnable in place with `bun run cli -- doctor` (any subcommand).
@@ -47,21 +47,21 @@ bun run lint    # prisma generate + config schema + tsc
 bun test
 ```
 
-After changing the config schema in `src/lib/config.ts`, regenerate the JSON
+After changing the config schema in `lib/config.ts`, regenerate the JSON
 schema with `bun run config:schema`.
 
 ## Layout notes
 
-- `src/management/` — the platform layer shared by CLI and GUI: provisioning
+- `management/` — the platform layer shared by CLI and GUI: provisioning
   (`provision.ts`), self-updating deploy with rollback (`deploy.ts`), the
   doctor checklist (`checks.ts`), and the `supervisor/` seam (launchd on
   macOS, a Task Scheduler logon task on Windows). There are no shell scripts;
   everything is TypeScript under Bun.
-- `src/lib/skills/` — the skill-composer boundary: `check.ts` scans a
+- `lib/skills/` — the skill-composer boundary: `check.ts` scans a
   repository's skillsets (exec + a sandboxed bun child process for the
   inventory), `compose.ts` is the `{{SKILL:...}}` token pipeline workflows
   compose sessions with.
-- `src/lib/workflows/` + `src/lib/workers/product/workflow/` — trigger
+- `apps/server/workflows/` + `apps/server/workers/product/workflow/` — trigger
   matching and the single workflow worker (start-session / message-session).
 - Conventions and vocabulary live in `CLAUDE.md` / `AGENTS.md` (mirrored).
 - `bin/remote-agent` (and `.cmd`) — the CLI wrappers package managers put on
@@ -79,7 +79,7 @@ Trusted Signing) activates automatically once the CI secrets exist; without
 them the artifacts build unsigned.
 
 Deployed installations update themselves from git via `remote-agent update`
-(`src/management/deploy.ts`), independent of package-manager releases.
+(`management/deploy.ts`), independent of package-manager releases.
 
 ## Design history
 

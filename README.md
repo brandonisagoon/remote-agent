@@ -28,14 +28,14 @@ scoop install remote-agent
 
 This also installs the runtime dependencies, Bun and cloudflared.
 
-**2. Create your config and provision the daemon:**
+**2. Create your config and provision the server:**
 
 ```sh
 remote-agent install
 ```
 
 This clones the repo into an app directory, builds it, migrates the database,
-and registers the daemon to start at login (a launchd user agent on macOS, a
+and registers the server to start at login (a launchd user agent on macOS, a
 Task Scheduler logon task on Windows — your login session, because the agent
 sessions use your credentials).
 
@@ -79,14 +79,14 @@ rebuild, migrate, restart — rolls back on failure), `uninstall [--purge]`.
   (a state change, a reaction) by composing one of the repo's own
   [skill-composer](https://github.com/brandonisagoon/skill-composer) skillsets
   into the worktree and either starting a session or messaging the running
-  one. A workflow can also start its session in plan mode: the daemon
+  one. A workflow can also start its session in plan mode: the server
   captures the finished plan when the agent asks to exit plan mode, writes it
   into the source issue's description under `## Implementation Plan`, and
   then moves the issue to a configured state — the agent never touches Linear
   for either step.
 - When a session's worktree is ready, the Linear issue gets one deep link per
   configured editor — opening locally, or over SSH when your editors run on a
-  different machine than the daemon.
+  different machine than the server.
 
 ## Configuration
 
@@ -111,7 +111,7 @@ repository must provide.
 
 Worktree deep links support Zed, VS Code, and Cursor (any app with a URL
 scheme works for local links). Zed users can additionally attach to running
-sessions over ACP — the `bun run acp` stdio bridge connects Zed to the daemon
+sessions over ACP — the `bun run acp` stdio bridge connects Zed to the server
 with full controls (provider, model, mode, thinking level) and restored
 context usage across reconnects.
 

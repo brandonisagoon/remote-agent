@@ -7,14 +7,14 @@ export default defineConfig({
   main: {
     build: {
       rollupOptions: {
-        input: resolve(import.meta.dirname, "src/desktop/main/index.ts"),
+        input: resolve(import.meta.dirname, "apps/desktop/main/index.ts"),
       },
     },
   },
   preload: {
     build: {
       rollupOptions: {
-        input: resolve(import.meta.dirname, "src/desktop/preload/index.ts"),
+        input: resolve(import.meta.dirname, "apps/desktop/preload/index.ts"),
         output: {
           format: "cjs",
           entryFileNames: "index.cjs",
@@ -23,16 +23,16 @@ export default defineConfig({
     },
   },
   renderer: {
-    root: resolve(import.meta.dirname, "src/desktop/renderer"),
+    root: resolve(import.meta.dirname, "apps/desktop/renderer"),
     build: {
       rollupOptions: {
-        input: resolve(import.meta.dirname, "src/desktop/renderer/index.html"),
+        input: resolve(import.meta.dirname, "apps/desktop/renderer/index.html"),
       },
     },
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
-        "@renderer": resolve(import.meta.dirname, "src/desktop/renderer/src"),
+        "@renderer": resolve(import.meta.dirname, "apps/desktop/renderer/src"),
       },
     },
   },
