@@ -5,7 +5,7 @@ import { createConnection } from "node:net";
 import { readConfig } from "../../../lib/config.ts";
 import { acpLog } from "./log.ts";
 
-/** Stateless Zed ACP stdio bridge. The machine server is the sole runtime and
+/** Stateless ACP stdio bridge for any ACP client (Zed, bb, T3 Code…). The machine server is the sole runtime and
  * database owner; this process only forwards framed NDJSON bytes. */
 export async function startAcpBridge(): Promise<void> {
   const config = readConfig();

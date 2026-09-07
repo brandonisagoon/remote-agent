@@ -216,7 +216,7 @@ describe("Remote Agent ACP proxy", () => {
     });
   });
 
-  test("uses stable Zed IDs, thought category, and boolean fast mode", async () => {
+  test("uses stable config-option IDs, thought category, and boolean fast mode", async () => {
     const runtime = new FakeRuntime();
     const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
     await initialize(agent);
@@ -258,7 +258,7 @@ describe("Remote Agent ACP proxy", () => {
     ]);
   });
 
-  test("translates Zed's fast boolean to the upstream select", async () => {
+  test("translates a client's fast boolean to the upstream select", async () => {
     const runtime = new FakeRuntime();
     const agent = new RemoteAgentAcpAgent(connection([]), runtime, testConfig());
     await initialize(agent);

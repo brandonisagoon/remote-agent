@@ -2,11 +2,11 @@
 
 ## Architecture ownership
 
-- `RuntimeSession.id` is the stable ID exposed to Zed and integrations.
+- `RuntimeSession.id` is the stable ID exposed to ACP clients and integrations.
 - acpx owns provider startup, ACP protocol handling, transcripts, and provider
   reconnect state.
 - SQLite maps that stable ID to acpx and provider session IDs. Reconnecting
-  Zed loads the same row instead of registering another logical session.
+  an ACP client loads the same row instead of registering another logical session.
 - Linear workers launch and route sessions through the application-owned
   `AgentSessionRuntime` interface. Linear issues are resources linked to
   sessions, not a shadow session registry — the `SessionMirror` row maps a
@@ -15,7 +15,7 @@
   resource links); provider-specific names live only under
   `apps/server/integrations/<provider>/`.
 - One machine server owns Prisma, acpx, and all configured repositories.
-  Zed's ACP command is a stateless stdio bridge to that server.
+  The ACP command any client runs is a stateless stdio bridge to that server.
 
 ## Running from a checkout
 

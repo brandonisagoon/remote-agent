@@ -97,6 +97,9 @@ function fastSelectValues(option: acp.SessionConfigOption): {
 
 export class RemoteAgentAcpAgent implements acp.Agent {
   private booleanConfigOptions = false;
+  /** The attached client's self-reported name (from initialize); the
+      protocol is client-agnostic — Zed, bb, T3 Code, or anything else. */
+  private clientName = "ACP client";
   private readonly activeTurns = new Map<string, AgentRuntimeTurn>();
 
   constructor(
@@ -110,6 +113,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
   ): Promise<acp.InitializeResponse> {
     this.booleanConfigOptions =
       params.clientCapabilities?.session?.configOptions?.boolean != null;
+    this.clientName = params.clientInfo?.title ?? params.clientInfo?.name ?? "ACP client";
     return {
       protocolVersion: acp.PROTOCOL_VERSION,
       agentInfo: {
@@ -140,10 +144,10 @@ export class RemoteAgentAcpAgent implements acp.Agent {
   async newSession(
     params: acp.NewSessionRequest,
   ): Promise<acp.NewSessionResponse> {
-    const logicalKey = `zed:${randomUUID()}`;
+    const logicalKey = `acp:${randomUUID()}`;
     const session = await this.runtime.ensureSession({
       sessionKey: logicalKey,
-      name: `Zed · ${path.basename(params.cwd) || "session"}`,
+      name: `${this.clientName} · ${path.basename(params.cwd) || "session"}`,
       agent: this.config.acp.providerId,
       cwd: params.cwd,
       worktreePath: params.cwd,
@@ -152,7 +156,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
       role: "primary",
       lifecycle: "persistent",
       model: this.config.acp.model,
-      systemPrompt: "A Zed ACP session was created. Wait for the user's request.",
+      systemPrompt: "An ACP client session was created. Wait for the user's request.",
     });
     this.publishUsageAfterSetup(session);
     return {
@@ -202,7 +206,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
   async closeSession(
     params: acp.CloseSessionRequest,
   ): Promise<acp.CloseSessionResponse> {
-    await this.runtime.close(params.sessionId, "Closed by Zed");
+    await this.runtime.close(params.sessionId, `Closed by ${this.clientName}`);
     return {};
   }
 
@@ -338,10 +342,10 @@ export class RemoteAgentAcpAgent implements acp.Agent {
 
   async cancel(params: acp.CancelNotification): Promise<void> {
     const active = this.activeTurns.get(params.sessionId);
-    if (active) await active.cancel("Cancelled by Zed");
+    if (active) await active.cancel(`Cancelled by ${this.clientName}`);
     else {
       await this.runtime
-        .cancel(params.sessionId, "Cancelled by Zed")
+        .cancel(params.sessionId, `Cancelled by ${this.clientName}`)
         .catch((error) => acpLog(`cancel failed for ${params.sessionId}`, error));
     }
   }

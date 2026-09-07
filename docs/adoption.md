@@ -49,18 +49,19 @@ Remote Agent owns:
   that branch doesn't exist yet and no live session handles the issue; the
   directory is the branch name with slashes flattened to hyphens under
   `worktreeRoot`. Branch names come from the repository's
-  `branchNaming` templates (keyed by connection, `"*"` default `{branch}`)
+  `branchNaming` templates (committed; keyed `"*"` | `"linear"` |
+  `"linear:<workspace>"`, default `{branch}`)
   rendered from provider facts — `{branch}` the provider's suggested name,
   `{issue}` the identifier, `{title}` the title, slugified; templates must keep
   `{branch}` or `{issue}`. The worktree directory comes from the repository's
-  `worktreeNaming` templates (keyed by connection like `branchNaming`,
-  default `{branch}` = the rendered branch), flattened for the filesystem. The server validates, never
+  `worktreeNaming` templates (machine-local, keyed by connection, default
+  `{branch}`), flattened for the filesystem. The server validates, never
   invents;
 - stable runtime identity, session labels, relationships, and integration
   links in SQLite. Storage is provider-neutral: webhook receipts, session
   mirrors, and resource links all carry a `provider` column, so future
   Slack/GitHub connections reuse the same tables;
-- acpx/provider execution and Zed ACP translation;
+- acpx/provider execution and ACP translation for any ACP client;
 - registry-backed routing and shutdown;
 - conversation-thread registration: once a thread is routed to a session,
   replies in it deliver deterministically without an @mention or a router
@@ -98,7 +99,7 @@ does not orchestrate a fleet in this version.
 2. Set the repository paths, credentials, machine settings, and optional acpx agent
    command overrides.
 3. Run `bun run db:deploy`, then start the machine server with `bun run start`.
-4. Configure Zed to run `bun run acp`; this is a stateless stdio bridge to the
+4. Configure your ACP client (Zed, bb, T3 Code) to run `bun run acp`; this is a stateless stdio bridge to the
    server socket, not a second runtime.
 5. Persist both the SQLite file and `acpx.stateDir` across deploys.
 

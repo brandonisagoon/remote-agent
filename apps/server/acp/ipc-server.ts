@@ -37,8 +37,8 @@ export async function startAcpIpcServer(input: {
   }
 
   // Raw sockets, so close() can force-disconnect attached bridges — Node's
-  // server.close only completes after every connection ends, and a lingering
-  // Zed bridge would otherwise hang shutdown before the WAL flush.
+  // server.close only completes after every connection ends, and a
+  // lingering client bridge would otherwise hang shutdown before the WAL flush.
   const sockets = new Set<import("node:net").Socket>();
   const server = createServer((socket) => {
     const stream = acp.ndJsonStream(
