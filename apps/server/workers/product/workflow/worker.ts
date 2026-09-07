@@ -17,7 +17,7 @@ import {
 import { hasLivePersistentSessionForResource } from "../../../services/sessions/runtime-registry.ts";
 import { composeForPrompt, renderSkillToken } from "../../../../../lib/skills/compose.ts";
 import { postWorktreeLinkComment } from "./comment.ts";
-import { isSafeBranchName, renderBranchName, renderWorktreeName } from "./branch.ts";
+import { branchTemplateFor, isSafeBranchName, renderBranchName, renderWorktreeName } from "./branch.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 
 type WorkflowEvent = Extract<
@@ -146,10 +146,11 @@ export function createWorkflowWorker(
       }
 
       // Repository-owned convention rendered from provider facts.
-      const template =
-        repository.branchNaming[context.config.activeConnectionId] ??
-        repository.branchNaming["*"] ??
-        "{branch}";
+      const connection = context.config.connections[context.config.activeConnectionId];
+      const template = branchTemplateFor(repository.branchNaming, {
+        provider: connection?.provider ?? "linear",
+        workspace: connection?.workspace ?? null,
+      });
       const branchName = renderBranchName(template, {
         branch: issue.branchName,
         issue: issue.identifier,

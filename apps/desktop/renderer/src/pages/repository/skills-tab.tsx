@@ -16,7 +16,7 @@ import {
 } from "@renderer/components/ui/table.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { skillsQueryOptions } from "@renderer/lib/queries/skills.ts";
-import type { Mutate } from "@renderer/lib/types.ts";
+import { useConfig } from "@renderer/lib/config-context.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 
 const INSTALL_CLI_COMMAND = "bun add --dev github:brandonisagoon/skill-composer";
@@ -46,9 +46,10 @@ const GITIGNORE_COMMAND =
 
 /** Read-only view of the repository's skill-composer skillsets. Skills are
     files in the user's repo — authored in their editor, never here. */
-export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
+export function SkillsTab({ id, value }: { id: string; value: ServiceFile }) {
   const repository = value.repositories[id]!;
-  const skillsRoot = repository.skillsRoot;
+  const repo = useConfig().repoConfig(id);
+  const skillsRoot = repo.config?.skillsRoot ?? "agent-skills";
   const queryClient = useQueryClient();
   const options = skillsQueryOptions(repository.root, skillsRoot);
   const { data: scan, isFetching, error } = useQuery({
@@ -75,7 +76,7 @@ export function SkillsTab({ id, value, mutate }: { id: string; value: ServiceFil
       return;
     }
     const relative = picked === root ? "." : picked.slice(root.length + 1);
-    mutate((file) => { file.repositories[id]!.skillsRoot = relative; });
+    repo.mutate((config) => { config.skillsRoot = relative; });
   };
 
   const openTerminal = async (command: string) => {

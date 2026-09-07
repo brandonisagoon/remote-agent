@@ -3,8 +3,13 @@ import { useQuery } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
 import { toast } from "sonner";
 
-import type { ServiceFile } from "../../../../lib/config.ts";
+import type { RepoConfig, ServiceFile } from "../../../../lib/config.ts";
 import type { ConfigDocument } from "../../../../lib/config-file.ts";
+import {
+  repoConfigsQueryOptions,
+  useSaveRepoConfig,
+  type RepoConfigDocuments,
+} from "@renderer/lib/queries/repo-configs.ts";
 import { DraftToasts } from "@renderer/components/draft-toasts.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
@@ -45,10 +50,18 @@ export function App() {
   // is form state layered on top: it remembers the document it was adopted
   // from and only converges on disk changes while clean.
   const { data: document } = useQuery(configQueryOptions);
+  const { data: repoDocuments } = useQuery(repoConfigsQueryOptions);
   const saveConfig = useSaveConfig();
+  const saveRepoConfig = useSaveRepoConfig();
   const [adopted, setAdopted] = useState<ConfigDocument | null>(null);
   const [draft, setDraft] = useState<ServiceFile | null>(null);
   const [dirty, setDirty] = useState(false);
+  // Repo-config drafts, keyed by repository id; present only while edited.
+  const [repoDrafts, setRepoDrafts] = useState<
+    Record<string, { adoptedRevision: string; value: RepoConfig }>
+  >({});
+  const repoDirty = Object.keys(repoDrafts).length > 0;
+  const anyDirty = dirty || repoDirty;
 
   // Adopt disk truth whenever clean; heal corrections write straight back out.
   useEffect(() => {
@@ -75,6 +88,9 @@ export function App() {
   // Disk moved past the document the draft is based on while dirty.
   const externalChange =
     dirty && document && adopted && document.revision !== adopted.revision ? document : null;
+  const repoExternalChange = Object.entries(repoDrafts).some(
+    ([id, entry]) => repoDocuments?.[id] && repoDocuments[id]!.revision !== entry.adoptedRevision,
+  );
 
   const mutate = (change: (value: ServiceFile) => void) => {
     setDraft((current) => {
@@ -92,15 +108,54 @@ export function App() {
     setDraft(next.valid ? clone(next.value) : null);
   };
 
+  const repoConfig = (id: string) => {
+    const documentEntry = repoDocuments?.[id];
+    const draftEntry = repoDrafts[id];
+    return {
+      config: draftEntry?.value ?? (documentEntry?.valid ? documentEntry.value : null),
+      error: documentEntry && !documentEntry.valid ? documentEntry.error : null,
+      path: documentEntry?.path ?? null,
+      mutate: (change: (config: RepoConfig) => void) => {
+        const base = draftEntry?.value ?? (documentEntry?.valid ? documentEntry.value : null);
+        if (!base || !documentEntry) return;
+        const next = clone(base);
+        change(next);
+        setRepoDrafts((current) => ({
+          ...current,
+          [id]: {
+            adoptedRevision: draftEntry?.adoptedRevision ?? documentEntry.revision,
+            value: next,
+          },
+        }));
+      },
+    };
+  };
+
   const save = async () => {
     if (!draft || !adopted || saveConfig.isPending) return;
     try {
-      const next = await saveConfig.mutateAsync({
-        expectedRevision: adopted.revision,
-        value: draft,
-      });
-      adopt(next);
-      toast.success("Configuration saved");
+      if (dirty) {
+        const next = await saveConfig.mutateAsync({
+          expectedRevision: adopted.revision,
+          value: draft,
+        });
+        adopt(next);
+      }
+      const savedRepos: string[] = [];
+      for (const [id, entry] of Object.entries(repoDrafts)) {
+        await saveRepoConfig.mutateAsync({
+          id,
+          expectedRevision: entry.adoptedRevision,
+          value: entry.value,
+        });
+        savedRepos.push(id);
+      }
+      if (savedRepos.length > 0) {
+        setRepoDrafts({});
+        toast.success("Saved — commit .remote-agent.config.json in the repository");
+      } else {
+        toast.success("Configuration saved");
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : String(error));
     }
@@ -128,6 +183,7 @@ export function App() {
 
   // Discard draft edits and re-adopt disk truth (the newest, if it moved).
   const revert = () => {
+    setRepoDrafts({});
     const source = externalChange ?? adopted;
     if (!source?.valid) return;
     adopt(source);
@@ -178,8 +234,14 @@ export function App() {
 
   return (
     <KeybindingsProvider>
-      <ConfigProvider value={{ draft, mutate, save, commit, revert, dirty }}>
-        <DraftToasts externalChange={externalChange} onReload={reloadExternalChange} />
+      <ConfigProvider value={{ draft, mutate, repoConfig, save, commit, revert, dirty: anyDirty }}>
+        <DraftToasts
+          externalChange={externalChange ?? (repoExternalChange ? adopted : null)}
+          onReload={() => {
+            setRepoDrafts({});
+            reloadExternalChange();
+          }}
+        />
         <RouterProvider router={router} />
       </ConfigProvider>
     </KeybindingsProvider>

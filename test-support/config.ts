@@ -84,6 +84,7 @@ export function testConfig(
       apiKey: "test-linear-key",
       agentUserId: "11111111-2222-3333-4444-555555555555",
       agentHandle: "cubic-agent",
+      workspace: null,
       router: { providerId: "codex", model: null, timeoutMs: 30_000 },
       editors: [{ name: "Zed", scheme: "zed", connection: "local" as const, remoteHost: null }],
     },

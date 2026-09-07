@@ -1,3 +1,19 @@
+/** Picks the branch template for the delivering connection from the repo's
+    committed naming policy: workspace-specific, then provider, then "*". */
+export function branchTemplateFor(
+  branchNaming: Record<string, string>,
+  connection: { provider: string; workspace: string | null },
+): string {
+  return (
+    (connection.workspace
+      ? branchNaming[`${connection.provider}:${connection.workspace}`]
+      : undefined) ??
+    branchNaming[connection.provider] ??
+    branchNaming["*"] ??
+    "{branch}"
+  );
+}
+
 /** Renders the repository's branch template from provider facts. The
     provider supplies the facts; the repository owns the convention; the
     server never invents names — an empty render (e.g. "{branch}" from a

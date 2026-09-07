@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import type { ServiceFile } from "../../../../../../lib/config.ts";
+import type { RepoConfig } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import {
@@ -14,27 +14,23 @@ import {
 } from "@renderer/components/ui/dropdown-menu.tsx";
 import { Input } from "@renderer/components/ui/input.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
-import type { Mutate } from "@renderer/lib/types.ts";
+import type { RepoConfigDraft } from "@renderer/lib/config-context.tsx";
 import { cn } from "@renderer/lib/utils.ts";
-
-type Repository = ServiceFile["repositories"][string];
 
 const KEY_PATTERN = /^[a-z0-9]+(?:[._-][a-z0-9]+)*$/;
 
 /** Group names are JSON map keys; renaming rewrites both the definition and
     its defaults, committed on blur so half-typed names never hit the draft. */
 function GroupNameInput({
-  repositoryId,
   groupKey,
   existing,
   autoFocus,
-  mutate,
+  repo,
 }: {
-  repositoryId: string;
   groupKey: string;
   existing: string[];
   autoFocus: boolean;
-  mutate: Mutate;
+  repo: RepoConfigDraft;
 }) {
   const [value, setValue] = useState(groupKey);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -52,8 +48,7 @@ function GroupNameInput({
       );
       return;
     }
-    mutate((file) => {
-      const repository = file.repositories[repositoryId]!;
+    repo.mutate((repository) => {
       repository.labels = Object.fromEntries(
         Object.entries(repository.labels).map(([key, definition]) =>
           key === groupKey ? [next, definition] : [key, definition],
@@ -81,26 +76,21 @@ function GroupNameInput({
     indented rows. Row actions live behind hover controls, like Linear's
     label settings. */
 function LabelGroup({
-  repositoryId,
   groupKey,
-  value,
   isNew,
-  mutate,
+  repo,
 }: {
-  repositoryId: string;
   groupKey: string;
-  value: ServiceFile;
   isNew: boolean;
-  mutate: Mutate;
+  repo: RepoConfigDraft;
 }) {
-  const repository = value.repositories[repositoryId]!;
+  const repository = repo.config!;
   const definition = repository.labels[groupKey]!;
   const defaults = repository.sessionDefaults.labels[groupKey] ?? [];
   const [expanded, setExpanded] = useState(isNew);
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState("");
-  const edit = (change: (repository: Repository) => void) =>
-    mutate((file) => { change(file.repositories[repositoryId]!); });
+  const edit = (change: (repository: RepoConfig) => void) => repo.mutate(change);
 
   const addLabel = () => {
     const next = draft.trim();
@@ -161,11 +151,10 @@ function LabelGroup({
           <span className="sr-only">{expanded ? "Collapse" : "Expand"}</span>
         </button>
         <GroupNameInput
-          repositoryId={repositoryId}
           groupKey={groupKey}
           existing={Object.keys(repository.labels).filter((key) => key !== groupKey)}
           autoFocus={isNew}
-          mutate={mutate}
+          repo={repo}
         />
         <Input
           className="text-muted-foreground h-7 flex-1 border-0 bg-transparent px-0 text-xs shadow-none focus-visible:ring-0 dark:bg-transparent"
@@ -295,22 +284,15 @@ function LabelGroup({
   );
 }
 
-export function LabelsSection({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
-  const repository = value.repositories[id]!;
-  const keys = Object.keys(repository.labels);
+export function LabelsSection({ repo }: { repo: RepoConfigDraft }) {
+  const keys = Object.keys(repo.config?.labels ?? {});
   const [newGroup, setNewGroup] = useState<string | null>(null);
   return (
     <>
       <div className="bg-background -mx-4 rounded-lg border">
         {keys.map((key) => (
           <div key={key} className="border-b last:border-b-0">
-            <LabelGroup
-              repositoryId={id}
-              groupKey={key}
-              value={value}
-              isNew={key === newGroup}
-              mutate={mutate}
-            />
+            <LabelGroup groupKey={key} isNew={key === newGroup} repo={repo} />
           </div>
         ))}
         {keys.length === 0 && (
@@ -328,9 +310,9 @@ export function LabelsSection({ id, value, mutate }: { id: string; value: Servic
                 className="size-6"
                 onClick={() => {
                   let key = "new-group";
-                  for (let index = 1; repository.labels[key]; index += 1) key = `new-group-${index}`;
-                  mutate((file) => {
-                    file.repositories[id]!.labels[key] = { exclusive: true, routerVisible: false };
+                  for (let index = 1; repo.config?.labels[key]; index += 1) key = `new-group-${index}`;
+                  repo.mutate((repository) => {
+                    repository.labels[key] = { exclusive: true, routerVisible: false };
                   });
                   setNewGroup(key);
                 }}

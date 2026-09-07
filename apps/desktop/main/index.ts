@@ -8,8 +8,11 @@ import example from "../../../remote-agent.config.example.json";
 import schema from "../../../remote-agent.config.schema.json";
 import {
   readConfigDocument,
+  readRepoConfigDocument,
   watchConfigDocument,
   writeConfigDocument,
+  writeRepoConfigDocument,
+  type RepoConfigDocument,
 } from "../../../lib/config-file.ts";
 import {
   checkForUpdates,
@@ -22,6 +25,8 @@ import {
   serviceStatus,
 } from "../../../management/service.ts";
 import { runChecks } from "../../../management/checks.ts";
+import { REPO_CONFIG_FILE } from "../../../lib/config.ts";
+import os from "node:os";
 import { checkSkills } from "../../../lib/skills/check.ts";
 import { detectEditors } from "./editor-detect.ts";
 import { listProviderModels } from "./provider-models.ts";
@@ -88,6 +93,46 @@ function readKeybindings(file: string): Keybindings {
   } catch {
     return {};
   }
+}
+
+/** Repository roots from the on-disk app config: ~ expanded, relative
+    resolved against the config directory — matching lib/config resolution. */
+function repositoryRoots(): Record<string, string> {
+  const configFile = desktopConfigPath();
+  const document = readConfigDocument(configFile);
+  if (!document.valid) return {};
+  const roots: Record<string, string> = {};
+  for (const [id, repository] of Object.entries(document.value.repositories)) {
+    const raw = repository.root.startsWith("~")
+      ? path.join(os.homedir(), repository.root.slice(1))
+      : repository.root;
+    roots[id] = path.isAbsolute(raw) ? raw : path.resolve(path.dirname(configFile), raw);
+  }
+  return roots;
+}
+
+function readRepoConfigDocuments(): Record<string, RepoConfigDocument & { root: string }> {
+  return Object.fromEntries(
+    Object.entries(repositoryRoots()).map(([id, root]) => [
+      id,
+      { ...readRepoConfigDocument(root), root },
+    ]),
+  );
+}
+
+let repoConfigWatcher: ReturnType<typeof watch> | null = null;
+/** Watches every repository's committed config; pushes the full map like
+    the app config's own change stream. */
+function watchRepoConfigs(): void {
+  void repoConfigWatcher?.close();
+  const files = Object.values(repositoryRoots()).map((root) => path.join(root, REPO_CONFIG_FILE));
+  const push = () => mainWindow?.webContents.send("repo-configs:changed", readRepoConfigDocuments());
+  repoConfigWatcher = watch(files, {
+    ignoreInitial: true,
+    awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 20 },
+  });
+  repoConfigWatcher.on("all", push);
+  push();
 }
 
 function desktopConfigPath(): string {
@@ -217,6 +262,12 @@ function registerIpc(file: string): void {
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
   ipcMain.handle("skills:check", (_event, root: string, skillsRoot: string) => checkSkills(root, skillsRoot));
+  ipcMain.handle("repo-configs:get", () => readRepoConfigDocuments());
+  ipcMain.handle("repo-config:save", (_event, input: { id: string; expectedRevision: string; value: unknown }) => {
+    const root = repositoryRoots()[input.id];
+    if (!root) throw new Error(`unknown repository: ${input.id}`);
+    return writeRepoConfigDocument({ root, expectedRevision: input.expectedRevision, value: input.value });
+  });
   ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
   ipcMain.handle("shell:open-with", (_event, appPath: string, target: string) =>
     new Promise<void>((resolve, reject) => {
@@ -266,7 +317,10 @@ async function createWindow(): Promise<void> {
 
   stopWatching = watchConfigDocument(file, (document) => {
     mainWindow?.webContents.send("config:changed", document);
+    // The repository set may have changed; rewatch and repush.
+    watchRepoConfigs();
   });
+  watchRepoConfigs();
 
   const bindingsFile = keybindingsPath(file);
   ensureKeybindings(bindingsFile);

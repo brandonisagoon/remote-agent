@@ -4,7 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
-import { SettingsSection } from "@renderer/components/settings-section.tsx";
+import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
 import {
@@ -23,6 +23,14 @@ import { SkillsTab } from "./skills-tab.tsx";
 import { LabelsSection } from "./labels-section.tsx";
 import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
+import { OpenInEditorMenu } from "@renderer/components/open-in-editor-menu.tsx";
+import {
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+} from "@renderer/components/ui/input-group.tsx";
+import { Label } from "@renderer/components/ui/label.tsx";
+import { useConfig } from "@renderer/lib/config-context.tsx";
 
 export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: RepositoryTab; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
@@ -30,7 +38,7 @@ export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: Re
   return (
     <div className="grid gap-6">
       {tab === "sessions" && <SessionsTab repositoryId={id} />}
-      {tab === "skillsets" && <SkillsTab id={id} value={value} mutate={mutate} />}
+      {tab === "skillsets" && <SkillsTab id={id} value={value} />}
       {tab === "settings" && <RepositorySettings id={id} value={value} mutate={mutate} />}
     </div>
   );
@@ -121,23 +129,49 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
 }
 
 function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
+  const repository = value.repositories[id]!;
+  const repo = useConfig().repoConfig(id);
   return (
-    <Accordion type="multiple" defaultValue={["git", "bootstrap", "workflows", "labels"]} className="-mt-3">
-      <GitSection id={id} value={value} mutate={mutate} />
-      <BootstrapSection id={id} value={value} mutate={mutate} />
+    <Accordion type="multiple" defaultValue={["config-file", "git", "bootstrap", "workflows", "labels"]} className="-mt-3">
+      {repo.error && (
+        <div className="border-destructive/40 bg-destructive/5 text-destructive -mx-4 mb-4 rounded-lg border p-4 text-sm">
+          Invalid .remote-agent.config.json — fix it in an editor: {repo.error}
+        </div>
+      )}
+      {repo.path && (
+        <SettingsSection
+          value="config-file"
+          title="Config File"
+          description="Bootstrap, naming, workflows, and labels live in the repository's own config, next to the code they configure."
+        >
+          <SettingsCard>
+            <div className="grid gap-2">
+              <Label>Repository config</Label>
+              <InputGroup>
+                <InputGroupInput readOnly value={repo.path} className="text-muted-foreground font-mono" />
+                <InputGroupAddon align="inline-end">
+                  <OpenInEditorMenu target={repo.path} compact />
+                </InputGroupAddon>
+              </InputGroup>
+            </div>
+          </SettingsCard>
+        </SettingsSection>
+      )}
+      <GitSection id={id} value={value} mutate={mutate} repo={repo} />
+      <BootstrapSection root={repository.root} repo={repo} />
       <SettingsSection
         value="workflows"
         title="Workflows"
         description="When a Linear event matches a trigger, the selected skillset is composed into the session's worktree and delivered."
       >
-        <WorkflowsSection id={id} value={value} mutate={mutate} />
+        <WorkflowsSection value={value} root={repository.root} repo={repo} />
       </SettingsSection>
       <SettingsSection
         value="labels"
         title="Labels"
         description="Label groups for sessions, exactly like Linear's issue labels: each group is one dimension (a phase, an area), its labels are the states a session can be in. New sessions start with the group's default label; skills instruct sessions to relabel themselves as work progresses, and router-visible groups help the session router match incoming comments to the right session."
       >
-        <LabelsSection id={id} value={value} mutate={mutate} />
+        <LabelsSection repo={repo} />
       </SettingsSection>
     </Accordion>
   );

@@ -181,7 +181,7 @@ describe("workflow worker", () => {
     const base = testConfig();
     const repository = {
       ...base.repository,
-      branchNaming: { "*": "agent/{issue}-{title}" },
+      branchNaming: { "*": "{branch}", linear: "agent/{issue}-{title}" },
     };
     const templateContext = { ...context(), config: { ...base, repository } };
     const result = await worker.execute(issueEvent("plan") as never, templateContext);

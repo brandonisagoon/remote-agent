@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import type { ServiceFile } from "../../../../../../lib/config.ts";
+import type { RepoConfig, ServiceFile } from "../../../../../../lib/config.ts";
+import type { RepoConfigDraft } from "@renderer/lib/config-context.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
@@ -30,9 +31,8 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { skillsQueryOptions } from "@renderer/lib/queries/skills.ts";
 import { randomHex } from "@renderer/lib/random.ts";
-import type { Mutate } from "@renderer/lib/types.ts";
 
-type Workflow = ServiceFile["repositories"][string]["workflows"][string];
+type Workflow = RepoConfig["workflows"][string];
 
 const EVENT_LABELS: Record<Workflow["on"], string> = {
   "issue.state-changed": "Issue enters state",
@@ -53,15 +53,15 @@ function conditionSummary(workflow: Workflow): string {
   return values.length > 0 ? values.join(", ") : "custom conditions";
 }
 
-export function WorkflowsSection({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
-  const repository = value.repositories[id]!;
+export function WorkflowsSection({ value, root, repo }: { value: ServiceFile; root: string; repo: RepoConfigDraft }) {
   const [editing, setEditing] = useState<string | null>(null);
+  const workflows = repo.config?.workflows ?? {};
   return (
     <>
       <div className="bg-background -mx-4 rounded-lg border">
         <Table className="table-fixed">
           <TableBody>
-            {Object.entries(repository.workflows).map(([workflowId, workflow]) => (
+            {Object.entries(workflows).map(([workflowId, workflow]) => (
               <TableRow key={workflowId} className="h-14">
                 <TableCell className="pl-4">
                   <div>{workflowId}</div>
@@ -86,7 +86,7 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
                     size="icon"
                     variant="ghost"
                     className="text-muted-foreground hover:text-destructive ml-1 size-8"
-                    onClick={() => mutate((file) => { delete file.repositories[id]!.workflows[workflowId]; })}
+                    onClick={() => repo.mutate((config) => { delete config.workflows[workflowId]; })}
                   >
                     <F7Icon name="xmark" />
                     <span className="sr-only">Remove Workflow</span>
@@ -94,7 +94,7 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
                 </TableCell>
               </TableRow>
             ))}
-            {Object.keys(repository.workflows).length === 0 && (
+            {Object.keys(workflows).length === 0 && (
               <TableRow>
                 <TableCell className="text-muted-foreground p-6 text-center">
                   No workflows — sessions start only from mentions and assignments.
@@ -113,8 +113,8 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
                 className="size-6"
                 onClick={() => {
                   const workflowId = `wf-${randomHex(4)}`;
-                  mutate((file) => {
-                    file.repositories[id]!.workflows[workflowId] = {
+                  repo.mutate((config) => {
+                    config.workflows[workflowId] = {
                       on: "issue.state-changed",
                       when: [{ "issue.state": ["Planning"] }],
                       skill: { skillset: "", flags: [] },
@@ -132,12 +132,12 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
           </Tooltip>
         </div>
       </div>
-      {editing && repository.workflows[editing] && (
+      {editing && workflows[editing] && (
         <WorkflowEditor
-          repositoryId={id}
           workflowId={editing}
           value={value}
-          mutate={mutate}
+          root={root}
+          repo={repo}
           onClose={() => setEditing(null)}
         />
       )}
@@ -146,27 +146,26 @@ export function WorkflowsSection({ id, value, mutate }: { id: string; value: Ser
 }
 
 function WorkflowEditor({
-  repositoryId,
   workflowId,
   value,
-  mutate,
+  root,
+  repo,
   onClose,
 }: {
-  repositoryId: string;
   workflowId: string;
   value: ServiceFile;
-  mutate: Mutate;
+  root: string;
+  repo: RepoConfigDraft;
   onClose(): void;
 }) {
-  const repository = value.repositories[repositoryId]!;
-  const workflow = repository.workflows[workflowId]!;
-  const { data: scan } = useQuery(skillsQueryOptions(repository.root, repository.skillsRoot));
+  const workflow = repo.config!.workflows[workflowId]!;
+  const { data: scan } = useQuery(skillsQueryOptions(root, repo.config!.skillsRoot));
   const skillsets = scan?.installed ? scan.skillsets : [];
   const selected = skillsets.find((entry) => entry.id === workflow.skill.skillset);
   const conditionField = EVENT_CONDITION_FIELD[workflow.on];
   const conditionValues = (workflow.when ?? []).flatMap((condition) => condition[conditionField] ?? []);
   const edit = (change: (workflow: Workflow) => void) =>
-    mutate((file) => { change(file.repositories[repositoryId]!.workflows[workflowId]!); });
+    repo.mutate((config) => { change(config.workflows[workflowId]!); });
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>

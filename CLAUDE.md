@@ -97,7 +97,18 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   (`branchNaming` templates keyed by connection, rendered from
   provider-supplied facts).
 - Zod v4 schemas in `lib/config.ts` are the single config source; the UI
-  mirrors the JSON shape exactly — when one changes, both change.
+  mirrors the JSON shape exactly — when one changes, both change. TWO config
+  files per repository: the app config's `repositories.<id>` holds machine
+  truth (paths, worktree naming); the repo's committed
+  `.remote-agent.config.json` (`RepoConfigSchema`, read at boot from the
+  checkout root) holds team policy (bootstrap, skillsRoot, branchNaming,
+  workflows, labels). BOTH are first-class watched config documents in the
+  desktop app — one draft/dirty/save flow (`app-root.tsx` composite draft;
+  `config-file.ts` document API); repo-config saves land in the repo's
+  working tree for the user to commit. Committed `branchNaming` keys are
+  portable only:
+  `"*"` | `"linear"` | `"linear:<workspace>"` (connections carry an optional
+  `workspace` identity); resolution is most-specific-first.
 - Share libraries within TypeScript; **exec across real boundaries** (repo
   scripts, skill-composer, launchctl/schtasks, cloudflared).
 - The GUI never does privileged or account-bound work: buttons open Terminal

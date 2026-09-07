@@ -53,12 +53,6 @@ export function AppLayout() {
         root: picked.repository.root,
         worktreeRoot: `../.worktrees/${picked.repository.name}`,
         worktreeNaming: { "*": "{branch}" },
-        branchNaming: { "*": "{branch}" },
-        bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
-        skillsRoot: "agent-skills",
-        workflows: {},
-        labels: {},
-        sessionDefaults: { labels: {} },
       };
     };
     if (dirty) mutate(create);

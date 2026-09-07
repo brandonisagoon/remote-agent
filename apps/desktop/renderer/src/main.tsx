@@ -4,6 +4,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { App } from "./app-root.tsx";
 import { Toaster } from "./components/ui/sonner.tsx";
 import { wireConfigStream } from "./lib/queries/config.ts";
+import { wireRepoConfigsStream } from "./lib/queries/repo-configs.ts";
 import { wireKeybindingsStream } from "./lib/queries/keybindings.ts";
 import { queryClient } from "./lib/queries/query-client.ts";
 import "./styles.css";
@@ -30,6 +31,7 @@ watchZoom();
 window.remoteAgent.window?.syncTrafficLights();
 
 wireConfigStream();
+wireRepoConfigsStream();
 wireKeybindingsStream();
 
 ReactDOM.createRoot(document.getElementById("root")!).render(

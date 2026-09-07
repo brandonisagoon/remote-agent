@@ -81,24 +81,42 @@ const BranchTemplateSchema = z
     "must contain {branch} or {issue}",
   );
 
+/** Machine-local repository entry: paths and local taste. Team-shared
+    policy lives in the repository's committed .remote-agent.json. */
 const RepositorySchema = z.object({
   name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
-  /** Worktree directory templates, keyed by connection like branchNaming
-      ({branch} = the rendered branch, plus {issue}/{title}); the result is
-      flattened for the filesystem. */
+  /** Worktree directory templates, keyed by connection ("*" = default) —
+      {branch} = the app's suggested branch, plus {issue}/{title}; the
+      result is flattened for the filesystem. Local filesystem taste, so it
+      stays machine-local where connection ids are meaningful. */
   worktreeNaming: z
     .record(z.union([z.literal("*"), ConfigIdSchema]), z.string().min(1))
     .default({ "*": "{branch}" }),
-  /** Branch naming policy, keyed by connection ("*" = every connection).
-      The provider supplies the facts; the repository owns the convention. */
-  branchNaming: z
-    .record(z.union([z.literal("*"), ConfigIdSchema]), BranchTemplateSchema)
-    .default({ "*": "{branch}" }),
-  bootstrapCommand: CommandSchema,
+});
+
+/** The repository's committed settings file (like .vscode/settings.json):
+    policy coupled to the repo's own content — bootstrap entry point,
+    skillsets, label vocabulary, branch conventions, workflows — versioned
+    with the code it configures. */
+export const REPO_CONFIG_FILE = ".remote-agent.config.json";
+
+export const RepoConfigSchema = z.object({
+  $schema: z.string().optional(),
+  bootstrapCommand: CommandSchema.default(["bash", "scripts/bootstrap.sh"]),
   /** Where the skill-composer inputs live, relative to root. */
   skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
+  /** Branch naming policy keyed by portable identifiers only — committed
+      files cannot reference machine-local connection ids. Keys: "*",
+      "<provider>", or "<provider>:<workspace>" (the connection's workspace
+      key); most specific wins. */
+  branchNaming: z
+    .record(
+      z.string().regex(/^(\*|linear(:[a-z0-9][a-z0-9._-]*)?)$/, 'key must be "*", "linear", or "linear:<workspace>"'),
+      BranchTemplateSchema,
+    )
+    .default({ "*": "{branch}" }),
   workflows: z.record(ConfigIdSchema, RepositoryWorkflowSchema).default({}),
   /** Label groups sessions in this repository are labeled by. */
   labels: z.record(ConfigIdSchema, LabelGroupSchema).default({}),
@@ -108,7 +126,58 @@ const RepositorySchema = z.object({
       labels: z.record(ConfigIdSchema, z.array(z.string().min(1))).default({}),
     })
     .default({ labels: {} }),
+}).superRefine((settings, context) => {
+  for (const [workflowId, workflow] of Object.entries(settings.workflows)) {
+    if (workflow.plan && workflow.deliver !== "start-session") {
+      context.addIssue({ code: "custom", path: ["workflows", workflowId, "plan"], message: "plan capture requires deliver: start-session" });
+    }
+    if (workflow.plan && workflow.providerId === "codex") {
+      context.addIssue({ code: "custom", path: ["workflows", workflowId, "plan"], message: "plan capture requires the claude provider (codex has no plan mode)" });
+    }
+  }
+  for (const [key, values] of Object.entries(settings.sessionDefaults.labels)) {
+    const group = settings.labels[key];
+    if (!group) {
+      context.addIssue({ code: "custom", path: ["sessionDefaults", "labels", key], message: `unknown label group: ${key}` });
+      continue;
+    }
+    if (group.exclusive && values.length > 1) {
+      context.addIssue({ code: "custom", path: ["sessionDefaults", "labels", key], message: "an exclusive group accepts at most one default" });
+    }
+    if (group.labels) {
+      for (const value of values) {
+        if (!group.labels.includes(value)) {
+          context.addIssue({ code: "custom", path: ["sessionDefaults", "labels", key], message: `label is not configured: ${value}` });
+        }
+      }
+    }
+  }
 });
+
+export type RepoConfig = z.infer<typeof RepoConfigSchema>;
+
+export function parseRepoConfig(value: unknown): RepoConfig {
+  return RepoConfigSchema.parse(value);
+}
+
+/** Reads <root>/.remote-agent.json; a missing file yields the defaults so
+    adoption is gradual. */
+export function readRepoConfig(root: string): RepoConfig {
+  const file = path.join(root, REPO_CONFIG_FILE);
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return parseRepoConfig({});
+  }
+  try {
+    return parseRepoConfig(JSON.parse(raw));
+  } catch (error) {
+    throw new Error(
+      `invalid repository config ${file}: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
 const WebhookSchema = z.object({
   /** Path segment of the inbound endpoint: publicUrl + /webhooks/<slug>. */
   slug: ConfigIdSchema,
@@ -135,6 +204,9 @@ const LinearConnectionSchema = z.object({
   apiKey: z.string().min(1),
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
+  /** Portable workspace identity (Linear workspace URL key). Committed
+      repo configs reference this — never the machine-local connection id. */
+  workspace: z.string().min(1).optional(),
   /** The machine that serves this connection's webhook and runs its sessions. */
   machineId: MachineSchema.optional(),
   /** Repositories this connection's sessions may work in; "*" subscribes
@@ -243,6 +315,13 @@ export const ServiceFileSchema = z.object({
       }
     }
   }
+  for (const [repositoryId, repository] of Object.entries(file.repositories)) {
+    for (const connectionId of Object.keys(repository.worktreeNaming)) {
+      if (connectionId !== "*" && !file.connections[connectionId]) {
+        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "worktreeNaming", connectionId], message: `unknown connection: ${connectionId}` });
+      }
+    }
+  }
   const webhookSlugs = new Set<string>();
   for (const [connectionId, connection] of Object.entries(file.connections)) {
     const webhook = connection.webhook;
@@ -251,43 +330,6 @@ export const ServiceFileSchema = z.object({
       context.addIssue({ code: "custom", path: ["connections", connectionId, "webhook", "slug"], message: `duplicate webhook slug: ${webhook.slug}` });
     }
     webhookSlugs.add(webhook.slug);
-  }
-  for (const [repositoryId, repository] of Object.entries(file.repositories)) {
-    for (const [workflowId, workflow] of Object.entries(repository.workflows)) {
-      if (workflow.connectionId !== undefined && !file.connections[workflow.connectionId]) {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "connectionId"], message: `unknown connection: ${workflow.connectionId}` });
-      }
-      if (workflow.plan && workflow.deliver !== "start-session") {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires deliver: start-session" });
-      }
-      if (workflow.plan && workflow.providerId === "codex") {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires the claude provider (codex has no plan mode)" });
-      }
-    }
-    for (const field of ["branchNaming", "worktreeNaming"] as const) {
-      for (const connectionId of Object.keys(repository[field])) {
-        if (connectionId !== "*" && !file.connections[connectionId]) {
-          context.addIssue({ code: "custom", path: ["repositories", repositoryId, field, connectionId], message: `unknown connection: ${connectionId}` });
-        }
-      }
-    }
-    for (const [key, values] of Object.entries(repository.sessionDefaults.labels)) {
-      const group = repository.labels[key];
-      if (!group) {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `unknown label group: ${key}` });
-        continue;
-      }
-      if (group.exclusive && values.length > 1) {
-        context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: "an exclusive group accepts at most one default" });
-      }
-      if (group.labels) {
-        for (const value of values) {
-          if (!group.labels.includes(value)) {
-            context.addIssue({ code: "custom", path: ["repositories", repositoryId, "sessionDefaults", "labels", key], message: `label is not configured: ${value}` });
-          }
-        }
-      }
-    }
   }
 });
 
@@ -343,6 +385,8 @@ export interface LinearConnectionConfig {
   apiKey: string;
   agentUserId: string;
   agentHandle: string | null;
+  /** Portable workspace identity; committed repo configs key on it. */
+  workspace: string | null;
   router: { providerId: "codex" | "claude"; model: string | null; timeoutMs: number };
   editors: ReadonlyArray<EditorConfig>;
 }
@@ -467,14 +511,17 @@ export function readConfig(): ServerConfig {
     Object.entries(file.repositories).map(([id, repository]) => {
       const root = absolute(repository.root, path.dirname(configFile));
       const worktreeRoot = absolute(repository.worktreeRoot, root);
+      // Team-shared policy comes from the repo's committed settings file;
+      // the machine-local entry contributes only paths and local taste.
+      const settings = readRepoConfig(root);
       return [id, {
         id,
         name: repository.name ?? id,
         root,
         worktreeRoot,
-        bootstrapCommand: [...repository.bootstrapCommand],
+        bootstrapCommand: [...settings.bootstrapCommand],
         labels: Object.fromEntries(
-          Object.entries(repository.labels).map(([key, group]) => [
+          Object.entries(settings.labels).map(([key, group]) => [
             key,
             {
               ...(group.description ? { description: group.description } : {}),
@@ -486,17 +533,17 @@ export function readConfig(): ServerConfig {
         ),
         sessionDefaults: {
           labels: Object.fromEntries(
-            Object.entries(repository.sessionDefaults.labels).map(([key, values]) => [
+            Object.entries(settings.sessionDefaults.labels).map(([key, values]) => [
               key,
               [...values],
             ]),
           ),
         },
-        skillsRoot: repository.skillsRoot,
+        skillsRoot: settings.skillsRoot,
         worktreeNaming: { ...repository.worktreeNaming },
-        branchNaming: { ...repository.branchNaming },
+        branchNaming: { ...settings.branchNaming },
         workflows: Object.fromEntries(
-          Object.entries(repository.workflows).map(([workflowId, workflow]) => [workflowId, {
+          Object.entries(settings.workflows).map(([workflowId, workflow]) => [workflowId, {
             id: workflowId,
             connectionId: workflow.connectionId ?? null,
             on: workflow.on,
@@ -528,6 +575,7 @@ export function readConfig(): ServerConfig {
       apiKey: connection.apiKey,
       agentUserId: connection.agentUserId,
       agentHandle: connection.agentHandle ?? null,
+      workspace: connection.workspace ?? null,
       router: {
         providerId: connection.router.providerId,
         model: connection.router.model ?? null,

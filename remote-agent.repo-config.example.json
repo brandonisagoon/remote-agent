@@ -1,0 +1,79 @@
+{
+  "$schema": "https://raw.githubusercontent.com/brandonisagoon/remote-agent/main/remote-agent.repo-config.schema.json",
+  "bootstrapCommand": [
+    "bash",
+    "scripts/bootstrap.sh"
+  ],
+  "skillsRoot": "agent-skills",
+  "branchNaming": {
+    "*": "{branch}"
+  },
+  "workflows": {
+    "plan": {
+      "on": "issue.state-changed",
+      "when": [
+        {
+          "issue.state": [
+            "Planning"
+          ]
+        }
+      ],
+      "skill": {
+        "skillset": "orchestrate",
+        "flags": []
+      },
+      "deliver": "start-session",
+      "providerId": "claude",
+      "plan": {
+        "captureToIssue": true,
+        "thenState": "Planned"
+      }
+    },
+    "review": {
+      "on": "issue.state-changed",
+      "when": [
+        {
+          "issue.state": [
+            "Pull Request"
+          ]
+        }
+      ],
+      "skill": {
+        "skillset": "reflect",
+        "flags": []
+      },
+      "deliver": "message-session"
+    },
+    "describe": {
+      "on": "issue.reaction",
+      "when": [
+        {
+          "reaction.emoji": [
+            "pencil2"
+          ]
+        }
+      ],
+      "skill": {
+        "skillset": "describe",
+        "flags": []
+      },
+      "deliver": "start-session",
+      "providerId": "claude",
+      "model": "opus"
+    }
+  },
+  "labels": {
+    "example.workflow": {
+      "labels": [
+        "planning",
+        "implementation",
+        "review"
+      ],
+      "exclusive": true,
+      "routerVisible": true
+    }
+  },
+  "sessionDefaults": {
+    "labels": {}
+  }
+}

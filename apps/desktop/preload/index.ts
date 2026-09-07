@@ -59,6 +59,15 @@ const api: DesktopApi = {
     check: (root, skillsRoot) => ipcRenderer.invoke("skills:check", root, skillsRoot),
     pickRoot: (defaultPath) => ipcRenderer.invoke("skills:pick-root", defaultPath),
   },
+  repoConfigs: {
+    get: () => ipcRenderer.invoke("repo-configs:get"),
+    save: (input) => ipcRenderer.invoke("repo-config:save", input),
+    onChange: (callback) => {
+      const listener = (_event: unknown, documents: unknown) => callback(documents as never);
+      ipcRenderer.on("repo-configs:changed", listener);
+      return () => ipcRenderer.removeListener("repo-configs:changed", listener);
+    },
+  },
   shell: {
     openPath: (target) => ipcRenderer.invoke("shell:open-path", target),
     openWith: (appPath, target) => ipcRenderer.invoke("shell:open-with", appPath, target),

@@ -7,15 +7,23 @@ the credential-bearing file untracked.
 
 ## Repository-owned contract
 
-The managed repository provides:
+Team-shared policy lives in the repository's committed
+`.remote-agent.config.json` (schema:
+[remote-agent.repo-config.schema.json](../remote-agent.repo-config.schema.json),
+example: [remote-agent.repo-config.example.json](../remote-agent.repo-config.example.json)):
+`bootstrapCommand`, `skillsRoot`, `branchNaming`, `workflows`, `labels`, and
+`sessionDefaults` — versioned with the code they configure. A missing file
+yields the schema defaults. `branchNaming` keys are portable only — `"*"`,
+`"linear"`, or `"linear:<workspace>"` matching the connection's `workspace`
+field; committed files never reference machine-local connection ids.
 
-- a stable checkout at `repositories.<id>.root`;
-- a worktree parent at `repositories.<id>.worktreeRoot`;
-- `repositories.<id>.bootstrapCommand`, invoked once in each new worktree
-  (after checkout, before the session);
+The managed repository additionally provides:
+
+- a stable checkout at `repositories.<id>.root` (machine-local config);
+- a worktree parent at `repositories.<id>.worktreeRoot` (machine-local);
 - [skill-composer](https://github.com/brandonisagoon/skill-composer) as a dev
-  dependency, with skillsets under `repositories.<id>.skillsRoot` (default
-  `agent-skills/`) — the instructions workflows compose into sessions;
+  dependency, with skillsets under `skillsRoot` (default `agent-skills/`) —
+  the instructions workflows compose into sessions;
 - any project-specific tools, dependencies, or authentication needed by the
   configured Codex/Claude commands.
 

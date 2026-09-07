@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -49,26 +49,37 @@ function serviceFile(editorConnection: "local" | "ssh" = "local") {
         name: "Example",
         root: "repository",
         worktreeRoot: "../worktrees",
-        bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
-        labels: {
-          "example.kind": {
-            labels: ["planning", "implementation"],
-            exclusive: true,
-            routerVisible: true,
-          },
-        },
-        sessionDefaults: { labels: { "example.kind": ["planning"] } },
-        workflows: {
-          plan: {
-            on: "issue.state-changed",
-            when: [{ "issue.state": ["Planning"] }],
-            skill: { skillset: "orchestrate", flags: [] },
-            deliver: "start-session",
-          },
-        },
       },
     },
   };
+}
+
+function repoConfigFile(): Record<string, unknown> {
+  return {
+    labels: {
+      "example.kind": {
+        labels: ["planning", "implementation"],
+        exclusive: true,
+        routerVisible: true,
+      },
+    },
+    sessionDefaults: { labels: { "example.kind": ["planning"] } },
+    workflows: {
+      plan: {
+        on: "issue.state-changed",
+        when: [{ "issue.state": ["Planning"] }],
+        skill: { skillset: "orchestrate", flags: [] },
+        deliver: "start-session",
+      },
+    },
+  };
+}
+
+/** Writes <root>/.remote-agent.config.json under the temp directory. */
+function writeRepoConfig(rootRelative: string, value: unknown = repoConfigFile()) {
+  const root = path.join(directory, rootRelative);
+  mkdirSync(root, { recursive: true });
+  writeFileSync(path.join(root, ".remote-agent.config.json"), JSON.stringify(value));
 }
 
 function writeConfig(value: unknown = serviceFile()) {
@@ -134,43 +145,42 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("no SSH link format");
   });
 
-  test("branch templates must keep the identifier and reference known connections", () => {
-    const value: any = serviceFile();
-    value.repositories.example.branchNaming = { "*": "agent/{slug}" };
-    writeConfig(value);
+  test("branch templates must keep the identifier and use portable keys", () => {
+    writeConfig();
+    const repo: any = repoConfigFile();
+    repo.branchNaming = { "*": "agent/{title}" };
+    writeRepoConfig("repository", repo);
     expect(() => readConfig()).toThrow("must contain {branch} or {issue}");
 
-    value.repositories.example.branchNaming = { "*": "{branch}", "nope": "{issue}" };
-    writeConfig(value);
-    expect(() => readConfig()).toThrow("unknown connection: nope");
+    repo.branchNaming = { "*": "{branch}", "linear-main": "{issue}" };
+    writeRepoConfig("repository", repo);
+    expect(() => readConfig()).toThrow("Invalid key in record");
 
-    value.repositories.example.branchNaming = { "*": "{branch}", "linear-main": "agent/{issue}-{slug}" };
-    writeConfig(value);
+    repo.branchNaming = { "*": "{branch}", "linear:cubic": "agent/{issue}-{title}" };
+    writeRepoConfig("repository", repo);
     expect(readConfig().repository.branchNaming).toEqual({
       "*": "{branch}",
-      "linear-main": "agent/{issue}-{slug}",
+      "linear:cubic": "agent/{issue}-{title}",
     });
   });
 
   test("resolves workflow plan capture and rejects invalid combinations", () => {
-    const value: any = serviceFile();
-    value.repositories.example.workflows.plan.plan = {
-      captureToIssue: true,
-      thenState: "Planned",
-    };
-    writeConfig(value);
+    writeConfig();
+    const repo: any = repoConfigFile();
+    repo.workflows.plan.plan = { captureToIssue: true, thenState: "Planned" };
+    writeRepoConfig("repository", repo);
     expect(readConfig().repository.workflows.plan!.plan).toEqual({
       captureToIssue: true,
       thenState: "Planned",
     });
 
-    value.repositories.example.workflows.plan.deliver = "message-session";
-    writeConfig(value);
+    repo.workflows.plan.deliver = "message-session";
+    writeRepoConfig("repository", repo);
     expect(() => readConfig()).toThrow("plan capture requires deliver: start-session");
 
-    value.repositories.example.workflows.plan.deliver = "start-session";
-    value.repositories.example.workflows.plan.providerId = "codex";
-    writeConfig(value);
+    repo.workflows.plan.deliver = "start-session";
+    repo.workflows.plan.providerId = "codex";
+    writeRepoConfig("repository", repo);
     expect(() => readConfig()).toThrow("plan capture requires the claude provider");
   });
 
@@ -187,6 +197,10 @@ describe("readConfig", () => {
       ...value.repositories.example,
       root: "second",
       worktreeRoot: "../second-worktrees",
+    };
+    writeConfig(value);
+    writeRepoConfig("repository");
+    writeRepoConfig("second", {
       labels: {
         "example.kind": {
           labels: ["review"],
@@ -195,8 +209,7 @@ describe("readConfig", () => {
         },
       },
       sessionDefaults: { labels: { "example.kind": ["review"] } },
-    };
-    writeConfig(value);
+    });
     const config = readConfig();
     expect(config.repositories.example.labels["example.kind"]?.labels).toEqual([
       "planning",

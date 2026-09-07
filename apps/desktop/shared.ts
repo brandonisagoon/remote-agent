@@ -1,4 +1,5 @@
 import type { ConfigDocument } from "../../lib/config-file.ts";
+import type { RepoConfigDocument } from "../../lib/config-file.ts";
 import type { CheckResult } from "../../management/checks.ts";
 import type { SkillsCheck } from "../../lib/skills/check.ts";
 import type { DetectedEditor } from "./main/editor-detect.ts";
@@ -80,6 +81,14 @@ export interface DesktopApi {
     pickFolder(title: string, defaultPath?: string): Promise<string | null>;
     /** Native file picker; returns the chosen absolute path or null. */
     pickFile(title: string, defaultPath?: string): Promise<string | null>;
+  };
+  repoConfigs: {
+    /** Every repository's committed config document, keyed by repo id. */
+    get(): Promise<Record<string, RepoConfigDocument & { root: string }>>;
+    /** Revision-guarded save into the repo's working tree. */
+    save(input: { id: string; expectedRevision: string; value: unknown }): Promise<RepoConfigDocument>;
+    /** Push stream fed by the main-process file watchers. */
+    onChange(callback: (documents: Record<string, RepoConfigDocument & { root: string }>) => void): () => void;
   };
   skills: {
     check(root: string, skillsRoot: string): Promise<SkillsCheck>;
