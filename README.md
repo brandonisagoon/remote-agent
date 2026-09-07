@@ -167,6 +167,24 @@ processes only). Sessions' MCP tools use the socket.
 
 ## Setup
 
+Two options: follow the steps yourself, or hand them to an agent.
+
+### Option A: with an agent
+
+Everything in Option B is plain commands and JSON. Give Claude Code or
+Codex this prompt on the machine that will run the server:
+
+```text
+Install Remote Agent on this machine. Clone https://github.com/brandonisagoon/remote-agent,
+run `bun install`, copy remote-agent.config.example.json to remote-agent.config.json,
+and fill it in: ask me for the Linear API key, the agent user id, and the public URL
+I want webhooks delivered to. Then run `bun run cli -- install` from the clone root,
+run `bun run cli -- doctor`, and walk me through every item it reports as failing —
+the Cloudflare tunnel, the Linear webhook, and the provider CLIs need my hands.
+```
+
+### Option B: step by step
+
 **1. Install the CLI.** This repo is its own Homebrew tap (formula and
 cask) and Scoop bucket.
 
@@ -254,21 +272,30 @@ stateless stdio connection to the server's socket.
 
 ## Configuration
 
-Two files per repository, each holding what belongs to it:
+Two files per repository:
 
-- `remote-agent.config.json` (machine-local, gitignored): `machine`
-  (server, sockets, storage, SSH host, install/update settings),
-  `providers`, `connections` (a Linear workspace: credentials, workspace
-  identity, webhook, router, editors), and `repositories.<id>` (checkout
-  root, worktree root, worktree naming).
+- `remote-agent.config.json` (machine-local, gitignored): `machine`,
+  `providers`, `connections`, and `repositories.<id>` (checkout root,
+  worktree root, worktree naming).
 - `.remote-agent.config.json` (committed in the repository): bootstrap
   command, skillsets root, branch naming, workflows, label groups.
 
-Both have published JSON schemas for editor completion:
-[remote-agent.config.schema.json](remote-agent.config.schema.json) and
-[remote-agent.repo-config.schema.json](remote-agent.repo-config.schema.json);
-examples: [remote-agent.config.example.json](remote-agent.config.example.json)
-and [remote-agent.repo-config.example.json](remote-agent.repo-config.example.json).
+Configure via the GUI, the JSON (schemas:
+[app](remote-agent.config.schema.json),
+[repository](remote-agent.repo-config.schema.json); examples:
+[app](remote-agent.config.example.json),
+[repository](remote-agent.repo-config.example.json); contract:
+[docs/adoption.md](docs/adoption.md)), or an agent with this prompt, run
+inside the repository:
+
+```text
+Set this repository up for Remote Agent: add skill-composer as a dev dependency,
+create agent-skills/, and write .remote-agent.config.json per
+https://raw.githubusercontent.com/brandonisagoon/remote-agent/main/remote-agent.repo-config.schema.json
+with bootstrapCommand and one workflow that starts a session when a Linear issue
+enters "Planning". Then add this checkout to repositories in the machine config
+and run `remote-agent restart`.
+```
 
 ---
 
