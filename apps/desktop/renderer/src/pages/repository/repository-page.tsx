@@ -146,7 +146,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         >
           <SettingsCard>
             <div className="grid gap-2">
-              <Label>Repository config</Label>
+              <Label>Repository Config</Label>
               <InputGroup>
                 <InputGroupInput readOnly value={repo.path} className="text-muted-foreground font-mono" />
                 <InputGroupAddon align="inline-end">

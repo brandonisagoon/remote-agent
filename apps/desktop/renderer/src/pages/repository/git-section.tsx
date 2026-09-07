@@ -138,7 +138,7 @@ function BranchNamingTable({ repo }: { repo: RepoConfigDraft }) {
 
   return (
     <div className="grid gap-2">
-      <Label>Branch naming</Label>
+      <Label>Branch Naming</Label>
       <div className="bg-background -mx-4 rounded-lg border">
         <Table className="table-fixed">
           <TableBody>{keys.map(row)}</TableBody>
@@ -242,7 +242,7 @@ function WorktreeNamingTable({ id, value, mutate }: { id: string; value: Service
 
   return (
     <div className="grid gap-2">
-      <Label>Worktree naming</Label>
+      <Label>Worktree Naming</Label>
       <div className="bg-background -mx-4 rounded-lg border">
         <Table className="table-fixed">
           <TableBody>{keys.map(row)}</TableBody>
@@ -302,9 +302,9 @@ export function GitSection({ id, value, mutate, repo }: {
       description="Where sessions check out and how their worktrees and branches are named."
     >
       <SettingsCard>
-        <Field label="Display name" value={repository.name ?? id} onChange={(next) => edit((entry) => { entry.name = next; })} />
-        <PathField label="Checkout root" title="Select Checkout Root" value={repository.root} onChange={(next) => edit((entry) => { entry.root = next; })} />
-        <PathField label="Worktree root" title="Select Worktree Root" value={repository.worktreeRoot} onChange={(next) => edit((entry) => { entry.worktreeRoot = next; })} />
+        <Field label="Display Name" value={repository.name ?? id} onChange={(next) => edit((entry) => { entry.name = next; })} />
+        <PathField label="Checkout Root" title="Select Checkout Root" value={repository.root} onChange={(next) => edit((entry) => { entry.root = next; })} />
+        <PathField label="Worktree Root" title="Select Worktree Root" value={repository.worktreeRoot} onChange={(next) => edit((entry) => { entry.worktreeRoot = next; })} />
       </SettingsCard>
       <WorktreeNamingTable id={id} value={value} mutate={mutate} />
       {repo.config && <BranchNamingTable repo={repo} />}
@@ -329,7 +329,7 @@ export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfi
     >
       <SettingsCard>
         <div className="grid gap-2">
-          <Label>Bootstrap command</Label>
+          <Label>Bootstrap Command</Label>
           <InputGroup>
             <InputGroupInput
               value={command.join(" ")}

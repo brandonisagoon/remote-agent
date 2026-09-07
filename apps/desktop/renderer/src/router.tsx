@@ -70,19 +70,30 @@ const connectionRoute = createRoute({
 const REPOSITORY_TABS = ["sessions", "settings", "skillsets"] as const;
 export type RepositoryTab = (typeof REPOSITORY_TABS)[number];
 
+/** Sidebar links are bare (/repositories/:id); land on the tab the user
+    last used for that repository rather than resetting to Sessions. */
+function lastRepositoryTab(repositoryId: string): RepositoryTab {
+  const stored = localStorage.getItem(`repository-tab:${repositoryId}`);
+  return REPOSITORY_TABS.includes(stored as RepositoryTab) ? (stored as RepositoryTab) : "sessions";
+}
+
+function rememberRepositoryTab(repositoryId: string, tab: RepositoryTab): void {
+  localStorage.setItem(`repository-tab:${repositoryId}`, tab);
+}
+
 const repositoryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/repositories/$repositoryId",
 });
 
-// Bare repository links land on Sessions.
+// Bare repository links land on the repository's last-used tab.
 const repositoryIndexRoute = createRoute({
   getParentRoute: () => repositoryRoute,
   path: "/",
   beforeLoad: ({ params }) => {
     throw redirect({
       to: "/repositories/$repositoryId/$tab",
-      params: { repositoryId: params.repositoryId, tab: "sessions" },
+      params: { repositoryId: params.repositoryId, tab: lastRepositoryTab(params.repositoryId) },
     });
   },
 });
@@ -101,6 +112,7 @@ const repositoryTabRoute = createRoute({
   component: function Repository() {
     const { repositoryId, tab } = repositoryTabRoute.useParams();
     const { draft, mutate } = useConfig();
+    rememberRepositoryTab(repositoryId, tab as RepositoryTab);
     return (
       <RepositoryPage
         id={repositoryId}
