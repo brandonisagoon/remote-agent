@@ -4,6 +4,8 @@ import { createConnection } from "node:net";
 import { configFilePath, readConfig, type ServerConfig } from "../lib/config.ts";
 import { findExecutable, installLayout } from "./paths.ts";
 import { run } from "./run.ts";
+import { resolveCname } from "node:dns/promises";
+import { listTunnels, tunnelHost, tunnelLabel, tunnelLoginCert, tunnelName } from "./tunnel.ts";
 import { serviceLabel, supervisor } from "./supervisor/index.ts";
 
 export type CheckStatus = "ok" | "warn" | "fail";
@@ -46,7 +48,7 @@ export async function runChecks(): Promise<CheckResult[]> {
   results.push(await serverCheck(config));
   results.push(await acpSocketCheck(config));
   results.push(repositoriesCheck(config));
-  results.push(await tunnelCheck(config));
+  results.push(...(await tunnelChecks(config)));
   results.push(...providerChecks());
 
   return results;
@@ -151,47 +153,71 @@ function repositoriesCheck(config: ServerConfig): CheckResult {
       };
 }
 
-async function tunnelCheck(config: ServerConfig): Promise<CheckResult> {
+/** The tunnel as five facts, each with the one command that fixes all of
+    them: `remote-agent tunnel` is idempotent. */
+async function tunnelChecks(config: ServerConfig): Promise<CheckResult[]> {
   const cloudflared = findExecutable("cloudflared");
-  if (!cloudflared) {
-    return { id: "tunnel", label: "Tunnel", status: "warn", remedy: "install cloudflared first" };
-  }
-  const tunnelName = readTunnelName(config);
-  const result = await run(cloudflared, ["tunnel", "list", "--output", "json"]);
-  if (!result.ok) {
-    return {
-      id: "tunnel",
-      label: "Tunnel",
-      status: "warn",
-      detail: "could not list tunnels",
-      remedy: "run: cloudflared tunnel login",
-    };
-  }
-  try {
-    const tunnels = JSON.parse(result.output) as Array<{ name: string }>;
-    return tunnels.some((tunnel) => tunnel.name === tunnelName)
-      ? { id: "tunnel", label: "Tunnel", status: "ok", detail: tunnelName }
-      : {
-          id: "tunnel",
-          label: "Tunnel",
-          status: "fail",
-          detail: `tunnel "${tunnelName}" not found`,
-          remedy: `run: cloudflared tunnel create ${tunnelName}`,
-        };
-  } catch {
-    return { id: "tunnel", label: "Tunnel", status: "warn", detail: "unexpected cloudflared output" };
-  }
-}
+  const remedy = "run: remote-agent tunnel";
+  const name = tunnelName(config);
+  const host = tunnelHost(config);
+  const results: CheckResult[] = [];
 
-function readTunnelName(config: ServerConfig): string {
-  try {
-    const file = JSON.parse(readFileSync(configFilePath(), "utf8")) as {
-      machine?: { installation?: { tunnelName?: string } };
-    };
-    return file.machine?.installation?.tunnelName ?? config.serviceName;
-  } catch {
-    return config.serviceName;
+  const loggedIn = existsSync(tunnelLoginCert());
+  results.push(
+    loggedIn
+      ? { id: "tunnel-login", label: "Cloudflare login", status: "ok", detail: tunnelLoginCert() }
+      : { id: "tunnel-login", label: "Cloudflare login", status: "fail", remedy },
+  );
+
+  const tunnels = cloudflared && loggedIn ? await listTunnels(cloudflared) : null;
+  const tunnel = tunnels?.find((entry) => entry.name === name) ?? null;
+  results.push(
+    tunnel
+      ? { id: "tunnel", label: "Tunnel", status: "ok", detail: name }
+      : { id: "tunnel", label: "Tunnel", status: loggedIn ? "fail" : "warn", detail: `tunnel "${name}" not found`, remedy },
+  );
+
+  let routed = false;
+  if (tunnel) {
+    try {
+      const records = await resolveCname(host);
+      routed = records.some((record) => record === `${tunnel.id}.cfargotunnel.com`);
+    } catch {
+      routed = false;
+    }
   }
+  results.push(
+    routed
+      ? { id: "tunnel-dns", label: "DNS route", status: "ok", detail: `${host} → ${name}` }
+      : { id: "tunnel-dns", label: "DNS route", status: tunnel ? "fail" : "warn", detail: `${host} does not point at the tunnel`, remedy },
+  );
+
+  const registered = await supervisor().registered(tunnelLabel(config.serviceName));
+  results.push(
+    registered
+      ? { id: "tunnel-service", label: "Tunnel service", status: "ok", detail: tunnelLabel(config.serviceName) }
+      : { id: "tunnel-service", label: "Tunnel service", status: tunnel ? "fail" : "warn", remedy },
+  );
+
+  try {
+    const response = await fetch(`${config.publicUrl.replace(/\/$/, "")}/health`, {
+      signal: AbortSignal.timeout(5_000),
+    });
+    results.push(
+      response.ok
+        ? { id: "public-url", label: "Public URL", status: "ok", detail: config.publicUrl }
+        : { id: "public-url", label: "Public URL", status: "fail", detail: `health returned ${response.status}`, remedy },
+    );
+  } catch (error) {
+    results.push({
+      id: "public-url",
+      label: "Public URL",
+      status: registered ? "fail" : "warn",
+      detail: error instanceof Error ? error.message : String(error),
+      remedy,
+    });
+  }
+  return results;
 }
 
 /** Provider CLIs are peers, not dependencies: we detect them, never install

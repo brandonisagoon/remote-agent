@@ -27,6 +27,19 @@ export async function run(
   });
 }
 
+/** Runs a command with the user's terminal attached (stdio inherited) —
+    for interactive steps such as `cloudflared tunnel login`. */
+export async function runInteractive(executable: string, args: string[]): Promise<void> {
+  const exitCode = await new Promise<number | null>((resolve, reject) => {
+    const child = spawn(executable, args, { stdio: "inherit", env: process.env });
+    child.on("error", reject);
+    child.on("close", resolve);
+  });
+  if (exitCode !== 0) {
+    throw new Error(`${executable} ${args.join(" ")} exited ${exitCode}`);
+  }
+}
+
 export class CommandError extends Error {
   constructor(executable: string, args: string[], result: RunResult) {
     const status = result.exitCode === null ? "could not run" : `exited ${result.exitCode}`;

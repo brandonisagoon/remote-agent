@@ -68,7 +68,11 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
     check("cloudflared"),
     check("cli"),
     check("service"),
+    check("tunnel-login"),
     check("tunnel"),
+    check("tunnel-dns"),
+    check("tunnel-service"),
+    check("public-url"),
   ].filter((entry) => entry !== undefined);
   const statusRows = [check("server"), check("acp"), check("config"), check("repositories")].filter(
     (entry) => entry !== undefined,
@@ -103,7 +107,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         disabled={working !== null || step.status === "ok" || !command}
         onClick={() => command && void openTerminal(command)}
       >
-        {step.id === "tunnel" ? "Create" : "Install"}
+        {step.id.startsWith("tunnel") || step.id === "public-url" ? "Set Up" : "Install"}
       </Button>
     );
   };

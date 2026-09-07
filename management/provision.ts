@@ -10,10 +10,10 @@ import { syncTree } from "./sync-tree.ts";
 /** One-time provisioning (TS port of the retired install.sh). Idempotent:
     safe to re-run after an upgrade or a failed attempt.
 
-    Provisioning is deliberately separate from startup. Creating a tunnel or
-    a DNS record mints long-lived credentials against a real domain, so this
-    never does either — the running service only ever does
-    `cloudflared tunnel run`. */
+    The Cloudflare login (a browser handshake) is the one step provisioning
+    never performs. Once the user has logged in, `remote-agent tunnel` — also
+    run here when the public URL doesn't answer — creates the tunnel, routes
+    DNS, and installs the tunnel runner as a second supervised service. */
 export async function provision(log: (line: string) => void): Promise<void> {
   const configFile = configFilePath();
   const config = readConfig();
@@ -90,7 +90,15 @@ export async function provision(log: (line: string) => void): Promise<void> {
   else log(`  local health FAILED — check ${layout.serviceLog}`);
   const publicHealth = `${config.publicUrl.replace(/\/$/, "")}/health`;
   if (await healthy(publicHealth)) log(`  public health OK  (${config.publicUrl})`);
-  else log("  public health FAILED — check the machine's Cloudflare tunnel");
+  else {
+    const { setupTunnel, tunnelLoginCert } = await import("./tunnel.ts");
+    if (existsSync(tunnelLoginCert())) {
+      log("  public health FAILED — finishing the tunnel setup");
+      await setupTunnel(log);
+    } else {
+      log("  public health FAILED — run `remote-agent tunnel` to set up the Cloudflare tunnel");
+    }
+  }
 }
 
 async function healthy(url: string): Promise<boolean> {

@@ -6,6 +6,7 @@ import { configFilePath, readConfig } from "../lib/config.ts";
 import { findExecutable, installLayout, sourceRoot } from "./paths.ts";
 import { runChecks } from "./checks.ts";
 import { provision } from "./provision.ts";
+import { setupTunnel, tunnelLabel } from "./tunnel.ts";
 import { serverDefinition, supervisor } from "./supervisor/index.ts";
 
 export interface ManagementResult {
@@ -84,6 +85,20 @@ export async function doctor(): Promise<ManagementResult> {
       : `${failed.length} check${failed.length === 1 ? "" : "s"} failing`,
     detail: lines.join("\n"),
   };
+}
+
+export async function setupTunnelCommand(): Promise<ManagementResult> {
+  const lines: string[] = [];
+  try {
+    await setupTunnel((line) => {
+      lines.push(line);
+      console.log(line);
+    });
+    return { ok: true, summary: "Tunnel ready", detail: lines.join("\n") };
+  } catch (error) {
+    lines.push(error instanceof Error ? error.message : String(error));
+    return { ok: false, summary: "Tunnel setup failed", detail: lines.join("\n") };
+  }
 }
 
 export async function installService(): Promise<ManagementResult> {
@@ -187,6 +202,9 @@ export async function uninstallService(options: { purge?: boolean } = {}): Promi
   try {
     const config = readConfig();
     await supervisor().uninstall(`dev.${config.serviceName}.service`);
+    // The tunnel runner is ours; the tunnel and login in the Cloudflare
+    // account are the user's and stay.
+    await supervisor().uninstall(tunnelLabel(config.serviceName)).catch(() => undefined);
     if (options.purge) {
       const { rmSync } = await import("node:fs");
       rmSync(config.installRoot, { recursive: true, force: true });

@@ -23,8 +23,12 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 - **CLI** (`remote-agent`) — thin commander skin over `management/`.
 - **`management/`** — the platform layer shared by CLI and GUI:
   provisioning, self-updating deploy with rollback, the doctor checklist
-  (`checks.ts` — single source for CLI doctor AND the GUI status tables), and
-  the `supervisor/` seam. **No shell scripts** — everything is TypeScript.
+  (`checks.ts` — single source for CLI doctor AND the GUI status tables),
+  the `supervisor/` seam, and `tunnel.ts` (`remote-agent tunnel`: login →
+  create → route DNS → run cloudflared as a second supervised service
+  `<label>.tunnel` → verify publicUrl; every step idempotent; doctor rows
+  `tunnel-login`/`tunnel`/`tunnel-dns`/`tunnel-service`/`public-url`).
+  **No shell scripts** — everything is TypeScript.
 - **`lib/skills/`** — skill-composer boundary. Repos own skill-composer
   as their own dev dependency; we always **exec** their copy (or a bun child
   process for the inventory shim), never import repo-owned config in-process.

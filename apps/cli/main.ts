@@ -8,6 +8,7 @@ import {
   installService,
   installUpdate,
   restartService,
+  setupTunnelCommand,
   serviceStatus,
   uninstallService,
 } from "../../management/service.ts";
@@ -32,6 +33,10 @@ program.command("doctor").description("Validate config and local dependencies").
 program.command("check-update").description("Check the configured release branch").action(action(checkForUpdates));
 program.command("update").description("Install the latest configured release").action(action(installUpdate));
 program.command("restart").description("Restart the local server").action(action(restartService));
+program
+  .command("tunnel")
+  .description("Set up the Cloudflare tunnel: login, create, route DNS, run as a service")
+  .action(action(setupTunnelCommand));
 program
   .command("uninstall")
   .description("Remove the local server (state is kept unless --purge)")

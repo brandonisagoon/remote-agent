@@ -161,7 +161,8 @@ processes only). Sessions' MCP tools use the socket.
 - GUI and CLI on one release cadence. The GUI edits both config
   files with explicit save/revert, shows the doctor checklist with buttons,
   and lists sessions. The CLI provides `install`, `doctor`, `status`,
-  `restart`, `check-update`, `update` (with rollback), and `uninstall`.
+  `restart`, `tunnel`, `check-update`, `update` (with rollback), and
+  `uninstall`.
 - Self-updating installs supervised by launchd (macOS) or a Task Scheduler
   logon task (Windows).
 
@@ -179,8 +180,9 @@ Install Remote Agent on this machine. Clone https://github.com/brandonisagoon/re
 run `bun install`, copy remote-agent.config.example.json to remote-agent.config.json,
 and fill it in: ask me for the Linear API key, the agent user id, and the public URL
 I want webhooks delivered to. Then run `bun run cli -- install` from the clone root,
-run `bun run cli -- doctor`, and walk me through every item it reports as failing —
-the Cloudflare tunnel, the Linear webhook, and the provider CLIs need my hands.
+run `bun run cli -- tunnel` (I will complete the browser login when it opens),
+then `bun run cli -- doctor` and walk me through anything still failing —
+the Linear webhook and the provider CLIs need my hands.
 ```
 
 ### Option B: step by step
@@ -230,9 +232,12 @@ remote-agent doctor
 `doctor` reports every prerequisite with what to do about it. The parts no
 installer can do for you:
 
-- **Cloudflare tunnel.** Linear needs a public URL to deliver webhooks:
-  `cloudflared tunnel login`, create a tunnel, and add the DNS record (the
-  GUI's Server section shows the exact record to create).
+- **Cloudflare tunnel.** Linear needs a public URL to deliver webhooks.
+  Run `remote-agent tunnel`: it opens the browser for `cloudflared tunnel
+  login` once, then creates the tunnel, routes DNS for your `publicUrl`,
+  installs the tunnel runner as a service beside the server, and verifies
+  the public URL. Re-run it any time; every step is idempotent. `doctor`
+  shows each step's state.
 - **Linear.** An API key, plus the webhook URL and secret from your
   connection settings pasted into Linear's webhook settings.
 - **Provider CLIs.** Install and authenticate `codex` and/or `claude`
