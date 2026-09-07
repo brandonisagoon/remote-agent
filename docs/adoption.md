@@ -68,6 +68,12 @@ Remote Agent owns:
   call. Sessions can register their own threads (and mark them as pending
   questions) via `PUT /api/sessions/:sessionId/threads`
   (and unregister via `DELETE /api/sessions/:sessionId/threads/:commentId`);
+- session tools over MCP: every session gets `delegate_session` (spawn a
+  child on the same issue and worktree; lineage, links, and mirror inherit
+  from the parent) and `register_thread` (claim a comment thread so replies
+  route here). Skills decide *when* to delegate; the server owns how. The
+  tools call the local control socket, so no URL, key, or curl choreography
+  is needed in skill content;
 - plan capture: a `start-session` workflow with
   `plan: { captureToIssue: true, thenState? }` (claude provider only)
   launches its session in plan mode; the server persists the plan into the

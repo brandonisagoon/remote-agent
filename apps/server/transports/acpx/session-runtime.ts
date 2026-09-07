@@ -15,6 +15,7 @@ import {
   createRuntimeStore,
 } from "acpx/runtime";
 import type {
+  McpServer,
   SessionConfigOption,
   SessionNotification,
   ToolCallStatus,
@@ -154,6 +155,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     private readonly config: ServerConfig,
     private readonly options: {
       onPermissionRequest?: AgentPermissionInterceptor;
+      /** MCP servers every session's harness spawns (e.g. remote-agent's own tools). */
+      mcpServers?: McpServer[];
     } = {},
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
@@ -167,6 +170,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
       elicitationModes: ["form", "url"],
+      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
       // Consulted before approve-all answers; undefined falls through to it.
       ...(options.onPermissionRequest
         ? {
@@ -257,7 +261,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         sessionOptions: {
           ...(input.model ? { model: input.model } : {}),
           ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
-          ...(input.agentEnv ? { env: input.agentEnv } : {}),
+          env: sessionEnvironment(row.id, this.config, input.agentEnv),
         },
       });
       this.handles.set(row.id, handle);
@@ -771,10 +775,25 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 }
 
+/** Server-owned facts about the session itself, injected into the harness
+    process so the remote-agent MCP server (a child of it) knows which
+    session it serves and where the control socket is. */
+export function sessionEnvironment(
+  sessionId: string,
+  config: Pick<ServerConfig, "controlIpcPath">,
+  extra: Record<string, string> = {},
+): Record<string, string> {
+  return {
+    ...extra,
+    REMOTE_AGENT_SESSION_ID: sessionId,
+    REMOTE_AGENT_SOCKET: config.controlIpcPath,
+  };
+}
+
 export function createAcpxSessionRuntime(
   prisma: PrismaClient,
   config: ServerConfig,
-  options: { onPermissionRequest?: AgentPermissionInterceptor } = {},
+  options: { onPermissionRequest?: AgentPermissionInterceptor; mcpServers?: McpServer[] } = {},
 ): AgentSessionRuntime {
   return new AcpxSessionRuntime(prisma, config, options);
 }

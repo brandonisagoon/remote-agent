@@ -11,6 +11,15 @@ import {
   registerThread,
   unregisterThread,
 } from "../../services/sessions/threads.ts";
+import { delegateSession } from "../../services/launches/delegate.ts";
+
+const DelegateSchema = z.object({
+  prompt: z.string().min(1).max(100_000),
+  provider: z.enum(["codex", "claude"]).optional(),
+  model: z.string().min(1).max(128).optional(),
+  name: z.string().min(1).max(120).optional(),
+  cwd: z.string().min(1).max(4096).optional(),
+});
 
 const SetLabelSchema = z.object({
   key: z.string().min(1),
@@ -210,6 +219,26 @@ routes.delete("/:sessionId/threads/:commentId", async (c) => {
     runtimeSessionId: c.req.param("sessionId"),
   });
   return c.json({ registered: false });
+});
+
+// A session spawns a child that inherits its lineage. Reached by the
+// remote-agent MCP tool over the control socket; no connection context in
+// the request, ever.
+routes.post("/:sessionId/delegate", async (c) => {
+  const parsed = DelegateSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) {
+    return c.json({ error: "Invalid body", issues: parsed.error.issues }, 400);
+  }
+  try {
+    const child = await delegateSession(
+      { parentSessionId: c.req.param("sessionId"), ...parsed.data },
+      { prisma: c.get("prisma"), runtime: c.get("agentRuntime") },
+    );
+    return c.json({ sessionId: child.id, name: child.name, status: child.status }, 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ error: message }, message.startsWith("unknown session") ? 404 : 400);
+  }
 });
 
 export default routes;

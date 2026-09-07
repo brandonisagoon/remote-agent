@@ -18,6 +18,9 @@ export interface CreateAppOptions {
   commandClient?: CommandClient;
   agentRuntime: AgentSessionRuntime;
   prisma: PrismaClient;
+  /** For the control socket: callers are gated by filesystem permissions,
+      so the API bearer check is skipped. Never set for the network port. */
+  trustLocal?: boolean;
 }
 
 export function createApp({
@@ -25,6 +28,7 @@ export function createApp({
   commandClient = bunCommandClient,
   agentRuntime,
   prisma,
+  trustLocal = false,
 }: CreateAppOptions): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
   app.use("*", contextMiddleware({
@@ -34,7 +38,7 @@ export function createApp({
     prisma,
   }));
   app.use("*", cacheControlMiddleware());
-  app.use("/api/*", apiAuthMiddleware());
+  if (!trustLocal) app.use("/api/*", apiAuthMiddleware());
   app.onError(errorHandler);
 
   mountRoutes(app);

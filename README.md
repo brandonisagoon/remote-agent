@@ -27,6 +27,8 @@ under your own subscriptions.
 - Exposes every session over ACP: attach from an editor with provider,
   model, mode, and thinking controls, plan-mode switching, and the agent's
   questions forwarded to you.
+- Gives every session its own tools over MCP: `delegate_session` to hand a
+  sub-task to a child session, `register_thread` to claim a comment thread.
 - Captures plans: a session started in plan mode writes its finished plan
   into the source issue and moves it to a configured state.
 
@@ -94,6 +96,13 @@ with a stable server-side ID.
 Sessions survive restarts and disconnects. Closing an editor or dropping an
 SSH connection does not end a session; only an explicit close or end does.
 
+### Local control socket
+
+The server serves its API twice: on the configured port with bearer auth
+(webhooks through the tunnel, remote GUIs) and on a unix socket under the
+install root with no key, gated by file permissions (this user's
+processes only). Sessions' MCP tools use the socket.
+
 ### Dependencies
 
 - [acpx](https://acpx.sh/): session runtime; launches and reconnects the
@@ -140,6 +149,9 @@ SSH connection does not end a session; only an explicit close or end does.
 - Thread routing: registered threads deliver without a mention; question
   threads frame replies as answers; a semantic router handles new threads.
 - Plan capture into the source issue, with a state transition.
+- Delegation: any session can spawn a child session on its issue and
+  worktree through the `delegate_session` MCP tool; children inherit the
+  parent's lineage and can delegate in turn.
 - Session labels: Linear-style label groups skills use to mark a session's
   phase; router-visible groups inform routing.
 - ACP for any client: provider, model, mode, and thinking controls;
