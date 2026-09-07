@@ -166,6 +166,21 @@ processes only). Sessions' MCP tools use the socket.
 - Self-updating installs supervised by launchd (macOS) or a Task Scheduler
   logon task (Windows).
 
+## Prerequisites
+
+- A macOS or Windows machine that stays on and logged in. Sessions run in
+  your login session with your credentials.
+- Git, plus the repositories you want agents to work in, checked out on
+  that machine.
+- Codex and/or Claude Code installed and authenticated. They are your
+  identity and subscription; Remote Agent never installs them.
+- A Linear workspace where you can create an API key, add a webhook, and
+  create a dedicated agent user and team.
+- A Cloudflare account with a domain on it, for the tunnel that delivers
+  Linear webhooks to your machine.
+- Bun and cloudflared. The Homebrew formula and Scoop manifest install both;
+  installing from a clone needs them present first.
+
 ## Setup
 
 Two options: follow the steps yourself, or hand them to an agent.
