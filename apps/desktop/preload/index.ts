@@ -51,6 +51,10 @@ const api: DesktopApi = {
   editors: {
     detect: () => ipcRenderer.invoke("editors:detect"),
   },
+  fs: {
+    pickFolder: (title, defaultPath) => ipcRenderer.invoke("fs:pick-folder", title, defaultPath),
+    pickFile: (title, defaultPath) => ipcRenderer.invoke("fs:pick-file", title, defaultPath),
+  },
   skills: {
     check: (root, skillsRoot) => ipcRenderer.invoke("skills:check", root, skillsRoot),
     pickRoot: (defaultPath) => ipcRenderer.invoke("skills:pick-root", defaultPath),

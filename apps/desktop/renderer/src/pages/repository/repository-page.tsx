@@ -3,12 +3,10 @@ import { useQuery } from "@tanstack/react-query";
 
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
-import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
-import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
+import { SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Accordion } from "@renderer/components/ui/accordion.tsx";
 import { Badge } from "@renderer/components/ui/badge.tsx";
-import { Button } from "@renderer/components/ui/button.tsx";
 import {
   Table,
   TableBody,
@@ -20,11 +18,11 @@ import {
 
 import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
 import type { RepositoryTab } from "@renderer/router.tsx";
+import { BootstrapSection, GitSection } from "./git-section.tsx";
 import { SkillsTab } from "./skills-tab.tsx";
 import { LabelsSection } from "./labels-section.tsx";
 import { WorkflowsSection } from "./workflows-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
-import { cn } from "@renderer/lib/utils.ts";
 
 export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: RepositoryTab; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
@@ -111,7 +109,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
           <F7Icon name="moon_zzz" className="text-muted-foreground/40 size-8" />
           <p className="text-muted-foreground text-sm">No sessions yet.</p>
           <p className="text-muted-foreground/70 max-w-md text-center text-xs">
-            Mention or assign the agent on a Linear issue to start one.
+            Workflows start sessions when Linear issues enter a configured state or get a reaction.
           </p>
         </div>
       ) : null}
@@ -123,21 +121,10 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
 }
 
 function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceFile; mutate: Mutate }) {
-  const repository = value.repositories[id]!;
   return (
-    <Accordion type="multiple" defaultValue={["paths", "workflows", "labels"]} className="-mt-3">
-      <SettingsSection
-        value="paths"
-        title="Paths & bootstrap"
-        description="Where sessions check out and how a fresh worktree gets ready."
-      >
-        <SettingsCard>
-          <Field label="Display name" value={repository.name ?? id} onChange={(next) => mutate((file) => { file.repositories[id]!.name = next; })} />
-          <Field label="Checkout root" value={repository.root} onChange={(next) => mutate((file) => { file.repositories[id]!.root = next; })} />
-          <Field label="Worktree root" value={repository.worktreeRoot} onChange={(next) => mutate((file) => { file.repositories[id]!.worktreeRoot = next; })} />
-          <Field label="Bootstrap command" value={repository.bootstrapCommand.join(" ")} onChange={(next) => mutate((file) => { file.repositories[id]!.bootstrapCommand = next.split(/\s+/).filter(Boolean); })} />
-        </SettingsCard>
-      </SettingsSection>
+    <Accordion type="multiple" defaultValue={["git", "bootstrap", "workflows", "labels"]} className="-mt-3">
+      <GitSection id={id} value={value} mutate={mutate} />
+      <BootstrapSection id={id} value={value} mutate={mutate} />
       <SettingsSection
         value="workflows"
         title="Workflows"

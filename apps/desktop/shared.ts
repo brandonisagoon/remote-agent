@@ -75,6 +75,12 @@ export interface DesktopApi {
   editors: {
     detect(): Promise<DetectedEditor[]>;
   };
+  fs: {
+    /** Native folder picker; returns the chosen absolute path or null. */
+    pickFolder(title: string, defaultPath?: string): Promise<string | null>;
+    /** Native file picker; returns the chosen absolute path or null. */
+    pickFile(title: string, defaultPath?: string): Promise<string | null>;
+  };
   skills: {
     check(root: string, skillsRoot: string): Promise<SkillsCheck>;
     pickRoot(defaultPath: string): Promise<string | null>;

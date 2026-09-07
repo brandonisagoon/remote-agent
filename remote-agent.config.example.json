@@ -65,6 +65,12 @@
       "name": "Your Repository",
       "root": "~/checkouts/your-repository",
       "worktreeRoot": "../.worktrees/your-repository",
+      "worktreeNaming": {
+        "*": "{branch}"
+      },
+      "branchNaming": {
+        "*": "{branch}"
+      },
       "bootstrapCommand": [
         "bash",
         "scripts/bootstrap.sh"

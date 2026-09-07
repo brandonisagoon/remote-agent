@@ -34,6 +34,8 @@ export function testConfig(
     name: "Test Repository",
     root: "/nonexistent/repository",
     worktreeRoot: "/nonexistent/.worktrees",
+    worktreeNaming: { "*": "{branch}" },
+    branchNaming: { "*": "{branch}" },
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
     skillsRoot: "agent-skills",
     workflows: {

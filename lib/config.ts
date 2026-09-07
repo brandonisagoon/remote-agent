@@ -69,10 +69,33 @@ const LabelGroupSchema = z.object({
   routerVisible: z.boolean().default(false),
 });
 
+/** A branch template renders provider facts into the session branch:
+    {branch} = provider's suggested name, {issue} = resource identifier,
+    {title} = title slug. Must keep {branch} or {issue} so the identifier
+    survives in the branch (session ↔ issue re-association parses it). */
+const BranchTemplateSchema = z
+  .string()
+  .min(1)
+  .refine(
+    (value) => value.includes("{branch}") || value.includes("{issue}"),
+    "must contain {branch} or {issue}",
+  );
+
 const RepositorySchema = z.object({
   name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
+  /** Worktree directory templates, keyed by connection like branchNaming
+      ({branch} = the rendered branch, plus {issue}/{title}); the result is
+      flattened for the filesystem. */
+  worktreeNaming: z
+    .record(z.union([z.literal("*"), ConfigIdSchema]), z.string().min(1))
+    .default({ "*": "{branch}" }),
+  /** Branch naming policy, keyed by connection ("*" = every connection).
+      The provider supplies the facts; the repository owns the convention. */
+  branchNaming: z
+    .record(z.union([z.literal("*"), ConfigIdSchema]), BranchTemplateSchema)
+    .default({ "*": "{branch}" }),
   bootstrapCommand: CommandSchema,
   /** Where the skill-composer inputs live, relative to root. */
   skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
@@ -241,6 +264,13 @@ export const ServiceFileSchema = z.object({
         context.addIssue({ code: "custom", path: ["repositories", repositoryId, "workflows", workflowId, "plan"], message: "plan capture requires the claude provider (codex has no plan mode)" });
       }
     }
+    for (const field of ["branchNaming", "worktreeNaming"] as const) {
+      for (const connectionId of Object.keys(repository[field])) {
+        if (connectionId !== "*" && !file.connections[connectionId]) {
+          context.addIssue({ code: "custom", path: ["repositories", repositoryId, field, connectionId], message: `unknown connection: ${connectionId}` });
+        }
+      }
+    }
     for (const [key, values] of Object.entries(repository.sessionDefaults.labels)) {
       const group = repository.labels[key];
       if (!group) {
@@ -283,6 +313,10 @@ export interface RepositoryConfig {
   worktreeRoot: string;
   bootstrapCommand: string[];
   skillsRoot: string;
+  /** Worktree directory template per connection id; "*" is the default. */
+  worktreeNaming: Record<string, string>;
+  /** Branch template per connection id; "*" is the default. */
+  branchNaming: Record<string, string>;
   workflows: Readonly<Record<string, WorkflowConfig>>;
   labels: Record<string, LabelGroupConfig>;
   sessionDefaults: { labels: Record<string, string[]> };
@@ -459,6 +493,8 @@ export function readConfig(): ServerConfig {
           ),
         },
         skillsRoot: repository.skillsRoot,
+        worktreeNaming: { ...repository.worktreeNaming },
+        branchNaming: { ...repository.branchNaming },
         workflows: Object.fromEntries(
           Object.entries(repository.workflows).map(([workflowId, workflow]) => [workflowId, {
             id: workflowId,

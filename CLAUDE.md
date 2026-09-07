@@ -91,6 +91,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 ## Conventions
 
 - Kebab-case file names. Explicit named exports in barrels, no `export *`.
+- Worktree seam: the server owns git (`worktree add`, path flattening), the
+  repository owns bootstrap (runs once per new worktree; exit code is the
+  only signal; contents are the repo's business), the repository owns the branch convention
+  (`branchNaming` templates keyed by connection, rendered from
+  provider-supplied facts).
 - Zod v4 schemas in `lib/config.ts` are the single config source; the UI
   mirrors the JSON shape exactly — when one changes, both change.
 - Share libraries within TypeScript; **exec across real boundaries** (repo

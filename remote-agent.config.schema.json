@@ -424,6 +424,52 @@
             "type": "string",
             "minLength": 1
           },
+          "worktreeNaming": {
+            "default": {
+              "*": "{branch}"
+            },
+            "type": "object",
+            "propertyNames": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "*"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                }
+              ]
+            },
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "branchNaming": {
+            "default": {
+              "*": "{branch}"
+            },
+            "type": "object",
+            "propertyNames": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "const": "*"
+                },
+                {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+                }
+              ]
+            },
+            "additionalProperties": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
           "bootstrapCommand": {
             "minItems": 1,
             "type": "array",
@@ -616,6 +662,8 @@
         "required": [
           "root",
           "worktreeRoot",
+          "worktreeNaming",
+          "branchNaming",
           "bootstrapCommand",
           "skillsRoot",
           "workflows",

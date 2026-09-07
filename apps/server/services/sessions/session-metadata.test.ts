@@ -30,6 +30,8 @@ function repository(
     name: id,
     root: `/tmp/${id}`,
     worktreeRoot: `/tmp/${id}-worktrees`,
+    worktreeNaming: { "*": "{branch}" },
+    branchNaming: { "*": "{branch}" },
     bootstrapCommand: ["true"],
     skillsRoot: "agent-skills",
     workflows: {},

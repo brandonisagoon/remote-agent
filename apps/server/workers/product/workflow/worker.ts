@@ -17,7 +17,7 @@ import {
 import { hasLivePersistentSessionForResource } from "../../../services/sessions/runtime-registry.ts";
 import { composeForPrompt, renderSkillToken } from "../../../../../lib/skills/compose.ts";
 import { postWorktreeLinkComment } from "./comment.ts";
-import { isSafeBranchName } from "./branch.ts";
+import { isSafeBranchName, renderBranchName, renderWorktreeName } from "./branch.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 
 type WorkflowEvent = Extract<
@@ -145,8 +145,22 @@ export function createWorkflowWorker(
         return result("ignored", "a live persistent runtime session already handles this issue");
       }
 
-      const branchName = issue.branchName?.trim();
-      if (!branchName) return result("failed", "source issue has no branch name");
+      // Repository-owned convention rendered from provider facts.
+      const template =
+        repository.branchNaming[context.config.activeConnectionId] ??
+        repository.branchNaming["*"] ??
+        "{branch}";
+      const branchName = renderBranchName(template, {
+        branch: issue.branchName,
+        issue: issue.identifier,
+        title: issue.title,
+      });
+      if (!branchName) {
+        return result(
+          "failed",
+          `branch template '${template}' rendered empty — the provider supplied no branch name for this resource`,
+        );
+      }
       if (!isSafeBranchName(branchName)) {
         return result("failed", `unsafe branch name: ${branchName}`);
       }
@@ -166,10 +180,22 @@ export function createWorkflowWorker(
       }
 
       let launched: Awaited<ReturnType<typeof spawnAgentThread>>;
+      let worktreePath = "";
       try {
-        const worktreePath = await (dependencies.provision ?? provisionWorktree)({
+        worktreePath = await (dependencies.provision ?? provisionWorktree)({
           repository,
           branchName,
+          directoryName: renderWorktreeName(
+            repository.worktreeNaming[context.config.activeConnectionId] ??
+              repository.worktreeNaming["*"] ??
+              "{branch}",
+            {
+              branch: issue.branchName,
+              issue: issue.identifier,
+              title: issue.title,
+            },
+            branchName,
+          ),
         });
         const seed = buildWorkflowSeedPrompt(workflow, {
           sourceIssueIdentifier: issue.identifier,
@@ -219,7 +245,7 @@ export function createWorkflowWorker(
       const commentOutcome = await dependencies.postWorktreeComment({
         config: context.config,
         issueId: issue.id,
-        branchName,
+        worktreePath,
         runtimeSessionId: launched.session.id,
         prisma: context.prisma,
       });

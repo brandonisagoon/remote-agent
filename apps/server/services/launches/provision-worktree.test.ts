@@ -49,6 +49,8 @@ function fixture(): RepositoryConfig {
     name: "Fixture",
     root,
     worktreeRoot: path.join(directory, "worktrees"),
+    worktreeNaming: { "*": "{branch}" },
+    branchNaming: { "*": "{branch}" },
     bootstrapCommand: ["bash", "scripts/bootstrap.sh"],
     skillsRoot: "agent-skills",
     workflows: {},

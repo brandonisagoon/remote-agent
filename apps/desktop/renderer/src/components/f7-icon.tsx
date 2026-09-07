@@ -11,6 +11,7 @@ import ChevronRight from "framework7-icons/react/esm/ChevronRight.js";
 import CubeBox from "framework7-icons/react/esm/CubeBox.js";
 import Desktopcomputer from "framework7-icons/react/esm/Desktopcomputer.js";
 import DocOnDoc from "framework7-icons/react/esm/DocOnDoc.js";
+import DocText from "framework7-icons/react/esm/DocText.js";
 import Ellipsis from "framework7-icons/react/esm/Ellipsis.js";
 import ExclamationmarkCircle from "framework7-icons/react/esm/ExclamationmarkCircle.js";
 import Eye from "framework7-icons/react/esm/Eye.js";
@@ -48,6 +49,7 @@ const ICONS = {
   cube_box: CubeBox,
   desktopcomputer: Desktopcomputer,
   doc_on_doc: DocOnDoc,
+  doc_text: DocText,
   exclamationmark_circle: ExclamationmarkCircle,
   eye: Eye,
   eye_slash: EyeSlash,

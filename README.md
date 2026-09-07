@@ -1,10 +1,11 @@
 # Remote Agent
 
 Run durable coding-agent sessions on your own machine, driven from Linear.
-Mention or assign the agent on an issue and Remote Agent starts a session in
-an isolated worktree, routes follow-up comments to the right session (replies
-in an established thread need no re-mention), and posts links that open the
-work in your editor. Sessions are executed by
+Configured workflows react to Linear events — an issue entering a state, a
+reaction — by starting a session in an isolated worktree; comments and
+mentions are routed into the right running session (replies in an
+established thread need no re-mention), and every worktree gets links that
+open the work in your editor. Sessions are executed by
 [acpx](https://acpx.sh/) using the provider CLIs you already have — Codex
 and/or Claude Code — with your own subscriptions and credentials.
 

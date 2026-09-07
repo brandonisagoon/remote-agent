@@ -189,6 +189,24 @@ function registerIpc(file: string): void {
   ipcMain.handle("config:path", () => desktopConfigPath());
   ipcMain.handle("management:checks", () => runChecks());
   ipcMain.handle("editors:detect", () => detectEditors());
+  ipcMain.handle("fs:pick-folder", async (_event, title: string, defaultPath?: string) => {
+    const result = await dialog.showOpenDialog({
+      title,
+      buttonLabel: "Select",
+      ...(defaultPath ? { defaultPath } : {}),
+      properties: ["openDirectory", "createDirectory"],
+    });
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
+  ipcMain.handle("fs:pick-file", async (_event, title: string, defaultPath?: string) => {
+    const result = await dialog.showOpenDialog({
+      title,
+      buttonLabel: "Select",
+      ...(defaultPath ? { defaultPath } : {}),
+      properties: ["openFile", "showHiddenFiles"],
+    });
+    return result.canceled ? null : (result.filePaths[0] ?? null);
+  });
   ipcMain.handle("skills:pick-root", async (_event, defaultPath: string) => {
     const result = await dialog.showOpenDialog({
       title: "Select Skills Root",

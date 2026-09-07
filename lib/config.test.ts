@@ -134,6 +134,24 @@ describe("readConfig", () => {
     expect(() => readConfig()).toThrow("no SSH link format");
   });
 
+  test("branch templates must keep the identifier and reference known connections", () => {
+    const value: any = serviceFile();
+    value.repositories.example.branchNaming = { "*": "agent/{slug}" };
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("must contain {branch} or {issue}");
+
+    value.repositories.example.branchNaming = { "*": "{branch}", "nope": "{issue}" };
+    writeConfig(value);
+    expect(() => readConfig()).toThrow("unknown connection: nope");
+
+    value.repositories.example.branchNaming = { "*": "{branch}", "linear-main": "agent/{issue}-{slug}" };
+    writeConfig(value);
+    expect(readConfig().repository.branchNaming).toEqual({
+      "*": "{branch}",
+      "linear-main": "agent/{issue}-{slug}",
+    });
+  });
+
   test("resolves workflow plan capture and rejects invalid combinations", () => {
     const value: any = serviceFile();
     value.repositories.example.workflows.plan.plan = {

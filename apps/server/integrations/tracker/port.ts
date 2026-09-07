@@ -11,6 +11,13 @@ export interface TrackerTriggerConfig {
  * Linear is the only implementation today. Keeping the surface structural
  * makes the adoption contract explicit without pretending a second adapter
  * exists or forcing the workers to import Linear modules directly.
+ *
+ * Provider contract: the source-resource resolver a provider exposes to the
+ * workflow worker must supply `branchName` — natively (Linear's branch
+ * format) or by the provider's own generated convention (a future Slack or
+ * GitHub adapter, optionally configurable on that connection). The server
+ * only validates branch safety and flattens the name into a worktree
+ * directory; it never invents names.
  */
 export interface TrackerPort {
   verifyWebhookSignature: typeof linear.verifyLinearSignature;

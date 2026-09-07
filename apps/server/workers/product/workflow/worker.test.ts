@@ -47,6 +47,7 @@ function context(overrides: {
 
 interface Recorded {
   provisioned: string[];
+  directories: Array<string | null>;
   launched: Array<Record<string, unknown>>;
   reactions: string[];
   comments: number;
@@ -67,8 +68,9 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
     compose: async (_worktree, prompt, harness) =>
       prompt.replaceAll(/{{SKILL:([a-z0-9+-]+)}}/g, (_m, token) =>
         harness === "claude" ? `/composed-${token}` : `$composed-${token}`),
-    provision: async ({ branchName }) => {
+    provision: async ({ branchName, directoryName }) => {
       record.provisioned.push(branchName);
+      record.directories.push(directoryName ?? null);
       return `/worktrees/${branchName}`;
     },
     launch: (async (input: Record<string, unknown>) => {
@@ -85,7 +87,7 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
 }
 
 function recorded(): Recorded {
-  return { provisioned: [], launched: [], reactions: [], comments: 0, forwarded: [] };
+  return { provisioned: [], directories: [], launched: [], reactions: [], comments: 0, forwarded: [] };
 }
 
 describe("workflow worker", () => {
@@ -96,6 +98,7 @@ describe("workflow worker", () => {
 
     expect(result.status).toBe("delivered");
     expect(record.provisioned).toEqual(["feature/fix-cube-42"]);
+    expect(record.directories).toEqual(["feature-fix-cube-42"]);
     expect(record.launched).toHaveLength(1);
     const launch = record.launched[0]!;
     expect(launch.provider).toBe("codex");
@@ -170,6 +173,33 @@ describe("workflow worker", () => {
     const result = await worker.execute(issueEvent("gone") as never, context());
     expect(result.status).toBe("failed");
     expect(result.detail).toContain("no longer configured");
+  });
+
+  test("the repository's branch template overrides the provider's name", async () => {
+    const record = recorded();
+    const worker = createWorkflowWorker(dependencies(record));
+    const base = testConfig();
+    const repository = {
+      ...base.repository,
+      branchNaming: { "*": "agent/{issue}-{title}" },
+    };
+    const templateContext = { ...context(), config: { ...base, repository } };
+    const result = await worker.execute(issueEvent("plan") as never, templateContext);
+    expect(result.status).toBe("delivered");
+    expect(record.provisioned).toEqual(["agent/cube-42-fix-the-flaky-test"]);
+  });
+
+  test("per-connection worktree templates shape the directory", async () => {
+    const record = recorded();
+    const worker = createWorkflowWorker(dependencies(record));
+    const base = testConfig();
+    const repository = {
+      ...base.repository,
+      worktreeNaming: { "*": "{branch}", [base.activeConnectionId]: "{issue}" },
+    };
+    const overrideContext = { ...context(), config: { ...base, repository } };
+    await worker.execute(issueEvent("plan") as never, overrideContext);
+    expect(record.directories).toEqual(["cube-42"]);
   });
 
   test("launches carry workflow provenance and plan mode when capture is on", async () => {

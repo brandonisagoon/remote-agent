@@ -11,17 +11,20 @@ The managed repository provides:
 
 - a stable checkout at `repositories.<id>.root`;
 - a worktree parent at `repositories.<id>.worktreeRoot`;
-- `repositories.<id>.bootstrapCommand`, invoked in a new worktree;
+- `repositories.<id>.bootstrapCommand`, invoked once in each new worktree
+  (after checkout, before the session);
 - [skill-composer](https://github.com/brandonisagoon/skill-composer) as a dev
   dependency, with skillsets under `repositories.<id>.skillsRoot` (default
   `agent-skills/`) — the instructions workflows compose into sessions;
 - any project-specific tools, dependencies, or authentication needed by the
   configured Codex/Claude commands.
 
-The bootstrap command should be idempotent, must create the workspace stamp
-files expected by the worktree readiness check, and must install the
-repository's dependencies — workflow skill composition runs the repository's
-own `node_modules/.bin/skill-composer` inside the fresh worktree.
+The bootstrap command runs exactly once per worktree the server creates; a
+non-zero exit fails the launch before any session exists. What it does
+inside the worktree is the repository's business — the one downstream
+expectation is that workflow skill composition execs the worktree's own
+`node_modules/.bin/skill-composer`, so a repo using workflows must end up
+with its dependencies installed.
 
 ## Service-owned contract
 
@@ -33,7 +36,18 @@ Remote Agent owns:
   provisions a worktree, composes the skill, and spawns a session;
   `message-session` composes in the running session's worktree and forwards);
 - worktree creation and skill composition (always the repository's own
-  skill-composer binary, executed in a child process);
+  skill-composer binary, executed in a child process). A worktree is created
+  only by a `start-session` workflow whose issue has a branch name, when
+  that branch doesn't exist yet and no live session handles the issue; the
+  directory is the branch name with slashes flattened to hyphens under
+  `worktreeRoot`. Branch names come from the repository's
+  `branchNaming` templates (keyed by connection, `"*"` default `{branch}`)
+  rendered from provider facts — `{branch}` the provider's suggested name,
+  `{issue}` the identifier, `{title}` the title, slugified; templates must keep
+  `{branch}` or `{issue}`. The worktree directory comes from the repository's
+  `worktreeNaming` templates (keyed by connection like `branchNaming`,
+  default `{branch}` = the rendered branch), flattened for the filesystem. The server validates, never
+  invents;
 - stable runtime identity, session labels, relationships, and integration
   links in SQLite. Storage is provider-neutral: webhook receipts, session
   mirrors, and resource links all carry a `provider` column, so future

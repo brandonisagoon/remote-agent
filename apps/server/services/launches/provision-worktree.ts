@@ -6,13 +6,19 @@ import type { RepositoryConfig } from "../../../../lib/config.ts";
 export interface ProvisionWorktreeInput {
   repository: RepositoryConfig;
   branchName: string;
+  /** Directory name under worktreeRoot; defaults to the flattened branch. */
+  directoryName?: string;
   baseBranch?: string;
 }
 
-async function run(args: string[], cwd: string): Promise<void> {
+async function run(
+  args: string[],
+  cwd: string,
+  env: Record<string, string> = {},
+): Promise<void> {
   const child = Bun.spawn(args, {
     cwd,
-    env: Bun.env,
+    env: { ...Bun.env, ...env },
     stdin: "ignore",
     stdout: "inherit",
     stderr: "inherit",
@@ -31,20 +37,19 @@ export function worktreePathForBranch(
   return path.join(worktreeRoot, safeName);
 }
 
-export async function provisionWorktree(
+/** Server-owned phase: the git surgery. Derives the directory from the
+    branch (provider-supplied — the server never invents branch names) and
+    creates the branch + working copy off the base in one step. */
+async function createWorktree(
   input: ProvisionWorktreeInput,
-): Promise<string> {
-  const { repository } = input;
-  const worktreePath = worktreePathForBranch(
-    repository.worktreeRoot,
-    input.branchName,
-  );
-  mkdirSync(repository.worktreeRoot, { recursive: true });
+  worktreePath: string,
+): Promise<void> {
+  mkdirSync(input.repository.worktreeRoot, { recursive: true });
   await run(
     [
       "git",
       "-C",
-      repository.root,
+      input.repository.root,
       "worktree",
       "add",
       "-b",
@@ -52,8 +57,27 @@ export async function provisionWorktree(
       worktreePath,
       input.baseBranch ?? "main",
     ],
-    repository.root,
+    input.repository.root,
   );
-  await run(repository.bootstrapCommand, worktreePath);
+}
+
+/** Repository-owned phase: the repo's own bootstrap command, run once in
+    the fresh worktree. The server's entire contract: non-zero exit fails
+    the launch. What the command does is the repository's business. */
+async function runRepositoryBootstrap(
+  input: ProvisionWorktreeInput,
+  worktreePath: string,
+): Promise<void> {
+  await run(input.repository.bootstrapCommand, worktreePath);
+}
+
+export async function provisionWorktree(
+  input: ProvisionWorktreeInput,
+): Promise<string> {
+  const worktreePath = input.directoryName
+    ? path.join(input.repository.worktreeRoot, input.directoryName)
+    : worktreePathForBranch(input.repository.worktreeRoot, input.branchName);
+  await createWorktree(input, worktreePath);
+  await runRepositoryBootstrap(input, worktreePath);
   return worktreePath;
 }
