@@ -1,0 +1,32 @@
+{
+    "version": "0.1.0",
+    "description": "GUI for the Remote Agent server: settings, status checklist, sessions",
+    "homepage": "https://github.com/brandonisagoon/remote-agent",
+    "license": "MIT",
+    "url": "https://github.com/brandonisagoon/remote-agent/releases/download/v0.1.0/remote-agent-0.1.0-setup.exe",
+    "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+    "installer": {
+        "args": [
+            "/S",
+            "/D=$dir\\app"
+        ]
+    },
+    "uninstaller": {
+        "file": "app\\Uninstall Remote Agent.exe",
+        "args": [
+            "/S"
+        ]
+    },
+    "shortcuts": [
+        [
+            "app\\Remote Agent.exe",
+            "Remote Agent"
+        ]
+    ],
+    "checkver": {
+        "github": "https://github.com/brandonisagoon/remote-agent"
+    },
+    "autoupdate": {
+        "url": "https://github.com/brandonisagoon/remote-agent/releases/download/v$version/remote-agent-$version-setup.exe"
+    }
+}

@@ -100,20 +100,39 @@ jobs:
         run: gh release upload "${{ github.ref_name }}" (Get-Item dist/*.exe) --clobber
 
   bump-formula:
-    needs: release
+    needs: [release, gui-macos, gui-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
-      - name: Render and commit formula
+      - name: Render formula, cask, and scoop manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          SHA256=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/v$VERSION.tar.gz" | shasum -a 256 | cut -d' ' -f1)
-          sed -i -e "s|url \".*\"$|url \"https://github.com/${{ github.repository }}/archive/refs/tags/v$VERSION.tar.gz\"|" \
-                 -e "s|sha256 \".*\"$|sha256 \"$SHA256\"|" Formula/remote-agent.rb
+          REPO="https://github.com/${{ github.repository }}"
+          sha() { curl -sL "$1" | shasum -a 256 | cut -d' ' -f1; }
+          SRC_SHA=$(sha "$REPO/archive/refs/tags/v$VERSION.tar.gz")
+          ARM_SHA=$(sha "$REPO/releases/download/v$VERSION/remote-agent-$VERSION-arm64.dmg")
+          X64_SHA=$(sha "$REPO/releases/download/v$VERSION/remote-agent-$VERSION-x64.dmg")
+          EXE_SHA=$(sha "$REPO/releases/download/v$VERSION/remote-agent-$VERSION-setup.exe")
+          # CLI formula (source tarball).
+          sed -i -e "s|url \".*\"$|url \"$REPO/archive/refs/tags/v$VERSION.tar.gz\"|" \
+                 -e "s|sha256 \".*\"$|sha256 \"$SRC_SHA\"|" Formula/remote-agent.rb
+          # GUI cask (per-arch DMGs).
+          sed -i -e "s|version \".*\"$|version \"$VERSION\"|" \
+                 -e "s|sha256 arm:   \".*\",$|sha256 arm:   \"$ARM_SHA\",|" \
+                 -e "s|intel: \".*\"$|intel: \"$X64_SHA\"|" Casks/remote-agent.rb
+          # Scoop: CLI (source zip) and GUI (installer).
+          jq --arg v "$VERSION" \
+             '.version=$v | .url="'"$REPO"'/archive/refs/tags/v"+$v+".zip" | .extract_dir="remote-agent-"+$v' \
+             bucket/remote-agent.json > tmp.json && mv tmp.json bucket/remote-agent.json
+          jq --arg v "$VERSION" --arg h "$EXE_SHA" \
+             '.version=$v | .url="'"$REPO"'/releases/download/v"+$v+"/remote-agent-"+$v+"-setup.exe" | .hash=$h' \
+             bucket/remote-agent-gui.json > tmp.json && mv tmp.json bucket/remote-agent-gui.json
           git config user.name "release-bot"
           git config user.email "noreply@github.com"
-          git add Formula/remote-agent.rb
-          git diff --cached --quiet || git commit -m "Formula: remote-agent $VERSION"
+          git add Formula/remote-agent.rb Casks/remote-agent.rb bucket/remote-agent.json bucket/remote-agent-gui.json
+          git diff --cached --quiet || git commit -m "Release manifests: $VERSION"
           git push

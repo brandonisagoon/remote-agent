@@ -155,7 +155,8 @@ SSH connection does not end a session; only an explicit close or end does.
 
 ## Setup
 
-**1. Install the CLI.** This repo is its own Homebrew tap and Scoop bucket.
+**1. Install the CLI.** This repo is its own Homebrew tap (formula and
+cask) and Scoop bucket.
 
 macOS:
 
@@ -214,11 +215,25 @@ skillsets under `agent-skills/`, and commit a `.remote-agent.config.json`
 workflows, and labels. Then add the checkout to your machine config. See
 [docs/adoption.md](docs/adoption.md) for the full contract.
 
-**5. Optionally install the GUI** from the
+**5. Optionally install the GUI.** From the same tap and bucket:
+
+macOS:
+
+```sh
+brew install --cask remote-agent
+```
+
+Windows:
+
+```powershell
+scoop install remote-agent-gui
+```
+
+Or download it from the
 [releases page](https://github.com/brandonisagoon/remote-agent/releases)
 (DMG on macOS, installer on Windows). It edits both config files with a
 settings UI, shows the same checklist as `doctor` with buttons attached,
-and lists sessions. Every release ships the CLI and app together, one
+and lists sessions. Every release ships the CLI and GUI together, one
 version.
 
 **6. Attach an ACP client.** Configure Zed, bb, or T3 Code to run

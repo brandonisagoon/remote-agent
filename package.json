@@ -84,9 +84,22 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        "dmg",
-        "zip"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "arm64",
+            "x64"
+          ]
+        }
       ],
+      "artifactName": "remote-agent-${version}-${arch}.${ext}",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
@@ -97,7 +110,8 @@
     "win": {
       "target": [
         "nsis"
-      ]
+      ],
+      "artifactName": "remote-agent-${version}-setup.${ext}"
     },
     "directories": {
       "buildResources": "build",

@@ -66,15 +66,16 @@ schema with `bun run config:schema`.
 - Conventions and vocabulary live in `CLAUDE.md` / `AGENTS.md` (mirrored).
 - `bin/remote-agent` (and `.cmd`) — the CLI wrappers package managers put on
   PATH.
-- `Formula/` and `bucket/` — this repo is its own Homebrew tap and Scoop
-  bucket.
+- `Formula/` (CLI), `Casks/` (GUI), and `bucket/` (CLI + GUI) — this repo
+  is its own Homebrew tap and Scoop bucket.
 
 ## Releases
 
 Single cadence: tag `vX.Y.Z` and `.github/workflows/release.yml` runs tests,
 creates the GitHub release (whose source tarball is what brew/scoop install),
-builds the desktop artifacts for macOS and Windows, and commits the rendered
-formula back to `main`. Signing (Apple Developer ID + notarization, Azure
+builds the GUI artifacts for macOS (arm64 and x64 DMGs) and Windows (NSIS
+installer), then commits the rendered formula, cask, and Scoop manifests
+back to `main`. Signing (Apple Developer ID + notarization, Azure
 Trusted Signing) activates automatically once the CI secrets exist; without
 them the artifacts build unsigned.
 
