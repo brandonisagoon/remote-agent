@@ -1,0 +1,27 @@
+/// Idempotency and intake audit record for an inbound provider webhook.
+model WebhookReceipt {
+  id           String  @id @default(cuid())
+  provider     String  @default("linear")
+  deliveryId   String
+  webhookId    String  @default("legacy")
+  connectionId String  @default("legacy")
+  repositoryId String  @default("legacy")
+  eventType    String
+  trigger      String?
+  /// The container resource the event concerns (issue, PR, channel).
+  resourceType String  @default("issue")
+  resourceId   String?
+  /// The threadable item within it (comment, message).
+  commentId    String?
+  status       String
+  detail       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  runs WorkerRun[]
+
+  @@index([resourceId])
+  @@index([createdAt])
+  @@unique([webhookId, deliveryId])
+}

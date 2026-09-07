@@ -1,5 +1,7 @@
 node_modules/
-src/generated/prisma/
+out/
+dist/
+generated/prisma/
 *.sqlite
 *.sqlite-journal
 *.sqlite-shm
@@ -7,4 +9,6 @@ src/generated/prisma/
 .env
 .env.*
 !.env.example
+# Contains API keys and webhook secrets. Commit only the redacted example.
+remote-agent.config.json
 .DS_Store

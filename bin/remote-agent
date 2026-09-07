@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Runs the CLI from the checkout this script lives in. Package managers and
+# the desktop app's Install CLI both symlink to this file — often with
+# RELATIVE link targets (Homebrew does) — so resolve each hop against the
+# link's own directory, not the caller's cwd.
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+ROOT="$(cd "$(dirname "$SOURCE")/.." && pwd)"
+exec bun "$ROOT/apps/cli/main.ts" "$@"

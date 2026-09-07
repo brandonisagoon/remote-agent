@@ -1,0 +1,119 @@
+# Single-cadence release: tag vX.Y.Z → tests → GitHub release (source
+# tarball for brew/scoop) → GUI artifacts → tap bump.
+#
+# Signing is env-gated so releases work before the accounts exist:
+#   macOS  — MAC_CERT_P12 / MAC_CERT_PASSWORD / APPLE_ID / APPLE_APP_PASSWORD /
+#            APPLE_TEAM_ID  (Developer ID + notarytool)
+#   Windows — AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET /
+#            TRUSTED_SIGNING_ENDPOINT / TRUSTED_SIGNING_ACCOUNT /
+#            TRUSTED_SIGNING_PROFILE  (Azure Trusted Signing)
+# This repo is its own brew tap (Formula/) and scoop bucket (bucket/); the
+# bump-formula job commits the rendered formula back to the default branch
+# after tagging, so the formula lands one commit behind the tag.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma generate
+      - run: bunx tsc --noEmit
+      - run: bun test
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" --generate-notes
+
+  gui-macos:
+    needs: release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma generate
+      - name: Import signing certificate
+        if: ${{ secrets.MAC_CERT_P12 != '' }}
+        env:
+          MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          echo "$MAC_CERT_P12" | base64 --decode > certificate.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import certificate.p12 -k build.keychain -P "$MAC_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci build.keychain
+      - name: Build, sign, notarize
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: ${{ secrets.MAC_CERT_P12 != '' }}
+        run: bun run desktop:dist
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" dist/*.dmg dist/*.zip --clobber
+
+  gui-windows:
+    needs: release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bunx prisma generate
+      - name: Build installer
+        run: bun run desktop:dist
+      - name: Sign installer (Azure Trusted Signing)
+        if: ${{ secrets.AZURE_CLIENT_ID != '' }}
+        uses: azure/trusted-signing-action@v5
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.TRUSTED_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.TRUSTED_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.TRUSTED_SIGNING_PROFILE }}
+          files-folder: dist
+          files-folder-filter: exe
+      - name: Upload artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" (Get-Item dist/*.exe) --clobber
+
+  bump-formula:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Render and commit formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          SHA256=$(curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/v$VERSION.tar.gz" | shasum -a 256 | cut -d' ' -f1)
+          sed -i -e "s|url \".*\"$|url \"https://github.com/${{ github.repository }}/archive/refs/tags/v$VERSION.tar.gz\"|" \
+                 -e "s|sha256 \".*\"$|sha256 \"$SHA256\"|" Formula/remote-agent.rb
+          git config user.name "release-bot"
+          git config user.email "noreply@github.com"
+          git add Formula/remote-agent.rb
+          git diff --cached --quiet || git commit -m "Formula: remote-agent $VERSION"
+          git push

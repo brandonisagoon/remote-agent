@@ -1,0 +1,25 @@
+{
+    "version": "0.1.0",
+    "description": "Control plane for acpx-backed coding-agent sessions driven by Linear",
+    "homepage": "https://github.com/brandonisagoon/remote-agent",
+    "license": "MIT",
+    "url": "https://github.com/brandonisagoon/remote-agent/archive/refs/tags/v0.1.0.zip",
+    "extract_dir": "remote-agent-0.1.0",
+    "depends": [
+        "bun",
+        "cloudflared"
+    ],
+    "bin": [
+        [
+            "bin\\remote-agent.cmd",
+            "remote-agent"
+        ]
+    ],
+    "checkver": {
+        "github": "https://github.com/brandonisagoon/remote-agent"
+    },
+    "autoupdate": {
+        "url": "https://github.com/brandonisagoon/remote-agent/archive/refs/tags/v$version.zip",
+        "extract_dir": "remote-agent-$version"
+    }
+}
