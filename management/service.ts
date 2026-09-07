@@ -151,10 +151,6 @@ export function cliEntryPath(): string {
   return path.join(appRoot, "bin", "remote-agent");
 }
 
-export function cliInstalled(): boolean {
-  return existsSync(CLI_LINK);
-}
-
 /** Opens the user's terminal with a command prefilled, so privileged or
     account-bound steps (sudo, brew, cloudflared login) run in their own
     shell — never from the app. */

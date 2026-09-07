@@ -13,7 +13,7 @@ import {
 import { getMachine, MachineSchema } from "../../../../lib/machines/index.ts";
 import { spawnAgentThread } from "../../services/launches/index.ts";
 import {
-  HarnessSchema,
+  ProviderIdSchema,
   SourceIssueIdentifierSchema,
   SessionLifecycleSchema,
   SessionRoleSchema,
@@ -21,7 +21,7 @@ import {
 
 const LaunchSchema = z.object({
   issueIdentifier: SourceIssueIdentifierSchema,
-  harness: HarnessSchema,
+  harness: ProviderIdSchema,
   model: z.string().min(1).max(128).optional(),
   prompt: z.string().min(1).max(100_000),
   machine: MachineSchema,
@@ -77,8 +77,10 @@ route.post("/", async (c) => {
   }
 
   try {
+    const { harness, ...rest } = parsed.data;
     const launched = await spawnAgentThread({
-      ...parsed.data,
+      ...rest,
+      provider: harness,
       launchKey:
         parsed.data.launchKey ??
         `api:${parsed.data.issueIdentifier}:${parsed.data.role}:${parsed.data.branchName ?? parsed.data.worktreePath}`,

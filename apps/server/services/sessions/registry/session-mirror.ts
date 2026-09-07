@@ -6,6 +6,8 @@ interface SessionMirrorInput {
   sessionKey: string;
   externalId: string;
   externalRef?: string | null;
+  provider?: string;
+  connectionId?: string;
   machineId?: string | null;
   lastEventId?: string | null;
   lastGeneration?: number | bigint | null;
@@ -59,6 +61,8 @@ export async function upsertSessionMirror(
         sessionKey: input.sessionKey,
         externalId: input.externalId,
         externalRef: input.externalRef ?? null,
+        ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.connectionId ? { connectionId: input.connectionId } : {}),
         ...runtime,
         lastEventId: input.lastEventId ?? null,
         lastGeneration: generation(input.lastGeneration),
@@ -82,9 +86,13 @@ export function updateSessionMirror(
   return prisma.sessionMirror.update({
     where: { sessionKey: input.sessionKey },
     data: {
-      machineId: input.machineId ?? null,
-      lastEventId: input.lastEventId ?? null,
-      lastGeneration: generation(input.lastGeneration),
+      // Only touch what the caller provided; a partial update must not null
+      // the omitted columns.
+      ...(input.machineId !== undefined ? { machineId: input.machineId } : {}),
+      ...(input.lastEventId !== undefined ? { lastEventId: input.lastEventId } : {}),
+      ...(input.lastGeneration !== undefined
+        ? { lastGeneration: generation(input.lastGeneration) }
+        : {}),
     },
   });
 }

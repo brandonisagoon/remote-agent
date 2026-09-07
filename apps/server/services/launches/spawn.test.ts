@@ -14,7 +14,7 @@ function launchInput(
     agentRuntime: createFakeAgentRuntime(),
     launchKey: "run-3278",
     issueIdentifier: "CUBE-3278",
-    harness: "claude",
+    provider: "claude",
     model: "fable",
     prompt: "Plan CUBE-3278",
     machine: "macbook-air",

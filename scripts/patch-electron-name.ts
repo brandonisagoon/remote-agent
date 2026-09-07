@@ -13,6 +13,10 @@ if (process.platform !== "darwin") process.exit(0);
 
 const electronRoot = path.resolve(import.meta.dir, "..", "node_modules", "electron");
 const dist = path.join(electronRoot, "dist");
+// Deployed server installs run `bun install` too (prisma/tsc are devDeps)
+// but have no Electron dist and may lack codesign/plutil — never fail the
+// install over dev-only branding.
+if (!existsSync(dist)) process.exit(0);
 const stock = path.join(dist, "Electron.app");
 const branded = path.join(dist, "Remote Agent.app");
 
@@ -26,20 +30,29 @@ if (existsSync(stock)) {
 }
 if (!existsSync(branded)) process.exit(0);
 
-const plist = path.join(branded, "Contents", "Info.plist");
-const current = await $`plutil -extract CFBundleName raw ${plist}`.text();
-if (current.trim() !== "Remote Agent") {
-  await $`plutil -replace CFBundleName -string "Remote Agent" ${plist}`;
-  await $`plutil -replace CFBundleDisplayName -string "Remote Agent" ${plist}`;
-  // The Dock prefers the localized display name; the lproj ships empty.
-  await Bun.write(
-    path.join(branded, "Contents", "Resources", "en.lproj", "InfoPlist.strings"),
-    'CFBundleName = "Remote Agent";\nCFBundleDisplayName = "Remote Agent";\n',
-  );
-  // Editing the plist invalidates Electron's signature.
-  await $`codesign --force --deep --sign - ${branded}`.quiet();
-}
+// Branding is dev-only polish; a headless/deployed install lacking codesign
+// or plutil access must never fail `bun install` over it.
+try {
+  const plist = path.join(branded, "Contents", "Info.plist");
+  const current = await $`plutil -extract CFBundleName raw ${plist}`.text();
+  if (current.trim() !== "Remote Agent") {
+    await $`plutil -replace CFBundleName -string "Remote Agent" ${plist}`;
+    await $`plutil -replace CFBundleDisplayName -string "Remote Agent" ${plist}`;
+    // The Dock prefers the localized display name; the lproj ships empty.
+    await Bun.write(
+      path.join(branded, "Contents", "Resources", "en.lproj", "InfoPlist.strings"),
+      'CFBundleName = "Remote Agent";\nCFBundleDisplayName = "Remote Agent";\n',
+    );
+    // Editing the plist invalidates Electron's signature.
+    await $`codesign --force --deep --sign - ${branded}`.quiet();
+  }
 
-// LaunchServices caches display names per bundle path.
-await $`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f ${branded}`.quiet();
-console.log("Patched Electron dev bundle to Remote Agent.app");
+  // LaunchServices caches display names per bundle path.
+  await $`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f ${branded}`.quiet();
+  console.log("Patched Electron dev bundle to Remote Agent.app");
+} catch (error) {
+  console.warn(
+    "Skipping Electron dev branding:",
+    error instanceof Error ? error.message : error,
+  );
+}

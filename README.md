@@ -28,6 +28,12 @@ scoop install remote-agent
 
 This also installs the runtime dependencies, Bun and cloudflared.
 
+> Until the first tagged release exists, install from a clone instead:
+> `git clone`, `bun install`, copy `remote-agent.config.example.json` to
+> `remote-agent.config.json` and edit it, then run `bun run cli -- install`
+> **from the clone root** (config discovery is relative to the working
+> directory).
+
 **2. Create your config and provision the server:**
 
 ```sh

@@ -61,8 +61,12 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 
 ## Vocabulary (enforced across JSON, code, and UI)
 
-- **provider** (codex | claude) — never "harness" (except skill-composer's own
-  `harnesses` API).
+- **provider** (codex | claude) — never "harness". Frozen carve-outs:
+  skill-composer's own `harnesses` API; the `harness` JSON field key in the
+  `/api/launches` and `/api/session-events` request bodies (wire contracts
+  with repo hooks — internal identifiers around them still say provider);
+  the "Harness session ID" description row and `Harness /` Linear labels
+  (provider-side data formats).
 - **label groups / labels** — `repositories.<id>.labels` +
   `sessionDefaults.labels`; `exclusive` (not cardinality), `routerVisible`.
   The Prisma `tags` rows are the one storage-internal exception, mapped to
@@ -72,8 +76,12 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `commentId` — container + threadable item); a session mirror is the
   provider-side object mirroring a session (Linear agent issue today).
   `WorkerRun.targetResourceId` names delivery targets. Provider-specific
-  vocabulary (AgentIssue, Linear webhook shapes) is allowed only inside
-  `apps/server/integrations/<provider>/`; the `"Harness session ID"` string in
+  vocabulary (AgentIssue, Linear webhook shapes) belongs inside
+  `apps/server/integrations/<provider>/` — documented exceptions: the
+  agent-issue mirror lifecycle (`apps/server/services/sessions/lifecycle/
+  agent-issue/`, `types/sessions/agent-issue.ts`) and the resolved-config
+  `linearApiKey`/`agentTeamKey` accessors, both pending the multi-provider
+  work; the `"Harness session ID"` string in
   agent-issue descriptions is Linear-side data format, not code vocabulary.
 - **connection** owns machineId, repository allowlist, one webhook, router,
   editors. **machine** is physical (server, sockets, sshHost, installation).

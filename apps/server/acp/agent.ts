@@ -11,7 +11,7 @@ import type {
 } from "../../../types/runtime/index.ts";
 import { acpLog } from "./log.ts";
 
-const HARNESS_ID = "harness";
+const PROVIDER_ID = "provider";
 const MODEL_ID = "model";
 const MODE_ID = "mode";
 const REASONING_ID = "reasoning_effort";
@@ -194,6 +194,7 @@ export class RemoteAgentAcpAgent implements acp.Agent {
     this.publishUsageAfterSetup(session);
     return {
       configOptions: this.configOptions(session),
+      modes: this.sessionModes(session),
       _meta: this.sessionMeta(session),
     };
   }
@@ -233,12 +234,12 @@ export class RemoteAgentAcpAgent implements acp.Agent {
     params: acp.SetSessionConfigOptionRequest,
   ): Promise<acp.SetSessionConfigOptionResponse> {
     let session = await this.requireSession(params.sessionId);
-    if (params.configId === HARNESS_ID) {
+    if (params.configId === PROVIDER_ID) {
       if (typeof params.value !== "string") {
-        throw acp.RequestError.invalidParams({ message: "harness must be a select value" });
+        throw acp.RequestError.invalidParams({ message: "provider must be a select value" });
       }
       if (params.value !== "codex" && params.value !== "claude") {
-        throw acp.RequestError.invalidParams({ message: "unsupported harness" });
+        throw acp.RequestError.invalidParams({ message: "unsupported provider" });
       }
       session = await this.runtime.switchAgent(session.id, params.value);
       return { configOptions: this.configOptions(session) };
@@ -369,10 +370,10 @@ export class RemoteAgentAcpAgent implements acp.Agent {
   private configOptions(session: AgentRuntimeSession): acp.SessionConfigOption[] {
     const normalized: acp.SessionConfigOption[] = [
       {
-        id: HARNESS_ID,
-        name: "Harness",
-        description: "Agent harness backing this session.",
-        category: "_harness",
+        id: PROVIDER_ID,
+        name: "Provider",
+        description: "Agent provider backing this session.",
+        category: "_provider",
         type: "select",
         currentValue: session.agent,
         options: [

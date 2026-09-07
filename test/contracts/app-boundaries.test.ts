@@ -35,21 +35,34 @@ function tsFiles(directory: string): string[] {
 
 const IMPORT_RE = /(?:from|import)\s*\(?\s*["'](\.\.?\/[^"']+)["']/g;
 
+/** Walks the app's import graph TRANSITIVELY: a kernel file that itself
+    reaches into apps/server would silently drag the server into an app
+    bundle, so kernel files reachable from an app are checked too. */
 function violations(appDirectory: string): string[] {
-  const appRoot = path.join(ROOT, appDirectory);
   const found: string[] = [];
-  for (const file of tsFiles(appRoot)) {
-    const source = readFileSync(file, "utf8");
+  const visited = new Set<string>();
+  const queue = tsFiles(path.join(ROOT, appDirectory)).map((file) =>
+    path.relative(ROOT, file).replace(/\\/g, "/"),
+  );
+  while (queue.length > 0) {
+    const file = queue.pop()!;
+    if (visited.has(file)) continue;
+    visited.add(file);
+    const source = readFileSync(path.join(ROOT, file), "utf8");
     for (const match of source.matchAll(IMPORT_RE)) {
       const resolved = path
-        .relative(ROOT, path.resolve(path.dirname(file), match[1]!))
+        .relative(ROOT, path.resolve(ROOT, path.dirname(file), match[1]!))
         .replace(/\\/g, "/");
-      if (resolved.startsWith(`${appDirectory}/`)) continue;
       if (resolved.startsWith("out/")) continue; // build products (preload cjs)
-      if (KERNEL_PREFIXES.some((prefix) => resolved === prefix || resolved.startsWith(prefix))) {
+      const inApp = resolved.startsWith(`${appDirectory}/`);
+      const inKernel = KERNEL_PREFIXES.some(
+        (prefix) => resolved === prefix || resolved.startsWith(prefix),
+      );
+      if (!inApp && !inKernel) {
+        found.push(`${file} -> ${resolved}`);
         continue;
       }
-      found.push(`${path.relative(ROOT, file)} -> ${resolved}`);
+      if (/\.(ts|tsx|mts)$/.test(resolved)) queue.push(resolved);
     }
   }
   return found;

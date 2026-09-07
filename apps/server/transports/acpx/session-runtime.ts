@@ -186,14 +186,22 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     try {
       const sessionId = await this.sessionIdForAcpSession(request.sessionId);
       if (!sessionId) return undefined;
-      const decision = await interceptor(
-        { sessionId, raw: request.raw },
-        context,
-      );
+      // Interception is observational; a broken OR HANGING interceptor must
+      // never block the turn — after the cap the runtime's policy answers
+      // and whatever the interceptor was persisting finishes in the
+      // background (or fails and logs on its own).
+      const decision = await Promise.race([
+        interceptor({ sessionId, raw: request.raw }, context),
+        new Promise<undefined>((resolve) => {
+          const timer = setTimeout(() => resolve(undefined), 60_000);
+          context.signal.addEventListener("abort", () => {
+            clearTimeout(timer);
+            resolve(undefined);
+          });
+        }),
+      ]);
       return decision ? { outcome: decision.outcome } : undefined;
     } catch {
-      // Interception is observational; a broken interceptor must never
-      // block the turn — the runtime's own policy answers instead.
       return undefined;
     }
   }

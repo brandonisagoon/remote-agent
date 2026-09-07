@@ -84,5 +84,6 @@ Deployed installations update themselves from git via `remote-agent update`
 ## Design history
 
 The migration inventory and design decisions are recorded in
-[docs/acpx-migration-plan.md](docs/acpx-migration-plan.md); the managed-
-repository contract is in [docs/adoption.md](docs/adoption.md).
+[docs/acpx-migration-plan.md](docs/acpx-migration-plan.md) and the ADRs
+under [docs/adr/](docs/adr/); the managed-repository contract is in
+[docs/adoption.md](docs/adoption.md).

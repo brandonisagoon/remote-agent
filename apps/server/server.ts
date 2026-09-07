@@ -5,6 +5,7 @@ import { createAcpxSessionRuntime } from "./transports/acpx/index.ts";
 import { startAcpIpcServer } from "./acp/ipc-server.ts";
 import { acquireRuntimeOwnership } from "./services/sessions/runtime-owner.ts";
 import { createPlanCaptureInterceptor } from "./services/sessions/plan-capture.ts";
+import { startRuntimeEventProjection } from "./services/sessions/runtime-events/projection.ts";
 
 const config = readConfig();
 const runtimeOwnership = acquireRuntimeOwnership(config);
@@ -14,6 +15,13 @@ const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   onPermissionRequest: createPlanCaptureInterceptor({ prisma, config }),
 });
 const acpIpcServer = await startAcpIpcServer({ config, runtime: agentRuntime });
+// Drains the lifecycle journal into Linear (mirror state, checkpoint
+// comments) and prunes it; without this the journal grows unbounded.
+const stopProjection = startRuntimeEventProjection({
+  config,
+  prisma,
+  runtime: agentRuntime,
+});
 
 const app = createApp({ config, agentRuntime, prisma });
 
@@ -29,6 +37,7 @@ console.log(`remote-agent listening on http://${config.hostname}:${config.port}`
 // than being left for the next process to recover.
 async function shutdown(signal: string): Promise<void> {
   console.log(`Received ${signal}, shutting down`);
+  await stopProjection();
   await acpIpcServer.close();
   await agentRuntime.shutdown();
   await server.stop();

@@ -1,4 +1,4 @@
-export type { Harness } from "./harness.ts";
+export type { ProviderId } from "./provider.ts";
 export type {
   AgentElicitationHandler,
   AgentPermissionDecision,

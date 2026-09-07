@@ -28,7 +28,7 @@ export {
 } from "./selection/index.ts";
 export { startRuntimeEventProjection } from "./runtime-events/index.ts";
 export {
-  HarnessSchema,
+  ProviderIdSchema,
   MachineSchema,
   SessionLifecycleSchema,
   SessionLifecycleEventSchema,

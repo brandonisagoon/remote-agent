@@ -1,5 +1,5 @@
 export {
-  HarnessSchema,
+  ProviderIdSchema,
   MachineSchema,
   SessionLifecycleEventSchema,
   SessionRoleSchema,

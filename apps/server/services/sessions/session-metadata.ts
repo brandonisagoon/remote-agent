@@ -31,16 +31,16 @@ function validateValues(
   const definition = definitionFor(repository, key);
   const normalized = [...new Set(values.map((value) => value.trim()))];
   if (normalized.some((value) => value.length === 0)) {
-    throw new Error(`tag ${key} contains an empty value`);
+    throw new Error(`label group ${key} contains an empty value`);
   }
   if (definition.exclusive && normalized.length > 1) {
-    throw new Error(`tag ${key} accepts only one value`);
+    throw new Error(`label group ${key} accepts only one value`);
   }
   if (definition.labels) {
     for (const value of normalized) {
       if (!definition.labels.includes(value)) {
         throw new Error(
-          `tag ${key} value is not configured for repository ${repository.id}: ${value}`,
+          `label ${key} value is not configured for repository ${repository.id}: ${value}`,
         );
       }
     }
@@ -81,7 +81,7 @@ export function resolveInitialSessionLabels(
 export async function readSessionLabels(
   prisma: PrismaClient,
   runtimeSessionId: string,
-): Promise<{ revision: number; tags: Record<string, string[]> }> {
+): Promise<{ revision: number; labels: Record<string, string[]> }> {
   const session = await prisma.runtimeSession.findUnique({
     where: { id: runtimeSessionId },
     select: {
@@ -90,9 +90,9 @@ export async function readSessionLabels(
     },
   });
   if (!session) throw new Error(`runtime session not found: ${runtimeSessionId}`);
-  const tags: Record<string, string[]> = {};
-  for (const tag of session.tags) (tags[tag.key] ??= []).push(tag.value);
-  return { revision: session.metadataRevision, tags };
+  const labels: Record<string, string[]> = {};
+  for (const tag of session.tags) (labels[tag.key] ??= []).push(tag.value);
+  return { revision: session.metadataRevision, labels };
 }
 
 export async function setSessionLabel(
@@ -105,7 +105,7 @@ export async function setSessionLabel(
     source: string;
     expectedRevision?: number;
   },
-): Promise<{ revision: number; tags: Record<string, string[]> }> {
+): Promise<{ revision: number; labels: Record<string, string[]> }> {
   const session = await prisma.runtimeSession.findUnique({
     where: { id: input.runtimeSessionId },
     select: { repositoryId: true, metadataRevision: true },
@@ -166,7 +166,7 @@ export async function removeSessionLabel(
     source: string;
     expectedRevision?: number;
   },
-): Promise<{ revision: number; tags: Record<string, string[]> }> {
+): Promise<{ revision: number; labels: Record<string, string[]> }> {
   const session = await prisma.runtimeSession.findUnique({
     where: { id: input.runtimeSessionId },
     select: { repositoryId: true, metadataRevision: true },

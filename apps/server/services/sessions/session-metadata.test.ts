@@ -88,7 +88,7 @@ describe("repository session metadata", () => {
 
     expect(await readSessionLabels(database.prisma, session.id)).toEqual({
       revision: 0,
-      tags: { "example.kind": ["planning"] },
+      labels: { "example.kind": ["planning"] },
     });
     const updated = await setSessionLabel(database.prisma, config, {
       runtimeSessionId: session.id,
@@ -99,7 +99,7 @@ describe("repository session metadata", () => {
     });
     expect(updated).toEqual({
       revision: 1,
-      tags: { "example.kind": ["implementation"] },
+      labels: { "example.kind": ["implementation"] },
     });
     await expect(setSessionLabel(database.prisma, config, {
       runtimeSessionId: session.id,
@@ -113,7 +113,7 @@ describe("repository session metadata", () => {
       key: "example.kind",
       source: "operator-test",
       expectedRevision: 1,
-    })).toEqual({ revision: 2, tags: {} });
+    })).toEqual({ revision: 2, labels: {} });
     expect(await database.prisma.runtimeMetadataEvent.count()).toBe(2);
   });
 

@@ -1,7 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClientProvider } from "@tanstack/react-query";
-import { App } from "./App.tsx";
+import { App } from "./app-root.tsx";
 import { Toaster } from "./components/ui/sonner.tsx";
 import { wireConfigStream } from "./lib/queries/config.ts";
 import { wireKeybindingsStream } from "./lib/queries/keybindings.ts";

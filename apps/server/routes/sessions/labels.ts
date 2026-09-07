@@ -12,13 +12,19 @@ import {
   unregisterThread,
 } from "../../services/sessions/threads.ts";
 
-const SetTagSchema = z.object({
+const SetLabelSchema = z.object({
   key: z.string().min(1),
   values: z.array(z.string().min(1)),
   expectedRevision: z.number().int().nonnegative().optional(),
 });
 
 const routes = new Hono<AppEnv>();
+
+/** Storage keeps `tags` rows; every API response speaks `labels`. */
+function inspectableSession<T extends { tags: unknown }>(session: T) {
+  const { tags, ...rest } = session;
+  return { ...rest, labels: tags };
+}
 
 const sessionInspectionInclude = {
   tags: { orderBy: [{ key: "asc" as const }, { value: "asc" as const }] },
@@ -40,7 +46,7 @@ routes.get("/", async (c) => {
     include: sessionInspectionInclude,
     orderBy: { updatedAt: "desc" },
   });
-  return c.json({ sessions });
+  return c.json({ sessions: sessions.map(inspectableSession) });
 });
 
 routes.get("/:sessionId", async (c) => {
@@ -49,7 +55,7 @@ routes.get("/:sessionId", async (c) => {
     include: sessionInspectionInclude,
   });
   return session
-    ? c.json({ session })
+    ? c.json({ session: inspectableSession(session) })
     : c.json({ error: "Session not found" }, 404);
 });
 
@@ -113,7 +119,7 @@ routes.get("/:sessionId/labels", async (c) => {
 });
 
 routes.put("/:sessionId/labels", async (c) => {
-  const parsed = SetTagSchema.safeParse(await c.req.json().catch(() => null));
+  const parsed = SetLabelSchema.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) {
     return c.json({ error: "Invalid body", issues: parsed.error.issues }, 400);
   }
@@ -164,11 +170,22 @@ routes.put("/:sessionId/threads", async (c) => {
   if (!parsed.success) return c.json({ error: "commentId is required" }, 400);
   const sessionId = c.req.param("sessionId");
   const prisma = c.get("prisma");
-  const session = await prisma.runtimeSession.findUnique({ where: { id: sessionId } });
+  const session = await prisma.runtimeSession.findUnique({
+    where: { id: sessionId },
+    include: {
+      resourceLinks: {
+        where: { provider: "linear", endedAt: null },
+        orderBy: { createdAt: "asc" },
+        take: 1,
+      },
+    },
+  });
   if (!session) return c.json({ error: "unknown session" }, 404);
   await registerThread(prisma, {
     provider: "linear",
-    connectionId: c.get("config").activeConnectionId,
+    connectionId:
+      session.resourceLinks[0]?.connectionId ??
+      c.get("config").activeConnectionId,
     threadRootCommentId: parsed.data.commentId,
     runtimeSessionId: sessionId,
     relationship: parsed.data.relationship,
@@ -178,9 +195,17 @@ routes.put("/:sessionId/threads", async (c) => {
 
 routes.delete("/:sessionId/threads/:commentId", async (c) => {
   const prisma = c.get("prisma");
+  const link = await prisma.runtimeSessionResourceLink.findFirst({
+    where: {
+      runtimeSessionId: c.req.param("sessionId"),
+      provider: "linear",
+      endedAt: null,
+    },
+    orderBy: { createdAt: "asc" },
+  });
   await unregisterThread(prisma, {
     provider: "linear",
-    connectionId: c.get("config").activeConnectionId,
+    connectionId: link?.connectionId ?? c.get("config").activeConnectionId,
     threadRootCommentId: c.req.param("commentId"),
     runtimeSessionId: c.req.param("sessionId"),
   });

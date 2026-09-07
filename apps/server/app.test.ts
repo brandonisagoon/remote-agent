@@ -93,6 +93,20 @@ describe("/api authentication", () => {
     expect(await response.json()).toMatchObject({ error: "Invalid body" });
   });
 
+  // A 401 passes whether or not the route exists (auth rejects before
+  // routing), so each API mount needs one authenticated probe that must
+  // reach its handler — an unmounted route would 404 here instead.
+  test("session events are mounted, not just authenticated", async () => {
+    const response = await app().request("/api/session-events", {
+      method: "POST",
+      headers: { authorization: `Bearer ${API_KEY}` },
+      body: "{}",
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({ error: "Invalid body" });
+  });
+
   test("an unknown /api path is 404, not 401, once authenticated", async () => {
     const response = await app().request("/api/nope", {
       headers: { authorization: `Bearer ${API_KEY}` },

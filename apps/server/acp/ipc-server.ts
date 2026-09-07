@@ -36,18 +36,21 @@ export async function startAcpIpcServer(input: {
     unlinkSync(socketPath);
   }
 
-  const connections = new Set<acp.AgentSideConnection>();
+  // Raw sockets, so close() can force-disconnect attached bridges — Node's
+  // server.close only completes after every connection ends, and a lingering
+  // Zed bridge would otherwise hang shutdown before the WAL flush.
+  const sockets = new Set<import("node:net").Socket>();
   const server = createServer((socket) => {
     const stream = acp.ndJsonStream(
       Writable.toWeb(socket),
       Readable.toWeb(socket) as unknown as ReadableStream<Uint8Array>,
     );
-    const connection = new acp.AgentSideConnection(
+    new acp.AgentSideConnection(
       (client) => new RemoteAgentAcpAgent(client, input.runtime, input.config),
       stream,
     );
-    connections.add(connection);
-    socket.once("close", () => connections.delete(connection));
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
   });
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error) => {
@@ -66,6 +69,7 @@ export async function startAcpIpcServer(input: {
 
   return {
     close: async () => {
+      for (const socket of sockets) socket.destroy();
       await closeServer(server);
       if (existsSync(socketPath)) unlinkSync(socketPath);
     },

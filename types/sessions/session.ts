@@ -6,7 +6,7 @@ import { AgentIssueLabel, type AgentIssueStateValue } from "./agent-issue.ts";
 export { MachineSchema } from "../../lib/machines/index.ts";
 export type { Machine } from "../../lib/machines/index.ts";
 
-export const HarnessSchema = z.enum(["codex", "claude"]);
+export const ProviderIdSchema = z.enum(["codex", "claude"]);
 export const SessionRoleSchema = z.enum([
   "primary",
   "delegate",
@@ -29,7 +29,7 @@ const RuntimeSchema = z.object({
   parentSessionId: z.string().min(1).max(256).nullish(),
   worktreePath: z.string().min(1).max(4096),
   branchName: z.string().min(1).max(512).nullish(),
-  harness: HarnessSchema,
+  harness: ProviderIdSchema,
   machine: MachineSchema,
   role: SessionRoleSchema.default("primary"),
   lifecycle: SessionLifecycleSchema.nullish(),

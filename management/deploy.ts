@@ -18,7 +18,7 @@ import { waitForHealth } from "./provision.ts";
 const LOCK_STALE_MS = 30 * 60_000;
 /** Files that affect the standalone service; other diffs fast-forward
     without a rebuild. */
-const RELEVANT_CHANGE = /^(src\/|prisma\/|bin\/|scripts\/|package\.json$|bun\.lock$|tsconfig.*\.json$|prisma\.config\.ts$)/m;
+const RELEVANT_CHANGE = /^(apps\/|lib\/|management\/|types\/|prisma\/|bin\/|scripts\/|package\.json$|bun\.lock$|tsconfig.*\.json$|prisma\.config\.ts$)/m;
 
 export type DeployOutcome = "deployed" | "up-to-date" | "skipped" | "already-running" | "failed";
 
@@ -209,7 +209,7 @@ async function restoreDatabaseSnapshot(context: DeployContext): Promise<void> {
   log(`restored SQLite database from ${context.snapshot}`);
 }
 
-// `bun src/management/deploy.ts [--force]` — invoked by the CLI/GUI update
+// `bun management/deploy.ts [--force]` — invoked by the CLI/GUI update
 // action and by hand.
 if (import.meta.main) {
   const outcome = await deploy({ force: process.argv.includes("--force") });

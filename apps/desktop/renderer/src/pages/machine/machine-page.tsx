@@ -40,7 +40,7 @@ function useAcpBridgeCommand(file: ServiceFile): string {
   const root =
     file.machine.installation.root ??
     `~/Library/Application Support/${file.serviceName}`;
-  return `REMOTE_AGENT_CONFIG='${configFile}' bun '${root.replace(/\/$/, "")}/app/src/acp/main.ts'`;
+  return `REMOTE_AGENT_CONFIG='${configFile}' bun '${root.replace(/\/$/, "")}/app/apps/server/acp/main.ts'`;
 }
 
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {

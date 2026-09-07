@@ -52,11 +52,24 @@
         "to": "bin"
       },
       {
-        "from": "src",
-        "to": "src",
+        "from": "lib",
+        "to": "lib",
         "filter": [
-          "**/*.ts",
-          "**/*.md"
+          "**/*.ts"
+        ]
+      },
+      {
+        "from": "management",
+        "to": "management",
+        "filter": [
+          "**/*.ts"
+        ]
+      },
+      {
+        "from": "types",
+        "to": "types",
+        "filter": [
+          "**/*.ts"
         ]
       },
       {
@@ -101,7 +114,6 @@
     "@tanstack/react-router": "^1.170.32",
     "acpx": "0.13.2",
     "chokidar": "^5.0.0",
-    "cn": "^0.2.5",
     "commander": "^15.0.0",
     "framework7-icons": "^5.0.5",
     "hono": "4.12.32",

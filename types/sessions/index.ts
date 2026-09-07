@@ -21,7 +21,7 @@ export type {
   UpdateAgentIssueInput,
 } from "./agent-issue.ts";
 export {
-  HarnessSchema,
+  ProviderIdSchema,
   MachineSchema,
   SessionLifecycleEventSchema,
   SourceIssueIdentifierSchema,

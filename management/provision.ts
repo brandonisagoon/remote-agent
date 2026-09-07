@@ -37,9 +37,12 @@ export async function provision(log: (line: string) => void): Promise<void> {
   // Prefer an explicit config remote, then the checkout's own origin (dev
   // installs inherit its auth), then the canonical public repository — the
   // brew/scoop-installed CLI runs from an unpacked tarball with no .git.
+  // run() merges stderr into output; only a successful lookup counts, or the
+  // "fatal: not a git repository" text would win the || chain as the URL.
+  const origin = await run("git", ["-C", sourceRoot(), "remote", "get-url", "origin"]);
   const gitRemote =
     file.machine?.installation?.gitRemote ||
-    (await run("git", ["-C", sourceRoot(), "remote", "get-url", "origin"])).output.trim() ||
+    (origin.ok ? origin.output.trim() : "") ||
     "https://github.com/brandonisagoon/remote-agent.git";
   if (!existsSync(path.join(layout.repo, ".git"))) {
     if (!gitRemote) throw new Error("machine.installation.gitRemote is required when the source checkout has no origin");

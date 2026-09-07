@@ -94,7 +94,7 @@ describe("session label API", () => {
       session: {
         id: "session-one",
         repositoryId: repository.id,
-        tags: [{ key: "example.kind", value: "implementation" }],
+        labels: [{ key: "example.kind", value: "implementation" }],
         outgoingRelations: [],
         incomingRelations: [],
         resourceLinks: [],

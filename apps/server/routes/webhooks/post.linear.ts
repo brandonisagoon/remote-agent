@@ -109,23 +109,30 @@ route.post("/", async (c) => {
 
     const issue = TrackerIssueWebhookSchema.safeParse(parsed);
     if (issue.success) {
-      const result = await handleIssueWebhook({
-        prisma,
-        config: scopedConfig,
-        agentRuntime,
-        deliveryId,
-        webhook: issue.data,
-      });
-      if (result.kind === IssueWebhookResultKind.Ignored) {
-        return c.json({ accepted: true, ignored: true }, 200);
+      try {
+        const result = await handleIssueWebhook({
+          prisma,
+          config: scopedConfig,
+          agentRuntime,
+          deliveryId,
+          webhook: issue.data,
+        });
+        if (result.kind === IssueWebhookResultKind.Ignored) {
+          return c.json({ accepted: true, ignored: true }, 200);
+        }
+        if (result.kind === IssueWebhookResultKind.Duplicate) {
+          return c.json({ accepted: true, duplicate: true }, 200);
+        }
+        if (result.kind === IssueWebhookResultKind.Ending) {
+          return c.json({ accepted: true, ending: true }, 202);
+        }
+        return c.json({ accepted: true, workflows: result.workflowIds ?? [] }, 202);
+      } catch (error) {
+        if (error instanceof WebhookReceiptError) {
+          return c.json({ error: "Failed to record delivery" }, 500);
+        }
+        throw error;
       }
-      if (result.kind === IssueWebhookResultKind.Duplicate) {
-        return c.json({ accepted: true, duplicate: true }, 200);
-      }
-      if (result.kind === IssueWebhookResultKind.Ending) {
-        return c.json({ accepted: true, ending: true }, 202);
-      }
-      return c.json({ accepted: true, workflows: result.workflowIds ?? [] }, 202);
     }
 
     const reaction = TrackerReactionWebhookSchema.safeParse(parsed);

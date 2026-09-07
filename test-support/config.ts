@@ -104,7 +104,7 @@ export function testConfig(
     port: 9000,
     publicUrl: "https://agents.example.com",
     databaseUrl: "file::memory:",
-    acpIpcPath: "/nonexistent/remote-agent/daemon.sock",
+    acpIpcPath: "/nonexistent/remote-agent/remote-agent.sock",
     controlIpcPath: "/nonexistent/remote-agent/control.sock",
     webhookSecret: "test-webhook-secret",
     apiKey: "test-api-key",

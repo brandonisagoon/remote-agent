@@ -12,7 +12,6 @@ import {
   type Machine,
   type MachineRecord,
 } from "./machines/index.ts";
-import type { Harness } from "../types/runtime/index.ts";
 
 /** Linear caps webhook payloads well below this size. */
 export const MAX_REQUEST_BYTES = 1_000_000;

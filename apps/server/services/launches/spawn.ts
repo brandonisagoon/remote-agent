@@ -13,7 +13,7 @@ export interface SpawnAgentThreadInput {
   agentRuntime: AgentSessionRuntime;
   launchKey: string;
   issueIdentifier: string;
-  harness: "codex" | "claude";
+  provider: "codex" | "claude";
   model?: string;
   prompt: string;
   machine: Machine;
@@ -38,7 +38,7 @@ export async function spawnAgentThread(
   const session = await input.agentRuntime.ensureSession({
     sessionKey: input.launchKey,
     name: input.title ?? `${input.issueIdentifier} · ${input.role}`,
-    agent: input.harness,
+    agent: input.provider,
     cwd: input.worktreePath,
     worktreePath: input.worktreePath,
     executionTarget: input.machine,

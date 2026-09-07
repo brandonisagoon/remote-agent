@@ -226,7 +226,7 @@ describe("Remote Agent ACP proxy", () => {
       mcpServers: [],
     });
     expect(loaded.configOptions).toMatchObject([
-      { id: "harness", currentValue: "codex" },
+      { id: "provider", currentValue: "codex" },
       { id: "model", currentValue: "gpt-5", category: "model" },
       {
         id: "reasoning_effort",
@@ -251,7 +251,7 @@ describe("Remote Agent ACP proxy", () => {
       value: "gpt-6",
     });
     expect(changed.configOptions).toMatchObject([
-      { id: "harness" },
+      { id: "provider" },
       { id: "model", currentValue: "gpt-6" },
       { id: "reasoning_effort", currentValue: "high" },
       { id: "fast_mode", currentValue: false },
@@ -378,7 +378,7 @@ describe("Remote Agent ACP proxy", () => {
     expect(updates[1]?.update).toMatchObject({
       sessionUpdate: "config_option_update",
       configOptions: [
-        { id: "harness" },
+        { id: "provider" },
         { id: "model" },
         { id: "reasoning_effort", currentValue: "high" },
         { id: "fast_mode", type: "boolean" },

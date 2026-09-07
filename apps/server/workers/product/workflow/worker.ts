@@ -62,7 +62,7 @@ function commandFailure(
 }
 
 /** The seed prompt embeds the workflow's skill token; the compose pipeline
-    later swaps it for the harness-specific invocation of the composed skill,
+    later swaps it for the provider-specific invocation of the composed skill,
     which carries the actual instructions. */
 export function buildWorkflowSeedPrompt(
   workflow: WorkflowConfig,
@@ -100,7 +100,7 @@ export function createWorkflowWorker(
       if (!workflow) {
         return result("failed", `workflow no longer configured: ${event.workflowId}`);
       }
-      const harness = workflow.providerId ?? context.config.acp.providerId;
+      const provider = workflow.providerId ?? context.config.acp.providerId;
 
       const issueRef = issueReferenceFromEvent(event);
       if (!issueRef) return result("failed", "event has no issue reference");
@@ -127,7 +127,7 @@ export function createWorkflowWorker(
             return (dependencies.compose ?? composeForPrompt)(
               target.runtime.worktreePath,
               seed,
-              harness,
+              provider,
               repository.skillsRoot,
             );
           },
@@ -179,7 +179,7 @@ export function createWorkflowWorker(
         const prompt = await (dependencies.compose ?? composeForPrompt)(
           worktreePath,
           seed,
-          harness,
+          provider,
           repository.skillsRoot,
         );
         launched = await (dependencies.launch ?? spawnAgentThread)({
@@ -191,7 +191,7 @@ export function createWorkflowWorker(
           worktreePath,
           issueIdentifier: issue.identifier,
           branchName,
-          harness,
+          provider,
           ...(workflow.model ? { model: workflow.model } : {}),
           lifecycle: "persistent",
           role: "primary",

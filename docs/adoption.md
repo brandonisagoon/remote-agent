@@ -43,7 +43,8 @@ Remote Agent owns:
 - conversation-thread registration: once a thread is routed to a session,
   replies in it deliver deterministically without an @mention or a router
   call. Sessions can register their own threads (and mark them as pending
-  questions) via `PUT /sessions/:id/threads`;
+  questions) via `PUT /api/sessions/:sessionId/threads`
+  (and unregister via `DELETE /api/sessions/:sessionId/threads/:commentId`);
 - plan capture: a `start-session` workflow with
   `plan: { captureToIssue: true, thenState? }` (claude provider only)
   launches its session in plan mode; the server persists the plan into the

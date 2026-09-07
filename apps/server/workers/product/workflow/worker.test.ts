@@ -98,7 +98,7 @@ describe("workflow worker", () => {
     expect(record.provisioned).toEqual(["feature/fix-cube-42"]);
     expect(record.launched).toHaveLength(1);
     const launch = record.launched[0]!;
-    expect(launch.harness).toBe("codex");
+    expect(launch.provider).toBe("codex");
     expect(launch.title).toBe("tracker-plan-cube-42");
     expect(String(launch.prompt)).toContain("$composed-orchestrate");
     expect(String(launch.prompt)).toContain("- workflow: plan");

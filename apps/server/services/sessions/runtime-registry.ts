@@ -296,11 +296,15 @@ export async function attachRuntimeSessionToMirror(
 ): Promise<void> {
   // Legacy webhook producers may report a runtime identity before this process
   // has imported it into the local registry. Linking is therefore best-effort;
-  // sessions provisioned through acpx always have a matching row.
-  await prisma.runtimeSession.updateMany({
-    where: { id: input.runtimeSessionId },
-    data: { sessionMirrorId: input.sessionMirrorId },
-  });
+  // sessions provisioned through acpx always have a matching row. The catch
+  // covers sessionMirrorId's @unique: another session already holding this
+  // mirror is a stale-producer race, not a reason to fail the caller.
+  await prisma.runtimeSession
+    .updateMany({
+      where: { id: input.runtimeSessionId },
+      data: { sessionMirrorId: input.sessionMirrorId },
+    })
+    .catch(() => undefined);
 }
 
 export async function getRuntimeEventCursor(

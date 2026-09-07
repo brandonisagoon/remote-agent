@@ -1,6 +1,6 @@
 # ADR 0001: Runtime, session ownership, and distribution
 
-- Status: Accepted
+- Status: Superseded by [ADR 0002](0002-acpx-runtime-ownership.md)
 - Date: 2026-08-18
 - Decision owners: Remote Agent maintainers
 

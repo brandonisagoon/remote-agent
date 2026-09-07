@@ -30,7 +30,10 @@
       "channel": "stable"
     }
   },
-  "providers": {},
+  "providers": {
+    "codex": {},
+    "claude": {}
+  },
   "connections": {
     "linear-main": {
       "provider": "linear",

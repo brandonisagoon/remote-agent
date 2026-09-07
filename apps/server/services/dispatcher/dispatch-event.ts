@@ -55,10 +55,17 @@ export async function dispatchEvent(
   for (const worker of (dependencies.workers ?? (await loadWorkers())).filter((entry) =>
     entry.supports(input.event),
   )) {
+    // One receipt can dispatch several workflow events; scope the run key by
+    // workflowId or the [receiptId, workerKey] unique collapses them onto a
+    // single run — and, via runId-derived launch keys, a single session.
+    const runKey =
+      "workflowId" in input.event
+        ? `${worker.key}:${input.event.workflowId}`
+        : worker.key;
     const run = await dependencies.startRun(
       input.prisma,
       input.receiptId,
-      worker.key,
+      runKey,
     );
     let result: WorkerResult;
     try {
