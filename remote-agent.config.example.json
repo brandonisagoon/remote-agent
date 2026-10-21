@@ -30,6 +30,12 @@
       "channel": "stable"
     }
   },
+  "routing": {
+    "ingress": false,
+    "receiverOnly": false,
+    "peers": {},
+    "connectionHosts": {}
+  },
   "providers": {
     "codex": {},
     "claude": {}

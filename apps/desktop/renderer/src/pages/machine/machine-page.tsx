@@ -4,6 +4,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import type { ManagementResult } from "../../../../../../management/service.ts";
 import { DnsRecordsTable } from "./dns-records-table.tsx";
+import { RoutingSection } from "./routing-section.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { CopyField } from "@renderer/components/copy-field.tsx";
 import { Field } from "@renderer/components/field.tsx";
@@ -257,8 +258,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
           />
         </SettingsCard>
       </SettingsSection>
-
-
+      <RoutingSection value={value} mutate={mutate} />
     </Accordion>
   );
 }

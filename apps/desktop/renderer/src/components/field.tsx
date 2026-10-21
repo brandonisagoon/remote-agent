@@ -1,4 +1,5 @@
 import { Input } from "@renderer/components/ui/input.tsx";
+import { useId } from "react";
 import { Label } from "@renderer/components/ui/label.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 
@@ -13,10 +14,12 @@ export function Field(props: {
   description?: React.ReactNode;
   onChange(value: string): void;
 }) {
+  const id = useId();
   return (
     <div className="grid gap-2">
-      <Label>{props.label}</Label>
+      <Label htmlFor={id}>{props.label}</Label>
       <Input
+        id={id}
         type={props.type}
         value={props.value}
         placeholder={props.placeholder}

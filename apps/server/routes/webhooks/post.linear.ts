@@ -1,4 +1,6 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
+import { routeLinearDelivery } from "../../services/tasks/routing.ts";
 
 import { MAX_REQUEST_BYTES } from "../../../../lib/config.ts";
 import {
@@ -22,9 +24,13 @@ import {
 import type { AppEnv } from "../../middleware/context.ts";
 
 const route = new Hono<AppEnv>();
+export const forwardedLinearRoute = new Hono<AppEnv>();
+forwardedLinearRoute.post("/:webhookId", (c) => receiveLinear(c, true));
+route.post("/", (c) => receiveLinear(c, false));
 
-route.post("/", async (c) => {
+async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
     const config = c.get("config");
+    if (!forwarded && config.routing?.receiverOnly) return c.json({ error: "This host receives Linear activity through its configured ingress" }, 403);
     const webhookId = c.req.param("webhookId");
     if (!webhookId) return c.json({ error: "Unknown webhook" }, 404);
     let webhookConfig;
@@ -44,7 +50,7 @@ route.post("/", async (c) => {
     if (Buffer.byteLength(rawBody) > MAX_REQUEST_BYTES) {
       return c.json({ error: "Payload Too Large" }, 413);
     }
-    if (
+    if (!forwarded &&
       !verifyTrackerWebhookSignature(
         rawBody,
         c.req.header("linear-signature") ?? null,
@@ -65,7 +71,7 @@ route.post("/", async (c) => {
     if (!envelope.success) {
       return c.json({ error: "Unrecognized webhook envelope" }, 400);
     }
-    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
+    if (!forwarded && Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
       return c.json({ error: "Stale webhook" }, 401);
     }
 
@@ -110,6 +116,12 @@ route.post("/", async (c) => {
     const deliveryId = c.req.header("linear-delivery");
     if (!deliveryId) {
       return c.json({ error: "Missing Linear-Delivery header" }, 400);
+    }
+    if (!forwarded && config.routing?.ingress) {
+      try {
+        const queued = await routeLinearDelivery({ prisma, config, webhookId, connectionId: webhookConfig.connectionId, repositoryId: repository.id, deliveryId, webhook: record });
+        return c.json({ accepted: true, placementId: queued.placement.id, deliveryId: queued.delivery.id, state: queued.delivery.state }, 202);
+      } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
     }
 
     const issue = TrackerIssueWebhookSchema.safeParse(parsed);
@@ -232,6 +244,6 @@ route.post("/", async (c) => {
       }
       throw error;
     }
-});
+}
 
 export default route;

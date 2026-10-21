@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { z } from "zod";
 import { readToolingSource } from "./tooling-source.ts";
+import { RoutingConfigSchema, type RoutingConfig } from "./routing-config.ts";
 
 import { sshLinkSupported } from "./machines/editor-link.ts";
 import { defaultInstallRoot } from "../management/paths.ts";
@@ -290,9 +291,17 @@ export const ServiceFileSchema = z.object({
     }).default({ channel: "stable" }),
   }),
   providers: ProvidersSchema,
+  routing: RoutingConfigSchema.optional(),
   connections: z.record(ConfigIdSchema, ConnectionSchema),
   repositories: z.record(ConfigIdSchema, RepositorySchema),
 }).superRefine((file, context) => {
+  if (file.routing?.ingress && file.routing.receiverOnly) context.addIssue({ code: "custom", path: ["routing"], message: "Choose ingress or receiver, not both" });
+  for (const [connectionId, machineId] of Object.entries(file.routing?.connectionHosts ?? {})) {
+    if (!file.connections[connectionId] || (machineId !== file.machine.id && !file.routing?.peers[machineId])) {
+      context.addIssue({ code: "custom", path: ["routing", "connectionHosts", connectionId], message: "Select a configured connection and owning host" });
+    }
+  }
+  if (file.routing?.peers[file.machine.id]) context.addIssue({ code: "custom", path: ["routing", "peers"], message: "A peer cannot have this machine's ID" });
   const repositoryIds = new Set(Object.keys(file.repositories));
   if (repositoryIds.size === 0) {
     context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
@@ -414,6 +423,7 @@ export interface WebhookConfig {
 }
 
 export interface ServerConfig {
+  routing?: RoutingConfig;
   serviceName: string;
   configFile: string;
   installRoot: string;
@@ -641,6 +651,7 @@ export function readConfig(): ServerConfig {
   const firstWebhook = Object.values(webhooks)[0];
 
   return {
+    ...(file.routing ? { routing: file.routing } : {}),
     serviceName: file.serviceName,
     configFile,
     installRoot,

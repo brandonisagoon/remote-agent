@@ -1,0 +1,32 @@
+/// The ingress owns placement, not the remote session or its transcript.
+model TaskPlacement {
+  id           String   @id @default(cuid())
+  sourceKey    String   @unique
+  machineId    String
+  repositoryId String
+  taskId       String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  deliveries   TaskDelivery[]
+}
+
+/// Outbox retries use the same remote identity after lost responses.
+model TaskDelivery {
+  sequence      Int      @id @default(autoincrement())
+  id            String   @unique @default(uuid())
+  requestKey    String   @unique
+  placementId   String
+  kind          String
+  payload       Json
+  state         String   @default("queued")
+  attempts      Int      @default(0)
+  retryAt       DateTime @default(now())
+  detail        String?
+  response      Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  placement     TaskPlacement @relation(fields: [placementId], references: [id], onDelete: Restrict)
+
+  @@index([state, retryAt])
+  @@index([placementId, sequence])
+}

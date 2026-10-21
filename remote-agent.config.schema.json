@@ -225,6 +225,75 @@
       },
       "additionalProperties": false
     },
+    "routing": {
+      "type": "object",
+      "properties": {
+        "ingress": {
+          "default": false,
+          "type": "boolean"
+        },
+        "receiverOnly": {
+          "default": false,
+          "type": "boolean"
+        },
+        "peers": {
+          "default": {},
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "apiKey": {
+                "type": "string",
+                "minLength": 16
+              },
+              "repositories": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "url",
+              "apiKey",
+              "repositories"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "connectionHosts": {
+          "default": {},
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          }
+        }
+      },
+      "required": [
+        "ingress",
+        "receiverOnly",
+        "peers",
+        "connectionHosts"
+      ],
+      "additionalProperties": false
+    },
     "connections": {
       "type": "object",
       "propertyNames": {

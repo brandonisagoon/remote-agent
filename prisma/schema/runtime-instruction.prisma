@@ -1,0 +1,13 @@
+/// Durable server-owned inbox. Unknown delivery is never automatically replayed.
+model RuntimeInstruction {
+  sequence  Int      @id @default(autoincrement())
+  id        String   @unique
+  sessionId String
+  text      String
+  state     String   @default("queued")
+  detail    String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([sessionId, state, createdAt])
+}

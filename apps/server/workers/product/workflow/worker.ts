@@ -112,6 +112,7 @@ export function createWorkflowWorker(
 
       if (workflow.deliver === "message-session") {
         return (dependencies.forward ?? forwardMessage)({
+          requestId: `worker:${context.runId}`,
           config: context.config,
           prisma: context.prisma,
           agentRuntime: context.agentRuntime!,

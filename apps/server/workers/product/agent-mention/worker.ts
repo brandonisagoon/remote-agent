@@ -114,6 +114,7 @@ ${message}`;
       }
 
       const result = await forward({
+        requestId: `worker:${context.runId}`,
         config: context.config,
         prisma: context.prisma,
         agentRuntime: context.agentRuntime!,

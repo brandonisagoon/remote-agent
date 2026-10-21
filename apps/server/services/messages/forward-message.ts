@@ -28,6 +28,7 @@ export interface ForwardMessageOptions {
   prisma?: PrismaClient;
   sourceIssueIdentifier: string;
   message: string;
+  requestId?: string;
   workerContext: RoutingInput["workerContext"];
   replyContext?: ReplyContext;
   finalizeMessage?: (
@@ -156,6 +157,7 @@ async function route(
     await options.agentRuntime.enqueue({
       sessionId: session.id,
       text: message,
+      ...(options.requestId ? { requestId: options.requestId } : {}),
     });
   } catch (error) {
     return {

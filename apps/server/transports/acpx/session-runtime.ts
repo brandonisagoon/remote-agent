@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { assertTaskAutomationAllowed } from "../../services/tasks/control.ts";
+import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
 
 import type {
   AcpRuntimeEvent,
@@ -502,15 +503,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     requestId?: string;
   }): Promise<string> {
     const session = await this.requireSession(input.sessionId);
-    await assertTaskAutomationAllowed(this.prisma, session.cwd);
-    const turn = this.startTurn(input);
-    void (async () => {
-      for await (const _event of turn.events) {
-        // Draining is required even when the caller only wants queue semantics.
-      }
-      await turn.result;
-    })();
-    return turn.requestId;
+    if (session.status === "closed") throw new Error("Session is closed");
+    const receipt = await queueInstruction(this.prisma, input);
+    void deliverInstructions(this.prisma, this).catch(() => undefined);
+    return receipt.id;
   }
 
   async setMode(sessionId: string, mode: string): Promise<void> {
