@@ -10,7 +10,8 @@ export type RepoConfigDocuments = Record<string, RepoConfigDocument & { root: st
 export const repoConfigsQueryOptions = queryOptions({
   queryKey: ["repo-configs"],
   queryFn: () => window.remoteAgent.repoConfigs.get(),
-  staleTime: Infinity,
+  staleTime: 5_000,
+  refetchInterval: 10_000,
 });
 
 /** Pipes repo-configs:changed events into the cache. Call once at startup. */

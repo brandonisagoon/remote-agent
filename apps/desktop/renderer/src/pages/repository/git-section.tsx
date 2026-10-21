@@ -1,3 +1,4 @@
+import { chooseHostPath } from "@renderer/components/remote-path-picker.tsx";
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
@@ -68,7 +69,7 @@ function PathField({ label, title, value, onChange }: {
               <InputGroupButton
                 size="icon-xs"
                 onClick={async () => {
-                  const picked = await window.remoteAgent.fs.pickFolder(title, value);
+                  const picked = await chooseHostPath(title, value);
                   if (picked) onChange(picked);
                 }}
               >
@@ -356,7 +357,7 @@ export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfi
                   <InputGroupButton
                     size="icon-xs"
                     onClick={async () => {
-                      const picked = await window.remoteAgent.fs.pickFile("Select Bootstrap Script", root);
+                      const picked = await chooseHostPath("Select Bootstrap Script", root, "file");
                       if (!picked) return;
                       const relative = picked.startsWith(`${root}/`)
                         ? picked.slice(root.length + 1)

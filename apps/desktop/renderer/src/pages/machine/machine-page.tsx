@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -33,6 +34,7 @@ import { cn } from "@renderer/lib/utils.ts";
 /** The stdio bridge an ACP app runs to reach the server: the deployed copy
     under the install root, pointed at this config file. */
 function useAcpBridgeCommand(file: ServiceFile): string {
+  const { host } = useHost();
   const { data: configFile = "" } = useQuery({
     queryKey: ["config-path"],
     queryFn: () => window.remoteAgent.config.path(),
@@ -41,16 +43,24 @@ function useAcpBridgeCommand(file: ServiceFile): string {
   const root =
     file.machine.installation.root ??
     `~/Library/Application Support/${file.serviceName}`;
+  if (host.kind === "ssh") {
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const command = `REMOTE_AGENT_CONFIG=${quote(host.configPath)} ${quote(host.executable)} ${quote(`${host.runtimePath}/apps/server/acp/main.ts`)}`;
+    return `ssh -T ${quote(host.sshHost)} ${quote(command)}`;
+  }
   return `REMOTE_AGENT_CONFIG='${configFile}' bun '${root.replace(/\/$/, "")}/app/apps/server/acp/main.ts'`;
 }
 
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {
+  const remote = useHost().host.kind === "ssh";
   const [result, setResult] = useState<ManagementResult | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const run = async (action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart") => {
     setWorking(action);
     try {
       setResult(await window.remoteAgent.management.run(action));
+    } catch (error) {
+      setResult({ ok: false, summary: error instanceof Error ? error.message : String(error) });
     } finally {
       setWorking(null);
     }
@@ -118,7 +128,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
       defaultValue={["installation", "status", "identity", "server", "remote-access", "acp", "storage"]}
       className="-mt-4"
     >
-      <SettingsSection
+      {!remote && <SettingsSection
         value="installation"
         title="Installation"
         description="Everything this machine needs, in order. Each step reports its own state."
@@ -146,7 +156,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             </TableBody>
           </Table>
         </div>
-      </SettingsSection>
+      </SettingsSection>}
 
       <SettingsSection value="status" title="Status" description="The running system.">
         <div className="bg-background -mx-4 rounded-lg border">
@@ -184,7 +194,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                     <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("check-update")}>
                       Check
                     </Button>
-                    <Button size="sm" disabled={working !== null} onClick={() => void act("update")}>
+                    <Button size="sm" disabled={working !== null || remote} title={remote ? "Deploy updates from the host’s installation workflow" : undefined} onClick={() => void act("update")}>
                       Install
                     </Button>
                   </div>
@@ -205,7 +215,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
 
       <SettingsSection value="identity" title="Identity">
         <SettingsCard>
-          <Field label="Machine ID" value={machine.id} onChange={(next) => mutate((file) => { file.machine.id = next; })} />
+          <Field label="Machine ID" value={machine.id} disabled={remote} onChange={(next) => mutate((file) => { file.machine.id = next; })} />
           <Field label="Display name" value={machine.name} onChange={(next) => mutate((file) => { file.machine.name = next; })} />
         </SettingsCard>
       </SettingsSection>

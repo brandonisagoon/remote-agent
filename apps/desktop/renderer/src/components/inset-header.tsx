@@ -1,4 +1,5 @@
-import { useParams } from "@tanstack/react-router";
+import { MachineSwitcher } from "@renderer/lib/host-context.tsx";
+import { useParams, useLocation } from "@tanstack/react-router";
 
 import { DeleteConnectionButton } from "@renderer/components/delete-connection-button.tsx";
 import { RepositoryHeaderControls } from "@renderer/pages/repository/repository-header-controls.tsx";
@@ -13,7 +14,9 @@ import { cn } from "@renderer/lib/utils.ts";
 
 function useHeaderTitle(): string {
   const { draft } = useConfig();
+  const location = useLocation();
   const params = useParams({ strict: false });
+  if (location.pathname === "/tasks") return "Tasks";
   if (params.providerId) return PROVIDER_LABELS[params.providerId] ?? params.providerId;
   if (params.connectionId) return draft.connections[params.connectionId]?.name ?? params.connectionId;
   if (params.repositoryId) return draft.repositories[params.repositoryId]?.name ?? params.repositoryId;
@@ -48,6 +51,7 @@ export function InsetHeader() {
       <span className="truncate text-sm font-medium">{title}</span>
       {params.repositoryId && <RepositoryHeaderControls repositoryId={params.repositoryId} />}
       {params.connectionId && <DeleteConnectionButton id={params.connectionId} className="ml-auto" />}
+      <div className="ml-auto"><MachineSwitcher /></div>
     </header>
   );
 }

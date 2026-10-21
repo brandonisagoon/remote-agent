@@ -7,6 +7,8 @@ import { wireConfigStream } from "./lib/queries/config.ts";
 import { wireRepoConfigsStream } from "./lib/queries/repo-configs.ts";
 import { wireKeybindingsStream } from "./lib/queries/keybindings.ts";
 import { queryClient } from "./lib/queries/query-client.ts";
+import { HostProvider } from "./lib/host-context.tsx";
+import { RemotePathPicker } from "./components/remote-path-picker.tsx";
 import "./styles.css";
 
 const media = window.matchMedia("(prefers-color-scheme: dark)");
@@ -37,7 +39,7 @@ wireKeybindingsStream();
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <HostProvider><App /><RemotePathPicker /></HostProvider>
       <Toaster />
     </QueryClientProvider>
   </React.StrictMode>,

@@ -4,6 +4,7 @@ import type { CheckResult } from "../../management/checks.ts";
 import type { SkillsCheck } from "../../lib/skills/check.ts";
 import type { DetectedEditor } from "./main/editor-detect.ts";
 import type { ManagementResult } from "../../management/service.ts";
+import type { DesktopHosts, DesktopHostStatus, DesktopTask, DesktopTaskActivity } from "../../lib/desktop-host.ts";
 
 export interface SessionSummary {
   id: string;
@@ -31,6 +32,19 @@ export interface SessionSummary {
 export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
+  hosts: {
+    list(): Promise<DesktopHosts>;
+    select(id: string): Promise<DesktopHosts>;
+    status(): Promise<DesktopHostStatus>;
+  };
+  tasks: {
+    list(): Promise<DesktopTask[]>;
+    activity(id: string): Promise<DesktopTaskActivity>;
+    control(id: string, action: "pause" | "resume" | "close"): Promise<unknown>;
+    answer(id: string, questionId: string, answer: string): Promise<unknown>;
+    instruct(id: string, requestKey: string, text: string): Promise<unknown>;
+    preview(id: string, resourceId: string): Promise<string>;
+  };
   tunnel: {
     /** Cloudflare tunnel UUID for a tunnel name, or null with a reason. */
     info(name: string): Promise<{ tunnelId: string | null; reason?: "cli-missing" | "not-found" }>;
@@ -71,12 +85,14 @@ export interface DesktopApi {
     ): () => void;
   };
   repository: {
+    validate(root: string): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" }>;
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
   };
   editors: {
     detect(): Promise<DetectedEditor[]>;
   };
   fs: {
+    list(directory: string, kind: "file" | "folder"): Promise<{ path: string; parent: string; entries: Array<{ name: string; path: string; directory: boolean }> }>;
     /** Native folder picker; returns the chosen absolute path or null. */
     pickFolder(title: string, defaultPath?: string): Promise<string | null>;
     /** Native file picker; returns the chosen absolute path or null. */

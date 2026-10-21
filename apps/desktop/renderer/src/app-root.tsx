@@ -1,3 +1,4 @@
+import { useHost, MachineSwitcher, UnavailableHost } from "@renderer/lib/host-context.tsx";
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -49,7 +50,9 @@ export function App() {
   // The query holds disk truth (push-updated by the file watcher). The draft
   // is form state layered on top: it remembers the document it was adopted
   // from and only converges on disk changes while clean.
-  const { data: document } = useQuery(configQueryOptions);
+  const configQuery = useQuery(configQueryOptions);
+  const document = configQuery.data;
+  const host = useHost();
   const { data: repoDocuments } = useQuery(repoConfigsQueryOptions);
   const saveConfig = useSaveConfig();
   const saveRepoConfig = useSaveRepoConfig();
@@ -62,6 +65,8 @@ export function App() {
   >({});
   const repoDirty = Object.keys(repoDrafts).length > 0;
   const anyDirty = dirty || repoDirty;
+
+  useEffect(() => { host.setDirty(anyDirty); return () => host.setDirty(false); }, [anyDirty, host.setDirty]);
 
   // Adopt disk truth whenever clean; heal corrections write straight back out.
   useEffect(() => {
@@ -195,6 +200,8 @@ export function App() {
     toast("Reloaded changes from disk");
   };
 
+  if (!document && configQuery.error) return <UnavailableHost error={String(configQuery.error)} retry={() => { void configQuery.refetch(); }} />;
+
   if (!document) {
     return (
       <div className="bg-background grid h-screen place-items-center">
@@ -207,6 +214,7 @@ export function App() {
     return (
       <main className="bg-background grid h-screen place-items-center p-8">
         <div className="grid w-full max-w-2xl gap-4">
+          <MachineSwitcher />
           <div className="flex items-center gap-2">
             <F7Icon name="exclamationmark_circle" className="text-destructive text-[20px]" />
             <h1 className="text-lg font-semibold">Configuration needs attention</h1>

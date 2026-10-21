@@ -1,3 +1,4 @@
+import { chooseHostPath } from "@renderer/components/remote-path-picker.tsx";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -69,7 +70,7 @@ export function SkillsTab({ id, value }: { id: string; value: ServiceFile }) {
   // Same dumb-install pattern as the machine page: the button opens Terminal
   // with the command prefilled; nothing privileged runs from the app.
   const changeSkillsRoot = async () => {
-    const picked = await window.remoteAgent.skills.pickRoot(skillsDirectory);
+    const picked = await chooseHostPath("Select skills root", skillsDirectory);
     if (!picked) return;
     const root = sourceRoot.replace(/\/$/, "");
     if (picked !== root && !picked.startsWith(`${root}/`)) {

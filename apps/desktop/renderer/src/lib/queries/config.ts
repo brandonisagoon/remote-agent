@@ -8,7 +8,8 @@ import { queryClient } from "@renderer/lib/queries/query-client.ts";
 export const configQueryOptions = queryOptions({
   queryKey: ["config"],
   queryFn: () => window.remoteAgent.config.get(),
-  staleTime: Infinity,
+  staleTime: 5_000,
+  refetchInterval: 10_000,
 });
 
 /** Pipes config:changed events into the cache. Call once at startup. */

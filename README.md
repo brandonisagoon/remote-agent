@@ -301,6 +301,12 @@ settings UI, shows the same checklist as `doctor` with buttons attached,
 and lists sessions. Every release ships the CLI and GUI together, one
 version.
 
+The GUI can also run on your laptop while controlling a remote machine over
+owner SSH. Its machine selector switches tasks, sessions and settings; private
+preview windows forward the selected task's recorded endpoints. See
+[remote desktop setup](docs/remote-desktop.md) for connection profiles and
+reconnection behavior.
+
 **6. Attach an ACP client.** Configure Zed, bb, or T3 Code to run
 `bun run acp`. The machine page shows the exact command. The bridge is a
 stateless stdio connection to the server's socket.

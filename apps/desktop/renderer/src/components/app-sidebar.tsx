@@ -82,6 +82,7 @@ export function AppSidebar({
         <NavHistoryButtons />
       </SidebarHeader>
       <SidebarContent className="overscroll-contain">
+        <SidebarGroup><SidebarGroupContent><SidebarMenu><SidebarMenuItem><SidebarMenuButton asChild isActive={!!matchRoute({ to: "/tasks" })}><Link to="/tasks"><MessagesSquareIcon /><span>Tasks</span></Link></SidebarMenuButton></SidebarMenuItem></SidebarMenu></SidebarGroupContent></SidebarGroup>
         <SidebarGroup>
           <SidebarGroupLabel>Providers</SidebarGroupLabel>
           <DropdownMenu>

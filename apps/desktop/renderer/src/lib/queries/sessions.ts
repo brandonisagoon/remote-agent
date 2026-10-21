@@ -4,6 +4,7 @@ export function sessionsQueryOptions(repositoryId: string) {
   return queryOptions({
     queryKey: ["sessions", repositoryId],
     queryFn: () => window.remoteAgent.sessions.list(repositoryId),
-    staleTime: 15_000,
+    staleTime: 3_000,
+    refetchInterval: 5_000,
   });
 }

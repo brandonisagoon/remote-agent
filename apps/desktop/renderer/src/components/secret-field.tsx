@@ -1,3 +1,4 @@
+import { STORED_SECRET } from "../../../../../lib/desktop-host.ts";
 import { useEffect, useId, useState } from "react";
 
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -31,7 +32,8 @@ export function SecretField(props: {
         <InputGroupInput
           id={id}
           type={visible ? "text" : "password"}
-          value={props.value}
+          value={props.value === STORED_SECRET ? "" : props.value}
+          placeholder={props.value === STORED_SECRET ? "Stored on this machine; enter a value to replace" : undefined}
           onChange={(event) => props.onChange(event.target.value)}
         />
         <InputGroupAddon align="inline-end">
