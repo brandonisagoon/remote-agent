@@ -8,9 +8,21 @@ import { splicePlanSection } from "../../services/sessions/plan-capture.ts";
 import { changeTaskControl } from "../../services/tasks/control.ts";
 import { launchTask } from "../../services/tasks/launch.ts";
 import { isSafeBranchName } from "../../workers/product/workflow/branch.ts";
+import { askSessionQuestion, linkedSourceIssue } from "../../services/sessions/questions.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
+
+sessionTaskRoutes.get("/:sessionId/source-issue", async (c) => {
+  const { issue } = await linkedSourceIssue({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") });
+  return c.json({ issue: { id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description, state: issue.state, labels: issue.labels } });
+});
+
+sessionTaskRoutes.post("/:sessionId/question", async (c) => {
+  const parsed = z.object({ requestKey: z.string().min(1).max(200), body: z.string().min(1).max(30_000) }).strict().safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "A question and stable requestKey are required" }, 400);
+  return c.json(await askSessionQuestion({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+});
 
 taskRoutes.post("/", async (c) => {
   const parsed = z.object({ requestKey: z.string().min(1).max(200), repositoryId: z.string().min(1), branchName: z.string().refine(isSafeBranchName, "Invalid branch name"), prompt: z.string().min(1).max(100_000), provider: z.enum(["codex", "claude"]).default("codex") }).strict().safeParse(await c.req.json());

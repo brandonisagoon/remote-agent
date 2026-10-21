@@ -130,6 +130,7 @@ export function createWorkflowWorker(
             const seed = buildWorkflowSeedPrompt(workflow, {
               sourceIssueIdentifier: issue.identifier,
               sourceIssueState: issue.state.name,
+              sourceIssueDescription: issue.description ?? "(No description)",
             });
             return (dependencies.compose ?? composeForPrompt)(
               target.runtime.worktreePath,
@@ -218,6 +219,7 @@ export function createWorkflowWorker(
         const seed = buildWorkflowSeedPrompt(workflow, {
           sourceIssueIdentifier: issue.identifier,
           sourceIssueTitle: issue.title,
+          sourceIssueDescription: issue.description ?? "(No description)",
           branchName,
           ...(task ? { taskId: task.id, preparation: "Prepare and verify this environment before implementing. Report failures and resource ownership through the remote-agent task tools." } : {}),
         });

@@ -39,11 +39,30 @@ model RuntimeSession {
   outgoingRelations  RuntimeSessionRelation[] @relation("runtime-relation-source")
   incomingRelations  RuntimeSessionRelation[] @relation("runtime-relation-target")
   resourceLinks      RuntimeSessionResourceLink[]
+  questions          RuntimeQuestion[]
 
   @@index([status])
   @@index([agentCommand, cwd])
   @@index([repositoryId, status])
   @@index([machineId, status])
+}
+
+/// Durable outbox identity. Its UUID is also the Linear comment ID, so an
+/// uncertain network result can be retried without posting another question.
+model RuntimeQuestion {
+  id               String   @id @default(uuid())
+  runtimeSessionId String
+  requestKey       String
+  connectionId     String
+  issueId          String
+  body             String
+  state            String   @default("pending")
+  error            String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([runtimeSessionId, requestKey])
 }
 
 /// Repository-defined metadata. Keys and values are intentionally opaque

@@ -36,6 +36,9 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   threads live in `RuntimeSessionResourceLink` (`comment-thread`, relationship
   `thread`/`question`): registered threads deliver without a mention or a
   router call; `question` threads frame the next human reply as the answer.
+  `read_source_issue` and `ask_question` use the session's linked issue and
+  server-held credential. `RuntimeQuestion` persists a client-assigned comment
+  UUID before delivery; retries reuse it and preserve an already-answered thread.
 - **Plan capture** (`apps/server/services/sessions/plan-capture.ts`) — a
   workflow with `plan: { captureToIssue, thenState? }` launches its session
   in plan mode (`RuntimeSession.workflowId` records provenance); the acpx

@@ -66,7 +66,7 @@ export interface CreatedIssueComment {
 
 export async function createThreadedIssueComment(
   apiKey: string,
-  input: { issueId: string; body: string; parentId?: string },
+  input: { issueId: string; body: string; parentId?: string; id?: string },
 ): Promise<CreatedIssueComment | null> {
   try {
     const data = await linearGraphql<{
@@ -78,6 +78,7 @@ export async function createThreadedIssueComment(
       input: {
         issueId: input.issueId,
         body: input.body,
+        ...(input.id ? { id: input.id } : {}),
         ...(input.parentId ? { parentId: input.parentId } : {}),
       },
     });
@@ -86,6 +87,13 @@ export async function createThreadedIssueComment(
     console.error(`Failed to create comment on issue ${input.issueId}:`, error);
     return null;
   }
+}
+
+/** Reconcile a client-assigned comment ID after an uncertain create response. */
+export async function fetchIssueCommentIdentity(apiKey: string, commentId: string): Promise<{ id: string; body: string; issue: { id: string } | null } | null> {
+  const data = await linearGraphql<{ comment: { id: string; body: string; issue: { id: string } | null } | null }>(apiKey,
+    "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body issue { id } } }", { commentId });
+  return data.comment;
 }
 
 export async function updateIssueComment(
