@@ -1,0 +1,14 @@
+diff --git a/dist/live-checkpoint-Gw2oGjhe.js b/dist/live-checkpoint-Gw2oGjhe.js
+index 1a7748c185233a94929b6bc8c8021098e33f0650..46d8ce33a9f4eade40adcbed5e263c9b8cbbd3fc 100644
+--- a/dist/live-checkpoint-Gw2oGjhe.js
++++ b/dist/live-checkpoint-Gw2oGjhe.js
+@@ -1666,7 +1666,8 @@ const OPAQUE_VALUE_PATHS = /* @__PURE__ */ new Set([
+ 	"agent_capabilities",
+ 	"messages.Agent.content.ToolUse.input",
+ 	"acpx.desired_config_options",
+-	"acpx.config_options"
++	"acpx.config_options",
++	"acpx.session_options.env"
+ ]);
+ function isRecord(value) {
+ 	return !!value && typeof value === "object" && !Array.isArray(value);

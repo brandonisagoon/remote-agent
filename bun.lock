@@ -49,6 +49,9 @@
   "trustedDependencies": [
     "electron",
   ],
+  "patchedDependencies": {
+    "acpx@0.13.2": "patches/acpx@0.13.2.patch",
+  },
   "packages": {
     "@agentclientprotocol/sdk": ["@agentclientprotocol/sdk@1.4.0", "", { "peerDependencies": { "zod": "^3.25.0 || ^4.0.0" } }, "sha512-/eufudw+aFY1LKLolT6yFE6UMmYRl7fMJ/DEONSIyR6wI3slHWITBsANRGqXEY8FRzqUxwh7QEaGiZHcJPVThg=="],
 

@@ -457,7 +457,16 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         }
       });
 
-    const chained = run.finally(() => {
+    // Setup and control checks can fail before a provider turn exists. They
+    // must settle the public result too, otherwise ACP clients hang forever.
+    const chained = run.catch(async (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      completion.resolve({ status: "failed", error: message });
+      queue.close();
+      await updateRuntimeSessionState(this.prisma, input.sessionId, {
+        status: "error", recoveryDetail: message,
+      }).catch(() => undefined);
+    }).finally(() => {
       if (this.turnChains.get(input.sessionId) === chained) {
         this.turnChains.delete(input.sessionId);
       }

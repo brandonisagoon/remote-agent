@@ -20,7 +20,7 @@ import { postWorktreeLinkComment } from "./comment.ts";
 import { branchTemplateFor, isSafeBranchName, renderBranchName, renderWorktreeName } from "./branch.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 import { beginTask, taskForSession } from "../../../services/tasks/store.ts";
-import { prepareTooling } from "../../../services/tasks/tooling.ts";
+import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 
 type WorkflowEvent = Extract<
@@ -191,6 +191,7 @@ export function createWorkflowWorker(
         `refs/heads/${branchName}`,
       ]);
       if (branchResult.ok && !task?.worktreePath) {
+        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: `Branch already exists outside this task: ${branchName}` } });
         return result(WorkerRunStatus.Existing, `branch already exists: ${branchName}`);
       }
       if (branchResult.stderr.trim()) {
@@ -214,21 +215,15 @@ export function createWorkflowWorker(
         worktreePath = task
           ? await provisionTaskWorktree(context.prisma, task.id, repository, directoryName)
           : await (dependencies.provision ?? provisionWorktree)({ repository, branchName, directoryName });
-        const toolingRoot = task ? await prepareTooling({ ...repository, tooling: { root: task.toolingRoot, revision: task.toolingRevision } }, context.config.installRoot) : worktreePath;
-        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { pinnedToolingRoot: toolingRoot, environmentStatus: "preparing", recoveryDetail: null } });
         const seed = buildWorkflowSeedPrompt(workflow, {
           sourceIssueIdentifier: issue.identifier,
           sourceIssueTitle: issue.title,
           branchName,
-          ...(task ? { taskId: task.id, toolingRoot, preparation: "Prepare and verify this environment before implementing. Report failures and resource ownership through the remote-agent task tools." } : {}),
+          ...(task ? { taskId: task.id, preparation: "Prepare and verify this environment before implementing. Report failures and resource ownership through the remote-agent task tools." } : {}),
         });
-        const prompt = await (dependencies.compose ?? composeForPrompt)(
-          worktreePath,
-          seed,
-          provider,
-          repository.skillsRoot,
-          toolingRoot,
-        );
+        const { prompt, toolingRoot } = task
+          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose })
+          : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma,

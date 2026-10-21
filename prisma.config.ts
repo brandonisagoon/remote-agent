@@ -9,8 +9,9 @@ function databaseUrl(): string {
   const configFile = path.resolve(selected);
   const config = JSON.parse(readFileSync(configFile, "utf8")) as {
     server?: { databaseUrl?: string };
+    machine?: { server?: { databaseUrl?: string } };
   };
-  const configured = config.server?.databaseUrl;
+  const configured = config.machine?.server?.databaseUrl ?? config.server?.databaseUrl;
   if (!configured) {
     return `file:${path.join(path.dirname(configFile), "remote-agent.sqlite")}`;
   }

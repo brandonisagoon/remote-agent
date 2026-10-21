@@ -10,6 +10,7 @@ import { beginTask } from "./store.ts";
 import { provisionTaskWorktree } from "./provision.ts";
 import { readToolingSource } from "../../../../lib/tooling-source.ts";
 import { assertTaskAutomationAllowed, changeTaskControl, reconcileTaskControls } from "./control.ts";
+import { prepareTaskPrompt } from "./preparation.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -56,6 +57,20 @@ test("tooling policy is read from a commit, not dirty source changes", () => {
   const revision = git(repo.root, "rev-parse", "HEAD");
   writeFileSync(path.join(repo.root, ".remote-agent.config.json"), JSON.stringify({ preparation: "command" }));
   expect(readToolingSource(repo.root, revision)).toEqual({ revision, settings: { preparation: "agent" } });
+});
+
+test("unavailable tooling yields a repair prompt in the existing worktree and retains the failure", async () => {
+  const repo = repository();
+  const task = await beginTask(db.prisma, { requestKey: "repair-test", repository: repo, machineId: "macbook-air", branchName: "codex/repair" });
+  const worktreePath = await provisionTaskWorktree(db.prisma, task.id, repo, "repair");
+  const prepared = await prepareTaskPrompt({ prisma: db.prisma, task, repository: repo, installRoot: path.join(directory, "runtime"), worktreePath, provider: "codex", seed: "Use {{SKILL:prepare}}. Preserve the original request." });
+  expect(prepared.prompt).toContain("tooling preparation failed");
+  expect(prepared.prompt).toContain("Preserve the original request");
+  const failed = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+  expect(failed.phase).toBe("blocked");
+  expect(failed.environmentStatus).toBe("degraded");
+  expect(failed.worktreePath).toBe(worktreePath);
+  expect(git(worktreePath, "status", "--porcelain")).toBe("");
 });
 
 test("network task APIs require authentication and resource identity cannot be replaced", async () => {
