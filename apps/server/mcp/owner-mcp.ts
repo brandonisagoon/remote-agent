@@ -40,7 +40,7 @@ createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line)
   const base = { jsonrpc: "2.0", id: message.id };
   if (message.method === "initialize") return void send({ ...base, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "drafted-owner", version: "1.0.0" }, instructions: "Owner-only remote task supervision. Show actual state and links; never equate queue acceptance with task readiness. Existing sessions are continued by stable task identity. Remote browser viewing uses the Codex in-app browser." } });
   if (message.method === "ping") return void send({ ...base, result: {} });
-  if (message.method === "tools/list") return void send({ ...base, result: { tools: tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: z.toJSONSchema(tool.schema) })) } });
+  if (message.method === "tools/list") return void send({ ...base, result: { tools: tools.map((tool) => ({ name: tool.name, description: tool.description, inputSchema: { type: "object", ...z.toJSONSchema(tool.schema) } })) } });
   if (message.method !== "tools/call") return void send({ ...base, error: { code: -32601, message: "Unknown method" } });
   void call(message.params?.name, message.params?.arguments ?? {}).then((result) => send({ ...base, result: { content: [{ type: "text", text: JSON.stringify(result) }] } })).catch((error) => send({ ...base, result: { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : "Remote supervision failed" }] } }));
 });

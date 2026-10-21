@@ -5,7 +5,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { RoutingConfigSchema } from "../../../../lib/routing-config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { createApp } from "../../app.ts";
-import { placeTask, queueRoutedRequest, dispatchPlacements } from "./routing.ts";
+import { placeTask, queueRoutedRequest, dispatchPlacements, resolvePlacementTask } from "./routing.ts";
 
 let db: TestDatabase;
 beforeEach(async () => { db = await createTestDatabase(); });
@@ -82,4 +82,23 @@ test("peer endpoints reject plaintext remote transports and embedded credentials
   for (const url of ["http://100.1.2.3:9000", "https://secret@example.com", "https://example.com/path"]) {
     expect(RoutingConfigSchema.safeParse({ peers: { host: { url, apiKey: "long-enough-private-key", repositories: ["repo"] } } }).success).toBe(false);
   }
+});
+
+test("Linear task inspection and queued answers resolve the recorded owner without replacement launches", async () => {
+  const config = testConfig({ routing });
+  const placement = await placeTask(db.prisma, config, { sourceKey: "linear:connection:issue-id", machineId: "workstation", repositoryId: config.repository.id });
+  await queueRoutedRequest(db.prisma, { placementId: placement.id, requestKey: "answer-on-owner", kind: "question", payload: { questionId: "question-id", answer: "Proceed with the test" } });
+  const paths: string[] = [];
+  const request = async (host: string, method: string, route: string, body?: unknown) => {
+    expect(host).toBe("workstation"); paths.push(route);
+    if (method === "GET") return Response.json({ task: { id: "linear-task", machineId: "workstation", repositoryId: config.repository.id } });
+    expect(body).toEqual({ answer: "Proceed with the test" });
+    return Response.json({ questionId: "question-id", instruction: { state: "queued" } });
+  };
+  await dispatchPlacements(db.prisma, request);
+  expect(paths).toHaveLength(2);
+  expect(paths[0]).toContain("/api/routing/source-task?");
+  expect(paths[1]).toBe("/api/tasks/linear-task/questions/question-id/answer");
+  expect((await db.prisma.taskDelivery.findFirstOrThrow()).state).toBe("acknowledged");
+  await expect(resolvePlacementTask(db.prisma, placement, async () => Response.json({ task: { id: "wrong", machineId: "another-host", repositoryId: config.repository.id } }))).rejects.toThrow("different owner");
 });
