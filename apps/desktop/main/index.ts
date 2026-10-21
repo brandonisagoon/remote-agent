@@ -103,9 +103,10 @@ function repositoryRoots(): Record<string, string> {
   if (!document.valid) return {};
   const roots: Record<string, string> = {};
   for (const [id, repository] of Object.entries(document.value.repositories)) {
-    const raw = repository.root.startsWith("~")
-      ? path.join(os.homedir(), repository.root.slice(1))
-      : repository.root;
+    const configuredRoot = repository.tooling?.root ?? repository.root;
+    const raw = configuredRoot.startsWith("~")
+      ? path.join(os.homedir(), configuredRoot.slice(1))
+      : configuredRoot;
     roots[id] = path.isAbsolute(raw) ? raw : path.resolve(path.dirname(configFile), raw);
   }
   return roots;

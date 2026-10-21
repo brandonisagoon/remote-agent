@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { z } from "zod";
+import { readToolingSource } from "./tooling-source.ts";
 
 import { sshLinkSupported } from "./machines/editor-link.ts";
 import { defaultInstallRoot } from "../management/paths.ts";
@@ -87,6 +88,11 @@ const RepositorySchema = z.object({
   name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
+  /** Optional external policy/skill repository. The product needs no adoption files. */
+  tooling: z.object({
+    root: z.string().min(1),
+    ref: z.string().min(1).default("HEAD"),
+  }).optional(),
   /** Worktree directory templates, keyed by connection ("*" = default) —
       {branch} = the app's suggested branch, plus {issue}/{title}; the
       result is flattened for the filesystem. Local filesystem taste, so it
@@ -104,6 +110,8 @@ export const REPO_CONFIG_FILE = ".remote-agent.config.json";
 
 export const RepoConfigSchema = z.object({
   $schema: z.string().optional(),
+  baseBranch: z.string().min(1).default("main"),
+  preparation: z.enum(["command", "agent"]).default("command"),
   bootstrapCommand: CommandSchema.default(["bash", "scripts/bootstrap.sh"]),
   /** Where the skill-composer inputs live, relative to root. */
   skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
@@ -353,6 +361,9 @@ export interface RepositoryConfig {
   name: string;
   root: string;
   worktreeRoot: string;
+  tooling?: { root: string; revision: string };
+  baseBranch?: string;
+  preparation?: "command" | "agent";
   bootstrapCommand: string[];
   skillsRoot: string;
   /** Worktree directory template per connection id; "*" is the default. */
@@ -513,12 +524,19 @@ export function readConfig(): ServerConfig {
       const worktreeRoot = absolute(repository.worktreeRoot, root);
       // Team-shared policy comes from the repo's committed settings file;
       // the machine-local entry contributes only paths and local taste.
-      const settings = readRepoConfig(root);
+      const toolingRoot = repository.tooling
+        ? absolute(repository.tooling.root, path.dirname(configFile))
+        : null;
+      const source = toolingRoot ? readToolingSource(toolingRoot, repository.tooling!.ref) : null;
+      const settings = source ? parseRepoConfig(source.settings) : readRepoConfig(root);
       return [id, {
         id,
         name: repository.name ?? id,
         root,
         worktreeRoot,
+        ...(source && toolingRoot ? { tooling: { root: toolingRoot, revision: source.revision } } : {}),
+        baseBranch: settings.baseBranch,
+        preparation: settings.preparation,
         bootstrapCommand: [...settings.bootstrapCommand],
         labels: Object.fromEntries(
           Object.entries(settings.labels).map(([key, group]) => [

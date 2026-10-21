@@ -1,0 +1,47 @@
+/// Exists before preparation or an agent. Provider transcripts remain in acpx.
+model RemoteTask {
+  id                 String   @id @default(cuid())
+  requestKey         String   @unique
+  repositoryId       String
+  machineId          String
+  connectionId       String?
+  issueIdentifier    String?
+  branchName         String
+  baseCommit         String?
+  worktreePath       String?  @unique
+  toolingRoot        String
+  toolingRevision    String
+  pinnedToolingRoot  String?
+  primarySessionId   String?  @unique
+  phase              String   @default("preparing")
+  environmentStatus  String   @default("pending")
+  controlMode        String   @default("agent")
+  controllerId       String?
+  controlGeneration  Int      @default(0)
+  recoveryDetail     String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+  resources          RemoteTaskResource[]
+
+  @@index([repositoryId, phase])
+  @@index([machineId, phase])
+}
+
+/// Exact ownership receipts. Unknown or unreceipted resources are never deleted.
+model RemoteTaskResource {
+  id          String   @id @default(cuid())
+  taskId      String
+  key         String
+  kind        String
+  purpose     String
+  externalId  String
+  state       String   @default("allocated")
+  metadata    Json?
+  expiresAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  task        RemoteTask @relation(fields: [taskId], references: [id], onDelete: Restrict)
+
+  @@unique([taskId, key])
+  @@index([state, expiresAt])
+}

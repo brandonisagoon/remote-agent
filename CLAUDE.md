@@ -29,8 +29,8 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `<label>.tunnel` → verify publicUrl; every step idempotent; doctor rows
   `tunnel-login`/`tunnel`/`tunnel-dns`/`tunnel-service`/`public-url`).
   **No shell scripts** — everything is TypeScript.
-- **`lib/skills/`** — skill-composer boundary. Repos own skill-composer
-  as their own dev dependency; we always **exec** their copy (or a bun child
+- **`lib/skills/`** — skill-composer boundary. The product or configured
+  external tooling repository owns skill-composer; we always **exec** its copy (or a bun child
   process for the inventory shim), never import repo-owned config in-process.
 - **Thread registry** (`apps/server/services/sessions/threads.ts`) — conversation
   threads live in `RuntimeSessionResourceLink` (`comment-thread`, relationship
@@ -104,9 +104,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 ## Conventions
 
 - Kebab-case file names. Explicit named exports in barrels, no `export *`.
-- Worktree seam: the server owns git (`worktree add`, path flattening), the
-  repository owns bootstrap (runs once per new worktree; exit code is the
-  only signal; contents are the repo's business), the repository owns the branch convention
+- Worktree seam: the server owns git (`worktree add`, path flattening). The
+  default command preparation runs bootstrap once and fails on nonzero exit.
+  Agent preparation starts in the created target worktree and reports actual
+  readiness separately. External tooling is pinned to a committed revision;
+  its policy and skills do not require product adoption files. The repository owns the branch convention
   (`branchNaming` templates keyed by connection, rendered from
   provider-supplied facts).
 - Zod v4 schemas in `lib/config.ts` are the single config source; the UI

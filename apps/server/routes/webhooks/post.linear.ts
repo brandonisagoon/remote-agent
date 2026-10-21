@@ -89,6 +89,11 @@ route.post("/", async (c) => {
         "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
         "linear.teamKey": team.key,
         "linear.projectId": data.projectId ?? issueRoutingData.projectId ?? project.id,
+        // State changes belong to the envelope actor. Comments/reactions
+        // belong to their author, never the issue's assignee or creator.
+        "linear.userId": record.type === "Issue"
+          ? record.actor?.id
+          : data.userId ?? data.user?.id,
       });
     } catch (error) {
       return c.json(

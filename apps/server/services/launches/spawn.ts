@@ -12,7 +12,7 @@ export interface SpawnAgentThreadInput {
   prisma: PrismaClient;
   agentRuntime: AgentSessionRuntime;
   launchKey: string;
-  issueIdentifier: string;
+  issueIdentifier?: string;
   provider: "codex" | "claude";
   model?: string;
   prompt: string;
@@ -28,6 +28,8 @@ export interface SpawnAgentThreadInput {
   workflowId?: string;
   /** Session mode set before the initial prompt enqueues (e.g. "plan"). */
   mode?: string;
+  taskId?: string;
+  toolingRoot?: string;
 }
 
 /** Ensure one durable, metadata-complete acpx session and enqueue its initial
@@ -37,7 +39,7 @@ export async function spawnAgentThread(
 ) {
   const session = await input.agentRuntime.ensureSession({
     sessionKey: input.launchKey,
-    name: input.title ?? `${input.issueIdentifier} · ${input.role}`,
+    name: input.title ?? `${input.issueIdentifier ?? "Task"} · ${input.role}`,
     agent: input.provider,
     cwd: input.worktreePath,
     worktreePath: input.worktreePath,
@@ -50,17 +52,24 @@ export async function spawnAgentThread(
     relations: input.parentSessionId
       ? [{ relationship: "spawned-by", targetSessionId: input.parentSessionId }]
       : [],
-    resourceLinks: [{
+    resourceLinks: input.issueIdentifier ? [{
       provider: "linear",
       connectionId: input.config.activeConnectionId,
       resourceType: "issue-identifier",
       externalId: input.issueIdentifier,
       relationship: "handles",
-    }],
+    }] : [],
     model: input.model,
+    ...(input.taskId ? { agentEnv: {
+      REMOTE_AGENT_TASK_ID: input.taskId,
+      ...(input.toolingRoot ? { REMOTE_AGENT_TOOLING_ROOT: input.toolingRoot } : {}),
+    } } : {}),
   });
 
   try {
+    if (input.taskId) {
+      await input.prisma.remoteTask.update({ where: { id: input.taskId }, data: { primarySessionId: session.id } });
+    }
     // Mode must land before the prompt: a plan-capture session that starts
     // its turn outside plan mode never produces an exit-plan approval.
     if (input.mode) await input.agentRuntime.setMode(session.id, input.mode);

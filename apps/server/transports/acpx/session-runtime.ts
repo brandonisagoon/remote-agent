@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { assertTaskAutomationAllowed } from "../../services/tasks/control.ts";
 
 import type {
   AcpRuntimeEvent,
@@ -338,6 +339,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           return;
         }
         const session = await this.requireSession(input.sessionId);
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
         const handle = await this.handleFor(session);
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
@@ -351,6 +353,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           createdAt: Date.now(),
           phase: "started",
         });
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
         current = this.runtime.startTurn({
           handle,
           text: input.text,
@@ -477,6 +480,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     text: string;
     requestId?: string;
   }): Promise<string> {
+    const session = await this.requireSession(input.sessionId);
+    await assertTaskAutomationAllowed(this.prisma, session.cwd);
     const turn = this.startTurn(input);
     void (async () => {
       for await (const _event of turn.events) {

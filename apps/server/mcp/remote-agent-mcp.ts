@@ -29,6 +29,21 @@ async function call(method: string, route: string, body?: Json): Promise<Json> {
 }
 
 const TOOLS = [
+  { name: "inspect_task", description: "Read this session's durable task, pinned tooling, environment state and owned resources.", inputSchema: { type: "object", properties: {}, additionalProperties: false } },
+  { name: "report_task", description: "Report task progress and verified environment readiness separately. Never infer completion from agent inactivity. Do not include secrets.", inputSchema: {
+    type: "object", properties: {
+      phase: { type: "string", enum: ["preparing", "working", "waiting", "blocked", "review", "complete"] },
+      environmentStatus: { type: "string", enum: ["pending", "preparing", "ready", "degraded", "stopped"] },
+      recoveryDetail: { type: ["string", "null"] },
+    }, additionalProperties: false,
+  } },
+  { name: "register_resource", description: "Record exact task-owned resource identity before use or cleanup. Keep credentials out of metadata. Different development and review resources use different keys.", inputSchema: {
+    type: "object", properties: {
+      key: { type: "string" }, kind: { type: "string" }, purpose: { type: "string", enum: ["development", "review", "browser", "tooling"] }, externalId: { type: "string" },
+      state: { type: "string", enum: ["allocated", "ready", "failed", "unknown", "released"] }, metadata: { type: "object" }, expiresAt: { type: ["string", "null"] },
+    }, required: ["key", "kind", "purpose", "externalId"], additionalProperties: false,
+  } },
+  { name: "publish_plan", description: "Save the plan under Implementation Plan in this session's linked Linear issue, preserving its original description. Works with Codex and Claude; does not advance the issue state.", inputSchema: { type: "object", properties: { plan: { type: "string" } }, required: ["plan"], additionalProperties: false } },
   {
     name: "delegate_session",
     description:
@@ -62,6 +77,10 @@ const TOOLS = [
 ] as const;
 
 async function callTool(name: string, args: Json): Promise<Json> {
+  if (name === "inspect_task") return call("GET", `/api/sessions/${sessionId}/task`);
+  if (name === "report_task") return call("PATCH", `/api/sessions/${sessionId}/task`, args);
+  if (name === "register_resource") return call("PUT", `/api/sessions/${sessionId}/task/resources`, args);
+  if (name === "publish_plan") return call("PUT", `/api/sessions/${sessionId}/plan`, args);
   if (name === "delegate_session") {
     return call("POST", `/api/sessions/${sessionId}/delegate`, args);
   }

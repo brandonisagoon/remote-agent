@@ -6,11 +6,14 @@ import launchRoutes from "./launches/index.ts";
 import sessionEventRoutes from "./session-events/index.ts";
 import sessionRoutes from "./sessions/index.ts";
 import webhookRoutes from "./webhooks/index.ts";
+import { taskRoutes, sessionTaskRoutes } from "./tasks/index.ts";
 
 export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/health", healthRoutes);
   app.route("/webhooks", webhookRoutes);
   app.route("/api/sessions", sessionRoutes);
+  app.route("/api/sessions", sessionTaskRoutes);
+  app.route("/api/tasks", taskRoutes);
   app.route("/api/session-events", sessionEventRoutes);
   app.route("/api/launches", launchRoutes);
 }

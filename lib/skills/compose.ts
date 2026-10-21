@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 /** Providers map 1:1 onto skill-composer harnesses. */
@@ -63,9 +63,10 @@ async function runComposer(
   cli: string,
   args: string[],
   cwd: string,
+  env: Record<string, string> = {},
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    const child = spawn(cli, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cli, args, { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => { stdout += chunk; });
@@ -79,8 +80,9 @@ async function composeWorktreeSkill(
   worktreePath: string,
   selection: Pick<PromptSkillSelection, "skillset" | "flags">,
   skillsRoot: string,
+  toolingRoot: string,
 ): Promise<ComposedSkill> {
-  const cli = skillComposerPath(worktreePath);
+  const cli = skillComposerPath(toolingRoot);
   if (!cli) {
     throw new Error(
       `skill-composer is not installed in this repository (expected node_modules/.bin/skill-composer under ${worktreePath})`,
@@ -92,11 +94,16 @@ async function composeWorktreeSkill(
     "--all",
     ...selection.flags.flatMap((flag) => ["--flag", flag]),
     "--root",
-    worktreePath,
+    toolingRoot,
     "--config",
-    path.join(worktreePath, skillsRoot, "skill-composer.config.ts"),
+    path.join(toolingRoot, skillsRoot, "skill-composer.config.ts"),
   ];
-  const { exitCode, stdout, stderr } = await runComposer(cli, args, worktreePath);
+  // Source validation stays anchored in the tooling repository. The composer
+  // explicitly supports independent output directories for each provider.
+  const { exitCode, stdout, stderr } = await runComposer(cli, args, worktreePath, toolingRoot === worktreePath ? {} : {
+    SKILL_COMPOSER_CLAUDE_OUTPUT_DIR: path.join(worktreePath, ".claude", "skills"),
+    SKILL_COMPOSER_CODEX_OUTPUT_DIR: path.join(worktreePath, ".agents", "skills"),
+  });
   let result: ComposeCliResult;
   try {
     result = JSON.parse(stdout.trim()) as ComposeCliResult;
@@ -117,6 +124,16 @@ async function composeWorktreeSkill(
         `Skill composer failed for '${selection.skillset}' (exit ${exitCode})`,
     );
   }
+  if (toolingRoot !== worktreePath) {
+    // Local Git metadata keeps generated adoption files out of product PRs.
+    // The target's tracked .gitignore and dependency manifests stay intact.
+    if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(result.skill)) throw new Error("Invalid generated skill name");
+    const excludePath = execFileSync("git", ["-C", worktreePath, "rev-parse", "--path-format=absolute", "--git-path", "info/exclude"], { encoding: "utf8" }).trim();
+    mkdirSync(path.dirname(excludePath), { recursive: true });
+    const existing = existsSync(excludePath) ? readFileSync(excludePath, "utf8") : "";
+    const rules = [`.claude`, `.agents`].map((directory) => `/${directory}/skills/${result.skill}/`).filter((rule) => !existing.split("\n").includes(rule));
+    if (rules.length) appendFileSync(excludePath, `\n${rules.join("\n")}\n`);
+  }
   return { skill: result.skill, harnesses: result.compatibility.harnesses };
 }
 
@@ -124,6 +141,7 @@ export async function composeWorktreeSkills(
   worktreePath: string,
   selections: readonly PromptSkillSelection[],
   skillsRoot = "agent-skills",
+  toolingRoot = worktreePath,
 ): Promise<Map<string, ComposedSkill>> {
   const composedBySelection = new Map<string, Promise<ComposedSkill>>();
   const entries = await Promise.all(
@@ -131,7 +149,7 @@ export async function composeWorktreeSkills(
       const key = [selection.skillset, ...selection.flags].join("+");
       let composed = composedBySelection.get(key);
       if (!composed) {
-        composed = composeWorktreeSkill(worktreePath, selection, skillsRoot);
+        composed = composeWorktreeSkill(worktreePath, selection, skillsRoot, toolingRoot);
         composedBySelection.set(key, composed);
       }
       return [selection.token, await composed] as const;
@@ -163,9 +181,10 @@ export async function composeForPrompt(
   prompt: string,
   harness: SkillHarness,
   skillsRoot = "agent-skills",
+  toolingRoot = worktreePath,
 ): Promise<string> {
   const selections = skillsetsFromPrompt(prompt);
   if (selections.length === 0) return prompt;
-  const skills = await composeWorktreeSkills(worktreePath, selections, skillsRoot);
+  const skills = await composeWorktreeSkills(worktreePath, selections, skillsRoot, toolingRoot);
   return resolveSkillPlaceholders(prompt, harness, skills);
 }

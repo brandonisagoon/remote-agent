@@ -48,10 +48,11 @@ const GITIGNORE_COMMAND =
     files in the user's repo — authored in their editor, never here. */
 export function SkillsTab({ id, value }: { id: string; value: ServiceFile }) {
   const repository = value.repositories[id]!;
+  const sourceRoot = repository.tooling?.root ?? repository.root;
   const repo = useConfig().repoConfig(id);
   const skillsRoot = repo.config?.skillsRoot ?? "agent-skills";
   const queryClient = useQueryClient();
-  const options = skillsQueryOptions(repository.root, skillsRoot);
+  const options = skillsQueryOptions(sourceRoot, skillsRoot);
   const { data: scan, isFetching, error } = useQuery({
     ...options,
     // The install/create/ignore steps happen in Terminal, invisible to the
@@ -63,14 +64,14 @@ export function SkillsTab({ id, value }: { id: string; value: ServiceFile }) {
     },
   });
   const refresh = () => void queryClient.invalidateQueries({ queryKey: options.queryKey });
-  const skillsDirectory = `${repository.root.replace(/\/$/, "")}/${skillsRoot}`;
+  const skillsDirectory = `${sourceRoot.replace(/\/$/, "")}/${skillsRoot}`;
 
   // Same dumb-install pattern as the machine page: the button opens Terminal
   // with the command prefilled; nothing privileged runs from the app.
   const changeSkillsRoot = async () => {
     const picked = await window.remoteAgent.skills.pickRoot(skillsDirectory);
     if (!picked) return;
-    const root = repository.root.replace(/\/$/, "");
+    const root = sourceRoot.replace(/\/$/, "");
     if (picked !== root && !picked.startsWith(`${root}/`)) {
       toast.error("The skills root must be inside the repository");
       return;
@@ -81,7 +82,7 @@ export function SkillsTab({ id, value }: { id: string; value: ServiceFile }) {
 
   const openTerminal = async (command: string) => {
     const result = await window.remoteAgent.management.openTerminal(
-      `cd '${repository.root}' && ${command}`,
+      `cd '${sourceRoot}' && ${command}`,
     );
     if (!result.ok) toast.error(result.summary);
   };

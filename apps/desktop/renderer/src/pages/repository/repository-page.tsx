@@ -142,7 +142,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         <SettingsSection
           value="config-file"
           title="Config File"
-          description="Bootstrap, naming, workflows, and labels live in the repository's own config, next to the code they configure."
+          description="Preparation, naming, workflows, and labels come from this config. External tooling is pinned to its committed Git ref when the server starts."
         >
           <SettingsCard>
             <div className="grid gap-2">
@@ -164,7 +164,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         title="Workflows"
         description="When a Linear event matches a trigger, the selected skillset is composed into the session's worktree and delivered."
       >
-        <WorkflowsSection value={value} root={repository.root} repo={repo} />
+        <WorkflowsSection value={value} root={repository.tooling?.root ?? repository.root} repo={repo} />
       </SettingsSection>
       <SettingsSection
         value="labels"
