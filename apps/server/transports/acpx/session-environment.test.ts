@@ -6,7 +6,7 @@ import { createRuntimeStore, type AcpSessionRecord } from "acpx/runtime";
 import { createTestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 
-import { createAcpxSessionRuntime, sessionEnvironment } from "./session-runtime.ts";
+import { createAcpxSessionRuntime, sessionEnvironment, sessionMcpServers } from "./session-runtime.ts";
 
 describe("sessionEnvironment", () => {
   test("injects the session id and control socket, preserving caller env", () => {
@@ -17,6 +17,16 @@ describe("sessionEnvironment", () => {
       REMOTE_AGENT_SESSION_ID: "runtime-1",
       REMOTE_AGENT_SOCKET: "/tmp/control.sock",
     });
+  });
+
+  test("each provider receives explicit, distinct MCP session identity", () => {
+    const server = { name: "remote-agent", command: "bun", args: ["mcp.ts"], env: [] };
+    const config = { controlIpcPath: "/tmp/private-control.sock" };
+    const first = sessionMcpServers("one", config, [server]);
+    const second = sessionMcpServers("two", config, [server]);
+    expect(first).toEqual([{ ...server, env: [{ name: "REMOTE_AGENT_SESSION_ID", value: "one" }, { name: "REMOTE_AGENT_SOCKET", value: config.controlIpcPath }] }]);
+    expect(second).toEqual([{ ...server, env: [{ name: "REMOTE_AGENT_SESSION_ID", value: "two" }, { name: "REMOTE_AGENT_SOCKET", value: config.controlIpcPath }] }]);
+    expect(server.env).toEqual([]);
   });
 
   test("the installed acpx store preserves environment names for reconnects", async () => {

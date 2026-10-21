@@ -139,7 +139,7 @@ function configOptionsFromStatus(value: unknown): SessionConfigOption[] {
 
 export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly store;
-  private readonly runtime;
+  private readonly runtimes = new Map<string, ReturnType<typeof createAcpRuntime>>();
   private readonly handles = new Map<string, AcpRuntimeHandle>();
   private readonly listeners = new Map<
     string,
@@ -161,25 +161,34 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     } = {},
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
-    this.runtime = createAcpRuntime({
-      cwd: config.installRoot,
+  }
+
+  /** Providers sanitize the environment of MCP children. Carry each
+   * session's identity explicitly in its own MCP descriptor. */
+  private runtimeFor(sessionId: string): ReturnType<typeof createAcpRuntime> {
+    const existing = this.runtimes.get(sessionId);
+    if (existing) return existing;
+    const runtime = createAcpRuntime({
+      cwd: this.config.installRoot,
       sessionStore: this.store,
       agentRegistry: createAgentRegistry({
-        overrides: config.acpxAgentCommands,
+        overrides: this.config.acpxAgentCommands,
       }),
       // Sessions run unattended; agents get their tool requests approved.
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
       elicitationModes: ["form", "url"],
-      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
+      mcpServers: sessionMcpServers(sessionId, this.config, this.options.mcpServers ?? []),
       // Consulted before approve-all answers; undefined falls through to it.
-      ...(options.onPermissionRequest
+      ...(this.options.onPermissionRequest
         ? {
             onPermissionRequest: (request, context) =>
               this.interceptPermissionRequest(request, context),
           }
         : {}),
     });
+    this.runtimes.set(sessionId, runtime);
+    return runtime;
   }
 
   private async interceptPermissionRequest(
@@ -254,7 +263,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
-      const handle = await this.runtime.ensureSession({
+      const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
+      const handle = await this.runtimeFor(row.id).ensureSession({
         sessionKey: row.id,
         agent: input.agent,
         mode: "persistent",
@@ -262,11 +272,13 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         sessionOptions: {
           ...(input.model ? { model: input.model } : {}),
           ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
-          env: sessionEnvironment(row.id, this.config, input.agentEnv),
+          env: sessionEnvironment(row.id, this.config, { ...input.agentEnv,
+            ...(task ? { REMOTE_AGENT_TASK_ID: task.id, ...(task.pinnedToolingRoot ? { REMOTE_AGENT_TOOLING_ROOT: task.pinnedToolingRoot } : {}) } : {}),
+          }),
         },
       });
       this.handles.set(row.id, handle);
-      const runtimeStatus = await this.runtime.getStatus({ handle });
+      const runtimeStatus = await this.runtimeFor(row.id).getStatus({ handle });
       return await attachRuntimeSession(this.prisma, {
         id: row.id,
         acpxRecordId: handle.acpxRecordId ?? row.acpxRecordId ?? row.id,
@@ -354,7 +366,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           phase: "started",
         });
         await assertTaskAutomationAllowed(this.prisma, session.cwd);
-        current = this.runtime.startTurn({
+        current = this.runtimeFor(session.id).startTurn({
           handle,
           text: input.text,
           mode: input.mode ?? "prompt",
@@ -504,7 +516,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   async setMode(sessionId: string, mode: string): Promise<void> {
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.setMode({ handle, mode });
+    await this.runtimeFor(sessionId).setMode({ handle, mode });
     await this.refreshSessionState(session.id, handle);
   }
 
@@ -515,7 +527,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   ): Promise<SessionConfigOption[]> {
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    const response = await this.runtime.setConfigOption({ handle, key, value });
+    const response = await this.runtimeFor(sessionId).setConfigOption({ handle, key, value });
     await updateRuntimeSessionState(this.prisma, session.id, {
       status: "idle",
       configOptions: response.configOptions,
@@ -538,7 +550,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       .join("\n\n")
       .slice(-24_000);
     const oldHandle = await this.handleFor(session);
-    await this.runtime.close({
+    const priorEnvironment = (await this.loadRecord(session))?.acpx?.session_options?.env;
+    await this.runtimeFor(sessionId).close({
       handle: oldHandle,
       reason: `Switching Remote Agent session to ${agent}`,
     });
@@ -548,21 +561,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       agent,
     });
     try {
-      const handle = await this.runtime.ensureSession({
+      const handle = await this.runtimeFor(sessionId).ensureSession({
         sessionKey: switched.id,
         agent,
         mode: "persistent",
         cwd: switched.cwd,
-        sessionOptions: transcript
-          ? {
+        sessionOptions: { env: sessionEnvironment(sessionId, this.config, priorEnvironment),
+          ...(transcript ? {
               systemPrompt:
                 "Continue the existing Remote Agent conversation summarized below. Preserve its context and wait for the user's next request.\n\n" +
                 transcript,
-            }
-          : undefined,
+            } : {}),
+        },
       });
       this.handles.set(switched.id, handle);
-      const status = await this.runtime.getStatus({ handle });
+      const status = await this.runtimeFor(sessionId).getStatus({ handle });
       return await attachRuntimeSession(this.prisma, {
         id: switched.id,
         acpxRecordId: handle.acpxRecordId ?? switched.id,
@@ -587,19 +600,20 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     }
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.cancel({ handle, reason });
+    await this.runtimeFor(sessionId).cancel({ handle, reason });
   }
 
   async close(sessionId: string, reason: string): Promise<void> {
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.close({ handle, reason });
+    await this.runtimeFor(sessionId).close({ handle, reason });
     await updateRuntimeSessionState(this.prisma, session.id, {
       status: "closed",
       closedAt: new Date(),
       recoveryDetail: null,
     });
     this.handles.delete(session.id);
+    this.runtimes.delete(session.id);
   }
 
   async output(sessionId: string): Promise<string | null> {
@@ -651,7 +665,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private async handleFor(session: AgentRuntimeSession): Promise<AcpRuntimeHandle> {
     const existing = this.handles.get(session.id);
     if (existing) return existing;
-    const handle = await this.runtime.ensureSession({
+    const handle = await this.runtimeFor(session.id).ensureSession({
       sessionKey: session.id,
       agent: session.agent,
       mode: "persistent",
@@ -679,7 +693,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     sessionId: string,
     handle: AcpRuntimeHandle,
   ): Promise<void> {
-    const status = await this.runtime.getStatus({ handle });
+    const status = await this.runtimeFor(sessionId).getStatus({ handle });
     await updateRuntimeSessionState(this.prisma, sessionId, {
       status: "idle",
       configOptions: configOptionsFromStatus(status),
@@ -749,7 +763,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       return [{ sessionUpdate: "usage_update", ...usage }];
     }
     if (event.tag === "config_option_update") {
-      const status = await this.runtime.getStatus({ handle });
+      const status = await this.runtimeFor(sessionId).getStatus({ handle });
       const configOptions = configOptionsFromStatus(status);
       await updateRuntimeSessionState(this.prisma, sessionId, { configOptions });
       return [{ sessionUpdate: "config_option_update", configOptions }];
@@ -802,6 +816,14 @@ export function sessionEnvironment(
     REMOTE_AGENT_SESSION_ID: sessionId,
     REMOTE_AGENT_SOCKET: config.controlIpcPath,
   };
+}
+
+export function sessionMcpServers(sessionId: string, config: Pick<ServerConfig, "controlIpcPath">, servers: McpServer[]): McpServer[] {
+  return servers.map((server) => {
+    if (server.name !== "remote-agent" || !("command" in server)) return server;
+    const env = sessionEnvironment(sessionId, config, Object.fromEntries(server.env.map(({ name, value }) => [name, value])));
+    return { ...server, env: Object.entries(env).map(([name, value]) => ({ name, value })) };
+  });
 }
 
 export function createAcpxSessionRuntime(

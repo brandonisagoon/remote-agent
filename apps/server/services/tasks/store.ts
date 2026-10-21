@@ -19,5 +19,8 @@ export async function beginTask(prisma: PrismaClient, input: {
 }
 
 export async function taskForSession(prisma: PrismaClient, sessionId: string) {
-  return prisma.remoteTask.findUnique({ where: { primarySessionId: sessionId }, include: { resources: true } });
+  const primary = await prisma.remoteTask.findUnique({ where: { primarySessionId: sessionId }, include: { resources: true } });
+  if (primary) return primary;
+  const session = await prisma.runtimeSession.findUnique({ where: { id: sessionId }, select: { cwd: true } });
+  return session ? prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd }, include: { resources: true } }) : null;
 }
