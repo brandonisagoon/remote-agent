@@ -253,8 +253,16 @@ installer can do for you:
   installs the tunnel runner as a service beside the server, and verifies
   the public URL. Re-run it any time; every step is idempotent. `doctor`
   shows each step's state.
-- **Linear.** An API key, plus the webhook URL and secret from your
-  connection settings pasted into Linear's webhook settings.
+- **Linear.** A private app with client credentials enabled, or an existing
+  account API key, plus the connection's webhook URL and signing secret.
+  App credentials use `apiKey: { "type": "app", "clientId": "…", "clientSecret": "…" }`;
+  personal keys retain the string form. The server mints app bearer tokens in
+  memory, renews before expiry, and retries an explicit 401 once. Never paste an
+  expiring OAuth token into the personal-key field. Query `viewer { id }` with
+  the app token for `agentUserId`; keep the authorized human's ID in repository
+  routing rules. Private apps need no second human account. Only configured
+  owner events dispatch work; valid deliveries outside that subscription receive
+  an ignored acknowledgement so Linear does not retry them indefinitely.
 - **Provider CLIs.** Install and authenticate `codex` and/or `claude`
   yourself; they are your identity and subscription, never installed for
   you. Their presence enables the matching provider.

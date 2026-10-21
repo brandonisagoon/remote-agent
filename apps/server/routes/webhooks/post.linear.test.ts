@@ -185,7 +185,8 @@ describe("user-scoped routing", () => {
       const payload = type === "Issue" ? issuePayload() : type === "Reaction" ? reactionPayload() : commentPayload();
       const data = { ...payload.data, userId, user: userId ? { id: userId } : undefined, assigneeId: "user-brandon", creatorId: "user-brandon" };
       const response = await post({ ...payload, data, actor: userId ? { id: userId } : undefined }, { requestConfig });
-      expect(response.status).toBe(409);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ accepted: false, ignored: true });
       expect(await prisma.webhookReceipt.count()).toBe(0);
       expect(await prisma.runtimeSession.count()).toBe(0);
     }

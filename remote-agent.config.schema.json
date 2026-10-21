@@ -313,8 +313,35 @@
             "minLength": 1
           },
           "apiKey": {
-            "type": "string",
-            "minLength": 1
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "app"
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "clientSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "type",
+                  "clientId",
+                  "clientSecret"
+                ],
+                "additionalProperties": false
+              }
+            ]
           },
           "agentUserId": {
             "type": "string",

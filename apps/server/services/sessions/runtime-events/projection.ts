@@ -24,6 +24,7 @@ import {
   pruneRuntimeLifecycleEvents,
 } from "../runtime-registry.ts";
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
+import { projectSourceCheckpoint } from "./source-checkpoint.ts";
 
 const CONSUMER = "linear-projection:v1";
 const MAX_OUTPUT = 8_000;
@@ -69,7 +70,12 @@ export async function projectRuntimeEvent(
     include: { sessionMirror: true },
   });
   const record = session?.sessionMirror;
-  if (!record) return;
+  if (!record) {
+    if (await projectSourceCheckpoint(config, prisma, runtime, event)) {
+      await advanceRuntimeEventCursor(prisma, { runtimeSessionId: event.sessionId, consumer: CONSUMER, sourceCursor: event.id, generation: sequence > 0n ? sequence : cursor.generation + 1n });
+    }
+    return;
+  }
   const issue = await findAgentIssue(config, { id: record.externalId });
   if (!issue) return;
 

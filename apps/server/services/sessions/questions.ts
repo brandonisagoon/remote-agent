@@ -1,3 +1,4 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
@@ -24,7 +25,7 @@ const delivery = { create: createThreadedIssueComment, read: fetchIssueCommentId
 /** Persist identity and register routing before the external write. Retrying
  * uses the same UUID; a lost response can never create a second comment. */
 export async function deliverSessionQuestion(input: {
-  prisma: PrismaClient; apiKey: string; sessionId: string; connectionId: string;
+  prisma: PrismaClient; apiKey: LinearCredential; sessionId: string; connectionId: string;
   issueId: string; requestKey: string; body: string;
 }, client = delivery) {
   const question = await input.prisma.runtimeQuestion.upsert({

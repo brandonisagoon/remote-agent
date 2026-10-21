@@ -8,7 +8,7 @@ import { Field } from "@renderer/components/field.tsx";
 import { PageHeading } from "@renderer/components/page-heading.tsx";
 import { MachineScopeEditor } from "./machine-scope-editor.tsx";
 import { WebhookEditor } from "./webhook-editor.tsx";
-import { SecretField } from "@renderer/components/secret-field.tsx";
+import { AuthenticationEditor } from "./authentication-editor.tsx";
 import { SettingsCard, SettingsSection } from "@renderer/components/settings-section.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
 import {
@@ -78,7 +78,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
         title="Authentication"
         description={
           <>
-            Paste in an API key from your{" "}
+            Use a private app or an account API key from your{" "}
             <a
               href="https://linear.app/settings/api"
               target="_blank"
@@ -92,7 +92,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
         }
       >
         <SettingsCard>
-          <SecretField label="Linear API key" value={connection.apiKey} onChange={(next) => mutate((file) => { file.connections[id]!.apiKey = next; })} />
+          <AuthenticationEditor connectionId={id} value={value} mutate={mutate} />
           {/* healConfig guarantees the webhook exists after adoption; the guard
               only covers the render between adoption and heal-save. */}
           {connection.webhook && (
@@ -103,7 +103,7 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
       <SettingsSection
         value="agent"
         title="Agent"
-        description="The Linear user this agent acts as — assigning or mentioning it is what triggers sessions."
+        description="The app or account identity that posts updates. Use its Linear user ID so its own replies cannot trigger a loop. Workflows and repository rules decide which human activity starts sessions."
       >
         <SettingsCard>
           <Field label="Agent user ID" value={connection.agentUserId} onChange={(next) => mutate((file) => { file.connections[id]!.agentUserId = next; })} />

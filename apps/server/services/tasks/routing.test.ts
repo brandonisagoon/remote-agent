@@ -68,8 +68,8 @@ test("Linear ingress rejects other and missing actors before persisting placemen
     const body = JSON.stringify({ type: "Issue", action: "update", webhookTimestamp: Date.now(), organizationId: "org", actor: actor ? { id: actor } : undefined, data: { id: "issue", identifier: "DRA-1", state: { name: "Planning", type: "unstarted" } } });
     return app.request(`/webhooks/${webhookId}`, { method: "POST", headers: { "content-type": "application/json", "linear-delivery": delivery, "linear-signature": createHmac("sha256", config.webhooks[webhookId]!.webhookSecret).update(body).digest("hex") }, body });
   };
-  expect((await post("other", "denied-one")).status).toBe(409);
-  expect((await post(undefined, "denied-two")).status).toBe(409);
+  expect(await (await post("other", "denied-one")).json()).toEqual({ accepted: false, ignored: true, reason: "outside_subscription" });
+  expect(await (await post(undefined, "denied-two")).json()).toEqual({ accepted: false, ignored: true, reason: "outside_subscription" });
   expect(await db.prisma.taskPlacement.count()).toBe(0);
   expect(await db.prisma.taskDelivery.count()).toBe(0);
   expect((await post("owner", "allowed")).status).toBe(202);

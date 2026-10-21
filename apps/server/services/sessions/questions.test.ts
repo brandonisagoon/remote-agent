@@ -1,3 +1,4 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { afterEach, expect, test } from "bun:test";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { beginRuntimeSession } from "./runtime-registry.ts";
@@ -16,7 +17,7 @@ test("question retries keep one comment identity, route early replies, and prese
   const ids: string[] = [];
   let delivered = false;
   const client = {
-    async create(_apiKey: string, comment: { id?: string; issueId: string; body: string }) {
+    async create(_apiKey: LinearCredential, comment: { id?: string; issueId: string; body: string }) {
       ids.push(comment.id!);
       const key = { provider: "linear", connectionId: input.connectionId, threadRootCommentId: comment.id! };
       expect((await findThreadSession(prisma, key))?.runtimeSessionId).toBe(session.id);
@@ -28,7 +29,7 @@ test("question retries keep one comment identity, route early replies, and prese
       }
       return null; // fixed UUID already exists
     },
-    async read(_apiKey: string, id: string) {
+    async read(_apiKey: LinearCredential, id: string) {
       if (ids.length === 1) throw new Error("Network unavailable");
       return { id, body: input.body, issue: { id: input.issueId } };
     },

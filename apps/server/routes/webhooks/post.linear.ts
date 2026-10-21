@@ -1,12 +1,14 @@
 import { Hono } from "hono";
 import type { Context } from "hono";
 import { routeLinearDelivery } from "../../services/tasks/routing.ts";
+import { completeLinearRouting } from "../../integrations/linear/webhooks/routing.ts";
 
 import { MAX_REQUEST_BYTES } from "../../../../lib/config.ts";
 import {
   getWebhookConfig,
   routeWebhookRepository,
   scopeConfig,
+  WebhookNotSubscribedError,
 } from "../../../../lib/config.ts";
 import {
   IssueWebhookResultKind,
@@ -90,7 +92,7 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
         : {};
     let repository;
     try {
-      repository = routeWebhookRepository(config, webhookId, {
+      const attributes = await completeLinearRouting(config, webhookConfig, {
         "linear.organizationId": record.organizationId,
         "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
         "linear.teamKey": team.key,
@@ -100,8 +102,12 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
         "linear.userId": record.type === "Issue"
           ? record.actor?.id
           : data.userId ?? data.user?.id,
-      });
+      }, record.type === "Issue" ? data.id : data.issueId ?? issueRoutingData.id);
+      repository = routeWebhookRepository(config, webhookId, attributes);
     } catch (error) {
+      // A valid delivery outside the owner's subscription is consumed without
+      // work. Retrying it cannot grant permission and can disable the webhook.
+      if (error instanceof WebhookNotSubscribedError) return c.json({ accepted: false, ignored: true, reason: "outside_subscription" }, 200);
       return c.json(
         { error: error instanceof Error ? error.message : String(error) },
         409,

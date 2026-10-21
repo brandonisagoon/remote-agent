@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 import { z } from "zod";
+import { LinearCredentialSchema, type LinearCredential } from "./linear-auth.ts";
 import { readToolingSource } from "./tooling-source.ts";
 import { RoutingConfigSchema, type RoutingConfig } from "./routing-config.ts";
 
@@ -210,7 +211,7 @@ const EditorSchema = z.object({
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
-  apiKey: z.string().min(1),
+  apiKey: LinearCredentialSchema,
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
   /** Portable workspace identity (Linear workspace URL key). Committed
@@ -402,7 +403,7 @@ export interface LinearConnectionConfig {
   id: string;
   provider: "linear";
   name: string;
-  apiKey: string;
+  apiKey: LinearCredential;
   agentUserId: string;
   agentHandle: string | null;
   /** Portable workspace identity; committed repo configs key on it. */
@@ -435,7 +436,7 @@ export interface ServerConfig {
   controlIpcPath: string;
   webhookSecret: string;
   apiKey: string;
-  linearApiKey: string;
+  linearApiKey: LinearCredential;
   agentUserId: string;
   agentHandle: string | null;
   agentTeamKey: string;
@@ -765,6 +766,8 @@ export function resolveRepositoryForCwd(
   return candidates[0]!.repository;
 }
 
+export class WebhookNotSubscribedError extends Error {}
+
 export function routeWebhookRepository(
   config: ServerConfig,
   webhookId: string,
@@ -788,13 +791,8 @@ export function routeWebhookRepository(
       )
       .map(([repositoryId]) => repositoryId),
   );
-  if (matchingRepositoryIds.size !== 1) {
-    throw new Error(
-      matchingRepositoryIds.size === 0
-        ? `webhook ${webhookId} did not match a repository routing rule`
-        : `webhook ${webhookId} matched multiple repositories`,
-    );
-  }
+  if (matchingRepositoryIds.size === 0) throw new WebhookNotSubscribedError(`webhook ${webhookId} did not match a repository routing rule`);
+  if (matchingRepositoryIds.size > 1) throw new Error(`webhook ${webhookId} matched multiple repositories`);
   const repositoryId = [...matchingRepositoryIds][0]!;
   return getRepositoryConfig(config, repositoryId);
 }

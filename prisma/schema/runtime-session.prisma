@@ -142,6 +142,7 @@ model RuntimeLifecycleEvent {
   requestId        String
   phase            String
   error            String?
+  output           String?
   occurredAt       DateTime
   createdAt        DateTime @default(now())
 

@@ -795,6 +795,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private async emitLifecycle(
     event: Omit<Extract<AgentRuntimeEvent, { kind: "turn" }>, "sequence">,
   ): Promise<void> {
+    if (event.phase === "completed") {
+      const output = (await this.output(event.sessionId))?.trim() ?? "";
+      event = { ...event, output: output.length > 8000 ? `…${output.slice(-8000)}` : output };
+    }
     await this.emit(await appendRuntimeLifecycleEvent(this.prisma, event));
   }
 }

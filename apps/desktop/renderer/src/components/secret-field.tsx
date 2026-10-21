@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import {
@@ -20,14 +20,16 @@ export function SecretField(props: {
   description?: string;
   onChange(value: string): void;
 }) {
+  const id = useId();
   const toggleLabel = useKeybindingLabel("toggle-secrets");
   const [visible, setVisible] = useState(secretsVisible);
   useEffect(() => subscribeSecrets(() => setVisible(secretsVisible())), []);
   return (
     <div className="grid gap-2">
-      <Label>{props.label}</Label>
+      <Label htmlFor={id}>{props.label}</Label>
       <InputGroup>
         <InputGroupInput
+          id={id}
           type={visible ? "text" : "password"}
           value={props.value}
           onChange={(event) => props.onChange(event.target.value)}

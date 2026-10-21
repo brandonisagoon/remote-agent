@@ -44,7 +44,11 @@
     "linear-main": {
       "provider": "linear",
       "name": "Linear Product",
-      "apiKey": "replace-with-linear-api-key",
+      "apiKey": {
+        "type": "app",
+        "clientId": "replace-with-linear-app-client-id",
+        "clientSecret": "replace-with-linear-app-client-secret"
+      },
       "agentUserId": "replace-with-linear-agent-user-id",
       "agentHandle": "agent",
       "webhook": {

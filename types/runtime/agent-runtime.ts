@@ -64,6 +64,7 @@ export type AgentRuntimeLifecycleEvent = {
   sequence?: number;
   phase: "started" | "completed" | "failed" | "cancelled";
   error?: string;
+  output?: string;
 };
 
 export type AgentRuntimeEvent =
