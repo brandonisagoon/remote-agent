@@ -174,8 +174,8 @@ processes only). Sessions' MCP tools use the socket.
   that machine.
 - Codex and/or Claude Code installed and authenticated. They are your
   identity and subscription; Remote Agent never installs them.
-- A Linear workspace where you can create an API key, add a webhook, and
-  create a dedicated agent user and team.
+- A Linear workspace where you can create a private app (or use an existing
+  account API key) and add a webhook for the intended team.
 - A Cloudflare account with a domain on it, for the tunnel that delivers
   Linear webhooks to your machine.
 - Bun and cloudflared. The Homebrew formula and Scoop manifest install both;
@@ -263,6 +263,13 @@ installer can do for you:
   routing rules. Private apps need no second human account. Only configured
   owner events dispatch work; valid deliveries outside that subscription receive
   an ignored acknowledgement so Linear does not retry them indefinitely.
+  For a private client-credentials installation, create a workspace webhook
+  restricted to the intended team, with Issue, Comment and Reaction events.
+  Set its URL to `/webhooks/<connection-slug>` on your public origin and copy
+  that webhook's signing secret into the connection. Restrict the installed
+  app's team access too. Avoid enabling a second app-level webhook for the same
+  events. Expose only the webhook path through the tunnel; keep the control
+  API, browser and previews private.
 - **Provider CLIs.** Install and authenticate `codex` and/or `claude`
   yourself; they are your identity and subscription, never installed for
   you. Their presence enables the matching provider.

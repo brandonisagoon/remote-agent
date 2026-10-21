@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { z } from "zod";
 import { createTestDatabase, type TestDatabase } from "../../../../../test-support/db.ts";
 import { testConfig } from "../../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../../test-support/agent-runtime.ts";
@@ -19,7 +20,7 @@ test("source checkpoints reconcile one comment after a lost reply and keep the c
   let reads = 0;
   const delivery = {
     issue: async () => ({ id: "issue", identifier: "DRA-1", title: "Pilot", description: null, branchName: "codex/pilot", state: { name: "Todo" }, labels: { nodes: [] }, relations: { nodes: [] }, inverseRelations: { nodes: [] } }),
-    create: async (_auth: LinearCredential, comment: { id?: string; issueId: string; body: string }) => { stored.set(comment.id!, { id: comment.id!, body: comment.body, issue: { id: comment.issueId } }); return null; },
+    create: async (_auth: LinearCredential, comment: { id?: string; issueId: string; body: string }) => { const id = z.uuidv4().parse(comment.id); stored.set(id, { id, body: comment.body, issue: { id: comment.issueId } }); return null; },
     read: async (_auth: LinearCredential, id: string) => { if (++reads === 1) throw new Error("offline"); return stored.get(id)!; },
   };
   const runtime = createFakeAgentRuntime();

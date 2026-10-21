@@ -22,7 +22,8 @@ export async function projectSourceCheckpoint(config: ServerConfig, prisma: Pris
   if (!output) return true;
   const body = `${event.phase === "failed" ? "### Agent turn failed" : "### Agent checkpoint"}\n\n${output.length > 8000 ? `…${output.slice(-8000)}` : output}`;
   const digest = createHash("sha256").update(`linear-checkpoint:${event.sessionId}:${event.id}`).digest("hex");
-  const id = `${digest.slice(0,8)}-${digest.slice(8,12)}-5${digest.slice(13,16)}-a${digest.slice(17,20)}-${digest.slice(20,32)}`;
+  // Linear accepts client IDs in UUIDv4 form; the hash keeps retries stable.
+  const id = `${digest.slice(0,8)}-${digest.slice(8,12)}-4${digest.slice(13,16)}-a${digest.slice(17,20)}-${digest.slice(20,32)}`;
   const thread = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: event.sessionId, provider: "linear", connectionId: source.connectionId, resourceType: "comment-thread", relationship: "thread", endedAt: null }, orderBy: { createdAt: "asc" } });
   const created = await delivery.create(scoped.linearApiKey, { id, issueId: issue.id, body, ...(thread ? { parentId: thread.externalId } : {}) });
   if (created?.id !== id) {
