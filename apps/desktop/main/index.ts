@@ -27,6 +27,7 @@ import {
 import { runChecks } from "../../../management/checks.ts";
 import { REPO_CONFIG_FILE } from "../../../lib/config.ts";
 import os from "node:os";
+import { scopedConfigFile } from "../../../lib/config-scope.ts";
 import { checkSkills } from "../../../lib/skills/check.ts";
 import { detectEditors } from "./editor-detect.ts";
 import { listProviderModels } from "./provider-models.ts";
@@ -102,8 +103,7 @@ function readKeybindings(file: string): Keybindings {
 
 /** Repository roots from the on-disk app config: ~ expanded, relative
     resolved against the config directory — matching lib/config resolution. */
-function repositoryRoots(): Record<string, string> {
-  const configFile = desktopConfigPath();
+function repositoryRoots(configFile = desktopConfigPath()): Record<string, string> {
   const document = readConfigDocument(configFile);
   if (!document.valid) return {};
   const roots: Record<string, string> = {};
@@ -117,37 +117,41 @@ function repositoryRoots(): Record<string, string> {
   return roots;
 }
 
-function readRepoConfigDocuments(): Record<string, RepoConfigDocument & { root: string }> {
+function readRepoConfigDocuments(file = desktopConfigPath()): Record<string, RepoConfigDocument & { root: string }> {
   return Object.fromEntries(
-    Object.entries(repositoryRoots()).map(([id, root]) => [
+    Object.entries(repositoryRoots(file)).map(([id, root]) => [
       id,
       { ...readRepoConfigDocument(root), root },
     ]),
   );
 }
 
-let repoConfigWatcher: ReturnType<typeof watch> | null = null;
-/** Watches every repository's committed config; pushes the full map like
-    the app config's own change stream. */
-function watchRepoConfigs(): void {
-  void repoConfigWatcher?.close();
-  if (hosts?.selected().kind === "ssh") return;
-  const files = Object.values(repositoryRoots()).map((root) => path.join(root, REPO_CONFIG_FILE));
-  const hostId = hosts?.selected().id;
-  const push = () => {
-    if (hosts?.selected().id === hostId) mainWindow?.webContents.send("repo-configs:changed", readRepoConfigDocuments());
-  };
-  repoConfigWatcher = watch(files, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 20 },
+function watchLocalConfigs(): () => Promise<void> {
+  const stops = hosts!.list().hosts.filter((host) => host.kind === "local").map((host) => {
+    const file = host.configPath ?? desktopConfigPath();
+    let repoWatcher: ReturnType<typeof watch> | null = null;
+    const rewatchRepos = () => {
+      void repoWatcher?.close();
+      const push = () => mainWindow?.webContents.send("repo-configs:changed", host.id, readRepoConfigDocuments(file));
+      repoWatcher = watch(Object.values(repositoryRoots(file)).map((root) => path.join(root, REPO_CONFIG_FILE)), {
+        ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 20 },
+      });
+      repoWatcher.on("all", push);
+      push();
+    };
+    const stop = watchConfigDocument(file, (document) => {
+      mainWindow?.webContents.send("config:changed", host.id, document);
+      rewatchRepos();
+    });
+    rewatchRepos();
+    return async () => { await stop(); await repoWatcher?.close(); };
   });
-  repoConfigWatcher.on("all", push);
-  push();
+  return async () => { await Promise.all(stops.map((stop) => stop())); };
 }
 
 function desktopConfigPath(): string {
-  const selected = hosts?.selected();
-  if (selected?.kind === "local" && selected.configPath) return selected.configPath;
+  const scoped = scopedConfigFile();
+  if (scoped) return scoped;
   const explicit = process.env.REMOTE_AGENT_CONFIG?.trim();
   if (explicit) return path.resolve(explicit);
   const development = path.resolve(process.cwd(), "remote-agent.config.json");
@@ -293,7 +297,7 @@ function registerIpc(file: string): void {
     if (!run) throw new Error(`unknown management action: ${action}`);
     return run();
   });
-  installHostIpc(hosts!, handlers, desktopConfigPath, file);
+  installHostIpc(hosts!, handlers, file);
 }
 
 async function createWindow(): Promise<void> {
@@ -329,7 +333,7 @@ async function createWindow(): Promise<void> {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     const destination = new URL(url);
     if (destination.protocol === "http:" && ["localhost", "127.0.0.1"].includes(destination.hostname)) {
-      const preview = new BrowserWindow({ width: 1180, height: 820, title: `Preview · ${hosts?.selected().name ?? "This Mac"}`, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
+      const preview = new BrowserWindow({ width: 1180, height: 820, title: "Preview", webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
       preview.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       void preview.loadURL(url);
     } else if (destination.protocol === "codex:" && destination.hostname === "new" && destination.searchParams.has("prompt")) {
@@ -338,12 +342,7 @@ async function createWindow(): Promise<void> {
     return { action: "deny" };
   });
 
-  stopWatching = watchConfigDocument(file, (document) => {
-    if (hosts?.selected().kind === "local" && desktopConfigPath() === file) mainWindow?.webContents.send("config:changed", document);
-    // The repository set may have changed; rewatch and repush.
-    watchRepoConfigs();
-  });
-  watchRepoConfigs();
+  stopWatching = watchLocalConfigs();
 
   const bindingsFile = keybindingsPath(file);
   ensureKeybindings(bindingsFile);

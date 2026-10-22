@@ -1,15 +1,15 @@
 import { queryOptions, useQueries, useQuery } from "@tanstack/react-query";
 import { combineMachineSessions } from "../../../../../../lib/desktop-sessions.ts";
-import { useHost } from "@renderer/lib/host-context.tsx";
+import { useHost, useHostDirectory } from "@renderer/lib/host-context.tsx";
 
-export function repositorySessionsKey(repositoryId: string) {
-  return ["sessions", repositoryId] as const;
+export function repositorySessionsKey(repositoryId: string, hostId: string) {
+  return ["sessions", repositoryId, hostId] as const;
 }
 
 function repositoryReferenceOptions(repositoryId: string, hostId: string) {
   return queryOptions({
-    queryKey: [...repositorySessionsKey(repositoryId), "reference", hostId],
-    queryFn: () => window.remoteAgent.sessions.repositoryReference(repositoryId),
+    queryKey: [...repositorySessionsKey(repositoryId, hostId), "reference", hostId],
+    queryFn: () => window.remoteAgent.forHost(hostId).sessions.repositoryReference(repositoryId),
     staleTime: 30_000,
     refetchInterval: 30_000,
     retry: false,
@@ -17,11 +17,12 @@ function repositoryReferenceOptions(repositoryId: string, hostId: string) {
 }
 
 export function useRepositorySessions(repositoryId: string) {
-  const { host, hosts } = useHost();
+  const { host, api } = useHost();
+  const { hosts } = useHostDirectory();
   const reference = useQuery(repositoryReferenceOptions(repositoryId, host.id));
   const queries = useQueries({ queries: hosts.hosts.map((machine) => ({
-    queryKey: [...repositorySessionsKey(repositoryId), "machine", machine.id, reference.data],
-    queryFn: () => window.remoteAgent.sessions.forHost(machine.id, reference.data!),
+    queryKey: [...repositorySessionsKey(repositoryId, host.id), "machine", machine.id, reference.data],
+    queryFn: () => api.sessions.forHost(machine.id, reference.data!),
     enabled: !!reference.data,
     staleTime: 3000,
     refetchInterval: 5000,

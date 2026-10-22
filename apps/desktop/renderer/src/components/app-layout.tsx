@@ -16,6 +16,7 @@ import {
 } from "@renderer/components/sidebar-resize-handle.tsx";
 import { SidebarInset, SidebarProvider } from "@renderer/components/ui/sidebar.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
+import { useHost, useHostDirectory } from "@renderer/lib/host-context.tsx";
 import { randomHex } from "@renderer/lib/random.ts";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "remote-agent:sidebar-width";
@@ -36,12 +37,15 @@ function storedSidebarWidth(): number {
 export function AppLayout() {
   const { draft, mutate, commit, dirty } = useConfig();
   const navigate = useNavigate();
+  const { host } = useHost();
+  const { entries } = useHostDirectory();
+  const search = { host: host.id };
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
 
   // Adding a repository is a file pick, not a form: the ID is an opaque key,
   // the name comes from the folder, and everything else has editable defaults.
   const addRepository = async () => {
-    const picked = await chooseHostRepository();
+    const picked = await chooseHostRepository(host);
     if (!picked) return;
     if ("error" in picked) {
       toast.error("That folder is not a git repository");
@@ -58,7 +62,7 @@ export function AppLayout() {
     };
     if (dirty) mutate(create);
     else void commit(create);
-    void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id } });
+    void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id }, search });
   };
 
   const addProvider = (providerId: "codex" | "claude") => {
@@ -67,7 +71,7 @@ export function AppLayout() {
     };
     if (dirty) mutate(create);
     else void commit(create);
-    void navigate({ to: "/providers/$providerId", params: { providerId } });
+    void navigate({ to: "/providers/$providerId", params: { providerId }, search });
   };
   const addConnection = () => {
     const id = generateConnectionId();
@@ -93,7 +97,7 @@ export function AppLayout() {
     // never silently saved along with it.
     if (dirty) mutate(create);
     else void commit(create);
-    void navigate({ to: "/connections/$connectionId", params: { connectionId: id } });
+    void navigate({ to: "/connections/$connectionId", params: { connectionId: id }, search });
   };
 
   // The macOS File menu mirrors the sidebar's add controls.
@@ -107,28 +111,29 @@ export function AppLayout() {
 
   // Removal is confirmed by the sidebar's alert dialog; write through
   // directly unless draft edits are pending (same rule as creation).
-  const applyRemoval = (remove: (value: typeof draft) => void, wasActive: boolean) => {
-    if (dirty) mutate(remove);
-    else void commit(remove);
-    if (wasActive) void navigate({ to: "/" });
+  const applyRemoval = (hostId: string, remove: (value: typeof draft) => void, wasActive: boolean) => {
+    const owner = entries.find((entry) => entry.host.id === hostId);
+    if (!owner) return;
+    void owner.config.commit(remove).catch((error) => toast.error(String(error)));
+    if (wasActive && hostId === host.id) void navigate({ to: "/", search });
   };
   const params = useParams({ strict: false });
-  const removeProvider = (id: string) => {
-    applyRemoval((value) => {
+  const removeProvider = (hostId: string, id: string) => {
+    applyRemoval(hostId, (value) => {
       delete value.providers[id as keyof typeof value.providers];
     }, params.providerId === id);
   };
-  const removeConnection = (id: string) => {
-    applyRemoval((value) => {
+  const removeConnection = (hostId: string, id: string) => {
+    applyRemoval(hostId, (value) => {
       delete value.connections[id];
     }, params.connectionId === id);
   };
-  const removeRepository = (id: string) => {
-    if (Object.keys(draft.repositories).length <= 1) {
+  const removeRepository = (hostId: string, id: string) => {
+    if (Object.keys(entries.find((entry) => entry.host.id === hostId)?.config.draft?.repositories ?? {}).length <= 1) {
       toast.error("At least one repository is required");
       return;
     }
-    applyRemoval((value) => {
+    applyRemoval(hostId, (value) => {
       delete value.repositories[id];
       // Heal connection allowlists that referenced it; an emptied allowlist
       // falls back to every repository.
@@ -172,7 +177,7 @@ export function AppLayout() {
                 : "max-w-3xl px-8 py-8",
             )}
           >
-            <Outlet />
+            <Outlet key={host.id} />
           </div>
         </div>
         {params.repositoryId && <RepositoryPathBar repositoryId={params.repositoryId} />}

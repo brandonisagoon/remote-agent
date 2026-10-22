@@ -34,10 +34,10 @@ import { cn } from "@renderer/lib/utils.ts";
 /** The stdio bridge an ACP app runs to reach the server: the deployed copy
     under the install root, pointed at this config file. */
 function useAcpBridgeCommand(file: ServiceFile): string {
-  const { host } = useHost();
+  const { host, api } = useHost();
   const { data: configFile = "" } = useQuery({
-    queryKey: ["config-path"],
-    queryFn: () => window.remoteAgent.config.path(),
+    queryKey: ["config-path", host.id],
+    queryFn: () => api.config.path(),
     staleTime: Infinity,
   });
   const root =
@@ -52,7 +52,7 @@ function useAcpBridgeCommand(file: ServiceFile): string {
 }
 
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {
-  const { host } = useHost();
+  const { host, api } = useHost();
   const remote = host.kind === "ssh";
   const customService = host.kind === "ssh" && !!host.serviceLabel;
   const [result, setResult] = useState<ManagementResult | null>(null);
@@ -60,7 +60,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const run = async (action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart") => {
     setWorking(action);
     try {
-      setResult(await window.remoteAgent.management.run(action));
+      setResult(await api.management.run(action));
     } catch (error) {
       setResult({ ok: false, summary: error instanceof Error ? error.message : String(error) });
     } finally {
@@ -70,11 +70,11 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const machine = value.machine;
   const bridgeCommand = useAcpBridgeCommand(value);
   const queryClient = useQueryClient();
-  const { data: checks = [] } = useQuery(checksQueryOptions);
+  const { data: checks = [] } = useQuery(checksQueryOptions(host.id));
   const check = (id: string) => checks.find((entry) => entry.id === id);
   const act = async (action: Parameters<typeof run>[0]) => {
     await run(action);
-    void queryClient.invalidateQueries({ queryKey: checksQueryOptions.queryKey });
+    void queryClient.invalidateQueries({ queryKey: checksQueryOptions(host.id).queryKey });
   };
   const installSteps = [
     check("bun"),
@@ -95,7 +95,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const remedyCommand = (step: { remedy?: string }) =>
     step.remedy?.match(/^(?:run|install with): (.+)$/)?.[1] ?? null;
   const openTerminal = async (commandLine: string) => {
-    setResult(await window.remoteAgent.management.openTerminal(commandLine));
+    setResult(await api.management.openTerminal(commandLine));
   };
   const stepAction = (step: NonNullable<ReturnType<typeof check>>) => {
     if (step.id === "cli") {
@@ -181,7 +181,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                       </Button>
                     )}
                     {row.id === "config" && (
-                      <Button size="sm" variant="outline" onClick={() => void window.remoteAgent.config.openInEditor()}>
+                      <Button size="sm" variant="outline" onClick={() => void api.config.openInEditor()}>
                         Edit
                       </Button>
                     )}
@@ -233,7 +233,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             <Field label="Port" type="number" value={machine.server.listen.port} onChange={(next) => mutate((file) => { file.machine.server.listen.port = Number(next); })} />
           </div>
           <Field label="Public URL" value={machine.server.publicUrl} onChange={(next) => mutate((file) => { file.machine.server.publicUrl = next; })} />
-          {customService ? <p className="text-muted-foreground text-xs">This service's public tunnel is managed on the selected machine.</p> : <DnsRecordsTable value={value} />}
+          {customService ? <p className="text-muted-foreground text-xs">This service's public tunnel is managed on this machine.</p> : <DnsRecordsTable value={value} />}
         </SettingsCard>
       </SettingsSection>
 

@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { Link } from "@tanstack/react-router";
 
 import type { ServiceFile } from "../../../../../../lib/config.ts";
@@ -6,16 +7,10 @@ import { Checkbox } from "@renderer/components/ui/checkbox.tsx";
 import {
   InputGroup,
   InputGroupAddon,
+  InputGroupInput,
   InputGroupButton,
 } from "@renderer/components/ui/input-group.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@renderer/components/ui/select.tsx";
 import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
@@ -29,6 +24,7 @@ export function MachineScopeEditor({
   value: ServiceFile;
   mutate: Mutate;
 }) {
+  const { host } = useHost();
   const connection = value.connections[connectionId]!;
   const repositories = connection.repositories;
   const routingMode = repositories === "*" ? "all" : "select";
@@ -48,30 +44,14 @@ export function MachineScopeEditor({
   return (
     <>
       <div className="grid gap-2">
-        <Label>Machine</Label>
+        <Label htmlFor="connection-machine">Machine</Label>
         <InputGroup>
-          {/* Span wrapper: the disabled trigger swallows pointer events, so the
-              tooltip listens on a live ancestor instead. */}
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span className="flex-1">
-                <Select value={connection.machineId ?? value.machine.id} disabled>
-                  <SelectTrigger className="w-full border-0 bg-transparent shadow-none dark:bg-transparent">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value={connection.machineId ?? value.machine.id}>{value.machine.name}</SelectItem>
-                  </SelectContent>
-                </Select>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent>Multi-machine support coming soon</TooltipContent>
-          </Tooltip>
+          <InputGroupInput id="connection-machine" value={value.machine.name} readOnly />
           <InputGroupAddon align="inline-end">
             <Tooltip>
               <TooltipTrigger asChild>
                 <InputGroupButton size="icon-xs" asChild>
-                  <Link to="/machine">
+                  <Link to="/machine" search={{ host: host.id }}>
                     <F7Icon name="desktopcomputer" />
                     <span className="sr-only">Open machine settings</span>
                   </Link>

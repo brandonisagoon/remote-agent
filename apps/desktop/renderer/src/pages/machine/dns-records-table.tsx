@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -41,8 +42,9 @@ function CellCopy({ value, label }: { value: string; label: string }) {
 /** The records to create at your DNS provider so publicUrl reaches this
     machine's Cloudflare tunnel. */
 export function DnsRecordsTable({ value }: { value: ServiceFile }) {
+  const { host } = useHost();
   const tunnelName = value.machine.installation.tunnelName ?? value.serviceName;
-  const { data: tunnel } = useQuery(tunnelInfoQueryOptions(tunnelName));
+  const { data: tunnel } = useQuery(tunnelInfoQueryOptions(host.id, tunnelName));
   let hostname: string | null = null;
   try {
     hostname = new URL(value.machine.server.publicUrl).hostname;

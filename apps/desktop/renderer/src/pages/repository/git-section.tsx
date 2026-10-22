@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { chooseHostPath } from "@renderer/components/remote-path-picker.tsx";
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -58,6 +59,7 @@ function PathField({ label, title, value, onChange }: {
   value: string;
   onChange(next: string): void;
 }) {
+  const { host } = useHost();
   return (
     <div className="grid gap-2">
       <Label>{label}</Label>
@@ -69,7 +71,7 @@ function PathField({ label, title, value, onChange }: {
               <InputGroupButton
                 size="icon-xs"
                 onClick={async () => {
-                  const picked = await chooseHostPath(title, value);
+                  const picked = await chooseHostPath(host, title, value);
                   if (picked) onChange(picked);
                 }}
               >
@@ -326,6 +328,7 @@ function commandForScript(relativePath: string): string[] {
 }
 
 export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfigDraft }) {
+  const { host } = useHost();
   const command = repo.config?.bootstrapCommand ?? [];
   return (
     <SettingsSection
@@ -357,7 +360,7 @@ export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfi
                   <InputGroupButton
                     size="icon-xs"
                     onClick={async () => {
-                      const picked = await chooseHostPath("Select Bootstrap Script", root, "file");
+                      const picked = await chooseHostPath(host, "Select Bootstrap Script", root, "file");
                       if (!picked) return;
                       const relative = picked.startsWith(`${root}/`)
                         ? picked.slice(root.length + 1)

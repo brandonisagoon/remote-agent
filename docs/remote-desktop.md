@@ -1,6 +1,6 @@
 # Manage a remote machine from the desktop
 
-Electron runs on the client. The selected machine's supervised server owns
+Electron runs on the client. Each machine's supervised server owns
 tasks, sessions, credentials and worktrees. Closing Electron, a preview, or
 its SSH connection does not close remote sessions or resume paused work.
 
@@ -47,10 +47,18 @@ restart verifies that its plist points to the exact configured file. A label
 is optional for the standard installation. The first version reads profiles
 at app startup; adding or changing profiles requires relaunching the desktop.
 
-Choose a configured machine in the existing **Machines** sidebar section. Save or revert settings
-before switching. Every request carries the renderer's original machine ID;
-after switching, stale requests are refused rather than redirected. The
-renderer reloads to discard the previous machine's cached state.
+The existing sidebar lists repositories, providers and connections from every
+configured machine together, with a machine badge on each item. **Machines**
+links open that machine's settings; they do not filter the directory or reload
+the window. The legacy `activeId` field only supplies the initial destination
+for an unqualified link. Navigation never rewrites the profile file.
+
+Every route, query and action carries its owning host ID. Duplicate repository
+or provider IDs on different hosts stay distinct. Drafts remain with their host
+when you navigate away, and an unsaved marker appears on its machine entry.
+Saving or reverting affects that host's drafts; a delayed save or path picker
+cannot be redirected by navigation. Local operations carry request-local config
+context through async work instead of changing process-wide environment state.
 
 ## Sessions and settings
 
@@ -58,8 +66,13 @@ The desktop retains its existing layout: each repository has its Sessions,
 Settings and Skillsets tabs. The sessions table reads that repository's
 sessions across all configured machines and identifies each row in a Machine
 column. There is no separate Tasks page or header machine dropdown.
-Choosing another machine opens its existing Machine page and reloads its
-configuration; selecting a repository returns to its usual tabs.
+Each repository link opens the checkout on its badged machine; its Sessions
+tab still combines matching repositories across machines. Machine and repository
+navigation, keyboard jumps and back/forward history use the same host identity.
+Connection settings display their owning machine as a read-only field with a link
+to its details; they do not offer a machine selector.
+An offline host does not hide reachable hosts or its own last received entries;
+the sidebar offers reconnect and labels cached entries as unavailable.
 
 Repository matching uses the product checkout's Git origin, normalizing SSH
 and HTTPS URLs and excluding embedded credentials. Different local repository
@@ -85,7 +98,7 @@ handles by opening its browser panel alongside the prepared chat. The user can
 see the preview immediately and still presses Send to run the review skill.
 
 Settings, file browsing, model discovery, status and restart run on the
-selected machine. Editor detection and keyboard preferences stay on the
+machine that owns the item you opened. Editor detection and keyboard preferences stay on the
 client. The ACP command displayed for a remote machine includes SSH and its
 actual runtime path. Installation and update deployment stay in the host's
 normal installation workflow; the desktop does not run remote installer
@@ -117,13 +130,13 @@ work with temporary client ports. It checks its own Host and Origin before
 forwarding. The control API port and arbitrary public URLs are refused. A streamed browser viewer opens the actual
 remote profile; a direct web preview uses the client browser's state. Preview
 windows have no desktop preload, Node access or desktop IPC API. Forwarding
-ends when the desktop quits or changes machine; remote resources remain.
+ends when the desktop quits; navigating to another machine leaves it intact.
 
-The desktop reconnects on the next read and polls the same session IDs. Only
-session reads span machines; settings, edits and service actions remain scoped
-to the selected machine, with stale-client checks before and after cross-machine reads.
-The existing sessions table reports read failures; startup failures keep
-Machines navigation available. It never creates a replacement task, migrates work, grants
+The desktop reconnects on the next read and polls the same session IDs.
+Configuration reads load independently across hosts to populate the directory.
+Edits and service actions always address their original owner. The existing
+sessions table reports read failures; startup failures keep the complete
+available directory reachable. It never creates a replacement task, migrates work, grants
 browser control or resumes automation as part of reconnecting.
 
 Only the owner's authenticated SSH connection reaches the host's existing

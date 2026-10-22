@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { Fragment } from "react";
 
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -6,6 +7,7 @@ import { useConfig } from "@renderer/lib/config-context.tsx";
 /** Finder-style path bar pinned to the window footer on repository routes.
     Clicking a segment reveals that folder. */
 export function RepositoryPathBar({ repositoryId }: { repositoryId: string }) {
+  const { api } = useHost();
   const { draft } = useConfig();
   const repository = draft.repositories[repositoryId];
   if (!repository) return null;
@@ -19,7 +21,7 @@ export function RepositoryPathBar({ repositoryId }: { repositoryId: string }) {
           <button
             type="button"
             className="hover:text-foreground flex min-w-0 items-center gap-1 whitespace-nowrap"
-            onClick={() => void window.remoteAgent.shell.openPath(pathTo(index))}
+            onClick={() => void api.shell.openPath(pathTo(index))}
           >
             {index === segments.length - 1 && <F7Icon name="folder" className="size-3 shrink-0" />}
             <span className="truncate">{segment}</span>

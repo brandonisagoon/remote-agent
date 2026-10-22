@@ -19,7 +19,9 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   pure control plane editing the config JSON. TanStack Router (hash history,
   code-based routes in `apps/desktop/renderer/src/router.tsx`) + TanStack
   Query (`@renderer/lib/queries/`; NO TanStack DB). Saves are explicit: draft state
-  over the `['config']` query, sonner save/revert — never save per keystroke.
+  over host-qualified `['config', hostId]` queries, sonner save/revert — never save per keystroke. The sidebar lists all hosts together with machine badges;
+  machine links open details, never select a global host. Routes, requests and
+  draft controllers retain their owner across navigation.
 - **CLI** (`remote-agent`) — thin commander skin over `management/`.
 - **`management/`** — the platform layer shared by CLI and GUI:
   provisioning, self-updating deploy with rollback, the doctor checklist

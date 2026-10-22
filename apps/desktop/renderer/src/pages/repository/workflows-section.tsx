@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
@@ -158,8 +159,9 @@ function WorkflowEditor({
   repo: RepoConfigDraft;
   onClose(): void;
 }) {
+  const { host } = useHost();
   const workflow = repo.config!.workflows[workflowId]!;
-  const { data: scan } = useQuery(skillsQueryOptions(root, repo.config!.skillsRoot));
+  const { data: scan } = useQuery(skillsQueryOptions(host.id, root, repo.config!.skillsRoot));
   const skillsets = scan?.installed ? scan.skillsets : [];
   const selected = skillsets.find((entry) => entry.id === workflow.skill.skillset);
   const conditionField = EVENT_CONDITION_FIELD[workflow.on];

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { scopedConfigFile } from "./config-scope.ts";
 
 import { z } from "zod";
 import { LinearCredentialSchema, type LinearCredential } from "./linear-auth.ts";
@@ -484,7 +485,7 @@ function absolute(value: string, base: string = process.cwd()): string {
 }
 
 export function configFilePath(): string {
-  return absolute(process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json");
+  return absolute(scopedConfigFile() ?? (process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json"));
 }
 
 export function readServiceFile(file: string = configFilePath()): ServiceFile {

@@ -30,12 +30,12 @@ export function OpenInEditorMenu({
 }) {
   const { draft } = useConfig();
   const { data: editors = [] } = useQuery(detectedEditorsQueryOptions);
-  const { host } = useHost();
+  const { host, api } = useHost();
   const sshHost = host.kind === "ssh" ? host.sshHost : draft.machine.sshHost ?? null;
 
   const openIn = (editor: { scheme: string | null; open: "scheme" | "app"; appPath: string }) => {
     if (editor.open === "app" || !editor.scheme) {
-      void window.remoteAgent.shell.openWith(editor.appPath, target);
+      void api.shell.openWith(editor.appPath, target);
       return;
     }
     const remote = sshHost !== null && sshLinkSupported(editor.scheme);

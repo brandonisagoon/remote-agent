@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useQuery } from "@tanstack/react-query";
 
 import type { ServiceFile } from "../../../../../../lib/config.ts";
@@ -44,7 +45,8 @@ import type { Mutate } from "@renderer/lib/types.ts";
     process), so upgrading the CLI updates the list. Falls back to a curated
     set; the JSON accepts any string either way. */
 function useProviderModels(providerId: string, currentModel: string | null): string[] {
-  const { data: models = [] } = useQuery(providerModelsQueryOptions(providerId));
+  const { host } = useHost();
+  const { data: models = [] } = useQuery(providerModelsQueryOptions(host.id, providerId));
   if (currentModel && !models.includes(currentModel)) return [currentModel, ...models];
   return models;
 }

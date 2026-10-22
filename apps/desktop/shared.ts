@@ -12,11 +12,28 @@ export type { SessionSummary } from "../../lib/desktop-sessions.ts";
 export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
+  forHost(hostId: string): HostDesktopApi;
   hosts: {
     list(): Promise<DesktopHosts>;
-    select(id: string): Promise<DesktopHosts>;
-    status(): Promise<DesktopHostStatus>;
   };
+  window: { syncTrafficLights(): void };
+  keybindings: {
+    get(): Promise<Keybindings>;
+    onChange(listener: (bindings: Keybindings) => void): () => void;
+    openInEditor(): Promise<string | null>;
+  };
+  menu: {
+    onAction(callback: (payload:
+      | { action: "add-repository" }
+      | { action: "add-connection" }
+      | { action: "add-provider"; providerId: "codex" | "claude" }
+    ) => void): () => void;
+  };
+  editors: { detect(): Promise<DetectedEditor[]> };
+}
+
+export interface HostDesktopApi {
+  status(): Promise<DesktopHostStatus>;
   tasks: {
     list(): Promise<DesktopTask[]>;
     activity(id: string): Promise<DesktopTaskActivity>;
@@ -34,21 +51,11 @@ export interface DesktopApi {
     /** Model ids advertised by the installed provider binary (with fallback). */
     models(providerId: string): Promise<string[]>;
   };
-  window: {
-    /** Re-center the native traffic lights against the zoom-scaled header. */
-    syncTrafficLights(): void;
-  };
-  keybindings: {
-    get(): Promise<Keybindings>;
-    onChange(listener: (bindings: Keybindings) => void): () => void;
-    openInEditor(): Promise<string | null>;
-  };
   config: {
     path(): Promise<string>;
     get(): Promise<ConfigDocument>;
     save(input: { expectedRevision: string; value: unknown }): Promise<ConfigDocument>;
     onChange(listener: (document: ConfigDocument) => void): () => void;
-    path(): Promise<string>;
     openInEditor(): Promise<string | null>;
     reveal(): Promise<void>;
   };
@@ -57,22 +64,9 @@ export interface DesktopApi {
     repositoryReference(repositoryId: string): Promise<DesktopRepositoryReference>;
     forHost(hostId: string, repository: DesktopRepositoryReference): Promise<MachineSessions>;
   };
-  menu: {
-    onAction(
-      callback: (
-        payload:
-          | { action: "add-repository" }
-          | { action: "add-connection" }
-          | { action: "add-provider"; providerId: "codex" | "claude" },
-      ) => void,
-    ): () => void;
-  };
   repository: {
     validate(root: string): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" }>;
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
-  };
-  editors: {
-    detect(): Promise<DetectedEditor[]>;
   };
   fs: {
     list(directory: string, kind: "file" | "folder"): Promise<{ path: string; parent: string; entries: Array<{ name: string; path: string; directory: boolean }> }>;

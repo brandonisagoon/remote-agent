@@ -127,16 +127,17 @@ test("supervision uses the private socket and previews reject the control API", 
   }
 });
 
-test("host selection persists and rejects stale UI calls before opening a connection", () => {
+test("host requests address a configured owner without a global selection or profile rewrite", () => {
   const { directory } = fixture();
   const file = path.join(directory, "desktop-hosts.json");
-  writeFileSync(file, JSON.stringify({ activeId: "first", hosts: [{ id: "first", name: "First", kind: "local" }, { id: "second", name: "Second", kind: "local" }] }));
+  const profiles = { activeId: "first", hosts: [{ id: "first", name: "First", kind: "local" as const }, { id: "second", name: "Second", kind: "local" as const }] };
+  writeFileSync(file, JSON.stringify(profiles));
   const manager = new DesktopHostManager(file);
-  expect(manager.select("first", "second").activeId).toBe("second");
-  expect(new DesktopHostManager(file).selected().id).toBe("second");
-  expect(() => manager.request("first", "tasks:control", ["task", "close"])).toThrow("selected machine changed");
-  expect(() => manager.select("first", "first")).toThrow("selected machine changed");
-  expect(statSync(file).mode & 0o777).toBe(0o600);
+  expect(manager.get("second").name).toBe("Second");
+  expect(manager.get("first").name).toBe("First");
+  expect(() => manager.request("unknown", "tasks:control", ["task", "close"])).toThrow("Unknown machine");
+  expect(manager.list()).toEqual(profiles);
+  expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(profiles);
 });
 
 test("SSH profile rejects options and safely quotes remote paths", async () => {

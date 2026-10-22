@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useNavigate } from "@tanstack/react-router";
 
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -20,6 +21,7 @@ import { cn } from "@renderer/lib/utils.ts";
 export function DeleteConnectionButton({ id, className }: { id: string; className?: string }) {
   const { draft, mutate, commit, dirty } = useConfig();
   const navigate = useNavigate();
+  const { host } = useHost();
   const connection = draft.connections[id];
   if (!connection) return null;
   const deleteConnection = () => {
@@ -31,7 +33,7 @@ export function DeleteConnectionButton({ id, className }: { id: string; classNam
     // silently saved along with it.
     if (dirty) mutate(remove);
     else void commit(remove);
-    void navigate({ to: "/" });
+    void navigate({ to: "/", search: { host: host.id } });
   };
   return (
     <AlertDialog>

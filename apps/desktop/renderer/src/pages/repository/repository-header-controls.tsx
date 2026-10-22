@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 
@@ -21,13 +22,14 @@ const TABS: Array<{ id: RepositoryTab; label: string }> = [
 /** Header widgets for repository routes: the page tabs and an Open in Editor
     dropdown listing every detected editor app. */
 export function RepositoryHeaderControls({ repositoryId }: { repositoryId: string }) {
+  const { host } = useHost();
   const { draft } = useConfig();
   const repository = draft.repositories[repositoryId];
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { tab?: string };
   const tab = (params.tab as RepositoryTab | undefined) ?? "sessions";
   const queryClient = useQueryClient();
-  const sessionsKey = repositorySessionsKey(repositoryId);
+  const sessionsKey = repositorySessionsKey(repositoryId, host.id);
   const refreshing = useIsFetching({ queryKey: sessionsKey }) > 0;
   if (!repository) return null;
 
@@ -40,6 +42,7 @@ export function RepositoryHeaderControls({ repositoryId }: { repositoryId: strin
           void navigate({
             to: "/repositories/$repositoryId/$tab",
             params: { repositoryId, tab: next as RepositoryTab },
+            search: { host: host.id },
           })
         }
         className="absolute left-1/2 -translate-x-1/2"
