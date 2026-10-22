@@ -306,9 +306,6 @@ export const ServiceFileSchema = z.object({
   }
   if (file.routing?.peers[file.machine.id]) context.addIssue({ code: "custom", path: ["routing", "peers"], message: "A peer cannot have this machine's ID" });
   const repositoryIds = new Set(Object.keys(file.repositories));
-  if (repositoryIds.size === 0) {
-    context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
-  }
   for (const [connectionId, connection] of Object.entries(file.connections)) {
     const schemes = new Set<string>();
     for (const [index, editor] of connection.editors.entries()) {
@@ -650,7 +647,9 @@ export function readConfig(filePath: string = configFilePath()): ServerConfig {
       } satisfies WebhookConfig]];
     }),
   );
-  const firstRepository = Object.values(repositories)[0]!;
+  const firstRepository = Object.values(repositories)[0];
+  // A desktop-only machine can have no repositories; a task server cannot.
+  if (!firstRepository) throw new Error("Add a repository before starting this machine's server");
   const firstConnection = Object.values(connections)[0];
   const firstWebhook = Object.values(webhooks)[0];
 

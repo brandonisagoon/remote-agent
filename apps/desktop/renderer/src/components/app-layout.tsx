@@ -83,10 +83,6 @@ export function AppLayout() {
   };
   const params = useParams({ strict: false });
   const removeRepository = (hostId: string, id: string) => {
-    if (Object.keys(entries.find((entry) => entry.host.id === hostId)?.config.draft?.repositories ?? {}).length <= 1) {
-      toast.error("At least one repository is required");
-      return;
-    }
     applyRemoval(hostId, (value) => {
       delete value.repositories[id];
       // Heal connection allowlists that referenced it; an emptied allowlist
