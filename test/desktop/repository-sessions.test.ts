@@ -150,11 +150,13 @@ test("ChatGPT preview handoff selects the client repository and preserves the ex
   const link = new URL(chatgptReviewLink(row, review, reference.origin));
   expect(link.protocol).toBe("codex:");
   expect(link.hostname).toBe("new");
-  expect([...link.searchParams.keys()]).toEqual(["prompt", "originUrl"]);
+  expect([...link.searchParams.keys()]).toEqual(["prompt", "originUrl", "browserUrl"]);
   expect(link.searchParams.get("originUrl")).toBe("https://github.com/drafted-ai/greenfield");
+  expect(link.searchParams.get("browserUrl")).toBe(preview.metadata.publicUrl);
   expect(link.searchParams.has("path")).toBe(false);
   const unlinked = new URL(chatgptReviewLink(row, review, null));
-  expect([...unlinked.searchParams.keys()]).toEqual(["prompt"]);
+  expect([...unlinked.searchParams.keys()]).toEqual(["prompt", "browserUrl"]);
+  expect(unlinked.searchParams.get("browserUrl")).toBe(preview.metadata.publicUrl);
   const prompt = link.searchParams.get("prompt")!;
   const context = JSON.parse(prompt.slice(prompt.indexOf("{")));
   expect(context).toEqual({ taskId: task.id, sessionId: row.id, machineId: row.machineId, repositoryId: row.repositoryId, previewUrl: preview.metadata.publicUrl });

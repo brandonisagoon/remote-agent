@@ -41,5 +41,5 @@ export function chatgptReviewLink(session: SessionIdentity, review: z.infer<type
   // Match the client's workspace by the credential-free Git identity. A remote
   // session's cwd/worktreePath belongs to its host, not the client opening ChatGPT.
   const repository = repositoryOrigin ? `&originUrl=${encodeURIComponent(`https://${repositoryOrigin}`)}` : "";
-  return `codex://new?prompt=${encodeURIComponent(prompt)}${repository}`;
+  return `codex://new?prompt=${encodeURIComponent(prompt)}${repository}&browserUrl=${encodeURIComponent(context.url)}`;
 }

@@ -80,7 +80,9 @@ row. Its deep link prefills the review skill and exact remote task binding, and
 uses the repository's credential-free Git origin to select a matching local
 workspace in ChatGPT. It never passes the remote worktree as a local path. A
 repository without a network origin leaves workspace selection to the user.
-The user still presses Send to start the review.
+The same link includes `browserUrl`, which the installed ChatGPT desktop app
+handles by opening its browser panel alongside the prepared chat. The user can
+see the preview immediately and still presses Send to run the review skill.
 
 Settings, file browsing, model discovery, status and restart run on the
 selected machine. Editor detection and keyboard preferences stay on the
