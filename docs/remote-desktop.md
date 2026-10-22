@@ -47,11 +47,15 @@ restart verifies that its plist points to the exact configured file. A label
 is optional for the standard installation. The first version reads profiles
 at app startup; adding or changing profiles requires relaunching the desktop.
 
-The existing sidebar lists repositories, providers and connections from every
-configured machine together, with a machine badge on each item. **Machines**
-links open that machine's settings; they do not filter the directory or reload
-the window. The legacy `activeId` field only supplies the initial destination
-for an unqualified link. Navigation never rewrites the profile file.
+The sidebar lists **Machines** and **Repositories** from every configured host,
+with a machine badge on each repository. Machine links open that machine's
+**Server**, **Providers** and **Connections** tabs; they do not filter the
+repository directory or reload the window. The tabs are centered in the page
+header, matching repository tabs. Providers and connections open their existing
+settings inside their machine tab, with a link back to the list. Old standalone
+provider and connection URLs redirect to those details on the same host.
+The legacy `activeId` field only supplies the initial destination for an
+unqualified link. Navigation never rewrites the profile file.
 
 Every route, query and action carries its owning host ID. Duplicate repository
 or provider IDs on different hosts stay distinct. Drafts remain with their host
@@ -106,7 +110,7 @@ commands. Restart refuses active/provisioning sessions and held browser
 control. If the server cannot report its activity, restart fails closed;
 inspect it over SSH before recovery.
 
-The Machine page's existing Storage section includes **Concurrent agent turns**
+The machine's Server tab includes a Storage section with **Concurrent agent turns**
 (`machine.acpx.maxConcurrentTurns`). A positive integer limits provider turns
 on that host; blank preserves the default unlimited behavior. Restart the
 server to apply a change. Waiting instructions retain their durable queued

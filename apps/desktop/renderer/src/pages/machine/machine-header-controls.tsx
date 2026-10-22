@@ -20,7 +20,7 @@ export function MachineHeaderControls() {
         const tab = TABS.find(({ to }) => to === next);
         if (tab) void navigate({ to: tab.to, search: { host: host.id } });
       }}
-      className="ml-auto shrink-0"
+      className="absolute left-1/2 -translate-x-1/2"
     >
       <TabsList aria-label="Machine settings">
         {TABS.map(({ to, label }) => <TabsTrigger key={to} value={to}>{label}</TabsTrigger>)}
