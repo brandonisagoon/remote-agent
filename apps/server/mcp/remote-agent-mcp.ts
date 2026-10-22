@@ -46,6 +46,12 @@ const TOOLS = [
     }, required: ["key", "kind", "purpose", "externalId"], additionalProperties: false,
   } },
   { name: "publish_plan", description: "Save the plan under Implementation Plan in this session's linked Linear issue, preserving its original description. Works with Codex and Claude; does not advance the issue state.", inputSchema: { type: "object", properties: { plan: { type: "string" } }, required: ["plan"], additionalProperties: false } },
+  { name: "publish_issue_update", description: "Publish a progress or review comment and optional state change on this primary session's linked Linear issue. Follow the repository's status and review policy. Upload screenshot/recording files from this machine as real issue attachments. Provide absolute file paths inside the worktree, or register each external file as a task resource with kind=evidence first. State changes require expectedState from read_source_issue. Evidence and comment are confirmed before state changes; sessions and previews stay open. Use the same requestKey and payload on retry. Never include secrets.", inputSchema: {
+    type: "object", properties: {
+      requestKey: { type: "string" }, body: { type: "string" }, state: { type: "string" }, expectedState: { type: "string" },
+      evidence: { type: "array", maxItems: 8, items: { type: "object", properties: { path: { type: "string" }, title: { type: "string" } }, required: ["path", "title"], additionalProperties: false } },
+    }, required: ["requestKey", "body"], additionalProperties: false,
+  } },
   {
     name: "delegate_session",
     description:
@@ -88,6 +94,7 @@ async function callTool(name: string, args: Json): Promise<Json> {
   if (name === "report_task") return call("PATCH", `/api/sessions/${sessionId}/task`, args);
   if (name === "register_resource") return call("PUT", `/api/sessions/${sessionId}/task/resources`, args);
   if (name === "publish_plan") return call("PUT", `/api/sessions/${sessionId}/plan`, args);
+  if (name === "publish_issue_update") return call("POST", `/api/sessions/${sessionId}/issue-update`, args);
   if (name === "delegate_session") {
     return call("POST", `/api/sessions/${sessionId}/delegate`, args);
   }

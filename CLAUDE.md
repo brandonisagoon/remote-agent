@@ -39,6 +39,13 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `read_source_issue` and `ask_question` use the session's linked issue and
   server-held credential. `RuntimeQuestion` persists a client-assigned comment
   UUID before delivery; retries reuse it and preserve an already-answered thread.
+- **Source-issue updates** (`apps/server/services/sessions/issue-updates.ts`) —
+  `publish_issue_update` is primary-only and bound to the session's source issue.
+  `RuntimeIssueUpdate` persists the request, upload receipts and comment UUID.
+  Evidence uploads/attachments and the routed comment precede the state change;
+  `expectedState` guards against stale owner changes. Completed receipts replay
+  without rewriting later states. Status policy lives in the tooling skills;
+  selecting a completed-type state never closes the session or its preview.
 - **Plan capture** (`apps/server/services/sessions/plan-capture.ts`) — a
   workflow with `plan: { captureToIssue, thenState? }` launches its session
   in plan mode (`RuntimeSession.workflowId` records provenance); the acpx

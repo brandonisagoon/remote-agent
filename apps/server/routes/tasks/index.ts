@@ -9,13 +9,22 @@ import { changeTaskControl } from "../../services/tasks/control.ts";
 import { launchTask } from "../../services/tasks/launch.ts";
 import { isSafeBranchName } from "../../workers/product/workflow/branch.ts";
 import { askSessionQuestion, linkedSourceIssue } from "../../services/sessions/questions.ts";
+import { IssueUpdateInput, publishSessionIssueUpdate } from "../../services/sessions/issue-updates.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
 
 sessionTaskRoutes.get("/:sessionId/source-issue", async (c) => {
   const { issue } = await linkedSourceIssue({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") });
-  return c.json({ issue: { id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description, state: issue.state, labels: issue.labels } });
+  return c.json({ issue: { id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description, state: issue.state, labels: issue.labels, availableStates: issue.team.states.nodes } });
+});
+
+sessionTaskRoutes.post("/:sessionId/issue-update", async (c) => {
+  const parsed = IssueUpdateInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid issue update", details: parsed.error.issues }, 400);
+  try {
+    return c.json(await publishSessionIssueUpdate({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
 sessionTaskRoutes.post("/:sessionId/question", async (c) => {

@@ -40,11 +40,31 @@ model RuntimeSession {
   incomingRelations  RuntimeSessionRelation[] @relation("runtime-relation-target")
   resourceLinks      RuntimeSessionResourceLink[]
   questions          RuntimeQuestion[]
+  issueUpdates       RuntimeIssueUpdate[]
 
   @@index([status])
   @@index([agentCommand, cwd])
   @@index([repositoryId, status])
   @@index([machineId, status])
+}
+
+/// Source-issue progress/review outbox. The UUID is the Linear comment ID.
+/// Uploaded assets survive retries, and state changes follow confirmed delivery.
+model RuntimeIssueUpdate {
+  id               String   @id @default(uuid())
+  runtimeSessionId String
+  requestKey       String
+  connectionId     String
+  issueId          String
+  input            Json
+  evidence         Json
+  commentPosted    Boolean  @default(false)
+  published        Boolean  @default(false)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
+
+  @@unique([runtimeSessionId, requestKey])
 }
 
 /// Durable outbox identity. Its UUID is also the Linear comment ID, so an

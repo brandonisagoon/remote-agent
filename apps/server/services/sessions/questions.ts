@@ -2,7 +2,7 @@ import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
-import { getSourceIssueForWorkflow } from "../../integrations/linear/session-store/source-issue/read.ts";
+import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
 import { assertTaskAutomationAllowed } from "../tasks/control.ts";
 import { findThreadSession, registerThread } from "./threads.ts";
 import { queueInstruction } from "./inbox.ts";
@@ -15,7 +15,7 @@ export async function linkedSourceIssue(input: { prisma: PrismaClient; config: S
   } });
   if (!link) throw new Error("Session has no linked Linear issue");
   const config = scopeConfig(input.config, { repositoryId: session.repositoryId, connectionId: link.connectionId });
-  const issue = await getSourceIssueForWorkflow(config, { id: link.externalId });
+  const issue = await getSourceIssueForUpdate(config, { id: link.externalId });
   if (!issue) throw new Error("Linked issue not found");
   return { session, link, config, issue };
 }

@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
+        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -104,5 +104,18 @@ describe("remote-agent MCP server", () => {
         expect(result.content[0]!.text).toContain("session is closed");
       },
     );
+  });
+
+  test("issue updates use the caller's fixed session and relay review evidence", async () => {
+    const input = { requestKey: "review-1", body: "1. Open the preview and save an item.", state: "Manual Review", expectedState: "On Course", evidence: [{ path: "/task/result.png", title: "Saved item" }] };
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/issue-update");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual(input);
+      return Response.json({ published: true, commentId: "comment" });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "publish_issue_update", arguments: input } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toEqual({ published: true, commentId: "comment" });
+    });
   });
 });

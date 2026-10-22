@@ -57,7 +57,8 @@ const GET_SOURCE_ISSUE_FOR_WORKFLOW = `
       branchName
       title
       description
-      state { name }
+      state { id name type }
+      team { states { nodes { id name type } } }
       labels { nodes { name parent { name } } }
     }
   }
@@ -135,8 +136,15 @@ export async function getSourceIssueForWorkflow(
   config: ServerConfig,
   query: { id: string },
 ): Promise<SourceIssueWithAgentIssues | null> {
+  return getSourceIssueForUpdate(config, query);
+}
+
+export async function getSourceIssueForUpdate(
+  config: ServerConfig,
+  query: { id: string },
+): Promise<SourceIssueForUpdate | null> {
   const data = await linearGraphql<{
-    issue: Omit<SourceIssueWithAgentIssues, "relations" | "inverseRelations"> | null;
+    issue: Omit<SourceIssueForUpdate, "relations" | "inverseRelations"> | null;
   }>(config.linearApiKey, GET_SOURCE_ISSUE_FOR_WORKFLOW, query);
   return data.issue
     ? {
@@ -146,3 +154,8 @@ export async function getSourceIssueForWorkflow(
       }
     : null;
 }
+
+export type SourceIssueForUpdate = SourceIssueWithAgentIssues & {
+  state: { id: string; name: string; type: string };
+  team: { states: { nodes: Array<{ id: string; name: string; type: string }> } };
+};
