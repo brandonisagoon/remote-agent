@@ -35,6 +35,7 @@ export function useRepositorySessions(repositoryId: string) {
   }));
   return {
     sessions: combineMachineSessions(snapshots),
+    repositoryOrigin: reference.data?.origin ?? null,
     error: reference.error,
     loading: reference.isPending || (!!reference.data && queries.some((query) => query.isPending)),
     unavailable: snapshots.filter((snapshot) => snapshot.unavailable),

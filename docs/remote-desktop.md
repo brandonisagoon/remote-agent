@@ -75,6 +75,13 @@ Conversation continuation and task supervision remain available through
 Linear, Zed/ACP and the owner MCP. Those interfaces use the same durable task
 and session identities. The desktop does not add a second supervision UI.
 
+An available public app preview adds **Open in ChatGPT** to its existing session
+row. Its deep link prefills the review skill and exact remote task binding, and
+uses the repository's credential-free Git origin to select a matching local
+workspace in ChatGPT. It never passes the remote worktree as a local path. A
+repository without a network origin leaves workspace selection to the user.
+The user still presses Send to start the review.
+
 Settings, file browsing, model discovery, status and restart run on the
 selected machine. Editor detection and keyboard preferences stay on the
 client. The ACP command displayed for a remote machine includes SSH and its

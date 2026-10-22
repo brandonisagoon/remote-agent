@@ -35,8 +35,11 @@ export function chatgptReviewForSession(session: SessionIdentity, rawTasks: unkn
   return undefined;
 }
 
-export function chatgptReviewLink(session: SessionIdentity, review: z.infer<typeof ChatgptReviewSchema>) {
+export function chatgptReviewLink(session: SessionIdentity, review: z.infer<typeof ChatgptReviewSchema>, repositoryOrigin: string | null) {
   const context = ChatgptReviewSchema.parse(review);
   const prompt = `Use $${context.skill} to open this app preview in the ChatGPT browser and help me review it. Route my feedback to this existing remote session.\n\n${JSON.stringify({ taskId: context.taskId, sessionId: session.id, machineId: session.machineId, repositoryId: session.repositoryId, previewUrl: context.url }, null, 2)}`;
-  return `codex://new?prompt=${encodeURIComponent(prompt)}`;
+  // Match the client's workspace by the credential-free Git identity. A remote
+  // session's cwd/worktreePath belongs to its host, not the client opening ChatGPT.
+  const repository = repositoryOrigin ? `&originUrl=${encodeURIComponent(`https://${repositoryOrigin}`)}` : "";
+  return `codex://new?prompt=${encodeURIComponent(prompt)}${repository}`;
 }

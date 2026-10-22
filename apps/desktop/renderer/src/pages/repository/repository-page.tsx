@@ -46,7 +46,7 @@ export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: Re
 }
 
 function SessionsTab({ repositoryId }: { repositoryId: string }) {
-  const { sessions, loading, error, unavailable, localOnly } = useRepositorySessions(repositoryId);
+  const { sessions, repositoryOrigin, loading, error, unavailable, localOnly } = useRepositorySessions(repositoryId);
   const counts = useMemo(
     () => ({
       active: sessions.filter((session) => session.status === "active").length,
@@ -77,7 +77,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
                 <div className="text-muted-foreground truncate font-mono text-[10px]">{session.id}</div>
                 {session.chatgptReview && !session.unavailable && (
                   <Button asChild variant="link" size="xs" className="h-auto p-0 text-xs motion-reduce:transition-none">
-                    <a href={chatgptReviewLink(session, session.chatgptReview)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
+                    <a href={chatgptReviewLink(session, session.chatgptReview, repositoryOrigin)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
                   </Button>
                 )}
               </TableCell>

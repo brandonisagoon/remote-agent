@@ -137,19 +137,24 @@ test("repository session operations use the supplied config without changing pro
   expect(DesktopOperationSchema.safeParse({ method: "sessions:repository", args: [{ ...reference as object, action: "close" }] }).success).toBe(false);
 });
 
-test("ChatGPT preview handoff preserves the exact remote task and primary session", async () => {
+test("ChatGPT preview handoff selects the client repository and preserves the exact remote session", async () => {
   const air = fixture("macbook-air", "repo-air", "https://github.com/drafted-ai/greenfield.git");
   const row = session(air.machineId, air.repositoryId);
   const preview = { kind: "local-http", purpose: "development", state: "ready", metadata: { publicUrl: "https://preview.example.com/designs/one?view=brief&mode=review", chatgptSkill: "drafted-review" } };
   const task = { id: "original-task", primarySessionId: row.id, machineId: row.machineId, repositoryId: row.repositoryId, resources: [preview] };
   await serve(air.socket, [row], [task]);
-  const data = await desktopRepositorySessions(air.file, await desktopRepositoryReference(air.file, air.repositoryId));
+  const reference = await desktopRepositoryReference(air.file, air.repositoryId);
+  const data = await desktopRepositorySessions(air.file, reference);
   const review = data.sessions[0]!.chatgptReview!;
   expect(review).toEqual({ taskId: task.id, url: preview.metadata.publicUrl, skill: "drafted-review" });
-  const link = new URL(chatgptReviewLink(row, review));
+  const link = new URL(chatgptReviewLink(row, review, reference.origin));
   expect(link.protocol).toBe("codex:");
   expect(link.hostname).toBe("new");
-  expect([...link.searchParams.keys()]).toEqual(["prompt"]);
+  expect([...link.searchParams.keys()]).toEqual(["prompt", "originUrl"]);
+  expect(link.searchParams.get("originUrl")).toBe("https://github.com/drafted-ai/greenfield");
+  expect(link.searchParams.has("path")).toBe(false);
+  const unlinked = new URL(chatgptReviewLink(row, review, null));
+  expect([...unlinked.searchParams.keys()]).toEqual(["prompt"]);
   const prompt = link.searchParams.get("prompt")!;
   const context = JSON.parse(prompt.slice(prompt.indexOf("{")));
   expect(context).toEqual({ taskId: task.id, sessionId: row.id, machineId: row.machineId, repositoryId: row.repositoryId, previewUrl: preview.metadata.publicUrl });
