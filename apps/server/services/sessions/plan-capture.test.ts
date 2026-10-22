@@ -112,6 +112,22 @@ describe("splicePlanSection", () => {
     const once = splicePlanSection("Ask.", "Plan.");
     expect(splicePlanSection(once, "Plan.")).toBe(once);
   });
+
+  test("replaces a captured plan with its own headings without retaining old sections", () => {
+    const first = splicePlanSection("Original ask.", "# First plan\n\n## Context\n\nOld context.\n\n## Steps\n\nOld steps.");
+    expect(first).toContain("### First plan\n\n#### Context");
+    const next = splicePlanSection(`${first}\n## Notes\n\nKeep me.`, "# Revised plan\n\n## Steps\n\nNew steps.");
+    expect(next).toBe("Original ask.\n\n## Implementation Plan\n\n### Revised plan\n\n#### Steps\n\nNew steps.\n\n## Notes\n\nKeep me.\n");
+    expect(splicePlanSection(next, "# Revised plan\n\n## Steps\n\nNew steps.")).toBe(next);
+  });
+
+  test("ignores heading-like text inside fenced code when finding section boundaries", () => {
+    const original = "Original ask.\n\n```md\n## Implementation Plan\nexample only\n```";
+    const plan = "## Steps\n\n~~~md\n## Example\n~~~\n\nDone.";
+    const first = splicePlanSection(original, plan);
+    expect(first).toContain("### Steps\n\n~~~md\n## Example\n~~~");
+    expect(splicePlanSection(`${first}\n## Notes\n\nKeep me.`, "Revised.")).toBe(`${original}\n\n## Implementation Plan\n\nRevised.\n\n## Notes\n\nKeep me.\n`);
+  });
 });
 
 describe("planFromPermissionRequest", () => {
