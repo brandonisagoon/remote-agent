@@ -84,6 +84,13 @@ commands. Restart refuses active/provisioning sessions and held browser
 control. If the server cannot report its activity, restart fails closed;
 inspect it over SSH before recovery.
 
+The Machine page's existing Storage section includes **Concurrent agent turns**
+(`machine.acpx.maxConcurrentTurns`). A positive integer limits provider turns
+on that host; blank preserves the default unlimited behavior. Restart the
+server to apply a change. Waiting instructions retain their durable queued
+state until a slot and provider handle are available. The limit does not cap
+application containers, detached processes, builds, or GPU usage.
+
 Remote configuration responses omit raw JSON and replace stored credentials
 with markers. Saving restores each marker only at its original field in a
 revision-checked document. Entering a new value replaces that credential on
