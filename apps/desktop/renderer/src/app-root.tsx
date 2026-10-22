@@ -1,4 +1,5 @@
-import { useHost, MachineSwitcher, UnavailableHost } from "@renderer/lib/host-context.tsx";
+import { useHost } from "@renderer/lib/host-context.tsx";
+import { HostRecoveryLayout, UnavailableHost } from "@renderer/components/host-recovery.tsx";
 import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
@@ -212,9 +213,8 @@ export function App() {
 
   if (!document.valid || !draft) {
     return (
-      <main className="bg-background grid h-screen place-items-center p-8">
+      <HostRecoveryLayout><main className="bg-background grid min-h-screen place-items-center p-8">
         <div className="grid w-full max-w-2xl gap-4">
-          <MachineSwitcher />
           <div className="flex items-center gap-2">
             <F7Icon name="exclamationmark_circle" className="text-destructive text-[20px]" />
             <h1 className="text-lg font-semibold">Configuration needs attention</h1>
@@ -236,7 +236,7 @@ export function App() {
             </Button>
           </div>
         </div>
-      </main>
+      </main></HostRecoveryLayout>
     );
   }
 

@@ -1,5 +1,5 @@
 import { formatForDisplay, parseHotkey, useHeldKeys } from "@tanstack/react-hotkeys";
-import { Link, useMatchRoute } from "@tanstack/react-router";
+import { Link, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { MessagesSquareIcon } from "lucide-react";
 
 import type { ServiceFile } from "../../../../../lib/config.ts";
@@ -19,6 +19,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui
 import { NavHistoryButtons } from "@renderer/components/nav-history-buttons.tsx";
 import { RemovableSidebarItem } from "@renderer/components/removable-sidebar-item.tsx";
 import { Button } from "@renderer/components/ui/button.tsx";
+import { MachinesSidebarGroup } from "@renderer/components/machines-sidebar-group.tsx";
+import { useHost } from "@renderer/lib/host-context.tsx";
 import {
   Sidebar,
   SidebarContent,
@@ -53,6 +55,8 @@ export function AppSidebar({
 }) {
   const addRepositoryLabel = useKeybindingLabel("add-repository");
   const matchRoute = useMatchRoute();
+  const navigate = useNavigate();
+  const { hosts } = useHost();
   // While the configured jump-item modifiers are held, items show their number.
   const bindings = useKeybindings();
   const heldKeys = useHeldKeys();
@@ -63,7 +67,7 @@ export function AppSidebar({
   const repositories = Object.entries(value.repositories);
   const connectionOrdinal = (index: number) => providers.length + 1 + index;
   const machineOrdinal = providers.length + connections.length + 1;
-  const repositoryOrdinal = (index: number) => machineOrdinal + 1 + index;
+  const repositoryOrdinal = (index: number) => machineOrdinal + hosts.hosts.length + index;
   const jumpBadge = (ordinal: number) =>
     modHeld && ordinal <= 9 ? (
       <SidebarMenuBadge>
@@ -82,7 +86,6 @@ export function AppSidebar({
         <NavHistoryButtons />
       </SidebarHeader>
       <SidebarContent className="overscroll-contain">
-        <SidebarGroup><SidebarGroupContent><SidebarMenu><SidebarMenuItem><SidebarMenuButton asChild isActive={!!matchRoute({ to: "/tasks" })}><Link to="/tasks"><MessagesSquareIcon /><span>Tasks</span></Link></SidebarMenuButton></SidebarMenuItem></SidebarMenu></SidebarGroupContent></SidebarGroup>
         <SidebarGroup>
           <SidebarGroupLabel>Providers</SidebarGroupLabel>
           <DropdownMenu>
@@ -197,22 +200,12 @@ export function AppSidebar({
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-        <SidebarGroup>
-          <SidebarGroupLabel>Machines</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton asChild isActive={!!matchRoute({ to: "/machine" })}>
-                  <Link to="/machine">
-                    <F7Icon name="desktopcomputer" />
-                    <span>{value.machine.name}</span>
-                  </Link>
-                </SidebarMenuButton>
-                {jumpBadge(machineOrdinal)}
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        <MachinesSidebarGroup
+          active={!!matchRoute({ to: "/machine" })}
+          machineName={value.machine.name}
+          onOpen={() => void navigate({ to: "/machine" })}
+          badge={(index) => jumpBadge(machineOrdinal + index)}
+        />
         <SidebarGroup>
           <SidebarGroupLabel>Repositories</SidebarGroupLabel>
           <Tooltip>

@@ -4,6 +4,7 @@ import { useNavigate, useRouter } from "@tanstack/react-router";
 
 import { useSidebar } from "@renderer/components/ui/sidebar.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { jumpChord, useKeybindings } from "@renderer/lib/keybindings.tsx";
 import { toggleAllSecrets } from "@renderer/lib/secrets-visibility.ts";
 import { navigateToItem, useCurrentSidebarIndex, useSidebarItems } from "@renderer/lib/sidebar-items.ts";
@@ -18,6 +19,7 @@ export function KeyboardShortcuts({ onAddRepository }: { onAddRepository(): void
   const { history } = useRouter();
   const { toggleSidebar } = useSidebar();
   const { save, revert, dirty } = useConfig();
+  const host = useHost();
 
   const navigate = useNavigate();
   const items = useSidebarItems();
@@ -35,7 +37,7 @@ export function KeyboardShortcuts({ onAddRepository }: { onAddRepository(): void
     bindings["prev-item"] as Hotkey,
     () => {
       const target = items[currentIndex <= 0 ? 0 : currentIndex - 1];
-      if (target) navigateToItem(navigate, target);
+      if (target) navigateToItem(navigate, target, host);
     },
     { preventDefault: true },
   );
@@ -43,7 +45,7 @@ export function KeyboardShortcuts({ onAddRepository }: { onAddRepository(): void
     bindings["next-item"] as Hotkey,
     () => {
       const target = items[Math.min(items.length - 1, currentIndex + 1)];
-      if (target) navigateToItem(navigate, target);
+      if (target) navigateToItem(navigate, target, host);
     },
     { preventDefault: true },
   );
@@ -51,7 +53,7 @@ export function KeyboardShortcuts({ onAddRepository }: { onAddRepository(): void
   useHotkeys(
     items.slice(0, 9).map((item, index) => ({
       hotkey: jumpChord(bindings, index + 1),
-      callback: () => navigateToItem(navigate, item),
+      callback: () => navigateToItem(navigate, item, host),
       options: { preventDefault: true },
     })),
   );

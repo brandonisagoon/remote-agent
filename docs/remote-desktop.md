@@ -47,26 +47,22 @@ restart verifies that its plist points to the exact configured file. A label
 is optional for the standard installation. The first version reads profiles
 at app startup; adding or changing profiles requires relaunching the desktop.
 
-The toolbar switches between configured machines. Save or revert settings
+Choose a configured machine in the existing **Machines** sidebar section. Save or revert settings
 before switching. Every request carries the renderer's original machine ID;
 after switching, stale requests are refused rather than redirected. The
 renderer reloads to discard the previous machine's cached state.
 
-## Tasks and settings
+## Sessions and settings
 
-Tasks shows recorded tasks, their actual primary sessions, conversation,
-pending questions and queued instructions. Answer questions, send follow-up
-messages, pause/resume automation, close work, or open the remote worktree
-in an SSH-capable editor. Closing a task preserves its files and resource
-receipts. Return a browser lease through its viewer before using task controls.
+The desktop retains its existing layout: each repository has its Sessions,
+Settings and Skillsets tabs. The sessions table reads the selected machine's
+existing sessions. There is no separate Tasks page or header machine dropdown.
+Choosing another machine opens its existing Machine page and reloads its
+configuration; selecting a repository returns to its usual tabs.
 
-Messages use a stable request key. A failed acknowledgement keeps the same
-text and key for retry; it is not automatically resent. Inspect conversation
-and pending receipts before retrying or clearing an uncertain draft. Drafts
-survive switching tasks and reloading the current window. An `unknown`
-instruction needs explicit resolution after inspecting the conversation:
-record the evidence, then mark it delivered, cancel it, or explicitly retry.
-Retry warns that an earlier delivery may already have performed its actions.
+Conversation continuation and task supervision remain available through
+Linear, Zed/ACP and the owner MCP. Those interfaces use the same durable task
+and session identities. The desktop does not add a second supervision UI.
 
 Settings, file browsing, model discovery, status and restart run on the
 selected machine. Editor detection and keyboard preferences stay on the
@@ -87,7 +83,7 @@ the change.
 
 ## Private previews and reconnection
 
-Preview buttons resolve a task's recorded loopback HTTP resource, then open
+The desktop bridge can resolve a task's recorded loopback HTTP resource and open
 an owner-SSH connection bound to client loopback. A local HTTP/WebSocket
 forwarder preserves the original Host and Origin, so strict browser gateways
 work with temporary client ports. It checks its own Host and Origin before
@@ -96,9 +92,9 @@ remote profile; a direct web preview uses the client browser's state. Preview
 windows have no desktop preload, Node access or desktop IPC API. Forwarding
 ends when the desktop quits or changes machine; remote resources remain.
 
-The desktop reconnects on the next read and polls the same task/session IDs.
-During disconnection it retains the last received task view and disables
-task controls. It never creates a replacement task, migrates work, grants
+The desktop reconnects on the next read and polls the same session IDs.
+The existing sessions table reports read failures; startup failures keep
+Machines navigation available. It never creates a replacement task, migrates work, grants
 browser control or resumes automation as part of reconnecting.
 
 Only the owner's authenticated SSH connection reaches the host's existing

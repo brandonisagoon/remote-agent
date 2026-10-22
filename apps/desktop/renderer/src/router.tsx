@@ -1,4 +1,3 @@
-import { TasksPage } from "@renderer/pages/tasks/tasks-page.tsx";
 import {
   createHashHistory,
   createRootRoute,
@@ -22,8 +21,6 @@ const rootRoute = createRootRoute({
   notFoundComponent: () => <PageHeading title="Not found" description="This location does not exist." />,
 });
 
-const tasksRoute = createRoute({ getParentRoute: () => rootRoute, path: "/tasks", component: TasksPage });
-
 const machineRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/machine",
@@ -39,7 +36,15 @@ const machineRoute = createRoute({
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  beforeLoad: () => { throw redirect({ to: "/tasks" }); },
+  beforeLoad: () => {
+    const document = queryClient.getQueryData(configQueryOptions.queryKey);
+    const repositoryId =
+      document?.valid ? Object.keys(document.value.repositories)[0] : undefined;
+    if (repositoryId) {
+      throw redirect({ to: "/repositories/$repositoryId", params: { repositoryId } });
+    }
+    throw redirect({ to: "/machine" });
+  },
 });
 
 const providerRoute = createRoute({
@@ -119,7 +124,7 @@ const repositoryTabRoute = createRoute({
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, tasksRoute, machineRoute, providerRoute, connectionRoute, repositoryRoute.addChildren([repositoryIndexRoute, repositoryTabRoute])]);
+const routeTree = rootRoute.addChildren([indexRoute, machineRoute, providerRoute, connectionRoute, repositoryRoute.addChildren([repositoryIndexRoute, repositoryTabRoute])]);
 
 // Hash history: works under the file:// URL of a packaged Electron build.
 export const router = createRouter({ routeTree, history: createHashHistory() });

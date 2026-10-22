@@ -1,7 +1,7 @@
 import { chooseHostRepository } from "./remote-path-picker.tsx";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { Outlet, useNavigate, useParams, useLocation } from "@tanstack/react-router";
+import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 
 import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
@@ -36,7 +36,6 @@ function storedSidebarWidth(): number {
 export function AppLayout() {
   const { draft, mutate, commit, dirty } = useConfig();
   const navigate = useNavigate();
-  const location = useLocation();
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
 
   // Adding a repository is a file pick, not a form: the ID is an opaque key,
@@ -167,7 +166,7 @@ export function AppLayout() {
           <div
             className={cn(
               "mx-auto w-full",
-              location.pathname === "/tasks" || (params.repositoryId && (params as { tab?: string }).tab === "sessions")
+              params.repositoryId && (params as { tab?: string }).tab === "sessions"
                 ? // Full-bleed data view: gutters match the window header's px-4.
                   "max-w-none px-4 py-4"
                 : "max-w-3xl px-8 py-8",
