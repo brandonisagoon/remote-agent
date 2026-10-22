@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { ChatgptReviewSchema } from "./chatgpt-review.ts";
 
 export const SessionSummarySchema = z.object({
   id: z.string(),
@@ -11,6 +12,7 @@ export const SessionSummarySchema = z.object({
   cwd: z.string(),
   worktreePath: z.string().nullable(),
   updatedAt: z.string(),
+  chatgptReview: ChatgptReviewSchema.optional(),
   labels: z.array(z.object({ key: z.string(), value: z.string(), source: z.string() })).default([]),
   resourceLinks: z.array(z.object({
     provider: z.string(), connectionId: z.string(), resourceType: z.string(),

@@ -9,6 +9,7 @@ import { parseServiceFile } from "../../lib/config.ts";
 import { canonicalGitOrigin, combineMachineSessions, type SessionSummary } from "../../lib/desktop-sessions.ts";
 import { desktopRepositoryReference, desktopRepositorySessions } from "../../management/desktop-sessions.ts";
 import { desktopOperation, DesktopOperationSchema } from "../../management/desktop-operations.ts";
+import { chatgptReviewForSession, chatgptReviewLink } from "../../lib/chatgpt-review.ts";
 
 const directories: string[] = [];
 const servers: Server[] = [];
@@ -39,12 +40,12 @@ function session(machineId: string, repositoryId: string, id = "same-session-id"
   return { id, machineId, repositoryId, name: "Existing session", status: "idle", role: "primary", agentCommand: "codex", cwd: "/worktree", worktreePath: "/worktree", updatedAt: "2026-10-21T12:00:00.000Z", labels: [], resourceLinks: [] };
 }
 
-async function serve(socket: string, sessions: SessionSummary[]) {
+async function serve(socket: string, sessions: SessionSummary[], tasks: unknown[] = []) {
   const requests: string[] = [];
   const server = createServer((request, response) => {
     requests.push(request.url!);
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ sessions }));
+    response.end(JSON.stringify(request.url === "/api/tasks" ? { tasks } : { sessions }));
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(socket, resolve));
@@ -75,8 +76,8 @@ test("one repository combines independently named checkouts and preserves each m
   expect(rows.map((row) => [row.machineId, row.repositoryId, row.machineName])).toEqual([
     ["macbook-air", "repo-air", "MacBook Air"], ["macbook-pro", "repo-pro", "This Mac"],
   ]);
-  expect(airCalls).toEqual(["/api/sessions?includeClosed=true&repositoryId=repo-air"]);
-  expect(proCalls).toEqual(["/api/sessions?includeClosed=true&repositoryId=repo-pro"]);
+  expect(airCalls).toEqual(["/api/tasks", "/api/sessions?includeClosed=true&repositoryId=repo-air"]);
+  expect(proCalls).toEqual(["/api/tasks", "/api/sessions?includeClosed=true&repositoryId=repo-pro"]);
 });
 
 test("matching display names and local IDs never merge unrelated repositories", async () => {
@@ -134,4 +135,32 @@ test("repository session operations use the supplied config without changing pro
   expect(result).toMatchObject({ machineId: "macbook-air", sessions: [{ id: "same-session-id" }] });
   expect(process.env.REMOTE_AGENT_CONFIG).toBe(previous);
   expect(DesktopOperationSchema.safeParse({ method: "sessions:repository", args: [{ ...reference as object, action: "close" }] }).success).toBe(false);
+});
+
+test("ChatGPT preview handoff preserves the exact remote task and primary session", async () => {
+  const air = fixture("macbook-air", "repo-air", "https://github.com/drafted-ai/greenfield.git");
+  const row = session(air.machineId, air.repositoryId);
+  const preview = { kind: "local-http", purpose: "development", state: "ready", metadata: { publicUrl: "https://preview.example.com/designs/one?view=brief&mode=review", chatgptSkill: "drafted-review" } };
+  const task = { id: "original-task", primarySessionId: row.id, machineId: row.machineId, repositoryId: row.repositoryId, resources: [preview] };
+  await serve(air.socket, [row], [task]);
+  const data = await desktopRepositorySessions(air.file, await desktopRepositoryReference(air.file, air.repositoryId));
+  const review = data.sessions[0]!.chatgptReview!;
+  expect(review).toEqual({ taskId: task.id, url: preview.metadata.publicUrl, skill: "drafted-review" });
+  const link = new URL(chatgptReviewLink(row, review));
+  expect(link.protocol).toBe("codex:");
+  expect(link.hostname).toBe("new");
+  expect([...link.searchParams.keys()]).toEqual(["prompt"]);
+  const prompt = link.searchParams.get("prompt")!;
+  const context = JSON.parse(prompt.slice(prompt.indexOf("{")));
+  expect(context).toEqual({ taskId: task.id, sessionId: row.id, machineId: row.machineId, repositoryId: row.repositoryId, previewUrl: preview.metadata.publicUrl });
+  for (const change of [{ machineId: "other-machine" }, { repositoryId: "other-repo" }, { id: "delegate-session" }]) {
+    expect(chatgptReviewForSession({ ...row, ...change }, { tasks: [task] })).toBeUndefined();
+  }
+  for (const change of [{ purpose: "browser" }, { state: "released" }, { state: "failed" }, { kind: "browser-profile" }]) {
+    expect(chatgptReviewForSession(row, { tasks: [{ ...task, resources: [{ ...preview, ...change }] }] })).toBeUndefined();
+  }
+  for (const url of ["http://localhost:19304", "https://secret:password@preview.example.com", "javascript:alert(1)"]) {
+    expect(chatgptReviewForSession(row, { tasks: [{ ...task, resources: [{ ...preview, metadata: { ...preview.metadata, publicUrl: url } }] }] })).toBeUndefined();
+  }
+  expect(chatgptReviewForSession(row, { error: "Old host without task previews" })).toBeUndefined();
 });

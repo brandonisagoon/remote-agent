@@ -5,6 +5,7 @@ import { readConfigDocument } from "../lib/config-file.ts";
 import type { ServiceFile } from "../lib/config.ts";
 import { canonicalGitOrigin, SessionSummarySchema, type DesktopRepositoryReference, type MachineSessions } from "../lib/desktop-sessions.ts";
 import { desktopControl } from "./desktop-control.ts";
+import { chatgptReviewForSession } from "../lib/chatgpt-review.ts";
 
 function sessionConfig(file: string): ServiceFile {
   const document = readConfigDocument(file);
@@ -44,26 +45,28 @@ export async function desktopRepositorySessions(file: string, reference: Desktop
   }).map((candidate) => candidate.id);
   if (!repositoryIds.length) return { machineId: config.machine.id, sessions: [] };
 
-  const results = await Promise.all(repositoryIds.map(async (repositoryId) => {
-    const route = `/api/sessions?includeClosed=true&repositoryId=${encodeURIComponent(repositoryId)}`;
+  async function readSessionApi(route: string): Promise<unknown> {
     const server = config.machine.server;
-    let body: unknown;
     if (server.controlSocketPath) {
-      body = await desktopControl(absoluteHostPath(server.controlSocketPath, file), route, "GET", undefined, 4000);
-    } else {
-      const { host, port } = server.listen;
-      const response = await fetch(`http://${host}:${port}${route}`, {
-        headers: { authorization: `Bearer ${server.apiKey}` }, signal: AbortSignal.timeout(4000),
-      });
-      if (!response.ok) throw new Error(`Session API returned ${response.status}`);
-      body = await response.json();
+      return desktopControl(absoluteHostPath(server.controlSocketPath, file), route, "GET", undefined, 4000);
     }
+    const { host, port } = server.listen;
+    const response = await fetch(`http://${host}:${port}${route}`, {
+      headers: { authorization: `Bearer ${server.apiKey}` }, signal: AbortSignal.timeout(4000),
+    });
+    if (!response.ok) throw new Error(`Session API returned ${response.status}`);
+    return response.json();
+  }
+  // Older hosts can list sessions without supporting task previews.
+  const tasks = await readSessionApi("/api/tasks").catch(() => null);
+  const results = await Promise.all(repositoryIds.map(async (repositoryId) => {
+    const body = await readSessionApi(`/api/sessions?includeClosed=true&repositoryId=${encodeURIComponent(repositoryId)}`);
     const parsed = SessionSummarySchema.array().safeParse((body as { sessions?: unknown })?.sessions);
     if (!parsed.success) throw new Error("Machine returned an invalid session list");
     if (parsed.data.some((session) => session.repositoryId !== repositoryId || session.machineId !== config.machine.id)) {
       throw new Error("Session response does not match the requested repository and machine");
     }
-    return parsed.data;
+    return parsed.data.map((session) => ({ ...session, chatgptReview: chatgptReviewForSession(session, tasks) }));
   }));
   return { machineId: config.machine.id, sessions: results.flat() };
 }

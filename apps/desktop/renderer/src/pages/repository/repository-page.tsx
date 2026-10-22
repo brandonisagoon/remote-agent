@@ -30,6 +30,8 @@ import {
 } from "@renderer/components/ui/input-group.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
+import { Button } from "@renderer/components/ui/button.tsx";
+import { chatgptReviewLink } from "../../../../../../lib/chatgpt-review.ts";
 
 export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: RepositoryTab; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
@@ -65,6 +67,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
             <TableHead>Provider</TableHead>
             <TableHead>Labels</TableHead>
             <TableHead>Updated</TableHead>
+            <TableHead><span className="sr-only">Preview</span></TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -102,6 +105,13 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
               </TableCell>
               <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
                 {new Date(session.updatedAt).toLocaleString()}
+              </TableCell>
+              <TableCell>
+                {session.chatgptReview && !session.unavailable && (
+                  <Button asChild variant="ghost" size="sm" className="motion-reduce:transition-none">
+                    <a href={chatgptReviewLink(session, session.chatgptReview)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
+                  </Button>
+                )}
               </TableCell>
             </TableRow>
           ))}

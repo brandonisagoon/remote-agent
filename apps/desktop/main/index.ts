@@ -332,6 +332,8 @@ async function createWindow(): Promise<void> {
       const preview = new BrowserWindow({ width: 1180, height: 820, title: `Preview · ${hosts?.selected().name ?? "This Mac"}`, webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
       preview.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       void preview.loadURL(url);
+    } else if (destination.protocol === "codex:" && destination.hostname === "new" && destination.searchParams.has("prompt")) {
+      void shell.openExternal(url);
     } else if (["https:", "zed:", "vscode:", "cursor:"].includes(destination.protocol)) void shell.openExternal(url);
     return { action: "deny" };
   });
