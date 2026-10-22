@@ -42,7 +42,7 @@ export interface DesktopHostStatus { connected: boolean; serverAvailable: boolea
 export interface DesktopTask {
   id: string; repositoryId: string; machineId: string; issueIdentifier: string | null;
   branchName: string; primarySessionId: string | null; phase: string; environmentStatus: string;
-  worktreePath: string | null; controlMode: string; recoveryDetail: string | null; updatedAt: string;
+  worktreePath: string | null; controlMode: string; controllerId: string | null; recoveryDetail: string | null; updatedAt: string;
   resources: Array<{ id: string; key: string; kind: string; purpose: string; externalId: string; state: string }>;
 }
 export interface DesktopTaskActivity {

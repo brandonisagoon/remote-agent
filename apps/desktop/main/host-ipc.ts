@@ -29,7 +29,7 @@ export function installHostIpc(hosts: DesktopHostManager, handlers: Map<string, 
       if (!channel.startsWith("keybindings:") && channel !== "editors:detect") return hosts.request(hostId, channel, args);
     }
     process.env.REMOTE_AGENT_CONFIG = localFile();
-    if (["host:status", "tasks:list", "tasks:activity", "tasks:control", "tasks:answer", "tasks:instruct", "tasks:preview", "fs:list", "repository:validate"].includes(channel)) {
+    if (["host:status", "tasks:list", "tasks:activity", "tasks:control", "tasks:answer", "tasks:instruct", "tasks:resolve", "tasks:preview", "fs:list", "repository:validate"].includes(channel)) {
       try { return await desktopOperation(localFile(), { method: channel, args }); }
       catch (error) { if (channel === "host:status") return { connected: true, serverAvailable: false, detail: error instanceof Error ? error.message : String(error) }; throw error; }
     }

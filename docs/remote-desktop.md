@@ -64,7 +64,9 @@ Messages use a stable request key. A failed acknowledgement keeps the same
 text and key for retry; it is not automatically resent. Inspect conversation
 and pending receipts before retrying or clearing an uncertain draft. Drafts
 survive switching tasks and reloading the current window. An `unknown`
-instruction still needs explicit owner-MCP resolution after inspection.
+instruction needs explicit resolution after inspecting the conversation:
+record the evidence, then mark it delivered, cancel it, or explicitly retry.
+Retry warns that an earlier delivery may already have performed its actions.
 
 Settings, file browsing, model discovery, status and restart run on the
 selected machine. Editor detection and keyboard preferences stay on the
@@ -86,8 +88,10 @@ the change.
 ## Private previews and reconnection
 
 Preview buttons resolve a task's recorded loopback HTTP resource, then open
-an owner-SSH port forward bound to client loopback. The control API port and
-arbitrary public URLs are refused. A streamed browser viewer opens the actual
+an owner-SSH connection bound to client loopback. A local HTTP/WebSocket
+forwarder preserves the original Host and Origin, so strict browser gateways
+work with temporary client ports. It checks its own Host and Origin before
+forwarding. The control API port and arbitrary public URLs are refused. A streamed browser viewer opens the actual
 remote profile; a direct web preview uses the client browser's state. Preview
 windows have no desktop preload, Node access or desktop IPC API. Forwarding
 ends when the desktop quits or changes machine; remote resources remain.
@@ -101,3 +105,8 @@ Only the owner's authenticated SSH connection reaches the host's existing
 user-only control socket. No server credential is copied to the client and
 no public control endpoint is added. Existing Linear actor restrictions and
 workflow routing remain authoritative for Linear intake.
+
+Answers and subsequent messages wait for the current turn to finish. If an
+agent remains inside an active turn while waiting for an answer, pause that
+turn, then resume to deliver the already saved answer. This preserves the
+session and receipt; it does not resend the original instruction.

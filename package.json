@@ -55,21 +55,24 @@
         "from": "lib",
         "to": "lib",
         "filter": [
-          "**/*.ts"
+          "**/*.ts",
+          "!**/*.test.ts"
         ]
       },
       {
         "from": "management",
         "to": "management",
         "filter": [
-          "**/*.ts"
+          "**/*.ts",
+          "!**/*.test.ts"
         ]
       },
       {
         "from": "types",
         "to": "types",
         "filter": [
-          "**/*.ts"
+          "**/*.ts",
+          "!**/*.test.ts"
         ]
       },
       {

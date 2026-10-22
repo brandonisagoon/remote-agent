@@ -43,6 +43,7 @@ export interface DesktopApi {
     control(id: string, action: "pause" | "resume" | "close"): Promise<unknown>;
     answer(id: string, questionId: string, answer: string): Promise<unknown>;
     instruct(id: string, requestKey: string, text: string): Promise<unknown>;
+    resolve(id: string, instructionId: string, action: "acknowledge" | "cancel" | "retry", reason: string): Promise<unknown>;
     preview(id: string, resourceId: string): Promise<string>;
   };
   tunnel: {

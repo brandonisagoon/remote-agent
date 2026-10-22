@@ -52,7 +52,9 @@ function useAcpBridgeCommand(file: ServiceFile): string {
 }
 
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {
-  const remote = useHost().host.kind === "ssh";
+  const { host } = useHost();
+  const remote = host.kind === "ssh";
+  const customService = host.kind === "ssh" && !!host.serviceLabel;
   const [result, setResult] = useState<ManagementResult | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const run = async (action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart") => {
@@ -231,7 +233,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             <Field label="Port" type="number" value={machine.server.listen.port} onChange={(next) => mutate((file) => { file.machine.server.listen.port = Number(next); })} />
           </div>
           <Field label="Public URL" value={machine.server.publicUrl} onChange={(next) => mutate((file) => { file.machine.server.publicUrl = next; })} />
-          <DnsRecordsTable value={value} />
+          {customService ? <p className="text-muted-foreground text-xs">This service's public tunnel is managed on the selected machine.</p> : <DnsRecordsTable value={value} />}
         </SettingsCard>
       </SettingsSection>
 

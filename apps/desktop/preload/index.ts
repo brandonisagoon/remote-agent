@@ -21,6 +21,7 @@ const api: DesktopApi = {
     control: (id, action) => invoke("tasks:control", id, action),
     answer: (id, questionId, answer) => invoke("tasks:answer", id, questionId, answer),
     instruct: (id, requestKey, text) => invoke("tasks:instruct", id, requestKey, text),
+    resolve: (id, instructionId, action, reason) => invoke("tasks:resolve", id, instructionId, action, reason),
     preview: (id, resourceId) => invoke("tasks:preview", id, resourceId),
   },
   tunnel: {

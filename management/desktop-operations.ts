@@ -25,6 +25,7 @@ export const DesktopOperationSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("tasks:control"), args: z.tuple([id, z.enum(["pause", "resume", "close"])]) }).strict(),
   z.object({ method: z.literal("tasks:answer"), args: z.tuple([id, id, text.max(100_000)]) }).strict(),
   z.object({ method: z.literal("tasks:instruct"), args: z.tuple([id, id, text.max(100_000)]) }).strict(),
+  z.object({ method: z.literal("tasks:resolve"), args: z.tuple([id, id, z.enum(["acknowledge", "cancel", "retry"]), text.max(2000)]) }).strict(),
   z.object({ method: z.literal("tasks:preview"), args: z.tuple([id, id]) }).strict(),
   z.object({ method: z.literal("skills:check"), args: z.tuple([text, text]) }).strict(),
   z.object({ method: z.literal("provider:models"), args: z.tuple([z.enum(["codex", "claude"])]) }).strict(),
@@ -94,6 +95,7 @@ export async function desktopOperation(file: string, raw: unknown, serviceLabel?
     case "tasks:control": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/automation`, "POST", { action: args[1] });
     case "tasks:answer": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/questions/${encodeURIComponent(args[1] as string)}/answer`, "POST", { answer: args[2] });
     case "tasks:instruct": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/instructions`, "POST", { requestKey: args[1], text: args[2] });
+    case "tasks:resolve": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/instructions/${encodeURIComponent(args[1] as string)}/resolve`, "POST", { action: args[2], reason: args[3] });
     case "tasks:preview": {
       const { task } = await control<{ task: DesktopTask }>(`/api/tasks/${encodeURIComponent(args[0] as string)}`);
       const resource = task.resources.find((entry) => entry.id === args[1] && entry.kind === "local-http" && entry.state !== "released");

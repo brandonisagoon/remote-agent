@@ -53,27 +53,29 @@ function TaskDetail({ id, connected }: { id: string; connected: boolean }) {
   if (!data) return <div className="text-muted-foreground rounded-lg border p-6 text-sm">{query.error ? String(query.error) : "Loading this session…"}</div>;
   const disabled = !connected || !!working || query.isError;
   const task = data.task;
+  const browserOwnsControl = !!task.controllerId && task.controllerId !== `task-supervisor:${id}`;
   const previews = task.resources.filter((resource) => resource.kind === "local-http" && resource.state !== "released");
   const pending = data.questions.filter((question) => question.state !== "answered");
   return <section aria-label="Selected task" className="min-w-0 rounded-lg border">
     <div className="grid gap-3 border-b p-4">
-      <div className="flex items-center justify-between gap-2"><h2 className="font-semibold">{task.issueIdentifier ?? task.repositoryId}</h2><Badge variant="outline">{data.session?.status ?? "preparing"}</Badge></div>
+      <div className="flex items-center justify-between gap-2"><h2 className="font-semibold">{task.issueIdentifier ?? task.repositoryId}</h2><Badge variant="outline">{task.controlMode === "agent" ? data.session?.status ?? "preparing" : task.controlMode}</Badge></div>
       <p className="text-muted-foreground break-all text-xs">{task.branchName}</p>
       <div className="flex flex-wrap items-center gap-2">
-        <Button size="sm" variant="outline" disabled={disabled || task.phase === "closed"} onClick={() => void act("pause", () => window.remoteAgent.tasks.control(id, "pause"))}>Pause</Button>
-        <Button size="sm" variant="outline" disabled={disabled || task.phase === "closed" || task.controlMode === "agent"} onClick={() => void act("resume", () => window.remoteAgent.tasks.control(id, "resume"))}>Resume</Button>
-        <Button size="sm" variant="ghost" disabled={disabled || task.phase === "closed"} onClick={() => { if (window.confirm("Close this agent session? Its worktree, history and retained previews stay available.")) void act("close", () => window.remoteAgent.tasks.control(id, "close")); }}>Close task</Button>
+        <Button size="sm" variant="outline" disabled={disabled || task.phase === "closed" || task.controlMode !== "agent"} onClick={() => void act("pause", () => window.remoteAgent.tasks.control(id, "pause"))}>Pause</Button>
+        <Button size="sm" variant="outline" disabled={disabled || task.phase === "closed" || task.controlMode === "agent" || browserOwnsControl} onClick={() => void act("resume", () => window.remoteAgent.tasks.control(id, "resume"))}>Resume</Button>
+        <Button size="sm" variant="ghost" disabled={disabled || task.phase === "closed" || browserOwnsControl} onClick={() => { if (window.confirm("Close this agent session? Its worktree, history and retained previews stay available.")) void act("close", () => window.remoteAgent.tasks.control(id, "close")); }}>Close task</Button>
         {task.worktreePath && <OpenInEditorMenu target={task.worktreePath} />}
       </div>
       {task.primarySessionId && <p className="text-muted-foreground break-all text-[11px]">Session {task.primarySessionId}</p>}
       {task.recoveryDetail && <p className="text-muted-foreground whitespace-pre-wrap text-xs">{task.recoveryDetail}</p>}
-      {task.controlMode === "human" && <p className="text-sm">Browser control is held by you. Return control from its viewer before resuming.</p>}
+      {browserOwnsControl && <p className="text-sm">Browser control is held by you. Return control from its viewer before resuming.</p>}
+      {task.controlMode === "paused" && !browserOwnsControl && <p className="text-sm">Automation is paused. Messages wait until you resume.</p>}
       {query.isError && <p role="alert" className="text-destructive text-xs">This view may be out of date. {String(query.error)}</p>}
     </div>
     {previews.length > 0 && <div className="flex flex-wrap gap-2 border-b p-4">{previews.map((resource) => <Button size="sm" key={resource.id} variant="outline" disabled={disabled} onClick={() => void act(resource.id, async () => { const url = await window.remoteAgent.tasks.preview(id, resource.id); window.open(url); })}>{resource.key === "browser-viewer" ? "Watch browser" : resource.purpose === "review" ? "Open review" : "Open preview"}</Button>)}</div>}
     {pending.map((question) => <TaskQuestion key={question.id} taskId={id} question={question} disabled={disabled} updated={refresh} />)}
     {task.phase !== "closed" && <TaskMessage taskId={id} disabled={disabled} updated={refresh} />}
-    <TaskInstructions instructions={data.instructions} />
+    <TaskInstructions taskId={id} instructions={data.instructions} disabled={disabled} updated={refresh} />
     <TaskHistory history={data.history} />
   </section>;
 }
@@ -107,10 +109,24 @@ function TaskMessage({ taskId, disabled, updated }: { taskId: string; disabled: 
   return <div className="grid gap-3 border-b p-4"><label htmlFor={field} className="text-sm font-medium">Continue this session</label><Textarea id={field} value={draft.text} onChange={(event) => setDraft({ text: event.target.value })} readOnly={!!draft.requestKey} disabled={sending} placeholder="Tell the agent what to do next…" /><div className="flex gap-2"><Button size="sm" disabled={disabled || sending || !draft.text.trim()} onClick={() => void send()}>{sending ? "Sending…" : draft.requestKey ? "Retry same message" : "Send message"}</Button><Button size="sm" variant="ghost" disabled={sending || !draft.text} onClick={() => { setDraft({ text: "" }); setError(null); if (draft.requestKey) toast.info("Draft cleared. An already delivered message remains in the session."); }}>Clear draft</Button></div>{error && <p role="alert" className="text-destructive text-xs">{error} A retry keeps the same message identity.</p>}</div>;
 }
 
-function TaskInstructions({ instructions }: { instructions: DesktopTaskActivity["instructions"] }) {
-  const pending = instructions.filter((instruction) => ["queued", "delivering", "unknown"].includes(instruction.state));
+function TaskInstructions({ taskId, instructions, disabled, updated }: { taskId: string; instructions: DesktopTaskActivity["instructions"]; disabled: boolean; updated(): void }) {
+  const pending = instructions.filter((instruction) => ["queued", "dispatching", "unknown", "failed"].includes(instruction.state));
   if (!pending.length) return null;
-  return <div className="grid gap-3 border-b p-4"><h3 className="text-sm font-medium">Pending messages</h3>{pending.map((instruction) => <div key={instruction.id} className="text-xs"><Badge variant="secondary">{instruction.state}</Badge><p className="mt-1 whitespace-pre-wrap">{instruction.text}</p>{instruction.detail && <p className="text-muted-foreground mt-1">{instruction.detail}</p>}</div>)}</div>;
+  return <div className="grid gap-3 border-b p-4"><h3 className="text-sm font-medium">Message status</h3>{pending.map((instruction) => <div key={instruction.id} className="text-xs"><Badge variant="secondary">{instruction.state === "dispatching" ? "In progress" : instruction.state}</Badge><p className="mt-1 whitespace-pre-wrap">{instruction.text}</p>{instruction.detail && <p className="text-muted-foreground mt-1">{instruction.detail}</p>}{instruction.state === "unknown" && <ResolveInstruction taskId={taskId} instructionId={instruction.id} disabled={disabled} updated={updated} />}</div>)}</div>;
+}
+
+function ResolveInstruction({ taskId, instructionId, disabled, updated }: { taskId: string; instructionId: string; disabled: boolean; updated(): void }) {
+  const field = useId();
+  const [reason, setReason] = useState("");
+  const [working, setWorking] = useState(false);
+  const resolve = async (action: "acknowledge" | "cancel" | "retry") => {
+    if (action === "retry" && !window.confirm("Retry this message? Check the conversation first: a previous delivery may already have performed its actions.")) return;
+    setWorking(true);
+    try { await window.remoteAgent.tasks.resolve(taskId, instructionId, action, reason); updated(); }
+    catch (error) { toast.error(error instanceof Error ? error.message : String(error)); }
+    finally { setWorking(false); }
+  };
+  return <div className="mt-3 grid gap-2"><label htmlFor={field}>Check the conversation and record why you chose this resolution.</label><Textarea id={field} value={reason} maxLength={2000} onChange={(event) => setReason(event.target.value)} disabled={working} placeholder="What happened to this message?" /><div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={disabled || working || !reason.trim()} onClick={() => void resolve("acknowledge")}>Mark delivered</Button><Button size="sm" variant="outline" disabled={disabled || working || !reason.trim()} onClick={() => void resolve("retry")}>Retry message</Button><Button size="sm" variant="ghost" disabled={disabled || working || !reason.trim()} onClick={() => void resolve("cancel")}>Cancel message</Button></div></div>;
 }
 
 function TaskHistory({ history }: { history: unknown[] }) {

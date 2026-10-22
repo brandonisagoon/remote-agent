@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { createServer } from "node:http";
 import example from "../../remote-agent.config.example.json";
 import { readConfigDocument, type ConfigDocument } from "../../lib/config-file.ts";
 import { DesktopHostSchema, STORED_SECRET, concealHostSecrets, restoreHostSecrets } from "../../lib/desktop-host.ts";
@@ -92,6 +93,38 @@ test("remote operation allowlist rejects arbitrary commands and update installs"
   const { file } = fixture();
   await expect(desktopOperation(file, { method: "shell:exec", args: ["unexpected-command"] })).rejects.toThrow();
   await expect(desktopOperation(file, { method: "management:run", args: ["update"] })).rejects.toThrow();
+});
+
+test("supervision uses the private socket and previews reject the control API", async () => {
+  const { file, directory } = fixture();
+  const socket = path.join(directory, "control.sock");
+  const value = structuredClone(example);
+  value.machine.server.controlSocketPath = socket;
+  writeFileSync(file, JSON.stringify(value));
+  const previous = process.env.REMOTE_AGENT_CONFIG;
+  process.env.REMOTE_AGENT_CONFIG = file;
+  const requests: Array<{ path: string; method: string; body: unknown }> = [];
+  let externalId = "http://127.0.0.1:9010/review";
+  const server = createServer(async (req, res) => {
+    let body = "";
+    for await (const part of req) body += part;
+    requests.push({ path: req.url!, method: req.method!, body: body ? JSON.parse(body) : null });
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify(req.method === "GET" ? { task: { resources: [{ id: "preview", kind: "local-http", state: "ready", externalId }] } } : { resolved: true }));
+  });
+  try {
+    await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
+    await desktopOperation(file, { method: "tasks:resolve", args: ["task", "instruction:one", "acknowledge", "Confirmed result in the transcript"] });
+    expect(requests[0]).toEqual({ path: "/api/tasks/task/instructions/instruction%3Aone/resolve", method: "POST", body: { action: "acknowledge", reason: "Confirmed result in the transcript" } });
+    expect(await desktopOperation(file, { method: "tasks:preview", args: ["task", "preview"] })).toBe(externalId);
+    for (const url of ["http://127.0.0.1:9000/api/tasks", "https://public.example/review", "http://private:token@localhost:9010/review"]) {
+      externalId = url;
+      await expect(desktopOperation(file, { method: "tasks:preview", args: ["task", "preview"] })).rejects.toThrow("task-owned loopback");
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    if (previous === undefined) delete process.env.REMOTE_AGENT_CONFIG; else process.env.REMOTE_AGENT_CONFIG = previous;
+  }
 });
 
 test("host selection persists and rejects stale UI calls before opening a connection", () => {
