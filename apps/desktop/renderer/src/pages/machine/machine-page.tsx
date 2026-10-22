@@ -253,6 +253,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         <SettingsCard>
           <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
           <Field label="Session State Directory" description="Where acpx persists each session's conversation state." value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
+          <Field label="Concurrent agent turns" type="number" description="Additional instructions wait in order. Blank leaves this machine unlimited. Requires a server restart." value={machine.acpx.maxConcurrentTurns ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.maxConcurrentTurns = next === "" ? undefined : Number(next); })} />
         </SettingsCard>
       </SettingsSection>
 

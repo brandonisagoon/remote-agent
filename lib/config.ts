@@ -240,6 +240,7 @@ const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
   .object({
     stateDir: z.string().min(1).optional(),
+    maxConcurrentTurns: PositiveIntegerSchema.optional(),
   })
   .default({});
 // Presence enables the provider in the UI; command (optional) overrides
@@ -447,6 +448,7 @@ export interface ServerConfig {
   routerModel: string | null;
   routerTimeoutMs: number;
   acpxStateDir: string;
+  maxConcurrentTurns?: number;
   acpxAgentCommands: Partial<Record<"codex" | "claude", string[]>>;
   webhookMaxAgeMs: number;
   deployScript: string;
@@ -683,6 +685,7 @@ export function readConfig(): ServerConfig {
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
+    maxConcurrentTurns: file.machine.acpx.maxConcurrentTurns,
     acpxAgentCommands: {
       ...(file.providers.codex?.command ? { codex: [...file.providers.codex.command] } : {}),
       ...(file.providers.claude?.command ? { claude: [...file.providers.claude.command] } : {}),

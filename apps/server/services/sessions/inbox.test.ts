@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { queueInstruction, deliverInstructions } from "./inbox.ts";
+import { TurnCapacity } from "./turn-capacity.ts";
 
 let db: TestDatabase;
 beforeEach(async () => { db = await createTestDatabase(); });
@@ -50,4 +51,39 @@ test("human control keeps queued instructions durable until explicit handback", 
   await deliverInstructions(db.prisma, runtime);
   for (let i = 0; i < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 1; i++) await Bun.sleep(5);
   expect(runtime.sentMessages).toHaveLength(1);
+});
+
+test("capacity waits stay queued across daemon loss and dispatch once on recovery", async () => {
+  const runtime = createFakeAgentRuntime([{ id: "one" }, { id: "two" }]);
+  const capacity = new TurnCapacity(1);
+  const releaseBusy = await capacity.acquire(new AbortController().signal);
+  const admitted: string[] = [];
+  runtime.startTurn = (input) => ({
+    requestId: input.requestId!,
+    events: { async *[Symbol.asyncIterator]() {} },
+    result: (async () => {
+      const release = await capacity.acquire(new AbortController().signal);
+      try {
+        if (!(await input.beforeStart?.())) throw new Error("claim failed");
+        admitted.push(input.requestId!);
+        return { status: "completed" as const };
+      } finally { release(); }
+    })(),
+    cancel: async () => {},
+  });
+  await queueInstruction(db.prisma, { sessionId: "one", requestId: "first", text: "first" });
+  await queueInstruction(db.prisma, { sessionId: "two", requestId: "second", text: "second" });
+  await deliverInstructions(db.prisma, runtime);
+  await deliverInstructions(db.prisma, runtime);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "queued" } })).toBe(2);
+  expect(admitted).toEqual([]);
+  capacity.stop();
+  releaseBusy();
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  await db.prisma.$disconnect();
+  const recovered = createFakeAgentRuntime([{ id: "one" }, { id: "two" }]);
+  await deliverInstructions(db.prisma, recovered);
+  for (let i = 0; i < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 2; i++) await Bun.sleep(5);
+  expect(recovered.sentMessages.map((message) => message.requestId)).toEqual(["first", "second"]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "completed" } })).toBe(2);
 });

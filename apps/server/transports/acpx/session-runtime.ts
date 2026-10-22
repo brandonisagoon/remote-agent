@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { assertTaskAutomationAllowed } from "../../services/tasks/control.ts";
 import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
+import { TurnCapacity } from "../../services/sessions/turn-capacity.ts";
 
 import type {
   AcpRuntimeEvent,
@@ -151,6 +152,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   >();
   private readonly turnChains = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, AcpRuntimeTurn>();
+  private readonly waitingTurns = new Map<string, Set<AbortController>>();
+  private readonly capacity: TurnCapacity;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -162,6 +165,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     } = {},
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
+    this.capacity = new TurnCapacity(config.maxConcurrentTurns);
   }
 
   /** Providers sanitize the environment of MCP children. Carry each
@@ -334,6 +338,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    beforeStart?: () => Promise<boolean>;
     onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn {
     const requestId = input.requestId ?? randomUUID();
@@ -341,6 +346,12 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     const completion = deferred<AgentRuntimeTurnResult>();
     let cancelled = false;
     let current: AcpRuntimeTurn | null = null;
+    let releaseCapacity: (() => void) | undefined;
+    const waiting = new AbortController();
+    const waitingForSession = this.waitingTurns.get(input.sessionId) ?? new Set<AbortController>();
+    waitingForSession.add(waiting);
+    this.waitingTurns.set(input.sessionId, waitingForSession);
+    const signal = input.signal ? AbortSignal.any([input.signal, waiting.signal]) : waiting.signal;
 
     const previous = this.turnChains.get(input.sessionId) ?? Promise.resolve();
     const run = previous
@@ -353,6 +364,15 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         }
         const session = await this.requireSession(input.sessionId);
         await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        if (this.capacity.full) {
+          queue.push({ kind: "update", id: `${requestId}:queued`, sessionId: session.id, requestId, createdAt: Date.now(), update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Queued — waiting for an available agent slot on this machine.\n" } } });
+        }
+        releaseCapacity = await this.capacity.acquire(signal);
+        if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
+        await this.requireSession(input.sessionId);
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
+        waitingForSession.delete(waiting);
         const handle = await this.handleFor(session);
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
@@ -372,7 +392,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           text: input.text,
           mode: input.mode ?? "prompt",
           requestId,
-          signal: input.signal,
+          signal,
           // Planning questions: forwarded to the attached ACP client when a
           // handler is provided; otherwise acpx resolves non-interactively.
           // The SDK response allows open-ended actions; acpx accepts only
@@ -474,12 +494,15 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     // must settle the public result too, otherwise ACP clients hang forever.
     const chained = run.catch(async (error) => {
       const message = error instanceof Error ? error.message : String(error);
-      completion.resolve({ status: "failed", error: message });
+      completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
       queue.close();
-      await updateRuntimeSessionState(this.prisma, input.sessionId, {
+      if (!signal.aborted) await updateRuntimeSessionState(this.prisma, input.sessionId, {
         status: "error", recoveryDetail: message,
       }).catch(() => undefined);
     }).finally(() => {
+      releaseCapacity?.();
+      waitingForSession.delete(waiting);
+      if (!waitingForSession.size) this.waitingTurns.delete(input.sessionId);
       if (this.turnChains.get(input.sessionId) === chained) {
         this.turnChains.delete(input.sessionId);
       }
@@ -492,6 +515,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       result: completion.promise,
       cancel: async (reason?: string) => {
         cancelled = true;
+        waiting.abort();
         if (current) await current.cancel({ reason });
       },
     };
@@ -589,6 +613,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async cancel(sessionId: string, reason?: string): Promise<void> {
+    for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const active = this.activeTurns.get(sessionId);
     if (active) {
       await active.cancel({ reason });
@@ -600,6 +625,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async close(sessionId: string, reason: string): Promise<void> {
+    for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
     await this.runtimeFor(sessionId).close({ handle, reason });
@@ -642,6 +668,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async shutdown(): Promise<void> {
+    for (const controllers of this.waitingTurns.values()) for (const waiting of controllers) waiting.abort();
+    this.capacity.stop();
     await Promise.allSettled(
       [...this.activeTurns.values()].map((turn) =>
         turn.cancel({ reason: "Remote Agent shutting down" }),

@@ -17,7 +17,8 @@
       "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock"
     },
     "acpx": {
-      "stateDir": "~/Library/Application Support/remote-agent/acpx"
+      "stateDir": "~/Library/Application Support/remote-agent/acpx",
+      "maxConcurrentTurns": 3
     },
     "acp": {
       "providerId": "codex"

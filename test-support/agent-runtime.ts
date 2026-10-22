@@ -116,7 +116,10 @@ export function createFakeAgentRuntime(
             // No events by default.
           },
         },
-        result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+        result: (async () => {
+          if (input.beforeStart && !(await input.beforeStart())) return { status: "cancelled" as const, stopReason: "cancelled" };
+          return { status: "completed" as const, stopReason: "end_turn" };
+        })(),
         cancel: async () => {
           cancelledSessionIds.push(input.sessionId);
         },

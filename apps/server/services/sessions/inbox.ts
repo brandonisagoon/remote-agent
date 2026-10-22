@@ -33,6 +33,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
     for (const receipt of queued) {
       if (visited.has(receipt.sessionId)) continue;
       visited.add(receipt.sessionId);
+      if (running.has(receipt.id)) continue;
       if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown"] } } })) continue;
       const session = await runtime.getSession(receipt.sessionId);
       if (!session || session.status === "closed") {
@@ -42,17 +43,18 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
       if (session.status === "active" || session.status === "provisioning") continue;
       const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
       if (task && task.controlMode !== "agent") continue;
-      const claim = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
-      if (!claim.count) continue;
       running.add(receipt.id);
       void (async () => {
         try {
-          const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId: receipt.id, text: receipt.text });
+          const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId: receipt.id, text: receipt.text, beforeStart: async () => {
+            const claim = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
+            return claim.count > 0;
+          } });
           for await (const _ of turn.events) { /* Persisted lifecycle journal is authoritative on restart. */ }
           const result = await turn.result;
-          await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: result.status, detail: result.error ?? null } });
+          await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });
         } catch {
-          await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
+          await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
         } finally { running.delete(receipt.id); }
       })();
     }
