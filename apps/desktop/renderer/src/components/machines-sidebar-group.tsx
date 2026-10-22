@@ -10,7 +10,7 @@ export function MachinesSidebarGroup({ badge }: { badge?(index: number): React.R
     <SidebarGroupLabel>Machines</SidebarGroupLabel>
     <SidebarGroupContent><SidebarMenu>
       {entries.map(({ host, config, error }, index) => <SidebarMenuItem key={host.id}>
-        <SidebarMenuButton asChild isActive={!!matchRoute({ to: "/machine", search: { host: host.id }, includeSearch: true })}>
+        <SidebarMenuButton asChild isActive={!!matchRoute({ to: "/machine", search: { host: host.id }, includeSearch: true, fuzzy: true })}>
           <Link to="/machine" search={{ host: host.id }}>
             <F7Icon name="desktopcomputer" />
             <span className="truncate">{host.name}</span>

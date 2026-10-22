@@ -39,6 +39,8 @@ function controller(source: ReturnType<typeof fixture>, save?: (input: { expecte
 test("all-machine navigation retains colliding IDs, badges and the offline host's last received repositories", () => {
   const air = fixture("air");
   const pro = fixture("pro");
+  air.value.connections = parseServiceFile(example).connections;
+  pro.value.connections = parseServiceFile(example).connections;
   const source = [
     { host: { id: "air", name: "MacBook Air", kind: "local" as const }, config: air.value, dirty: true, unavailable: true },
     { host: { id: "pro", name: "This Mac", kind: "local" as const }, config: pro.value, dirty: false, unavailable: false },
@@ -52,7 +54,7 @@ test("all-machine navigation retains colliding IDs, badges and the offline host'
   ]);
   expect(new Set(items.map((item) => item.key)).size).toBe(items.length);
   expect(items.filter((item) => item.kind === "machine").map((item) => item.hostId)).toEqual(["air", "pro", "unreachable"]);
-  expect(items.filter((item) => item.kind === "provider" && item.id === "codex").map((item) => item.hostId)).toEqual(["air", "pro"]);
+  expect(items.map((item) => item.kind)).toEqual(["machine", "machine", "machine", "repository", "repository"]);
 });
 
 test("navigating between hosts preserves separate drafts; saving one cannot save the other", async () => {

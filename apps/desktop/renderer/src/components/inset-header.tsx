@@ -1,23 +1,22 @@
 import { useParams } from "@tanstack/react-router";
 
-import { DeleteConnectionButton } from "@renderer/components/delete-connection-button.tsx";
+import { MachineHeaderControls } from "@renderer/pages/machine/machine-header-controls.tsx";
 import { RepositoryHeaderControls } from "@renderer/pages/repository/repository-header-controls.tsx";
 import { NavHistoryButtons } from "@renderer/components/nav-history-buttons.tsx";
 import { SidebarTrigger, useSidebar } from "@renderer/components/ui/sidebar.tsx";
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import { PROVIDER_LABELS } from "@renderer/lib/sidebar-items.ts";
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useKeybindingLabel } from "@renderer/lib/keybindings.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 
 function useHeaderTitle(): string {
   const { draft } = useConfig();
+  const { host } = useHost();
   const params = useParams({ strict: false });
-  if (params.providerId) return PROVIDER_LABELS[params.providerId] ?? params.providerId;
-  if (params.connectionId) return draft.connections[params.connectionId]?.name ?? params.connectionId;
   if (params.repositoryId) return draft.repositories[params.repositoryId]?.name ?? params.repositoryId;
-  return draft.machine.name;
+  return host.name;
 }
 
 export function InsetHeader() {
@@ -47,7 +46,7 @@ export function InsetHeader() {
       {(!open || isMobile) && <NavHistoryButtons />}
       <span className="truncate text-sm font-medium">{title}</span>
       {params.repositoryId && <RepositoryHeaderControls repositoryId={params.repositoryId} />}
-      {params.connectionId && <DeleteConnectionButton id={params.connectionId} className="ml-auto" />}
+      {!params.repositoryId && <MachineHeaderControls />}
     </header>
   );
 }

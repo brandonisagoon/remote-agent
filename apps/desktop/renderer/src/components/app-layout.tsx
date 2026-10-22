@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 
+import { useMachineActions } from "@renderer/pages/machine/use-machine-actions.ts";
 import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
@@ -20,11 +21,6 @@ import { useHost, useHostDirectory } from "@renderer/lib/host-context.tsx";
 import { randomHex } from "@renderer/lib/random.ts";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "remote-agent:sidebar-width";
-
-/** Opaque connection id: provider prefix for grep-ability + random hex. */
-function generateConnectionId(): string {
-  return `linear-${randomHex(6)}`;
-}
 
 function storedSidebarWidth(): number {
   const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
@@ -65,42 +61,9 @@ export function AppLayout() {
     void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id }, search });
   };
 
-  const addProvider = (providerId: "codex" | "claude") => {
-    const create = (value: typeof draft) => {
-      value.providers[providerId] = {};
-    };
-    if (dirty) mutate(create);
-    else void commit(create);
-    void navigate({ to: "/providers/$providerId", params: { providerId }, search });
-  };
-  const addConnection = () => {
-    const id = generateConnectionId();
-    const create = (value: typeof draft) => {
-      value.connections[id] = {
-        provider: "linear",
-        name: "New Linear Connection",
-        apiKey: "replace-me",
-        agentUserId: "replace-me",
-        machineId: value.machine.id,
-        repositories: "*",
-        router: { providerId: "codex", timeoutMs: 30_000 },
-        editors: [{ name: "Zed", scheme: "zed" }],
-        webhook: {
-          slug: `wh-${randomHex(6)}`,
-          secret: randomHex(16),
-          webhookMaxAgeMs: 60_000,
-        },
-      };
-    };
-    // A default connection is self-contained: write it through directly.
-    // With unsaved edits pending it joins the draft instead, so those are
-    // never silently saved along with it.
-    if (dirty) mutate(create);
-    else void commit(create);
-    void navigate({ to: "/connections/$connectionId", params: { connectionId: id }, search });
-  };
+  const { addProvider, addConnection } = useMachineActions();
 
-  // The macOS File menu mirrors the sidebar's add controls.
+  // The macOS File menu mirrors the current machine's tab controls.
   useEffect(() =>
     window.remoteAgent.menu.onAction((payload) => {
       if (payload.action === "add-repository") void addRepository();
@@ -118,16 +81,6 @@ export function AppLayout() {
     if (wasActive && hostId === host.id) void navigate({ to: "/", search });
   };
   const params = useParams({ strict: false });
-  const removeProvider = (hostId: string, id: string) => {
-    applyRemoval(hostId, (value) => {
-      delete value.providers[id as keyof typeof value.providers];
-    }, params.providerId === id);
-  };
-  const removeConnection = (hostId: string, id: string) => {
-    applyRemoval(hostId, (value) => {
-      delete value.connections[id];
-    }, params.connectionId === id);
-  };
   const removeRepository = (hostId: string, id: string) => {
     if (Object.keys(entries.find((entry) => entry.host.id === hostId)?.config.draft?.repositories ?? {}).length <= 1) {
       toast.error("At least one repository is required");
@@ -153,12 +106,7 @@ export function AppLayout() {
         onCommit={(width) => localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(width))}
       />
       <AppSidebar
-        value={draft}
-        onAddProvider={addProvider}
-        onAddConnection={addConnection}
         onAddRepository={() => void addRepository()}
-        onRemoveProvider={removeProvider}
-        onRemoveConnection={removeConnection}
         onRemoveRepository={removeRepository}
       />
 

@@ -1,20 +1,10 @@
 import { formatForDisplay, parseHotkey, useHeldKeys } from "@tanstack/react-hotkeys";
 import { Link, useMatchRoute } from "@tanstack/react-router";
-import { MessagesSquareIcon } from "lucide-react";
 
-import type { ServiceFile } from "../../../../../lib/config.ts";
-import { BrandIcon } from "@renderer/components/brand-icon.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { jumpChord, useKeybindings, useKeybindingLabel } from "@renderer/lib/keybindings.tsx";
 import { useSidebarItems } from "@renderer/lib/sidebar-items.ts";
 import { Kbd, KbdGroup } from "@renderer/components/ui/kbd.tsx";
-import { Badge } from "@renderer/components/ui/badge.tsx";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@renderer/components/ui/dropdown-menu.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 import { NavHistoryButtons } from "@renderer/components/nav-history-buttons.tsx";
 import { RemovableSidebarItem } from "@renderer/components/removable-sidebar-item.tsx";
@@ -38,20 +28,10 @@ import {
 } from "@renderer/components/ui/sidebar.tsx";
 
 export function AppSidebar({
-  value,
-  onAddProvider,
-  onAddConnection,
   onAddRepository,
-  onRemoveProvider,
-  onRemoveConnection,
   onRemoveRepository,
 }: {
-  value: ServiceFile;
-  onAddProvider(id: "codex" | "claude"): void;
-  onAddConnection(): void;
   onAddRepository(): void;
-  onRemoveProvider(hostId: string, id: string): void;
-  onRemoveConnection(hostId: string, id: string): void;
   onRemoveRepository(hostId: string, id: string): void;
 }) {
   const addRepositoryLabel = useKeybindingLabel("add-repository");
@@ -64,12 +44,8 @@ export function AppSidebar({
   const heldKeys = useHeldKeys();
   const jumpModifiers = parseHotkey(`${bindings["jump-item"]}+1`).modifiers;
   const modHeld = jumpModifiers.length > 0 && jumpModifiers.every((key) => heldKeys.includes(key));
-  const providers = items.filter((item) => item.kind === "provider");
-  const connections = items.filter((item) => item.kind === "connection");
   const repositories = items.filter((item) => item.kind === "repository");
-  const connectionOrdinal = (index: number) => providers.length + 1 + index;
-  const machineOrdinal = providers.length + connections.length + 1;
-  const repositoryOrdinal = (index: number) => machineOrdinal + hosts.hosts.length + index;
+  const repositoryOrdinal = (index: number) => hosts.hosts.length + 1 + index;
   const jumpBadge = (ordinal: number) =>
     modHeld && ordinal <= 9 ? (
       <SidebarMenuBadge>
@@ -88,121 +64,7 @@ export function AppSidebar({
         <NavHistoryButtons />
       </SidebarHeader>
       <SidebarContent className="overscroll-contain">
-        <SidebarGroup>
-          <SidebarGroupLabel>Providers</SidebarGroupLabel>
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <SidebarGroupAction>
-                    <F7Icon name="plus" />
-                    <span className="sr-only">Add a Provider</span>
-                  </SidebarGroupAction>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="right">Add a Provider to {host.name}</TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent side="bottom" align="end">
-              <DropdownMenuItem disabled={"codex" in value.providers} onSelect={() => onAddProvider("codex")}>
-                <BrandIcon name="openai" />
-                Codex
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled={"claude" in value.providers} onSelect={() => onAddProvider("claude")}>
-                <BrandIcon name="claudecode" />
-                Claude Code
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {providers.map((item, index) => (
-                <RemovableSidebarItem
-                  key={item.key}
-                  label={`${item.label} on ${item.hostName}`}
-                  description="Sessions can no longer use this provider until it is added again."
-                  onRemove={() => onRemoveProvider(item.hostId, item.id)}
-                >
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={!!matchRoute({ to: "/providers/$providerId", params: { providerId: item.id }, search: { host: item.hostId }, includeSearch: true })}
-                    >
-                      <Link to="/providers/$providerId" params={{ providerId: item.id }} search={{ host: item.hostId }}>
-                        {item.id === "claude" ? <BrandIcon name="claudecode" /> : <BrandIcon name="openai" />}
-                        <span className="min-w-0 truncate">{item.label}</span>
-                        <MachineBadge name={item.hostName} unavailable={item.unavailable} />
-                      </Link>
-                    </SidebarMenuButton>
-                    {jumpBadge(index + 1)}
-                  </SidebarMenuItem>
-                </RemovableSidebarItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        <SidebarGroup>
-          <SidebarGroupLabel>Connections</SidebarGroupLabel>
-          <DropdownMenu>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <DropdownMenuTrigger asChild>
-                  <SidebarGroupAction>
-                    <F7Icon name="plus" />
-                    <span className="sr-only">Add a Connection</span>
-                  </SidebarGroupAction>
-                </DropdownMenuTrigger>
-              </TooltipTrigger>
-              <TooltipContent side="right">Add a Connection to {host.name}</TooltipContent>
-            </Tooltip>
-            <DropdownMenuContent side="bottom" align="end">
-              <DropdownMenuItem onSelect={onAddConnection}>
-                <BrandIcon name="linear" />
-                Linear
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled>
-                <MessagesSquareIcon />
-                Slack
-                <Badge variant="secondary" className="ml-auto">
-                  Coming soon
-                </Badge>
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled>
-                <BrandIcon name="github" />
-                GitHub
-                <Badge variant="secondary" className="ml-auto">
-                  Coming soon
-                </Badge>
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {connections.map((item, index) => (
-                <RemovableSidebarItem
-                  key={item.key}
-                  label={`${item.label} on ${item.hostName}`}
-                  description="Its credentials and webhook endpoint will be removed from this machine."
-                  onRemove={() => onRemoveConnection(item.hostId, item.id)}
-                >
-                  <SidebarMenuItem>
-                    <SidebarMenuButton
-                      asChild
-                      isActive={!!matchRoute({ to: "/connections/$connectionId", params: { connectionId: item.id }, search: { host: item.hostId }, includeSearch: true })}
-                    >
-                      <Link to="/connections/$connectionId" params={{ connectionId: item.id }} search={{ host: item.hostId }}>
-                        <BrandIcon name="linear" />
-                        <span className="min-w-0 truncate">{item.label}</span>
-                        <MachineBadge name={item.hostName} unavailable={item.unavailable} />
-                      </Link>
-                    </SidebarMenuButton>
-                    {jumpBadge(connectionOrdinal(index))}
-                  </SidebarMenuItem>
-                </RemovableSidebarItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-        <MachinesSidebarGroup badge={(index) => jumpBadge(machineOrdinal + index)} />
+        <MachinesSidebarGroup badge={(index) => jumpBadge(index + 1)} />
         <SidebarGroup>
           <SidebarGroupLabel>Repositories</SidebarGroupLabel>
           <Tooltip>

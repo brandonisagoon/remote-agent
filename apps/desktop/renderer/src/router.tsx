@@ -14,6 +14,9 @@ import { useConfig } from "@renderer/lib/config-context.tsx";
 import { ConnectionPage } from "@renderer/pages/connection/connection-page.tsx";
 import { ProviderPage } from "@renderer/pages/provider/provider-page.tsx";
 import { MachinePage } from "@renderer/pages/machine/machine-page.tsx";
+import { ProvidersTab } from "@renderer/pages/machine/providers-tab.tsx";
+import { ConnectionsTab } from "@renderer/pages/machine/connections-tab.tsx";
+import { MachineDetailHeading } from "@renderer/pages/machine/machine-detail-heading.tsx";
 import { RepositoryPage } from "@renderer/pages/repository/repository-page.tsx";
 
 const rootRoute = createRootRoute({
@@ -27,6 +30,17 @@ const rootRoute = createRootRoute({
 const machineRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/machine",
+});
+
+const machineIndexRoute = createRoute({
+  getParentRoute: () => machineRoute,
+  path: "/",
+  beforeLoad: ({ search }) => { throw redirect({ to: "/machine/server", search }); },
+});
+
+const machineServerRoute = createRoute({
+  getParentRoute: () => machineRoute,
+  path: "server",
   component: function Machine() {
     const { draft, mutate } = useConfig();
     return <MachinePage value={draft} mutate={mutate} />;
@@ -47,23 +61,38 @@ const indexRoute = createRoute({
 });
 
 const providerRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/providers/$providerId",
+  getParentRoute: () => machineRoute,
+  path: "providers/$providerId",
   component: function Provider() {
     const { providerId } = providerRoute.useParams();
     const { draft, mutate } = useConfig();
-    return <ProviderPage id={providerId} value={draft} mutate={mutate} />;
+    return <><MachineDetailHeading kind="provider" id={providerId} /><ProviderPage id={providerId} value={draft} mutate={mutate} /></>;
   },
 });
 
 const connectionRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/connections/$connectionId",
+  getParentRoute: () => machineRoute,
+  path: "connections/$connectionId",
   component: function Connection() {
     const { connectionId } = connectionRoute.useParams();
     const { draft, mutate } = useConfig();
-    return <ConnectionPage id={connectionId} value={draft} mutate={mutate} />;
+    return <><MachineDetailHeading kind="connection" id={connectionId} /><ConnectionPage id={connectionId} value={draft} mutate={mutate} /></>;
   },
+});
+
+const providersRoute = createRoute({ getParentRoute: () => machineRoute, path: "providers", component: ProvidersTab });
+const connectionsRoute = createRoute({ getParentRoute: () => machineRoute, path: "connections", component: ConnectionsTab });
+
+// Previously saved links still reach the same configuration on the same host.
+const legacyProviderRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/providers/$providerId",
+  beforeLoad: ({ params, search }) => { throw redirect({ to: "/machine/providers/$providerId", params, search }); },
+});
+const legacyConnectionRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/connections/$connectionId",
+  beforeLoad: ({ params, search }) => { throw redirect({ to: "/machine/connections/$connectionId", params, search }); },
 });
 
 const REPOSITORY_TABS = ["sessions", "settings", "skillsets"] as const;
@@ -126,7 +155,13 @@ const repositoryTabRoute = createRoute({
   },
 });
 
-const routeTree = rootRoute.addChildren([indexRoute, machineRoute, providerRoute, connectionRoute, repositoryRoute.addChildren([repositoryIndexRoute, repositoryTabRoute])]);
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  machineRoute.addChildren([machineIndexRoute, machineServerRoute, providersRoute, providerRoute, connectionsRoute, connectionRoute]),
+  legacyProviderRoute,
+  legacyConnectionRoute,
+  repositoryRoute.addChildren([repositoryIndexRoute, repositoryTabRoute]),
+]);
 
 // Hash history: works under the file:// URL of a packaged Electron build.
 export const router = createRouter({ routeTree, history: createHashHistory() });

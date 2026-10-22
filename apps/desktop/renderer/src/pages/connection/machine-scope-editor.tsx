@@ -51,7 +51,7 @@ export function MachineScopeEditor({
             <Tooltip>
               <TooltipTrigger asChild>
                 <InputGroupButton size="icon-xs" asChild>
-                  <Link to="/machine" search={{ host: host.id }}>
+                  <Link to="/machine/server" search={{ host: host.id }}>
                     <F7Icon name="desktopcomputer" />
                     <span className="sr-only">Open machine settings</span>
                   </Link>

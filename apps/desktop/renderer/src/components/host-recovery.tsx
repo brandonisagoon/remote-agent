@@ -15,8 +15,8 @@ export function HostRecoveryLayout({ children }: { children: React.ReactNode }) 
     <Sidebar>
       <SidebarHeader className="titlebar-drag h-12 flex-row items-center justify-end pr-2"><NavHistoryButtons /></SidebarHeader>
       <SidebarContent>
-        {(["provider", "connection", "machine", "repository"] as const).map((kind) => <SidebarGroup key={kind}>
-          <SidebarGroupLabel>{{ provider: "Providers", connection: "Connections", machine: "Machines", repository: "Repositories" }[kind]}</SidebarGroupLabel>
+        {(["machine", "repository"] as const).map((kind) => <SidebarGroup key={kind}>
+          <SidebarGroupLabel>{{ machine: "Machines", repository: "Repositories" }[kind]}</SidebarGroupLabel>
           <SidebarMenu>{items.filter((item) => item.kind === kind).map((item) => <SidebarMenuItem key={item.key}>
             <SidebarMenuButton onClick={() => navigateToItem(navigate, item)}>
               <F7Icon name={kind === "repository" ? "folder" : "desktopcomputer"} />
