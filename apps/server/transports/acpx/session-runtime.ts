@@ -371,9 +371,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
         await this.requireSession(input.sessionId);
         await assertTaskAutomationAllowed(this.prisma, session.cwd);
-        if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
-        waitingForSession.delete(waiting);
         const handle = await this.handleFor(session);
+        if (signal.aborted) throw new Error("Waiting turn cancelled");
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
@@ -416,6 +417,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
             : {}),
         });
         this.activeTurns.set(session.id, current);
+        waitingForSession.delete(waiting);
         let index = 0;
         try {
           for await (const event of current.events) {
@@ -496,8 +498,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       const message = error instanceof Error ? error.message : String(error);
       completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
       queue.close();
-      if (!signal.aborted) await updateRuntimeSessionState(this.prisma, input.sessionId, {
-        status: "error", recoveryDetail: message,
+      if (!signal.aborted) await this.prisma.runtimeSession.updateMany({
+        where: { id: input.sessionId, status: { not: "closed" } },
+        data: { status: "error", recoveryDetail: message },
       }).catch(() => undefined);
     }).finally(() => {
       releaseCapacity?.();

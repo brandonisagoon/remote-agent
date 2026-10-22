@@ -5,6 +5,7 @@ import path from "node:path";
 import { createRuntimeStore, type AcpSessionRecord } from "acpx/runtime";
 import { createTestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
+import { beginRuntimeSession, updateRuntimeSessionState } from "../../services/sessions/runtime-registry.ts";
 
 import { createAcpxSessionRuntime, sessionEnvironment, sessionMcpServers } from "./session-runtime.ts";
 
@@ -56,6 +57,19 @@ describe("sessionEnvironment", () => {
       const events = [];
       for await (const event of turn.events) events.push(event);
       expect(events).toEqual([]);
+    } finally { await runtime.shutdown(); await db.cleanup(); }
+  });
+
+  test("a queued request cannot reopen a session closed before provider startup", async () => {
+    const db = await createTestDatabase();
+    const runtime = createAcpxSessionRuntime(db.prisma, testConfig());
+    try {
+      const session = await beginRuntimeSession(db.prisma, { sessionKey: "closed-before-start", agent: "codex", cwd: "/tmp/closed-capacity-check" });
+      await updateRuntimeSessionState(db.prisma, session.id, { status: "closed", closedAt: new Date() });
+      const turn = runtime.startTurn({ sessionId: session.id, text: "Must remain closed" });
+      expect((await turn.result).status).toBe("failed");
+      for await (const _ of turn.events) {}
+      expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: session.id } })).status).toBe("closed");
     } finally { await runtime.shutdown(); await db.cleanup(); }
   });
 });
