@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "delegate_session", "register_thread"]);
+        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -76,6 +76,22 @@ describe("remote-agent MCP server", () => {
         ]);
       },
     );
+  });
+
+  test("delegate supervision keeps the caller fixed and escapes target IDs", async () => {
+    const seen: Array<{ method: string; url: string; body: unknown }> = [];
+    await withServer(async (request) => {
+      const url = new URL(request.url);
+      seen.push({ method: request.method, url: url.pathname + url.search, body: request.method === "GET" ? null : await request.json() });
+      return Response.json({ accepted: true });
+    }, async (rpc) => {
+      await rpc({ method: "tools/call", params: { name: "inspect_delegates", arguments: { sessionId: "child/one" } } });
+      await rpc({ method: "tools/call", params: { name: "instruct_delegate", arguments: { sessionId: "child/one", requestKey: "fix-1", text: "Fix the observed issue", parentSessionId: "untrusted" } } });
+    });
+    expect(seen).toEqual([
+      { method: "GET", url: "/api/sessions/session-7/delegates?delegateId=child%2Fone", body: null },
+      { method: "POST", url: "/api/sessions/session-7/delegates/child%2Fone/instructions", body: { requestKey: "fix-1", text: "Fix the observed issue" } },
+    ]);
   });
 
   test("surfaces server errors as tool errors", async () => {

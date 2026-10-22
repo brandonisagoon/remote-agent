@@ -49,7 +49,7 @@ const TOOLS = [
   {
     name: "delegate_session",
     description:
-      "Start a child agent session that inherits this session's repository, worktree, and issue. Use it to hand off a bounded sub-task (research, a parallel implementation slice, a review). The child works in the same worktree on the same issue; replies in threads it registers route to it. Returns the child's session id.",
+      "Start a child agent session that inherits this session's repository, worktree, and issue. Use it for a bounded sub-task. Set notifyParent=true to receive its result as a durable follow-up after ending your turn, freeing capacity for the child. Inspect the returned session ID before treating it as completed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -57,11 +57,14 @@ const TOOLS = [
         provider: { type: "string", enum: ["codex", "claude"], description: "Defaults to this session's provider." },
         model: { type: "string" },
         name: { type: "string", description: "Short label shown in session lists." },
+        notifyParent: { type: "boolean", description: "Keep this worker available for follow-up and return completed, failed or cancelled turns to this parent's inbox. End your turn while waiting; do not busy-poll and hold a provider slot." },
       },
       required: ["prompt"],
       additionalProperties: false,
     },
   },
+  { name: "inspect_delegates", description: "Read your own delegated sessions' actual models, recent history and instruction receipts. Optional sessionId selects one child. Queued or idle alone does not establish success.", inputSchema: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false } },
+  { name: "instruct_delegate", description: "Queue a follow-up for your own existing worker using a stable requestKey. Delivery respects active turns and human control. End your turn to free capacity; notifyParent workers return their result to your inbox.", inputSchema: { type: "object", properties: { sessionId: { type: "string" }, requestKey: { type: "string" }, text: { type: "string" } }, required: ["sessionId", "requestKey", "text"], additionalProperties: false } },
   {
     name: "register_thread",
     description:
@@ -87,6 +90,11 @@ async function callTool(name: string, args: Json): Promise<Json> {
   if (name === "publish_plan") return call("PUT", `/api/sessions/${sessionId}/plan`, args);
   if (name === "delegate_session") {
     return call("POST", `/api/sessions/${sessionId}/delegate`, args);
+  }
+  if (name === "inspect_delegates") return call("GET", `/api/sessions/${sessionId}/delegates${typeof args.sessionId === "string" ? `?delegateId=${encodeURIComponent(args.sessionId)}` : ""}`);
+  if (name === "instruct_delegate") {
+    if (typeof args.sessionId !== "string") throw new Error("A delegate sessionId is required");
+    return call("POST", `/api/sessions/${sessionId}/delegates/${encodeURIComponent(args.sessionId)}/instructions`, { requestKey: args.requestKey, text: args.text });
   }
   if (name === "register_thread") {
     return call("PUT", `/api/sessions/${sessionId}/threads`, args);

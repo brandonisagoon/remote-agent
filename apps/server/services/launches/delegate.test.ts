@@ -100,4 +100,16 @@ describe("delegateSession", () => {
       delegateSession({ parentSessionId: "done", prompt: "x" }, { prisma: database.prisma, runtime }),
     ).rejects.toThrow("session is closed: done");
   });
+
+  test("an explicitly selected worker model uses durable launch and opt-in parent results", async () => {
+    database = await createTestDatabase();
+    const runtime = createFakeAgentRuntime([{ id: "astra", agent: "codex", cwd: "/wt", worktreePath: "/wt", repositoryId: "drafted" }]);
+    const child = await delegateSession({ parentSessionId: "astra", prompt: "Implement the bounded slice", provider: "claude", model: "claude-opus-5-5", notifyParent: true }, { prisma: database.prisma, runtime });
+    expect(runtime.ensureInputs[0]).toMatchObject({ agent: "claude", model: "claude-opus-5-5", cwd: "/wt", lifecycle: "persistent", relations: [
+      { relationship: "spawned-by", targetSessionId: "astra" },
+      { relationship: "notifies-parent", targetSessionId: "astra" },
+    ] });
+    expect(runtime.sentMessages).toHaveLength(0);
+    expect(await database.prisma.runtimeInstruction.findUnique({ where: { id: `delegate:${child.id}` } })).toMatchObject({ sessionId: child.id, state: "queued", text: "Implement the bounded slice" });
+  });
 });
