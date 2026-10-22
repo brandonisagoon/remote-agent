@@ -107,7 +107,7 @@ export function AppSidebar({
                       <Link to="/repositories/$repositoryId" params={{ repositoryId: item.id }} search={{ host: item.hostId }}>
                         <F7Icon name="folder" />
                         <span className="min-w-0 truncate">{item.label}</span>
-                        <MachineBadge name={item.hostName} unavailable={item.unavailable} />
+                        {!(modHeld && repositoryOrdinal(index) <= 9) && <MachineBadge name={item.hostName} unavailable={item.unavailable} />}
                       </Link>
                     </SidebarMenuButton>
                     {jumpBadge(repositoryOrdinal(index))}

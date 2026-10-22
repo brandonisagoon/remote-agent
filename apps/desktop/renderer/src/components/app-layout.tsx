@@ -8,6 +8,7 @@ import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
 import { RepositoryPathBar } from "@renderer/pages/repository/path-bar.tsx";
+import { MachinePathBar } from "@renderer/pages/machine/path-bar.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 import {
   SIDEBAR_DEFAULT_WIDTH,
@@ -128,7 +129,7 @@ export function AppLayout() {
             <Outlet key={host.id} />
           </div>
         </div>
-        {params.repositoryId && <RepositoryPathBar repositoryId={params.repositoryId} />}
+        {params.repositoryId ? <RepositoryPathBar repositoryId={params.repositoryId} /> : <MachinePathBar />}
       </SidebarInset>
 
     </SidebarProvider>

@@ -54,6 +54,10 @@ repository directory or reload the window. The tabs are centered in the page
 header, matching repository tabs. Providers and connections open their existing
 settings inside their machine tab, with a link back to the list. Old standalone
 provider and connection URLs redirect to those details on the same host.
+Machine tabs share the repository-style bottom path bar, pointing to that
+machine's configuration file. Folder segments open on the owning machine;
+the file opens in its editor. Holding the sidebar jump shortcut modifiers
+replaces repository machine badges with the corresponding keyboard hints.
 The legacy `activeId` field only supplies the initial destination for an
 unqualified link. Navigation never rewrites the profile file.
 
