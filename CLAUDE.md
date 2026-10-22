@@ -50,12 +50,16 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 - **Session tools + control socket** (`apps/server/mcp/`,
   `apps/server/control-socket.ts`) — every session's harness spawns the
   `remote-agent` stdio MCP server (registered via acpx `mcpServers`); it
-  exposes `delegate_session` and `register_thread`, calling the same Hono
+  exposes `delegate_session`, `inspect_delegates`, `instruct_delegate` and
+  `register_thread`, calling the same Hono
   routes over `controlIpcPath` (`createApp({ trustLocal: true })`, socket
   mode 0600, no bearer). Identity comes from `REMOTE_AGENT_SESSION_ID` /
   `REMOTE_AGENT_SOCKET`, injected into every session's env by
   `sessionEnvironment`. `delegateSession` copies the parent's non-thread
   resource links, sets `spawned-by`, role `delegate`, lifecycle `one-shot`.
+  Opt-in `notifyParent` workers are persistent and use the durable inbox
+  for initial instructions, follow-ups and terminal results to the parent.
+  The lifecycle journal reconciles result delivery after restart.
 - **Workflows** (`repositories.<id>.workflows`) — trigger (`on` +
   `when` conditions + optional `connectionId`) → skill (skillset + flags) →
   delivery (`start-session` | `message-session`). Matched in the webhook
