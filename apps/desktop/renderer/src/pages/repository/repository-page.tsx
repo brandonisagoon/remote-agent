@@ -67,7 +67,6 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
             <TableHead>Provider</TableHead>
             <TableHead>Labels</TableHead>
             <TableHead>Updated</TableHead>
-            <TableHead><span className="sr-only">Preview</span></TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -76,6 +75,11 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
               <TableCell className="max-w-[260px]">
                 <div className="truncate font-medium">{session.name ?? session.id}</div>
                 <div className="text-muted-foreground truncate font-mono text-[10px]">{session.id}</div>
+                {session.chatgptReview && !session.unavailable && (
+                  <Button asChild variant="link" size="xs" className="h-auto p-0 text-xs motion-reduce:transition-none">
+                    <a href={chatgptReviewLink(session, session.chatgptReview)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
+                  </Button>
+                )}
               </TableCell>
               <TableCell className="text-muted-foreground whitespace-nowrap" title={session.machineId}>
                 {session.machineName}
@@ -105,13 +109,6 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
               </TableCell>
               <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
                 {new Date(session.updatedAt).toLocaleString()}
-              </TableCell>
-              <TableCell>
-                {session.chatgptReview && !session.unavailable && (
-                  <Button asChild variant="ghost" size="sm" className="motion-reduce:transition-none">
-                    <a href={chatgptReviewLink(session, session.chatgptReview)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
-                  </Button>
-                )}
               </TableCell>
             </TableRow>
           ))}
