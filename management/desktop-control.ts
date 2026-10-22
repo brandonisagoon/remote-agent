@@ -2,9 +2,9 @@ import { request } from "node:http";
 
 /** Owner-authenticated SSH reaches this user-only socket; no bearer leaves
  * the host and no unauthenticated TCP listener is created on the client. */
-export function desktopControl<T>(socketPath: string, route: string, method = "GET", body?: unknown): Promise<T> {
+export function desktopControl<T>(socketPath: string, route: string, method = "GET", body?: unknown, timeoutMs = 30_000): Promise<T> {
   return new Promise((resolve, reject) => {
-    const req = request({ socketPath, path: route, method, headers: { "Content-Type": "application/json" }, timeout: 30_000 }, (response) => {
+    const req = request({ socketPath, path: route, method, headers: { "Content-Type": "application/json" }, timeout: timeoutMs }, (response) => {
       let text = "";
       response.setEncoding("utf8");
       response.on("data", (chunk) => { text += chunk; if (text.length > 8_000_000) req.destroy(new Error("Response exceeds desktop limit")); });

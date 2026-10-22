@@ -8,7 +8,7 @@ import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
+import { repositorySessionsKey } from "@renderer/lib/queries/sessions.ts";
 import { cn } from "@renderer/lib/utils.ts";
 import type { RepositoryTab } from "@renderer/router.tsx";
 
@@ -27,7 +27,7 @@ export function RepositoryHeaderControls({ repositoryId }: { repositoryId: strin
   const params = useParams({ strict: false }) as { tab?: string };
   const tab = (params.tab as RepositoryTab | undefined) ?? "sessions";
   const queryClient = useQueryClient();
-  const sessionsKey = sessionsQueryOptions(repositoryId).queryKey;
+  const sessionsKey = repositorySessionsKey(repositoryId);
   const refreshing = useIsFetching({ queryKey: sessionsKey }) > 0;
   if (!repository) return null;
 

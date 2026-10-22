@@ -55,10 +55,21 @@ renderer reloads to discard the previous machine's cached state.
 ## Sessions and settings
 
 The desktop retains its existing layout: each repository has its Sessions,
-Settings and Skillsets tabs. The sessions table reads the selected machine's
-existing sessions. There is no separate Tasks page or header machine dropdown.
+Settings and Skillsets tabs. The sessions table reads that repository's
+sessions across all configured machines and identifies each row in a Machine
+column. There is no separate Tasks page or header machine dropdown.
 Choosing another machine opens its existing Machine page and reloads its
 configuration; selecting a repository returns to its usual tabs.
+
+Repository matching uses the product checkout's Git origin, normalizing SSH
+and HTTPS URLs and excluding embedded credentials. Different local repository
+IDs or display names still match the same origin; unrelated repositories with
+the same name do not. A checkout without a network origin stays scoped to its
+original machine. The external tooling checkout is not used as product identity.
+Each machine loads independently. An unavailable machine is named below the
+table, and any previously received rows remain visibly marked as stale. Refresh
+Sessions retries all sources. Duplicate profiles for one machine do not duplicate
+its sessions; equal session IDs on different machines remain distinct.
 
 Conversation continuation and task supervision remain available through
 Linear, Zed/ACP and the owner MCP. Those interfaces use the same durable task
@@ -92,7 +103,9 @@ remote profile; a direct web preview uses the client browser's state. Preview
 windows have no desktop preload, Node access or desktop IPC API. Forwarding
 ends when the desktop quits or changes machine; remote resources remain.
 
-The desktop reconnects on the next read and polls the same session IDs.
+The desktop reconnects on the next read and polls the same session IDs. Only
+session reads span machines; settings, edits and service actions remain scoped
+to the selected machine, with stale-client checks before and after cross-machine reads.
 The existing sessions table reports read failures; startup failures keep
 Machines navigation available. It never creates a replacement task, migrates work, grants
 browser control or resumes automation as part of reconnecting.

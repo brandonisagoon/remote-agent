@@ -5,28 +5,8 @@ import type { SkillsCheck } from "../../lib/skills/check.ts";
 import type { DetectedEditor } from "./main/editor-detect.ts";
 import type { ManagementResult } from "../../management/service.ts";
 import type { DesktopHosts, DesktopHostStatus, DesktopTask, DesktopTaskActivity } from "../../lib/desktop-host.ts";
-
-export interface SessionSummary {
-  id: string;
-  repositoryId: string;
-  machineId: string;
-  name: string | null;
-  status: string;
-  role: string | null;
-  agentCommand: string;
-  cwd: string;
-  worktreePath: string | null;
-  updatedAt: string;
-  labels: Array<{ key: string; value: string; source: string }>;
-  resourceLinks: Array<{
-    provider: string;
-    connectionId: string;
-    resourceType: string;
-    externalId: string;
-    relationship: string;
-    endedAt: string | null;
-  }>;
-}
+import type { DesktopRepositoryReference, MachineSessions, SessionSummary } from "../../lib/desktop-sessions.ts";
+export type { SessionSummary } from "../../lib/desktop-sessions.ts";
 
 /** Action id → TanStack Hotkeys chord string (e.g. "Mod+B"). */
 export type Keybindings = Record<string, string>;
@@ -74,6 +54,8 @@ export interface DesktopApi {
   };
   sessions: {
     list(repositoryId?: string): Promise<SessionSummary[]>;
+    repositoryReference(repositoryId: string): Promise<DesktopRepositoryReference>;
+    forHost(hostId: string, repository: DesktopRepositoryReference): Promise<MachineSessions>;
   };
   menu: {
     onAction(

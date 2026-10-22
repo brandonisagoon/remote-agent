@@ -3,9 +3,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { DesktopHostsSchema, type DesktopHosts, type DesktopHost, type DesktopHostStatus } from "../../../lib/desktop-host.ts";
 import { HostTransport } from "./host-transport.ts";
+import { MachineSessionsSchema, type DesktopRepositoryReference } from "../../../lib/desktop-sessions.ts";
 
 export class DesktopHostManager {
-  private transport: HostTransport | null = null;
+  private transports = new Map<string, HostTransport>();
   private state: DesktopHosts;
   private switching = false;
   constructor(private file: string) {
@@ -16,10 +17,19 @@ export class DesktopHostManager {
   assertSelected(id: string) { if (this.switching || this.state.activeId !== id) throw new Error("The selected machine changed. Reload before continuing."); }
   request<T>(id: string, method: string, args: unknown[] = []) {
     this.assertSelected(id);
-    const host = this.selected();
+    return this.transport(id).request<T>(method, args);
+  }
+  private transport(id: string) {
+    const host = this.state.hosts.find((entry) => entry.id === id);
+    if (!host) throw new Error("Unknown machine");
     if (host.kind !== "ssh") throw new Error("This machine does not use SSH");
-    this.transport ??= new HostTransport(host);
-    return this.transport.request<T>(method, args);
+    let transport = this.transports.get(id);
+    if (!transport) { transport = new HostTransport(host); this.transports.set(id, transport); }
+    return transport;
+  }
+  /** Cross-machine access is read-only and restricted to the session table. */
+  async repositorySessions(id: string, reference: DesktopRepositoryReference) {
+    return MachineSessionsSchema.parse(await this.transport(id).request("sessions:repository", [reference]));
   }
   async status(id: string): Promise<DesktopHostStatus> {
     try { return await this.request<DesktopHostStatus>(id, "host:status"); }
@@ -33,9 +43,9 @@ export class DesktopHostManager {
       const next = { ...this.state, activeId: id };
       const temporary = path.join(path.dirname(this.file), `.hosts-${randomUUID()}.tmp`);
       writeFileSync(temporary, JSON.stringify(next, null, 2), { mode: 0o600 }); renameSync(temporary, this.file);
-      this.transport?.close(); this.transport = null; this.state = next;
+      this.close(); this.state = next;
       return this.list();
     } finally { this.switching = false; }
   }
-  close() { this.transport?.close(); this.transport = null; }
+  close() { for (const transport of this.transports.values()) transport.close(); this.transports.clear(); }
 }

@@ -4,13 +4,26 @@ import { DesktopHostManager } from "./hosts.ts";
 import { desktopOperation } from "../../../management/desktop-operations.ts";
 import { buildEditorDeepLink } from "../../../lib/machines/editor-link.ts";
 import { forwardPreview, closePreviewForwards } from "./preview-forward.ts";
+import { DesktopRepositoryReferenceSchema } from "../../../lib/desktop-sessions.ts";
+import { desktopRepositoryReference, desktopRepositorySessions } from "../../../management/desktop-sessions.ts";
 
 type Handler = (event: IpcMainInvokeEvent, ...args: any[]) => unknown;
-export function installHostIpc(hosts: DesktopHostManager, handlers: Map<string, Handler>, localFile: () => string) {
+export function installHostIpc(hosts: DesktopHostManager, handlers: Map<string, Handler>, localFile: () => string, defaultLocalFile: string) {
   ipcMain.handle("hosts:list", () => hosts.list());
   ipcMain.handle("hosts:select", (_event, value) => {
     const { expectedId, id } = z.object({ expectedId: z.string(), id: z.string() }).strict().parse(value);
     const next = hosts.select(expectedId, id); closePreviewForwards(); return next;
+  });
+  ipcMain.handle("sessions:for-host", async (_event, value) => {
+    const { expectedId, hostId, repository } = z.object({ expectedId: z.string(), hostId: z.string(), repository: DesktopRepositoryReferenceSchema }).strict().parse(value);
+    hosts.assertSelected(expectedId);
+    const host = hosts.list().hosts.find((entry) => entry.id === hostId);
+    if (!host) throw new Error("Unknown machine");
+    const sessions = host.kind === "ssh"
+      ? await hosts.repositorySessions(hostId, repository)
+      : await desktopRepositorySessions(host.configPath ?? defaultLocalFile, repository);
+    hosts.assertSelected(expectedId);
+    return sessions;
   });
   ipcMain.handle("host:call", async (event, value) => {
     const { hostId, channel, args } = z.object({ hostId: z.string(), channel: z.string(), args: z.array(z.unknown()) }).strict().parse(value);
@@ -28,6 +41,7 @@ export function installHostIpc(hosts: DesktopHostManager, handlers: Map<string, 
       }
       if (!channel.startsWith("keybindings:") && channel !== "editors:detect") return hosts.request(hostId, channel, args);
     }
+    if (channel === "sessions:repository-reference") return desktopRepositoryReference(localFile(), z.string().min(1).parse(args[0]));
     process.env.REMOTE_AGENT_CONFIG = localFile();
     if (["host:status", "tasks:list", "tasks:activity", "tasks:control", "tasks:answer", "tasks:instruct", "tasks:resolve", "tasks:preview", "fs:list", "repository:validate"].includes(channel)) {
       try { return await desktopOperation(localFile(), { method: channel, args }); }

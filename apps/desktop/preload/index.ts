@@ -58,6 +58,8 @@ const api: DesktopApi = {
   },
   sessions: {
     list: (repositoryId) => invoke("sessions:list", repositoryId),
+    repositoryReference: (repositoryId) => invoke("sessions:repository-reference", repositoryId),
+    forHost: async (hostId, repository) => ipcRenderer.invoke("sessions:for-host", { expectedId: (await initialHosts).activeId, hostId, repository }),
   },
   menu: {
     onAction: (callback) => {

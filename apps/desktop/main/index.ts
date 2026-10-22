@@ -293,7 +293,7 @@ function registerIpc(file: string): void {
     if (!run) throw new Error(`unknown management action: ${action}`);
     return run();
   });
-  installHostIpc(hosts!, handlers, desktopConfigPath);
+  installHostIpc(hosts!, handlers, desktopConfigPath, file);
 }
 
 async function createWindow(): Promise<void> {

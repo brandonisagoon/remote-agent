@@ -12,6 +12,8 @@ import { checkForUpdates, restartService, serviceStatus } from "./service.ts";
 import { run, runOrThrow } from "./run.ts";
 import { listProviderModels } from "./provider-models.ts";
 import { tunnelInfo } from "./tunnel-info.ts";
+import { DesktopRepositoryReferenceSchema } from "../lib/desktop-sessions.ts";
+import { desktopRepositoryReference, desktopRepositorySessions } from "./desktop-sessions.ts";
 
 const text = z.string().min(1);
 const id = z.string().min(1).max(200);
@@ -21,6 +23,8 @@ export const DesktopOperationSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("config:save"), args: z.tuple([save]) }).strict(),
   z.object({ method: z.literal("repo-config:save"), args: z.tuple([save.extend({ id })]) }).strict(),
   z.object({ method: z.literal("sessions:list"), args: z.tuple([z.string().nullish()]) }).strict(),
+  z.object({ method: z.literal("sessions:repository-reference"), args: z.tuple([id]) }).strict(),
+  z.object({ method: z.literal("sessions:repository"), args: z.tuple([DesktopRepositoryReferenceSchema]) }).strict(),
   z.object({ method: z.literal("tasks:activity"), args: z.tuple([id]) }).strict(),
   z.object({ method: z.literal("tasks:control"), args: z.tuple([id, z.enum(["pause", "resume", "close"])]) }).strict(),
   z.object({ method: z.literal("tasks:answer"), args: z.tuple([id, id, text.max(100_000)]) }).strict(),
@@ -53,6 +57,8 @@ function safeDocument(file: string) {
 export async function desktopOperation(file: string, raw: unknown, serviceLabel?: string): Promise<unknown> {
   const operation = DesktopOperationSchema.parse(raw);
   const args = operation.args as unknown[];
+  if (operation.method === "sessions:repository-reference") return desktopRepositoryReference(file, operation.args[0]);
+  if (operation.method === "sessions:repository") return desktopRepositorySessions(file, operation.args[0]);
   if (operation.method === "config:path") return file;
   if (operation.method === "config:get") return safeDocument(file);
   if (operation.method === "config:save") {
