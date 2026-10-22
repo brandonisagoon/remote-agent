@@ -102,6 +102,17 @@ afterEach(() => {
 });
 
 describe("readConfig", () => {
+  test("an explicit file resolves its own paths without changing the default connection", () => {
+    const defaultFile = writeConfig();
+    const second = path.join(directory, "second");
+    mkdirSync(second);
+    const secondFile = path.join(second, "remote-agent.config.json");
+    writeFileSync(secondFile, JSON.stringify(serviceFile()));
+    expect(readConfig(secondFile).repository.root).toBe(path.join(second, "repository"));
+    expect(process.env.REMOTE_AGENT_CONFIG).toBe(defaultFile);
+    expect(readConfig().repository.root).toBe(path.join(directory, "repository"));
+  });
+
   test("loads all settings from one JSON file and derives neutral paths", () => {
     writeConfig();
     const config = readConfig();

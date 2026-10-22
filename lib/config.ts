@@ -517,8 +517,8 @@ function resolveDatabaseUrl(value: string | undefined, stateRoot: string): strin
   return `file:${absolute(file, stateRoot)}`;
 }
 
-export function readConfig(): ServerConfig {
-  const configFile = configFilePath();
+export function readConfig(filePath: string = configFilePath()): ServerConfig {
+  const configFile = absolute(filePath);
   const file = readServiceFile(configFile);
   const machine = file.machine.id;
   const hosts = configureMachines([{

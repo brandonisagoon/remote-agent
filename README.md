@@ -311,6 +311,21 @@ reconnection behavior.
 `bun run acp`. The machine page shows the exact command. The bridge is a
 stateless stdio connection to the server's socket.
 
+If a machine retains separate Remote Agent deployments, one ACP entry can expose
+both without merging their databases. Pass each config explicitly:
+
+```sh
+bun apps/server/acp/main.ts --config "/path/to/first/remote-agent.config.json" --config "/path/to/second/remote-agent.config.json"
+```
+
+Name the entry **Remote Agent**. In an SSH project, register it in that machine's
+Zed settings and remove any duplicate deployment-specific entry from the client
+settings. Import existing threads under Remote Agent; their session IDs and
+history stay on their original servers. New sessions use the most specific
+configured checkout or worktree root. Unknown or ambiguous paths/IDs fail
+explicitly. Both servers must be running; after a restart, reload the agent.
+The bridge does not migrate worktrees or change provider sessions.
+
 ## Configuration
 
 Two files per repository:
