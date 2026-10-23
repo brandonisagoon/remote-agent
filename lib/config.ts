@@ -221,7 +221,7 @@ const LinearConnectionSchema = z.object({
   /** The machine that serves this connection's webhook and runs its sessions. */
   machineId: MachineSchema.optional(),
   /** Repositories this connection's sessions may work in; "*" subscribes
-      every repository, present and future. */
+      every repository, present and future. An empty map disables intake. */
   repositories: z.union([
     z.literal("*"),
     z.record(
@@ -322,9 +322,6 @@ export const ServiceFileSchema = z.object({
     }
     if (connection.repositories !== "*") {
       const targets = Object.keys(connection.repositories);
-      if (targets.length === 0) {
-        context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories"], message: "a connection requires at least one repository (or \"*\")" });
-      }
       for (const repositoryId of targets) {
         if (!repositoryIds.has(repositoryId)) {
           context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });

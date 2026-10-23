@@ -19,15 +19,15 @@ export async function launchTask(input: LaunchInput) {
     if (existing.fingerprint !== fingerprint) throw new Error("Launch request key already belongs to a different request");
     return existing.promise;
   }
-  const promise = performLaunch(input);
+  const promise = performLaunch(input, fingerprint);
   pending.set(key, { fingerprint, promise });
   try { return await promise; } finally { pending.delete(key); }
 }
 
-async function performLaunch(input: LaunchInput) {
+async function performLaunch(input: LaunchInput, requestFingerprint: string) {
   const repository = getRepositoryConfig(input.config, input.repositoryId);
   if (!repository.tooling) throw new Error("Select a repository with external tooling");
-  const task = await beginTask(input.prisma, { requestKey: input.requestKey, repository, machineId: input.config.machine, branchName: input.branchName });
+  const task = await beginTask(input.prisma, { requestKey: input.requestKey, repository, machineId: input.config.machine, branchName: input.branchName, requestFingerprint });
   if (task.primarySessionId && await input.prisma.runtimeInstruction.findUnique({ where: { id: `launch:${task.requestKey}` } })) return task;
   try {
     const worktreePath = await provisionTaskWorktree(input.prisma, task.id, repository, task.id);

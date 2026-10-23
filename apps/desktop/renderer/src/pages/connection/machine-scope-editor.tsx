@@ -94,7 +94,6 @@ export function MachineScopeEditor({
                 <label key={repositoryId} className="flex items-center gap-2 text-sm">
                   <Checkbox
                     checked={checked}
-                    disabled={checked && routingTargets.length === 1}
                     onCheckedChange={(next) => toggleRepository(repositoryId, next === true)}
                   />
                   <span className="truncate">{repository.name ?? repositoryId}</span>
@@ -103,6 +102,9 @@ export function MachineScopeEditor({
               );
             })}
           </div>
+        )}
+        {routingMode === "select" && routingTargets.length === 0 && (
+          <p className="text-muted-foreground text-sm">No repositories selected. Incoming requests are disabled.</p>
         )}
       </div>
     </>

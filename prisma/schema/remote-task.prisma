@@ -2,6 +2,7 @@
 model RemoteTask {
   id                 String   @id @default(cuid())
   requestKey         String   @unique
+  requestFingerprint String?
   repositoryId       String
   machineId          String
   connectionId       String?

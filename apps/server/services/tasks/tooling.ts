@@ -30,6 +30,7 @@ export async function prepareTooling(repository: RepositoryConfig, installRoot: 
       }
       const actual = await run(["git", "rev-parse", "HEAD"], destination);
       if (actual !== source.revision) throw new Error("Tooling checkout revision does not match its receipt");
+      if (await run(["git", "status", "--porcelain", "--untracked-files=normal"], destination)) throw new Error("Pinned tooling checkout has local changes; preserve and reconcile them before reuse");
       if (!existsSync(`${destination}.ready`)) {
         await run([process.execPath, "install", "--frozen-lockfile"], destination);
         writeFileSync(`${destination}.ready`, `${source.revision}\n`, { mode: 0o600 });

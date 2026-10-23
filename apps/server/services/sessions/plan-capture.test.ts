@@ -180,6 +180,26 @@ describe("plan capture interceptor", () => {
     ]);
   });
 
+  test("plan reads and writes use the linked connection instead of the server default", async () => {
+    database = await createTestDatabase();
+    const session = await planSession(database.prisma, { workflowId: "plan-capture" });
+    const config = planCaptureConfig();
+    config.connections = { ...config.connections, "other-linear": { ...config.connections["linear-test"]!, id: "other-linear", apiKey: "other-workspace-key" } };
+    await database.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: session.id, relationship: "handles" }, data: { connectionId: "other-linear" } });
+    const observed: string[] = [];
+    const interceptor = createPlanCaptureInterceptor({ prisma: database.prisma, config }, {
+      getIssue: async (scoped) => {
+        observed.push(scoped.activeConnectionId);
+        expect(scoped.linearApiKey).toBe("other-workspace-key");
+        return { id: "other-issue", description: "Keep original.", team: { states: { nodes: [{ id: "planned", name: "Planned" }] } } };
+      },
+      updateIssue: async (scoped) => { observed.push(scoped.activeConnectionId); expect(scoped.linearApiKey).toBe("other-workspace-key"); },
+    });
+    await interceptor({ sessionId: session.id, raw: exitPlanRequest("Scoped plan.") }, { signal: new AbortController().signal });
+    expect(observed).toEqual(["other-linear", "other-linear", "other-linear"]);
+    expect(config.activeConnectionId).toBe("linear-test");
+  });
+
   test("does nothing for sessions without a plan-capture workflow", async () => {
     database = await createTestDatabase();
     const session = await planSession(database.prisma);

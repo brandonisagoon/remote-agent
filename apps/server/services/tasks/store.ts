@@ -4,6 +4,7 @@ import type { RepositoryConfig } from "../../../../lib/config.ts";
 export async function beginTask(prisma: PrismaClient, input: {
   requestKey: string; repository: RepositoryConfig; machineId: string;
   connectionId?: string; issueIdentifier?: string; branchName: string;
+  requestFingerprint?: string;
 }) {
   const { repository, ...identity } = input;
   if (!repository.tooling) throw new Error("Managed tasks require a pinned tooling source");
@@ -14,6 +15,9 @@ export async function beginTask(prisma: PrismaClient, input: {
   });
   if (task.repositoryId !== repository.id || task.machineId !== input.machineId || task.branchName !== input.branchName || task.connectionId !== (input.connectionId ?? null) || task.issueIdentifier !== (input.issueIdentifier ?? null)) {
     throw new Error("Task request key already belongs to a different launch");
+  }
+  if (input.requestFingerprint && task.requestFingerprint !== input.requestFingerprint) {
+    throw new Error("Task request key has different or unverifiable launch content; inspect the existing task before continuing it");
   }
   return task;
 }

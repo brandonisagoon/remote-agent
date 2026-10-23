@@ -1,7 +1,7 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import type { ServerConfig } from "../../../../lib/config.ts";
+import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import {
   getSourceIssueForPlanCapture,
   updateSourceIssue,
@@ -130,13 +130,14 @@ export function createPlanCaptureInterceptor(
         );
         return undefined;
       }
-      const issue = await getIssue(context.config, { id: link.externalId });
+      const config = scopeConfig(context.config, { repositoryId: session.repositoryId, connectionId: link.connectionId });
+      const issue = await getIssue(config, { id: link.externalId });
       if (!issue) {
         console.error(`plan capture: source issue ${link.externalId} not found`);
         return undefined;
       }
       await updateIssue(
-        context.config,
+        config,
         { id: issue.id },
         { description: splicePlanSection(issue.description, plan) },
       );
@@ -147,7 +148,7 @@ export function createPlanCaptureInterceptor(
           (entry) => entry.name === workflow.plan!.thenState,
         );
         if (state) {
-          await updateIssue(context.config, { id: issue.id }, { stateId: state.id });
+          await updateIssue(config, { id: issue.id }, { stateId: state.id });
         } else {
           console.error(
             `plan capture: state '${workflow.plan.thenState}' not found on the issue's team`,

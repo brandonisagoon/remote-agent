@@ -11,6 +11,7 @@ import { provisionTaskWorktree } from "./provision.ts";
 import { readToolingSource } from "../../../../lib/tooling-source.ts";
 import { assertTaskAutomationAllowed, changeTaskControl, reconcileTaskControls } from "./control.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
+import { prepareTooling } from "./tooling.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -57,6 +58,36 @@ test("tooling policy is read from a commit, not dirty source changes", () => {
   const revision = git(repo.root, "rev-parse", "HEAD");
   writeFileSync(path.join(repo.root, ".remote-agent.config.json"), JSON.stringify({ preparation: "command" }));
   expect(readToolingSource(repo.root, revision)).toEqual({ revision, settings: { preparation: "agent" } });
+});
+
+test("launch content remains bound to its request key after client disposal", async () => {
+  const repo = repository();
+  const input = { requestKey: "bound-launch", repository: repo, machineId: "air", branchName: "codex/bound", requestFingerprint: "original-prompt-and-provider" };
+  const first = await beginTask(db.prisma, input);
+  await db.prisma.$disconnect();
+  expect((await beginTask(db.prisma, input)).id).toBe(first.id);
+  await expect(beginTask(db.prisma, { ...input, requestFingerprint: "different-prompt-or-provider" })).rejects.toThrow("launch content");
+  expect(await db.prisma.remoteTask.count()).toBe(1);
+  await db.prisma.remoteTask.update({ where: { id: first.id }, data: { requestFingerprint: null } });
+  await expect(beginTask(db.prisma, input)).rejects.toThrow("unverifiable");
+});
+
+test("a pinned tooling checkout with modified or untracked policy fails closed without discarding work", async () => {
+  const repo = repository();
+  const revision = git(repo.root, "rev-parse", "HEAD");
+  repo.tooling = { root: repo.root, revision };
+  const installRoot = path.join(directory, "runtime");
+  const pinned = path.join(installRoot, "tooling", repo.id, revision);
+  mkdirSync(path.dirname(pinned), { recursive: true });
+  git(repo.root, "worktree", "add", "--detach", pinned, revision);
+  writeFileSync(`${pinned}.ready`, `${revision}\n`);
+  expect(await prepareTooling(repo, installRoot)).toBe(pinned);
+  writeFileSync(path.join(pinned, "README.md"), "uncommitted policy");
+  await expect(prepareTooling(repo, installRoot)).rejects.toThrow("local changes");
+  expect(readFileSync(path.join(pinned, "README.md"), "utf8")).toBe("uncommitted policy");
+  writeFileSync(path.join(pinned, "README.md"), "product\n");
+  writeFileSync(path.join(pinned, "AGENTS.md"), "untracked policy");
+  await expect(prepareTooling(repo, installRoot)).rejects.toThrow("local changes");
 });
 
 test("unavailable tooling yields a repair prompt in the existing worktree and retains the failure", async () => {

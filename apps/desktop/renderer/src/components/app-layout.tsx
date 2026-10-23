@@ -20,6 +20,7 @@ import { SidebarInset, SidebarProvider } from "@renderer/components/ui/sidebar.t
 import { useConfig } from "@renderer/lib/config-context.tsx";
 import { useHost, useHostDirectory } from "@renderer/lib/host-context.tsx";
 import { randomHex } from "@renderer/lib/random.ts";
+import { removeRepository as removeRepositoryFromConfig } from "../../../../../lib/config-repositories.ts";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "remote-agent:sidebar-width";
 
@@ -84,14 +85,7 @@ export function AppLayout() {
   const params = useParams({ strict: false });
   const removeRepository = (hostId: string, id: string) => {
     applyRemoval(hostId, (value) => {
-      delete value.repositories[id];
-      // Heal connection allowlists that referenced it; an emptied allowlist
-      // falls back to every repository.
-      for (const connection of Object.values(value.connections)) {
-        if (connection.repositories === "*") continue;
-        delete connection.repositories[id];
-        if (Object.keys(connection.repositories).length === 0) connection.repositories = "*";
-      }
+      removeRepositoryFromConfig(value, id);
     }, params.repositoryId === id);
   };
 
