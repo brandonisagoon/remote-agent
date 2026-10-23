@@ -1,10 +1,10 @@
 import { queryOptions } from "@tanstack/react-query";
 
-/** The management checklist (main process). Short stale time + the default
-    focus refetch keep the tables honest after the user acts in Terminal;
-    action buttons invalidate explicitly. */
-export const checksQueryOptions = queryOptions({
-  queryKey: ["management-checks"],
-  queryFn: () => window.remoteAgent.management.checks(),
-  staleTime: 10_000,
-});
+/** Each machine owns its management checklist and refresh state. */
+export function checksQueryOptions(hostId: string) {
+  return queryOptions({
+    queryKey: ["management-checks", hostId],
+    queryFn: () => window.remoteAgent.forHost(hostId).management.checks(),
+    staleTime: 10_000,
+  });
+}

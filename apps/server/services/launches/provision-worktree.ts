@@ -55,7 +55,7 @@ async function createWorktree(
       "-b",
       input.branchName,
       worktreePath,
-      input.baseBranch ?? "main",
+      input.baseBranch ?? input.repository.baseBranch ?? "main",
     ],
     input.repository.root,
   );
@@ -77,7 +77,11 @@ export async function provisionWorktree(
   const worktreePath = input.directoryName
     ? path.join(input.repository.worktreeRoot, input.directoryName)
     : worktreePathForBranch(input.repository.worktreeRoot, input.branchName);
+  const relative = path.relative(input.repository.worktreeRoot, worktreePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Worktree must be a child of the configured worktree root");
+  }
   await createWorktree(input, worktreePath);
-  await runRepositoryBootstrap(input, worktreePath);
+  if (input.repository.preparation !== "agent") await runRepositoryBootstrap(input, worktreePath);
   return worktreePath;
 }

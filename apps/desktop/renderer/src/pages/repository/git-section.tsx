@@ -1,3 +1,5 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
+import { chooseHostPath } from "@renderer/components/remote-path-picker.tsx";
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { Field } from "@renderer/components/field.tsx";
@@ -57,6 +59,7 @@ function PathField({ label, title, value, onChange }: {
   value: string;
   onChange(next: string): void;
 }) {
+  const { host } = useHost();
   return (
     <div className="grid gap-2">
       <Label>{label}</Label>
@@ -68,7 +71,7 @@ function PathField({ label, title, value, onChange }: {
               <InputGroupButton
                 size="icon-xs"
                 onClick={async () => {
-                  const picked = await window.remoteAgent.fs.pickFolder(title, value);
+                  const picked = await chooseHostPath(host, title, value);
                   if (picked) onChange(picked);
                 }}
               >
@@ -305,6 +308,11 @@ export function GitSection({ id, value, mutate, repo }: {
         <Field label="Display Name" value={repository.name ?? id} onChange={(next) => edit((entry) => { entry.name = next; })} />
         <PathField label="Checkout Root" title="Select Checkout Root" value={repository.root} onChange={(next) => edit((entry) => { entry.root = next; })} />
         <PathField label="Worktree Root" title="Select Worktree Root" value={repository.worktreeRoot} onChange={(next) => edit((entry) => { entry.worktreeRoot = next; })} />
+        <PathField label="External Tooling Root (optional)" title="Select Tooling Root" value={repository.tooling?.root ?? ""} onChange={(next) => edit((entry) => {
+          entry.tooling = next ? { root: next, ref: entry.tooling?.ref ?? "HEAD" } : undefined;
+        })} />
+        <Field label="Tooling Git Ref" value={repository.tooling?.ref ?? "HEAD"} onChange={(next) => edit((entry) => { if (entry.tooling) entry.tooling.ref = next; })} />
+        <Field label="Base Branch" value={repo.config?.baseBranch ?? "main"} onChange={(next) => repo.mutate((config) => { config.baseBranch = next; })} />
       </SettingsCard>
       <WorktreeNamingTable id={id} value={value} mutate={mutate} />
       {repo.config && <BranchNamingTable repo={repo} />}
@@ -320,6 +328,7 @@ function commandForScript(relativePath: string): string[] {
 }
 
 export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfigDraft }) {
+  const { host } = useHost();
   const command = repo.config?.bootstrapCommand ?? [];
   return (
     <SettingsSection
@@ -329,9 +338,17 @@ export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfi
     >
       <SettingsCard>
         <div className="grid gap-2">
+          <Label htmlFor="preparation-mode">Preparation</Label>
+          <select id="preparation-mode" className="bg-background rounded-md border p-2 text-sm" value={repo.config?.preparation ?? "command"} onChange={(event) => repo.mutate((config) => { config.preparation = event.target.value as "command" | "agent"; })}>
+            <option value="command">Run bootstrap command before starting</option>
+            <option value="agent">Start the agent to prepare its worktree</option>
+          </select>
+        </div>
+        <div className="grid gap-2">
           <Label>Bootstrap Command</Label>
           <InputGroup>
             <InputGroupInput
+              disabled={repo.config?.preparation === "agent"}
               value={command.join(" ")}
               onChange={(event) => repo.mutate((config) => {
                 config.bootstrapCommand = event.target.value.split(/\s+/).filter(Boolean);
@@ -343,7 +360,7 @@ export function BootstrapSection({ root, repo }: { root: string; repo: RepoConfi
                   <InputGroupButton
                     size="icon-xs"
                     onClick={async () => {
-                      const picked = await window.remoteAgent.fs.pickFile("Select Bootstrap Script", root);
+                      const picked = await chooseHostPath(host, "Select Bootstrap Script", root, "file");
                       if (!picked) return;
                       const relative = picked.startsWith(`${root}/`)
                         ? picked.slice(root.length + 1)

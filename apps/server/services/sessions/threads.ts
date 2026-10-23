@@ -101,6 +101,7 @@ export async function resolveQuestionThread(
   key: ThreadKey & { runtimeSessionId: string },
 ): Promise<void> {
   await registerThread(prisma, { ...key, relationship: "thread" });
+  await prisma.runtimeQuestion.updateMany({ where: { id: key.threadRootCommentId, runtimeSessionId: key.runtimeSessionId }, data: { state: "answered", error: null } });
 }
 
 /** Ends a thread registration without touching the session. */

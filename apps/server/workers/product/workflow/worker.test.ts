@@ -11,6 +11,7 @@ const ISSUE: SourceIssueWithAgentIssues = {
   id: "issue-uuid",
   identifier: "CUBE-42",
   title: "Fix the flaky test",
+  description: "Reproduce the intermittent failure and preserve the public API.",
   branchName: "feature/fix-cube-42",
   state: { name: "Planning" },
   labels: { nodes: [] },
@@ -97,6 +98,7 @@ describe("workflow worker", () => {
     const result = await worker.execute(issueEvent("plan") as never, context());
 
     expect(result.status).toBe("delivered");
+    expect(String(record.launched[0]?.prompt)).toContain(ISSUE.description!);
     expect(record.provisioned).toEqual(["feature/fix-cube-42"]);
     expect(record.directories).toEqual(["feature-fix-cube-42"]);
     expect(record.launched).toHaveLength(1);

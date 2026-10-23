@@ -1,4 +1,7 @@
 import { randomUUID } from "node:crypto";
+import { assertTaskAutomationAllowed } from "../../services/tasks/control.ts";
+import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
+import { TurnCapacity } from "../../services/sessions/turn-capacity.ts";
 
 import type {
   AcpRuntimeEvent,
@@ -138,7 +141,7 @@ function configOptionsFromStatus(value: unknown): SessionConfigOption[] {
 
 export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly store;
-  private readonly runtime;
+  private readonly runtimes = new Map<string, ReturnType<typeof createAcpRuntime>>();
   private readonly handles = new Map<string, AcpRuntimeHandle>();
   private readonly listeners = new Map<
     string,
@@ -149,6 +152,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   >();
   private readonly turnChains = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, AcpRuntimeTurn>();
+  private readonly waitingTurns = new Map<string, Set<AbortController>>();
+  private readonly capacity: TurnCapacity;
 
   constructor(
     private readonly prisma: PrismaClient,
@@ -160,25 +165,35 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     } = {},
   ) {
     this.store = createRuntimeStore({ stateDir: config.acpxStateDir });
-    this.runtime = createAcpRuntime({
-      cwd: config.installRoot,
+    this.capacity = new TurnCapacity(config.maxConcurrentTurns);
+  }
+
+  /** Providers sanitize the environment of MCP children. Carry each
+   * session's identity explicitly in its own MCP descriptor. */
+  private runtimeFor(sessionId: string): ReturnType<typeof createAcpRuntime> {
+    const existing = this.runtimes.get(sessionId);
+    if (existing) return existing;
+    const runtime = createAcpRuntime({
+      cwd: this.config.installRoot,
       sessionStore: this.store,
       agentRegistry: createAgentRegistry({
-        overrides: config.acpxAgentCommands,
+        overrides: this.config.acpxAgentCommands,
       }),
       // Sessions run unattended; agents get their tool requests approved.
       permissionMode: "approve-all",
       nonInteractivePermissions: "deny",
       elicitationModes: ["form", "url"],
-      ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
+      mcpServers: sessionMcpServers(sessionId, this.config, this.options.mcpServers ?? []),
       // Consulted before approve-all answers; undefined falls through to it.
-      ...(options.onPermissionRequest
+      ...(this.options.onPermissionRequest
         ? {
             onPermissionRequest: (request, context) =>
               this.interceptPermissionRequest(request, context),
           }
         : {}),
     });
+    this.runtimes.set(sessionId, runtime);
+    return runtime;
   }
 
   private async interceptPermissionRequest(
@@ -253,7 +268,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
-      const handle = await this.runtime.ensureSession({
+      const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
+      const handle = await this.runtimeFor(row.id).ensureSession({
         sessionKey: row.id,
         agent: input.agent,
         mode: "persistent",
@@ -261,11 +277,13 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         sessionOptions: {
           ...(input.model ? { model: input.model } : {}),
           ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
-          env: sessionEnvironment(row.id, this.config, input.agentEnv),
+          env: sessionEnvironment(row.id, this.config, { ...input.agentEnv,
+            ...(task ? { REMOTE_AGENT_TASK_ID: task.id, ...(task.pinnedToolingRoot ? { REMOTE_AGENT_TOOLING_ROOT: task.pinnedToolingRoot } : {}) } : {}),
+          }),
         },
       });
       this.handles.set(row.id, handle);
-      const runtimeStatus = await this.runtime.getStatus({ handle });
+      const runtimeStatus = await this.runtimeFor(row.id).getStatus({ handle });
       return await attachRuntimeSession(this.prisma, {
         id: row.id,
         acpxRecordId: handle.acpxRecordId ?? row.acpxRecordId ?? row.id,
@@ -320,6 +338,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    beforeStart?: () => Promise<boolean>;
     onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn {
     const requestId = input.requestId ?? randomUUID();
@@ -327,6 +346,12 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     const completion = deferred<AgentRuntimeTurnResult>();
     let cancelled = false;
     let current: AcpRuntimeTurn | null = null;
+    let releaseCapacity: (() => void) | undefined;
+    const waiting = new AbortController();
+    const waitingForSession = this.waitingTurns.get(input.sessionId) ?? new Set<AbortController>();
+    waitingForSession.add(waiting);
+    this.waitingTurns.set(input.sessionId, waitingForSession);
+    const signal = input.signal ? AbortSignal.any([input.signal, waiting.signal]) : waiting.signal;
 
     const previous = this.turnChains.get(input.sessionId) ?? Promise.resolve();
     const run = previous
@@ -338,7 +363,18 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           return;
         }
         const session = await this.requireSession(input.sessionId);
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        if (this.capacity.full) {
+          queue.push({ kind: "update", id: `${requestId}:queued`, sessionId: session.id, requestId, createdAt: Date.now(), update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Queued — waiting for an available agent slot on this machine.\n" } } });
+        }
+        releaseCapacity = await this.capacity.acquire(signal);
+        if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
+        await this.requireSession(input.sessionId);
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
         const handle = await this.handleFor(session);
+        if (signal.aborted) throw new Error("Waiting turn cancelled");
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
@@ -351,12 +387,13 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           createdAt: Date.now(),
           phase: "started",
         });
-        current = this.runtime.startTurn({
+        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        current = this.runtimeFor(session.id).startTurn({
           handle,
           text: input.text,
           mode: input.mode ?? "prompt",
           requestId,
-          signal: input.signal,
+          signal,
           // Planning questions: forwarded to the attached ACP client when a
           // handler is provided; otherwise acpx resolves non-interactively.
           // The SDK response allows open-ended actions; acpx accepts only
@@ -380,6 +417,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
             : {}),
         });
         this.activeTurns.set(session.id, current);
+        waitingForSession.delete(waiting);
         let index = 0;
         try {
           for await (const event of current.events) {
@@ -454,7 +492,20 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         }
       });
 
-    const chained = run.finally(() => {
+    // Setup and control checks can fail before a provider turn exists. They
+    // must settle the public result too, otherwise ACP clients hang forever.
+    const chained = run.catch(async (error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
+      queue.close();
+      if (!signal.aborted) await this.prisma.runtimeSession.updateMany({
+        where: { id: input.sessionId, status: { not: "closed" } },
+        data: { status: "error", recoveryDetail: message },
+      }).catch(() => undefined);
+    }).finally(() => {
+      releaseCapacity?.();
+      waitingForSession.delete(waiting);
+      if (!waitingForSession.size) this.waitingTurns.delete(input.sessionId);
       if (this.turnChains.get(input.sessionId) === chained) {
         this.turnChains.delete(input.sessionId);
       }
@@ -467,6 +518,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       result: completion.promise,
       cancel: async (reason?: string) => {
         cancelled = true;
+        waiting.abort();
         if (current) await current.cancel({ reason });
       },
     };
@@ -477,20 +529,17 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     text: string;
     requestId?: string;
   }): Promise<string> {
-    const turn = this.startTurn(input);
-    void (async () => {
-      for await (const _event of turn.events) {
-        // Draining is required even when the caller only wants queue semantics.
-      }
-      await turn.result;
-    })();
-    return turn.requestId;
+    const session = await this.requireSession(input.sessionId);
+    if (session.status === "closed") throw new Error("Session is closed");
+    const receipt = await queueInstruction(this.prisma, input);
+    void deliverInstructions(this.prisma, this).catch(() => undefined);
+    return receipt.id;
   }
 
   async setMode(sessionId: string, mode: string): Promise<void> {
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.setMode({ handle, mode });
+    await this.runtimeFor(sessionId).setMode({ handle, mode });
     await this.refreshSessionState(session.id, handle);
   }
 
@@ -501,7 +550,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   ): Promise<SessionConfigOption[]> {
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    const response = await this.runtime.setConfigOption({ handle, key, value });
+    const response = await this.runtimeFor(sessionId).setConfigOption({ handle, key, value });
     await updateRuntimeSessionState(this.prisma, session.id, {
       status: "idle",
       configOptions: response.configOptions,
@@ -524,7 +573,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       .join("\n\n")
       .slice(-24_000);
     const oldHandle = await this.handleFor(session);
-    await this.runtime.close({
+    const priorEnvironment = (await this.loadRecord(session))?.acpx?.session_options?.env;
+    await this.runtimeFor(sessionId).close({
       handle: oldHandle,
       reason: `Switching Remote Agent session to ${agent}`,
     });
@@ -534,21 +584,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       agent,
     });
     try {
-      const handle = await this.runtime.ensureSession({
+      const handle = await this.runtimeFor(sessionId).ensureSession({
         sessionKey: switched.id,
         agent,
         mode: "persistent",
         cwd: switched.cwd,
-        sessionOptions: transcript
-          ? {
+        sessionOptions: { env: sessionEnvironment(sessionId, this.config, priorEnvironment),
+          ...(transcript ? {
               systemPrompt:
                 "Continue the existing Remote Agent conversation summarized below. Preserve its context and wait for the user's next request.\n\n" +
                 transcript,
-            }
-          : undefined,
+            } : {}),
+        },
       });
       this.handles.set(switched.id, handle);
-      const status = await this.runtime.getStatus({ handle });
+      const status = await this.runtimeFor(sessionId).getStatus({ handle });
       return await attachRuntimeSession(this.prisma, {
         id: switched.id,
         acpxRecordId: handle.acpxRecordId ?? switched.id,
@@ -566,6 +616,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async cancel(sessionId: string, reason?: string): Promise<void> {
+    for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const active = this.activeTurns.get(sessionId);
     if (active) {
       await active.cancel({ reason });
@@ -573,19 +624,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     }
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.cancel({ handle, reason });
+    await this.runtimeFor(sessionId).cancel({ handle, reason });
   }
 
   async close(sessionId: string, reason: string): Promise<void> {
+    for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const session = await this.requireSession(sessionId);
     const handle = await this.handleFor(session);
-    await this.runtime.close({ handle, reason });
+    await this.runtimeFor(sessionId).close({ handle, reason });
     await updateRuntimeSessionState(this.prisma, session.id, {
       status: "closed",
       closedAt: new Date(),
       recoveryDetail: null,
     });
     this.handles.delete(session.id);
+    this.runtimes.delete(session.id);
   }
 
   async output(sessionId: string): Promise<string | null> {
@@ -618,6 +671,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async shutdown(): Promise<void> {
+    for (const controllers of this.waitingTurns.values()) for (const waiting of controllers) waiting.abort();
+    this.capacity.stop();
     await Promise.allSettled(
       [...this.activeTurns.values()].map((turn) =>
         turn.cancel({ reason: "Remote Agent shutting down" }),
@@ -637,7 +692,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private async handleFor(session: AgentRuntimeSession): Promise<AcpRuntimeHandle> {
     const existing = this.handles.get(session.id);
     if (existing) return existing;
-    const handle = await this.runtime.ensureSession({
+    const handle = await this.runtimeFor(session.id).ensureSession({
       sessionKey: session.id,
       agent: session.agent,
       mode: "persistent",
@@ -665,7 +720,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     sessionId: string,
     handle: AcpRuntimeHandle,
   ): Promise<void> {
-    const status = await this.runtime.getStatus({ handle });
+    const status = await this.runtimeFor(sessionId).getStatus({ handle });
     await updateRuntimeSessionState(this.prisma, sessionId, {
       status: "idle",
       configOptions: configOptionsFromStatus(status),
@@ -735,7 +790,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       return [{ sessionUpdate: "usage_update", ...usage }];
     }
     if (event.tag === "config_option_update") {
-      const status = await this.runtime.getStatus({ handle });
+      const status = await this.runtimeFor(sessionId).getStatus({ handle });
       const configOptions = configOptionsFromStatus(status);
       await updateRuntimeSessionState(this.prisma, sessionId, { configOptions });
       return [{ sessionUpdate: "config_option_update", configOptions }];
@@ -771,6 +826,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private async emitLifecycle(
     event: Omit<Extract<AgentRuntimeEvent, { kind: "turn" }>, "sequence">,
   ): Promise<void> {
+    if (event.phase === "completed") {
+      const output = (await this.output(event.sessionId))?.trim() ?? "";
+      event = { ...event, output: output.length > 8000 ? `…${output.slice(-8000)}` : output };
+    }
     await this.emit(await appendRuntimeLifecycleEvent(this.prisma, event));
   }
 }
@@ -788,6 +847,14 @@ export function sessionEnvironment(
     REMOTE_AGENT_SESSION_ID: sessionId,
     REMOTE_AGENT_SOCKET: config.controlIpcPath,
   };
+}
+
+export function sessionMcpServers(sessionId: string, config: Pick<ServerConfig, "controlIpcPath">, servers: McpServer[]): McpServer[] {
+  return servers.map((server) => {
+    if (server.name !== "remote-agent" || !("command" in server)) return server;
+    const env = sessionEnvironment(sessionId, config, Object.fromEntries(server.env.map(({ name, value }) => [name, value])));
+    return { ...server, env: Object.entries(env).map(([name, value]) => ({ name, value })) };
+  });
 }
 
 export function createAcpxSessionRuntime(

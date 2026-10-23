@@ -112,6 +112,22 @@ describe("splicePlanSection", () => {
     const once = splicePlanSection("Ask.", "Plan.");
     expect(splicePlanSection(once, "Plan.")).toBe(once);
   });
+
+  test("replaces a captured plan with its own headings without retaining old sections", () => {
+    const first = splicePlanSection("Original ask.", "# First plan\n\n## Context\n\nOld context.\n\n## Steps\n\nOld steps.");
+    expect(first).toContain("### First plan\n\n#### Context");
+    const next = splicePlanSection(`${first}\n## Notes\n\nKeep me.`, "# Revised plan\n\n## Steps\n\nNew steps.");
+    expect(next).toBe("Original ask.\n\n## Implementation Plan\n\n### Revised plan\n\n#### Steps\n\nNew steps.\n\n## Notes\n\nKeep me.\n");
+    expect(splicePlanSection(next, "# Revised plan\n\n## Steps\n\nNew steps.")).toBe(next);
+  });
+
+  test("ignores heading-like text inside fenced code when finding section boundaries", () => {
+    const original = "Original ask.\n\n```md\n## Implementation Plan\nexample only\n```";
+    const plan = "## Steps\n\n~~~md\n## Example\n~~~\n\nDone.";
+    const first = splicePlanSection(original, plan);
+    expect(first).toContain("### Steps\n\n~~~md\n## Example\n~~~");
+    expect(splicePlanSection(`${first}\n## Notes\n\nKeep me.`, "Revised.")).toBe(`${original}\n\n## Implementation Plan\n\nRevised.\n\n## Notes\n\nKeep me.\n`);
+  });
 });
 
 describe("planFromPermissionRequest", () => {
@@ -162,6 +178,26 @@ describe("plan capture interceptor", () => {
       { description: "Original ask.\n\n## Implementation Plan\n\nStep one.\n" },
       { stateId: "state-planned" },
     ]);
+  });
+
+  test("plan reads and writes use the linked connection instead of the server default", async () => {
+    database = await createTestDatabase();
+    const session = await planSession(database.prisma, { workflowId: "plan-capture" });
+    const config = planCaptureConfig();
+    config.connections = { ...config.connections, "other-linear": { ...config.connections["linear-test"]!, id: "other-linear", apiKey: "other-workspace-key" } };
+    await database.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: session.id, relationship: "handles" }, data: { connectionId: "other-linear" } });
+    const observed: string[] = [];
+    const interceptor = createPlanCaptureInterceptor({ prisma: database.prisma, config }, {
+      getIssue: async (scoped) => {
+        observed.push(scoped.activeConnectionId);
+        expect(scoped.linearApiKey).toBe("other-workspace-key");
+        return { id: "other-issue", description: "Keep original.", team: { states: { nodes: [{ id: "planned", name: "Planned" }] } } };
+      },
+      updateIssue: async (scoped) => { observed.push(scoped.activeConnectionId); expect(scoped.linearApiKey).toBe("other-workspace-key"); },
+    });
+    await interceptor({ sessionId: session.id, raw: exitPlanRequest("Scoped plan.") }, { signal: new AbortController().signal });
+    expect(observed).toEqual(["other-linear", "other-linear", "other-linear"]);
+    expect(config.activeConnectionId).toBe("linear-test");
   });
 
   test("does nothing for sessions without a plan-capture workflow", async () => {

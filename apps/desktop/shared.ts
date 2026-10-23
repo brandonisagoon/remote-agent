@@ -4,33 +4,45 @@ import type { CheckResult } from "../../management/checks.ts";
 import type { SkillsCheck } from "../../lib/skills/check.ts";
 import type { DetectedEditor } from "./main/editor-detect.ts";
 import type { ManagementResult } from "../../management/service.ts";
-
-export interface SessionSummary {
-  id: string;
-  repositoryId: string;
-  machineId: string;
-  name: string | null;
-  status: string;
-  role: string | null;
-  agentCommand: string;
-  cwd: string;
-  worktreePath: string | null;
-  updatedAt: string;
-  labels: Array<{ key: string; value: string; source: string }>;
-  resourceLinks: Array<{
-    provider: string;
-    connectionId: string;
-    resourceType: string;
-    externalId: string;
-    relationship: string;
-    endedAt: string | null;
-  }>;
-}
+import type { DesktopHosts, DesktopHostStatus, DesktopTask, DesktopTaskActivity } from "../../lib/desktop-host.ts";
+import type { DesktopRepositoryReference, MachineSessions, SessionSummary } from "../../lib/desktop-sessions.ts";
+export type { SessionSummary } from "../../lib/desktop-sessions.ts";
 
 /** Action id → TanStack Hotkeys chord string (e.g. "Mod+B"). */
 export type Keybindings = Record<string, string>;
 
 export interface DesktopApi {
+  forHost(hostId: string): HostDesktopApi;
+  hosts: {
+    list(): Promise<DesktopHosts>;
+  };
+  window: { syncTrafficLights(): void };
+  keybindings: {
+    get(): Promise<Keybindings>;
+    onChange(listener: (bindings: Keybindings) => void): () => void;
+    openInEditor(): Promise<string | null>;
+  };
+  menu: {
+    onAction(callback: (payload:
+      | { action: "add-repository" }
+      | { action: "add-connection" }
+      | { action: "add-provider"; providerId: "codex" | "claude" }
+    ) => void): () => void;
+  };
+  editors: { detect(): Promise<DetectedEditor[]> };
+}
+
+export interface HostDesktopApi {
+  status(): Promise<DesktopHostStatus>;
+  tasks: {
+    list(): Promise<DesktopTask[]>;
+    activity(id: string): Promise<DesktopTaskActivity>;
+    control(id: string, action: "pause" | "resume" | "close"): Promise<unknown>;
+    answer(id: string, questionId: string, answer: string): Promise<unknown>;
+    instruct(id: string, requestKey: string, text: string): Promise<unknown>;
+    resolve(id: string, instructionId: string, action: "acknowledge" | "cancel" | "retry", reason: string): Promise<unknown>;
+    preview(id: string, resourceId: string): Promise<string>;
+  };
   tunnel: {
     /** Cloudflare tunnel UUID for a tunnel name, or null with a reason. */
     info(name: string): Promise<{ tunnelId: string | null; reason?: "cli-missing" | "not-found" }>;
@@ -39,44 +51,25 @@ export interface DesktopApi {
     /** Model ids advertised by the installed provider binary (with fallback). */
     models(providerId: string): Promise<string[]>;
   };
-  window: {
-    /** Re-center the native traffic lights against the zoom-scaled header. */
-    syncTrafficLights(): void;
-  };
-  keybindings: {
-    get(): Promise<Keybindings>;
-    onChange(listener: (bindings: Keybindings) => void): () => void;
-    openInEditor(): Promise<string | null>;
-  };
   config: {
     path(): Promise<string>;
     get(): Promise<ConfigDocument>;
     save(input: { expectedRevision: string; value: unknown }): Promise<ConfigDocument>;
     onChange(listener: (document: ConfigDocument) => void): () => void;
-    path(): Promise<string>;
     openInEditor(): Promise<string | null>;
     reveal(): Promise<void>;
   };
   sessions: {
     list(repositoryId?: string): Promise<SessionSummary[]>;
-  };
-  menu: {
-    onAction(
-      callback: (
-        payload:
-          | { action: "add-repository" }
-          | { action: "add-connection" }
-          | { action: "add-provider"; providerId: "codex" | "claude" },
-      ) => void,
-    ): () => void;
+    repositoryReference(repositoryId: string): Promise<DesktopRepositoryReference>;
+    forHost(hostId: string, repository: DesktopRepositoryReference): Promise<MachineSessions>;
   };
   repository: {
+    validate(root: string): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" }>;
     pick(): Promise<{ repository: { root: string; name: string } } | { error: "not-a-repository" } | null>;
   };
-  editors: {
-    detect(): Promise<DetectedEditor[]>;
-  };
   fs: {
+    list(directory: string, kind: "file" | "folder"): Promise<{ path: string; parent: string; entries: Array<{ name: string; path: string; directory: boolean }> }>;
     /** Native folder picker; returns the chosen absolute path or null. */
     pickFolder(title: string, defaultPath?: string): Promise<string | null>;
     /** Native file picker; returns the chosen absolute path or null. */

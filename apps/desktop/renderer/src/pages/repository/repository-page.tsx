@@ -1,5 +1,4 @@
 import { useMemo } from "react";
-import { useQuery } from "@tanstack/react-query";
 
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
@@ -16,7 +15,7 @@ import {
   TableRow,
 } from "@renderer/components/ui/table.tsx";
 
-import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
+import { useRepositorySessions } from "@renderer/lib/queries/sessions.ts";
 import type { RepositoryTab } from "@renderer/router.tsx";
 import { BootstrapSection, GitSection } from "./git-section.tsx";
 import { SkillsTab } from "./skills-tab.tsx";
@@ -31,6 +30,8 @@ import {
 } from "@renderer/components/ui/input-group.tsx";
 import { Label } from "@renderer/components/ui/label.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
+import { Button } from "@renderer/components/ui/button.tsx";
+import { chatgptReviewLink } from "../../../../../../lib/chatgpt-review.ts";
 
 export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: RepositoryTab; value: ServiceFile; mutate: Mutate }) {
   const repository = value.repositories[id];
@@ -45,10 +46,7 @@ export function RepositoryPage({ id, tab, value, mutate }: { id: string; tab: Re
 }
 
 function SessionsTab({ repositoryId }: { repositoryId: string }) {
-  const query = useQuery(sessionsQueryOptions(repositoryId));
-  const sessions = query.data ?? [];
-  const loading = query.isFetching;
-  const error = query.error ? (query.error instanceof Error ? query.error.message : String(query.error)) : null;
+  const { sessions, repositoryOrigin, loading, error, unavailable, localOnly } = useRepositorySessions(repositoryId);
   const counts = useMemo(
     () => ({
       active: sessions.filter((session) => session.status === "active").length,
@@ -63,6 +61,7 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
         <TableHeader>
           <TableRow>
             <TableHead>Session</TableHead>
+            <TableHead>Machine</TableHead>
             <TableHead>State</TableHead>
             <TableHead>Role</TableHead>
             <TableHead>Provider</TableHead>
@@ -72,10 +71,19 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
         </TableHeader>
         <TableBody>
           {sessions.map((session) => (
-            <TableRow key={session.id}>
+            <TableRow key={`${session.machineId}:${session.id}`}>
               <TableCell className="max-w-[260px]">
                 <div className="truncate font-medium">{session.name ?? session.id}</div>
                 <div className="text-muted-foreground truncate font-mono text-[10px]">{session.id}</div>
+                {session.chatgptReview && !session.unavailable && (
+                  <Button asChild variant="link" size="xs" className="h-auto p-0 text-xs motion-reduce:transition-none">
+                    <a href={chatgptReviewLink(session, session.chatgptReview, repositoryOrigin)} target="_blank" rel="noreferrer">Open in ChatGPT</a>
+                  </Button>
+                )}
+              </TableCell>
+              <TableCell className="text-muted-foreground whitespace-nowrap" title={session.machineId}>
+                {session.machineName}
+                {session.unavailable && <div className="text-xs">Last received state</div>}
               </TableCell>
               <TableCell>
                 <Badge variant={session.status === "active" ? "default" : "secondary"}>{session.status}</Badge>
@@ -109,10 +117,10 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
       {error ? (
         <div className="flex flex-col items-center gap-3 py-20">
           <F7Icon name="exclamationmark_circle" className="text-muted-foreground/40 size-8" />
-          <p className="text-muted-foreground text-sm">The server is unavailable.</p>
-          <p className="text-muted-foreground/70 max-w-md text-center text-xs">{error}</p>
+          <p className="text-muted-foreground text-sm">Could not read this repository.</p>
+          <p className="text-muted-foreground/70 max-w-md text-center text-xs">{String(error)} Use Refresh Sessions to try again.</p>
         </div>
-      ) : !loading && sessions.length === 0 ? (
+      ) : !loading && !unavailable.length && sessions.length === 0 ? (
         <div className="flex flex-col items-center gap-3 py-20">
           <F7Icon name="moon_zzz" className="text-muted-foreground/40 size-8" />
           <p className="text-muted-foreground text-sm">No sessions yet.</p>
@@ -121,6 +129,9 @@ function SessionsTab({ repositoryId }: { repositoryId: string }) {
           </p>
         </div>
       ) : null}
+      {localOnly && <p className="text-muted-foreground border-t px-4 py-2 text-xs">This checkout has no network Git origin. Only this machine's sessions can be matched.</p>}
+      {unavailable.map((machine) => <p key={machine.hostId} role="status" className="text-muted-foreground border-t px-4 py-2 text-xs">{machine.machineName} is unavailable. {machine.data?.sessions.length ? "Showing its last received sessions. " : "Its sessions may be missing. "}Use Refresh Sessions to try again.</p>)}
+      {loading && <p role="status" className="text-muted-foreground border-t px-4 py-2 text-xs">Loading sessions from machines…</p>}
       <div className="text-muted-foreground/70 flex items-center border-t px-4 py-1.5 text-xs tabular-nums">
         {counts.active} active · {counts.total} total
       </div>
@@ -142,7 +153,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         <SettingsSection
           value="config-file"
           title="Config File"
-          description="Bootstrap, naming, workflows, and labels live in the repository's own config, next to the code they configure."
+          description="Preparation, naming, workflows, and labels come from this config. External tooling is pinned to its committed Git ref when the server starts."
         >
           <SettingsCard>
             <div className="grid gap-2">
@@ -164,7 +175,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
         title="Workflows"
         description="When a Linear event matches a trigger, the selected skillset is composed into the session's worktree and delivered."
       >
-        <WorkflowsSection value={value} root={repository.root} repo={repo} />
+        <WorkflowsSection value={value} root={repository.tooling?.root ?? repository.root} repo={repo} />
       </SettingsSection>
       <SettingsSection
         value="labels"

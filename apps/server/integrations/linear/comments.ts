@@ -1,3 +1,4 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { linearGraphql } from "./client.ts";
 
 const CREATE_ISSUE_COMMENT = `
@@ -45,7 +46,7 @@ const ISSUE_COMMENTS = `
 /** Returns the created comment's ID (so callers can register its thread),
     or null on failure. */
 export async function createIssueComment(
-  apiKey: string,
+  apiKey: LinearCredential,
   issueId: string,
   body: string,
 ): Promise<string | null> {
@@ -65,8 +66,8 @@ export interface CreatedIssueComment {
 }
 
 export async function createThreadedIssueComment(
-  apiKey: string,
-  input: { issueId: string; body: string; parentId?: string },
+  apiKey: LinearCredential,
+  input: { issueId: string; body: string; parentId?: string; id?: string },
 ): Promise<CreatedIssueComment | null> {
   try {
     const data = await linearGraphql<{
@@ -78,6 +79,7 @@ export async function createThreadedIssueComment(
       input: {
         issueId: input.issueId,
         body: input.body,
+        ...(input.id ? { id: input.id } : {}),
         ...(input.parentId ? { parentId: input.parentId } : {}),
       },
     });
@@ -88,8 +90,15 @@ export async function createThreadedIssueComment(
   }
 }
 
+/** Reconcile a client-assigned comment ID after an uncertain create response. */
+export async function fetchIssueCommentIdentity(apiKey: LinearCredential, commentId: string): Promise<{ id: string; body: string; issue: { id: string } | null } | null> {
+  const data = await linearGraphql<{ comment: { id: string; body: string; issue: { id: string } | null } | null }>(apiKey,
+    "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body issue { id } } }", { commentId });
+  return data.comment;
+}
+
 export async function updateIssueComment(
-  apiKey: string,
+  apiKey: LinearCredential,
   commentId: string,
   body: string,
 ): Promise<boolean> {
@@ -105,7 +114,7 @@ export async function updateIssueComment(
 }
 
 export async function fetchIssueCommentBody(
-  apiKey: string,
+  apiKey: LinearCredential,
   commentId: string,
 ): Promise<string | null> {
   try {
@@ -120,7 +129,7 @@ export async function fetchIssueCommentBody(
 }
 
 export async function issueHasCommentContaining(
-  apiKey: string,
+  apiKey: LinearCredential,
   issueId: string,
   marker: string,
 ): Promise<boolean> {

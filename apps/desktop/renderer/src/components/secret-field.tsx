@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { STORED_SECRET } from "../../../../../lib/desktop-host.ts";
+import { useEffect, useId, useState } from "react";
 
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import {
@@ -20,16 +21,19 @@ export function SecretField(props: {
   description?: string;
   onChange(value: string): void;
 }) {
+  const id = useId();
   const toggleLabel = useKeybindingLabel("toggle-secrets");
   const [visible, setVisible] = useState(secretsVisible);
   useEffect(() => subscribeSecrets(() => setVisible(secretsVisible())), []);
   return (
     <div className="grid gap-2">
-      <Label>{props.label}</Label>
+      <Label htmlFor={id}>{props.label}</Label>
       <InputGroup>
         <InputGroupInput
+          id={id}
           type={visible ? "text" : "password"}
-          value={props.value}
+          value={props.value === STORED_SECRET ? "" : props.value}
+          placeholder={props.value === STORED_SECRET ? "Stored on this machine; enter a value to replace" : undefined}
           onChange={(event) => props.onChange(event.target.value)}
         />
         <InputGroupAddon align="inline-end">

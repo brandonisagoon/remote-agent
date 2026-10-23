@@ -1,9 +1,11 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { ServiceFile } from "../../../../../../lib/config.ts";
 import type { ManagementResult } from "../../../../../../management/service.ts";
 import { DnsRecordsTable } from "./dns-records-table.tsx";
+import { RoutingSection } from "./routing-section.tsx";
 import { F7Icon } from "@renderer/components/f7-icon.tsx";
 import { CopyField } from "@renderer/components/copy-field.tsx";
 import { Field } from "@renderer/components/field.tsx";
@@ -32,24 +34,35 @@ import { cn } from "@renderer/lib/utils.ts";
 /** The stdio bridge an ACP app runs to reach the server: the deployed copy
     under the install root, pointed at this config file. */
 function useAcpBridgeCommand(file: ServiceFile): string {
+  const { host, api } = useHost();
   const { data: configFile = "" } = useQuery({
-    queryKey: ["config-path"],
-    queryFn: () => window.remoteAgent.config.path(),
+    queryKey: ["config-path", host.id],
+    queryFn: () => api.config.path(),
     staleTime: Infinity,
   });
   const root =
     file.machine.installation.root ??
     `~/Library/Application Support/${file.serviceName}`;
+  if (host.kind === "ssh") {
+    const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+    const command = `REMOTE_AGENT_CONFIG=${quote(host.configPath)} ${quote(host.executable)} ${quote(`${host.runtimePath}/apps/server/acp/main.ts`)}`;
+    return `ssh -T ${quote(host.sshHost)} ${quote(command)}`;
+  }
   return `REMOTE_AGENT_CONFIG='${configFile}' bun '${root.replace(/\/$/, "")}/app/apps/server/acp/main.ts'`;
 }
 
 export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mutate }) {
+  const { host, api } = useHost();
+  const remote = host.kind === "ssh";
+  const customService = host.kind === "ssh" && !!host.serviceLabel;
   const [result, setResult] = useState<ManagementResult | null>(null);
   const [working, setWorking] = useState<string | null>(null);
   const run = async (action: "status" | "doctor" | "install" | "install-cli" | "check-update" | "update" | "restart") => {
     setWorking(action);
     try {
-      setResult(await window.remoteAgent.management.run(action));
+      setResult(await api.management.run(action));
+    } catch (error) {
+      setResult({ ok: false, summary: error instanceof Error ? error.message : String(error) });
     } finally {
       setWorking(null);
     }
@@ -57,11 +70,11 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const machine = value.machine;
   const bridgeCommand = useAcpBridgeCommand(value);
   const queryClient = useQueryClient();
-  const { data: checks = [] } = useQuery(checksQueryOptions);
+  const { data: checks = [] } = useQuery(checksQueryOptions(host.id));
   const check = (id: string) => checks.find((entry) => entry.id === id);
   const act = async (action: Parameters<typeof run>[0]) => {
     await run(action);
-    void queryClient.invalidateQueries({ queryKey: checksQueryOptions.queryKey });
+    void queryClient.invalidateQueries({ queryKey: checksQueryOptions(host.id).queryKey });
   };
   const installSteps = [
     check("bun"),
@@ -82,7 +95,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
   const remedyCommand = (step: { remedy?: string }) =>
     step.remedy?.match(/^(?:run|install with): (.+)$/)?.[1] ?? null;
   const openTerminal = async (commandLine: string) => {
-    setResult(await window.remoteAgent.management.openTerminal(commandLine));
+    setResult(await api.management.openTerminal(commandLine));
   };
   const stepAction = (step: NonNullable<ReturnType<typeof check>>) => {
     if (step.id === "cli") {
@@ -117,7 +130,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
       defaultValue={["installation", "status", "identity", "server", "remote-access", "acp", "storage"]}
       className="-mt-4"
     >
-      <SettingsSection
+      {!remote && <SettingsSection
         value="installation"
         title="Installation"
         description="Everything this machine needs, in order. Each step reports its own state."
@@ -145,7 +158,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             </TableBody>
           </Table>
         </div>
-      </SettingsSection>
+      </SettingsSection>}
 
       <SettingsSection value="status" title="Status" description="The running system.">
         <div className="bg-background -mx-4 rounded-lg border">
@@ -168,7 +181,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                       </Button>
                     )}
                     {row.id === "config" && (
-                      <Button size="sm" variant="outline" onClick={() => void window.remoteAgent.config.openInEditor()}>
+                      <Button size="sm" variant="outline" onClick={() => void api.config.openInEditor()}>
                         Edit
                       </Button>
                     )}
@@ -183,7 +196,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
                     <Button size="sm" variant="outline" disabled={working !== null} onClick={() => void act("check-update")}>
                       Check
                     </Button>
-                    <Button size="sm" disabled={working !== null} onClick={() => void act("update")}>
+                    <Button size="sm" disabled={working !== null || remote} title={remote ? "Deploy updates from the host’s installation workflow" : undefined} onClick={() => void act("update")}>
                       Install
                     </Button>
                   </div>
@@ -204,7 +217,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
 
       <SettingsSection value="identity" title="Identity">
         <SettingsCard>
-          <Field label="Machine ID" value={machine.id} onChange={(next) => mutate((file) => { file.machine.id = next; })} />
+          <Field label="Machine ID" value={machine.id} disabled={remote} onChange={(next) => mutate((file) => { file.machine.id = next; })} />
           <Field label="Display name" value={machine.name} onChange={(next) => mutate((file) => { file.machine.name = next; })} />
         </SettingsCard>
       </SettingsSection>
@@ -220,7 +233,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
             <Field label="Port" type="number" value={machine.server.listen.port} onChange={(next) => mutate((file) => { file.machine.server.listen.port = Number(next); })} />
           </div>
           <Field label="Public URL" value={machine.server.publicUrl} onChange={(next) => mutate((file) => { file.machine.server.publicUrl = next; })} />
-          <DnsRecordsTable value={value} />
+          {customService ? <p className="text-muted-foreground text-xs">This service's public tunnel is managed on this machine.</p> : <DnsRecordsTable value={value} />}
         </SettingsCard>
       </SettingsSection>
 
@@ -240,6 +253,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
         <SettingsCard>
           <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
           <Field label="Session State Directory" description="Where acpx persists each session's conversation state." value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
+          <Field label="Concurrent agent turns" type="number" description="Additional instructions wait in order. Blank leaves this machine unlimited. Requires a server restart." value={machine.acpx.maxConcurrentTurns ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.maxConcurrentTurns = next === "" ? undefined : Number(next); })} />
         </SettingsCard>
       </SettingsSection>
 
@@ -257,8 +271,7 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
           />
         </SettingsCard>
       </SettingsSection>
-
-
+      <RoutingSection value={value} mutate={mutate} />
     </Accordion>
   );
 }

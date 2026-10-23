@@ -19,7 +19,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   pure control plane editing the config JSON. TanStack Router (hash history,
   code-based routes in `apps/desktop/renderer/src/router.tsx`) + TanStack
   Query (`@renderer/lib/queries/`; NO TanStack DB). Saves are explicit: draft state
-  over the `['config']` query, sonner save/revert — never save per keystroke.
+  over host-qualified `['config', hostId]` queries, sonner save/revert — never save per keystroke. The sidebar lists all hosts together with machine badges;
+  machine links open details, never select a global host. Server, Providers and
+  Connections are tabs inside each machine page; the sidebar lists Machines and
+  Repositories only. Routes, requests and draft controllers retain their owner
+  across navigation.
 - **CLI** (`remote-agent`) — thin commander skin over `management/`.
 - **`management/`** — the platform layer shared by CLI and GUI:
   provisioning, self-updating deploy with rollback, the doctor checklist
@@ -29,13 +33,23 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `<label>.tunnel` → verify publicUrl; every step idempotent; doctor rows
   `tunnel-login`/`tunnel`/`tunnel-dns`/`tunnel-service`/`public-url`).
   **No shell scripts** — everything is TypeScript.
-- **`lib/skills/`** — skill-composer boundary. Repos own skill-composer
-  as their own dev dependency; we always **exec** their copy (or a bun child
+- **`lib/skills/`** — skill-composer boundary. The product or configured
+  external tooling repository owns skill-composer; we always **exec** its copy (or a bun child
   process for the inventory shim), never import repo-owned config in-process.
 - **Thread registry** (`apps/server/services/sessions/threads.ts`) — conversation
   threads live in `RuntimeSessionResourceLink` (`comment-thread`, relationship
   `thread`/`question`): registered threads deliver without a mention or a
   router call; `question` threads frame the next human reply as the answer.
+  `read_source_issue` and `ask_question` use the session's linked issue and
+  server-held credential. `RuntimeQuestion` persists a client-assigned comment
+  UUID before delivery; retries reuse it and preserve an already-answered thread.
+- **Source-issue updates** (`apps/server/services/sessions/issue-updates.ts`) —
+  `publish_issue_update` is primary-only and bound to the session's source issue.
+  `RuntimeIssueUpdate` persists the request, upload receipts and comment UUID.
+  Evidence uploads/attachments and the routed comment precede the state change;
+  `expectedState` guards against stale owner changes. Completed receipts replay
+  without rewriting later states. Status policy lives in the tooling skills;
+  selecting a completed-type state never closes the session or its preview.
 - **Plan capture** (`apps/server/services/sessions/plan-capture.ts`) — a
   workflow with `plan: { captureToIssue, thenState? }` launches its session
   in plan mode (`RuntimeSession.workflowId` records provenance); the acpx
@@ -47,12 +61,16 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 - **Session tools + control socket** (`apps/server/mcp/`,
   `apps/server/control-socket.ts`) — every session's harness spawns the
   `remote-agent` stdio MCP server (registered via acpx `mcpServers`); it
-  exposes `delegate_session` and `register_thread`, calling the same Hono
+  exposes `delegate_session`, `inspect_delegates`, `instruct_delegate` and
+  `register_thread`, calling the same Hono
   routes over `controlIpcPath` (`createApp({ trustLocal: true })`, socket
   mode 0600, no bearer). Identity comes from `REMOTE_AGENT_SESSION_ID` /
   `REMOTE_AGENT_SOCKET`, injected into every session's env by
   `sessionEnvironment`. `delegateSession` copies the parent's non-thread
   resource links, sets `spawned-by`, role `delegate`, lifecycle `one-shot`.
+  Opt-in `notifyParent` workers are persistent and use the durable inbox
+  for initial instructions, follow-ups and terminal results to the parent.
+  The lifecycle journal reconciles result delivery after restart.
 - **Workflows** (`repositories.<id>.workflows`) — trigger (`on` +
   `when` conditions + optional `connectionId`) → skill (skillset + flags) →
   delivery (`start-session` | `message-session`). Matched in the webhook
@@ -104,9 +122,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 ## Conventions
 
 - Kebab-case file names. Explicit named exports in barrels, no `export *`.
-- Worktree seam: the server owns git (`worktree add`, path flattening), the
-  repository owns bootstrap (runs once per new worktree; exit code is the
-  only signal; contents are the repo's business), the repository owns the branch convention
+- Worktree seam: the server owns git (`worktree add`, path flattening). The
+  default command preparation runs bootstrap once and fails on nonzero exit.
+  Agent preparation starts in the created target worktree and reports actual
+  readiness separately. External tooling is pinned to a committed revision;
+  its policy and skills do not require product adoption files. The repository owns the branch convention
   (`branchNaming` templates keyed by connection, rendered from
   provider-supplied facts).
 - Zod v4 schemas in `lib/config.ts` are the single config source; the UI

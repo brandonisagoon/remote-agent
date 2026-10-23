@@ -1,3 +1,4 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { linearGraphql } from "./client.ts";
 
 const COMMENT_CONTEXT = `
@@ -32,7 +33,7 @@ export interface CommentContext {
  * The issue is still reachable one level down, via documentContent.
  */
 export async function fetchCommentContext(
-  apiKey: string,
+  apiKey: LinearCredential,
   commentId: string,
 ): Promise<CommentContext> {
   const empty: CommentContext = {

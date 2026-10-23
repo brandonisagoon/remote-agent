@@ -19,6 +19,9 @@ import { composeForPrompt, renderSkillToken } from "../../../../../lib/skills/co
 import { postWorktreeLinkComment } from "./comment.ts";
 import { branchTemplateFor, isSafeBranchName, renderBranchName, renderWorktreeName } from "./branch.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
+import { beginTask, taskForSession } from "../../../services/tasks/store.ts";
+import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
+import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 
 type WorkflowEvent = Extract<
   DispatchEvent,
@@ -109,6 +112,7 @@ export function createWorkflowWorker(
 
       if (workflow.deliver === "message-session") {
         return (dependencies.forward ?? forwardMessage)({
+          requestId: `worker:${context.runId}`,
           config: context.config,
           prisma: context.prisma,
           agentRuntime: context.agentRuntime!,
@@ -120,15 +124,21 @@ export function createWorkflowWorker(
           },
           message: `Run the ${workflow.id} workflow for ${issue.identifier} (state: ${issue.state.name}).`,
           finalizeMessage: async (target) => {
+            const task = repository.tooling
+              ? await taskForSession(context.prisma, target.runtime.sessionKey)
+              : null;
+            if (repository.tooling && !task?.pinnedToolingRoot) throw new Error("Session has no pinned tooling source; reconcile before composing follow-up skills");
             const seed = buildWorkflowSeedPrompt(workflow, {
               sourceIssueIdentifier: issue.identifier,
               sourceIssueState: issue.state.name,
+              sourceIssueDescription: issue.description ?? "(No description)",
             });
             return (dependencies.compose ?? composeForPrompt)(
               target.runtime.worktreePath,
               seed,
               provider,
               repository.skillsRoot,
+              task?.pinnedToolingRoot ?? target.runtime.worktreePath,
             );
           },
         });
@@ -165,6 +175,15 @@ export function createWorkflowWorker(
       if (!isSafeBranchName(branchName)) {
         return result("failed", `unsafe branch name: ${branchName}`);
       }
+      const task = repository.tooling ? await beginTask(context.prisma, {
+        requestKey: context.runId,
+        repository,
+        machineId: context.config.machine,
+        connectionId: context.config.activeConnectionId,
+        issueIdentifier: issue.identifier,
+        branchName,
+      }) : null;
+      if (task?.primarySessionId) return result(WorkerRunStatus.Existing, `task ${task.id} already owns runtime_session:${task.primarySessionId}`);
       const branchResult = await context.commandClient.run("git", [
         "-C",
         repository.root,
@@ -173,7 +192,8 @@ export function createWorkflowWorker(
         "--quiet",
         `refs/heads/${branchName}`,
       ]);
-      if (branchResult.ok) {
+      if (branchResult.ok && !task?.worktreePath) {
+        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: `Branch already exists outside this task: ${branchName}` } });
         return result(WorkerRunStatus.Existing, `branch already exists: ${branchName}`);
       }
       if (branchResult.stderr.trim()) {
@@ -183,10 +203,7 @@ export function createWorkflowWorker(
       let launched: Awaited<ReturnType<typeof spawnAgentThread>>;
       let worktreePath = "";
       try {
-        worktreePath = await (dependencies.provision ?? provisionWorktree)({
-          repository,
-          branchName,
-          directoryName: renderWorktreeName(
+        const directoryName = renderWorktreeName(
             repository.worktreeNaming[context.config.activeConnectionId] ??
               repository.worktreeNaming["*"] ??
               "{branch}",
@@ -196,19 +213,20 @@ export function createWorkflowWorker(
               title: issue.title,
             },
             branchName,
-          ),
-        });
+          );
+        worktreePath = task
+          ? await provisionTaskWorktree(context.prisma, task.id, repository, directoryName)
+          : await (dependencies.provision ?? provisionWorktree)({ repository, branchName, directoryName });
         const seed = buildWorkflowSeedPrompt(workflow, {
           sourceIssueIdentifier: issue.identifier,
           sourceIssueTitle: issue.title,
+          sourceIssueDescription: issue.description ?? "(No description)",
           branchName,
+          ...(task ? { taskId: task.id, preparation: "Prepare and verify this environment before implementing. Report failures and resource ownership through the remote-agent task tools." } : {}),
         });
-        const prompt = await (dependencies.compose ?? composeForPrompt)(
-          worktreePath,
-          seed,
-          provider,
-          repository.skillsRoot,
-        );
+        const { prompt, toolingRoot } = task
+          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose })
+          : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma,
@@ -225,11 +243,13 @@ export function createWorkflowWorker(
           title: buildWorkflowSessionName(workflow.id, issue.identifier),
           prompt,
           workflowId: workflow.id,
+          ...(task ? { taskId: task.id, toolingRoot } : {}),
           // Plan capture: the session plans in native plan mode; the server
           // persists the plan on exit-plan-mode approval.
           ...(workflow.plan?.captureToIssue ? { mode: "plan" } : {}),
         });
       } catch (error) {
+        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: error instanceof Error ? error.message : String(error) } });
         return result(
           "failed",
           `workflow launch failed: ${error instanceof Error ? error.message : String(error)}`,

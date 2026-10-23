@@ -1,3 +1,4 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { linearGraphql } from "./client.ts";
 
 /**
@@ -41,7 +42,7 @@ const CREATE_ISSUE_REACTION = `
  * delivery into a recorded failure.
  */
 export async function reactToComment(
-  apiKey: string,
+  apiKey: LinearCredential,
   commentId: string,
   emoji: string,
 ): Promise<boolean> {
@@ -60,7 +61,7 @@ export async function reactToComment(
 
 /** Best-effort acknowledgement that work has started on an issue. */
 export async function reactToIssue(
-  apiKey: string,
+  apiKey: LinearCredential,
   issueId: string,
   emoji: string,
 ): Promise<boolean> {

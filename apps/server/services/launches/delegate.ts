@@ -5,6 +5,7 @@ import type {
   AgentRuntimeSession,
   AgentSessionRuntime,
 } from "../../../../types/runtime/index.ts";
+import { queueInstruction } from "../sessions/inbox.ts";
 
 export interface DelegateSessionInput {
   parentSessionId: string;
@@ -13,6 +14,7 @@ export interface DelegateSessionInput {
   model?: string;
   name?: string;
   cwd?: string;
+  notifyParent?: boolean;
 }
 
 /** Spawns a child session that inherits its parent's lineage: repository,
@@ -52,10 +54,13 @@ export async function delegateSession(
     repositoryId: parent.repositoryId,
     machineId: parent.machineId,
     role: "delegate",
-    lifecycle: "one-shot",
+    lifecycle: input.notifyParent ? "persistent" : "one-shot",
     ...(parent.workflowId ? { workflowId: parent.workflowId } : {}),
     ...(input.model ? { model: input.model } : {}),
-    relations: [{ relationship: "spawned-by", targetSessionId: parent.id }],
+    relations: [
+      { relationship: "spawned-by", targetSessionId: parent.id },
+      ...(input.notifyParent ? [{ relationship: "notifies-parent", targetSessionId: parent.id }] : []),
+    ],
     resourceLinks: inherited.map((link) => ({
       provider: link.provider,
       connectionId: link.connectionId,
@@ -66,11 +71,13 @@ export async function delegateSession(
   });
 
   try {
-    await dependencies.runtime.enqueue({
+    const instruction = {
       sessionId: child.id,
       text: input.prompt,
       requestId: `delegate:${child.id}`,
-    });
+    };
+    if (input.notifyParent) await queueInstruction(dependencies.prisma, instruction);
+    else await dependencies.runtime.enqueue(instruction);
   } catch (error) {
     await dependencies.runtime
       .close(child.id, "Delegate launch enqueue failed")

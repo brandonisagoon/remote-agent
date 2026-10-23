@@ -1,11 +1,14 @@
+import { chooseHostRepository } from "./remote-path-picker.tsx";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { Outlet, useNavigate, useParams } from "@tanstack/react-router";
 
+import { useMachineActions } from "@renderer/pages/machine/use-machine-actions.ts";
 import { AppSidebar } from "@renderer/components/app-sidebar.tsx";
 import { InsetHeader } from "@renderer/components/inset-header.tsx";
 import { KeyboardShortcuts } from "@renderer/components/keyboard-shortcuts.tsx";
 import { RepositoryPathBar } from "@renderer/pages/repository/path-bar.tsx";
+import { MachinePathBar } from "@renderer/pages/machine/path-bar.tsx";
 import { cn } from "@renderer/lib/utils.ts";
 import {
   SIDEBAR_DEFAULT_WIDTH,
@@ -15,14 +18,11 @@ import {
 } from "@renderer/components/sidebar-resize-handle.tsx";
 import { SidebarInset, SidebarProvider } from "@renderer/components/ui/sidebar.tsx";
 import { useConfig } from "@renderer/lib/config-context.tsx";
+import { useHost, useHostDirectory } from "@renderer/lib/host-context.tsx";
 import { randomHex } from "@renderer/lib/random.ts";
+import { removeRepository as removeRepositoryFromConfig } from "../../../../../lib/config-repositories.ts";
 
 const SIDEBAR_WIDTH_STORAGE_KEY = "remote-agent:sidebar-width";
-
-/** Opaque connection id: provider prefix for grep-ability + random hex. */
-function generateConnectionId(): string {
-  return `linear-${randomHex(6)}`;
-}
 
 function storedSidebarWidth(): number {
   const stored = Number(localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY));
@@ -35,12 +35,15 @@ function storedSidebarWidth(): number {
 export function AppLayout() {
   const { draft, mutate, commit, dirty } = useConfig();
   const navigate = useNavigate();
+  const { host } = useHost();
+  const { entries } = useHostDirectory();
+  const search = { host: host.id };
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
 
   // Adding a repository is a file pick, not a form: the ID is an opaque key,
   // the name comes from the folder, and everything else has editable defaults.
   const addRepository = async () => {
-    const picked = await window.remoteAgent.repository.pick();
+    const picked = await chooseHostRepository(host);
     if (!picked) return;
     if ("error" in picked) {
       toast.error("That folder is not a git repository");
@@ -57,45 +60,12 @@ export function AppLayout() {
     };
     if (dirty) mutate(create);
     else void commit(create);
-    void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id } });
+    void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: id }, search });
   };
 
-  const addProvider = (providerId: "codex" | "claude") => {
-    const create = (value: typeof draft) => {
-      value.providers[providerId] = {};
-    };
-    if (dirty) mutate(create);
-    else void commit(create);
-    void navigate({ to: "/providers/$providerId", params: { providerId } });
-  };
-  const addConnection = () => {
-    const id = generateConnectionId();
-    const create = (value: typeof draft) => {
-      value.connections[id] = {
-        provider: "linear",
-        name: "New Linear Connection",
-        apiKey: "replace-me",
-        agentUserId: "replace-me",
-        machineId: value.machine.id,
-        repositories: "*",
-        router: { providerId: "codex", timeoutMs: 30_000 },
-        editors: [{ name: "Zed", scheme: "zed" }],
-        webhook: {
-          slug: `wh-${randomHex(6)}`,
-          secret: randomHex(16),
-          webhookMaxAgeMs: 60_000,
-        },
-      };
-    };
-    // A default connection is self-contained: write it through directly.
-    // With unsaved edits pending it joins the draft instead, so those are
-    // never silently saved along with it.
-    if (dirty) mutate(create);
-    else void commit(create);
-    void navigate({ to: "/connections/$connectionId", params: { connectionId: id } });
-  };
+  const { addProvider, addConnection } = useMachineActions();
 
-  // The macOS File menu mirrors the sidebar's add controls.
+  // The macOS File menu mirrors the current machine's tab controls.
   useEffect(() =>
     window.remoteAgent.menu.onAction((payload) => {
       if (payload.action === "add-repository") void addRepository();
@@ -106,36 +76,16 @@ export function AppLayout() {
 
   // Removal is confirmed by the sidebar's alert dialog; write through
   // directly unless draft edits are pending (same rule as creation).
-  const applyRemoval = (remove: (value: typeof draft) => void, wasActive: boolean) => {
-    if (dirty) mutate(remove);
-    else void commit(remove);
-    if (wasActive) void navigate({ to: "/" });
+  const applyRemoval = (hostId: string, remove: (value: typeof draft) => void, wasActive: boolean) => {
+    const owner = entries.find((entry) => entry.host.id === hostId);
+    if (!owner) return;
+    void owner.config.commit(remove).catch((error) => toast.error(String(error)));
+    if (wasActive && hostId === host.id) void navigate({ to: "/", search });
   };
   const params = useParams({ strict: false });
-  const removeProvider = (id: string) => {
-    applyRemoval((value) => {
-      delete value.providers[id as keyof typeof value.providers];
-    }, params.providerId === id);
-  };
-  const removeConnection = (id: string) => {
-    applyRemoval((value) => {
-      delete value.connections[id];
-    }, params.connectionId === id);
-  };
-  const removeRepository = (id: string) => {
-    if (Object.keys(draft.repositories).length <= 1) {
-      toast.error("At least one repository is required");
-      return;
-    }
-    applyRemoval((value) => {
-      delete value.repositories[id];
-      // Heal connection allowlists that referenced it; an emptied allowlist
-      // falls back to every repository.
-      for (const connection of Object.values(value.connections)) {
-        if (connection.repositories === "*") continue;
-        delete connection.repositories[id];
-        if (Object.keys(connection.repositories).length === 0) connection.repositories = "*";
-      }
+  const removeRepository = (hostId: string, id: string) => {
+    applyRemoval(hostId, (value) => {
+      removeRepositoryFromConfig(value, id);
     }, params.repositoryId === id);
   };
 
@@ -147,12 +97,7 @@ export function AppLayout() {
         onCommit={(width) => localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(width))}
       />
       <AppSidebar
-        value={draft}
-        onAddProvider={addProvider}
-        onAddConnection={addConnection}
         onAddRepository={() => void addRepository()}
-        onRemoveProvider={removeProvider}
-        onRemoveConnection={removeConnection}
         onRemoveRepository={removeRepository}
       />
 
@@ -171,10 +116,10 @@ export function AppLayout() {
                 : "max-w-3xl px-8 py-8",
             )}
           >
-            <Outlet />
+            <Outlet key={host.id} />
           </div>
         </div>
-        {params.repositoryId && <RepositoryPathBar repositoryId={params.repositoryId} />}
+        {params.repositoryId ? <RepositoryPathBar repositoryId={params.repositoryId} /> : <MachinePathBar />}
       </SidebarInset>
 
     </SidebarProvider>

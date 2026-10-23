@@ -143,7 +143,8 @@ function post(
     secret = SECRET,
     deliveryId = crypto.randomUUID(),
     signature,
-  }: { secret?: string; deliveryId?: string | null; signature?: string } = {},
+    requestConfig = config,
+  }: { secret?: string; deliveryId?: string | null; signature?: string; requestConfig?: ServerConfig } = {},
 ) {
   const raw = typeof body === "string" ? body : JSON.stringify(body);
   const headers: Record<string, string> = {
@@ -153,12 +154,51 @@ function post(
   };
   if (deliveryId) headers["linear-delivery"] = deliveryId;
 
-  return createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/linear-test", {
+  return createApp({ config: requestConfig, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/linear-test", {
     method: "POST",
     headers,
     body: raw,
   });
 }
+
+describe("user-scoped routing", () => {
+  const requestConfig = testConfig({
+    webhookSecret: SECRET,
+    webhooks: {
+      ...config.webhooks,
+      "linear-test": {
+        ...config.webhooks["linear-test"]!,
+        repositoryRouting: {
+          [config.repository.id]: { when: [{ "linear.userId": ["user-brandon"] }] },
+        },
+      },
+    },
+  });
+
+  test("accepts the configured comment author", async () => {
+    const response = await post(commentPayload(), { requestConfig });
+    expect(response.status).toBe(202);
+  });
+
+  test.each(["Comment", "Reaction", "Issue"])("rejects another user or an absent actor for %s before dispatch", async (type) => {
+    for (const userId of ["someone-else", undefined]) {
+      const payload = type === "Issue" ? issuePayload() : type === "Reaction" ? reactionPayload() : commentPayload();
+      const data = { ...payload.data, userId, user: userId ? { id: userId } : undefined, assigneeId: "user-brandon", creatorId: "user-brandon" };
+      const response = await post({ ...payload, data, actor: userId ? { id: userId } : undefined }, { requestConfig });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ accepted: false, ignored: true });
+      expect(await prisma.webhookReceipt.count()).toBe(0);
+      expect(await prisma.runtimeSession.count()).toBe(0);
+    }
+  });
+
+  test("routes issue changes by the actor, not the assignee", async () => {
+    const payload = issuePayload({ state: "Unconfigured state" });
+    const response = await post({ ...payload, actor: { id: "user-brandon" }, data: { ...payload.data, assigneeId: "someone-else" } }, { requestConfig });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ignored: true });
+  });
+});
 
 describe("signature verification", () => {
   test("rejects a wrong secret before doing any work", async () => {

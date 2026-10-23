@@ -24,6 +24,8 @@ import {
   pruneRuntimeLifecycleEvents,
 } from "../runtime-registry.ts";
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
+import { projectSourceCheckpoint } from "./source-checkpoint.ts";
+import { queueDelegateResult } from "../../launches/delegate-supervision.ts";
 
 const CONSUMER = "linear-projection:v1";
 const MAX_OUTPUT = 8_000;
@@ -69,7 +71,12 @@ export async function projectRuntimeEvent(
     include: { sessionMirror: true },
   });
   const record = session?.sessionMirror;
-  if (!record) return;
+  if (!record) {
+    if (await projectSourceCheckpoint(config, prisma, runtime, event)) {
+      await advanceRuntimeEventCursor(prisma, { runtimeSessionId: event.sessionId, consumer: CONSUMER, sourceCursor: event.id, generation: sequence > 0n ? sequence : cursor.generation + 1n });
+    }
+    return;
+  }
   const issue = await findAgentIssue(config, { id: record.externalId });
   if (!issue) return;
 
@@ -151,7 +158,10 @@ export function startRuntimeEventProjection(input: {
   const drain = () => {
     chain = chain.then(async () => {
       if (stopped) return;
-      for (const event of await listRuntimeLifecycleEvents(input.prisma)) {
+      const events = await listRuntimeLifecycleEvents(input.prisma);
+      // Local orchestration must keep working when a Linear checkpoint is offline.
+      for (const event of events) await queueDelegateResult(input.prisma, event);
+      for (const event of events) {
         try {
           await projectRuntimeEvent(input.config, input.prisma, input.runtime, event);
         } catch (error) {

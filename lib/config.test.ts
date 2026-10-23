@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { readConfig, routeWebhookRepository } from "./config.ts";
+import { removeRepository } from "./config-repositories.ts";
+import { parseServiceFile } from "./config.ts";
 
 let directory: string;
 let previousConfig: string | undefined;
@@ -102,6 +104,28 @@ afterEach(() => {
 });
 
 describe("readConfig", () => {
+  test("removing the last allowed repository disables intake even after another repository is added", () => {
+    const value = parseServiceFile(serviceFile());
+    removeRepository(value, "example");
+    expect(value.connections["linear-main"]!.repositories).toEqual({});
+    value.repositories.second = { root: "second", worktreeRoot: "../worktrees", worktreeNaming: { "*": "{branch}" } };
+    writeConfig(value);
+    const config = readConfig();
+    expect(config.webhooks["linear-main"]!.repositoryRouting).toEqual({});
+    expect(() => routeWebhookRepository(config, "linear-main", { "linear.actorId": "owner" })).toThrow("did not match");
+    expect(value.connections["linear-second"]!.repositories).toBe("*");
+  });
+  test("an explicit file resolves its own paths without changing the default connection", () => {
+    const defaultFile = writeConfig();
+    const second = path.join(directory, "second");
+    mkdirSync(second);
+    const secondFile = path.join(second, "remote-agent.config.json");
+    writeFileSync(secondFile, JSON.stringify(serviceFile()));
+    expect(readConfig(secondFile).repository.root).toBe(path.join(second, "repository"));
+    expect(process.env.REMOTE_AGENT_CONFIG).toBe(defaultFile);
+    expect(readConfig().repository.root).toBe(path.join(directory, "repository"));
+  });
+
   test("loads all settings from one JSON file and derives neutral paths", () => {
     writeConfig();
     const config = readConfig();

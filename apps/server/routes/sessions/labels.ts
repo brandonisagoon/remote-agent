@@ -19,6 +19,7 @@ const DelegateSchema = z.object({
   model: z.string().min(1).max(128).optional(),
   name: z.string().min(1).max(120).optional(),
   cwd: z.string().min(1).max(4096).optional(),
+  notifyParent: z.boolean().optional(),
 });
 
 const SetLabelSchema = z.object({

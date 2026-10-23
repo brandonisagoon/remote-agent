@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["delegate_session", "register_thread"]);
+        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -78,6 +78,22 @@ describe("remote-agent MCP server", () => {
     );
   });
 
+  test("delegate supervision keeps the caller fixed and escapes target IDs", async () => {
+    const seen: Array<{ method: string; url: string; body: unknown }> = [];
+    await withServer(async (request) => {
+      const url = new URL(request.url);
+      seen.push({ method: request.method, url: url.pathname + url.search, body: request.method === "GET" ? null : await request.json() });
+      return Response.json({ accepted: true });
+    }, async (rpc) => {
+      await rpc({ method: "tools/call", params: { name: "inspect_delegates", arguments: { sessionId: "child/one" } } });
+      await rpc({ method: "tools/call", params: { name: "instruct_delegate", arguments: { sessionId: "child/one", requestKey: "fix-1", text: "Fix the observed issue", parentSessionId: "untrusted" } } });
+    });
+    expect(seen).toEqual([
+      { method: "GET", url: "/api/sessions/session-7/delegates?delegateId=child%2Fone", body: null },
+      { method: "POST", url: "/api/sessions/session-7/delegates/child%2Fone/instructions", body: { requestKey: "fix-1", text: "Fix the observed issue" } },
+    ]);
+  });
+
   test("surfaces server errors as tool errors", async () => {
     await withServer(
       () => Response.json({ error: "session is closed: session-7" }, { status: 400 }),
@@ -88,5 +104,18 @@ describe("remote-agent MCP server", () => {
         expect(result.content[0]!.text).toContain("session is closed");
       },
     );
+  });
+
+  test("issue updates use the caller's fixed session and relay review evidence", async () => {
+    const input = { requestKey: "review-1", body: "1. Open the preview and save an item.", state: "Manual Review", expectedState: "On Course", evidence: [{ path: "/task/result.png", title: "Saved item" }] };
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/issue-update");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual(input);
+      return Response.json({ published: true, commentId: "comment" });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "publish_issue_update", arguments: input } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toEqual({ published: true, commentId: "comment" });
+    });
   });
 });

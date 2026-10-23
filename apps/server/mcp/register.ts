@@ -4,9 +4,8 @@ import type { McpServerStdio } from "@agentclientprotocol/sdk";
 
 import { findExecutable, sourceRoot } from "../../../management/paths.ts";
 
-/** The MCP server every session gets: acpx passes it to the harness, which
-    spawns it per session with the session's environment (where the server
-    injected REMOTE_AGENT_SESSION_ID and REMOTE_AGENT_SOCKET). */
+/** Base MCP descriptor. The runtime supplies explicit session identity in
+    its env list because providers sanitize inherited MCP environments. */
 export function remoteAgentMcpServer(): McpServerStdio {
   const bun = findExecutable("bun") ?? "bun";
   return {

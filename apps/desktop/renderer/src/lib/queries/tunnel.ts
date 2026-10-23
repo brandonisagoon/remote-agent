@@ -1,9 +1,9 @@
 import { queryOptions } from "@tanstack/react-query";
 
-export function tunnelInfoQueryOptions(name: string) {
+export function tunnelInfoQueryOptions(hostId: string, name: string) {
   return queryOptions({
-    queryKey: ["tunnel-info", name],
-    queryFn: () => window.remoteAgent.tunnel.info(name),
+    queryKey: ["tunnel-info", hostId, name],
+    queryFn: () => window.remoteAgent.forHost(hostId).tunnel.info(name),
     staleTime: 60_000,
   });
 }

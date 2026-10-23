@@ -64,6 +64,7 @@ export type AgentRuntimeLifecycleEvent = {
   sequence?: number;
   phase: "started" | "completed" | "failed" | "cancelled";
   error?: string;
+  output?: string;
 };
 
 export type AgentRuntimeEvent =
@@ -128,6 +129,8 @@ export interface AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    /** Claim a durable instruction only after a provider slot is available. */
+    beforeStart?: () => Promise<boolean>;
     /** Answers the agent's planning questions (ACP elicitation) for this
         turn. Absent = headless; acpx resolves them non-interactively. */
     onElicitation?: AgentElicitationHandler;

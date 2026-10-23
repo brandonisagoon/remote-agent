@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useEffect } from "react";
 import { formatForDisplay } from "@tanstack/react-hotkeys";
 import { toast } from "sonner";
@@ -36,6 +37,8 @@ export function DraftToasts({
   onReload(): void;
 }) {
   const { dirty, save, revert } = useConfig();
+  const { host, config } = useHost();
+  useEffect(() => () => { toast.dismiss("unsaved"); toast.dismiss("external-change"); }, []);
   const bindings = useKeybindings();
 
   useEffect(() => {
@@ -43,15 +46,15 @@ export function DraftToasts({
       toast.dismiss("unsaved");
       return;
     }
-    toast("Unsaved changes", {
+    toast(`Unsaved changes · ${host.name}`, {
       id: "unsaved",
       duration: Infinity,
       action: (
         <div className="ml-auto flex gap-2">
-          <Button size="sm" variant="outline" onClick={revert}>
+          <Button size="sm" variant="outline" disabled={config.saving} onClick={revert}>
             Revert <ButtonKbds chord={bindings["revert"]} />
           </Button>
-          <Button size="sm" onClick={() => void save()}>
+          <Button size="sm" disabled={config.saving} onClick={() => void save()}>
             Save <ButtonKbds chord={bindings["save"]} onDark />
           </Button>
         </div>

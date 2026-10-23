@@ -1,10 +1,14 @@
 import { Hono } from "hono";
+import type { Context } from "hono";
+import { routeLinearDelivery } from "../../services/tasks/routing.ts";
+import { completeLinearRouting } from "../../integrations/linear/webhooks/routing.ts";
 
 import { MAX_REQUEST_BYTES } from "../../../../lib/config.ts";
 import {
   getWebhookConfig,
   routeWebhookRepository,
   scopeConfig,
+  WebhookNotSubscribedError,
 } from "../../../../lib/config.ts";
 import {
   IssueWebhookResultKind,
@@ -22,9 +26,13 @@ import {
 import type { AppEnv } from "../../middleware/context.ts";
 
 const route = new Hono<AppEnv>();
+export const forwardedLinearRoute = new Hono<AppEnv>();
+forwardedLinearRoute.post("/:webhookId", (c) => receiveLinear(c, true));
+route.post("/", (c) => receiveLinear(c, false));
 
-route.post("/", async (c) => {
+async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
     const config = c.get("config");
+    if (!forwarded && config.routing?.receiverOnly) return c.json({ error: "This host receives Linear activity through its configured ingress" }, 403);
     const webhookId = c.req.param("webhookId");
     if (!webhookId) return c.json({ error: "Unknown webhook" }, 404);
     let webhookConfig;
@@ -44,7 +52,7 @@ route.post("/", async (c) => {
     if (Buffer.byteLength(rawBody) > MAX_REQUEST_BYTES) {
       return c.json({ error: "Payload Too Large" }, 413);
     }
-    if (
+    if (!forwarded &&
       !verifyTrackerWebhookSignature(
         rawBody,
         c.req.header("linear-signature") ?? null,
@@ -65,7 +73,7 @@ route.post("/", async (c) => {
     if (!envelope.success) {
       return c.json({ error: "Unrecognized webhook envelope" }, 400);
     }
-    if (Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
+    if (!forwarded && Math.abs(Date.now() - envelope.data.webhookTimestamp) > webhookConfig.webhookMaxAgeMs) {
       return c.json({ error: "Stale webhook" }, 401);
     }
 
@@ -84,13 +92,22 @@ route.post("/", async (c) => {
         : {};
     let repository;
     try {
-      repository = routeWebhookRepository(config, webhookId, {
+      const attributes = await completeLinearRouting(config, webhookConfig, {
         "linear.organizationId": record.organizationId,
         "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
         "linear.teamKey": team.key,
         "linear.projectId": data.projectId ?? issueRoutingData.projectId ?? project.id,
-      });
+        // State changes belong to the envelope actor. Comments/reactions
+        // belong to their author, never the issue's assignee or creator.
+        "linear.userId": record.type === "Issue"
+          ? record.actor?.id
+          : data.userId ?? data.user?.id,
+      }, record.type === "Issue" ? data.id : data.issueId ?? issueRoutingData.id);
+      repository = routeWebhookRepository(config, webhookId, attributes);
     } catch (error) {
+      // A valid delivery outside the owner's subscription is consumed without
+      // work. Retrying it cannot grant permission and can disable the webhook.
+      if (error instanceof WebhookNotSubscribedError) return c.json({ accepted: false, ignored: true, reason: "outside_subscription" }, 200);
       return c.json(
         { error: error instanceof Error ? error.message : String(error) },
         409,
@@ -105,6 +122,12 @@ route.post("/", async (c) => {
     const deliveryId = c.req.header("linear-delivery");
     if (!deliveryId) {
       return c.json({ error: "Missing Linear-Delivery header" }, 400);
+    }
+    if (!forwarded && config.routing?.ingress) {
+      try {
+        const queued = await routeLinearDelivery({ prisma, config, webhookId, connectionId: webhookConfig.connectionId, repositoryId: repository.id, deliveryId, webhook: record });
+        return c.json({ accepted: true, placementId: queued.placement.id, deliveryId: queued.delivery.id, state: queued.delivery.state }, 202);
+      } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
     }
 
     const issue = TrackerIssueWebhookSchema.safeParse(parsed);
@@ -227,6 +250,6 @@ route.post("/", async (c) => {
       }
       throw error;
     }
-});
+}
 
 export default route;

@@ -5,6 +5,19 @@
     "$schema": {
       "type": "string"
     },
+    "baseBranch": {
+      "default": "main",
+      "type": "string",
+      "minLength": 1
+    },
+    "preparation": {
+      "default": "command",
+      "type": "string",
+      "enum": [
+        "command",
+        "agent"
+      ]
+    },
     "bootstrapCommand": {
       "default": [
         "bash",
@@ -213,6 +226,8 @@
     }
   },
   "required": [
+    "baseBranch",
+    "preparation",
     "bootstrapCommand",
     "skillsRoot",
     "branchNaming",

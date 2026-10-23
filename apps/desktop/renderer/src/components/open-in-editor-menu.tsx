@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useQuery } from "@tanstack/react-query";
 
 import { buildEditorDeepLink, sshLinkSupported } from "../../../../../lib/machines/editor-link.ts";
@@ -29,11 +30,12 @@ export function OpenInEditorMenu({
 }) {
   const { draft } = useConfig();
   const { data: editors = [] } = useQuery(detectedEditorsQueryOptions);
-  const sshHost = draft.machine.sshHost ?? null;
+  const { host, api } = useHost();
+  const sshHost = host.kind === "ssh" ? host.sshHost : draft.machine.sshHost ?? null;
 
   const openIn = (editor: { scheme: string | null; open: "scheme" | "app"; appPath: string }) => {
     if (editor.open === "app" || !editor.scheme) {
-      void window.remoteAgent.shell.openWith(editor.appPath, target);
+      void api.shell.openWith(editor.appPath, target);
       return;
     }
     const remote = sshHost !== null && sshLinkSupported(editor.scheme);
@@ -70,7 +72,7 @@ export function OpenInEditorMenu({
       </Tooltip>
       <DropdownMenuContent align={align}>
         {editors.map((editor) => (
-          <DropdownMenuItem key={editor.scheme ?? editor.appPath} onSelect={() => openIn(editor)}>
+          <DropdownMenuItem disabled={host.kind === "ssh" && (!editor.scheme || !sshLinkSupported(editor.scheme))} key={editor.scheme ?? editor.appPath} onSelect={() => openIn(editor)}>
             {editor.icon ? (
               <img src={editor.icon} alt="" className="size-4.5" />
             ) : (
