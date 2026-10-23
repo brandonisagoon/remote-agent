@@ -16,7 +16,6 @@ import { ProviderPage } from "@renderer/pages/provider/provider-page.tsx";
 import { MachinePage } from "@renderer/pages/machine/machine-page.tsx";
 import { ProvidersTab } from "@renderer/pages/machine/providers-tab.tsx";
 import { ConnectionsTab } from "@renderer/pages/machine/connections-tab.tsx";
-import { MachineDetailHeading } from "@renderer/pages/machine/machine-detail-heading.tsx";
 import { RepositoryPage } from "@renderer/pages/repository/repository-page.tsx";
 
 const rootRoute = createRootRoute({
@@ -66,7 +65,7 @@ const providerRoute = createRoute({
   component: function Provider() {
     const { providerId } = providerRoute.useParams();
     const { draft, mutate } = useConfig();
-    return <><MachineDetailHeading kind="provider" id={providerId} /><ProviderPage id={providerId} value={draft} mutate={mutate} /></>;
+    return <ProviderPage id={providerId} value={draft} mutate={mutate} />;
   },
 });
 
@@ -76,7 +75,7 @@ const connectionRoute = createRoute({
   component: function Connection() {
     const { connectionId } = connectionRoute.useParams();
     const { draft, mutate } = useConfig();
-    return <><MachineDetailHeading kind="connection" id={connectionId} /><ConnectionPage id={connectionId} value={draft} mutate={mutate} /></>;
+    return <ConnectionPage id={connectionId} value={draft} mutate={mutate} />;
   },
 });
 
