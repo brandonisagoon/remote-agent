@@ -55,10 +55,11 @@ header, matching repository tabs. Providers and connections open their existing
 settings inside their machine tab, with a link back to the list. Old standalone
 provider and connection URLs redirect to those details on the same host.
 Machine tabs use the same compact bottom path bar as repository pages. It shows
-the current navigation path, such as **Providers › Claude Code** or
-**Connections › Linear**, with a link back to that machine's list. The detail's
-removal action stays at the right of the bar. Repository path bars continue to
-show the checkout's filesystem path. Holding the sidebar jump shortcut modifiers
+the current navigation path, such as **MacBook Air › Providers › Claude Code** or
+**MacBook Air › Connections › Linear**. Every path bar starts with a link to its
+owning machine; the list segment returns to that machine's list. The detail's
+removal action stays at the right of the bar. Repository path bars show their
+owning machine followed by the checkout's filesystem path. Holding the sidebar jump shortcut modifiers
 replaces repository machine badges with the corresponding keyboard hints.
 The legacy `activeId` field only supplies the initial destination for an
 unqualified link. Navigation never rewrites the profile file.
