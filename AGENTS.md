@@ -123,6 +123,10 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 
 - Kebab-case file names. Explicit named exports in barrels, no `export *`.
 - Worktree seam: the server owns git (`worktree add`, path flattening). The
+  configured remote base (for example `origin/staging`) is fetched before a
+  new task pins its base commit; fetch failure blocks launch. Retries reuse
+  the recorded commit and never pull or reset an existing task's worktree.
+  Explicit commits and local branch bases retain their configured meaning. The
   default command preparation runs bootstrap once and fails on nonzero exit.
   Agent preparation starts in the created target worktree and reports actual
   readiness separately. External tooling is pinned to a committed revision;

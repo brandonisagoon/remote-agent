@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
@@ -58,6 +58,41 @@ test("tooling policy is read from a commit, not dirty source changes", () => {
   const revision = git(repo.root, "rev-parse", "HEAD");
   writeFileSync(path.join(repo.root, ".remote-agent.config.json"), JSON.stringify({ preparation: "command" }));
   expect(readToolingSource(repo.root, revision)).toEqual({ revision, settings: { preparation: "agent" } });
+});
+
+test("new tasks pin fetched staging while retries preserve their base, worktree and unfinished edits", async () => {
+  const repo = repository();
+  const remote = path.join(directory, "upstream");
+  git(directory, "clone", repo.root, remote);
+  git(remote, "config", "user.name", "Fixture");
+  git(remote, "config", "user.email", "fixture@example.com");
+  git(repo.root, "remote", "add", "origin", remote);
+  git(repo.root, "fetch", "origin");
+  repo.baseBranch = "origin/staging";
+  const advance = (message: string) => {
+    writeFileSync(path.join(remote, "README.md"), message);
+    git(remote, "add", "."); git(remote, "commit", "-m", message);
+    return git(remote, "rev-parse", "HEAD");
+  };
+  const latest = advance("new staging");
+  const task = await beginTask(db.prisma, { requestKey: "fresh-task", repository: repo, machineId: "air", branchName: "codex/fresh-task" });
+  const worktree = await provisionTaskWorktree(db.prisma, task.id, repo, "fresh-task");
+  expect(git(worktree, "rev-parse", "HEAD")).toBe(latest);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).baseCommit).toBe(latest);
+  writeFileSync(path.join(worktree, "README.md"), "unfinished owner work");
+  const next = advance("next task base");
+  git(repo.root, "remote", "set-url", "origin", path.join(directory, "missing"));
+  expect(await provisionTaskWorktree(db.prisma, task.id, repo, "ignored")).toBe(worktree);
+  expect(readFileSync(path.join(worktree, "README.md"), "utf8")).toBe("unfinished owner work");
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).baseCommit).toBe(latest);
+  const second = await beginTask(db.prisma, { requestKey: "next-task", repository: repo, machineId: "air", branchName: "codex/next-task" });
+  await expect(provisionTaskWorktree(db.prisma, second.id, repo, "next-task")).rejects.toThrow("Worktree base preparation failed");
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: second.id } })).toMatchObject({ worktreePath: null, baseCommit: null });
+  expect(existsSync(path.join(repo.worktreeRoot, "next-task"))).toBeFalse();
+  git(repo.root, "remote", "set-url", "origin", remote);
+  const secondWorktree = await provisionTaskWorktree(db.prisma, second.id, repo, "next-task");
+  expect(git(secondWorktree, "rev-parse", "HEAD")).toBe(next);
+  expect(git(worktree, "rev-parse", "HEAD")).toBe(latest);
 });
 
 test("launch content remains bound to its request key after client disposal", async () => {
