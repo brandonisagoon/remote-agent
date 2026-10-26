@@ -43,6 +43,14 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `read_source_issue` and `ask_question` use the session's linked issue and
   server-held credential. `RuntimeQuestion` persists a client-assigned comment
   UUID before delivery; retries reuse it and preserve an already-answered thread.
+- **Source attachments** (`apps/server/services/sessions/source-attachments.ts`) —
+  `download_source_attachment` validates membership in the linked issue,
+  comments or attachments and uses that connection's server-held credential.
+  Only the exact HTTPS Linear uploads origin receives authentication; redirects
+  are refused, app-token 401s renew once and downloads are capped at 50 MiB.
+  Completed files are private session-cache inputs outside the product worktree.
+  Tooling recovery policy belongs in the external skills and uses the existing
+  supervised Codex delegate/inbox flow, not a second session orchestrator.
 - **Source-issue updates** (`apps/server/services/sessions/issue-updates.ts`) —
   `publish_issue_update` is primary-only and bound to the session's source issue.
   `RuntimeIssueUpdate` persists the request, upload receipts and comment UUID.

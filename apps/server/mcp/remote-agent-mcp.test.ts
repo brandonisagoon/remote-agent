@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["read_source_issue", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
+        expect(names).toEqual(["read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -104,6 +104,19 @@ describe("remote-agent MCP server", () => {
         expect(result.content[0]!.text).toContain("session is closed");
       },
     );
+  });
+
+  test("attachment downloads bind to the caller's session and expose only a local receipt", async () => {
+    const url = "https://uploads.linear.app/workspace/image/file";
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/source-attachment");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual({ url });
+      return Response.json({ path: "/private/attachment.png", contentType: "image/png", size: 123 });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "download_source_attachment", arguments: { url, sessionId: "someone-else", path: "/untrusted/destination" } } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toMatchObject({ path: "/private/attachment.png", size: 123 });
+    });
   });
 
   test("issue updates use the caller's fixed session and relay review evidence", async () => {

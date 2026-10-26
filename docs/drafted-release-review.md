@@ -12,6 +12,8 @@ Reviewed against this repository's AGENTS.md and Cubic's CLAUDE.md, service/rout
 
 ## Reviewed boundaries
 
+The Linear attachment follow-up also checks source-issue membership, exact upload-origin authentication, one app-token refresh on 401, refusal of redirects, bounded streamed downloads, private files outside product worktrees, and refusal during human control. The external Drafted policy uses existing supervised Codex workers for bounded tooling recovery and preserves planning-only scope. It does not grant agents permission to redeploy the shared server or broaden credentials.
+
 - Desktop host-qualified routes, requests, drafts, explicit saves and stale-revision protection; all-machine repository and session listings; secret markers restored only at their original field; private SSH preview transport.
 - Stable ACP session ownership across Cubic and Drafted, collision rejection, most-specific worktree routing, and failure without replacing existing conversations.
 - Signed Linear intake, actor filtering before launch, app-token renewal, issue-bound question and evidence delivery, durable instruction outcomes, per-host turn capacity and explicit control handoff.
