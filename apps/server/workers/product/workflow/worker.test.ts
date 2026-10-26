@@ -83,6 +83,7 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
       return { status: "delivered", detail: "forwarded", targetResourceId: null };
     }) as unknown as WorkflowWorkerDependencies["forward"],
     hasLiveSession: async () => false,
+    continuePlan: async () => null,
     ...overrides,
   };
 }

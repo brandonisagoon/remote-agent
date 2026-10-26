@@ -22,6 +22,7 @@ import { buildWorkflowSessionName } from "./launch.ts";
 import { beginTask, taskForSession } from "../../../services/tasks/store.ts";
 import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
+import { continuePlanningSession } from "./continue-plan.ts";
 
 type WorkflowEvent = Extract<
   DispatchEvent,
@@ -40,6 +41,7 @@ export interface WorkflowWorkerDependencies {
   launch?: typeof spawnAgentThread;
   forward?: typeof forwardMessage;
   hasLiveSession?: typeof hasLivePersistentSessionForResource;
+  continuePlan?: typeof continuePlanningSession;
 }
 
 const defaultDependencies: WorkflowWorkerDependencies = {
@@ -144,7 +146,22 @@ export function createWorkflowWorker(
         });
       }
 
-      // start-session: fresh worktree, composed skill, persistent primary.
+      // A planning primary is an existing conversation to continue, not a
+      // duplicate implementation launch. Resolve it before the generic guard.
+      const continuation = await (dependencies.continuePlan ?? continuePlanningSession)({
+        context, workflow, issueIdentifier: issue.identifier, compose: dependencies.compose,
+        seed: buildWorkflowSeedPrompt(workflow, {
+          sourceIssueIdentifier: issue.identifier,
+          sourceIssueTitle: issue.title,
+          sourceIssueDescription: issue.description ?? "(No description)",
+        }),
+      });
+      if (continuation) {
+        if (continuation.status === "delivered") await dependencies.react(context.config.linearApiKey, issue.id, TrackerReaction.CodeChange);
+        return continuation;
+      }
+
+      // Otherwise start a fresh worktree and persistent primary.
       if (await (dependencies.hasLiveSession ?? hasLivePersistentSessionForResource)(context.prisma, {
         repositoryId: repository.id,
         provider: "linear",

@@ -85,7 +85,11 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   handlers (`apps/server/workflows/match.ts`), executed by the single workflow
   worker (`apps/server/workers/product/workflow/`), which composes
   `{{SKILL:skillset+flags}}` tokens via `composeForPrompt` inside the
-  session's worktree.
+  session's worktree. A start workflow after plan capture continues the sole
+  idle primary with the configured provider/model and its original task,
+  worktree and tooling pin. A durable inbox preparation reservation blocks
+  follow-ups until setup commits with the workflow change and execution
+  prompt; duplicate reactions cannot enqueue a second implementation.
 
 ## Layout
 

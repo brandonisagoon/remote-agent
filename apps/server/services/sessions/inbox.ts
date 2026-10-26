@@ -34,7 +34,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
       if (visited.has(receipt.sessionId)) continue;
       visited.add(receipt.sessionId);
       if (running.has(receipt.id)) continue;
-      if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown"] } } })) continue;
+      if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown", "preparing"] } } })) continue;
       const session = await runtime.getSession(receipt.sessionId);
       if (!session || session.status === "closed") {
         await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "failed", detail: "Session is unavailable or closed" } });
