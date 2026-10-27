@@ -31,7 +31,7 @@ beforeEach(async () => {
     ) {
       return Response.json({ data: { issue: null } });
     }
-    if (body.query.includes("CreateReaction")) {
+    if (body.query.includes("CreateReaction") || body.query.includes("CreateIssueReaction")) {
       return Response.json({
         data: { reactionCreate: { success: true } },
       });
@@ -41,9 +41,18 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await Bun.sleep(10);
-  globalThis.fetch = originalFetch;
-  await db.cleanup();
+  const unsettled = () => prisma.webhookReceipt.count({ where: {
+    status: "accepted",
+    OR: [{ runs: { none: {} } }, { runs: { some: { status: "pending" } } }],
+  } });
+  try {
+    // A 202 acknowledges intake, not worker completion; keep its DB and fetch stub alive.
+    for (let i = 0; i < 100 && await unsettled() > 0; i++) await Bun.sleep(5);
+    expect(await unsettled()).toBe(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await db.cleanup();
+  }
 });
 
 function commentPayload(overrides: Record<string, unknown> = {}) {
