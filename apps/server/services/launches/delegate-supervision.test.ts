@@ -33,6 +33,9 @@ test("terminal results survive replay, remain queued during human control, and r
   expect(runtime.sentMessages).toHaveLength(0);
   await prisma.remoteTask.update({ where: { id: "task-one" }, data: { controlMode: "agent" } });
   await deliverInstructions(prisma, runtime);
+  // Delivery continues in the background; settle its receipt before closing SQLite.
+  for (let i = 0; i < 50 && await prisma.runtimeInstruction.count({ where: { id: receipt.id, state: "completed" } }) < 1; i++) await Bun.sleep(5);
+  expect((await prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } })).state).toBe("completed");
   expect(runtime.sentMessages).toHaveLength(1);
   expect(runtime.sentMessages[0]!.sessionId).toBe(parent.id);
 });
