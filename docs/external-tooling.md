@@ -4,6 +4,16 @@ An optional machine repository entry `tooling: { root, ref }` selects another Gi
 
 The external policy may set `baseBranch` (for example `origin/staging`) and `preparation: "agent"`. Remote Agent creates the worktree before starting its primary agent. Skill Composer runs from the pinned tooling checkout with its own dependencies and writes generated skills through its supported output-directory overrides. Narrow local Git excludes keep those generated folders out of product PRs.
 
+When external tooling includes `AGENTS.md`, its contents are included directly
+in the task message with the pinned source path. This delivers owner-configured
+task exceptions alongside the request instead of relying on a skill file to
+override the target repository's general instructions. Composition-based
+workflow continuations and composition-failure repair prompts retain that
+policy. Repositories without external tooling keep their existing prompts.
+The mutable tooling source and the target's tracked instruction files are not
+rewritten. This is instruction delivery, not a permission or sandbox bypass;
+actual task control and provider approval restrictions still apply.
+
 A remote branch base is fetched before each new launch resolves its commit. Fetch errors block creation, even when a cached tracking ref exists. Parallel launches can share an in-flight fetch, but no result is cached for later launches. The task persists the resulting `baseCommit` before creating its worktree; retries use that recorded commit without refetching or changing existing work. Local branch names and explicit commit revisions continue to use the caller-selected local state. The configured target clone is never pulled, checked out or reset as part of this process.
 
 `RemoteTask` is created before setup and retains its request key, host, target branch/base, worktree, pinned tooling revision, primary session, environment status and resource receipts. Retrying the same request reuses that identity. Setup failures remain visible; both direct and workflow launches can start a repair agent in the already-created worktree. Unknown worktrees are not adopted. A resource key cannot be reassigned to a different external resource.
@@ -21,6 +31,20 @@ Human control transitions through draining → human → paused or explicit resu
 ## Owner supervision and delivery
 
 `apps/server/mcp/owner-mcp.ts --socket PATH` exposes owner-only stdio tools over the private control socket. Connect it through the owner's SSH identity. It lists tasks and placements, reads actual transcripts and questions, launches on an explicit host, queues instructions, answers questions, and pauses/resumes/closes work. It is intentionally separate from the narrower MCP injected into task agents. Closing work retains files and preview leases; resource cleanup belongs to the external tooling adapter. This is a supported supervision interface, not a native Codex import of an acpx transcript.
+
+### Outcome recovery and completion
+
+Owner comments on a managed source issue and registered direct children now enter the existing primary's durable inbox. They do not require a mention or a new routing/model call. Paused/human-controlled work remains queued until handback. `read_work_graph` binds current direct children; `publish_child_issue_update` reconciles only those acceptance units and checks dependencies. Parent handoff refuses unfinished children; Manual Review may retain explicitly reported Blocked units, while Done requires completed/canceled units and the agreed delivery boundary.
+
+Configured owner Merge transitions record completion authority and acceptance of the task's actual content automatically. No extra approval API call is required for that normal path. Commit, remote publication, PR, review and merge are independently observed; reporting a successful turn cannot manufacture delivery. Explicit local/research boundaries are supported without forcing a PR. For exceptional owner decisions, `owner-mcp.ts --socket PATH --config FILE` enables authenticated completion-contract and verification writes using the config's API key. These writes require bearer authentication even on the local control socket and are not session tools. Do not use them to fabricate a missing approval or verification result.
+
+Finalization is two-phase: the task-bound adapter prepares a success-only delivery receipt before cleanup, removes exact owned resources and the clean worktree, asks the server to confirm filesystem/Git absence against that receipt, publishes Done, then closes the primary last. A missing checkout without both receipts is not successful completion. Interrupted cleanup and publication reuse stable keys; no broad Git pruning, closed-session bypass or repeated blind deletion is needed.
+
+Old pins can resolve named capabilities from `.remote-agent-capabilities.json` at the owner-configured committed host tooling revision. This preserves the original task pin and records separate immutable provenance. Session tools expose only `development-credentials`, returning instructions/adapter references, never secret values or automatic export. Preparation and owner-authorized Merge use internal bounded compatibility paths. Mutable source edits are not release capabilities.
+
+Interrupted delivery remains unknown until the exact provider process is proven stopped and its effects inspected. Supported instruction resolution is idempotent and gives an authorized retry a new lifecycle identity; it never blindly replays an uncertain effect. Activity inspection separates actual in-process execution from persisted active state, queued work, owner waits, control state and delivery uncertainty. It does not resume work or invent an ETA.
+
+Known projection failures use a durable per-event retry budget: five failed attempts with exponential backoff. Exhaustion retains the original journal event and inbox identity; unrelated sessions continue. After inspecting and correcting the cause, the authenticated owner can request `POST /api/tasks/:taskId/projection-retries` with `{sessionId, eventId, stage, requestKey, reason}`. `stage` is `notify`, `project` or `stall`. Only an exhausted delivery owned by this open, agent-controlled task can be reset. A stable request key cannot replenish a later exhausted cycle. This retries idempotent projection work, not a provider turn, and never resumes paused control. Pending/exhausted delivery receipts remain visible in task activity.
 
 Direct tasks can call `ask_question` without a Linear link. The question persists locally for owner supervision. Answering persists one instruction atomically with the answered state; repeated identical answers are safe and changed answers are rejected. Linked questions still use their fixed Linear comment UUID.
 

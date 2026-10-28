@@ -26,6 +26,8 @@ import {
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
 import { projectSourceCheckpoint } from "./source-checkpoint.ts";
 import { queueDelegateResult } from "../../launches/delegate-supervision.ts";
+import { runRuntimeProjectionAttempt } from "./projection-retries.ts";
+import { projectTaskStalls } from "./task-stalls.ts";
 
 const CONSUMER = "linear-projection:v1";
 const MAX_OUTPUT = 8_000;
@@ -148,27 +150,52 @@ export async function projectRuntimeEvent(
   }
 }
 
-export function startRuntimeEventProjection(input: {
+type ProjectionInput = {
   config: ServerConfig;
   prisma: PrismaClient;
   runtime: AgentSessionRuntime;
-}): () => Promise<void> {
+};
+
+/** Reconcile each session independently: one failed remote checkpoint or
+ * malformed result must not strand unrelated owners' completed workers. */
+export async function drainRuntimeEventProjection(
+  input: ProjectionInput,
+  delivery = { notify: queueDelegateResult, project: projectRuntimeEvent },
+  options: { now?: () => number } = {},
+): Promise<void> {
+  const events = await listRuntimeLifecycleEvents(input.prisma);
+  const blocked = new Set<string>();
+  // Persist local continuations before any remote projection can prune events.
+  for (const event of events) {
+    if (blocked.has(event.sessionId)) continue;
+    try {
+      if (!(await runRuntimeProjectionAttempt(input.prisma, { sessionId: event.sessionId, eventId: event.id, stage: "notify" }, () => delivery.notify(input.prisma, event), options.now))) blocked.add(event.sessionId);
+    } catch (error) {
+      blocked.add(event.sessionId);
+      console.error(`[runtime-events] failed to queue result ${event.id}:`, error);
+    }
+  }
+  for (const event of events) {
+    if (blocked.has(event.sessionId)) continue;
+    try {
+      if (!(await runRuntimeProjectionAttempt(input.prisma, { sessionId: event.sessionId, eventId: event.id, stage: "project" }, () => delivery.project(input.config, input.prisma, input.runtime, event), options.now))) blocked.add(event.sessionId);
+    } catch (error) {
+      // Preserve this session's order and retain its durable event on failure,
+      // while other sessions can still publish and advance their own cursors.
+      blocked.add(event.sessionId);
+      console.error(`[runtime-events] failed to project ${event.id}:`, error);
+    }
+  }
+}
+
+export function startRuntimeEventProjection(input: ProjectionInput): () => Promise<void> {
   let chain = Promise.resolve();
   let stopped = false;
   const drain = () => {
     chain = chain.then(async () => {
       if (stopped) return;
-      const events = await listRuntimeLifecycleEvents(input.prisma);
-      // Local orchestration must keep working when a Linear checkpoint is offline.
-      for (const event of events) await queueDelegateResult(input.prisma, event);
-      for (const event of events) {
-        try {
-          await projectRuntimeEvent(input.config, input.prisma, input.runtime, event);
-        } catch (error) {
-          console.error(`[runtime-events] failed to project ${event.id}:`, error);
-          break;
-        }
-      }
+      await drainRuntimeEventProjection(input);
+      await projectTaskStalls(input);
     }).catch((error) => {
       console.error("[runtime-events] journal drain failed:", error);
     });

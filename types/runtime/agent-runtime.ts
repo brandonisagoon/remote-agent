@@ -117,6 +117,11 @@ export interface EnsureAgentSessionInput {
 export interface AgentSessionRuntime {
   ensureSession(input: EnsureAgentSessionInput): Promise<AgentRuntimeSession>;
   getSession(sessionId: string): Promise<AgentRuntimeSession | null>;
+  /** Explicit recovery only: prove the provider writer has stopped before
+   * clearing stale active state. Never infers an instruction's outcome. */
+  reconcileInterruptedSession?(sessionId: string): Promise<AgentRuntimeSession>;
+  /** Process-local observation; absence of owned work never proves idle. */
+  observeSessionActivity?(sessionId: string): { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
   listSessions(input?: {
     cwd?: string;
     repositoryId?: string;

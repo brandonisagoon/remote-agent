@@ -7,6 +7,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import * as dispatcher from "../../services/dispatcher/index.ts";
 
 const SECRET = "test-webhook-secret";
 const AGENT_USER_ID = "11111111-2222-3333-4444-555555555555";
@@ -19,10 +20,22 @@ const config: ServerConfig = testConfig({
 
 let db: TestDatabase;
 let prisma: PrismaClient;
+const dispatchEvent = dispatcher.dispatchEvent;
+let dispatches: Array<Promise<void>>;
+let dispatchSpy: ReturnType<typeof spyOn<typeof dispatcher, "dispatchEvent">>;
 
 beforeEach(async () => {
   db = await createTestDatabase();
   prisma = db.prisma;
+  dispatches = [];
+  dispatchSpy = spyOn(dispatcher, "dispatchEvent").mockImplementation((...args) => {
+    const pending = dispatchEvent(...args);
+    dispatches.push(pending);
+    // The webhook intentionally returns before dispatch completes. Observe
+    // rejection now, then assert its actual result before deleting the DB.
+    void pending.catch(() => undefined);
+    return pending;
+  });
   globalThis.fetch = (async (_input, init) => {
     const body = JSON.parse(String(init?.body)) as { query: string };
     if (
@@ -41,15 +54,14 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  const unsettled = () => prisma.webhookReceipt.count({ where: {
-    status: "accepted",
-    OR: [{ runs: { none: {} } }, { runs: { some: { status: "pending" } } }],
-  } });
   try {
-    // A 202 acknowledges intake, not worker completion; keep its DB and fetch stub alive.
-    for (let i = 0; i < 100 && await unsettled() > 0; i++) await Bun.sleep(5);
-    expect(await unsettled()).toBe(0);
+    await Promise.all(dispatches);
+    expect(await prisma.webhookReceipt.count({ where: {
+      status: "accepted",
+      OR: [{ runs: { none: {} } }, { runs: { some: { status: "pending" } } }],
+    } })).toBe(0);
   } finally {
+    dispatchSpy.mockRestore();
     globalThis.fetch = originalFetch;
     await db.cleanup();
   }

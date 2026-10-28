@@ -9,6 +9,17 @@ const GET_SOURCE_ISSUE = `
   }
 `;
 
+/** Resolve live parentage for a newly added child before its primary has read
+ * the work graph. A webhook's identifier alone never grants task ownership. */
+export async function getSourceIssueParent(config: ServerConfig, query: { id: string }) {
+  const data = await linearGraphql<{ issue: { id: string; identifier: string; parent: { id: string; identifier: string } | null } | null }>(
+    config.linearApiKey,
+    `query SourceIssueParent($id: String!) { issue(id: $id) { id identifier parent { id identifier } } }`,
+    query,
+  );
+  return data.issue;
+}
+
 const GET_SOURCE_ISSUE_WITH_AGENT_ISSUES = `
   query SourceIssueWithAgentIssues($id: String!) {
     issue(id: $id) {
