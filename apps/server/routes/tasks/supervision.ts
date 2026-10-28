@@ -5,8 +5,17 @@ import { queueInstruction, deliverInstructions, resolveTaskInstruction } from ".
 import { changeTaskControl } from "../../services/tasks/control.ts";
 import { answerSessionQuestion } from "../../services/sessions/questions.ts";
 import { readTaskActivity } from "../../services/tasks/activity.ts";
+import { ProjectionRetryStage, retryTaskRuntimeProjection } from "../../services/sessions/runtime-events/projection-retries.ts";
 
 export const taskSupervisionRoutes = new Hono<AppEnv>();
+
+taskSupervisionRoutes.post("/:taskId/projection-retries", async (c) => {
+  const parsed = z.object({ sessionId: z.string().min(1).max(200), eventId: z.string().min(1).max(500), stage: ProjectionRetryStage,
+    requestKey: z.string().min(1).max(200), reason: z.string().trim().min(1).max(2000) }).strict().safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Identify the exhausted delivery and record an explicit recovery reason" }, 400);
+  try { return c.json(await retryTaskRuntimeProjection(c.get("prisma"), { taskId: c.req.param("taskId"), ...parsed.data }), 202); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 taskSupervisionRoutes.post("/:taskId/questions/:questionId/answer", async (c) => {
   const parsed = z.object({ answer: z.string().min(1).max(100_000) }).strict().safeParse(await c.req.json());

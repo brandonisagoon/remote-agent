@@ -1,5 +1,6 @@
 import type { PrismaClient, RemoteTask, RuntimeInstruction, RuntimeLifecycleEvent, RuntimeQuestion, RuntimeSession } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import { listRuntimeProjectionRetries } from "../sessions/runtime-events/projection-retries.ts";
 
 type Task = Pick<RemoteTask, "id" | "phase" | "controlMode" | "recoveryDetail">;
 type Session = Pick<RuntimeSession, "id" | "status" | "closedAt" | "recoveryDetail">;
@@ -131,12 +132,22 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
       });
     }
   }
-  const activity = { ...main.activity, pendingDelegateResults, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
+  const projectionRetries = primarySession ? await listRuntimeProjectionRetries(prisma, [primarySession.id, ...children.map((child) => child.id)]) : [];
+  const activity = { ...main.activity, pendingDelegateResults, projectionRetries, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
   if (activity.state === "idle" && pendingDelegateResults.length) {
     activity.state = "stalled"; activity.cause = "A completed delegate result has not completed delivery to the primary";
     activity.since = pendingDelegateResults[0]!.since; activity.durationMs = pendingDelegateResults[0]!.durationMs;
   } else if (activity.state === "idle" && activity.activeDelegateSessionIds.length) {
     activity.state = "waiting-active-work"; activity.cause = "The primary has no queued work; its delegates have observed active turns";
+  }
+  // Publication failure is independent of provider liveness. Preserve executing,
+  // queued and paused states; expose its bounded recovery separately in all cases.
+  const failedNotification = projectionRetries.find((retry) => retry.stage === "notify" && retry.state === "exhausted");
+  if (failedNotification && ["idle", "unknown", "stalled"].includes(activity.state)) {
+    activity.state = "stalled";
+    activity.cause = "Delegate-result notification exhausted its automatic delivery attempts; explicit projection recovery is required";
+    activity.since = new Date(failedNotification.failedAt).toISOString();
+    activity.durationMs = Math.max(0, now - failedNotification.failedAt);
   }
   return { task, session: main.session, history: main.history, questions: main.questions, instructions: main.instructions, delegates, activity };
 }

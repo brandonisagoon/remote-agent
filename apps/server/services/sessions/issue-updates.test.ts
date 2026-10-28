@@ -216,3 +216,66 @@ test("child graph rejects delegates and paused task automation", async () => {
   await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
   await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("paused");
 });
+
+test("DRA-28 implementation scopes advance independently while verification waits for all three and gates parent review", async () => {
+  const f = await fixture();
+  f.issue.identifier = "DRA-28";
+  const todo = { id: "todo", name: "Todo", type: "unstarted" };
+  const verifying = { id: "verifying", name: "Verification", type: "started" };
+  f.states.push(todo, verifying);
+  const definitions = [
+    ["DRA-29", "Persist semantic question identities"],
+    ["DRA-30", "Apply history to lot and survey asks"],
+    ["DRA-32", "Share question guards across structured tools"],
+    ["DRA-31", "Verify no-repeat behavior"],
+  ] as const;
+  const children = definitions.map(([identifier, title]) => ({ ...f.issue, id: identifier, identifier, title, state: todo }));
+  const implementations = children.slice(0, 3);
+  const verification = children[3]!;
+  const graph = () => children.map((child): WorkIssue => ({
+    id: child.id, identifier: child.identifier, title: child.title, url: `https://linear.app/issue/${child.identifier}`,
+    state: child.state, parent: { id: f.issue.id, identifier: f.issue.identifier }, completedAt: null,
+    blocks: child === verification ? [] : [verification.id],
+    blockedBy: child === verification ? implementations.map(({ id }) => id) : [],
+  }));
+  const client = { ...f.client,
+    graph: async (_config: ServerConfig, query: { id: string }) => ({ id: query.id, identifier: f.issue.identifier, states: f.states, children: query.id === f.issue.id ? graph() : [] }),
+    read: async (_config: ServerConfig, query: { id: string }) => [f.issue, ...children].find(({ id }) => id === query.id)!,
+    update: async (_config: ServerConfig, query: { id: string }, change: { stateId?: string }) => {
+      const issue = [f.issue, ...children].find(({ id }) => id === query.id)!;
+      issue.state = f.states.find(({ id }) => id === change.stateId)!;
+      f.steps.push(`${issue.identifier}:${issue.state.name}`);
+    },
+  };
+  const update = (child: typeof verification, state: string) => ({
+    ...f.input, evidence: [], childIssueId: child.id, requestKey: `${child.id}:${state}`,
+    body: `${child.title}: ${state === "Done" ? "Focused acceptance passed" : "Work started"}.`, state, expectedState: child.state.name,
+  });
+  expect((await readSessionWorkGraph(f.input, client)).children.map(({ identifier, blockedBy }) => ({ identifier, blockedBy }))).toEqual([
+    { identifier: "DRA-29", blockedBy: [] }, { identifier: "DRA-30", blockedBy: [] },
+    { identifier: "DRA-32", blockedBy: [] }, { identifier: "DRA-31", blockedBy: ["DRA-29", "DRA-30", "DRA-32"] },
+  ]);
+  for (const child of implementations) await publishChildIssueUpdate(update(child, "On Course"), client);
+  expect(children.map(({ state }) => state.name)).toEqual(["On Course", "On Course", "On Course", "Todo"]);
+  for (const child of implementations) {
+    const writes = f.steps.length;
+    await expect(publishChildIssueUpdate(update(verification, "Verification"), client)).rejects.toThrow("prerequisite");
+    expect(f.steps).toHaveLength(writes);
+    const completed = update(child, "Done");
+    const receipt = await publishChildIssueUpdate(completed, client);
+    await f.prisma.$disconnect();
+    expect(await publishChildIssueUpdate(completed, client)).toEqual(receipt);
+    expect(f.comments.size).toBe(f.steps.filter((step) => step === "comment").length);
+  }
+  await publishChildIssueUpdate(update(verification, "Verification"), client);
+  const handoff = { ...f.input, evidence: [], requestKey: "parent-review", body: "All three changes verified together; owner review is ready." };
+  const writes = f.steps.length;
+  await expect(publishSessionIssueUpdate(handoff, client)).rejects.toThrow("DRA-31 (Verification)");
+  expect(f.steps).toHaveLength(writes);
+  await publishChildIssueUpdate(update(verification, "Done"), client);
+  expect((await publishSessionIssueUpdate(handoff, client)).state).toBe("Manual Review");
+  expect(f.comments.size).toBe(9); // Three start/result pairs, verification start/result, one parent handoff.
+  expect(await f.prisma.remoteTask.count()).toBe(1);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).primarySessionId).toBe(f.session.id);
+});

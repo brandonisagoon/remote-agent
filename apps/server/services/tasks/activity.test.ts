@@ -3,6 +3,7 @@ import { createTestDatabase, type TestDatabase } from "../../../../test-support/
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { beginRuntimeSession } from "../sessions/runtime-registry.ts";
 import { deriveSessionActivity, readTaskActivity } from "./activity.ts";
+import { runRuntimeProjectionAttempt } from "../sessions/runtime-events/projection-retries.ts";
 
 const now = new Date("2026-10-27T12:00:00Z").getTime();
 const before = (seconds: number) => new Date(now - seconds * 1000);
@@ -124,4 +125,18 @@ test("unavailable runtime reads expose uncertainty without changing work or hidi
   expect(await f.prisma.runtimeSession.count({ where: { status: "idle" } })).toBe(2);
   expect(f.runtime.sentMessages).toHaveLength(0);
   expect(f.runtime.cancelledSessionIds).toHaveLength(0);
+});
+
+test("exhausted delivery retries expose bounded recovery without fabricating or overriding provider execution", async () => {
+  const f = await fixture();
+  const identity = { sessionId: f.child.id, eventId: "failed-notify", stage: "notify" as const };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await runRuntimeProjectionAttempt(f.prisma, identity, async () => { throw new Error("inbox unavailable"); }, () => now + attempt * 60_000);
+  }
+  expect((await f.read())!.activity).toMatchObject({ state: "stalled", projectionRetries: [{ ...identity, state: "exhausted", attempts: 5 }], cause: "Delegate-result notification exhausted its automatic delivery attempts; explicit projection recovery is required" });
+  f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
+  expect((await f.read())!.activity.state).toBe("executing");
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: now });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  expect((await f.read())!.activity.state).toBe("paused");
 });

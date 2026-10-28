@@ -17,7 +17,17 @@ Previously resolved DRA-51, 54, 62, 63 and 68 retain their existing evidence. Th
 
 Owner instruction: finish this implementation, wait for the current product issues to clear, then deploy and use ready Todo/Backlog issues as real acceptance work. Never resume an owner-stopped session or repin a running task to satisfy this gate.
 
-The latest read-only checkpoint found DRA-14, DRA-23, DRA-36 and DRA-37 Done, DRA-35 Canceled, and DRA-28 still in Verification. DRA-28's product integration PR is #4227 against staging; its issue says required CI is running. Re-read Linear and task activity immediately before deployment. These historical observations are not a standing assertion that the gate is clear.
+The gate cleared on October 28: DRA-14, DRA-23, DRA-28, DRA-36 and DRA-37 reached Done; DRA-35 was Canceled. Their tasks were closed and paused, with no executing/provisioning session or held browser control. Re-read Linear and task activity immediately before any subsequent activation; this historical observation is not a standing assertion that the gate is clear.
+
+## Initial deployment and acceptance review
+
+At 2026-10-28 07:01 UTC, the custom Air pilot activated runtime `53aeb03943f1fe0391a57a44275131b1598ecb6b` and configured new-task tooling `137bcf034860e086b7aa775ab00a2178db44bed7`. The installed desktop/default CLI were not replaced. Runtime/type/build verification passed (532 runtime tests, 48 tooling tests; 43 focused tests after integrating upstream teardown corrections).
+
+The private receipt is `drafted-pilot/maintenance/dra33-release.5CTVJx/deployment.json` under the user's Application Support directory. It records preservation of all 23 task identities, 55 session/provider identities, original task pins and four stopped instructions. Config, manifest and consistent SQLite backups are retained beside it. The custom pilot uses an immutable runtime checkout and its existing launchd label; the standard install is separate and must not be changed accidentally.
+
+The first bootstrap attempt encountered asynchronous launchd job removal. Rollback restored the old service; waiting for confirmed removal before bootstrap activated the new revision successfully. `management/supervisor/launchd-control.test.ts` now reproduces the ordering requirement, bounded wait and non-absence error handling without operating any real service.
+
+Acceptance review closed DRA-53, DRA-55, DRA-58 and DRA-75 with issue-specific tests and the deployed receipt. It identified follow-up work before the first backlog launch: bounded failed-projection retries (DRA-47), meaningful stall publication (DRA-57), combined child/restart fixtures (DRA-34/65), and restoration of previously deployed Drafted guidance/safety checks omitted by the first package. Do not count an initial healthy process as proof of all these behaviors. New product work remains unlaunched until the corrected release is verified and activated.
 
 ## Release procedure
 

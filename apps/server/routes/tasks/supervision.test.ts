@@ -15,12 +15,12 @@ let directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await mkdtemp(path.join(tmpdir(), "task-recovery-")); });
 afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: true, force: true }); });
 
-async function fixture() {
+async function fixture(extraDelegates: string[] = []) {
   const config = { ...testConfig(), acpxStateDir: directory };
   const child = Bun.spawn([process.execPath, "-e", ""], { stdout: "ignore", stderr: "ignore" });
   await child.exited;
   const store = createRuntimeStore({ stateDir: directory });
-  for (const id of ["primary", "delegate", "unrelated"]) {
+  for (const id of ["primary", "delegate", "unrelated", ...extraDelegates]) {
     await db.prisma.runtimeSession.create({ data: {
       id, scopeKey: id, agentCommand: "codex", cwd: directory, repositoryId: "repo", machineId: "air",
       status: "active", role: id === "primary" ? "primary" : "delegate", acpxRecordId: `record-${id}`, acpxSessionId: `provider-${id}`,
@@ -35,6 +35,7 @@ async function fixture() {
     await store.save(record);
   }
   await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "delegate", targetSessionId: "primary", relationship: "spawned-by" } });
+  for (const id of extraDelegates) await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: id, targetSessionId: "primary", relationship: "spawned-by" } });
   await db.prisma.remoteTask.create({ data: {
     id: "task", requestKey: "task", repositoryId: "repo", machineId: "air", worktreePath: directory,
     primarySessionId: "primary", branchName: "codex/task", toolingRoot: directory, toolingRevision: "a".repeat(40),
@@ -137,4 +138,75 @@ test("live provider blocks resolution and paused, human-controlled or closed tas
   expect(runtime.sentMessages).toHaveLength(0);
   await uncertain("closed-work");
   expect((await resolve("closed-work")).status).toBe(409);
+});
+
+test("mixed restart recovers safe primary and worker continuations once while retaining unknown effects and live providers", async () => {
+  const { config, store } = await fixture(["completed", "uncertain", "live"]);
+  const originalTask = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } });
+  const identities = await db.prisma.runtimeSession.findMany({ orderBy: { id: "asc" }, select: { id: true, acpxRecordId: true, acpxSessionId: true, cwd: true } });
+  const liveRecord = (await store.load("record-live"))!;
+  await store.save({ ...liveRecord, pid: process.pid });
+  // This worker's terminal result reached the journal before daemon loss;
+  // its inbox acknowledgement did not. Other turns have no known outcome.
+  await db.prisma.runtimeSession.update({ where: { id: "completed" }, data: { status: "idle" } });
+  for (const sessionId of ["primary", "delegate", "completed", "uncertain", "live"]) {
+    await db.prisma.runtimeInstruction.create({ data: { id: `${sessionId}-prior`, sessionId, text: `${sessionId} original effect`, state: "dispatching" } });
+    await queueInstruction(db.prisma, { sessionId, requestId: `${sessionId}-next`, text: `${sessionId} continuation` });
+  }
+  await db.prisma.runtimeLifecycleEvent.create({ data: {
+    id: "completed-terminal", runtimeSessionId: "completed", requestId: "completed-prior", phase: "completed", occurredAt: new Date(),
+  } });
+  await db.prisma.$disconnect();
+  // Fresh daemon objects have no process-local delivery claims. Provider
+  // identity/liveness is real acpx storage; model turns use the fake seam.
+  const real = createAcpxSessionRuntime(db.prisma, config);
+  const runtime = createFakeAgentRuntime();
+  runtime.getSession = real.getSession.bind(real);
+  runtime.reconcileInterruptedSession = real.reconcileInterruptedSession!.bind(real);
+  const app = createApp({ config, prisma: db.prisma, agentRuntime: runtime });
+  const resolve = (id: string) => app.request(`/api/tasks/task/instructions/${id}/resolve`, {
+    method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ action: "acknowledge", requestKey: `inspected:${id}`, reason: "Inspected provider history and owned worktree; original effect already accounted for" }),
+  });
+  const settle = async (ids: string[]) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await db.prisma.runtimeInstruction.count({ where: { id: { in: ids }, state: "completed" } }) === ids.length) return;
+      await Bun.sleep(5);
+    }
+    throw new Error(`Delivery did not settle: ${ids.join(", ")}`);
+  };
+  await deliverInstructions(db.prisma, runtime);
+  await settle(["completed-prior", "completed-next"]);
+  expect(runtime.sentMessages.map(({ requestId }) => requestId)).toEqual(["completed-next"]);
+  for (const id of ["primary", "delegate", "uncertain", "live"]) {
+    expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: `${id}-prior` } })).state).toBe("unknown");
+  }
+  expect((await resolve("live-prior")).status).toBe(409);
+  for (const id of ["primary-prior", "delegate-prior"]) expect((await resolve(id)).status).toBe(200);
+  await deliverInstructions(db.prisma, runtime);
+  await settle(["primary-next", "delegate-next"]);
+  // Repeated resolution and drains cannot replay original effects or create
+  // duplicate continuations, including after reconnecting the durable store.
+  await db.prisma.$disconnect();
+  for (const id of ["primary-prior", "delegate-prior"]) expect((await resolve(id)).status).toBe(200);
+  await deliverInstructions(db.prisma, runtime);
+  expect(runtime.sentMessages.map(({ requestId }) => requestId).sort()).toEqual(["completed-next", "delegate-next", "primary-next"]);
+  const response = await app.request("/api/tasks/task/activity", { headers: { authorization: `Bearer ${config.apiKey}` } });
+  expect(response.status).toBe(200);
+  const activity = await response.json() as { delegates: Array<{ session: { id: string }; activity: { state: string; cause: string }; instructions: Array<{ id: string; state: string }> }> };
+  for (const id of ["uncertain", "live"]) {
+    const worker = activity.delegates.find(({ session }) => session.id === id)!;
+    expect(worker.activity).toMatchObject({ state: "stalled" });
+    expect(worker.activity.cause).toContain("automatic replay is disabled");
+    expect(worker.instructions.map(({ id, state }) => ({ id, state }))).toEqual([
+      { id: `${id}-next`, state: "queued" }, { id: `${id}-prior`, state: "unknown" },
+    ]);
+  }
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "instruction-resolved" } })).toBe(2);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toMatchObject({
+    primarySessionId: originalTask.primarySessionId, worktreePath: originalTask.worktreePath,
+    toolingRevision: originalTask.toolingRevision, toolingRoot: originalTask.toolingRoot, controlMode: originalTask.controlMode,
+  });
+  expect(await db.prisma.runtimeSession.findMany({ orderBy: { id: "asc" }, select: { id: true, acpxRecordId: true, acpxSessionId: true, cwd: true } })).toEqual(identities);
+  expect(await db.prisma.remoteTask.count()).toBe(1);
 });

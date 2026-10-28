@@ -26,6 +26,8 @@ import {
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
 import { projectSourceCheckpoint } from "./source-checkpoint.ts";
 import { queueDelegateResult } from "../../launches/delegate-supervision.ts";
+import { runRuntimeProjectionAttempt } from "./projection-retries.ts";
+import { projectTaskStalls } from "./task-stalls.ts";
 
 const CONSUMER = "linear-projection:v1";
 const MAX_OUTPUT = 8_000;
@@ -159,6 +161,7 @@ type ProjectionInput = {
 export async function drainRuntimeEventProjection(
   input: ProjectionInput,
   delivery = { notify: queueDelegateResult, project: projectRuntimeEvent },
+  options: { now?: () => number } = {},
 ): Promise<void> {
   const events = await listRuntimeLifecycleEvents(input.prisma);
   const blocked = new Set<string>();
@@ -166,7 +169,7 @@ export async function drainRuntimeEventProjection(
   for (const event of events) {
     if (blocked.has(event.sessionId)) continue;
     try {
-      await delivery.notify(input.prisma, event);
+      if (!(await runRuntimeProjectionAttempt(input.prisma, { sessionId: event.sessionId, eventId: event.id, stage: "notify" }, () => delivery.notify(input.prisma, event), options.now))) blocked.add(event.sessionId);
     } catch (error) {
       blocked.add(event.sessionId);
       console.error(`[runtime-events] failed to queue result ${event.id}:`, error);
@@ -175,9 +178,9 @@ export async function drainRuntimeEventProjection(
   for (const event of events) {
     if (blocked.has(event.sessionId)) continue;
     try {
-      await delivery.project(input.config, input.prisma, input.runtime, event);
+      if (!(await runRuntimeProjectionAttempt(input.prisma, { sessionId: event.sessionId, eventId: event.id, stage: "project" }, () => delivery.project(input.config, input.prisma, input.runtime, event), options.now))) blocked.add(event.sessionId);
     } catch (error) {
-      // Preserve this session's order and retry its durable event next pass,
+      // Preserve this session's order and retain its durable event on failure,
       // while other sessions can still publish and advance their own cursors.
       blocked.add(event.sessionId);
       console.error(`[runtime-events] failed to project ${event.id}:`, error);
@@ -192,6 +195,7 @@ export function startRuntimeEventProjection(input: ProjectionInput): () => Promi
     chain = chain.then(async () => {
       if (stopped) return;
       await drainRuntimeEventProjection(input);
+      await projectTaskStalls(input);
     }).catch((error) => {
       console.error("[runtime-events] journal drain failed:", error);
     });
