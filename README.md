@@ -174,8 +174,8 @@ processes only). Sessions' MCP tools use the socket.
   that machine.
 - Codex and/or Claude Code installed and authenticated. They are your
   identity and subscription; Remote Agent never installs them.
-- A Linear workspace where you can create an API key, add a webhook, and
-  create a dedicated agent user and team.
+- A Linear workspace where you can create a private app (or use an existing
+  account API key) and add a webhook for the intended team.
 - A Cloudflare account with a domain on it, for the tunnel that delivers
   Linear webhooks to your machine.
 - Bun and cloudflared. The Homebrew formula and Scoop manifest install both;
@@ -253,8 +253,23 @@ installer can do for you:
   installs the tunnel runner as a service beside the server, and verifies
   the public URL. Re-run it any time; every step is idempotent. `doctor`
   shows each step's state.
-- **Linear.** An API key, plus the webhook URL and secret from your
-  connection settings pasted into Linear's webhook settings.
+- **Linear.** A private app with client credentials enabled, or an existing
+  account API key, plus the connection's webhook URL and signing secret.
+  App credentials use `apiKey: { "type": "app", "clientId": "…", "clientSecret": "…" }`;
+  personal keys retain the string form. The server mints app bearer tokens in
+  memory, renews before expiry, and retries an explicit 401 once. Never paste an
+  expiring OAuth token into the personal-key field. Query `viewer { id }` with
+  the app token for `agentUserId`; keep the authorized human's ID in repository
+  routing rules. Private apps need no second human account. Only configured
+  owner events dispatch work; valid deliveries outside that subscription receive
+  an ignored acknowledgement so Linear does not retry them indefinitely.
+  For a private client-credentials installation, create a workspace webhook
+  restricted to the intended team, with Issue, Comment and Reaction events.
+  Set its URL to `/webhooks/<connection-slug>` on your public origin and copy
+  that webhook's signing secret into the connection. Restrict the installed
+  app's team access too. Avoid enabling a second app-level webhook for the same
+  events. Expose only the webhook path through the tunnel; keep the control
+  API, browser and previews private.
 - **Provider CLIs.** Install and authenticate `codex` and/or `claude`
   yourself; they are your identity and subscription, never installed for
   you. Their presence enables the matching provider.
@@ -286,9 +301,30 @@ settings UI, shows the same checklist as `doctor` with buttons attached,
 and lists sessions. Every release ships the CLI and GUI together, one
 version.
 
+The GUI can also run on your laptop while controlling a remote machine over
+owner SSH. Its machine selector switches tasks, sessions and settings; private
+preview windows forward the selected task's recorded endpoints. See
+[remote desktop setup](docs/remote-desktop.md) for connection profiles and
+reconnection behavior.
+
 **6. Attach an ACP client.** Configure Zed, bb, or T3 Code to run
 `bun run acp`. The machine page shows the exact command. The bridge is a
 stateless stdio connection to the server's socket.
+
+If a machine retains separate Remote Agent deployments, one ACP entry can expose
+both without merging their databases. Pass each config explicitly:
+
+```sh
+bun apps/server/acp/main.ts --config "/path/to/first/remote-agent.config.json" --config "/path/to/second/remote-agent.config.json"
+```
+
+Name the entry **Remote Agent**. In an SSH project, register it in that machine's
+Zed settings and remove any duplicate deployment-specific entry from the client
+settings. Import existing threads under Remote Agent; their session IDs and
+history stay on their original servers. New sessions use the most specific
+configured checkout or worktree root. Unknown or ambiguous paths/IDs fail
+explicitly. Both servers must be running; after a restart, reload the agent.
+The bridge does not migrate worktrees or change provider sessions.
 
 ## Configuration
 

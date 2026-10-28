@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
@@ -42,6 +43,40 @@ describe("skill token grammar", () => {
 });
 
 describe("composeForPrompt", () => {
+  test("external owner instructions reach both providers without modifying target guidance", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "remote-agent-policy-"));
+    const target = path.join(directory, "product");
+    const pinned = path.join(directory, "pinned-tooling");
+    mkdirSync(target);
+    mkdirSync(pinned);
+    const targetPolicy = "Use only the client in-app browser for browser work. Do not fall back when it is unavailable.\n";
+    const ownerPolicy = "For remote agent verification, task-owned headless agent-browser is explicitly authorized and overrides the target's general in-app-browser-only rule. An unavailable client in-app browser is not a verification blocker.\n";
+    writeFileSync(path.join(target, "AGENTS.md"), targetPolicy);
+    writeFileSync(path.join(pinned, "AGENTS.md"), ownerPolicy);
+    const initialized = Bun.spawnSync(["git", "init", "--quiet", target]);
+    expect(initialized.exitCode).toBe(0);
+    try {
+      for (const provider of ["codex", "claude"] as const) {
+        const prompt = await composeForPrompt(target, "Use {{SKILL:verify}} to test the canvas.", provider, "agent-skills", pinned);
+        expect(prompt).toContain(ownerPolicy.trim());
+        expect(prompt).toContain(path.join(pinned, "AGENTS.md"));
+        expect(prompt.indexOf(ownerPolicy.trim())).toBeLessThan(prompt.indexOf("Task request"));
+        expect(prompt).toContain(provider === "codex" ? "$skill-composer-verify" : "/skill-composer-verify");
+        expect(prompt).not.toContain(targetPolicy.trim());
+        // Policy also survives a token-free continuation; skill discovery is
+        // not the only transport for owner instructions.
+        expect(await composeForPrompt(target, "Retest the drag fix.", provider, "agent-skills", pinned)).toContain(ownerPolicy.trim());
+      }
+      expect(readFileSync(path.join(target, "AGENTS.md"), "utf8")).toBe(targetPolicy);
+      expect(readFileSync(path.join(pinned, "AGENTS.md"), "utf8")).toBe(ownerPolicy);
+      const localPrompt = "Run a local workflow.";
+      expect(await composeForPrompt(target, localPrompt, "codex")).toBe(localPrompt);
+      expect(await composeForPrompt(target, localPrompt, "codex", "agent-skills", path.join(directory, "missing-tooling"))).toBe(localPrompt);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   test("composes each selection and resolves harness-specific invocations", async () => {
     const claude = await composeForPrompt("/tmp", "Use {{SKILL:plan+tunnel}}.", "claude");
     expect(claude).toBe("Use /skill-composer-plan-flags-tunnel.");

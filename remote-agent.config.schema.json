@@ -93,6 +93,11 @@
             "stateDir": {
               "type": "string",
               "minLength": 1
+            },
+            "maxConcurrentTurns": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
             }
           },
           "additionalProperties": false
@@ -225,6 +230,75 @@
       },
       "additionalProperties": false
     },
+    "routing": {
+      "type": "object",
+      "properties": {
+        "ingress": {
+          "default": false,
+          "type": "boolean"
+        },
+        "receiverOnly": {
+          "default": false,
+          "type": "boolean"
+        },
+        "peers": {
+          "default": {},
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string",
+                "format": "uri"
+              },
+              "apiKey": {
+                "type": "string",
+                "minLength": 16
+              },
+              "repositories": {
+                "minItems": 1,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "required": [
+              "url",
+              "apiKey",
+              "repositories"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "connectionHosts": {
+          "default": {},
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+          }
+        }
+      },
+      "required": [
+        "ingress",
+        "receiverOnly",
+        "peers",
+        "connectionHosts"
+      ],
+      "additionalProperties": false
+    },
     "connections": {
       "type": "object",
       "propertyNames": {
@@ -244,8 +318,35 @@
             "minLength": 1
           },
           "apiKey": {
-            "type": "string",
-            "minLength": 1
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "const": "app"
+                  },
+                  "clientId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "clientSecret": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                },
+                "required": [
+                  "type",
+                  "clientId",
+                  "clientSecret"
+                ],
+                "additionalProperties": false
+              }
+            ]
           },
           "agentUserId": {
             "type": "string",
@@ -427,6 +528,25 @@
           "worktreeRoot": {
             "type": "string",
             "minLength": 1
+          },
+          "tooling": {
+            "type": "object",
+            "properties": {
+              "root": {
+                "type": "string",
+                "minLength": 1
+              },
+              "ref": {
+                "default": "HEAD",
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "root",
+              "ref"
+            ],
+            "additionalProperties": false
           },
           "worktreeNaming": {
             "default": {

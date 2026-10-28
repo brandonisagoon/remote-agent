@@ -64,6 +64,7 @@ export type AgentRuntimeLifecycleEvent = {
   sequence?: number;
   phase: "started" | "completed" | "failed" | "cancelled";
   error?: string;
+  output?: string;
 };
 
 export type AgentRuntimeEvent =
@@ -116,6 +117,11 @@ export interface EnsureAgentSessionInput {
 export interface AgentSessionRuntime {
   ensureSession(input: EnsureAgentSessionInput): Promise<AgentRuntimeSession>;
   getSession(sessionId: string): Promise<AgentRuntimeSession | null>;
+  /** Explicit recovery only: prove the provider writer has stopped before
+   * clearing stale active state. Never infers an instruction's outcome. */
+  reconcileInterruptedSession?(sessionId: string): Promise<AgentRuntimeSession>;
+  /** Process-local observation; absence of owned work never proves idle. */
+  observeSessionActivity?(sessionId: string): { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
   listSessions(input?: {
     cwd?: string;
     repositoryId?: string;
@@ -128,6 +134,8 @@ export interface AgentSessionRuntime {
     requestId?: string;
     mode?: "prompt" | "steer";
     signal?: AbortSignal;
+    /** Claim a durable instruction only after a provider slot is available. */
+    beforeStart?: () => Promise<boolean>;
     /** Answers the agent's planning questions (ACP elicitation) for this
         turn. Absent = headless; acpx resolves them non-interactively. */
     onElicitation?: AgentElicitationHandler;

@@ -27,12 +27,18 @@ import {
 import { runChecks } from "../../../management/checks.ts";
 import { REPO_CONFIG_FILE } from "../../../lib/config.ts";
 import os from "node:os";
+import { scopedConfigFile } from "../../../lib/config-scope.ts";
 import { checkSkills } from "../../../lib/skills/check.ts";
 import { detectEditors } from "./editor-detect.ts";
 import { listProviderModels } from "./provider-models.ts";
 import { tunnelInfo } from "./tunnel-info.ts";
 import type { DesktopApi, Keybindings, SessionSummary } from "../shared.ts";
 
+import { DesktopHostManager } from "./hosts.ts";
+import { installHostIpc } from "./host-ipc.ts";
+import { closePreviewForwards } from "./preview-forward.ts";
+
+let hosts: DesktopHostManager | null = null;
 let mainWindow: BrowserWindow | null = null;
 let stopWatching: (() => Promise<void>) | null = null;
 let stopWatchingKeybindings: (() => Promise<void>) | null = null;
@@ -97,45 +103,55 @@ function readKeybindings(file: string): Keybindings {
 
 /** Repository roots from the on-disk app config: ~ expanded, relative
     resolved against the config directory — matching lib/config resolution. */
-function repositoryRoots(): Record<string, string> {
-  const configFile = desktopConfigPath();
+function repositoryRoots(configFile = desktopConfigPath()): Record<string, string> {
   const document = readConfigDocument(configFile);
   if (!document.valid) return {};
   const roots: Record<string, string> = {};
   for (const [id, repository] of Object.entries(document.value.repositories)) {
-    const raw = repository.root.startsWith("~")
-      ? path.join(os.homedir(), repository.root.slice(1))
-      : repository.root;
+    const configuredRoot = repository.tooling?.root ?? repository.root;
+    const raw = configuredRoot.startsWith("~")
+      ? path.join(os.homedir(), configuredRoot.slice(1))
+      : configuredRoot;
     roots[id] = path.isAbsolute(raw) ? raw : path.resolve(path.dirname(configFile), raw);
   }
   return roots;
 }
 
-function readRepoConfigDocuments(): Record<string, RepoConfigDocument & { root: string }> {
+function readRepoConfigDocuments(file = desktopConfigPath()): Record<string, RepoConfigDocument & { root: string }> {
   return Object.fromEntries(
-    Object.entries(repositoryRoots()).map(([id, root]) => [
+    Object.entries(repositoryRoots(file)).map(([id, root]) => [
       id,
       { ...readRepoConfigDocument(root), root },
     ]),
   );
 }
 
-let repoConfigWatcher: ReturnType<typeof watch> | null = null;
-/** Watches every repository's committed config; pushes the full map like
-    the app config's own change stream. */
-function watchRepoConfigs(): void {
-  void repoConfigWatcher?.close();
-  const files = Object.values(repositoryRoots()).map((root) => path.join(root, REPO_CONFIG_FILE));
-  const push = () => mainWindow?.webContents.send("repo-configs:changed", readRepoConfigDocuments());
-  repoConfigWatcher = watch(files, {
-    ignoreInitial: true,
-    awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 20 },
+function watchLocalConfigs(): () => Promise<void> {
+  const stops = hosts!.list().hosts.filter((host) => host.kind === "local").map((host) => {
+    const file = host.configPath ?? desktopConfigPath();
+    let repoWatcher: ReturnType<typeof watch> | null = null;
+    const rewatchRepos = () => {
+      void repoWatcher?.close();
+      const push = () => mainWindow?.webContents.send("repo-configs:changed", host.id, readRepoConfigDocuments(file));
+      repoWatcher = watch(Object.values(repositoryRoots(file)).map((root) => path.join(root, REPO_CONFIG_FILE)), {
+        ignoreInitial: true, awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 20 },
+      });
+      repoWatcher.on("all", push);
+      push();
+    };
+    const stop = watchConfigDocument(file, (document) => {
+      mainWindow?.webContents.send("config:changed", host.id, document);
+      rewatchRepos();
+    });
+    rewatchRepos();
+    return async () => { await stop(); await repoWatcher?.close(); };
   });
-  repoConfigWatcher.on("all", push);
-  push();
+  return async () => { await Promise.all(stops.map((stop) => stop())); };
 }
 
 function desktopConfigPath(): string {
+  const scoped = scopedConfigFile();
+  if (scoped) return scoped;
   const explicit = process.env.REMOTE_AGENT_CONFIG?.trim();
   if (explicit) return path.resolve(explicit);
   const development = path.resolve(process.cwd(), "remote-agent.config.json");
@@ -186,18 +202,20 @@ async function listSessions(repositoryId?: string): Promise<SessionSummary[]> {
 function registerIpc(file: string): void {
   if (ipcRegistered) return;
   ipcRegistered = true;
-  ipcMain.handle("config:get", () => readConfigDocument(file));
-  ipcMain.handle("config:save", (_event, input: { expectedRevision: string; value: unknown }) =>
-    writeConfigDocument({ file, ...input }));
-  ipcMain.handle("config:open-in-editor", async () => {
-    const error = await shell.openPath(file);
+  const handlers = new Map<string, (event: Electron.IpcMainInvokeEvent, ...args: any[]) => unknown>();
+  const handle = (channel: string, listener: (event: Electron.IpcMainInvokeEvent, ...args: any[]) => unknown) => handlers.set(channel, listener);
+  handle("config:get", () => readConfigDocument(desktopConfigPath()));
+  handle("config:save", (_event, input: { expectedRevision: string; value: unknown }) =>
+    writeConfigDocument({ file: desktopConfigPath(), ...input }));
+  handle("config:open-in-editor", async () => {
+    const error = await shell.openPath(desktopConfigPath());
     return error || null;
   });
-  ipcMain.handle("config:reveal", () => shell.showItemInFolder(file));
-  ipcMain.handle("keybindings:get", () => readKeybindings(keybindingsPath(file)));
-  ipcMain.handle("tunnel:info", (_event, name: string) => tunnelInfo(name));
-  ipcMain.handle("provider:models", (_event, providerId: string) => {
-    const document = readConfigDocument(file);
+  handle("config:reveal", () => shell.showItemInFolder(desktopConfigPath()));
+  handle("keybindings:get", () => readKeybindings(keybindingsPath(file)));
+  handle("tunnel:info", (_event, name: string) => tunnelInfo(name));
+  handle("provider:models", (_event, providerId: string) => {
+    const document = readConfigDocument(desktopConfigPath());
     const agents = document.valid ? document.value.providers : {};
     return listProviderModels(providerId, agents);
   });
@@ -206,11 +224,11 @@ function registerIpc(file: string): void {
     const window = BrowserWindow.fromWebContents(event.sender);
     window?.setWindowButtonPosition(trafficLightPositionForZoom(event.sender.getZoomFactor()));
   });
-  ipcMain.handle("keybindings:open-in-editor", async () => {
+  handle("keybindings:open-in-editor", async () => {
     const error = await shell.openPath(keybindingsPath(file));
     return error || null;
   });
-  ipcMain.handle("sessions:list", (_event, repositoryId?: string) => listSessions(repositoryId));
+  handle("sessions:list", (_event, repositoryId?: string) => listSessions(repositoryId));
   const actions: Record<string, () => Promise<unknown>> = {
     status: serviceStatus,
     doctor,
@@ -220,7 +238,7 @@ function registerIpc(file: string): void {
     update: installUpdate,
     restart: restartService,
   };
-  ipcMain.handle("repository:pick", async () => {
+  handle("repository:pick", async () => {
     const result = await dialog.showOpenDialog({
       title: "Add Repository",
       buttonLabel: "Add Repository",
@@ -231,10 +249,10 @@ function registerIpc(file: string): void {
     if (!existsSync(path.join(root, ".git"))) return { error: "not-a-repository" as const };
     return { repository: { root, name: path.basename(root) } };
   });
-  ipcMain.handle("config:path", () => desktopConfigPath());
-  ipcMain.handle("management:checks", () => runChecks());
-  ipcMain.handle("editors:detect", () => detectEditors());
-  ipcMain.handle("fs:pick-folder", async (_event, title: string, defaultPath?: string) => {
+  handle("config:path", () => desktopConfigPath());
+  handle("management:checks", () => runChecks());
+  handle("editors:detect", () => detectEditors());
+  handle("fs:pick-folder", async (_event, title: string, defaultPath?: string) => {
     const result = await dialog.showOpenDialog({
       title,
       buttonLabel: "Select",
@@ -243,7 +261,7 @@ function registerIpc(file: string): void {
     });
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
-  ipcMain.handle("fs:pick-file", async (_event, title: string, defaultPath?: string) => {
+  handle("fs:pick-file", async (_event, title: string, defaultPath?: string) => {
     const result = await dialog.showOpenDialog({
       title,
       buttonLabel: "Select",
@@ -252,7 +270,7 @@ function registerIpc(file: string): void {
     });
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
-  ipcMain.handle("skills:pick-root", async (_event, defaultPath: string) => {
+  handle("skills:pick-root", async (_event, defaultPath: string) => {
     const result = await dialog.showOpenDialog({
       title: "Select Skills Root",
       buttonLabel: "Select",
@@ -261,29 +279,31 @@ function registerIpc(file: string): void {
     });
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
-  ipcMain.handle("skills:check", (_event, root: string, skillsRoot: string) => checkSkills(root, skillsRoot));
-  ipcMain.handle("repo-configs:get", () => readRepoConfigDocuments());
-  ipcMain.handle("repo-config:save", (_event, input: { id: string; expectedRevision: string; value: unknown }) => {
+  handle("skills:check", (_event, root: string, skillsRoot: string) => checkSkills(root, skillsRoot));
+  handle("repo-configs:get", () => readRepoConfigDocuments());
+  handle("repo-config:save", (_event, input: { id: string; expectedRevision: string; value: unknown }) => {
     const root = repositoryRoots()[input.id];
     if (!root) throw new Error(`unknown repository: ${input.id}`);
     return writeRepoConfigDocument({ root, expectedRevision: input.expectedRevision, value: input.value });
   });
-  ipcMain.handle("shell:open-path", (_event, target: string) => shell.openPath(target));
-  ipcMain.handle("shell:open-with", (_event, appPath: string, target: string) =>
+  handle("shell:open-path", (_event, target: string) => shell.openPath(target));
+  handle("shell:open-with", (_event, appPath: string, target: string) =>
     new Promise<void>((resolve, reject) => {
       execFile("open", ["-a", appPath, target], (error) => (error ? reject(error) : resolve()));
     }));
-  ipcMain.handle("management:open-terminal", (_event, commandLine: string) => openInTerminal(commandLine));
-  ipcMain.handle("management:run", (_event, action: keyof typeof actions) => {
+  handle("management:open-terminal", (_event, commandLine: string) => openInTerminal(commandLine));
+  handle("management:run", (_event, action: keyof typeof actions) => {
     const run = actions[action];
     if (!run) throw new Error(`unknown management action: ${action}`);
     return run();
   });
+  installHostIpc(hosts!, handlers, file);
 }
 
 async function createWindow(): Promise<void> {
   const file = desktopConfigPath();
   ensureConfig(file);
+  hosts ??= new DesktopHostManager(path.join(app.getPath("userData"), "desktop-hosts.json"));
   process.env.REMOTE_AGENT_CONFIG = file;
   registerIpc(file);
 
@@ -311,16 +331,18 @@ async function createWindow(): Promise<void> {
 
   // Renderer links (target=_blank) open in the system browser.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    void shell.openExternal(url);
+    const destination = new URL(url);
+    if (destination.protocol === "http:" && ["localhost", "127.0.0.1"].includes(destination.hostname)) {
+      const preview = new BrowserWindow({ width: 1180, height: 820, title: "Preview", webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true } });
+      preview.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      void preview.loadURL(url);
+    } else if (destination.protocol === "codex:" && destination.hostname === "new" && destination.searchParams.has("prompt")) {
+      void shell.openExternal(url);
+    } else if (["https:", "zed:", "vscode:", "cursor:"].includes(destination.protocol)) void shell.openExternal(url);
     return { action: "deny" };
   });
 
-  stopWatching = watchConfigDocument(file, (document) => {
-    mainWindow?.webContents.send("config:changed", document);
-    // The repository set may have changed; rewatch and repush.
-    watchRepoConfigs();
-  });
-  watchRepoConfigs();
+  stopWatching = watchLocalConfigs();
 
   const bindingsFile = keybindingsPath(file);
   ensureKeybindings(bindingsFile);
@@ -343,7 +365,8 @@ async function createWindow(): Promise<void> {
   }
 }
 
-app.setName("Remote Agent");
+app.setName(process.env.REMOTE_AGENT_DESKTOP_NAME ?? (app.isPackaged ? app.getName() : "Remote Agent"));
+if (process.env.REMOTE_AGENT_DESKTOP_HOME) app.setPath("userData", process.env.REMOTE_AGENT_DESKTOP_HOME);
 
 /** Mirrors the sidebar's add controls in the macOS File menu. Accelerators
     come from keybindings.json so the menu stays in sync with in-app hotkeys. */
@@ -407,6 +430,8 @@ app.on("window-all-closed", () => {
 });
 
 app.on("before-quit", () => {
+  hosts?.close();
+  closePreviewForwards();
   void stopWatching?.();
   void stopWatchingKeybindings?.();
 });

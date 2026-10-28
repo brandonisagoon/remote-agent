@@ -357,6 +357,7 @@ export async function appendRuntimeLifecycleEvent(
       requestId: event.requestId,
       phase: event.phase,
       error: event.error,
+      output: event.output,
       occurredAt: new Date(event.createdAt),
     },
     update: {},
@@ -385,6 +386,7 @@ export async function listRuntimeLifecycleEvents(
         ? row.phase
         : "failed",
     ...(row.error ? { error: row.error } : {}),
+    ...(row.output != null ? { output: row.output } : {}),
   }));
 }
 

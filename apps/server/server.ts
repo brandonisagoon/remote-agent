@@ -8,11 +8,15 @@ import { createPlanCaptureInterceptor } from "./services/sessions/plan-capture.t
 import { startRuntimeEventProjection } from "./services/sessions/runtime-events/projection.ts";
 import { remoteAgentMcpServer } from "./mcp/register.ts";
 import { startControlSocket } from "./control-socket.ts";
+import { reconcileTaskControls } from "./services/tasks/control.ts";
+import { startInstructionDelivery } from "./services/sessions/inbox.ts";
+import { startPlacementDelivery, routingRequest } from "./services/tasks/routing.ts";
 
 const config = readConfig();
 const runtimeOwnership = acquireRuntimeOwnership(config);
 const prisma = createPrismaClient(config.databaseUrl);
 await applyPragmas(prisma);
+await reconcileTaskControls(prisma);
 const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   onPermissionRequest: createPlanCaptureInterceptor({ prisma, config }),
   // Every session discovers remote-agent's own tools (delegate_session,
@@ -20,6 +24,7 @@ const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   mcpServers: [remoteAgentMcpServer()],
 });
 const acpIpcServer = await startAcpIpcServer({ config, runtime: agentRuntime });
+const stopInstructionDelivery = startInstructionDelivery(prisma, agentRuntime);
 // Drains the lifecycle journal into Linear (mirror state, checkpoint
 // comments) and prunes it; without this the journal grows unbounded.
 const stopProjection = startRuntimeEventProjection({
@@ -29,6 +34,8 @@ const stopProjection = startRuntimeEventProjection({
 });
 
 const app = createApp({ config, agentRuntime, prisma });
+const localApp = createApp({ config, agentRuntime, prisma, trustLocal: true });
+const stopPlacementDelivery = startPlacementDelivery(prisma, routingRequest(config, (request) => localApp.fetch(request)));
 
 const server = Bun.serve({
   hostname: config.hostname,
@@ -39,7 +46,7 @@ const server = Bun.serve({
 // and GUI), gated by socket permissions instead of the API key.
 const controlSocket = await startControlSocket({
   path: config.controlIpcPath,
-  app: createApp({ config, agentRuntime, prisma, trustLocal: true }),
+  app: localApp,
 });
 
 console.log(`remote-agent listening on http://${config.hostname}:${config.port}`);
@@ -48,6 +55,8 @@ console.log(`remote-agent listening on http://${config.hostname}:${config.port}`
 // than being left for the next process to recover.
 async function shutdown(signal: string): Promise<void> {
   console.log(`Received ${signal}, shutting down`);
+  stopInstructionDelivery();
+  stopPlacementDelivery();
   await stopProjection();
   await controlSocket.close();
   await acpIpcServer.close();

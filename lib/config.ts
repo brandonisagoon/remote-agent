@@ -1,8 +1,12 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { scopedConfigFile } from "./config-scope.ts";
 
 import { z } from "zod";
+import { LinearCredentialSchema, type LinearCredential } from "./linear-auth.ts";
+import { readToolingSource } from "./tooling-source.ts";
+import { RoutingConfigSchema, type RoutingConfig } from "./routing-config.ts";
 
 import { sshLinkSupported } from "./machines/editor-link.ts";
 import { defaultInstallRoot } from "../management/paths.ts";
@@ -87,6 +91,11 @@ const RepositorySchema = z.object({
   name: z.string().min(1).optional(),
   root: z.string().min(1),
   worktreeRoot: z.string().min(1),
+  /** Optional external policy/skill repository. The product needs no adoption files. */
+  tooling: z.object({
+    root: z.string().min(1),
+    ref: z.string().min(1).default("HEAD"),
+  }).optional(),
   /** Worktree directory templates, keyed by connection ("*" = default) —
       {branch} = the app's suggested branch, plus {issue}/{title}; the
       result is flattened for the filesystem. Local filesystem taste, so it
@@ -104,6 +113,8 @@ export const REPO_CONFIG_FILE = ".remote-agent.config.json";
 
 export const RepoConfigSchema = z.object({
   $schema: z.string().optional(),
+  baseBranch: z.string().min(1).default("main"),
+  preparation: z.enum(["command", "agent"]).default("command"),
   bootstrapCommand: CommandSchema.default(["bash", "scripts/bootstrap.sh"]),
   /** Where the skill-composer inputs live, relative to root. */
   skillsRoot: RepositoryRelativePathSchema.default("agent-skills"),
@@ -201,7 +212,7 @@ const EditorSchema = z.object({
 const LinearConnectionSchema = z.object({
   provider: z.literal("linear"),
   name: z.string().min(1),
-  apiKey: z.string().min(1),
+  apiKey: LinearCredentialSchema,
   agentUserId: z.string().min(1),
   agentHandle: z.string().min(1).optional(),
   /** Portable workspace identity (Linear workspace URL key). Committed
@@ -210,7 +221,7 @@ const LinearConnectionSchema = z.object({
   /** The machine that serves this connection's webhook and runs its sessions. */
   machineId: MachineSchema.optional(),
   /** Repositories this connection's sessions may work in; "*" subscribes
-      every repository, present and future. */
+      every repository, present and future. An empty map disables intake. */
   repositories: z.union([
     z.literal("*"),
     z.record(
@@ -230,6 +241,7 @@ const ConnectionSchema = LinearConnectionSchema;
 const AcpxSchema = z
   .object({
     stateDir: z.string().min(1).optional(),
+    maxConcurrentTurns: PositiveIntegerSchema.optional(),
   })
   .default({});
 // Presence enables the provider in the UI; command (optional) overrides
@@ -282,13 +294,18 @@ export const ServiceFileSchema = z.object({
     }).default({ channel: "stable" }),
   }),
   providers: ProvidersSchema,
+  routing: RoutingConfigSchema.optional(),
   connections: z.record(ConfigIdSchema, ConnectionSchema),
   repositories: z.record(ConfigIdSchema, RepositorySchema),
 }).superRefine((file, context) => {
-  const repositoryIds = new Set(Object.keys(file.repositories));
-  if (repositoryIds.size === 0) {
-    context.addIssue({ code: "custom", path: ["repositories"], message: "at least one repository is required" });
+  if (file.routing?.ingress && file.routing.receiverOnly) context.addIssue({ code: "custom", path: ["routing"], message: "Choose ingress or receiver, not both" });
+  for (const [connectionId, machineId] of Object.entries(file.routing?.connectionHosts ?? {})) {
+    if (!file.connections[connectionId] || (machineId !== file.machine.id && !file.routing?.peers[machineId])) {
+      context.addIssue({ code: "custom", path: ["routing", "connectionHosts", connectionId], message: "Select a configured connection and owning host" });
+    }
   }
+  if (file.routing?.peers[file.machine.id]) context.addIssue({ code: "custom", path: ["routing", "peers"], message: "A peer cannot have this machine's ID" });
+  const repositoryIds = new Set(Object.keys(file.repositories));
   for (const [connectionId, connection] of Object.entries(file.connections)) {
     const schemes = new Set<string>();
     for (const [index, editor] of connection.editors.entries()) {
@@ -305,9 +322,6 @@ export const ServiceFileSchema = z.object({
     }
     if (connection.repositories !== "*") {
       const targets = Object.keys(connection.repositories);
-      if (targets.length === 0) {
-        context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories"], message: "a connection requires at least one repository (or \"*\")" });
-      }
       for (const repositoryId of targets) {
         if (!repositoryIds.has(repositoryId)) {
           context.addIssue({ code: "custom", path: ["connections", connectionId, "repositories", repositoryId], message: `unknown repository: ${repositoryId}` });
@@ -353,6 +367,9 @@ export interface RepositoryConfig {
   name: string;
   root: string;
   worktreeRoot: string;
+  tooling?: { root: string; revision: string };
+  baseBranch?: string;
+  preparation?: "command" | "agent";
   bootstrapCommand: string[];
   skillsRoot: string;
   /** Worktree directory template per connection id; "*" is the default. */
@@ -382,7 +399,7 @@ export interface LinearConnectionConfig {
   id: string;
   provider: "linear";
   name: string;
-  apiKey: string;
+  apiKey: LinearCredential;
   agentUserId: string;
   agentHandle: string | null;
   /** Portable workspace identity; committed repo configs key on it. */
@@ -403,6 +420,7 @@ export interface WebhookConfig {
 }
 
 export interface ServerConfig {
+  routing?: RoutingConfig;
   serviceName: string;
   configFile: string;
   installRoot: string;
@@ -414,7 +432,7 @@ export interface ServerConfig {
   controlIpcPath: string;
   webhookSecret: string;
   apiKey: string;
-  linearApiKey: string;
+  linearApiKey: LinearCredential;
   agentUserId: string;
   agentHandle: string | null;
   agentTeamKey: string;
@@ -425,6 +443,7 @@ export interface ServerConfig {
   routerModel: string | null;
   routerTimeoutMs: number;
   acpxStateDir: string;
+  maxConcurrentTurns?: number;
   acpxAgentCommands: Partial<Record<"codex" | "claude", string[]>>;
   webhookMaxAgeMs: number;
   deployScript: string;
@@ -460,7 +479,7 @@ function absolute(value: string, base: string = process.cwd()): string {
 }
 
 export function configFilePath(): string {
-  return absolute(process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json");
+  return absolute(scopedConfigFile() ?? (process.env.REMOTE_AGENT_CONFIG?.trim() || "remote-agent.config.json"));
 }
 
 export function readServiceFile(file: string = configFilePath()): ServiceFile {
@@ -493,8 +512,8 @@ function resolveDatabaseUrl(value: string | undefined, stateRoot: string): strin
   return `file:${absolute(file, stateRoot)}`;
 }
 
-export function readConfig(): ServerConfig {
-  const configFile = configFilePath();
+export function readConfig(filePath: string = configFilePath()): ServerConfig {
+  const configFile = absolute(filePath);
   const file = readServiceFile(configFile);
   const machine = file.machine.id;
   const hosts = configureMachines([{
@@ -513,12 +532,19 @@ export function readConfig(): ServerConfig {
       const worktreeRoot = absolute(repository.worktreeRoot, root);
       // Team-shared policy comes from the repo's committed settings file;
       // the machine-local entry contributes only paths and local taste.
-      const settings = readRepoConfig(root);
+      const toolingRoot = repository.tooling
+        ? absolute(repository.tooling.root, path.dirname(configFile))
+        : null;
+      const source = toolingRoot ? readToolingSource(toolingRoot, repository.tooling!.ref) : null;
+      const settings = source ? parseRepoConfig(source.settings) : readRepoConfig(root);
       return [id, {
         id,
         name: repository.name ?? id,
         root,
         worktreeRoot,
+        ...(source && toolingRoot ? { tooling: { root: toolingRoot, revision: source.revision } } : {}),
+        baseBranch: settings.baseBranch,
+        preparation: settings.preparation,
         bootstrapCommand: [...settings.bootstrapCommand],
         labels: Object.fromEntries(
           Object.entries(settings.labels).map(([key, group]) => [
@@ -618,11 +644,14 @@ export function readConfig(): ServerConfig {
       } satisfies WebhookConfig]];
     }),
   );
-  const firstRepository = Object.values(repositories)[0]!;
+  const firstRepository = Object.values(repositories)[0];
+  // A desktop-only machine can have no repositories; a task server cannot.
+  if (!firstRepository) throw new Error("Add a repository before starting this machine's server");
   const firstConnection = Object.values(connections)[0];
   const firstWebhook = Object.values(webhooks)[0];
 
   return {
+    ...(file.routing ? { routing: file.routing } : {}),
     serviceName: file.serviceName,
     configFile,
     installRoot,
@@ -653,6 +682,7 @@ export function readConfig(): ServerConfig {
     routerModel: firstConnection?.router.model ?? null,
     routerTimeoutMs: firstConnection?.router.timeoutMs ?? 30_000,
     acpxStateDir: absolute(file.machine.acpx.stateDir ?? path.join(installRoot, "acpx")),
+    maxConcurrentTurns: file.machine.acpx.maxConcurrentTurns,
     acpxAgentCommands: {
       ...(file.providers.codex?.command ? { codex: [...file.providers.codex.command] } : {}),
       ...(file.providers.claude?.command ? { claude: [...file.providers.claude.command] } : {}),
@@ -736,6 +766,8 @@ export function resolveRepositoryForCwd(
   return candidates[0]!.repository;
 }
 
+export class WebhookNotSubscribedError extends Error {}
+
 export function routeWebhookRepository(
   config: ServerConfig,
   webhookId: string,
@@ -759,13 +791,8 @@ export function routeWebhookRepository(
       )
       .map(([repositoryId]) => repositoryId),
   );
-  if (matchingRepositoryIds.size !== 1) {
-    throw new Error(
-      matchingRepositoryIds.size === 0
-        ? `webhook ${webhookId} did not match a repository routing rule`
-        : `webhook ${webhookId} matched multiple repositories`,
-    );
-  }
+  if (matchingRepositoryIds.size === 0) throw new WebhookNotSubscribedError(`webhook ${webhookId} did not match a repository routing rule`);
+  if (matchingRepositoryIds.size > 1) throw new Error(`webhook ${webhookId} matched multiple repositories`);
   const repositoryId = [...matchingRepositoryIds][0]!;
   return getRepositoryConfig(config, repositoryId);
 }

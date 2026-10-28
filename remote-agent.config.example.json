@@ -17,7 +17,8 @@
       "controlSocketPath": "~/Library/Application Support/remote-agent/control.sock"
     },
     "acpx": {
-      "stateDir": "~/Library/Application Support/remote-agent/acpx"
+      "stateDir": "~/Library/Application Support/remote-agent/acpx",
+      "maxConcurrentTurns": 3
     },
     "acp": {
       "providerId": "codex"
@@ -30,6 +31,12 @@
       "channel": "stable"
     }
   },
+  "routing": {
+    "ingress": false,
+    "receiverOnly": false,
+    "peers": {},
+    "connectionHosts": {}
+  },
   "providers": {
     "codex": {},
     "claude": {}
@@ -38,7 +45,11 @@
     "linear-main": {
       "provider": "linear",
       "name": "Linear Product",
-      "apiKey": "replace-with-linear-api-key",
+      "apiKey": {
+        "type": "app",
+        "clientId": "replace-with-linear-app-client-id",
+        "clientSecret": "replace-with-linear-app-client-secret"
+      },
       "agentUserId": "replace-with-linear-agent-user-id",
       "agentHandle": "agent",
       "webhook": {

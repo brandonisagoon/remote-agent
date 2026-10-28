@@ -4,6 +4,8 @@ export const LinearIssueWebhookSchema = z.object({
   type: z.literal("Issue"),
   action: z.literal("update"),
   webhookTimestamp: z.number().int(),
+  organizationId: z.string().optional(),
+  actor: z.object({ id: z.string() }).optional(),
   data: z.object({
     id: z.string(),
     identifier: z.string(),

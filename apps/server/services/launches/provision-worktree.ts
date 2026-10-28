@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 import type { RepositoryConfig } from "../../../../lib/config.ts";
+import { resolveWorktreeBase } from "./worktree-base.ts";
 
 export interface ProvisionWorktreeInput {
   repository: RepositoryConfig;
@@ -44,6 +45,7 @@ async function createWorktree(
   input: ProvisionWorktreeInput,
   worktreePath: string,
 ): Promise<void> {
+  const baseCommit = await resolveWorktreeBase(input.repository.root, input.baseBranch ?? input.repository.baseBranch ?? "main");
   mkdirSync(input.repository.worktreeRoot, { recursive: true });
   await run(
     [
@@ -55,7 +57,7 @@ async function createWorktree(
       "-b",
       input.branchName,
       worktreePath,
-      input.baseBranch ?? "main",
+      baseCommit,
     ],
     input.repository.root,
   );
@@ -77,7 +79,11 @@ export async function provisionWorktree(
   const worktreePath = input.directoryName
     ? path.join(input.repository.worktreeRoot, input.directoryName)
     : worktreePathForBranch(input.repository.worktreeRoot, input.branchName);
+  const relative = path.relative(input.repository.worktreeRoot, worktreePath);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error("Worktree must be a child of the configured worktree root");
+  }
   await createWorktree(input, worktreePath);
-  await runRepositoryBootstrap(input, worktreePath);
+  if (input.repository.preparation !== "agent") await runRepositoryBootstrap(input, worktreePath);
   return worktreePath;
 }

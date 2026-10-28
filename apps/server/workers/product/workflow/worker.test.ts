@@ -5,12 +5,13 @@ import { DispatchEventType, type DispatchEvent } from "../../../../../types/disp
 import type { WorkerContext } from "../../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../../test-support/config.ts";
 import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
-import { buildWorkflowSeedPrompt, createWorkflowWorker, type WorkflowWorkerDependencies } from "./worker.ts";
+import { acknowledgementReaction, buildWorkflowSeedPrompt, createWorkflowWorker, type WorkflowWorkerDependencies } from "./worker.ts";
 
 const ISSUE: SourceIssueWithAgentIssues = {
   id: "issue-uuid",
   identifier: "CUBE-42",
   title: "Fix the flaky test",
+  description: "Reproduce the intermittent failure and preserve the public API.",
   branchName: "feature/fix-cube-42",
   state: { name: "Planning" },
   labels: { nodes: [] },
@@ -26,6 +27,17 @@ function issueEvent(workflowId: string): DispatchEvent {
       action: "update",
       webhookTimestamp: Date.now(),
       data: { id: "issue-uuid", identifier: "CUBE-42", state: { name: "Planning" } },
+    },
+  } as DispatchEvent;
+}
+
+function reactionEvent(workflowId: string, emoji: string): DispatchEvent {
+  return {
+    type: DispatchEventType.TrackerWorkflowTriggered,
+    workflowId,
+    webhook: {
+      type: "Reaction", action: "create", webhookTimestamp: Date.now(),
+      data: { id: "reaction-uuid", emoji, userId: "owner-uuid", issueId: "issue-uuid", issue: { id: "issue-uuid", identifier: "CUBE-42" } },
     },
   } as DispatchEvent;
 }
@@ -82,6 +94,7 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
       return { status: "delivered", detail: "forwarded", targetResourceId: null };
     }) as unknown as WorkflowWorkerDependencies["forward"],
     hasLiveSession: async () => false,
+    continuePlan: async () => null,
     ...overrides,
   };
 }
@@ -97,6 +110,7 @@ describe("workflow worker", () => {
     const result = await worker.execute(issueEvent("plan") as never, context());
 
     expect(result.status).toBe("delivered");
+    expect(String(record.launched[0]?.prompt)).toContain(ISSUE.description!);
     expect(record.provisioned).toEqual(["feature/fix-cube-42"]);
     expect(record.directories).toEqual(["feature-fix-cube-42"]);
     expect(record.launched).toHaveLength(1);
@@ -108,11 +122,16 @@ describe("workflow worker", () => {
     expect(record.comments).toBe(1);
   });
 
-  test("reaction-triggered workflows acknowledge with the describe reaction", async () => {
+  test.each(["pencil2", "rocket", "eyes"])("reaction-triggered workflows acknowledge with the triggering %s reaction", async (emoji) => {
     const record = recorded();
     const worker = createWorkflowWorker(dependencies(record));
-    await worker.execute(issueEvent("describe") as never, context());
-    expect(record.reactions).toEqual(["pencil2"]);
+    await worker.execute(reactionEvent("describe", emoji) as never, context());
+    expect(record.reactions).toEqual([emoji]);
+  });
+
+  test("acknowledgement follows the event rather than workflow name", () => {
+    expect(acknowledgementReaction(reactionEvent("implement", "rocket") as never)).toBe("rocket");
+    expect(acknowledgementReaction(issueEvent("plan") as never)).toBe("memo");
   });
 
   test("state-triggered workflows acknowledge with the plan memo", async () => {

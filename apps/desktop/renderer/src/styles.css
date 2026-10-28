@@ -190,3 +190,7 @@
 .titlebar-drag input {
   -webkit-app-region: no-drag;
 }
+
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}

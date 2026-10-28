@@ -1,3 +1,6 @@
+import type { LinearCredential } from "../../../../lib/linear-auth.ts";
+import { linearAppAuth } from "./app-auth.ts";
+
 const LINEAR_GRAPHQL_URL = "https://api.linear.app/graphql";
 
 interface LinearGraphqlError {
@@ -11,27 +14,31 @@ interface LinearGraphqlResponse<T> {
 
 export class LinearApiError extends Error {}
 
-/**
- * Minimal Linear GraphQL client, mirroring
- * apps/api/src/lib/services/linear/client.ts. Note Linear takes the raw API key
- * in Authorization with no `Bearer` prefix.
- *
- * Duplicated rather than imported because this app deliberately has no
- * @cubic/* workspace dependencies — it must install standalone in the deploy.
- */
+/** Personal keys use a raw Authorization header; apps use renewable bearer
+ * tokens. Only an explicit HTTP 401 permits one retry, never an ambiguous
+ * mutation failure or a network timeout. */
 export async function linearGraphql<T>(
-  apiKey: string,
+  apiKey: LinearCredential,
   query: string,
   variables: Record<string, unknown> = {},
 ): Promise<T> {
-  const response = await fetch(LINEAR_GRAPHQL_URL, {
+  const send = (authorization: string) => fetch(LINEAR_GRAPHQL_URL, {
     method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(30_000),
     headers: {
       "Content-Type": "application/json",
-      Authorization: apiKey,
+      Authorization: authorization,
     },
     body: JSON.stringify({ query, variables }),
   });
+  const authorization = await linearAppAuth.authorization(apiKey);
+  let response = await send(authorization);
+  if (response.status === 401 && typeof apiKey !== "string") {
+    await response.body?.cancel();
+    linearAppAuth.reject(apiKey, authorization);
+    response = await send(await linearAppAuth.authorization(apiKey));
+  }
 
   if (!response.ok) {
     const body = await response.text().catch(() => "");

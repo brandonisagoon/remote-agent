@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { createConnection } from "node:net";
 
-import { configFilePath, readConfig, type ServerConfig } from "../lib/config.ts";
+import { configFilePath, readConfig, readServiceFile, type ServerConfig } from "../lib/config.ts";
 import { findExecutable, installLayout } from "./paths.ts";
 import { run } from "./run.ts";
 import { resolveCname } from "node:dns/promises";
@@ -31,6 +31,13 @@ export async function runChecks(): Promise<CheckResult[]> {
 
   let config: ServerConfig;
   try {
+    if (Object.keys(readServiceFile().repositories).length === 0) {
+      results.push(
+        { id: "config", label: "Configuration", status: "ok", detail: configFilePath() },
+        { id: "repositories", label: "Repositories", status: "warn", detail: "No repositories configured", remedy: "Add a repository to run tasks on this machine" },
+      );
+      return results;
+    }
     config = readConfig();
     results.push({ id: "config", label: "Configuration", status: "ok", detail: configFilePath() });
   } catch (error) {

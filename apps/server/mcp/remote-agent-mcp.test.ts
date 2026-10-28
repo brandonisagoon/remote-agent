@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["delegate_session", "register_thread"]);
+        expect(names).toEqual(["read_work_graph", "publish_child_issue_update", "read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "resolve_tooling_capability", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -78,6 +78,22 @@ describe("remote-agent MCP server", () => {
     );
   });
 
+  test("delegate supervision keeps the caller fixed and escapes target IDs", async () => {
+    const seen: Array<{ method: string; url: string; body: unknown }> = [];
+    await withServer(async (request) => {
+      const url = new URL(request.url);
+      seen.push({ method: request.method, url: url.pathname + url.search, body: request.method === "GET" ? null : await request.json() });
+      return Response.json({ accepted: true });
+    }, async (rpc) => {
+      await rpc({ method: "tools/call", params: { name: "inspect_delegates", arguments: { sessionId: "child/one" } } });
+      await rpc({ method: "tools/call", params: { name: "instruct_delegate", arguments: { sessionId: "child/one", requestKey: "fix-1", text: "Fix the observed issue", parentSessionId: "untrusted" } } });
+    });
+    expect(seen).toEqual([
+      { method: "GET", url: "/api/sessions/session-7/delegates?delegateId=child%2Fone", body: null },
+      { method: "POST", url: "/api/sessions/session-7/delegates/child%2Fone/instructions", body: { requestKey: "fix-1", text: "Fix the observed issue" } },
+    ]);
+  });
+
   test("surfaces server errors as tool errors", async () => {
     await withServer(
       () => Response.json({ error: "session is closed: session-7" }, { status: 400 }),
@@ -88,5 +104,61 @@ describe("remote-agent MCP server", () => {
         expect(result.content[0]!.text).toContain("session is closed");
       },
     );
+  });
+
+  test("named capability resolution fixes the caller and never forwards arbitrary source paths", async () => {
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/tooling-capability");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual({ capability: "development-credentials" });
+      return Response.json({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "development-credentials", adapter: "/immutable/src/credentials-backup.ts" }, instructions: "Inspect names; verify integrity; export task-required keys only." });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "resolve_tooling_capability", arguments: {
+        capability: "development-credentials", sessionId: "someone-else", adapter: "/tmp/untrusted.ts", revision: "latest",
+      } } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text).receipt.capability).toBe("development-credentials");
+    });
+  });
+
+  test("attachment downloads bind to the caller's session and expose only a local receipt", async () => {
+    const url = "https://uploads.linear.app/workspace/image/file";
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/source-attachment");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual({ url });
+      return Response.json({ path: "/private/attachment.png", contentType: "image/png", size: 123 });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "download_source_attachment", arguments: { url, sessionId: "someone-else", path: "/untrusted/destination" } } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toMatchObject({ path: "/private/attachment.png", size: 123 });
+    });
+  });
+
+  test("issue updates use the caller's fixed session and relay review evidence", async () => {
+    const input = { requestKey: "review-1", body: "1. Open the preview and save an item.", state: "Manual Review", expectedState: "On Course", evidence: [{ path: "/task/result.png", title: "Saved item" }] };
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/issue-update");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual(input);
+      return Response.json({ published: true, commentId: "comment" });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "publish_issue_update", arguments: input } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toEqual({ published: true, commentId: "comment" });
+    });
+  });
+
+  test("child graph and updates use the existing caller session without launching another", async () => {
+    const seen: Array<{ method: string; path: string; body: unknown }> = [];
+    const input = { childIssueId: "DRA-29", requestKey: "child-start", body: "Implementation started", expectedState: "Todo", state: "Implementing" };
+    await withServer(async (request) => {
+      seen.push({ method: request.method, path: new URL(request.url).pathname, body: request.method === "GET" ? null : await request.json() });
+      return Response.json({ accepted: true });
+    }, async (rpc) => {
+      await rpc({ method: "tools/call", params: { name: "read_work_graph", arguments: { sessionId: "unrelated" } } });
+      await rpc({ method: "tools/call", params: { name: "publish_child_issue_update", arguments: input } });
+    });
+    expect(seen).toEqual([
+      { method: "GET", path: "/api/sessions/session-7/work-graph", body: null },
+      { method: "POST", path: "/api/sessions/session-7/child-issue-update", body: input },
+    ]);
   });
 });

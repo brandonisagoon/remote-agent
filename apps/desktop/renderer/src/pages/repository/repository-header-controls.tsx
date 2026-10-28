@@ -1,3 +1,4 @@
+import { useHost } from "@renderer/lib/host-context.tsx";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useParams } from "@tanstack/react-router";
 
@@ -8,7 +9,7 @@ import { Tabs, TabsList, TabsTrigger } from "@renderer/components/ui/tabs.tsx";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@renderer/components/ui/tooltip.tsx";
 
 import { useConfig } from "@renderer/lib/config-context.tsx";
-import { sessionsQueryOptions } from "@renderer/lib/queries/sessions.ts";
+import { repositorySessionsKey } from "@renderer/lib/queries/sessions.ts";
 import { cn } from "@renderer/lib/utils.ts";
 import type { RepositoryTab } from "@renderer/router.tsx";
 
@@ -21,13 +22,14 @@ const TABS: Array<{ id: RepositoryTab; label: string }> = [
 /** Header widgets for repository routes: the page tabs and an Open in Editor
     dropdown listing every detected editor app. */
 export function RepositoryHeaderControls({ repositoryId }: { repositoryId: string }) {
+  const { host } = useHost();
   const { draft } = useConfig();
   const repository = draft.repositories[repositoryId];
   const navigate = useNavigate();
   const params = useParams({ strict: false }) as { tab?: string };
   const tab = (params.tab as RepositoryTab | undefined) ?? "sessions";
   const queryClient = useQueryClient();
-  const sessionsKey = sessionsQueryOptions(repositoryId).queryKey;
+  const sessionsKey = repositorySessionsKey(repositoryId, host.id);
   const refreshing = useIsFetching({ queryKey: sessionsKey }) > 0;
   if (!repository) return null;
 
@@ -40,6 +42,7 @@ export function RepositoryHeaderControls({ repositoryId }: { repositoryId: strin
           void navigate({
             to: "/repositories/$repositoryId/$tab",
             params: { repositoryId, tab: next as RepositoryTab },
+            search: { host: host.id },
           })
         }
         className="absolute left-1/2 -translate-x-1/2"

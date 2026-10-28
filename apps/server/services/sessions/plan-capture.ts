@@ -1,7 +1,7 @@
 import type { RequestPermissionRequest } from "@agentclientprotocol/sdk";
 
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import type { ServerConfig } from "../../../../lib/config.ts";
+import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import {
   getSourceIssueForPlanCapture,
   updateSourceIssue,
@@ -27,27 +27,63 @@ export function planFromPermissionRequest(
   return typeof plan === "string" && plan.trim() ? plan.trim() : null;
 }
 
+/** Only actual ATX headings delimit sections; examples inside fences do not. */
+function markdownHeadings(markdown: string) {
+  const headings: Array<{ start: number; end: number; hashes: number; level: number; title: string }> = [];
+  let offset = 0;
+  let fence: string | null = null;
+  for (const line of markdown.split("\n")) {
+    const marker = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (fence) {
+      if (marker && marker[1]![0] === fence[0] && marker[1]!.length >= fence.length && !marker[2]!.trim()) fence = null;
+    } else if (marker) {
+      fence = marker[1]!;
+    } else {
+      const heading = /^( {0,3})(#{1,6})(?:[ \t]+(.*)|$)/.exec(line);
+      if (heading) headings.push({
+        start: offset,
+        end: offset + line.length,
+        hashes: offset + heading[1]!.length,
+        level: heading[2]!.length,
+        title: (heading[3] ?? "").replace(/[ \t]+#+[ \t]*$/, "").trim(),
+      });
+    }
+    offset += line.length + 1;
+  }
+  return headings;
+}
+
+/** Keep a captured plan's own headings inside the enclosing h2 section. */
+function nestPlanHeadings(plan: string): string {
+  const headings = markdownHeadings(plan);
+  const shift = Math.max(0, 3 - Math.min(3, ...headings.map((heading) => heading.level)));
+  let nested = plan;
+  for (const heading of headings.reverse()) {
+    nested = nested.slice(0, heading.hashes)
+      + "#".repeat(Math.min(6, heading.level + shift))
+      + nested.slice(heading.hashes + heading.level);
+  }
+  return nested;
+}
+
 /** Replaces the plan section in place, or appends it below the original
-    description. The section runs from the header to the next h2 heading. */
+    description. The section ends at the next peer or parent heading. */
 export function splicePlanSection(
   description: string | null,
   plan: string,
 ): string {
-  const section = `${PLAN_SECTION_HEADER}\n\n${plan.trim()}`;
+  const section = `${PLAN_SECTION_HEADER}\n\n${nestPlanHeadings(plan.trim().replace(/\r\n/g, "\n"))}`;
   const existing = (description ?? "").replace(/\r\n/g, "\n");
-  const headerPattern = /^## Implementation Plan[ \t]*$/m;
-  const match = headerPattern.exec(existing);
+  const headings = markdownHeadings(existing);
+  const match = headings.find((heading) => heading.level === 2 && heading.title === "Implementation Plan");
   if (!match) {
     const base = existing.trimEnd();
     return base ? `${base}\n\n${section}\n` : `${section}\n`;
   }
-  const start = match.index;
-  const nextHeading = /^## /m.exec(existing.slice(start + match[0].length));
-  const end = nextHeading
-    ? start + match[0].length + nextHeading.index
-    : existing.length;
+  const start = match.start;
+  const end = headings.find((heading) => heading.start > match.end && heading.level <= 2)?.start ?? existing.length;
   const before = existing.slice(0, start).trimEnd();
-  const after = existing.slice(end).trimStart();
+  const after = existing.slice(end).trim();
   return [before, section, after].filter(Boolean).join("\n\n") + "\n";
 }
 
@@ -94,13 +130,14 @@ export function createPlanCaptureInterceptor(
         );
         return undefined;
       }
-      const issue = await getIssue(context.config, { id: link.externalId });
+      const config = scopeConfig(context.config, { repositoryId: session.repositoryId, connectionId: link.connectionId });
+      const issue = await getIssue(config, { id: link.externalId });
       if (!issue) {
         console.error(`plan capture: source issue ${link.externalId} not found`);
         return undefined;
       }
       await updateIssue(
-        context.config,
+        config,
         { id: issue.id },
         { description: splicePlanSection(issue.description, plan) },
       );
@@ -111,7 +148,7 @@ export function createPlanCaptureInterceptor(
           (entry) => entry.name === workflow.plan!.thenState,
         );
         if (state) {
-          await updateIssue(context.config, { id: issue.id }, { stateId: state.id });
+          await updateIssue(config, { id: issue.id }, { stateId: state.id });
         } else {
           console.error(
             `plan capture: state '${workflow.plan.thenState}' not found on the issue's team`,

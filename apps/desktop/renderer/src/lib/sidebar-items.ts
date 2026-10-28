@@ -1,62 +1,29 @@
 import { useParams } from "@tanstack/react-router";
 import type { useNavigate } from "@tanstack/react-router";
+import { useHost, useHostDirectory } from "./host-context.tsx";
+import { machineSidebarItems } from "../../../../../lib/desktop-navigation.ts";
 
-import { useConfig } from "@renderer/lib/config-context.tsx";
+export const PROVIDER_LABELS: Record<string, string> = { codex: "Codex", claude: "Claude Code" };
+export type SidebarItem = ReturnType<typeof machineSidebarItems>[number];
 
-export const PROVIDER_LABELS: Record<string, string> = {
-  codex: "Codex",
-  claude: "Claude Code",
-};
-
-export interface SidebarItem {
-  id: string;
-  label: string;
-  link:
-    | { to: "/machine" }
-    | { to: "/providers/$providerId"; params: { providerId: string } }
-    | { to: "/connections/$connectionId"; params: { connectionId: string } }
-    | { to: "/repositories/$repositoryId"; params: { repositoryId: string } };
-}
-
-/** Sidebar destinations in display order: providers, connections, machine, repositories. */
+/** Pointer and keyboard navigation share the same complete machine directory. */
 export function useSidebarItems(): SidebarItem[] {
-  const { draft } = useConfig();
-  return [
-    ...Object.keys(draft.providers).map((id) => ({
-      id: `provider:${id}`,
-      label: PROVIDER_LABELS[id] ?? id,
-      link: { to: "/providers/$providerId" as const, params: { providerId: id } },
-    })),
-    ...Object.entries(draft.connections).map(([id, connection]) => ({
-      id: `connection:${id}`,
-      label: connection.name,
-      link: { to: "/connections/$connectionId" as const, params: { connectionId: id } },
-    })),
-    { id: "machine", label: draft.machine.name, link: { to: "/machine" as const } },
-    ...Object.entries(draft.repositories).map(([id, repository]) => ({
-      id: `repository:${id}`,
-      label: repository.name ?? id,
-      link: { to: "/repositories/$repositoryId" as const, params: { repositoryId: id } },
-    })),
-  ];
+  const { entries } = useHostDirectory();
+  return machineSidebarItems(entries.map(({ host, config, error }) => ({
+    host, config: config.draft, dirty: config.anyDirty, unavailable: !!error,
+  })));
 }
 
 export function useCurrentSidebarIndex(items: SidebarItem[]): number {
   const params = useParams({ strict: false });
-  if (params.providerId) return items.findIndex((item) => item.id === `provider:${params.providerId}`);
-  if (params.connectionId) return items.findIndex((item) => item.id === `connection:${params.connectionId}`);
-  if (params.repositoryId) return items.findIndex((item) => item.id === `repository:${params.repositoryId}`);
-  return items.findIndex((item) => item.id === "machine");
+  const { host } = useHost();
+  const kind = params.repositoryId ? "repository" : "machine";
+  const id = params.repositoryId ?? host.id;
+  return items.findIndex((item) => item.kind === kind && item.hostId === host.id && item.id === id);
 }
 
 export function navigateToItem(navigate: ReturnType<typeof useNavigate>, item: SidebarItem): void {
-  if (item.link.to === "/machine") {
-    void navigate({ to: "/machine" });
-  } else if (item.link.to === "/providers/$providerId") {
-    void navigate({ to: item.link.to, params: item.link.params });
-  } else if (item.link.to === "/connections/$connectionId") {
-    void navigate({ to: item.link.to, params: item.link.params });
-  } else {
-    void navigate({ to: item.link.to, params: item.link.params });
-  }
+  const search = { host: item.hostId };
+  if (item.kind === "machine") void navigate({ to: "/machine", search });
+  else void navigate({ to: "/repositories/$repositoryId", params: { repositoryId: item.id }, search });
 }

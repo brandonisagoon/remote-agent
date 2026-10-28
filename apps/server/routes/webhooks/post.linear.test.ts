@@ -7,6 +7,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import * as dispatcher from "../../services/dispatcher/index.ts";
 
 const SECRET = "test-webhook-secret";
 const AGENT_USER_ID = "11111111-2222-3333-4444-555555555555";
@@ -19,10 +20,22 @@ const config: ServerConfig = testConfig({
 
 let db: TestDatabase;
 let prisma: PrismaClient;
+const dispatchEvent = dispatcher.dispatchEvent;
+let dispatches: Array<Promise<void>>;
+let dispatchSpy: ReturnType<typeof spyOn<typeof dispatcher, "dispatchEvent">>;
 
 beforeEach(async () => {
   db = await createTestDatabase();
   prisma = db.prisma;
+  dispatches = [];
+  dispatchSpy = spyOn(dispatcher, "dispatchEvent").mockImplementation((...args) => {
+    const pending = dispatchEvent(...args);
+    dispatches.push(pending);
+    // The webhook intentionally returns before dispatch completes. Observe
+    // rejection now, then assert its actual result before deleting the DB.
+    void pending.catch(() => undefined);
+    return pending;
+  });
   globalThis.fetch = (async (_input, init) => {
     const body = JSON.parse(String(init?.body)) as { query: string };
     if (
@@ -31,7 +44,7 @@ beforeEach(async () => {
     ) {
       return Response.json({ data: { issue: null } });
     }
-    if (body.query.includes("CreateReaction")) {
+    if (body.query.includes("CreateReaction") || body.query.includes("CreateIssueReaction")) {
       return Response.json({
         data: { reactionCreate: { success: true } },
       });
@@ -41,9 +54,17 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await Bun.sleep(10);
-  globalThis.fetch = originalFetch;
-  await db.cleanup();
+  try {
+    await Promise.all(dispatches);
+    expect(await prisma.webhookReceipt.count({ where: {
+      status: "accepted",
+      OR: [{ runs: { none: {} } }, { runs: { some: { status: "pending" } } }],
+    } })).toBe(0);
+  } finally {
+    dispatchSpy.mockRestore();
+    globalThis.fetch = originalFetch;
+    await db.cleanup();
+  }
 });
 
 function commentPayload(overrides: Record<string, unknown> = {}) {
@@ -143,7 +164,8 @@ function post(
     secret = SECRET,
     deliveryId = crypto.randomUUID(),
     signature,
-  }: { secret?: string; deliveryId?: string | null; signature?: string } = {},
+    requestConfig = config,
+  }: { secret?: string; deliveryId?: string | null; signature?: string; requestConfig?: ServerConfig } = {},
 ) {
   const raw = typeof body === "string" ? body : JSON.stringify(body);
   const headers: Record<string, string> = {
@@ -153,12 +175,51 @@ function post(
   };
   if (deliveryId) headers["linear-delivery"] = deliveryId;
 
-  return createApp({ config, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/linear-test", {
+  return createApp({ config: requestConfig, prisma, agentRuntime: createFakeAgentRuntime() }).request("/webhooks/linear-test", {
     method: "POST",
     headers,
     body: raw,
   });
 }
+
+describe("user-scoped routing", () => {
+  const requestConfig = testConfig({
+    webhookSecret: SECRET,
+    webhooks: {
+      ...config.webhooks,
+      "linear-test": {
+        ...config.webhooks["linear-test"]!,
+        repositoryRouting: {
+          [config.repository.id]: { when: [{ "linear.userId": ["user-brandon"] }] },
+        },
+      },
+    },
+  });
+
+  test("accepts the configured comment author", async () => {
+    const response = await post(commentPayload(), { requestConfig });
+    expect(response.status).toBe(202);
+  });
+
+  test.each(["Comment", "Reaction", "Issue"])("rejects another user or an absent actor for %s before dispatch", async (type) => {
+    for (const userId of ["someone-else", undefined]) {
+      const payload = type === "Issue" ? issuePayload() : type === "Reaction" ? reactionPayload() : commentPayload();
+      const data = { ...payload.data, userId, user: userId ? { id: userId } : undefined, assigneeId: "user-brandon", creatorId: "user-brandon" };
+      const response = await post({ ...payload, data, actor: userId ? { id: userId } : undefined }, { requestConfig });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ accepted: false, ignored: true });
+      expect(await prisma.webhookReceipt.count()).toBe(0);
+      expect(await prisma.runtimeSession.count()).toBe(0);
+    }
+  });
+
+  test("routes issue changes by the actor, not the assignee", async () => {
+    const payload = issuePayload({ state: "Unconfigured state" });
+    const response = await post({ ...payload, actor: { id: "user-brandon" }, data: { ...payload.data, assigneeId: "someone-else" } }, { requestConfig });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ignored: true });
+  });
+});
 
 describe("signature verification", () => {
   test("rejects a wrong secret before doing any work", async () => {
