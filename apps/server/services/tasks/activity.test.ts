@@ -206,3 +206,53 @@ test("owner Merge racing review publication acknowledgement suppresses stale own
   await f.publish("review");
   expect((await f.read())!.activity.state).toBe("idle");
 });
+
+test("explicit blocked or waiting progress exposes an unconfirmed dependency without inventing its duration or owner", async () => {
+  const f = await fixture();
+  const detail = "Cloudflare operation returned 403; authorization is needed before retry.";
+  for (const phase of ["blocked", "waiting"]) {
+    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase, recoveryDetail: detail, updatedAt: before(90) } });
+    await f.prisma.$disconnect();
+    expect((await f.read())!.activity).toMatchObject({ state: "waiting-dependency", cause: `Task reports a dependency; not independently confirmed: ${detail}`, since: null, durationMs: null, ownerQuestions: [], control: { reportedPhase: phase, reportedDetail: detail } });
+  }
+  for (const recoveryDetail of [null, "", "  \n "]) {
+    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "blocked", recoveryDetail } });
+    expect((await f.read())!.activity.state).toBe("idle");
+  }
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working", recoveryDetail: detail } });
+  expect((await f.read())!.activity.state).toBe("idle");
+  expect(f.runtime.sentMessages).toHaveLength(0);
+});
+
+test("reported dependency cannot override active work, queue, unknown result, or paused and closed control", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "blocked", recoveryDetail: "Awaiting dependency" } });
+  f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
+  expect((await f.read())!.activity.state).toBe("executing");
+  f.runtime.observeSessionActivity = (id) => ({ state: id === f.child.id ? "executing" : "unknown", observedAt: now });
+  expect((await f.read())!.activity.state).toBe("waiting-active-work");
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: now });
+  const event = await f.prisma.runtimeLifecycleEvent.create({ data: { id: "dependency-worker-done", runtimeSessionId: f.child.id, requestId: "worker-turn", phase: "completed", occurredAt: before(30) } });
+  expect((await f.read())!.activity).toMatchObject({ state: "stalled", pendingDelegateResults: [{ deliveryState: "not-enqueued" }] });
+  const id = `delegate-result:${f.primary.id}:${event.id}`;
+  await f.prisma.runtimeInstruction.create({ data: { id, sessionId: f.primary.id, text: "Terminal worker result", state: "queued" } });
+  expect((await f.read())!.activity.state).toBe("queued");
+  await f.prisma.runtimeInstruction.update({ where: { id }, data: { state: "unknown" } });
+  expect((await f.read())!.activity).toMatchObject({ state: "stalled", pendingDelegateResults: [{ deliveryState: "unknown" }] });
+  await f.prisma.runtimeInstruction.update({ where: { id }, data: { state: "completed" } });
+  expect((await f.read())!.activity.state).toBe("waiting-dependency");
+  await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "active" } });
+  expect((await f.read())!.activity.state).toBe("unknown");
+  await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "idle" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  expect((await f.read())!.activity.state).toBe("paused");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed", controlMode: "agent" } });
+  expect((await f.read())!.activity.state).toBe("closed");
+});
+
+test("confirmed review handoff retains precedence over reported dependency", async () => {
+  const f = await reviewFixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting", recoveryDetail: "Review requested" } });
+  await f.publish("review");
+  expect((await f.read())!.activity).toMatchObject({ state: "waiting-owner", durationMs: 30_000 });
+});

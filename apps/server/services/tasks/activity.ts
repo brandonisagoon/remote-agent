@@ -9,7 +9,7 @@ type Instruction = Pick<RuntimeInstruction, "id" | "state" | "detail" | "created
 type Turn = Pick<RuntimeLifecycleEvent, "id" | "requestId" | "phase" | "occurredAt" | "sequence">;
 type Question = Pick<RuntimeQuestion, "id" | "state" | "createdAt" | "updatedAt">;
 type Observation = { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
-type ActivityState = "executing" | "queued" | "waiting-owner" | "waiting-active-work" | "stalled" | "unknown" | "paused" | "closed" | "idle";
+type ActivityState = "executing" | "queued" | "waiting-owner" | "waiting-active-work" | "waiting-dependency" | "stalled" | "unknown" | "paused" | "closed" | "idle";
 const unsettledStates = ["preparing", "queued", "dispatching", "unknown"];
 const PublishedIdentity = z.object({ connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(), state: z.string().nullable() });
 
@@ -188,6 +188,15 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
     activity.state = "waiting-owner";
     activity.cause = "A confirmed source-issue Manual Review handoff awaits owner action; no later owner Merge authorization is recorded";
     Object.assign(activity, timing(reviewHandoff.since, now));
+  }
+  // Explicit progress is reported, not independently observed dependency or
+  // owner identity. Never infer either from prose or reuse updatedAt as a phase
+  // timestamp: unrelated task updates also change it.
+  const reportedDependency = task.recoveryDetail?.trim();
+  if (activity.state === "idle" && ["waiting", "blocked"].includes(task.phase) && reportedDependency) {
+    activity.state = "waiting-dependency";
+    activity.cause = `Task reports a dependency; not independently confirmed: ${reportedDependency}`;
+    Object.assign(activity, timing(null, now));
   }
   return { task, session: main.session, history: main.history, questions: main.questions, instructions: main.instructions, delegates, activity };
 }
