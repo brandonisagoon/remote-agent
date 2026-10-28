@@ -2,6 +2,7 @@ import type { Hono } from "hono";
 
 import type { AppEnv } from "../middleware/context.ts";
 import healthRoutes from "./health/index.ts";
+import { diagnosticsRoutes } from "./diagnostics/index.ts";
 import launchRoutes from "./launches/index.ts";
 import sessionEventRoutes from "./session-events/index.ts";
 import sessionRoutes from "./sessions/index.ts";
@@ -14,6 +15,7 @@ import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
 
 export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/health", healthRoutes);
+  app.route("/api/diagnostics", diagnosticsRoutes);
   app.route("/webhooks", webhookRoutes);
   app.route("/api/sessions", sessionRoutes);
   app.route("/api/sessions", sessionTaskRoutes);

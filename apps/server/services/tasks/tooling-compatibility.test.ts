@@ -37,6 +37,7 @@ async function fixture(pinnedPreparation = false) {
   write(source, ".remote-agent-capabilities.json", JSON.stringify({ version: 1, capabilities: {
     prepare: { instructions: "agent-skills/prepare/instructions.md", adapter: "src/cli.ts" },
     merge: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
+    cleanup: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
     "development-credentials": { instructions: "credentials/README.md", adapter: "src/credentials-backup.ts" },
   } }));
   write(source, "agent-skills/prepare/instructions.md", "Host preparation capability: inspect the actual task services.");
@@ -137,6 +138,20 @@ test("credential capability route rejects arbitrary names and paths and uses tas
   }
   expect((await request({ capability: "development-credentials" }, "another-session")).status).toBe(409);
   expect((await request({ capability: "development-credentials" })).status).toBe(200);
+});
+
+test("old pin resolves named cleanup without running effects, changing authority or repinning", async () => {
+  const f = await fixture();
+  const input = { prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "cleanup" as const };
+  const result = await resolveSessionToolingCapability(input);
+  expect(result.receipt).toMatchObject({ capability: "cleanup", capabilityRevision: f.hostRevision, taskToolingRevision: f.oldRevision });
+  expect(result.instructions).toContain("not new deletion or merge authority");
+  expect(result.instructions).toContain("independently verified absence");
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "completion-contract" } })).toBe(0);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  await expect(resolveSessionToolingCapability(input)).rejects.toThrow("paused");
 });
 
 test("undeclared development credential capability fails concretely without upgrading the task", async () => {

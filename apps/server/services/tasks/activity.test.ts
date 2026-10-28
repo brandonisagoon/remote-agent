@@ -140,3 +140,69 @@ test("exhausted delivery retries expose bounded recovery without fabricating or 
   await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
   expect((await f.read())!.activity.state).toBe("paused");
 });
+
+async function reviewFixture() {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { connectionId: "connection", issueIdentifier: "DRA-57", phase: "review" } });
+  await f.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: f.primary.id, provider: "linear", connectionId: "connection", resourceType: "issue-identifier", externalId: "DRA-57", relationship: "handles" } });
+  const publish = async (key: string, options: { identifier?: string; state?: string; published?: boolean; commentPosted?: boolean; observed?: boolean; connectionId?: string } = {}) => {
+    const identifier = options.identifier ?? "DRA-57", state = options.state ?? "Manual Review", connectionId = options.connectionId ?? "connection";
+    const receipt = await f.prisma.runtimeIssueUpdate.create({ data: { runtimeSessionId: f.primary.id, requestKey: key, issueId: `uuid:${identifier}`, connectionId, input: { state }, evidence: [], published: options.published ?? true, commentPosted: options.commentPosted ?? true, createdAt: before(40), updatedAt: before(30) } });
+    if (options.observed !== false) await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.primary.id, action: "issue-update-published", source: "issue-update-observer", key: receipt.id, occurredAt: before(30), value: JSON.stringify({ connectionId, issueIdentifier: identifier, issueId: receipt.issueId, state }) } });
+    return receipt;
+  };
+  return { ...f, publish };
+}
+
+test("published source review waits for the owner without a question, survives reconnect, and later owner Merge supersedes it", async () => {
+  const f = await reviewFixture();
+  expect((await f.read())!.activity.state).toBe("idle"); // reported phase is not evidence
+  const receipt = await f.publish("review");
+  await f.prisma.$disconnect();
+  expect((await f.read())!.activity).toMatchObject({ state: "waiting-owner", durationMs: 30_000, ownerQuestions: [], reviewHandoff: { receiptId: receipt.id, issueIdentifier: "DRA-57", issueId: "uuid:DRA-57", publishedAt: before(30).toISOString() } });
+  await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.primary.id, action: "completion-contract", source: `owner:${f.task.id}`, key: "owner-merge", occurredAt: before(20), value: JSON.stringify({ boundary: "merge" }) } });
+  expect((await f.read())!.activity).toMatchObject({ state: "idle", reviewHandoff: null, control: { reportedPhase: "review" } });
+  expect(f.runtime.sentMessages).toHaveLength(0);
+});
+
+test("child, foreign connection, unconfirmed and legacy ambiguous review receipts cannot imply source owner wait", async () => {
+  const f = await reviewFixture();
+  await f.publish("legacy", { observed: false });
+  await f.publish("child", { identifier: "DRA-CHILD" });
+  await f.publish("other-connection", { connectionId: "foreign" });
+  expect((await f.read())!.activity.state).toBe("idle");
+  await f.publish("unknown", { published: false });
+  expect((await f.read())!.activity.state).toBe("idle");
+  await f.publish("missing-comment", { commentPosted: false });
+  expect((await f.read())!.activity.state).toBe("idle");
+  await f.publish("confirmed");
+  expect((await f.read())!.activity.state).toBe("waiting-owner");
+  await f.publish("working", { state: "On Course" });
+  expect((await f.read())!.activity.state).toBe("idle");
+});
+
+test("review handoff never hides executing, queued, active delegate, stalled, unknown or paused evidence", async () => {
+  const f = await reviewFixture();
+  await f.publish("review");
+  f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
+  expect((await f.read())!.activity.state).toBe("executing");
+  f.runtime.observeSessionActivity = (id) => ({ state: id === f.child.id ? "executing" : "unknown", observedAt: now });
+  expect((await f.read())!.activity.state).toBe("waiting-active-work");
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: now });
+  const receipt = await f.prisma.runtimeInstruction.create({ data: { id: "review-followup", sessionId: f.primary.id, text: "Followup", state: "queued" } });
+  expect((await f.read())!.activity.state).toBe("queued");
+  await f.prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "unknown" } });
+  expect((await f.read())!.activity.state).toBe("stalled");
+  await f.prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "completed" } });
+  await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "active" } });
+  expect((await f.read())!.activity.state).toBe("unknown");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  expect((await f.read())!.activity.state).toBe("paused");
+});
+
+test("owner Merge racing review publication acknowledgement suppresses stale owner wait", async () => {
+  const f = await reviewFixture();
+  await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.primary.id, action: "completion-contract", source: `owner:${f.task.id}`, key: "racing-merge", occurredAt: before(35), value: JSON.stringify({ boundary: "merge" }) } });
+  await f.publish("review");
+  expect((await f.read())!.activity.state).toBe("idle");
+});

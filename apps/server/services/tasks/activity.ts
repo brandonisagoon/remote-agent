@@ -1,5 +1,6 @@
 import type { PrismaClient, RemoteTask, RuntimeInstruction, RuntimeLifecycleEvent, RuntimeQuestion, RuntimeSession } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import { z } from "zod";
 import { listRuntimeProjectionRetries } from "../sessions/runtime-events/projection-retries.ts";
 
 type Task = Pick<RemoteTask, "id" | "phase" | "controlMode" | "recoveryDetail">;
@@ -10,6 +11,37 @@ type Question = Pick<RuntimeQuestion, "id" | "state" | "createdAt" | "updatedAt"
 type Observation = { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
 type ActivityState = "executing" | "queued" | "waiting-owner" | "waiting-active-work" | "stalled" | "unknown" | "paused" | "closed" | "idle";
 const unsettledStates = ["preparing", "queued", "dispatching", "unknown"];
+const PublishedIdentity = z.object({ connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(), state: z.string().nullable() });
+
+async function sourceReviewHandoff(prisma: PrismaClient, task: RemoteTask, session: RuntimeSession | null) {
+  if (!session || session.role === "delegate" || !task.connectionId || !task.issueIdentifier) return null;
+  const links = await prisma.runtimeSessionResourceLink.findMany({ where: { runtimeSessionId: session.id, provider: "linear", resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
+  if (links.length !== 1 || links[0]!.connectionId !== task.connectionId || links[0]!.externalId !== task.issueIdentifier) return null;
+  const events = await prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: session.id, action: "issue-update-published", source: "issue-update-observer" }, orderBy: { sequence: "desc" } });
+  for (const event of events) {
+    let value: unknown;
+    try { value = JSON.parse(event.value ?? "null"); } catch { continue; }
+    const parsed = PublishedIdentity.safeParse(value);
+    if (!parsed.success) continue;
+    const identity = parsed.data;
+    if (identity.connectionId !== task.connectionId || identity.issueIdentifier !== task.issueIdentifier) continue;
+    // A later source state publication supersedes review. Comment-only updates
+    // do not. Legacy unbound receipts cannot establish source-vs-child identity.
+    if (!identity.state) continue;
+    if (identity.state !== "Manual Review") return null;
+    const receipt = await prisma.runtimeIssueUpdate.findFirst({ where: { id: event.key ?? "", runtimeSessionId: session.id, connectionId: identity.connectionId, issueId: identity.issueId, published: true, commentPosted: true } });
+    const payload = z.object({ state: z.literal("Manual Review") }).safeParse(receipt?.input);
+    if (!receipt || !payload.success) return null;
+    // Include an owner decision racing publication acknowledgement: a Merge
+    // recorded after this update began must not be hidden by a later receipt.
+    const decisions = await prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: session.id, source: `owner:${task.id}`, action: "completion-contract", occurredAt: { gte: receipt.createdAt } } });
+    for (const decision of decisions) {
+      try { if (JSON.parse(decision.value ?? "null")?.boundary === "merge") return null; } catch { /* malformed legacy metadata grants no authority */ }
+    }
+    return { receiptId: receipt.id, issueIdentifier: identity.issueIdentifier, issueId: identity.issueId, publishedAt: event.occurredAt.toISOString(), since: event.occurredAt };
+  }
+  return null;
+}
 
 function timing(since: Date | null, now: number) {
   return { since: since?.toISOString() ?? null, durationMs: since ? Math.max(0, now - since.getTime()) : null };
@@ -133,7 +165,8 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
     }
   }
   const projectionRetries = primarySession ? await listRuntimeProjectionRetries(prisma, [primarySession.id, ...children.map((child) => child.id)]) : [];
-  const activity = { ...main.activity, pendingDelegateResults, projectionRetries, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
+  const reviewHandoff = await sourceReviewHandoff(prisma, task, primarySession);
+  const activity = { ...main.activity, reviewHandoff: reviewHandoff ? { receiptId: reviewHandoff.receiptId, issueIdentifier: reviewHandoff.issueIdentifier, issueId: reviewHandoff.issueId, publishedAt: reviewHandoff.publishedAt } : null, pendingDelegateResults, projectionRetries, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
   if (activity.state === "idle" && pendingDelegateResults.length) {
     activity.state = "stalled"; activity.cause = "A completed delegate result has not completed delivery to the primary";
     activity.since = pendingDelegateResults[0]!.since; activity.durationMs = pendingDelegateResults[0]!.durationMs;
@@ -148,6 +181,13 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
     activity.cause = "Delegate-result notification exhausted its automatic delivery attempts; explicit projection recovery is required";
     activity.since = new Date(failedNotification.failedAt).toISOString();
     activity.durationMs = Math.max(0, now - failedNotification.failedAt);
+  }
+  // Review is an observed handoff, not an inference from model-reported phase
+  // or prose. Preserve all execution, queue, uncertainty and stall evidence.
+  if (activity.state === "idle" && reviewHandoff) {
+    activity.state = "waiting-owner";
+    activity.cause = "A confirmed source-issue Manual Review handoff awaits owner action; no later owner Merge authorization is recorded";
+    Object.assign(activity, timing(reviewHandoff.since, now));
   }
   return { task, session: main.session, history: main.history, questions: main.questions, instructions: main.instructions, delegates, activity };
 }

@@ -1,6 +1,23 @@
 import { expect, test } from "bun:test";
 import { TurnCapacity } from "./turn-capacity.ts";
 
+test("omitting a limit admits eight simultaneous turns without a hidden pilot cap", async () => {
+  const capacity = new TurnCapacity();
+  const controller = new AbortController();
+  const admitted: Array<() => void> = [];
+  const attempts = Array.from({ length: 8 }, () => capacity.acquire(controller.signal).then((release) => { admitted.push(release); }));
+  try {
+    await Promise.resolve();
+    expect(admitted).toHaveLength(8);
+    expect(capacity.full).toBe(false);
+    await Promise.all(attempts);
+  } finally {
+    controller.abort();
+    for (const release of admitted) release();
+    await Promise.allSettled(attempts);
+  }
+});
+
 test("machine slots admit FIFO and release exactly once", async () => {
   const capacity = new TurnCapacity(3);
   const signal = new AbortController().signal;

@@ -10,6 +10,7 @@ import { deliverInstructions } from "../../../../services/sessions/inbox.ts";
 import { registerThread } from "../../../../services/sessions/threads.ts";
 import * as dispatcher from "../../../../services/dispatcher/index.ts";
 import * as graphs from "../../session-store/source-issue/work-graph.ts";
+import * as issueReads from "../../session-store/source-issue/read.ts";
 import * as inbox from "../../../../services/sessions/inbox.ts";
 import { handleCommentWebhook } from "./handler.ts";
 import type { LinearCommentWebhook } from "../../webhook-types/comment.ts";
@@ -17,6 +18,7 @@ import type { LinearCommentWebhook } from "../../webhook-types/comment.ts";
 let db: TestDatabase;
 let dispatch: ReturnType<typeof spyOn<typeof dispatcher, "dispatchEvent">>;
 let graph: ReturnType<typeof spyOn<typeof graphs, "getIssueWorkGraph">>;
+let parentRead: ReturnType<typeof spyOn<typeof issueReads, "getSourceIssueParent">>;
 const config = testConfig();
 config.webhooks[config.activeWebhookId]!.repositoryRouting[config.activeRepositoryId] = { when: [{ "linear.userId": ["owner"] }] };
 let runtime: ReturnType<typeof createFakeAgentRuntime>;
@@ -24,12 +26,13 @@ beforeEach(async () => {
   db = await createTestDatabase();
   runtime = createFakeAgentRuntime();
   dispatch = spyOn(dispatcher, "dispatchEvent").mockResolvedValue();
+  parentRead = spyOn(issueReads, "getSourceIssueParent").mockResolvedValue(null);
   graph = spyOn(graphs, "getIssueWorkGraph").mockResolvedValue({ id: "issue", identifier: "DRA-28", states: [], children: [{
     id: "child-issue", identifier: "DRA-29", title: "Child scope", url: "https://linear.app/issue/DRA-29", completedAt: null,
     state: { id: "todo", name: "Todo", type: "unstarted" }, parent: { id: "issue", identifier: "DRA-28" }, blockedBy: [], blocks: [],
   }] });
 });
-afterEach(async () => { dispatch.mockRestore(); graph.mockRestore(); await db.cleanup(); });
+afterEach(async () => { dispatch.mockRestore(); graph.mockRestore(); parentRead.mockRestore(); await db.cleanup(); });
 
 function comment(overrides: Partial<LinearCommentWebhook["data"]> = {}): LinearCommentWebhook {
   return { type: "Comment", action: "create", webhookTimestamp: Date.now(), data: {
@@ -220,6 +223,76 @@ test("a direct child comment wakes the parent's existing primary once", async ()
   expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).text).toContain("DRA-29 — direct child of DRA-28");
   expect(await db.prisma.remoteTask.count()).toBe(1);
   expect(await db.prisma.runtimeSession.count()).toBe(1);
+});
+
+test("a newly created child routes without a prior primary graph read and resumes exactly once", async () => {
+  const { session } = await primary("one", { status: "idle" });
+  parentRead.mockResolvedValue({ id: "child-issue", identifier: "DRA-29", parent: { id: "issue", identifier: "DRA-28" } });
+  expect(await receive(childComment())).toMatchObject({ kind: "accepted" });
+  await deliverInstructions(db.prisma, runtime);
+  await waitForCompletion();
+  await receive(childComment(), "redelivery");
+  expect(parentRead).toHaveBeenCalledTimes(1);
+  expect(runtime.sentMessages).toHaveLength(1);
+  expect(runtime.sentMessages[0]?.sessionId).toBe(session.id);
+  expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).text).toContain("DRA-29 — direct child of DRA-28");
+  expect(await db.prisma.remoteTask.count()).toBe(1);
+  expect(await db.prisma.runtimeSession.count()).toBe(1);
+  expect(dispatch).not.toHaveBeenCalled();
+});
+
+test("new child discovery verifies current parent and leaves failed reads retryable", async () => {
+  await primary();
+  parentRead.mockRejectedValueOnce(new Error("parent lookup unavailable"));
+  await expect(receive(childComment())).rejects.toThrow("parent lookup unavailable");
+  expect(await db.prisma.webhookReceipt.count()).toBe(0);
+  parentRead.mockResolvedValue({ id: "child-issue", identifier: "DRA-29", parent: { id: "wrong-parent", identifier: "DRA-28" } });
+  expect(await receive(childComment())).toEqual({ kind: "ignored", reason: "child_no_longer_owned" });
+  expect(await db.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test("new child discovery does not query unauthorized actors or replace a closed parent", async () => {
+  await primary("one", { phase: "closed", status: "closed" });
+  await receive(childComment({ userId: "other" }), "other");
+  expect(parentRead).not.toHaveBeenCalled();
+  parentRead.mockResolvedValue({ id: "child-issue", identifier: "DRA-29", parent: { id: "issue", identifier: "DRA-28" } });
+  expect(await receive(childComment({ body: "@cubic-agent continue" }))).toEqual({ kind: "ignored", reason: "source_primary_unavailable" });
+  expect(dispatch).not.toHaveBeenCalled();
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test("a child acquiring its own task during discovery cannot be bound or delivered to the parent", async () => {
+  await primary();
+  parentRead.mockResolvedValue({ id: "child-issue", identifier: "DRA-29", parent: { id: "issue", identifier: "DRA-28" } });
+  graph.mockImplementationOnce(async () => {
+    const own = await primary("child-task");
+    await db.prisma.remoteTask.update({ where: { id: own.task.id }, data: { issueIdentifier: "DRA-29" } });
+    await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: own.session.id }, data: { externalId: "DRA-29" } });
+    return { id: "issue", identifier: "DRA-28", states: [], children: [{ id: "child-issue", identifier: "DRA-29", title: "New own task", url: "https://linear.app/issue/DRA-29", completedAt: null,
+      state: { id: "todo", name: "Todo", type: "unstarted" }, parent: { id: "issue", identifier: "DRA-28" }, blockedBy: [], blocks: [] }] };
+  });
+  await expect(receive(childComment())).rejects.toThrow("Child acquired its own task");
+  expect(await db.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.webhookReceipt.count()).toBe(0);
+  expect(await receive(childComment(), "retry")).toMatchObject({ kind: "accepted" });
+  const childTask = await db.prisma.remoteTask.findFirstOrThrow({ where: { issueIdentifier: "DRA-29" } });
+  expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).sessionId).toBe(childTask.primarySessionId!);
+});
+
+test("a persisted child link cannot steal owner replies after the child acquires its own task", async () => {
+  const parent = await primary();
+  await bindChild(parent.session.id);
+  const own = await primary("child-task");
+  await db.prisma.remoteTask.update({ where: { id: own.task.id }, data: { issueIdentifier: "DRA-29" } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: own.session.id }, data: { externalId: "DRA-29" } });
+  await receive(childComment());
+  await receive(childComment(), "redelivery");
+  expect(await db.prisma.runtimeInstruction.count()).toBe(1);
+  expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).sessionId).toBe(own.session.id);
+  expect(graph).not.toHaveBeenCalled();
+  expect(dispatch).not.toHaveBeenCalled();
 });
 
 test("registered child answers retain question context across uncertain response and retry", async () => {

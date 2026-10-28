@@ -123,7 +123,17 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     const confirmed = await client.read(config, { id: issue.id });
     if (confirmed?.state.id !== target.id) throw new Error("Issue state change is unconfirmed; inspect and retry the same update");
   }
-  await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { published: true } });
+  // Keep the resolved provider identity separate from the caller's immutable
+  // retry payload. A primary can also publish child updates; consumers must not
+  // mistake those receipts for a handoff of its source issue. Commit only after
+  // the comment and requested state are confirmed, atomically with publication.
+  await prisma.$transaction(async (tx) => {
+    await tx.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { published: true } });
+    await tx.runtimeMetadataEvent.create({ data: {
+      runtimeSessionId: sessionId, action: "issue-update-published", source: "issue-update-observer", key: receipt.id,
+      value: JSON.stringify({ connectionId: link.connectionId, issueId: issue.id, issueIdentifier: issue.identifier, state: payload.state ?? null }),
+    } });
+  });
   return result();
 }
 

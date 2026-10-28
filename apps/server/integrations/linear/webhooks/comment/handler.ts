@@ -11,6 +11,7 @@ import { findThreadSession } from "../../../../services/sessions/threads.ts";
 import { createWebhookReceipt } from "../../../../services/receipts/store.ts";
 import { deliverInstructions, queueInstruction } from "../../../../services/sessions/inbox.ts";
 import { getIssueWorkGraph } from "../../session-store/source-issue/work-graph.ts";
+import { getSourceIssueParent } from "../../session-store/source-issue/read.ts";
 import { withToolingInstructions } from "../../../../../../lib/skills/compose.ts";
 
 /** A subscription without an explicit actor is not owner authorization. The
@@ -60,7 +61,7 @@ async function childPrimary(prisma: PrismaClient, config: ServerConfig, identifi
 async function queueOwnerComment(input: {
   prisma: PrismaClient; config: ServerConfig; agentRuntime: AgentSessionRuntime;
   deliveryId: string; webhook: LinearCommentWebhook; sessionId: string;
-  parentIdentifier?: string; questionId?: string;
+  parentIdentifier?: string; questionId?: string; discoveredChild?: boolean;
 }): Promise<CommentWebhookResult> {
   const { prisma, config, webhook, sessionId } = input;
   const data = webhook.data;
@@ -71,6 +72,17 @@ async function queueOwnerComment(input: {
   const queued = await prisma.$transaction(async (tx) => {
     const session = await tx.runtimeSession.findUnique({ where: { id: sessionId } });
     const task = await tx.remoteTask.findUnique({ where: { primarySessionId: sessionId } });
+    if (input.parentIdentifier) {
+      // Discovery includes remote reads. A child may acquire its own task
+      // during those reads; never steal its comment for the old parent.
+      const direct = await sourcePrimary(tx as PrismaClient, config, data.issue!.identifier);
+      if (direct.primary || direct.reason) throw new Error("Child acquired its own task before owner comment delivery");
+      if (input.discoveredChild) {
+        const identity = { runtimeSessionId: sessionId, provider: "linear", connectionId: config.activeConnectionId,
+          resourceType: "issue-identifier", externalId: data.issue!.identifier, relationship: "child" };
+        await tx.runtimeSessionResourceLink.upsert({ where: { runtimeSessionId_provider_connectionId_resourceType_externalId_relationship: identity }, create: identity, update: {} });
+      }
+    }
     const currentOwner = input.parentIdentifier
       ? (await childPrimary(tx as PrismaClient, config, data.issue!.identifier)).owner
       : await sourcePrimary(tx as PrismaClient, config, data.issue!.identifier);
@@ -145,8 +157,34 @@ export async function handleCommentWebhook(input: {
       });
   let ownerRoutingFailure: string | null = null;
   let childRoutingFailure: string | null = null;
-  if (!selfAuthored && data.issue?.identifier) {
-    const ownership = await childPrimary(prisma, config, data.issue.identifier);
+  // Direct ownership supersedes a historical parent-child link. Otherwise a
+  // child promoted into its own task would retry forever against the parent.
+  if (!selfAuthored && data.issue?.identifier && isSubscribedOwner(config, authorId)) {
+    const direct = await sourcePrimary(prisma, config, data.issue.identifier);
+    if (direct.primary && (!registration || registration.runtimeSessionId === direct.primary.id)) {
+      return queueOwnerComment({ ...input, sessionId: direct.primary.id, ...(registration ? { questionId: threadRootCommentId } : {}) });
+    }
+    ownerRoutingFailure = direct.primary && registration ? "source_thread_owner_mismatch" : direct.reason;
+  }
+  if (!selfAuthored && !ownerRoutingFailure && data.issue?.identifier) {
+    let ownership = await childPrimary(prisma, config, data.issue.identifier);
+    let discoveredParentId: string | null = null;
+    // A child created by the owner must not wait for the primary to refresh its
+    // graph. Discover only for a subscribed owner and never revive stale links
+    // or steal an issue that already has its own task.
+    if (!ownership.owner && !ownership.reason && isSubscribedOwner(config, authorId)) {
+      const direct = await sourcePrimary(prisma, config, data.issue.identifier);
+      if (!direct.primary && !direct.reason) {
+        const issue = await getSourceIssueParent(config, { id: data.issue.id });
+        if (issue?.id === data.issue.id && issue.identifier === data.issue.identifier && issue.parent) {
+          const parent = await sourcePrimary(prisma, config, issue.parent.identifier);
+          if (parent.primary) {
+            ownership = { owner: { primary: parent.primary, parentIdentifier: issue.parent.identifier }, reason: null };
+            discoveredParentId = issue.parent.id;
+          } else if (parent.reason) ownership = { owner: null, reason: parent.reason };
+        }
+      }
+    }
     if (ownership.owner) {
       if (!isSubscribedOwner(config, authorId)) childRoutingFailure = "unauthorized_child_comment";
       else if (registration && registration.runtimeSessionId !== ownership.owner.primary.id) childRoutingFailure = "child_thread_owner_mismatch";
@@ -156,18 +194,14 @@ export async function handleCommentWebhook(input: {
         // retry; a confirmed changed parent is rejected, including mentions.
         const graph = await getIssueWorkGraph(config, { id: ownership.owner.parentIdentifier });
         const child = graph.children.find((candidate) => candidate.identifier === data.issue!.identifier && candidate.id === data.issue!.id);
-        if (graph.identifier !== ownership.owner.parentIdentifier || child?.parent?.id !== graph.id) childRoutingFailure = "child_no_longer_owned";
-        else return queueOwnerComment({ ...input, sessionId: ownership.owner.primary.id, parentIdentifier: ownership.owner.parentIdentifier,
-          ...(registration ? { questionId: threadRootCommentId } : {}) });
+        if (graph.identifier !== ownership.owner.parentIdentifier || child?.parent?.id !== graph.id || (discoveredParentId && graph.id !== discoveredParentId)) childRoutingFailure = "child_no_longer_owned";
+        else {
+          return queueOwnerComment({ ...input, sessionId: ownership.owner.primary.id, parentIdentifier: ownership.owner.parentIdentifier,
+            discoveredChild: Boolean(discoveredParentId),
+            ...(registration ? { questionId: threadRootCommentId } : {}) });
+        }
       }
     } else childRoutingFailure = ownership.reason;
-  }
-  if (!selfAuthored && !childRoutingFailure && data.issue?.identifier && isSubscribedOwner(config, authorId)) {
-    const ownership = await sourcePrimary(prisma, config, data.issue.identifier);
-    if (ownership.primary && (!registration || registration.runtimeSessionId === ownership.primary.id)) {
-      return queueOwnerComment({ ...input, sessionId: ownership.primary.id, ...(registration ? { questionId: threadRootCommentId } : {}) });
-    }
-    ownerRoutingFailure = ownership.primary && registration ? "source_thread_owner_mismatch" : ownership.reason;
   }
   const accepted = !childRoutingFailure && !ownerRoutingFailure && (mentioned || registration !== null);
   const detail = selfAuthored

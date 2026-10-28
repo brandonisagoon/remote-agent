@@ -6,7 +6,7 @@ import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 
 // Merge is deliberately not exposed: its workflow has a separate owner
 // approval boundary. A caller may select a name, never a path or revision.
-export const ToolingCapabilityInput = z.object({ capability: z.literal("development-credentials") }).strict();
+export const ToolingCapabilityInput = z.object({ capability: z.enum(["development-credentials", "cleanup"]) }).strict();
 type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string };
 
 export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput>, resolve = resolveToolingCompatibility) {
@@ -33,7 +33,9 @@ export async function resolveSessionToolingCapability(input: Context & z.infer<t
   const owned = await assertOwnership(input.prisma);
   const result = await resolve({ task: owned.task, repository: owned.repository, installRoot: input.config.installRoot,
     capability, worktreePath: owned.session.cwd, pinnedToolingRoot: owned.task.pinnedToolingRoot ?? undefined,
-    seed: "Recover only the development configuration required by this existing task; inspect names and integrity, then verify the original live operation. Distinguish missing configuration, authorization denial, invalid credentials and provider outage. Never use production fallback." });
+    seed: capability === "cleanup"
+      ? "Recover this task's incomplete or unsupported cleanup receipts without changing its tooling pin. Inspect exact ownership, use supported lifecycle operations within existing authority, verify absence, then resume the original primary's finalizer. Never fabricate released state or broaden deletion targets."
+      : "Recover only the development configuration required by this existing task; inspect names and integrity, then verify the original live operation. Distinguish missing configuration, authorization denial, invalid credentials and provider outage. Never use production fallback." });
   const key = `${owned.task.id}:${createHash("sha256").update(JSON.stringify(result.receipt)).digest("hex")}`;
   await input.prisma.$transaction(async (tx) => {
     const current = await assertOwnership(tx);

@@ -6,6 +6,8 @@ import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
+import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
+import { readTaskActivity } from "../tasks/activity.ts";
 import { beginRuntimeSession } from "./runtime-registry.ts";
 import { findThreadSession } from "./threads.ts";
 import { IssueUpdateInput, publishSessionIssueUpdate } from "./issue-updates.ts";
@@ -57,6 +59,9 @@ test("review uploads and attaches captures before the comment/state, keeps the s
   const f = await fixture();
   await f.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "preview", kind: "local-http", purpose: "review", externalId: "http://localhost:3000", state: "ready" } });
   const result = await publishSessionIssueUpdate(f.input, f.client);
+  const observed = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "issue-update-published", key: result.commentId } });
+  expect(observed.source).toBe("issue-update-observer");
+  expect(JSON.parse(observed.value!)).toEqual({ connectionId: f.input.config.activeConnectionId, issueId: f.issue.id, issueIdentifier: f.issue.identifier, state: "Manual Review" });
   expect(result.state).toBe("Manual Review");
   expect(f.steps).toEqual(["upload", "attach", "comment", "state"]);
   expect(f.comments.get(result.commentId)?.body).toContain("![Saved item](<https://uploads.linear.app/evidence-1>)");
@@ -68,6 +73,7 @@ test("review uploads and attaches captures before the comment/state, keeps the s
   expect(await publishSessionIssueUpdate(f.input, f.client)).toEqual(result);
   expect(f.issue.state.name).toBe("Done");
   expect(f.steps).toHaveLength(4);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(1);
 });
 
 test("a failed attachment and lost comment response recover after reconnect without reuploading or duplicate comments", async () => {
@@ -80,10 +86,12 @@ test("a failed attachment and lost comment response recover after reconnect with
     comment: async (...args: Parameters<typeof f.client.comment>) => { if (lostResponse) { lostResponse = false; throw new Error("comment read offline"); } return f.client.comment(...args); },
   };
   await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("attachment offline");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(0);
   expect(f.issue.state.name).toBe("On Course");
   expect(f.comments.size).toBe(0);
   await f.prisma.$disconnect();
   await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("comment read offline");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(0);
   expect(f.issue.state.name).toBe("On Course");
   await f.prisma.$disconnect();
   expect((await publishSessionIssueUpdate(f.input, client)).published).toBe(true);
@@ -184,6 +192,8 @@ test("child updates are scoped, dependency-aware, durable and remain in the pare
   const completed = { ...input, state: "Done" };
   const result = await publishChildIssueUpdate(completed, client);
   expect(result.issueIdentifier).toBe(child.identifier);
+  const observed = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "issue-update-published", key: result.commentId } });
+  expect(JSON.parse(observed.value!)).toMatchObject({ issueIdentifier: child.identifier, issueId: child.id, state: "Done" });
   expect(f.steps).toEqual(["comment", "state"]);
   expect(f.issue.state.name).toBe("On Course");
   await f.prisma.$disconnect();
@@ -192,6 +202,19 @@ test("child updates are scoped, dependency-aware, durable and remain in the pare
   expect(await f.prisma.runtimeSession.count()).toBe(1);
   nodes.splice(0, 1); // Owner reparented the child: even replay cannot grant access.
   await expect(publishChildIssueUpdate(completed, client)).rejects.toThrow("direct child");
+});
+
+test("confirmed review publication feeds owner-wait activity without a question or reported review phase", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { connectionId: f.input.config.activeConnectionId, issueIdentifier: f.issue.identifier, phase: "working" } });
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle" } });
+  const runtime = createFakeAgentRuntime([{ ...f.session, status: "idle" }]);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity.state).toBe("idle");
+  const result = await publishSessionIssueUpdate({ ...f.input, evidence: [] }, f.client);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "waiting-owner", ownerQuestions: [], reviewHandoff: { receiptId: result.commentId, issueIdentifier: f.issue.identifier }, control: { reportedPhase: "working" } });
+  await publishSessionIssueUpdate({ ...f.input, requestKey: "resume-work", evidence: [], state: "On Course", expectedState: "Manual Review" }, f.client);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "idle", reviewHandoff: null });
+  expect(runtime.sentMessages).toHaveLength(0);
 });
 
 test("required unfinished children prevent parent handoff before any external write", async () => {

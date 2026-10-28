@@ -167,3 +167,68 @@ test("control handoff while waiting for capacity keeps the original queued instr
   finish();
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "waiting" } })).state).toBe("queued");
 });
+
+test.each([undefined, 1])("owner cleanup progresses on its original primary with managed-turn limit %s", async (limit) => {
+  const runtime = createFakeAgentRuntime([
+    { id: "busy", status: "active" },
+    { id: "primary", cwd: "/cleanup-task" },
+    ...["other-one", "other-two", "other-three"].map((id) => ({ id })),
+  ]);
+  const task = await db.prisma.remoteTask.create({ data: {
+    requestKey: "cleanup-task", primarySessionId: "primary", repositoryId: "repo", machineId: "air",
+    branchName: "codex/cleanup", worktreePath: "/cleanup-task", toolingRoot: "/tools", toolingRevision: "a".repeat(40),
+  } });
+  await db.prisma.runtimeInstruction.createMany({ data: Array.from({ length: 105 }, (_, index) => ({
+    id: `busy-${index}`, sessionId: "busy", text: "Unrelated queued work",
+  })) });
+  await queueInstruction(db.prisma, { sessionId: "primary", requestId: "owner-cleanup", text: "Complete the authorized cleanup" });
+  for (const id of ["other-one", "other-two", "other-three"]) await queueInstruction(db.prisma, { sessionId: id, requestId: id, text: "Independent work" });
+  const capacity = new TurnCapacity(limit);
+  const admitted: string[] = [];
+  const finishers = new Map<string, () => void>();
+  const pending: Promise<unknown>[] = [];
+  let ending = false;
+  runtime.startTurn = (input) => {
+    const result = (async () => {
+      const release = await capacity.acquire(new AbortController().signal);
+      try {
+        if (!(await input.beforeStart?.())) return { status: "cancelled" as const };
+        admitted.push(input.requestId!);
+        if (!ending) await new Promise<void>((resolve) => { finishers.set(input.requestId!, resolve); });
+        return { status: "completed" as const };
+      } finally { release(); }
+    })();
+    pending.push(result);
+    return { requestId: input.requestId!, events: { async *[Symbol.asyncIterator]() {} }, result, cancel: async () => {} };
+  };
+  const waitFor = async (predicate: () => Promise<boolean>) => {
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await predicate()) return;
+      await Bun.sleep(5);
+    }
+    throw new Error("Managed-turn admission did not settle");
+  };
+  try {
+    await deliverInstructions(db.prisma, runtime);
+    await waitFor(async () => admitted.length === (limit === undefined ? 4 : 1));
+    expect(admitted[0]).toBe("owner-cleanup");
+    expect(await db.prisma.runtimeInstruction.count({ where: { state: "dispatching" } })).toBe(limit === undefined ? 4 : 1);
+    expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "owner-cleanup" } })).sessionId).toBe("primary");
+    if (limit === 1) {
+      expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "other-one" } })).state).toBe("queued");
+      finishers.get("owner-cleanup")!();
+      await waitFor(async () => admitted.length === 2);
+      expect(admitted).toEqual(["owner-cleanup", "other-one"]);
+    }
+  } finally {
+    ending = true;
+    for (const finish of finishers.values()) finish();
+    await Promise.allSettled(pending);
+    await waitFor(async () => await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) === 4);
+  }
+  expect(await db.prisma.runtimeInstruction.count({ where: { sessionId: "busy", state: "queued" } })).toBe(105);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
+    primarySessionId: "primary", worktreePath: "/cleanup-task", toolingRevision: "a".repeat(40), controlMode: "agent",
+  });
+  expect(await db.prisma.remoteTask.count()).toBe(1);
+});
