@@ -56,6 +56,10 @@ beforeEach(async () => {
 afterEach(async () => {
   try {
     await Promise.all(dispatches);
+    expect(await prisma.webhookReceipt.count({ where: {
+      status: "accepted",
+      OR: [{ runs: { none: {} } }, { runs: { some: { status: "pending" } } }],
+    } })).toBe(0);
   } finally {
     dispatchSpy.mockRestore();
     globalThis.fetch = originalFetch;
