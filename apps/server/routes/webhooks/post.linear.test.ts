@@ -7,6 +7,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import * as dispatcher from "../../services/dispatcher/index.ts";
 
 const SECRET = "test-webhook-secret";
 const AGENT_USER_ID = "11111111-2222-3333-4444-555555555555";
@@ -19,10 +20,22 @@ const config: ServerConfig = testConfig({
 
 let db: TestDatabase;
 let prisma: PrismaClient;
+const dispatchEvent = dispatcher.dispatchEvent;
+let dispatches: Array<Promise<void>>;
+let dispatchSpy: ReturnType<typeof spyOn<typeof dispatcher, "dispatchEvent">>;
 
 beforeEach(async () => {
   db = await createTestDatabase();
   prisma = db.prisma;
+  dispatches = [];
+  dispatchSpy = spyOn(dispatcher, "dispatchEvent").mockImplementation((...args) => {
+    const pending = dispatchEvent(...args);
+    dispatches.push(pending);
+    // The webhook intentionally returns before dispatch completes. Observe
+    // rejection now, then assert its actual result before deleting the DB.
+    void pending.catch(() => undefined);
+    return pending;
+  });
   globalThis.fetch = (async (_input, init) => {
     const body = JSON.parse(String(init?.body)) as { query: string };
     if (
@@ -31,7 +44,7 @@ beforeEach(async () => {
     ) {
       return Response.json({ data: { issue: null } });
     }
-    if (body.query.includes("CreateReaction")) {
+    if (body.query.includes("CreateReaction") || body.query.includes("CreateIssueReaction")) {
       return Response.json({
         data: { reactionCreate: { success: true } },
       });
@@ -41,9 +54,13 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await Bun.sleep(10);
-  globalThis.fetch = originalFetch;
-  await db.cleanup();
+  try {
+    await Promise.all(dispatches);
+  } finally {
+    dispatchSpy.mockRestore();
+    globalThis.fetch = originalFetch;
+    await db.cleanup();
+  }
 });
 
 function commentPayload(overrides: Record<string, unknown> = {}) {

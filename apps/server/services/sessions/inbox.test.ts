@@ -87,3 +87,41 @@ test("capacity waits stay queued across daemon loss and dispatch once on recover
   expect(recovered.sentMessages.map((message) => message.requestId)).toEqual(["first", "second"]);
   expect(await db.prisma.runtimeInstruction.count({ where: { state: "completed" } })).toBe(2);
 });
+
+test("a page of busy-session backlog cannot starve another owner's instruction", async () => {
+  const runtime = createFakeAgentRuntime([{ id: "busy", status: "active" }, { id: "ready" }]);
+  await db.prisma.runtimeInstruction.createMany({ data: Array.from({ length: 105 }, (_, index) => ({
+    id: `busy-${index}`, sessionId: "busy", text: `queued-${index}`,
+  })) });
+  await queueInstruction(db.prisma, { sessionId: "ready", requestId: "owner-ready", text: "owner correction" });
+  await queueInstruction(db.prisma, { sessionId: "ready", requestId: "owner-later", text: "later" });
+  await deliverInstructions(db.prisma, runtime);
+  for (let i = 0; i < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 1; i++) await Bun.sleep(5);
+  expect(runtime.sentMessages.map(({ requestId }) => requestId)).toEqual(["owner-ready"]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { sessionId: "busy", state: "queued" } })).toBe(105);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "owner-later" } })).state).toBe("queued");
+});
+
+test("paging preserves unknown, preparing and human-control guards without blocking other sessions", async () => {
+  const runtime = createFakeAgentRuntime([
+    { id: "uncertain" }, { id: "preparing" }, { id: "paused", cwd: "/paused-task" }, { id: "ready" },
+  ]);
+  await db.prisma.remoteTask.create({ data: {
+    requestKey: "paused-task", repositoryId: "repo", machineId: "air", branchName: "codex/paused",
+    worktreePath: "/paused-task", toolingRoot: "/tools", toolingRevision: "a".repeat(40), controlMode: "paused",
+  } });
+  await db.prisma.runtimeInstruction.createMany({ data: [
+    { id: "unknown", sessionId: "uncertain", text: "uncertain work", state: "unknown" },
+    { id: "preparation", sessionId: "preparing", text: "setup", state: "preparing" },
+    ...["uncertain", "preparing", "paused"].flatMap((sessionId) => Array.from({ length: 105 }, (_, index) => ({
+      id: `${sessionId}-${index}`, sessionId, text: `queued-${index}`, state: "queued",
+    }))),
+  ] });
+  await queueInstruction(db.prisma, { sessionId: "ready", requestId: "ready", text: "run" });
+  await deliverInstructions(db.prisma, runtime);
+  for (let i = 0; i < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 1; i++) await Bun.sleep(5);
+  expect(runtime.sentMessages.map(({ sessionId }) => sessionId)).toEqual(["ready"]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "queued" } })).toBe(315);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unknown" } })).state).toBe("unknown");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "preparation" } })).state).toBe("preparing");
+});

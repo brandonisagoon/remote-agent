@@ -28,35 +28,44 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         ? { state: event.phase, detail: event.error }
         : { state: "unknown", detail: "Delivery was interrupted. Inspect session history before resolving; automatic replay is disabled." } });
     }
-    const queued = await prisma.runtimeInstruction.findMany({ where: { state: "queued" }, orderBy: { sequence: "asc" }, take: 100 });
+    // A busy/paused/uncertain session can have more than a page of queued
+    // instructions. Do not let that backlog hide unrelated owners' work.
+    // Visit each session once per pass, retaining its oldest queued message.
     const visited = new Set<string>();
-    for (const receipt of queued) {
-      if (visited.has(receipt.sessionId)) continue;
-      visited.add(receipt.sessionId);
-      if (running.has(receipt.id)) continue;
-      if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown", "preparing"] } } })) continue;
-      const session = await runtime.getSession(receipt.sessionId);
-      if (!session || session.status === "closed") {
-        await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "failed", detail: "Session is unavailable or closed" } });
-        continue;
+    while (true) {
+      const queued = await prisma.runtimeInstruction.findMany({
+        where: { state: "queued", sessionId: { notIn: [...visited] } },
+        orderBy: { sequence: "asc" }, take: 100,
+      });
+      if (!queued.length) break;
+      for (const receipt of queued) {
+        if (visited.has(receipt.sessionId)) continue;
+        visited.add(receipt.sessionId);
+        if (running.has(receipt.id)) continue;
+        if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown", "preparing"] } } })) continue;
+        const session = await runtime.getSession(receipt.sessionId);
+        if (!session || session.status === "closed") {
+          await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "failed", detail: "Session is unavailable or closed" } });
+          continue;
+        }
+        if (session.status === "active" || session.status === "provisioning") continue;
+        const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
+        if (task && task.controlMode !== "agent") continue;
+        running.add(receipt.id);
+        void (async () => {
+          try {
+            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId: receipt.id, text: receipt.text, beforeStart: async () => {
+              const claim = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
+              return claim.count > 0;
+            } });
+            for await (const _ of turn.events) { /* Persisted lifecycle journal is authoritative on restart. */ }
+            const result = await turn.result;
+            await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });
+          } catch {
+            await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
+          } finally { running.delete(receipt.id); }
+        })();
       }
-      if (session.status === "active" || session.status === "provisioning") continue;
-      const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
-      if (task && task.controlMode !== "agent") continue;
-      running.add(receipt.id);
-      void (async () => {
-        try {
-          const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId: receipt.id, text: receipt.text, beforeStart: async () => {
-            const claim = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
-            return claim.count > 0;
-          } });
-          for await (const _ of turn.events) { /* Persisted lifecycle journal is authoritative on restart. */ }
-          const result = await turn.result;
-          await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });
-        } catch {
-          await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
-        } finally { running.delete(receipt.id); }
-      })();
     }
   } finally { flushing.delete(runtime); }
 }
