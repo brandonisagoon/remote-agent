@@ -24,6 +24,8 @@ describe("orchestration worktree link comment", () => {
       "[Open Worktree in Zed](zed://ssh/test-remote/srv/worktrees/foo-cube-2829)",
     );
     expect(body).toContain("Remote Agent session `runtime_2829`");
+    expect(body).toContain("does not assign implementation to another chat");
+    expect(body).toContain("Send corrections to its owning primary");
     expect(body).not.toContain("<!--");
   });
 

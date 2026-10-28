@@ -139,6 +139,41 @@ test("unavailable tooling yields a repair prompt in the existing worktree and re
   expect(git(worktreePath, "status", "--porcelain")).toBe("");
 });
 
+test("launch and composition repair deliver the task's pinned owner policy instead of dirty source policy", async () => {
+  const repo = repository();
+  const source = path.join(directory, "tooling");
+  git(directory, "clone", repo.root, source);
+  git(source, "config", "user.name", "Fixture");
+  git(source, "config", "user.email", "fixture@example.com");
+  const policy = "Owner authorizes task-owned headless browser verification.\n";
+  writeFileSync(path.join(source, "AGENTS.md"), policy);
+  git(source, "add", "AGENTS.md");
+  git(source, "commit", "-m", "owner policy");
+  const revision = git(source, "rev-parse", "HEAD");
+  repo.tooling = { root: source, revision };
+  const task = await beginTask(db.prisma, { requestKey: "policy-launch", repository: repo, machineId: "air", branchName: "codex/policy" });
+  const worktreePath = await provisionTaskWorktree(db.prisma, task.id, repo, "policy");
+  const installRoot = path.join(directory, "runtime");
+  const pinned = path.join(installRoot, "tooling", repo.id, revision);
+  mkdirSync(path.dirname(pinned), { recursive: true });
+  git(source, "worktree", "add", "--detach", pinned, revision);
+  writeFileSync(`${pinned}.ready`, `${revision}\n`);
+  writeFileSync(path.join(source, "AGENTS.md"), "New mutable policy must not enter this task.\n");
+  const input = { prisma: db.prisma, task, repository: repo, installRoot, worktreePath, provider: "codex" as const, seed: "Verify the retained preview." };
+  const prepared = await prepareTaskPrompt(input);
+  expect(prepared.prompt).toContain(policy.trim());
+  expect(prepared.prompt).toContain(path.join(pinned, "AGENTS.md"));
+  expect(prepared.prompt).not.toContain("New mutable policy");
+  const failed = await prepareTaskPrompt({ ...input, compose: async () => { throw new Error("composer unavailable"); } });
+  expect(failed.prompt).toContain(policy.trim());
+  expect(failed.prompt).toContain("composer unavailable");
+  expect(failed.prompt).toContain(input.seed);
+  expect(git(worktreePath, "status", "--porcelain")).toBe("");
+  expect(existsSync(path.join(worktreePath, "AGENTS.md"))).toBeFalse();
+  expect(git(pinned, "rev-parse", "HEAD")).toBe(revision);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toolingRevision).toBe(revision);
+});
+
 test("network task APIs require authentication and resource identity cannot be replaced", async () => {
   const repo = repository();
   const config = testConfig({ repository: repo });

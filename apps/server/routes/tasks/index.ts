@@ -11,13 +11,48 @@ import { isSafeBranchName } from "../../workers/product/workflow/branch.ts";
 import { askSessionQuestion, linkedSourceIssue } from "../../services/sessions/questions.ts";
 import { IssueUpdateInput, publishSessionIssueUpdate } from "../../services/sessions/issue-updates.ts";
 import { downloadSourceAttachment } from "../../services/sessions/source-attachments.ts";
+import { ChildIssueUpdateInput, publishChildIssueUpdate, readSessionWorkGraph } from "../../services/sessions/child-issues.ts";
+import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../services/tasks/tooling-capabilities.ts";
+import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
 
+for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalization], ["confirm-finalization", confirmTaskFinalization]] as const) {
+  sessionTaskRoutes.post(`/:sessionId/${action}`, async (c) => {
+    const parsed = FinalizationInput.safeParse(await c.req.json());
+    if (!parsed.success) return c.json({ error: "A stable finalization requestKey is required" }, 400);
+    try {
+      return c.json(await finalize({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+    } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+  });
+}
+
+sessionTaskRoutes.post("/:sessionId/tooling-capability", async (c) => {
+  const parsed = ToolingCapabilityInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "An allowlisted tooling capability name is required" }, 400);
+  try {
+    return c.json(await resolveSessionToolingCapability({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
 sessionTaskRoutes.get("/:sessionId/source-issue", async (c) => {
   const { issue } = await linkedSourceIssue({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") });
   return c.json({ issue: { id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description, state: issue.state, labels: issue.labels, availableStates: issue.team.states.nodes } });
+});
+
+sessionTaskRoutes.get("/:sessionId/work-graph", async (c) => {
+  try {
+    return c.json(await readSessionWorkGraph({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+sessionTaskRoutes.post("/:sessionId/child-issue-update", async (c) => {
+  const parsed = ChildIssueUpdateInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid child update", details: parsed.error.issues }, 400);
+  try {
+    return c.json(await publishChildIssueUpdate({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
 sessionTaskRoutes.post("/:sessionId/source-attachment", async (c) => {

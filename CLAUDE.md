@@ -171,6 +171,12 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
 
 ## Working on this repo
 
+- A product worktree/editor link is navigation and evidence, not delegation to
+  this coordinating chat. For status requests, inspect the existing task and
+  session read-only. Route implementation corrections to its owning primary;
+  do not edit the linked product worktree or start another writer without an
+  explicit assignment. Attribute results to the actual task, session and host.
+
 - **Restart matrix**: renderer (`apps/desktop/renderer/`) hot-reloads;
   `apps/desktop/main/`, `lib/`, `management/` need a full
   `bun run desktop:dev` restart; server changes need a server restart.

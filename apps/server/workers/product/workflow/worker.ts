@@ -23,6 +23,7 @@ import { beginTask, taskForSession } from "../../../services/tasks/store.ts";
 import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 import { continuePlanningSession } from "./continue-plan.ts";
+import { deliverManagedMerge } from "./merge-delivery.ts";
 
 type WorkflowEvent = Extract<
   DispatchEvent,
@@ -91,6 +92,12 @@ function issueReferenceFromEvent(event: WorkflowEvent): string | null {
   return data.identifier;
 }
 
+/** Acknowledge the owner's actual trigger, not the workflow's display name. */
+export function acknowledgementReaction(event: WorkflowEvent): string {
+  const data = event.webhook.data;
+  return "emoji" in data ? data.emoji : TrackerReaction.PlanUpdate;
+}
+
 export function createWorkflowWorker(
   dependencies: WorkflowWorkerDependencies = defaultDependencies,
 ): Worker<WorkflowEvent> {
@@ -113,6 +120,12 @@ export function createWorkflowWorker(
       if (!issue) return result("failed", "source issue not found");
 
       if (workflow.deliver === "message-session") {
+        if (repository.tooling && workflow.skill.skillset === "merge") {
+          if (event.webhook.type !== "Issue" || event.webhook.data.state?.name !== "Merge") return result("failed", "Merge requires an owner-selected Merge state transition");
+          return deliverManagedMerge({ context, workflow, issueIdentifier: issue.identifier, webhook: event.webhook,
+            read: dependencies.getIssue, compose: dependencies.compose,
+            seed: buildWorkflowSeedPrompt(workflow, { sourceIssueIdentifier: issue.identifier, sourceIssueState: issue.state.name, sourceIssueDescription: issue.description ?? "(No description)" }) });
+        }
         return (dependencies.forward ?? forwardMessage)({
           requestId: `worker:${context.runId}`,
           config: context.config,
@@ -157,7 +170,7 @@ export function createWorkflowWorker(
         }),
       });
       if (continuation) {
-        if (continuation.status === "delivered") await dependencies.react(context.config.linearApiKey, issue.id, TrackerReaction.CodeChange);
+        if (continuation.status === "delivered") await dependencies.react(context.config.linearApiKey, issue.id, acknowledgementReaction(event));
         return continuation;
       }
 
@@ -273,12 +286,10 @@ export function createWorkflowWorker(
         );
       }
 
-      // Reaction-triggered workflows acknowledge with the describe emoji;
-      // state-triggered ones with the plan memo.
       const reacted = await dependencies.react(
         context.config.linearApiKey,
         issue.id,
-        workflow.on === "issue.reaction" ? TrackerReaction.Describing : TrackerReaction.PlanUpdate,
+        acknowledgementReaction(event),
       );
       const commentOutcome = await dependencies.postWorktreeComment({
         config: context.config,

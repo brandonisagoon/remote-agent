@@ -139,6 +139,26 @@ function configOptionsFromStatus(value: unknown): SessionConfigOption[] {
   return Array.isArray(options) ? (options as SessionConfigOption[]) : [];
 }
 
+function assertProviderStopped(record: AcpSessionRecord, activeSince?: Date): void {
+  // acpx records the actual ACP child PID from its agent lifecycle snapshot.
+  // Only ESRCH proves absence; permission errors and PID reuse fail closed.
+  if (record.pid !== undefined) {
+    if (!Number.isSafeInteger(record.pid) || record.pid <= 0) throw new Error("Provider PID is invalid; cannot prove the writer stopped");
+    try { process.kill(record.pid, 0); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+      throw new Error("Provider process liveness could not be verified; recovery is blocked");
+    }
+    throw new Error("Provider process is still alive; recovery will not reset a possible writer");
+  }
+  const exited = Date.parse(record.lastAgentExitAt ?? "");
+  const started = Date.parse(record.agentStartedAt ?? "");
+  const prompted = Date.parse(record.lastPromptAt ?? "");
+  if (!Number.isFinite(exited) || !Number.isFinite(started) || !Number.isFinite(prompted) || exited < started || exited < prompted || (activeSince && exited < activeSince.getTime())) {
+    throw new Error("Provider PID or confirmed exit evidence is unavailable; recovery cannot prove it stopped");
+  }
+}
+
 export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly store;
   private readonly runtimes = new Map<string, ReturnType<typeof createAcpRuntime>>();
@@ -153,6 +173,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly turnChains = new Map<string, Promise<void>>();
   private readonly activeTurns = new Map<string, AcpRuntimeTurn>();
   private readonly waitingTurns = new Map<string, Set<AbortController>>();
+  private readonly recoveringSessions = new Set<string>();
   private readonly capacity: TurnCapacity;
 
   constructor(
@@ -304,6 +325,42 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     return findRuntimeSession(this.prisma, sessionId);
   }
 
+  observeSessionActivity(sessionId: string) {
+    const active = this.activeTurns.get(sessionId);
+    const state = active ? "executing" as const
+      : this.turnChains.has(sessionId) || this.waitingTurns.get(sessionId)?.size ? "queued" as const : "unknown" as const;
+    return { state, observedAt: Date.now(), ...(active ? { requestId: active.requestId } : {}) };
+  }
+
+  async reconcileInterruptedSession(sessionId: string): Promise<AgentRuntimeSession> {
+    if (this.recoveringSessions.has(sessionId) || this.turnChains.has(sessionId) || this.activeTurns.has(sessionId) || this.waitingTurns.get(sessionId)?.size) {
+      throw new Error("Session still has local work in flight; wait for it to stop before resolving");
+    }
+    this.recoveringSessions.add(sessionId);
+    try {
+      const session = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
+      if (session.status === "closed" || session.status === "provisioning") throw new Error("Session is closed or still provisioning");
+      if (!session.acpxRecordId) throw new Error("Provider process identity is unavailable; recovery cannot prove it stopped");
+      const record = await this.store.load(session.acpxRecordId);
+      if (!record || record.acpxRecordId !== session.acpxRecordId || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId) {
+        throw new Error("Provider record identity changed or is unavailable; inspect the session before recovery");
+      }
+      assertProviderStopped(record, session.status === "active" ? session.updatedAt : undefined);
+      // getStatus() reads persisted data too. Check the actual agent PID and
+      // reject changing records instead of treating a stored status as liveness.
+      const current = await this.store.load(session.acpxRecordId);
+      if (JSON.stringify(current) !== JSON.stringify(record)) throw new Error("Provider record changed during recovery; inspect and retry");
+      if (session.status === "active") {
+        const changed = await this.prisma.runtimeSession.updateMany({
+          where: { id: sessionId, status: "active", updatedAt: session.updatedAt },
+          data: { status: "idle", recoveryDetail: "Provider process confirmed stopped during explicit instruction reconciliation; prior outcome remains unresolved until recorded." },
+        });
+        if (!changed.count) throw new Error("Session changed during recovery; inspect and retry");
+      }
+      return await this.requireSession(sessionId);
+    } finally { this.recoveringSessions.delete(sessionId); }
+  }
+
   listSessions(
     input: { cwd?: string; repositoryId?: string; includeClosed?: boolean } = {},
   ): Promise<AgentRuntimeSession[]> {
@@ -341,6 +398,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     beforeStart?: () => Promise<boolean>;
     onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn {
+    if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled; retry after recovery finishes");
     const requestId = input.requestId ?? randomUUID();
     const queue = new AsyncPushQueue<AgentRuntimeEvent>();
     const completion = deferred<AgentRuntimeTurnResult>();

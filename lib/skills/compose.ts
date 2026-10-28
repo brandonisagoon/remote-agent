@@ -175,7 +175,33 @@ export function resolveSkillPlaceholders(
   });
 }
 
-/** Scan → compose (deduped) → resolve. The one call sites use. */
+/** External tooling is an owner-configured task policy source, not just a
+ * collection of optional skills. Deliver its pinned instructions in the task
+ * message so a target AGENTS.md cannot hide an explicit owner exception behind
+ * a skill invocation. Never read the mutable tooling source or edit the target. */
+export function withToolingInstructions(
+  prompt: string,
+  worktreePath: string,
+  toolingRoot: string,
+): string {
+  if (path.resolve(toolingRoot) === path.resolve(worktreePath)) return prompt;
+  const instructionsPath = path.join(toolingRoot, "AGENTS.md");
+  if (!existsSync(instructionsPath)) return prompt;
+  const instructions = readFileSync(instructionsPath, "utf8").trim();
+  if (!instructions) return prompt;
+  return [
+    "Owner-configured task instructions",
+    `Source: ${instructionsPath}`,
+    "These instructions come from the repository owner's configured external tooling checkout. Apply its explicit task-specific exceptions when reading the target repository's general instructions. Later direct owner instructions still take precedence.",
+    "",
+    instructions,
+    "",
+    "Task request",
+    prompt,
+  ].join("\n");
+}
+
+/** Scan → compose (deduped) → resolve → include pinned owner instructions. */
 export async function composeForPrompt(
   worktreePath: string,
   prompt: string,
@@ -184,7 +210,6 @@ export async function composeForPrompt(
   toolingRoot = worktreePath,
 ): Promise<string> {
   const selections = skillsetsFromPrompt(prompt);
-  if (selections.length === 0) return prompt;
   const skills = await composeWorktreeSkills(worktreePath, selections, skillsRoot, toolingRoot);
-  return resolveSkillPlaceholders(prompt, harness, skills);
+  return withToolingInstructions(resolveSkillPlaceholders(prompt, harness, skills), worktreePath, toolingRoot);
 }

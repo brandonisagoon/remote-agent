@@ -8,6 +8,7 @@ import sessionRoutes from "./sessions/index.ts";
 import webhookRoutes from "./webhooks/index.ts";
 import { taskRoutes, sessionTaskRoutes } from "./tasks/index.ts";
 import { taskSupervisionRoutes } from "./tasks/supervision.ts";
+import { taskCompletionRoutes } from "./tasks/completion.ts";
 import { taskRoutingRoutes } from "./tasks/routing.ts";
 import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
 
@@ -18,6 +19,7 @@ export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/api/sessions", sessionTaskRoutes);
   app.route("/api/tasks", taskRoutes);
   app.route("/api/tasks", taskSupervisionRoutes);
+  app.route("/api/tasks", taskCompletionRoutes);
   app.route("/api/routing", taskRoutingRoutes);
   app.route("/api/routing/linear", forwardedLinearRoute);
   app.route("/api/session-events", sessionEventRoutes);

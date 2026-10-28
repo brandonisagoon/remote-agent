@@ -1,9 +1,94 @@
 import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import { isCurrentMergeApproval } from "../tasks/completion.ts";
 
 const active = new WeakMap<AgentSessionRuntime, Set<string>>();
 const flushing = new WeakSet<AgentSessionRuntime>();
+
+type InboxStore = Pick<PrismaClient, "remoteTask" | "runtimeInstruction" | "runtimeSession" | "runtimeSessionRelation" | "runtimeMetadataEvent">;
+
+async function taskInstruction(store: InboxStore, taskId: string, instructionId: string) {
+  const task = await store.remoteTask.findUnique({ where: { id: taskId } });
+  if (!task?.primarySessionId || !task.worktreePath) throw new Error("Task has no primary session or worktree");
+  const instruction = await store.runtimeInstruction.findUnique({ where: { id: instructionId } });
+  const session = instruction && await store.runtimeSession.findUnique({ where: { id: instruction.sessionId } });
+  if (!instruction || !session || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId) {
+    throw new Error("Instruction does not belong to this task");
+  }
+  if (session.id !== task.primarySessionId) {
+    const relation = session.role === "delegate" && await store.runtimeSessionRelation.findFirst({ where: {
+      sourceSessionId: session.id, targetSessionId: task.primarySessionId, relationship: "spawned-by", endedAt: null,
+    } });
+    if (!relation) throw new Error("Instruction is not owned by this task's primary or delegate");
+  }
+  return { task, instruction, session };
+}
+
+/** A human's explicit outcome decision is durable separately from delivery
+ * state, so a lost HTTP response cannot authorize another retry after dispatch. */
+export async function resolveTaskInstruction(prisma: PrismaClient, runtime: AgentSessionRuntime, input: {
+  taskId: string; instructionId: string; action: "acknowledge" | "cancel" | "retry"; reason: string; requestKey?: string;
+}) {
+  const key = input.instructionId;
+  const source = `task-supervisor:${input.taskId}`;
+  const value = JSON.stringify({ requestKey: input.requestKey ?? null, action: input.action, reason: input.reason });
+  const auditWhere = { action: "instruction-resolved", key, source };
+  const inspect = async (store: InboxStore) => {
+    const owned = await taskInstruction(store, input.taskId, input.instructionId);
+    const decisions = await store.runtimeMetadataEvent.findMany({ where: { ...auditWhere, runtimeSessionId: owned.session.id } });
+    const prior = decisions.find((decision) => JSON.parse(decision.value!).requestKey === (input.requestKey ?? null));
+    if (prior) {
+      if (prior.value !== value) throw new Error("Resolution request key already belongs to another decision");
+      return { ...owned, resolved: true };
+    }
+    if (owned.task.phase === "closed" || owned.session.status === "closed") throw new Error("Task or session is closed");
+    if (input.action === "retry" && owned.task.controlMode !== "agent") throw new Error("Resume task automation before retrying an instruction");
+    if (owned.instruction.state !== "unknown") throw new Error("Instruction is not awaiting resolution");
+    return { ...owned, resolved: false };
+  };
+  const first = await inspect(prisma);
+  if (first.resolved) return { resolved: true as const };
+  if (!runtime.reconcileInterruptedSession) throw new Error("Runtime cannot verify interrupted provider liveness");
+  await runtime.reconcileInterruptedSession(first.session.id);
+  await prisma.$transaction(async (tx) => {
+    const current = await inspect(tx);
+    if (current.resolved) return;
+    const changed = await tx.runtimeInstruction.updateMany({
+      where: { id: input.instructionId, sessionId: current.session.id, state: "unknown", updatedAt: current.instruction.updatedAt },
+      data: { state: { acknowledge: "acknowledged", cancel: "cancelled", retry: "queued" }[input.action], detail: input.reason },
+    });
+    if (!changed.count) throw new Error("Instruction changed during resolution; inspect and retry");
+    await tx.runtimeMetadataEvent.create({ data: { ...auditWhere, runtimeSessionId: current.session.id, value } });
+  });
+  return { resolved: true as const };
+}
+
+async function instructionRequestId(prisma: PrismaClient, receipt: { id: string; sessionId: string }) {
+  const decisions = await prisma.runtimeMetadataEvent.findMany({ where: {
+    runtimeSessionId: receipt.sessionId, action: "instruction-resolved", key: receipt.id,
+  }, orderBy: { sequence: "desc" } });
+  const retry = decisions.find((decision) => JSON.parse(decision.value!).action === "retry");
+  // Each explicitly authorized attempt gets its own lifecycle identity. A late
+  // terminal event from the interrupted attempt cannot settle its replacement.
+  return retry ? `${receipt.id}:retry:${retry.sequence}` : receipt.id;
+}
+
+async function instructionAuthorityAllows(prisma: Pick<PrismaClient, "runtimeMetadataEvent" | "remoteTask" | "runtimeInstruction">, receipt: { id: string; sessionId: string }) {
+  const dispatch = await prisma.runtimeMetadataEvent.findFirst({ where: {
+    runtimeSessionId: receipt.sessionId, action: "workflow-dispatch", key: receipt.id,
+  }, orderBy: { sequence: "desc" } });
+  if (!dispatch) return true;
+  const saved = JSON.parse(dispatch.value ?? "null");
+  if (saved?.state !== "Merge") return true;
+  const task = typeof saved.taskId === "string" && await prisma.remoteTask.findUnique({ where: { id: saved.taskId } });
+  const approval = saved.completionApproval;
+  if (task && task.primarySessionId === receipt.sessionId && typeof approval?.requestKey === "string" && Number.isSafeInteger(approval.contractRevision)
+    && await isCurrentMergeApproval(prisma, { taskId: task.id, sessionId: receipt.sessionId, approval })) return true;
+  await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, sessionId: receipt.sessionId, state: "queued" },
+    data: { state: "cancelled", detail: "Owner merge authority was revoked, replaced or is unverified; this instruction will not replay." } });
+  return false;
+}
 
 export async function queueInstruction(prisma: Pick<PrismaClient, "runtimeInstruction">, input: { sessionId: string; text: string; requestId?: string }) {
   const id = input.requestId ?? randomUUID();
@@ -23,8 +108,10 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
     const unsettled = await prisma.runtimeInstruction.findMany({ where: { state: { in: ["dispatching", "unknown"] } } });
     for (const receipt of unsettled) {
       if (running.has(receipt.id)) continue;
-      const event = await prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: receipt.sessionId, requestId: receipt.id, phase: { in: ["completed", "cancelled", "failed"] } }, orderBy: { sequence: "desc" } });
-      await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: event
+      const requestId = await instructionRequestId(prisma, receipt);
+      const event = await prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: receipt.sessionId, requestId, phase: { in: ["completed", "cancelled", "failed"] } }, orderBy: { sequence: "desc" } });
+      if (!event && receipt.state === "unknown") continue; // Keep its original uncertainty timestamp and evidence.
+      await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: receipt.state, updatedAt: receipt.updatedAt }, data: event
         ? { state: event.phase, detail: event.error }
         : { state: "unknown", detail: "Delivery was interrupted. Inspect session history before resolving; automatic replay is disabled." } });
     }
@@ -50,14 +137,19 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         }
         if (session.status === "active" || session.status === "provisioning") continue;
         const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
-        if (task && task.controlMode !== "agent") continue;
+        if (task && (task.controlMode !== "agent" || task.phase === "closed")) continue;
+        if (!(await instructionAuthorityAllows(prisma, receipt))) continue;
+        const requestId = await instructionRequestId(prisma, receipt);
         running.add(receipt.id);
         void (async () => {
           try {
-            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId: receipt.id, text: receipt.text, beforeStart: async () => {
-              const claim = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
+            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: receipt.text, beforeStart: async () => prisma.$transaction(async (tx) => {
+              const currentTask = await tx.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
+              if (currentTask && (currentTask.controlMode !== "agent" || currentTask.phase === "closed")) return false;
+              if (!(await instructionAuthorityAllows(tx, receipt))) return false;
+              const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
               return claim.count > 0;
-            } });
+            }) });
             for await (const _ of turn.events) { /* Persisted lifecycle journal is authoritative on restart. */ }
             const result = await turn.result;
             await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });

@@ -1,9 +1,10 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
-import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
+import { queueInstruction, deliverInstructions, resolveTaskInstruction } from "../../services/sessions/inbox.ts";
 import { changeTaskControl } from "../../services/tasks/control.ts";
 import { answerSessionQuestion } from "../../services/sessions/questions.ts";
+import { readTaskActivity } from "../../services/tasks/activity.ts";
 
 export const taskSupervisionRoutes = new Hono<AppEnv>();
 
@@ -17,17 +18,8 @@ taskSupervisionRoutes.post("/:taskId/questions/:questionId/answer", async (c) =>
 });
 
 taskSupervisionRoutes.get("/:taskId/activity", async (c) => {
-  const prisma = c.get("prisma");
-  const task = await prisma.remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
-  if (!task) return c.json({ error: "Task not found" }, 404);
-  const sessionId = task.primarySessionId;
-  const runtime = c.get("agentRuntime");
-  const [session, history, questions, instructions] = sessionId ? await Promise.all([
-    runtime.getSession(sessionId), runtime.history(sessionId),
-    prisma.runtimeQuestion.findMany({ where: { runtimeSessionId: sessionId }, orderBy: { createdAt: "asc" } }),
-    prisma.runtimeInstruction.findMany({ where: { sessionId }, orderBy: { createdAt: "desc" }, take: 100 }),
-  ]) : [null, [], [], []];
-  return c.json({ task, session, history, questions, instructions });
+  const result = await readTaskActivity(c.get("prisma"), c.get("agentRuntime"), c.req.param("taskId"));
+  return result ? c.json(result) : c.json({ error: "Task not found" }, 404);
 });
 
 taskSupervisionRoutes.post("/:taskId/instructions", async (c) => {
@@ -47,13 +39,13 @@ taskSupervisionRoutes.post("/:taskId/instructions", async (c) => {
 });
 
 taskSupervisionRoutes.post("/:taskId/instructions/:instructionId/resolve", async (c) => {
-  const parsed = z.object({ action: z.enum(["acknowledge", "cancel", "retry"]), reason: z.string().min(1).max(2000) }).strict().safeParse(await c.req.json());
+  const parsed = z.object({ action: z.enum(["acknowledge", "cancel", "retry"]), reason: z.string().trim().min(1).max(2000), requestKey: z.string().min(1).max(200).optional() }).strict().safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Choose a resolution and record the evidence from inspecting session history" }, 400);
   const prisma = c.get("prisma");
-  const task = await prisma.remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
-  if (!task?.primarySessionId) return c.json({ error: "Task has no primary session" }, 409);
-  const result = await prisma.runtimeInstruction.updateMany({ where: { id: c.req.param("instructionId"), sessionId: task.primarySessionId, state: "unknown" }, data: { state: { acknowledge: "acknowledged", cancel: "cancelled", retry: "queued" }[parsed.data.action], detail: parsed.data.reason } });
-  return result.count ? c.json({ resolved: true }) : c.json({ error: "Instruction is not awaiting resolution" }, 409);
+  try {
+    const result = await resolveTaskInstruction(prisma, c.get("agentRuntime"), { taskId: c.req.param("taskId"), instructionId: c.req.param("instructionId"), ...parsed.data });
+    return c.json(result);
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
 taskSupervisionRoutes.post("/:taskId/automation", async (c) => {

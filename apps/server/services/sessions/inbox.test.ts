@@ -125,3 +125,45 @@ test("paging preserves unknown, preparing and human-control guards without block
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unknown" } })).state).toBe("unknown");
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "preparation" } })).state).toBe("preparing");
 });
+
+test("a concurrent owner resolution cannot be overwritten by a stale reconciliation scan", async () => {
+  const runtime = createFakeAgentRuntime([{ id: "session", status: "active" }]);
+  await db.prisma.runtimeInstruction.create({ data: { id: "unknown", sessionId: "session", text: "may have run", state: "unknown" } });
+  const store = new Proxy(db.prisma, { get(target, property) {
+    if (property === "runtimeLifecycleEvent") return { findFirst: async () => {
+      await db.prisma.runtimeInstruction.update({ where: { id: "unknown" }, data: { state: "acknowledged", detail: "Owner verified the effect" } });
+      return { phase: "completed", error: null };
+    } };
+    return Reflect.get(target, property);
+  } });
+  await deliverInstructions(store, runtime);
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unknown" } })).toMatchObject({ state: "acknowledged", detail: "Owner verified the effect" });
+});
+
+test("repeated unknown reconciliation preserves the original stalled timestamp and evidence", async () => {
+  const runtime = createFakeAgentRuntime([{ id: "session", status: "active" }]);
+  const since = new Date("2026-01-01T00:00:00Z");
+  await db.prisma.runtimeInstruction.create({ data: { id: "unknown", sessionId: "session", text: "possibly ran", state: "unknown", detail: "Original uncertain provider outcome", updatedAt: since } });
+  await deliverInstructions(db.prisma, runtime);
+  await deliverInstructions(db.prisma, runtime);
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unknown" } })).toMatchObject({ updatedAt: since, detail: "Original uncertain provider outcome" });
+});
+
+test("control handoff while waiting for capacity keeps the original queued instruction", async () => {
+  const runtime = createFakeAgentRuntime([{ id: "session", cwd: "/handoff" }]);
+  await db.prisma.remoteTask.create({ data: { requestKey: "handoff", repositoryId: "repo", machineId: "air", branchName: "codex/handoff", worktreePath: "/handoff", toolingRoot: "/tools", toolingRevision: "a".repeat(40) } });
+  let claim: (() => Promise<boolean>) | undefined;
+  let finish!: () => void;
+  runtime.startTurn = (input) => ({
+    requestId: input.requestId!,
+    events: { async *[Symbol.asyncIterator]() {} },
+    result: new Promise<{ status: "cancelled" }>((resolve) => { claim = input.beforeStart; finish = () => resolve({ status: "cancelled" }); }),
+    cancel: async () => {},
+  });
+  await queueInstruction(db.prisma, { sessionId: "session", requestId: "waiting", text: "wait" });
+  await deliverInstructions(db.prisma, runtime);
+  await db.prisma.remoteTask.updateMany({ data: { controlMode: "human" } });
+  expect(await claim!()).toBe(false);
+  finish();
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "waiting" } })).state).toBe("queued");
+});

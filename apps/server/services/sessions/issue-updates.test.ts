@@ -10,6 +10,8 @@ import { beginRuntimeSession } from "./runtime-registry.ts";
 import { findThreadSession } from "./threads.ts";
 import { IssueUpdateInput, publishSessionIssueUpdate } from "./issue-updates.ts";
 import { readIssueEvidence } from "./issue-evidence.ts";
+import { publishChildIssueUpdate, readSessionWorkGraph } from "./child-issues.ts";
+import type { WorkIssue } from "../../integrations/linear/session-store/source-issue/work-graph.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -22,7 +24,7 @@ async function fixture() {
   directory = await mkdtemp(path.join(tmpdir(), "issue-update-"));
   const prisma = db.prisma;
   const config = testConfig();
-  const runtime = await beginRuntimeSession(prisma, { sessionKey: "update", agent: "codex", cwd: directory, repositoryId: config.activeRepositoryId, machineId: config.machine });
+  const runtime = await beginRuntimeSession(prisma, { sessionKey: "update", agent: "codex", role: "primary", cwd: directory, repositoryId: config.activeRepositoryId, machineId: config.machine });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: runtime.id } });
   const link = await prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-8", relationship: "handles" } });
   const task = await prisma.remoteTask.create({ data: { requestKey: "task", repositoryId: session.repositoryId, machineId: session.machineId, branchName: "codex/feature", toolingRoot: directory, toolingRevision: "abc", worktreePath: directory, primarySessionId: session.id } });
@@ -33,6 +35,8 @@ async function fixture() {
   let uploads = 0;
   const client = {
     source: async () => ({ session, link, config, issue }),
+    graph: async () => ({ id: issue.id, identifier: issue.identifier, children: [], states }),
+    complete: async () => {},
     read: async () => issue,
     update: async (_config: ServerConfig, _query: { id: string }, input: { stateId?: string }) => { steps.push("state"); issue.state = states.find((state) => state.id === input.stateId)!; },
     upload: async (_key: LinearCredential, input: { name: string; contentType: string; bytes: Uint8Array }) => { expect(input.bytes.length).toBeGreaterThan(0); steps.push("upload"); return `https://uploads.linear.app/evidence-${++uploads}`; },
@@ -125,6 +129,21 @@ test("backend Done accepts no screenshots; phase is separate and status transiti
   expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("preparing");
 });
 
+test("child graph rejects a primary whose task worktree identity changed", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { worktreePath: directory + "-other" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("owning task primary");
+  expect(await f.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(0);
+});
+
+test("terminal parent updates obey the observed completion boundary before publishing; review does not require shipping", async () => {
+  const f = await fixture();
+  const client = { ...f.client, complete: async () => { throw new Error("Local commit has not been published"); } };
+  await expect(publishSessionIssueUpdate({ ...f.input, state: "Done", evidence: [] }, client)).rejects.toThrow("not been published");
+  expect(f.steps).toEqual([]);
+  expect((await publishSessionIssueUpdate({ ...f.input, requestKey: "review-after-local" }, client)).state).toBe("Manual Review");
+});
+
 test("media detection rejects non-captures and paths outside the worktree including symlink escapes", async () => {
   const f = await fixture();
   const worktree = path.join(directory, "nested");
@@ -136,4 +155,64 @@ test("media detection rejects non-captures and paths outside the worktree includ
   expect((await readIssueEvidence({ path: f.capture, title: "Owned external" }, worktree, [realCapture])).receipt.contentType).toBe("image/png");
   await writeFile(f.capture, "SECRET=not-an-image");
   await expect(readIssueEvidence({ path: f.capture, title: "Invalid" }, directory, [])).rejects.toThrow("capture");
+});
+
+test("child updates are scoped, dependency-aware, durable and remain in the parent's task", async () => {
+  const f = await fixture();
+  const child = { ...f.issue, id: "child-id", identifier: "DRA-29" };
+  const prerequisite = { ...f.issue, id: "prerequisite", identifier: "DRA-30" };
+  const nodes: WorkIssue[] = [child, prerequisite].map((issue) => ({
+    id: issue.id, identifier: issue.identifier, title: issue.title, url: `https://linear.app/issue/${issue.identifier}`,
+    state: issue.state, parent: { id: f.issue.id, identifier: f.issue.identifier }, completedAt: null,
+    blocks: [], blockedBy: issue.id === child.id ? [prerequisite.id] : [],
+  }));
+  const client = { ...f.client,
+    graph: async (_config: ServerConfig, query: { id: string }) => ({ id: query.id, identifier: f.issue.identifier, states: f.states, children: query.id === f.issue.id ? nodes : [] }),
+    read: async (_config: ServerConfig, query: { id: string }) => query.id === child.id ? child : prerequisite,
+    update: async (_config: ServerConfig, query: { id: string }, change: { stateId?: string }) => {
+      expect(query.id).toBe(child.id);
+      child.state = f.states.find((state) => state.id === change.stateId)!;
+      f.steps.push("state");
+    },
+  };
+  const input = { ...f.input, evidence: [], childIssueId: child.identifier, state: "On Course", expectedState: "On Course" };
+  expect((await readSessionWorkGraph(input, client)).children).toHaveLength(2);
+  expect(await f.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(2);
+  await expect(publishChildIssueUpdate({ ...input, childIssueId: f.issue.id }, client)).rejects.toThrow("direct child");
+  await expect(publishChildIssueUpdate(input, client)).rejects.toThrow("prerequisite");
+  nodes[1]!.state = f.states[2]!;
+  const completed = { ...input, state: "Done" };
+  const result = await publishChildIssueUpdate(completed, client);
+  expect(result.issueIdentifier).toBe(child.identifier);
+  expect(f.steps).toEqual(["comment", "state"]);
+  expect(f.issue.state.name).toBe("On Course");
+  await f.prisma.$disconnect();
+  expect(await publishChildIssueUpdate(completed, client)).toEqual(result);
+  expect(f.comments.size).toBe(1);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  nodes.splice(0, 1); // Owner reparented the child: even replay cannot grant access.
+  await expect(publishChildIssueUpdate(completed, client)).rejects.toThrow("direct child");
+});
+
+test("required unfinished children prevent parent handoff before any external write", async () => {
+  const f = await fixture();
+  const node: WorkIssue = {
+    id: "child", identifier: "DRA-31", title: "Verify", url: "https://linear.app/issue/DRA-31",
+    state: { id: "todo", name: "Todo", type: "unstarted" }, completedAt: null,
+    parent: { id: f.issue.id, identifier: f.issue.identifier }, blocks: [], blockedBy: [],
+  };
+  const client = { ...f.client, graph: async () => ({ id: f.issue.id, identifier: f.issue.identifier, states: f.states, children: [node] }) };
+  await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("DRA-31 (Todo)");
+  expect(f.steps).toEqual([]);
+  node.state = f.states[2]!;
+  expect((await publishSessionIssueUpdate(f.input, client)).state).toBe("Manual Review");
+});
+
+test("child graph rejects delegates and paused task automation", async () => {
+  const f = await fixture();
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("primary");
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "primary" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("paused");
 });
