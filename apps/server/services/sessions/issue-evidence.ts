@@ -2,10 +2,13 @@ import { createHash } from "node:crypto";
 import { open, realpath } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
+import { PreparedVideo, prepareVideoEvidence, preparedVideoPath } from "./video-evidence.ts";
 
+// `path`, `contentType`, `sha256` and `size` describe the source capture.
+// Receipts created before video preparation have no `prepared` field.
 export const EvidenceReceipt = z.object({
   path: z.string(), title: z.string(), contentType: z.string(), sha256: z.string(), size: z.number(),
-  assetUrl: z.string().optional(), attachmentId: z.string().optional(),
+  prepared: PreparedVideo.optional(), assetUrl: z.string().optional(), attachmentId: z.string().optional(),
 });
 export type EvidenceReceipt = z.infer<typeof EvidenceReceipt>;
 export const MAX_EVIDENCE_BYTES = 50 * 1024 * 1024;
@@ -28,6 +31,14 @@ export async function readIssueEvidence(input: { path: string; title: string }, 
   const relative = path.relative(root, file);
   const inside = relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
   if (!inside && !ownedPaths.includes(file)) throw new Error("Evidence outside the worktree needs an exact task resource with kind=evidence");
+  const bytes = await readBoundedFile(file);
+  const receipt: EvidenceReceipt = { ...input, contentType: mediaType(bytes), size: bytes.length, sha256: sha256(bytes) };
+  return { bytes, receipt };
+}
+
+const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
+
+async function readBoundedFile(file: string): Promise<Buffer> {
   const handle = await open(file, "r");
   try {
     const stat = await handle.stat();
@@ -40,9 +51,58 @@ export async function readIssueEvidence(input: { path: string; title: string }, 
       offset += read.bytesRead;
     }
     if ((await handle.stat()).size !== stat.size) throw new Error("Evidence changed while reading; capture it again");
-    const receipt: EvidenceReceipt = { ...input, contentType: mediaType(bytes), size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
-    return { bytes, receipt };
+    return bytes;
   } finally { await handle.close(); }
+}
+
+/** Private server cache owned by one session's update request. */
+export function evidenceCacheDirectory(stateDir: string, sessionId: string, requestKey: string): string {
+  return path.join(stateDir, "issue-evidence", sha256(Buffer.from(sessionId)), sha256(Buffer.from(requestKey)));
+}
+
+type Context = { cwd: string; ownedPaths: string[]; cacheDirectory: string };
+
+async function readUnchanged(file: EvidenceReceipt, context: Context): Promise<Buffer> {
+  const { bytes, receipt } = await readIssueEvidence(file, context.cwd, context.ownedPaths);
+  if (receipt.sha256 !== file.sha256) throw new Error("Evidence changed since this update began; restore the capture before retrying");
+  return bytes;
+}
+
+/** Prepare every not-yet-uploaded video before any remote effect. A video
+ * already uploaded by an older receipt keeps its asset. Returns whether any
+ * receipt changed. */
+export async function prepareIssueEvidence(evidence: EvidenceReceipt[], context: Context): Promise<boolean> {
+  let changed = false;
+  for (const file of evidence) {
+    if (!file.contentType.startsWith("video/") || file.prepared || file.assetUrl) continue;
+    const bytes = await readUnchanged(file, context);
+    file.prepared = await prepareVideoEvidence({ bytes, title: file.title, name: path.basename(file.path) }, context.cacheDirectory, { maxBytes: MAX_EVIDENCE_BYTES });
+    changed = true;
+  }
+  return changed;
+}
+
+/** The name, type and digest actually uploaded for a receipt. */
+export function evidenceUpload(file: EvidenceReceipt) {
+  if (file.prepared) return { name: file.prepared.name, contentType: file.prepared.contentType, sha256: file.prepared.sha256, size: file.prepared.size };
+  return { name: path.basename(file.path), contentType: file.contentType, sha256: file.sha256, size: file.size };
+}
+
+/** Revalidate the source, then return the exact bytes recorded for upload.
+ * A prepared video is never re-encoded here; a missing or changed output fails. */
+export async function readEvidenceUpload(file: EvidenceReceipt, context: Context) {
+  const source = await readUnchanged(file, context);
+  const upload = evidenceUpload(file);
+  if (file.contentType.startsWith("video/") && !file.prepared) throw new Error(`Video evidence '${file.title}' was not prepared; retry the same update`);
+  if (!file.prepared || file.prepared.transform === "none") {
+    if (sha256(source) !== upload.sha256) throw new Error(`Video evidence '${file.title}' no longer matches its validated digest; publish a new update with a new requestKey`);
+    return { ...upload, bytes: source };
+  }
+  const bytes = await readBoundedFile(preparedVideoPath(context.cacheDirectory, file.prepared)).catch(() => undefined);
+  if (!bytes || sha256(bytes) !== upload.sha256) {
+    throw new Error(`Prepared video for '${file.title}' is missing or changed since validation; it is not re-encoded under the same request. Publish a new update with a new requestKey`);
+  }
+  return { ...upload, bytes };
 }
 
 export function issueUpdateBody(body: string, evidence: EvidenceReceipt[]): string {

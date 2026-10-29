@@ -180,6 +180,9 @@ processes only). Sessions' MCP tools use the socket.
   Linear webhooks to your machine.
 - Bun and cloudflared. The Homebrew formula and Scoop manifest install both;
   installing from a clone needs them present first.
+- ffmpeg with ffprobe on the server machine to publish screen recordings as
+  issue evidence; videos are converted to phone-compatible MP4 before upload.
+  Install it yourself, for example `brew install ffmpeg`.
 
 ## Setup
 

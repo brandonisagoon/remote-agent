@@ -25,6 +25,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      # Video evidence tests encode, convert and decode real media.
+      - name: Install ffmpeg and ffprobe
+        run: |
+          brew install ffmpeg
+          ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/encoders.txt"
+          for encoder in libx264 aac libvpx libopus; do grep -q " $encoder " "$RUNNER_TEMP/encoders.txt" || { echo "ffmpeg lacks $encoder"; exit 1; }; done
+          ffprobe -hide_banner -version | head -1
       - run: bun install --frozen-lockfile
       - run: bunx prisma generate
       - run: bunx tsc --noEmit
