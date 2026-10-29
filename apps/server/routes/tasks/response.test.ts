@@ -30,3 +30,24 @@ test("task reads preserve old pinned clients without restoring browser state or 
     expect("controllerId" in stored).toBeFalse();
   } finally { await db.cleanup(); }
 });
+
+test("every task read exposes v2 negotiation after adoption without inventing confirmed retention", async () => {
+  const db = await createTestDatabase();
+  try {
+    const config = testConfig();
+    const app = createApp({ config, prisma: db.prisma, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+    const session = await db.prisma.runtimeSession.create({ data: { id: "external-primary", scopeKey: "external-primary", agentCommand: "codex", role: "primary", status: "closed", cwd: "/original-product", repositoryId: config.repository.id, machineId: config.machine } });
+    const task = await db.prisma.remoteTask.create({ data: { id: "external-task", requestKey: "external-task", repositoryId: config.repository.id, machineId: config.machine, branchName: "codex/original", primarySessionId: session.id, worktreePath: session.cwd, toolingRoot: "/original-tooling", toolingRevision: "original-pin", phase: "closed" } });
+    // Protocol negotiation is conservative even if an incomplete historical
+    // record needs repair; it must never grant retained-resource exemptions.
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, source: `owner:${task.id}`, action: "external-delivery-binding", key: "adoption", value: "{}" } });
+    for (const route of [`/api/tasks/${task.id}`, `/api/sessions/${session.id}/task`, "/api/tasks", "/api/tasks?pagination=id"]) {
+      const response = await app.request(route);
+      expect(response.status).toBe(200);
+      const data = await response.json() as { task?: Record<string, unknown>; tasks?: Array<Record<string, unknown>> };
+      const observed = data.task ?? data.tasks?.[0];
+      expect(observed).toMatchObject({ id: task.id, finalizationVersion: 2, toolingRevision: "original-pin", controlMode: "paused" });
+      expect(observed).not.toHaveProperty("finalizationRetention");
+    }
+  } finally { await db.cleanup(); }
+});
