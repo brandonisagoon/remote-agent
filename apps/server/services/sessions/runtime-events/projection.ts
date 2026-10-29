@@ -26,9 +26,13 @@ import {
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
 import { projectSourceCheckpoint } from "./source-checkpoint.ts";
 import { queueDelegateResult } from "../../launches/delegate-supervision.ts";
+import { runRuntimeProjectionAttempt } from "./projection-retries.ts";
+import { projectTaskStalls } from "./task-stalls.ts";
 
 const CONSUMER = "linear-projection:v1";
+const NOTIFY_CONSUMER = "delegate-notification:v1";
 const MAX_OUTPUT = 8_000;
+const yieldToRequests = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 function checkpoint(output: string): string {
   const text = output.trim();
@@ -55,7 +59,7 @@ export async function projectRuntimeEvent(
   prisma: PrismaClient,
   runtime: AgentSessionRuntime,
   event: AgentRuntimeLifecycleEvent,
-): Promise<void> {
+): Promise<boolean> {
   const cursor = await getRuntimeEventCursor(prisma, {
     runtimeSessionId: event.sessionId,
     consumer: CONSUMER,
@@ -64,7 +68,7 @@ export async function projectRuntimeEvent(
   if (
     cursor.sourceCursor === event.id ||
     (sequence > 0n && cursor.generation >= sequence)
-  ) return;
+  ) return true;
 
   const session = await prisma.runtimeSession.findUnique({
     where: { id: event.sessionId },
@@ -74,11 +78,12 @@ export async function projectRuntimeEvent(
   if (!record) {
     if (await projectSourceCheckpoint(config, prisma, runtime, event)) {
       await advanceRuntimeEventCursor(prisma, { runtimeSessionId: event.sessionId, consumer: CONSUMER, sourceCursor: event.id, generation: sequence > 0n ? sequence : cursor.generation + 1n });
+      return true;
     }
-    return;
+    return false;
   }
   const issue = await findAgentIssue(config, { id: record.externalId });
-  if (!issue) return;
+  if (!issue) return false;
 
   const parsed = parseAgentIssueRuntime(issue.description);
   const metadata = parsed ? agentIssueRuntimeWithLabels(issue, parsed) : null;
@@ -146,32 +151,83 @@ export async function projectRuntimeEvent(
       throughSequence: event.sequence,
     });
   }
+  return true;
 }
 
-export function startRuntimeEventProjection(input: {
+type ProjectionInput = {
   config: ServerConfig;
   prisma: PrismaClient;
   runtime: AgentSessionRuntime;
+};
+
+/** Reconcile each session independently: one failed remote checkpoint or
+ * malformed result must not strand unrelated owners' completed workers. */
+export async function drainRuntimeEventProjection(
+  input: ProjectionInput,
+  delivery: { notify: typeof queueDelegateResult; project: (config: ServerConfig, prisma: PrismaClient, runtime: AgentSessionRuntime, event: AgentRuntimeLifecycleEvent) => Promise<void | boolean> } = { notify: queueDelegateResult, project: projectRuntimeEvent },
+  options: { now?: () => number } = {},
+): Promise<void> {
+  // A busy producer must not keep extending this pass and defer projection
+  // indefinitely. Later events belong to the next coalesced drain.
+  const latest = await input.prisma.runtimeLifecycleEvent.findFirst({ orderBy: { sequence: "desc" }, select: { sequence: true } });
+  if (!latest) return;
+  const blocked = new Set<string>();
+  // Persist local continuations before any remote projection can prune events.
+  for (const stage of ["notify", "project"] as const) {
+    let afterSequence = 0;
+    while (true) {
+      const events = await listRuntimeLifecycleEvents(input.prisma, {
+        consumer: stage === "notify" ? NOTIFY_CONSUMER : CONSUMER,
+        afterSequence, throughSequence: latest.sequence, take: 100, excludedSessionIds: [...blocked],
+        ...(stage === "project" ? { afterConsumer: NOTIFY_CONSUMER } : {}),
+      });
+      if (!events.length) break;
+      for (let index = 0; index < events.length; index++) {
+        const event = events[index]!;
+        if (!blocked.has(event.sessionId)) {
+          try {
+            let acknowledged = true;
+            const delivered = await runRuntimeProjectionAttempt(input.prisma, { sessionId: event.sessionId, eventId: event.id, stage }, async () => {
+              if (stage === "notify") await delivery.notify(input.prisma, event);
+              else acknowledged = await delivery.project(input.config, input.prisma, input.runtime, event) !== false;
+            }, options.now);
+            if (!delivered || !acknowledged) blocked.add(event.sessionId);
+            else await advanceRuntimeEventCursor(input.prisma, { runtimeSessionId: event.sessionId,
+              consumer: stage === "notify" ? NOTIFY_CONSUMER : CONSUMER, sourceCursor: event.id, generation: BigInt(event.sequence!) });
+          } catch (error) {
+            blocked.add(event.sessionId);
+            console.error(`[runtime-events] failed ${stage} delivery ${event.id}:`, error);
+          }
+        }
+        // The native SQLite adapter resolves through microtasks. Awaiting SQL
+        // alone does not give health requests or provider I/O an event-loop turn.
+        if ((index + 1) % 20 === 0) await yieldToRequests();
+      }
+      afterSequence = events.at(-1)!.sequence!;
+      await yieldToRequests();
+    }
+  }
+}
+
+export function startRuntimeEventProjection(input: ProjectionInput, work = async () => {
+  await drainRuntimeEventProjection(input);
+  await projectTaskStalls(input);
 }): () => Promise<void> {
-  let chain = Promise.resolve();
+  let running: Promise<void> | undefined;
+  let requested = false;
   let stopped = false;
   const drain = () => {
-    chain = chain.then(async () => {
-      if (stopped) return;
-      const events = await listRuntimeLifecycleEvents(input.prisma);
-      // Local orchestration must keep working when a Linear checkpoint is offline.
-      for (const event of events) await queueDelegateResult(input.prisma, event);
-      for (const event of events) {
-        try {
-          await projectRuntimeEvent(input.config, input.prisma, input.runtime, event);
-        } catch (error) {
-          console.error(`[runtime-events] failed to project ${event.id}:`, error);
-          break;
-        }
-      }
-    }).catch((error) => {
-      console.error("[runtime-events] journal drain failed:", error);
-    });
+    if (stopped) return;
+    requested = true;
+    if (running) return;
+    running = (async () => {
+      do {
+        requested = false;
+        try { await work(); }
+        catch (error) { console.error("[runtime-events] journal drain failed:", error); }
+        await yieldToRequests();
+      } while (requested && !stopped);
+    })().finally(() => { running = undefined; });
   };
   const unsubscribe = input.runtime.subscribeAll((event) => {
     if (event.kind === "turn") drain();
@@ -182,6 +238,6 @@ export function startRuntimeEventProjection(input: {
     stopped = true;
     clearInterval(timer);
     unsubscribe();
-    await chain;
+    await running;
   };
 }

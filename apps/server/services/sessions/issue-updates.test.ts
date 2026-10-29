@@ -7,11 +7,15 @@ import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
+import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
+import { readTaskActivity } from "../tasks/activity.ts";
 import { beginRuntimeSession } from "./runtime-registry.ts";
 import { findThreadSession } from "./threads.ts";
 import { IssueUpdateInput, publishSessionIssueUpdate } from "./issue-updates.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, readIssueEvidence } from "./issue-evidence.ts";
 import { preparedVideoPath } from "./video-evidence.ts";
+import { publishChildIssueUpdate, readSessionWorkGraph } from "./child-issues.ts";
+import type { WorkIssue } from "../../integrations/linear/session-store/source-issue/work-graph.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -24,7 +28,7 @@ async function fixture() {
   directory = await mkdtemp(path.join(tmpdir(), "issue-update-"));
   const prisma = db.prisma;
   const config = testConfig({ acpxStateDir: path.join(directory, "state") });
-  const runtime = await beginRuntimeSession(prisma, { sessionKey: "update", agent: "codex", cwd: directory, repositoryId: config.activeRepositoryId, machineId: config.machine });
+  const runtime = await beginRuntimeSession(prisma, { sessionKey: "update", agent: "codex", role: "primary", cwd: directory, repositoryId: config.activeRepositoryId, machineId: config.machine });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: runtime.id } });
   const link = await prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-8", relationship: "handles" } });
   const task = await prisma.remoteTask.create({ data: { requestKey: "task", repositoryId: session.repositoryId, machineId: session.machineId, branchName: "codex/feature", toolingRoot: directory, toolingRevision: "abc", worktreePath: directory, primarySessionId: session.id } });
@@ -36,6 +40,8 @@ async function fixture() {
   const uploaded: Array<{ name: string; contentType: string; bytes: Uint8Array }> = [];
   const client = {
     source: async () => ({ session, link, config, issue }),
+    graph: async () => ({ id: issue.id, identifier: issue.identifier, children: [], states }),
+    complete: async () => {},
     read: async () => issue,
     update: async (_config: ServerConfig, _query: { id: string }, input: { stateId?: string }) => { steps.push("state"); issue.state = states.find((state) => state.id === input.stateId)!; },
     upload: async (_key: LinearCredential, input: { name: string; contentType: string; bytes: Uint8Array }) => { expect(input.bytes.length).toBeGreaterThan(0); uploaded.push(input); steps.push("upload"); return `https://uploads.linear.app/evidence-${++uploads}`; },
@@ -56,6 +62,9 @@ test("review uploads and attaches captures before the comment/state, keeps the s
   const f = await fixture();
   await f.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "preview", kind: "local-http", purpose: "review", externalId: "http://localhost:3000", state: "ready" } });
   const result = await publishSessionIssueUpdate(f.input, f.client);
+  const observed = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "issue-update-published", key: result.commentId } });
+  expect(observed.source).toBe("issue-update-observer");
+  expect(JSON.parse(observed.value!)).toEqual({ connectionId: f.input.config.activeConnectionId, issueId: f.issue.id, issueIdentifier: f.issue.identifier, state: "Manual Review" });
   expect(result.state).toBe("Manual Review");
   expect(f.steps).toEqual(["upload", "attach", "comment", "state"]);
   expect(f.comments.get(result.commentId)?.body).toContain("![Saved item](<https://uploads.linear.app/evidence-1>)");
@@ -67,6 +76,7 @@ test("review uploads and attaches captures before the comment/state, keeps the s
   expect(await publishSessionIssueUpdate(f.input, f.client)).toEqual(result);
   expect(f.issue.state.name).toBe("Done");
   expect(f.steps).toHaveLength(4);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(1);
 });
 
 test("a failed attachment and lost comment response recover after reconnect without reuploading or duplicate comments", async () => {
@@ -79,10 +89,12 @@ test("a failed attachment and lost comment response recover after reconnect with
     comment: async (...args: Parameters<typeof f.client.comment>) => { if (lostResponse) { lostResponse = false; throw new Error("comment read offline"); } return f.client.comment(...args); },
   };
   await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("attachment offline");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(0);
   expect(f.issue.state.name).toBe("On Course");
   expect(f.comments.size).toBe(0);
   await f.prisma.$disconnect();
   await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("comment read offline");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(0);
   expect(f.issue.state.name).toBe("On Course");
   await f.prisma.$disconnect();
   expect((await publishSessionIssueUpdate(f.input, client)).published).toBe(true);
@@ -106,15 +118,15 @@ test("failed upload leaves status unchanged; capture changes and stale owner sta
   expect(f.steps).toEqual([]);
 });
 
-test("simultaneous retries share one delivery and unknown states, workers and human control are rejected", async () => {
+test("simultaneous retries share one delivery and unknown states, workers and task closure are rejected", async () => {
   const f = await fixture();
   await expect(publishSessionIssueUpdate({ ...f.input, state: "In Progress" }, f.client)).rejects.toThrow("not in the linked issue's team");
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
   await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("primary");
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "primary" } });
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "human" } });
-  await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("human");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("closed");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
   const results = await Promise.all([publishSessionIssueUpdate(f.input, f.client), publishSessionIssueUpdate(f.input, f.client)]);
   expect(results[0]).toEqual(results[1]);
   expect(f.steps).toEqual(["upload", "attach", "comment", "state"]);
@@ -128,6 +140,21 @@ test("backend Done accepts no screenshots; phase is separate and status transiti
   expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("preparing");
 });
 
+test("child graph rejects a primary whose task worktree identity changed", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { worktreePath: directory + "-other" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("owning task primary");
+  expect(await f.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(0);
+});
+
+test("terminal parent updates obey the observed completion boundary before publishing; review does not require shipping", async () => {
+  const f = await fixture();
+  const client = { ...f.client, complete: async () => { throw new Error("Local commit has not been published"); } };
+  await expect(publishSessionIssueUpdate({ ...f.input, state: "Done", evidence: [] }, client)).rejects.toThrow("not been published");
+  expect(f.steps).toEqual([]);
+  expect((await publishSessionIssueUpdate({ ...f.input, requestKey: "review-after-local" }, client)).state).toBe("Manual Review");
+});
+
 test("media detection rejects non-captures and paths outside the worktree including symlink escapes", async () => {
   const f = await fixture();
   const worktree = path.join(directory, "nested");
@@ -139,6 +166,144 @@ test("media detection rejects non-captures and paths outside the worktree includ
   expect((await readIssueEvidence({ path: f.capture, title: "Owned external" }, worktree, [realCapture])).receipt.contentType).toBe("image/png");
   await writeFile(f.capture, "SECRET=not-an-image");
   await expect(readIssueEvidence({ path: f.capture, title: "Invalid" }, directory, [])).rejects.toThrow("capture");
+});
+
+test("child updates are scoped, dependency-aware, durable and remain in the parent's task", async () => {
+  const f = await fixture();
+  const child = { ...f.issue, id: "child-id", identifier: "DRA-29" };
+  const prerequisite = { ...f.issue, id: "prerequisite", identifier: "DRA-30" };
+  const nodes: WorkIssue[] = [child, prerequisite].map((issue) => ({
+    id: issue.id, identifier: issue.identifier, title: issue.title, url: `https://linear.app/issue/${issue.identifier}`,
+    state: issue.state, parent: { id: f.issue.id, identifier: f.issue.identifier }, completedAt: null,
+    blocks: [], blockedBy: issue.id === child.id ? [prerequisite.id] : [],
+  }));
+  const client = { ...f.client,
+    graph: async (_config: ServerConfig, query: { id: string }) => ({ id: query.id, identifier: f.issue.identifier, states: f.states, children: query.id === f.issue.id ? nodes : [] }),
+    read: async (_config: ServerConfig, query: { id: string }) => query.id === child.id ? child : prerequisite,
+    update: async (_config: ServerConfig, query: { id: string }, change: { stateId?: string }) => {
+      expect(query.id).toBe(child.id);
+      child.state = f.states.find((state) => state.id === change.stateId)!;
+      f.steps.push("state");
+    },
+  };
+  const input = { ...f.input, evidence: [], childIssueId: child.identifier, state: "On Course", expectedState: "On Course" };
+  expect((await readSessionWorkGraph(input, client)).children).toHaveLength(2);
+  expect(await f.prisma.runtimeSessionResourceLink.count({ where: { relationship: "child" } })).toBe(2);
+  await expect(publishChildIssueUpdate({ ...input, childIssueId: f.issue.id }, client)).rejects.toThrow("direct child");
+  await expect(publishChildIssueUpdate(input, client)).rejects.toThrow("prerequisite");
+  nodes[1]!.state = f.states[2]!;
+  const completed = { ...input, state: "Done" };
+  const result = await publishChildIssueUpdate(completed, client);
+  expect(result.issueIdentifier).toBe(child.identifier);
+  const observed = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "issue-update-published", key: result.commentId } });
+  expect(JSON.parse(observed.value!)).toMatchObject({ issueIdentifier: child.identifier, issueId: child.id, state: "Done" });
+  expect(f.steps).toEqual(["comment", "state"]);
+  expect(f.issue.state.name).toBe("On Course");
+  await f.prisma.$disconnect();
+  expect(await publishChildIssueUpdate(completed, client)).toEqual(result);
+  expect(f.comments.size).toBe(1);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  nodes.splice(0, 1); // Owner reparented the child: even replay cannot grant access.
+  await expect(publishChildIssueUpdate(completed, client)).rejects.toThrow("direct child");
+});
+
+test("confirmed review publication feeds owner-wait activity without a question or reported review phase", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { connectionId: f.input.config.activeConnectionId, issueIdentifier: f.issue.identifier, phase: "working" } });
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle" } });
+  const runtime = createFakeAgentRuntime([{ ...f.session, status: "idle" }]);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity.state).toBe("idle");
+  const result = await publishSessionIssueUpdate({ ...f.input, evidence: [] }, f.client);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "waiting-owner", ownerQuestions: [], reviewHandoff: { receiptId: result.commentId, issueIdentifier: f.issue.identifier }, progress: { reportedPhase: "working" } });
+  await publishSessionIssueUpdate({ ...f.input, requestKey: "resume-work", evidence: [], state: "On Course", expectedState: "Manual Review" }, f.client);
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "idle", reviewHandoff: null });
+  expect(runtime.sentMessages).toHaveLength(0);
+});
+
+test("required unfinished children prevent parent handoff before any external write", async () => {
+  const f = await fixture();
+  const node: WorkIssue = {
+    id: "child", identifier: "DRA-31", title: "Verify", url: "https://linear.app/issue/DRA-31",
+    state: { id: "todo", name: "Todo", type: "unstarted" }, completedAt: null,
+    parent: { id: f.issue.id, identifier: f.issue.identifier }, blocks: [], blockedBy: [],
+  };
+  const client = { ...f.client, graph: async () => ({ id: f.issue.id, identifier: f.issue.identifier, states: f.states, children: [node] }) };
+  await expect(publishSessionIssueUpdate(f.input, client)).rejects.toThrow("DRA-31 (Todo)");
+  expect(f.steps).toEqual([]);
+  node.state = f.states[2]!;
+  expect((await publishSessionIssueUpdate(f.input, client)).state).toBe("Manual Review");
+});
+
+test("child graph rejects delegates and closed tasks", async () => {
+  const f = await fixture();
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("primary");
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "primary" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("closed");
+});
+
+test("DRA-28 implementation scopes advance independently while verification waits for all three and gates parent review", async () => {
+  const f = await fixture();
+  f.issue.identifier = "DRA-28";
+  const todo = { id: "todo", name: "Todo", type: "unstarted" };
+  const verifying = { id: "verifying", name: "Verification", type: "started" };
+  f.states.push(todo, verifying);
+  const definitions = [
+    ["DRA-29", "Persist semantic question identities"],
+    ["DRA-30", "Apply history to lot and survey asks"],
+    ["DRA-32", "Share question guards across structured tools"],
+    ["DRA-31", "Verify no-repeat behavior"],
+  ] as const;
+  const children = definitions.map(([identifier, title]) => ({ ...f.issue, id: identifier, identifier, title, state: todo }));
+  const implementations = children.slice(0, 3);
+  const verification = children[3]!;
+  const graph = () => children.map((child): WorkIssue => ({
+    id: child.id, identifier: child.identifier, title: child.title, url: `https://linear.app/issue/${child.identifier}`,
+    state: child.state, parent: { id: f.issue.id, identifier: f.issue.identifier }, completedAt: null,
+    blocks: child === verification ? [] : [verification.id],
+    blockedBy: child === verification ? implementations.map(({ id }) => id) : [],
+  }));
+  const client = { ...f.client,
+    graph: async (_config: ServerConfig, query: { id: string }) => ({ id: query.id, identifier: f.issue.identifier, states: f.states, children: query.id === f.issue.id ? graph() : [] }),
+    read: async (_config: ServerConfig, query: { id: string }) => [f.issue, ...children].find(({ id }) => id === query.id)!,
+    update: async (_config: ServerConfig, query: { id: string }, change: { stateId?: string }) => {
+      const issue = [f.issue, ...children].find(({ id }) => id === query.id)!;
+      issue.state = f.states.find(({ id }) => id === change.stateId)!;
+      f.steps.push(`${issue.identifier}:${issue.state.name}`);
+    },
+  };
+  const update = (child: typeof verification, state: string) => ({
+    ...f.input, evidence: [], childIssueId: child.id, requestKey: `${child.id}:${state}`,
+    body: `${child.title}: ${state === "Done" ? "Focused acceptance passed" : "Work started"}.`, state, expectedState: child.state.name,
+  });
+  expect((await readSessionWorkGraph(f.input, client)).children.map(({ identifier, blockedBy }) => ({ identifier, blockedBy }))).toEqual([
+    { identifier: "DRA-29", blockedBy: [] }, { identifier: "DRA-30", blockedBy: [] },
+    { identifier: "DRA-32", blockedBy: [] }, { identifier: "DRA-31", blockedBy: ["DRA-29", "DRA-30", "DRA-32"] },
+  ]);
+  for (const child of implementations) await publishChildIssueUpdate(update(child, "On Course"), client);
+  expect(children.map(({ state }) => state.name)).toEqual(["On Course", "On Course", "On Course", "Todo"]);
+  for (const child of implementations) {
+    const writes = f.steps.length;
+    await expect(publishChildIssueUpdate(update(verification, "Verification"), client)).rejects.toThrow("prerequisite");
+    expect(f.steps).toHaveLength(writes);
+    const completed = update(child, "Done");
+    const receipt = await publishChildIssueUpdate(completed, client);
+    await f.prisma.$disconnect();
+    expect(await publishChildIssueUpdate(completed, client)).toEqual(receipt);
+    expect(f.comments.size).toBe(f.steps.filter((step) => step === "comment").length);
+  }
+  await publishChildIssueUpdate(update(verification, "Verification"), client);
+  const handoff = { ...f.input, evidence: [], requestKey: "parent-review", body: "All three changes verified together; owner review is ready." };
+  const writes = f.steps.length;
+  await expect(publishSessionIssueUpdate(handoff, client)).rejects.toThrow("DRA-31 (Verification)");
+  expect(f.steps).toHaveLength(writes);
+  await publishChildIssueUpdate(update(verification, "Done"), client);
+  expect((await publishSessionIssueUpdate(handoff, client)).state).toBe("Manual Review");
+  expect(f.comments.size).toBe(9); // Three start/result pairs, verification start/result, one parent handoff.
+  expect(await f.prisma.remoteTask.count()).toBe(1);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).primarySessionId).toBe(f.session.id);
 });
 
 // Real ffmpeg/ffprobe: the published bytes must be the validated MP4.

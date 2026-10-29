@@ -5,9 +5,11 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { attachIssueEvidence, uploadIssueEvidence } from "../../integrations/linear/evidence.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
+import { getIssueWorkGraph } from "../../integrations/linear/session-store/source-issue/work-graph.ts";
 import { updateSourceIssue } from "../../integrations/linear/session-store/source-issue/update.ts";
-import { assertTaskAutomationAllowed } from "../tasks/control.ts";
+import { assertTaskOpen } from "../tasks/task-state.ts";
 import { taskForSession } from "../tasks/store.ts";
+import { assertCompletionAllowed } from "../tasks/completion.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { registerThread } from "./threads.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
@@ -19,15 +21,17 @@ export const IssueUpdateInput = z.object({
 }).strict().refine((value) => Boolean(value.state) === Boolean(value.expectedState), "State changes require both state and expectedState from read_source_issue");
 type Input = z.infer<typeof IssueUpdateInput>;
 
-const delivery = {
+export const issueUpdateDelivery = {
   source: linkedSourceIssue, read: getSourceIssueForUpdate, update: updateSourceIssue,
+  graph: getIssueWorkGraph,
+  complete: async (input: Parameters<typeof assertCompletionAllowed>[0]) => { await assertCompletionAllowed(input); },
   upload: uploadIssueEvidence, attach: attachIssueEvidence, create: createThreadedIssueComment, comment: fetchIssueCommentIdentity,
 };
 
 // These writes run only in the HTTP server. Serializing per source prevents two
 // simultaneous retries from racing uploads or undoing a newer status update.
 const writes = new Map<string, Promise<unknown>>();
-export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, client = delivery) {
+export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, client = issueUpdateDelivery) {
   const source = await client.source(input);
   const key = `${source.link.connectionId}:${source.issue.id}`;
   const previous = writes.get(key) ?? Promise.resolve();
@@ -36,10 +40,10 @@ export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaC
   try { return await run; } finally { if (writes.get(key) === run) writes.delete(key); }
 }
 
-async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof delivery) {
+async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof issueUpdateDelivery) {
   const { prisma, sessionId } = input;
   const { session, link, config, issue } = source;
-  await assertTaskAutomationAllowed(prisma, session.cwd);
+  await assertTaskOpen(prisma, session.cwd);
   const current = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
   if (current.status === "closed" || current.role === "delegate") throw new Error("Only an open primary session may publish source-issue updates");
   const task = await taskForSession(prisma, sessionId);
@@ -67,10 +71,29 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   // not-yet-uploaded videos before this attempt's first remote effect.
   if (await prepareIssueEvidence(evidence, context)) await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
   const checkState = async () => {
-    await assertTaskAutomationAllowed(prisma, session.cwd);
+    await assertTaskOpen(prisma, session.cwd);
     const latest = await client.read(config, { id: issue.id });
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
+    if (target?.name === "Merge" && latest.state.name !== "Merge") throw new Error("Only an owner-selected Merge state authorizes delivery; agents cannot select it");
+    if (target?.type === "completed" && target.name !== "Manual Review") await client.complete({ prisma, config, sessionId });
+    if (task && target && (target.type === "completed" || target.name === "Manual Review" || target.name === "Merge")) {
+      const graph = await client.graph(config, { id: issue.id });
+      const unfinished = [];
+      for (const child of graph.children) {
+        if (child.state.type === "canceled" || (child.state.type === "completed" && child.state.name !== "Manual Review")) continue;
+        // Review may explicitly expose blocked child work, but Merge/Done may
+        // not silently treat it as delivered. Require a published child receipt
+        // so a bare stale status is not a substitute for the actual blocker.
+        if (target.name === "Manual Review" && child.state.name === "Blocked") {
+          const blocker = await prisma.runtimeIssueUpdate.findFirst({ where: { runtimeSessionId: sessionId, issueId: child.id, connectionId: link.connectionId, published: true }, orderBy: { updatedAt: "desc" } });
+          const saved = blocker ? IssueUpdateInput.safeParse(blocker.input) : null;
+          if (saved?.success && saved.data.state === "Blocked") continue;
+        }
+        unfinished.push(child);
+      }
+      if (unfinished.length) throw new Error(`Reconcile required child work before handoff: ${unfinished.map((child) => `${child.identifier} (${child.state.name})`).join(", ")}`);
+    }
     return latest;
   };
   await checkState();
@@ -81,7 +104,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
     if (!file.attachmentId) {
-      await assertTaskAutomationAllowed(prisma, session.cwd);
+      await assertTaskOpen(prisma, session.cwd);
       file.attachmentId = await client.attach(config.linearApiKey, { issueId: issue.id, title: file.title, url: file.assetUrl });
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
@@ -105,7 +128,17 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     const confirmed = await client.read(config, { id: issue.id });
     if (confirmed?.state.id !== target.id) throw new Error("Issue state change is unconfirmed; inspect and retry the same update");
   }
-  await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { published: true } });
+  // Keep the resolved provider identity separate from the caller's immutable
+  // retry payload. A primary can also publish child updates; consumers must not
+  // mistake those receipts for a handoff of its source issue. Commit only after
+  // the comment and requested state are confirmed, atomically with publication.
+  await prisma.$transaction(async (tx) => {
+    await tx.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { published: true } });
+    await tx.runtimeMetadataEvent.create({ data: {
+      runtimeSessionId: sessionId, action: "issue-update-published", source: "issue-update-observer", key: receipt.id,
+      value: JSON.stringify({ connectionId: link.connectionId, issueId: issue.id, issueIdentifier: issue.identifier, state: payload.state ?? null }),
+    } });
+  });
   // Replays need only the receipt; this request's prepared copies are private.
   await rm(context.cacheDirectory, { recursive: true, force: true }).catch(() => undefined);
   return result();

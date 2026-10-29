@@ -9,7 +9,6 @@ import { createApp } from "../../app.ts";
 import { beginTask } from "./store.ts";
 import { provisionTaskWorktree } from "./provision.ts";
 import { readToolingSource } from "../../../../lib/tooling-source.ts";
-import { assertTaskAutomationAllowed, changeTaskControl, reconcileTaskControls } from "./control.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { prepareTooling } from "./tooling.ts";
 
@@ -139,6 +138,41 @@ test("unavailable tooling yields a repair prompt in the existing worktree and re
   expect(git(worktreePath, "status", "--porcelain")).toBe("");
 });
 
+test("launch and composition repair deliver the task's pinned owner policy instead of dirty source policy", async () => {
+  const repo = repository();
+  const source = path.join(directory, "tooling");
+  git(directory, "clone", repo.root, source);
+  git(source, "config", "user.name", "Fixture");
+  git(source, "config", "user.email", "fixture@example.com");
+  const policy = "Owner authorizes task-owned headless browser verification.\n";
+  writeFileSync(path.join(source, "AGENTS.md"), policy);
+  git(source, "add", "AGENTS.md");
+  git(source, "commit", "-m", "owner policy");
+  const revision = git(source, "rev-parse", "HEAD");
+  repo.tooling = { root: source, revision };
+  const task = await beginTask(db.prisma, { requestKey: "policy-launch", repository: repo, machineId: "air", branchName: "codex/policy" });
+  const worktreePath = await provisionTaskWorktree(db.prisma, task.id, repo, "policy");
+  const installRoot = path.join(directory, "runtime");
+  const pinned = path.join(installRoot, "tooling", repo.id, revision);
+  mkdirSync(path.dirname(pinned), { recursive: true });
+  git(source, "worktree", "add", "--detach", pinned, revision);
+  writeFileSync(`${pinned}.ready`, `${revision}\n`);
+  writeFileSync(path.join(source, "AGENTS.md"), "New mutable policy must not enter this task.\n");
+  const input = { prisma: db.prisma, task, repository: repo, installRoot, worktreePath, provider: "codex" as const, seed: "Verify the retained preview." };
+  const prepared = await prepareTaskPrompt(input);
+  expect(prepared.prompt).toContain(policy.trim());
+  expect(prepared.prompt).toContain(path.join(pinned, "AGENTS.md"));
+  expect(prepared.prompt).not.toContain("New mutable policy");
+  const failed = await prepareTaskPrompt({ ...input, compose: async () => { throw new Error("composer unavailable"); } });
+  expect(failed.prompt).toContain(policy.trim());
+  expect(failed.prompt).toContain("composer unavailable");
+  expect(failed.prompt).toContain(input.seed);
+  expect(git(worktreePath, "status", "--porcelain")).toBe("");
+  expect(existsSync(path.join(worktreePath, "AGENTS.md"))).toBeFalse();
+  expect(git(pinned, "rev-parse", "HEAD")).toBe(revision);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toolingRevision).toBe(revision);
+});
+
 test("network task APIs require authentication and resource identity cannot be replaced", async () => {
   const repo = repository();
   const config = testConfig({ repository: repo });
@@ -154,26 +188,41 @@ test("network task APIs require authentication and resource identity cannot be r
   expect(await db.prisma.remoteTaskResource.count()).toBe(1);
   const first = await db.prisma.remoteTaskResource.findFirstOrThrow();
   expect((await put({ ...resource, externalId: first.externalId, state: "ready" })).status).toBe(200);
+
+
 });
 
-test("human control blocks all worktree sessions, survives restart paused, and requires the same viewer to resume", async () => {
+
+test("task closure stops its sessions without a browser takeover endpoint", async () => {
   const repo = repository();
-  const task = await beginTask(db.prisma, { requestKey: "control-test", repository: repo, machineId: "macbook-air", branchName: "codex/control" });
-  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { worktreePath: "/task/control" } });
-  const runtime = createFakeAgentRuntime([{ id: "primary", cwd: "/task/control", status: "active" }, { id: "delegate", cwd: "/task/control", status: "active" }]);
-  runtime.cancel = async (id) => {
-    await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("draining");
-    runtime.cancelledSessionIds.push(id);
-    runtime.putSession({ id, cwd: "/task/control", status: "idle" });
-  };
-  const controllerId = "viewer-owner-123456";
-  const granted = await changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId, action: "take" });
-  expect(granted.controlMode).toBe("human");
-  expect(runtime.cancelledSessionIds.sort()).toEqual(["delegate", "primary"]);
-  await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("human");
-  await reconcileTaskControls(db.prisma);
-  await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("paused");
-  await expect(changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId: "another-viewer-123", action: "resume" })).rejects.toThrow("Another viewer");
-  await changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId, action: "resume" });
-  await assertTaskAutomationAllowed(db.prisma, "/task/control");
+  const config = testConfig({ repository: repo });
+  const task = await beginTask(db.prisma, { requestKey: "close-task", repository: repo, machineId: config.machine, branchName: "codex/close" });
+  const worktreePath = path.join(directory, "close-worktree");
+  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { primarySessionId: "primary", worktreePath } });
+  const identity = { cwd: worktreePath, repositoryId: repo.id, machineId: config.machine };
+  const runtime = createFakeAgentRuntime([
+    { id: "primary", ...identity, status: "active" }, { id: "delegate", ...identity, status: "active" },
+    { id: "unrelated", ...identity, repositoryId: "another-repository", status: "active" },
+  ]);
+  await db.prisma.runtimeInstruction.createMany({ data: ["primary", "delegate"].map((sessionId) => ({ id: sessionId, sessionId, text: "pending", state: "queued" })) });
+  const app = createApp({ config, prisma: db.prisma, agentRuntime: runtime });
+  const post = (route: string, body: object) => app.request(`/api/tasks/${task.id}/${route}`, {
+    method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  expect((await post("control", { controllerId: "old-viewer", action: "take" })).status).toBe(404);
+  // This fake accepts cancellation without publishing a terminal receipt.
+  expect((await post("automation", { action: "pause" })).status).toBe(202);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).ownerPaused).toBeTrue();
+  expect((await post("automation", { action: "resume" })).status).toBe(200);
+  const closed = await post("automation", { action: "close" });
+  expect(closed.status).toBe(200);
+  const value = await closed.json() as { task: Record<string, unknown> };
+  expect(value.task.phase).toBe("closed");
+  expect(value.task.controlMode).toBe("paused");
+  expect(value.task.controllerId).toBe(`task-supervisor:${task.id}`);
+  const stored = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+  for (const field of ["controlMode", "controllerId", "controlGeneration"]) expect(field in stored).toBeFalse();
+  expect(runtime.closedSessionIds.sort()).toEqual(["delegate", "primary"]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "cancelled" } })).toBe(2);
+  expect((await post("automation", { action: "close" })).status).toBe(200);
 });

@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { run, runOrThrow } from "../run.ts";
+import { stopLaunchdJob } from "./launchd-control.ts";
 import type { ServiceDefinition, Supervisor } from "./types.ts";
 
 function domain(): string {
@@ -58,19 +59,19 @@ function writePlist(definition: ServiceDefinition): string {
 export const launchdSupervisor: Supervisor = {
   async install(definition) {
     const file = writePlist(definition);
-    await run("launchctl", ["bootout", `${domain()}/${definition.label}`]);
+    await stopLaunchdJob(`${domain()}/${definition.label}`);
     await runOrThrow("launchctl", ["bootstrap", domain(), file]);
   },
 
   async uninstall(label) {
-    await run("launchctl", ["bootout", `${domain()}/${label}`]);
+    await stopLaunchdJob(`${domain()}/${label}`);
     rmSync(plistPath(label), { force: true });
   },
 
   async stop(label) {
     // bootout both stops and unloads; the plist stays, so the server still
     // starts at next login. restart() re-bootstraps it.
-    await run("launchctl", ["bootout", `${domain()}/${label}`]);
+    await stopLaunchdJob(`${domain()}/${label}`);
   },
 
   async registered(label) {

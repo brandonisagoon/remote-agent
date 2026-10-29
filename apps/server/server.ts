@@ -8,7 +8,6 @@ import { createPlanCaptureInterceptor } from "./services/sessions/plan-capture.t
 import { startRuntimeEventProjection } from "./services/sessions/runtime-events/projection.ts";
 import { remoteAgentMcpServer } from "./mcp/register.ts";
 import { startControlSocket } from "./control-socket.ts";
-import { reconcileTaskControls } from "./services/tasks/control.ts";
 import { startInstructionDelivery } from "./services/sessions/inbox.ts";
 import { startPlacementDelivery, routingRequest } from "./services/tasks/routing.ts";
 
@@ -16,7 +15,6 @@ const config = readConfig();
 const runtimeOwnership = acquireRuntimeOwnership(config);
 const prisma = createPrismaClient(config.databaseUrl);
 await applyPragmas(prisma);
-await reconcileTaskControls(prisma);
 const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   onPermissionRequest: createPlanCaptureInterceptor({ prisma, config }),
   // Every session discovers remote-agent's own tools (delegate_session,

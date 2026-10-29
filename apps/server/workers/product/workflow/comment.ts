@@ -35,7 +35,8 @@ export function buildWorktreeLinkComment(input: {
     );
     return `[Open Worktree in ${editor.name}](${link})`;
   });
-  return [...links, `Remote Agent session \`${input.runtimeSessionId}\``].join(" · ");
+  return [...links, `Remote Agent session \`${input.runtimeSessionId}\``].join(" · ")
+    + "\n\nThis link opens the existing task worktree; it does not assign implementation to another chat. Status checks should inspect this session. Send corrections to its owning primary instead of starting another writer.";
 }
 
 /** Posts the editor deep links once the worktree exists. The caller passes

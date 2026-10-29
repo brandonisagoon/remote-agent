@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
+        expect(names).toEqual(["read_work_graph", "publish_child_issue_update", "read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "resolve_tooling_capability", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },
@@ -106,6 +106,20 @@ describe("remote-agent MCP server", () => {
     );
   });
 
+  test("named capability resolution fixes the caller and never forwards arbitrary source paths", async () => {
+    await withServer(async (request) => {
+      expect(new URL(request.url).pathname).toBe("/api/sessions/session-7/tooling-capability");
+      expect(request.method).toBe("POST");
+      expect(await request.json()).toEqual({ capability: "development-credentials" });
+      return Response.json({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "development-credentials", adapter: "/immutable/src/credentials-backup.ts" }, instructions: "Inspect names; verify integrity; export task-required keys only." });
+    }, async (rpc) => {
+      const call = await rpc({ method: "tools/call", params: { name: "resolve_tooling_capability", arguments: {
+        capability: "development-credentials", sessionId: "someone-else", adapter: "/tmp/untrusted.ts", revision: "latest",
+      } } });
+      expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text).receipt.capability).toBe("development-credentials");
+    });
+  });
+
   test("attachment downloads bind to the caller's session and expose only a local receipt", async () => {
     const url = "https://uploads.linear.app/workspace/image/file";
     await withServer(async (request) => {
@@ -130,5 +144,21 @@ describe("remote-agent MCP server", () => {
       const call = await rpc({ method: "tools/call", params: { name: "publish_issue_update", arguments: input } });
       expect(JSON.parse((call.result as { content: Array<{ text: string }> }).content[0]!.text)).toEqual({ published: true, commentId: "comment" });
     });
+  });
+
+  test("child graph and updates use the existing caller session without launching another", async () => {
+    const seen: Array<{ method: string; path: string; body: unknown }> = [];
+    const input = { childIssueId: "DRA-29", requestKey: "child-start", body: "Implementation started", expectedState: "Todo", state: "Implementing" };
+    await withServer(async (request) => {
+      seen.push({ method: request.method, path: new URL(request.url).pathname, body: request.method === "GET" ? null : await request.json() });
+      return Response.json({ accepted: true });
+    }, async (rpc) => {
+      await rpc({ method: "tools/call", params: { name: "read_work_graph", arguments: { sessionId: "unrelated" } } });
+      await rpc({ method: "tools/call", params: { name: "publish_child_issue_update", arguments: input } });
+    });
+    expect(seen).toEqual([
+      { method: "GET", path: "/api/sessions/session-7/work-graph", body: null },
+      { method: "POST", path: "/api/sessions/session-7/child-issue-update", body: input },
+    ]);
   });
 });

@@ -104,6 +104,16 @@ afterEach(() => {
 });
 
 describe("readConfig", () => {
+  test("omitted managed-turn limit stays unlimited while an owner-selected limit survives resolution", () => {
+    writeConfig();
+    expect(readConfig().maxConcurrentTurns).toBeUndefined();
+    const selected = serviceFile();
+    selected.machine.acpx = { maxConcurrentTurns: 5 };
+    writeConfig(selected);
+    expect(readConfig().maxConcurrentTurns).toBe(5);
+    expect(parseServiceFile(selected).machine.acpx.maxConcurrentTurns).toBe(5);
+  });
+
   test("removing the last allowed repository disables intake even after another repository is added", () => {
     const value = parseServiceFile(serviceFile());
     removeRepository(value, "example");

@@ -50,6 +50,7 @@
     "electron",
   ],
   "patchedDependencies": {
+    "@prisma/adapter-libsql@7.9.1": "patches/@prisma%2Fadapter-libsql@7.9.1.patch",
     "acpx@0.13.2": "patches/acpx@0.13.2.patch",
   },
   "packages": {
