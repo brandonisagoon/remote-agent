@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
-import { fetchQualifiedIssueComment } from "../../integrations/linear/comments.ts";
+import { fetchIssueCommentIdentity, fetchQualifiedIssueComment } from "../../integrations/linear/comments.ts";
 import { linkedSourceIssue } from "../sessions/questions.ts";
 import { CompletionContractInput } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
@@ -13,7 +13,7 @@ import { assertFinalizationResources, finalizationDigest, finalizationResourceId
 export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
-  snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources };
+  handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem
@@ -119,7 +119,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (externalDigest(recheckedComment.acceptance) !== externalDigest(acceptance)) throw new Error("Owner acceptance changed during adoption");
   if (externalDigest(await dependencies.snapshot(current.identity.taskWorktree)) !== externalDigest(originalSnapshot)) throw new Error("Original cleanup worktree changed during adoption");
   for (const observed of deliveries) if (externalDigest(await dependencies.observer.source(manifest.deliveries.find((delivery) => delivery.id === observed.id)!)) !== externalDigest(observed.snapshot)) throw new Error("External source changed during adoption");
-  await dependencies.assertResources({ resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, removed: false });
+  await dependencies.assertResources({ taskId: input.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, removed: false });
   return input.prisma.$transaction(async (tx) => {
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey } });
     if (duplicate) {

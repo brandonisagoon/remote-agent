@@ -134,6 +134,9 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     const confirmed = await client.read(config, { id: issue.id });
     if (confirmed?.state.id !== target.id) throw new Error("Issue state change is unconfirmed; inspect and retry the same update");
   }
+  // Revalidate completion after the state effect. This also reconciles an exact
+  // pending external Done handoff when its provider acknowledgement was lost.
+  await checkState();
   // Keep the resolved provider identity separate from the caller's immutable
   // retry payload. A primary can also publish child updates; consumers must not
   // mistake those receipts for a handoff of its source issue. Commit only after

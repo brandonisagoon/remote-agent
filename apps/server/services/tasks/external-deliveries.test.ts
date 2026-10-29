@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { Hono } from "hono";
@@ -16,9 +16,10 @@ import { completionObservation } from "./completion-observation.ts";
 import { adoptExternalDeliveries, externalBindingDependencies } from "./external-deliveries.ts";
 import { EXTERNAL_BINDING, ExternalDeliveryBindingInput } from "./external-delivery-schema.ts";
 import { observeExternalRemote, observeExternalSource, externalDeliveryObservation } from "./external-delivery-observation.ts";
-import { prepareExternalFinalization, confirmExternalFinalization, assertExternalDoneAllowed, externalFinalizationProjection } from "./external-finalization.ts";
+import { prepareExternalFinalization, confirmExternalFinalization, assertExternalDoneAllowed, externalFinalizationProjection, PreparedExternalFinalization } from "./external-finalization.ts";
 import { prepareTaskFinalization } from "./finalization.ts";
-import { prepareFinalizationResources, assertFinalizationResources, type ResourceObservation } from "./finalization-resources.ts";
+import { prepareFinalizationResources, assertFinalizationResources, finalizationDigest, inspectFinalizationQuarantine, type ResourceObservation } from "./finalization-resources.ts";
+import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "external-delivery-"))); });
@@ -76,9 +77,76 @@ async function fixture() {
     assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, noProcesses) };
   const input = { ...context, binding: manifest };
   const finalize = { prisma: db.prisma, config, sessionId: session.id, requestKey: "finalize:task", finalizationVersion: 2 as const };
-  const remove = async () => { await rm(copies, { recursive: true }); await db.prisma.remoteTaskResource.update({ where: { id: sourceResource.id }, data: { state: "released" } }); git(product, "worktree", "remove", worktree); };
-  return { ...context, input, dependencies, finalize, task, session, comment, issue, states, copies, publisher, policy, report, worktree, product, sourceResource, manifest, remove };
+  const capture = async (renameRoot = true) => {
+    const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-prepared", source: `finalizer:${task.id}` } });
+    const prepared = PreparedExternalFinalization.parse(JSON.parse(event.value!));
+    const entry = prepared.resources.find((resource) => resource.disposition === "retire-owned" && resource.target.type === "tree");
+    if (!entry || entry.disposition !== "retire-owned" || entry.target.type !== "tree") throw new Error("Missing fixture capture plan");
+    const target = entry.target, root = target.inventory.find((node) => node.path === ".")!;
+    if (!(await lstat(target.quarantine.directory).catch(() => null))) {
+      await mkdir(target.quarantine.directory, { mode: 0o700 });
+      const location = await lstat(target.quarantine.directory);
+      const journal = { version: 1, taskId: task.id, resourceId: entry.id, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path,
+        source: { dev: root.dev, ino: root.ino, mode: root.mode }, quarantine: { dev: location.dev, ino: location.ino } };
+      await writeFile(target.quarantine.journal, JSON.stringify(journal), { mode: 0o600, flag: "wx" });
+    }
+    if (renameRoot && await lstat(target.path).catch(() => null)) await rename(target.path, target.quarantine.path);
+    await inspectFinalizationQuarantine({ taskId: task.id, resourceId: entry.id, target });
+    return target;
+  };
+  const remove = async () => { await capture(); await db.prisma.remoteTaskResource.update({ where: { id: sourceResource.id }, data: { state: "released" } }); git(product, "worktree", "remove", worktree); };
+  return { ...context, input, dependencies, finalize, task, session, comment, issue, states, copies, publisher, policy, report, worktree, product, sourceResource, manifest, capture, remove };
 }
+
+function publicationFixture(f: Awaited<ReturnType<typeof fixture>>, failure?: "state-response" | "receipt-transaction") {
+  const comments = new Map<string, { id: string; body: string; issue: { id: string } }>();
+  let createCount = 0, updateCount = 0, gateCount = 0, fail = Boolean(failure);
+  const dependencies = { ...f.dependencies, handoffComment: async (_credential: unknown, id: string) => comments.get(id) ?? null };
+  const prisma = new Proxy(db.prisma, { get(target, property) {
+    if (property === "$transaction") return async (callback: Parameters<typeof target.$transaction>[0]) => target.$transaction(async (tx) => {
+      const result = await (callback as (transaction: typeof tx) => Promise<unknown>)(tx);
+      if (failure === "receipt-transaction" && fail && await tx.runtimeIssueUpdate.count({ where: { requestKey: `${f.finalize.requestKey}:done`, published: true } })) {
+        fail = false; throw new Error("injected published-receipt transaction loss");
+      }
+      return result;
+    });
+    return Reflect.get(target, property);
+  } });
+  const client = { ...issueUpdateDelivery, source: dependencies.source,
+    read: async () => f.issue,
+    graph: async () => ({ id: f.issue.id, identifier: f.issue.identifier, children: [], states: f.states }),
+    complete: async (input: Parameters<typeof issueUpdateDelivery.complete>[0]) => { gateCount++; await assertExternalDoneAllowed(input, dependencies); },
+    create: async (_credential: unknown, input: { id?: string; issueId: string; body: string }) => {
+      createCount++; comments.set(input.id!, { id: input.id!, body: input.body, issue: { id: input.issueId } }); return { id: input.id! };
+    },
+    comment: dependencies.handoffComment,
+    update: async (_config: unknown, _query: unknown, input: { stateId?: string }) => {
+      updateCount++; f.issue.state = f.states.find((state) => state.id === input.stateId)!;
+      if (failure === "state-response" && fail) { fail = false; throw new Error("injected applied-Done response loss"); }
+    },
+  };
+  const publish = (handoff: { requestKey: string; body: string; state: string; expectedState: string }) => publishSessionIssueUpdate({ ...f.finalize, ...handoff, prisma, evidence: [] }, client);
+  return { dependencies, publish, comments, counts: () => ({ createCount, updateCount, gateCount }) };
+}
+
+test.each(["state-response", "receipt-transaction"] as const)("exact pending Done handoff reconciles actual %s loss without another comment or cleanup", async (failure) => {
+  const f = await fixture(); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies); await f.remove();
+  const confirmed = await confirmExternalFinalization(f.finalize, f.dependencies);
+  const publication = publicationFixture(f, failure);
+  await expect(publication.publish(prepared.doneHandoff)).rejects.toThrow("injected");
+  expect(f.issue.state.name).toBe("Done");
+  const pending = await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: prepared.doneHandoff.requestKey } });
+  expect(pending.published).toBe(false); expect(pending.commentPosted).toBe(true);
+  expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).status).toBe("idle");
+  expect(await prepareExternalFinalization(f.finalize, publication.dependencies)).toEqual(confirmed);
+  expect((await publication.publish(prepared.doneHandoff)).published).toBe(true);
+  expect((await publication.publish(prepared.doneHandoff)).published).toBe(true);
+  expect(publication.counts()).toMatchObject({ createCount: 1, updateCount: 1 });
+  expect(publication.counts().gateCount).toBeGreaterThan(2);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "issue-update-published" } })).toBe(1);
+});
 
 test("accepted external deliveries preserve original cleanup identity through prepare, partial retry, confirmation and closed GET retention", async () => {
   const f = await fixture();
@@ -92,7 +160,7 @@ test("accepted external deliveries preserve original cleanup identity through pr
   expect(prepared.revision).toBe(git(f.worktree, "rev-parse", "HEAD"));
   expect(prepared.delivery.deliveries.map((entry) => entry.mergeCommit)).toEqual(["b".repeat(40), "c".repeat(40)]);
   expect(prepared.doneHandoff.body).toContain("cleanup revision");
-  await rm(f.publisher, { recursive: true });
+  await f.capture(false);
   expect(await prepareExternalFinalization(f.finalize, f.dependencies)).toEqual(prepared);
   await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("filesystem resources");
   await f.remove();
@@ -152,7 +220,7 @@ test("a later contract, owner comment edit or recreated path blocks confirmation
   await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("comment author");
   f.comment.comment.body = "Phone playback works.";
   await mkdir(f.copies);
-  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("filesystem resources");
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("recreated");
   await rm(f.copies, { recursive: true });
   await setCompletionContract({ prisma: db.prisma, config: f.config, taskId: f.task.id, contract: CompletionContractInput.parse({ requestKey: "revoked", expectedRevision: f.manifest.expectedContractRevision, boundary: "revoked", basis: "Owner withdrew delivery" }) });
   await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("revoked or replaced");
@@ -222,7 +290,7 @@ test("missing or mismatched durable resource proofs block Done and confirmed rep
   expect((await externalFinalizationProjection(db.prisma, f.task)).finalizationRetention).toBeUndefined();
 });
 
-test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted client consumes all eight server-planned resources, resumes a partial failure and closes last", async () => {
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(["state-response", "receipt-transaction"] as const)("actual Drafted client resumes eight-resource cleanup and %s publication loss, then closes last", async (failure) => {
   const f = await fixture();
   const clientRoot = await realpath(process.env.DRAFTED_INTEGRATION_ROOT!);
   const { finalizeTask } = await import(path.join(clientRoot, "src/finalize.ts"));
@@ -243,6 +311,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted client consum
   await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "fixture-endpoint", kind: "local-http", purpose: "review", externalId: "http://127.0.0.1:29199", state: "ready", metadata: { pid: 98765, script } } });
   f.manifest.resourceIds = (await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } })).map((resource) => resource.id);
   await adoptExternalDeliveries(f.input, f.dependencies);
+  const publication = publicationFixture(f, failure);
   let injected = false, published = false, closed = 0;
   const effects: string[] = [];
   const registry = {
@@ -251,41 +320,62 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted client consum
       return TaskRecord.parse(JSON.parse(JSON.stringify({ ...task, ...await externalFinalizationProjection(db.prisma, task) })));
     },
     resource: async (receipt: { key: string; state: string; metadata?: Record<string, unknown> }) => {
-      // Crash after the first actual evidence unlink but before its state write.
+      // Crash after the whole root is captured but before an evidence state write.
       if (!injected && receipt.key === "evidence-one" && receipt.state === "released") { injected = true; throw new Error("injected partial cleanup response loss"); }
       const record = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: receipt.key } } });
       await db.prisma.remoteTaskResource.update({ where: { id: record.id }, data: { state: receipt.state, ...(receipt.metadata ? { metadata: JSON.parse(JSON.stringify(receipt.metadata)) } : {}) } });
       effects.push(`released:${receipt.key}`);
     },
-    prepareFinalization: async (request: { requestKey: string; finalizationVersion?: 2; authorityOnly?: true }) => FinalizationReceipt.parse(await prepareExternalFinalization({ ...f.finalize, ...request }, f.dependencies)),
-    confirmFinalization: async (request: { requestKey: string; finalizationVersion?: 2 }) => FinalizationReceipt.parse(await confirmExternalFinalization({ ...f.finalize, ...request }, f.dependencies)),
+    prepareFinalization: async (request: { requestKey: string; finalizationVersion?: 2; authorityOnly?: true }) => FinalizationReceipt.parse(await prepareExternalFinalization({ ...f.finalize, ...request }, publication.dependencies)),
+    confirmFinalization: async (request: { requestKey: string; finalizationVersion?: 2 }) => FinalizationReceipt.parse(await confirmExternalFinalization({ ...f.finalize, ...request }, publication.dependencies)),
     publishIssueUpdate: async (handoff: { requestKey: string; body: string; state: string; expectedState: string }) => {
-      await assertExternalDoneAllowed({ ...f.finalize, ...handoff }, f.dependencies);
-      await db.prisma.runtimeIssueUpdate.create({ data: { runtimeSessionId: f.session.id, requestKey: handoff.requestKey, connectionId: f.task.connectionId!, issueId: f.issue.id, input: handoff, evidence: [], published: true } });
-      published = true; f.issue.state = f.states[2]!; effects.push("Done"); return { published: true };
+      const result = await publication.publish(handoff);
+      published = result.published; effects.push("Done"); return result;
     },
   };
-  const execute = () => finalizeTask({ registry, close: async () => {
+  const execute = () => finalizeTask({ registry, runner: async (command: string[], cwd: string) => {
+    if (command[0] === "git" && command.includes("worktree") && command.includes("remove")) effects.push("removed:worktree");
+    const result = await bunCommandClient.run(command[0]!, command.slice(1), { cwd });
+    if (!result.ok) throw new Error("Fixture Git command failed");
+    return result.stdout.trim();
+  }, close: async () => {
     if (!published) throw new Error("Session closed before Done");
     await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
     await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
     closed++; effects.push("closed");
-  }, preparedCleanup: { observation: noProcesses, browser: async (input: { beforeMutation?: () => Promise<void> }) => {
+  }, preparedCleanup: { observation: noProcesses, browser: async (input: { action: string; beforeMutation?: () => Promise<void> }) => {
     await input.beforeMutation?.();
-    await rm(profile, { recursive: true }); await rm(contextFile);
-    return { released: true };
+    expect(input.action).toBe("close");
+    effects.push("closed:browser");
+    return { closed: true };
   } } });
   await expect(execute()).rejects.toThrow("injected partial cleanup");
   expect(closed).toBe(0); expect(published).toBe(false);
   expect(await lstat(path.join(f.copies, "evidence-one.mp4")).then(() => true, () => false)).toBe(false);
   const prepared = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-prepared" } });
   expect(JSON.parse(prepared.value!).resources).toHaveLength(8);
+  await expect(execute()).rejects.toThrow("injected");
+  expect(closed).toBe(0); expect(published).toBe(false); expect(f.issue.state.name).toBe("Done");
+  const releasedBeforeRetry = effects.filter((effect) => effect.startsWith("released:"));
   expect((await execute()).closed).toBe(true);
+  expect(effects.filter((effect) => effect.startsWith("released:"))).toEqual(releasedBeforeRetry);
+  expect(effects.filter((effect) => effect === "removed:worktree")).toHaveLength(1);
+  expect(effects.filter((effect) => effect === "closed:browser")).toHaveLength(1);
+  expect(publication.counts()).toMatchObject({ createCount: 1, updateCount: 1 });
   expect(effects.slice(-2)).toEqual(["Done", "closed"]);
   const final = await registry.task();
   expect(final.toolingRevision).toBe(f.task.toolingRevision);
   expect(final.finalizationRetention.resources).toHaveLength(3);
   expect(final.resources.filter((resource: { state: string }) => resource.state !== "released")).toHaveLength(3);
+  const sealed = PreparedExternalFinalization.parse(JSON.parse(prepared.value!));
+  const captured = sealed.resources.find((resource) => resource.disposition === "retire-owned" && resource.target.type === "tree");
+  if (!captured || captured.disposition !== "retire-owned" || captured.target.type !== "tree") throw new Error("Missing captured root");
+  expect(await inspectFinalizationQuarantine({ taskId: f.task.id, resourceId: captured.id, target: captured.target })).toMatchObject({ captured: true });
+  expect(await readFile(path.join(captured.target.quarantine.path, "evidence-one.mp4"), "utf8")).toBe("existing owned evidence-one bytes");
+  expect(await readFile(path.join(captured.target.quarantine.path, "evidence-two.mp4"), "utf8")).toBe("existing owned evidence-two bytes");
+  expect(await readFile(path.join(captured.target.quarantine.path, "review-browser", "profile", "Cookies"), "utf8")).toBe("opaque fixture browser bytes");
+  expect(await readFile(path.join(captured.target.quarantine.path, "review-browser", "browser-task.json"), "utf8")).toBe(JSON.stringify({ taskId: f.task.id }));
+  expect(sealed.doneHandoff.body).toContain("verified retained quarantine");
   expect(await lstat(f.copies).then(() => true, () => false)).toBe(false);
   expect(await lstat(f.worktree).then(() => true, () => false)).toBe(false);
   expect(git(f.product, "rev-parse", "HEAD")).toBe(f.task.baseCommit!);
@@ -293,3 +383,45 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted client consum
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
   expect(await execute()).toMatchObject({ alreadyClosed: true }); expect(closed).toBe(1);
 }, 30_000);
+
+test("pending Done reconciliation refuses mismatched payload, comment, source, missing proof and renewed resources", async () => {
+  const f = await fixture(); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies); await f.remove(); await confirmExternalFinalization(f.finalize, f.dependencies);
+  const publication = publicationFixture(f, "state-response");
+  f.issue.state = f.states[2]!;
+  await expect(prepareExternalFinalization(f.finalize, publication.dependencies)).rejects.toThrow("current owner Merge");
+  f.issue.state = f.states[0]!;
+  await expect(publication.publish(prepared.doneHandoff)).rejects.toThrow("injected");
+  await expect(prepareExternalFinalization({ ...f.finalize, authorityOnly: true }, publication.dependencies)).rejects.toThrow("full replay verification");
+  const receipt = await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: prepared.doneHandoff.requestKey } });
+  const comment = publication.comments.get(receipt.id)!;
+  for (const changed of [null, { ...comment, id: "another-comment" }, { ...comment, issue: { id: "another-issue" } }, { ...comment, body: "different handoff" }]) {
+    if (changed) publication.comments.set(receipt.id, changed); else publication.comments.delete(receipt.id);
+    await expect(prepareExternalFinalization(f.finalize, publication.dependencies)).rejects.toThrow("exact posted handoff comment");
+  }
+  publication.comments.set(receipt.id, comment);
+  const payload = receipt.input as Record<string, unknown>;
+  for (const changed of [{ ...payload, body: "different payload" }, { ...payload, requestKey: "different-key" }, { ...payload, evidence: [{ path: "/unowned", title: "unowned" }] }]) {
+    await db.prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { input: JSON.parse(JSON.stringify(changed)) } });
+    await expect(prepareExternalFinalization(f.finalize, publication.dependencies)).rejects.toThrow();
+  }
+  await db.prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { input: JSON.parse(JSON.stringify(payload)), issueId: "different-issue" } });
+  await expect(prepareExternalFinalization(f.finalize, publication.dependencies)).rejects.toThrow("current owner Merge");
+  await db.prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { issueId: f.issue.id } });
+  const proof = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-resource-proof" } });
+  await db.prisma.runtimeMetadataEvent.update({ where: { sequence: proof.sequence }, data: { value: "{}" } });
+  await expect(publication.publish(prepared.doneHandoff)).rejects.toThrow("proof is missing or mismatched");
+  await db.prisma.runtimeMetadataEvent.update({ where: { sequence: proof.sequence }, data: { value: proof.value } });
+  await mkdir(f.worktree);
+  await expect(prepareExternalFinalization(f.finalize, publication.dependencies)).rejects.toThrow("still exists");
+  await rm(f.worktree, { recursive: true });
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "new-resource", kind: "evidence", purpose: "review", externalId: path.join(directory, "renewed"), state: "ready" } });
+  await expect(publication.publish(prepared.doneHandoff)).rejects.toThrow("resource set changed");
+  await db.prisma.remoteTaskResource.delete({ where: { id: resource.id } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  await expect(publication.publish(prepared.doneHandoff)).rejects.toThrow();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: receipt.id } })).published).toBe(false);
+  expect(publication.counts()).toMatchObject({ createCount: 1, updateCount: 1 });
+  expect((await publication.publish(prepared.doneHandoff)).published).toBe(true);
+});

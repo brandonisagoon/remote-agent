@@ -1,9 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertFinalizationResources, assertFinalizationTree, finalizationResourceIdentity, finalizationResourceObservation, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
+import { assertFinalizationResources, assertFinalizationTree, finalizationDigest, finalizationResourceIdentity, finalizationResourceObservation, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -47,6 +47,16 @@ function tree(plan: FinalizationResourcePlan[]) {
   if (!result || result.disposition !== "retire-owned" || result.target.type !== "tree") throw new Error("Missing source tree plan");
   return result.target;
 }
+async function capture(plan: FinalizationResourcePlan[], renameRoot = true) {
+  const target = tree(plan), source = target.inventory.find((entry) => entry.path === ".")!;
+  await mkdir(target.quarantine.directory, { mode: 0o700 });
+  const directory = await lstat(target.quarantine.directory);
+  const journal = { version: 1, taskId: "original-task", resourceId: "source", planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path,
+    source: { dev: source.dev, ino: source.ino, mode: source.mode }, quarantine: { dev: directory.dev, ino: directory.ino } };
+  await writeFile(target.quarantine.journal, JSON.stringify(journal), { mode: 0o600, flag: "wx" });
+  if (renameRoot) await rename(target.path, target.quarantine.path);
+  return { target, journal };
+}
 
 describe("external-delivery resource ownership", () => {
   test("freezes all eight identities, retains only provider-verified references and never reads browser cookies", async () => {
@@ -58,7 +68,7 @@ describe("external-delivery resource ownership", () => {
     expect(target.inventory.find((entry) => entry.path === "browser/profile")?.kind).toBe("opaque");
     expect(plan.at(-1)?.disposition === "retire-owned" && plan.at(-1)).toMatchObject({ dependencies: ["profile", "capture", "prepared", "endpoint"] });
     expect(JSON.stringify(plan)).not.toContain("private cookie bytes");
-    await assertFinalizationResources({ resources: f.resources, plan, removed: false }, quiet);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
   });
 
   test("a PR or CI resource outside the independently observed delivery set is rejected", async () => {
@@ -104,15 +114,17 @@ describe("external-delivery resource ownership", () => {
     await expect(f.prepare()).rejects.toThrow("Unknown resource purpose");
   });
 
-  test("inventory permits exact dependency removal but refuses changed or new bytes", async () => {
+  test("inventory preserves every dependency and refuses missing, changed or new bytes", async () => {
     const f = await fixture(), plan = await f.prepare(), target = tree(plan);
-    await unlink(f.capture); await rm(f.profile, { recursive: true });
     await assertFinalizationTree(target);
     await writeFile(path.join(f.root, "new.txt"), "new material");
     await expect(assertFinalizationTree(target)).rejects.toThrow("New material");
     await unlink(path.join(f.root, "new.txt"));
     await writeFile(path.join(f.sourcePath, "readme.txt"), "different source");
     await expect(assertFinalizationTree(target)).rejects.toThrow("contents changed");
+    await writeFile(path.join(f.sourcePath, "readme.txt"), "accepted source");
+    await unlink(f.capture);
+    await expect(assertFinalizationTree(target)).rejects.toThrow("incomplete");
   });
 
   test("leaf symlinks are inventoried as links without following their target", async () => {
@@ -128,24 +140,98 @@ describe("external-delivery resource ownership", () => {
   test("state-only release is not independent absence proof", async () => {
     const f = await fixture(), plan = await f.prepare();
     for (const resource of f.resources.filter((r) => !["pull-request", "ci-run"].includes(r.kind))) resource.state = "released";
-    await expect(assertFinalizationResources({ resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow("owned filesystem resources");
-    await rm(f.root, { recursive: true });
-    await assertFinalizationResources({ resources: f.resources, plan, removed: true }, quiet);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow("owned filesystem resources");
+    const { target } = await capture(plan);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet);
+    expect(await readFile(path.join(target.quarantine.path, "capture.webm"), "utf8")).toBe("capture");
+    expect(await readFile(path.join(target.quarantine.path, "browser/profile/cookies.sqlite"), "utf8")).toContain("private cookie bytes");
     await mkdir(f.root);
-    await expect(assertFinalizationResources({ resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow();
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow();
+  });
+
+  test("adoption freezes a unique sibling quarantine without creating it", async () => {
+    const f = await fixture(), plan = await f.prepare(), target = tree(plan);
+    expect(path.dirname(target.quarantine.directory)).toBe(path.dirname(f.root));
+    expect(target.quarantine.path).toBe(path.join(target.quarantine.directory, "contents"));
+    expect(target.quarantine.journal).toBe(path.join(target.quarantine.directory, "pending.json"));
+    expect(await lstat(target.quarantine.directory).catch(() => null)).toBeNull();
+    expect(tree(await f.prepare()).quarantine.directory).not.toBe(target.quarantine.directory);
+  });
+
+  test("pending capture and lost rename acknowledgment replay against the same frozen journal", async () => {
+    const f = await fixture(), plan = await f.prepare();
+    const { target } = await capture(plan, false);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow("active paths");
+    await rename(f.root, target.quarantine.path);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    f.resources.find((resource) => resource.id === "capture")!.state = "released";
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet)).rejects.toThrow("released resource receipt");
+  });
+
+  test("missing source alone and a missing or mismatched journal never prove retirement", async () => {
+    const f = await fixture(), plan = await f.prepare();
+    await rename(f.root, path.join(f.temp, "unrecorded-move"));
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("no retained quarantine proof");
+    await rename(path.join(f.temp, "unrecorded-move"), f.root);
+    const { target, journal } = await capture(plan);
+    await expect(assertFinalizationResources({ taskId: "wrong-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("journal does not match");
+    for (const changed of [{ ...journal, resourceId: "other" }, { ...journal, planDigest: "0".repeat(64) }, { ...journal, quarantine: { ...journal.quarantine, ino: journal.quarantine.ino + 1 } }]) {
+      await writeFile(target.quarantine.journal, JSON.stringify(changed));
+      await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("journal does not match");
+    }
+    await unlink(target.quarantine.journal);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow();
+    expect(await readFile(path.join(target.quarantine.path, "capture.webm"), "utf8")).toBe("capture");
+  });
+
+  test("quarantine permissions, hardlinked journals, symlinks and unexpected entries are rejected", async () => {
+    const f = await fixture(), plan = await f.prepare(), { target } = await capture(plan);
+    const verify = () => assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    await chmod(target.quarantine.directory, 0o755); await expect(verify()).rejects.toThrow("private directory");
+    await chmod(target.quarantine.directory, 0o700); await chmod(target.quarantine.journal, 0o644); await expect(verify()).rejects.toThrow("private regular file");
+    await chmod(target.quarantine.journal, 0o600); await link(target.quarantine.journal, path.join(f.temp, "shared-journal")); await expect(verify()).rejects.toThrow("private regular file");
+    await unlink(path.join(f.temp, "shared-journal"));
+    await writeFile(path.join(target.quarantine.directory, "unexpected"), "preserve"); await expect(verify()).rejects.toThrow("unexpected material");
+    await unlink(path.join(target.quarantine.directory, "unexpected"));
+    await rename(target.quarantine.directory, path.join(f.temp, "moved-quarantine"));
+    await symlink(path.join(f.temp, "moved-quarantine"), target.quarantine.directory); await expect(verify()).rejects.toThrow("symlink");
+  });
+
+  test("captured replacement, changed contents and recreated active root stay preserved", async () => {
+    const f = await fixture(), plan = await f.prepare(), { target } = await capture(plan);
+    const verify = () => assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    await rename(target.quarantine.path, path.join(f.temp, "original-capture"));
+    await mkdir(target.quarantine.path); await writeFile(path.join(target.quarantine.path, "sentinel"), "replacement survives");
+    await expect(verify()).rejects.toThrow("root identity changed");
+    expect(await readFile(path.join(target.quarantine.path, "sentinel"), "utf8")).toBe("replacement survives");
+    await rename(target.quarantine.path, path.join(f.temp, "replacement-capture"));
+    await rename(path.join(f.temp, "original-capture"), target.quarantine.path);
+    await writeFile(path.join(target.quarantine.path, "capture.webm"), "changed"); await expect(verify()).rejects.toThrow("contents changed");
+    await writeFile(path.join(target.quarantine.path, "capture.webm"), "capture");
+    await mkdir(f.root); await writeFile(path.join(f.root, "sentinel"), "recreated survives"); await expect(verify()).rejects.toThrow("recreated");
+    expect(await readFile(path.join(f.root, "sentinel"), "utf8")).toBe("recreated survives");
+  });
+
+  test("captured browser and process absence are independently required", async () => {
+    const f = await fixture(), plan = await f.prepare(), { target } = await capture(plan);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, { ...quiet, browserAbsent: async () => { throw new Error("browser running"); } })).rejects.toThrow("browser running");
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, { ...quiet, rootIdle: async (root) => { if (root === target.quarantine.path) throw new Error("captured files open"); } })).rejects.toThrow("captured files open");
+    expect(await readFile(path.join(target.quarantine.path, "capture.webm"), "utf8")).toBe("capture");
   });
 
   test("new resources, changed metadata, or falsely released references invalidate confirmation", async () => {
     const f = await fixture(), plan = await f.prepare();
     (f.resources.find((r) => r.id === "ci")!.metadata as Record<string, unknown>).observed = "provider checked";
-    await assertFinalizationResources({ resources: f.resources, plan, removed: false }, quiet);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
     f.resources.find((r) => r.id === "ci")!.state = "released";
-    await expect(assertFinalizationResources({ resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("falsely marked");
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("falsely marked");
     f.resources.find((r) => r.id === "ci")!.state = "ready";
     (f.resources.find((r) => r.id === "ci")!.metadata as Record<string, unknown>).runId = 999;
-    await expect(assertFinalizationResources({ resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("identity changed");
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("identity changed");
     f.resources.push({ id: "later", key: "later", kind: "unknown", purpose: "tooling", externalId: "later", state: "ready" });
-    await expect(assertFinalizationResources({ resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("set changed");
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("set changed");
   });
 
   test("endpoint and open-process uncertainty fail before any cleanup authority", async () => {

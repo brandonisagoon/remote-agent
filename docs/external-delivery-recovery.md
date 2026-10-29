@@ -45,19 +45,40 @@ current linked issue in Merge. It freezes both delivery evidence and the full
 resource inventory before returning cleanup authority. The receipt's
 `doneHandoff` is the only accepted terminal publication payload.
 
-Full prepare calls revalidate the remaining inventory and independent provider
-identity between resources. During bounded deletion batches, an existing
+Full prepare calls revalidate the complete inventory and independent provider
+identity between lifecycle steps. During bounded inventory-verification batches, an existing
 unconfirmed v2 preparation may use `authorityOnly: true` to recheck current
 owner/source, task, contract, binding, verification and registry identity without
 rehashing the whole tree. It cannot create a preparation or confirm cleanup.
 
-Confirmation independently checks physical absence and original Git worktree
-deregistration. Released registry state alone is insufficient. Only exact
-provider-verified PR/CI references in the frozen plan remain retained history.
+The compatible client closes the exact browser session, verifies idle resources,
+and moves the entire adopted source root into a frozen private sibling quarantine
+using descriptor-bound native operations. Source copies, evidence, browser profile
+and offline context remain recoverable together; no prepared file is unlinked.
+The pending journal binds the task, resource, plan digest and original directory
+identity so a lost capture acknowledgement can be reconciled. Unknown material
+or substituted paths cannot be silently discarded.
+
+Confirmation independently verifies the complete retained quarantine inventory,
+absence of the original active paths, and original Git worktree deregistration.
+Released registry state alone is insufficient. The quarantine is retained; this
+workflow includes no automatic purge. Only exact provider-verified PR/CI
+references in the frozen plan remain active registry history.
 After confirmation, task reads expose their linked `finalizationRetention` receipt
 even after the primary closes, so maintenance does not attempt to delete them.
 New resources, changed metadata, missing proof events, edited acceptance,
 superseded contracts or revoked verification block reuse.
+
+If Linear applies Done but its response or the local publication transaction is
+lost, the primary retries the same finalization and handoff keys. Done itself
+grants no cleanup authority. The server reconciles only an existing confirmed
+v2 preparation with its exact pending issue/connection, immutable handoff
+payload, posted comment ID/body and complete resource proofs. It rechecks current
+owner/binding authority and physical absence before returning the confirmed
+receipt. The normal publisher then finishes that same receipt without posting a
+second comment or changing Done again; the session closes only after publication
+is acknowledged. A different payload, edited/missing comment, missing proof or
+recreated resource preserves the open session for reconciliation.
 
 Deployment applies the additive `20261029220000_external_delivery_receipts`
 migration before enabling this server version. The new partial unique index
@@ -74,5 +95,8 @@ DRAFTED_INTEGRATION_ROOT=/absolute/path/to/drafted bun test apps/server/services
 ```
 
 It covers all eight resource kinds/instances used by this recovery, a failure
-after an evidence file is removed but before its receipt is saved, same-key
-resumption, confirmed retention and publishing Done before closing the session.
+after the whole root is captured but before an evidence receipt is saved, and both a
+lost Done-state response and failed publication transaction. It calls the actual
+issue publisher and completion gate with fake provider boundaries, then verifies
+same-key resumption, one comment/state update, confirmed retention and closing
+the session last.

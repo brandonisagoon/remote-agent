@@ -44,8 +44,23 @@ async function sourceAuthority(input: Context, taskId: string, dependencies: Ext
   if (source.issue.state.name === "Done") {
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...whereFor(input, taskId), action: FINALIZATION_CONFIRMED } });
     const update = await input.prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: input.sessionId, requestKey: `${input.requestKey}:done` } } });
-    const payload = update?.input as { state?: string; expectedState?: string } | undefined;
-    if (confirmed && update?.published && update.connectionId === source.link.connectionId && update.issueId === source.issue.id && payload?.state === "Done" && payload.expectedState === "Merge") return source;
+    // Linear may have applied Done before its response or the local publication
+    // transaction was acknowledged. Only reconcile this frozen handoff: a bare
+    // Done state or a model-authored resource can never authorize fresh cleanup.
+    if (confirmed && update?.commentPosted && update.connectionId === source.link.connectionId && update.issueId === source.issue.id) {
+      const confirmation = z.object({ version: z.literal(2), preparedRevision: z.number().int(), resourceProofs: z.array(z.number().int()) }).strict().parse(JSON.parse(confirmed.value!));
+      const preparation = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: confirmation.preparedRevision } });
+      const prepared = PreparedExternalFinalization.parse(JSON.parse(preparation.value!));
+      if (preparation.action !== FINALIZATION_PREPARED || preparation.source !== confirmed.source || preparation.runtimeSessionId !== input.sessionId || preparation.key !== input.requestKey || prepared.taskId !== taskId || prepared.sessionId !== input.sessionId || prepared.requestKey !== input.requestKey || prepared.issueId !== source.issue.id || prepared.connectionId !== source.link.connectionId) throw new Error("Done reconciliation has no matching frozen finalization identity");
+      const payload = z.object({ requestKey: z.string(), body: z.string(), state: z.literal("Done"), expectedState: z.literal("Merge"), evidence: z.array(z.never()).length(0) }).strict().parse(update.input);
+      if (finalizationDigest(payload) !== finalizationDigest({ ...prepared.doneHandoff, evidence: [] }) || !Array.isArray(update.evidence) || update.evidence.length !== 0) throw new Error("Done reconciliation must use the exact frozen handoff payload");
+      const comment = await dependencies.handoffComment(source.config.linearApiKey, update.id);
+      if (comment?.id !== update.id || comment.issue?.id !== prepared.issueId || comment.body !== prepared.doneHandoff.body) throw new Error("Done reconciliation requires the exact posted handoff comment");
+      await assertResourceProofs(input.prisma, prepared, preparation.sequence, confirmed.value);
+      // Callers still validate live binding/owner authority, every retained
+      // resource and physical absence before returning the confirmed receipt.
+      return source;
+    }
   }
   throw new Error("External finalization requires current owner Merge authority");
 }
@@ -61,7 +76,7 @@ async function preparedAuthority(input: Context, prepared: PreparedExternalFinal
 }
 
 async function resources(input: Context, prepared: PreparedExternalFinalization, removed: boolean, dependencies: ExternalDependencies) {
-  await dependencies.assertResources({ resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed });
+  await dependencies.assertResources({ taskId: prepared.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed });
 }
 
 async function assertResourceProofs(prisma: Pick<PrismaClient, "runtimeMetadataEvent">, prepared: PreparedExternalFinalization, preparedRevision: number, value: string | null) {
@@ -101,7 +116,7 @@ export async function prepareExternalFinalization(input: Context, dependencies =
   }
   if (input.authorityOnly) throw new Error("Authority-only checks require an existing unconfirmed preparation");
   const deliveries = await observeBoundExternalDelivery({ ...input, taskId: task.id, binding, revision, sources: true }, dependencies);
-  await dependencies.assertResources({ resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), plan: binding.resources, removed: false });
+  await dependencies.assertResources({ taskId: task.id, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), plan: binding.resources, removed: false });
   const cleanupSnapshot = CleanupSnapshot.parse(await dependencies.snapshot(task.worktreePath!));
   const worktree = await realpath(task.worktreePath!);
   const gitCwd = await realpath(getRepositoryConfig(input.config, task.repositoryId).root);
@@ -114,7 +129,7 @@ export async function prepareExternalFinalization(input: Context, dependencies =
   if (matching.length !== 1 || matching[0]!.HEAD !== cleanupSnapshot.head || matching[0]!.branch !== `refs/heads/${task.branchName}` || cleanupSnapshot.branch !== task.branchName) throw new Error("Original cleanup Git registration does not match the prepared identity");
   const approval = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: binding.acceptance.approvalEventSequence } });
   if (JSON.parse(approval.value!).snapshot.fingerprint !== cleanupSnapshot.fingerprint) throw new Error("Original cleanup content changed since owner acceptance");
-  const body = [`Delivered and verified:`, ...deliveries.map((delivery) => `- ${delivery.url} — merged as ${delivery.mergeCommit}.`), "", `Removed the original ${task.repositoryId} task worktree (${task.branchName}, cleanup revision ${cleanupSnapshot.head}) and verified owned-resource cleanup. Retained the linked PR and CI history.`, "", `Acceptance: existing owner comment ${binding.acceptance.ownerCommentId}. Local verification reports remain owner-attested; CI was independently observed.`, "Coding session is about to close."].join("\n");
+  const body = [`Delivered and verified:`, ...deliveries.map((delivery) => `- ${delivery.url} — merged as ${delivery.mergeCommit}.`), "", `Removed the original ${task.repositoryId} task worktree (${task.branchName}, cleanup revision ${cleanupSnapshot.head}). Retired owned filesystem resources to verified retained quarantine; their original active paths are absent. Retained the linked PR and CI history.`, "", `Acceptance: existing owner comment ${binding.acceptance.ownerCommentId}. Local verification reports remain owner-attested; CI was independently observed.`, "Coding session is about to close."].join("\n");
   const original = { taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey, repositoryId: task.repositoryId, machineId: task.machineId,
     connectionId: task.connectionId!, issueId: source.issue.id, issueIdentifier: task.issueIdentifier!, contractRevision: binding.contractRevision,
     worktree, taskWorktree: task.worktreePath!, registeredWorktree: matching[0]!.worktree!, revision: cleanupSnapshot.head, branch: task.branchName, gitDirectory, gitCwd,
