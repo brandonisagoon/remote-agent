@@ -193,7 +193,7 @@ test("network task APIs require authentication and resource identity cannot be r
 });
 
 
-test("task closure stops its sessions without browser control fields or a takeover endpoint", async () => {
+test("task closure stops its sessions without a browser takeover endpoint", async () => {
   const repo = repository();
   const config = testConfig({ repository: repo });
   const task = await beginTask(db.prisma, { requestKey: "close-task", repository: repo, machineId: config.machine, branchName: "codex/close" });
@@ -217,7 +217,10 @@ test("task closure stops its sessions without browser control fields or a takeov
   expect(closed.status).toBe(200);
   const value = await closed.json() as { task: Record<string, unknown> };
   expect(value.task.phase).toBe("closed");
-  for (const field of ["controlMode", "controllerId", "controlGeneration"]) expect(field in value.task).toBeFalse();
+  expect(value.task.controlMode).toBe("paused");
+  expect(value.task.controllerId).toBe(`task-supervisor:${task.id}`);
+  const stored = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+  for (const field of ["controlMode", "controllerId", "controlGeneration"]) expect(field in stored).toBeFalse();
   expect(runtime.closedSessionIds.sort()).toEqual(["delegate", "primary"]);
   expect(await db.prisma.runtimeInstruction.count({ where: { state: "cancelled" } })).toBe(2);
   expect((await post("automation", { action: "close" })).status).toBe(200);

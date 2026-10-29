@@ -14,6 +14,8 @@ import { ChildIssueUpdateInput, publishChildIssueUpdate, readSessionWorkGraph } 
 import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../services/tasks/tooling-capabilities.ts";
 import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
 
+import { taskResponse } from "./response.ts";
+
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
 
@@ -80,14 +82,14 @@ taskRoutes.post("/", async (c) => {
   const parsed = z.object({ requestKey: z.string().min(1).max(200), repositoryId: z.string().min(1), branchName: z.string().refine(isSafeBranchName, "Invalid branch name"), prompt: z.string().min(1).max(100_000), provider: z.enum(["codex", "claude"]).default("codex") }).strict().safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid task launch", details: parsed.error.issues }, 400);
   const task = await launchTask({ ...parsed.data, config: c.get("config"), prisma: c.get("prisma"), runtime: c.get("agentRuntime") });
-  return c.json({ task }, 201);
+  return c.json({ task: taskResponse(task) }, 201);
 });
 
 taskRoutes.get("/", async (c) => {
   const prisma = c.get("prisma");
   // Preserve the desktop's recent-task view. Maintenance explicitly requests
   // a stable ID order so activity cannot move tasks between cursor pages.
-  if (c.req.query("pagination") !== "id") return c.json({ tasks: await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { updatedAt: "desc" }, take: 100 }) });
+  if (c.req.query("pagination") !== "id") return c.json({ tasks: (await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { updatedAt: "desc" }, take: 100 })).map(taskResponse) });
   const cursor = c.req.query("cursor");
   const rows = await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { id: "asc" }, take: 101, ...(cursor ? { where: { id: { gt: cursor } } } : {}) });
   const tasks = rows.slice(0, 100);
@@ -96,16 +98,16 @@ taskRoutes.get("/", async (c) => {
     action: "finalization-prepared", source: { in: complete.map((task) => `finalizer:${task.id}`) },
     runtimeSessionId: { in: complete.map((task) => task.primarySessionId!) },
   }, select: { source: true, runtimeSessionId: true } }) : [];
-  return c.json({ tasks: tasks.map((task) => ({ ...task, finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) })), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
+  return c.json({ tasks: tasks.map((task) => ({ ...taskResponse(task), finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) })), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
 });
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
-  return task ? c.json({ task }) : c.json({ error: "Task not found" }, 404);
+  return task ? c.json({ task: taskResponse(task) }) : c.json({ error: "Task not found" }, 404);
 });
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {
   const task = await taskForSession(c.get("prisma"), c.req.param("sessionId"));
-  return task ? c.json({ task }) : c.json({ error: "Session has no managed task" }, 404);
+  return task ? c.json({ task: taskResponse(task) }) : c.json({ error: "Session has no managed task" }, 404);
 });
 
 const Progress = z.object({
@@ -120,7 +122,7 @@ sessionTaskRoutes.patch("/:sessionId/task", async (c) => {
   const prisma = c.get("prisma");
   const task = await taskForSession(prisma, c.req.param("sessionId"));
   if (!task) return c.json({ error: "Session has no managed task" }, 404);
-  return c.json({ task: await prisma.remoteTask.update({ where: { id: task.id }, data: parsed.data }) });
+  return c.json({ task: taskResponse(await prisma.remoteTask.update({ where: { id: task.id }, data: parsed.data })) });
 });
 
 const Resource = z.object({

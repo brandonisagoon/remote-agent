@@ -6,6 +6,8 @@ import { answerSessionQuestion } from "../../services/sessions/questions.ts";
 import { readTaskActivity } from "../../services/tasks/activity.ts";
 import { ProjectionRetryStage, retryTaskRuntimeProjection } from "../../services/sessions/runtime-events/projection-retries.ts";
 
+import { taskResponse } from "./response.ts";
+
 export const taskSupervisionRoutes = new Hono<AppEnv>();
 
 taskSupervisionRoutes.post("/:taskId/projection-retries", async (c) => {
@@ -76,7 +78,7 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
           }
         }
       }
-      return c.json({ task: await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } }) });
+      return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
     }
     // Stop new deliveries before cancelling current work, including delegates.
     await prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "closed", recoveryDetail: "Agent closed. Resource cleanup is a separate operation; inspect retained resources." } });
@@ -88,6 +90,6 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
         await prisma.runtimeInstruction.updateMany({ where: { sessionId: session.id, state: "queued" }, data: { state: "cancelled", detail: "Task closed by owner" } });
       }
     }
-    return c.json({ task: await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } }) });
+    return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
