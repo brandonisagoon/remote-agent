@@ -2,9 +2,9 @@ import { afterEach, expect, test } from "bun:test";
 import { createTestDatabase, type TestDatabase } from "../../../../../test-support/db.ts";
 import { createFakeAgentRuntime } from "../../../../../test-support/agent-runtime.ts";
 import { testConfig } from "../../../../../test-support/config.ts";
-import { appendRuntimeLifecycleEvent, beginRuntimeSession } from "../runtime-registry.ts";
+import { advanceRuntimeEventCursor, appendRuntimeLifecycleEvent, beginRuntimeSession } from "../runtime-registry.ts";
 import { queueDelegateResult } from "../../launches/delegate-supervision.ts";
-import { drainRuntimeEventProjection } from "./projection.ts";
+import { drainRuntimeEventProjection, startRuntimeEventProjection } from "./projection.ts";
 import { listRuntimeProjectionRetries, projectionRetryPolicy, retryTaskRuntimeProjection, resolveRuntimeProjectionRetry, runRuntimeProjectionAttempt } from "./projection-retries.ts";
 import { createApp } from "../../../app.ts";
 import { deliverInstructions } from "../inbox.ts";
@@ -88,7 +88,8 @@ test("a failed Linear projection preserves per-session order without blocking lo
     notify: queueDelegateResult,
     project: async (_config, _prisma, _runtime, event) => { projected.push(event.id); },
   }, { now: () => 1_000 });
-  expect(projected).toEqual(["first-1", "first-2", "second-1"]);
+  // The unrelated successful projection was acknowledged and is not replayed.
+  expect(projected).toEqual(["first-1", "first-2"]);
   expect(await input.prisma.runtimeInstruction.count()).toBe(3);
 });
 
@@ -229,4 +230,92 @@ test("an observed resolved stall clears exhausted telemetry without sending or r
   expect(attempts).toBe(projectionRetryPolicy.maxAttempts);
   expect(await input.prisma.runtimeInstruction.count()).toBe(0);
   expect(input.runtime.sentMessages).toHaveLength(0);
+});
+
+test("acknowledged journal history is retained without repeating notification or projection after restart", async () => {
+  const { input, first } = await fixture();
+  await input.prisma.runtimeLifecycleEvent.deleteMany();
+  await input.prisma.runtimeLifecycleEvent.createMany({ data: Array.from({ length: 1_500 }, (_, index) => ({
+    id: `history-${index}`, runtimeSessionId: first.id, requestId: `history-${index}`, phase: "completed", occurredAt: new Date(), output: "Retained evidence",
+  })) });
+  const last = await input.prisma.runtimeLifecycleEvent.findFirstOrThrow({ orderBy: { sequence: "desc" } });
+  for (const consumer of ["delegate-notification:v1", "linear-projection:v1"]) await advanceRuntimeEventCursor(input.prisma, {
+    runtimeSessionId: first.id, consumer, sourceCursor: last.id, generation: BigInt(last.sequence),
+  });
+  await appendRuntimeLifecycleEvent(input.prisma, { kind: "turn", id: "new-result", sessionId: first.id, requestId: "new-result", phase: "completed", createdAt: Date.now() });
+  const notified: string[] = [], projected: string[] = [];
+  const delivery = { notify: async (_prisma: typeof input.prisma, event: Parameters<typeof queueDelegateResult>[1]) => { notified.push(event.id); },
+    project: async (_config: typeof input.config, _prisma: typeof input.prisma, _runtime: AgentSessionRuntime, event: Parameters<typeof queueDelegateResult>[1]) => { projected.push(event.id); } };
+  await drainRuntimeEventProjection(input, delivery);
+  await input.prisma.$disconnect();
+  await drainRuntimeEventProjection(input, delivery);
+  expect(notified).toEqual(["new-result"]);
+  expect(projected).toEqual(["new-result"]);
+  expect(await input.prisma.runtimeLifecycleEvent.count()).toBe(1_501);
+});
+
+test("a missing source acknowledgement stays pending and cannot skip later events in that session", async () => {
+  const { input } = await fixture();
+  const attempted: string[] = [];
+  await drainRuntimeEventProjection(input, { notify: queueDelegateResult, project: async (_config, _prisma, _runtime, event) => {
+    attempted.push(event.id); return event.id !== "first-1";
+  } });
+  expect(attempted).toEqual(["first-1", "second-1"]);
+  attempted.length = 0;
+  await drainRuntimeEventProjection(input, { notify: queueDelegateResult, project: async (_config, _prisma, _runtime, event) => { attempted.push(event.id); } });
+  expect(attempted).toEqual(["first-1", "first-2"]);
+  expect(await input.prisma.runtimeInstruction.count()).toBe(3);
+});
+
+test("a large journal gives real health and task requests time to run before reconciliation finishes", async () => {
+  const { input, first } = await fixture();
+  await input.prisma.runtimeLifecycleEvent.createMany({ data: Array.from({ length: 500 }, (_, index) => ({
+    id: `backfill-${index}`, runtimeSessionId: first.id, requestId: `backfill-${index}`, phase: "completed", occurredAt: new Date(),
+  })) });
+  const app = createApp({ ...input, agentRuntime: input.runtime, trustLocal: true });
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+  let done = false, servedWhileDraining = false;
+  try {
+    const drain = drainRuntimeEventProjection(input, { notify: queueDelegateResult, project: async () => {} }).then(() => { done = true; });
+    const requests = (async () => {
+      const health = await fetch(new URL("/health", server.url));
+      expect(health.status).toBe(200); await health.body?.cancel();
+      const task = await fetch(new URL("/api/tasks/task", server.url));
+      expect(task.status).toBe(200); expect((await task.json() as { task: { id: string } }).task.id).toBe("task");
+      servedWhileDraining = !done;
+    })();
+    await Promise.all([drain, requests]);
+    expect(servedWhileDraining).toBeTrue();
+    expect(await input.prisma.runtimeInstruction.count()).toBe(503);
+  } finally { await server.stop(true); }
+});
+
+test("projection triggers coalesce while work runs instead of queuing one replay per event", async () => {
+  const { input } = await fixture();
+  let listener: ((event: any) => void | Promise<void>) | undefined;
+  input.runtime.subscribeAll = (callback) => { listener = callback; return () => { listener = undefined; }; };
+  let release!: () => void, calls = 0;
+  const first = new Promise<void>((resolve) => { release = resolve; });
+  const stop = startRuntimeEventProjection(input, async () => { calls++; if (calls === 1) await first; });
+  for (let index = 0; index < 1_000; index++) await listener?.({ kind: "turn" });
+  expect(calls).toBe(1);
+  release();
+  for (let attempt = 0; attempt < 100 && calls < 2; attempt++) await Bun.sleep(1);
+  await stop();
+  expect(calls).toBe(2);
+});
+
+test("events arriving during notification wait for the next pass without delaying current projection", async () => {
+  const { input } = await fixture();
+  const notified: string[] = [], projected: string[] = [];
+  await drainRuntimeEventProjection(input, {
+    notify: async (prisma, event) => {
+      notified.push(event.id);
+      await appendRuntimeLifecycleEvent(prisma, { ...event, id: `later-${event.id}`, requestId: `later-${event.id}` });
+    },
+    project: async (_config, _prisma, _runtime, event) => { projected.push(event.id); },
+  });
+  expect(notified).toEqual(["first-1", "first-2", "second-1"]);
+  expect(projected).toEqual(notified);
+  expect(await input.prisma.runtimeLifecycleEvent.count()).toBe(6);
 });

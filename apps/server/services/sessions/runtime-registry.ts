@@ -367,8 +367,23 @@ export async function appendRuntimeLifecycleEvent(
 
 export async function listRuntimeLifecycleEvents(
   prisma: PrismaClient,
+  pending?: { consumer: string; afterSequence: number; throughSequence: number; take: number; afterConsumer?: string; excludedSessionIds?: string[] },
 ): Promise<AgentRuntimeLifecycleEvent[]> {
+  // Retain journal evidence, but never make every poll replay acknowledged
+  // history. Cursor joins also bound what is loaded before JSON conversion.
+  const ids = pending ? await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT event.id FROM RuntimeLifecycleEvent AS event
+    LEFT JOIN RuntimeEventCursor AS cursor ON cursor.runtimeSessionId = event.runtimeSessionId AND cursor.consumer = ${pending.consumer}
+    LEFT JOIN RuntimeEventCursor AS prerequisite ON prerequisite.runtimeSessionId = event.runtimeSessionId AND prerequisite.consumer = ${pending.afterConsumer ?? ""}
+    WHERE event.sequence > COALESCE(cursor.generation, 0)
+      AND event.sequence > ${pending.afterSequence}
+      AND event.sequence <= ${pending.throughSequence}
+      AND (${pending.afterConsumer ?? null} IS NULL OR event.sequence <= COALESCE(prerequisite.generation, 0))
+      AND ${pending.excludedSessionIds?.length ? Prisma.sql`event.runtimeSessionId NOT IN (${Prisma.join(pending.excludedSessionIds)})` : Prisma.sql`1=1`}
+    ORDER BY event.sequence ASC LIMIT ${pending.take}` : null;
+  if (ids && !ids.length) return [];
   const rows = await prisma.runtimeLifecycleEvent.findMany({
+    ...(ids ? { where: { id: { in: ids.map((row) => row.id) } } } : {}),
     orderBy: { sequence: "asc" },
   });
   return rows.map((row) => ({
