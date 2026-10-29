@@ -117,7 +117,7 @@ test("old terminal events cannot resolve an interrupted explicit retry", async (
   expect(await db.prisma.runtimeMetadataEvent.count()).toBe(2);
 });
 
-test("live provider blocks resolution and paused, human-controlled or closed tasks never resume implicitly", async () => {
+test("live providers and closed tasks block instruction resolution", async () => {
   const { runtime, resolve, uncertain, store } = await fixture();
   await uncertain("first");
   const record = (await store.load("record-delegate"))!;
@@ -125,15 +125,10 @@ test("live provider blocks resolution and paused, human-controlled or closed tas
   expect((await resolve("first")).status).toBe(409);
   expect((await runtime.getSession("delegate"))?.status).toBe("active");
   await store.save(record);
-  for (const controlMode of ["human", "paused", "draining"]) {
-    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode } });
-    expect((await resolve("first", "retry")).status).toBe(409);
-  }
+
   expect((await resolve("first", "cancel")).status).toBe(200);
   await queueInstruction(db.prisma, { sessionId: "delegate", requestId: "later", text: "later" });
-  await deliverInstructions(db.prisma, runtime);
-  expect(runtime.sentMessages).toHaveLength(0);
-  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode: "agent", phase: "closed" } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
   await deliverInstructions(db.prisma, runtime);
   expect(runtime.sentMessages).toHaveLength(0);
   await uncertain("closed-work");
@@ -205,7 +200,7 @@ test("mixed restart recovers safe primary and worker continuations once while re
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "instruction-resolved" } })).toBe(2);
   expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toMatchObject({
     primarySessionId: originalTask.primarySessionId, worktreePath: originalTask.worktreePath,
-    toolingRevision: originalTask.toolingRevision, toolingRoot: originalTask.toolingRoot, controlMode: originalTask.controlMode,
+    toolingRevision: originalTask.toolingRevision, toolingRoot: originalTask.toolingRoot,
   });
   expect(await db.prisma.runtimeSession.findMany({ orderBy: { id: "asc" }, select: { id: true, acpxRecordId: true, acpxSessionId: true, cwd: true } })).toEqual(identities);
   expect(await db.prisma.remoteTask.count()).toBe(1);

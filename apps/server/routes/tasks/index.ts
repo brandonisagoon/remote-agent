@@ -5,7 +5,6 @@ import { taskForSession } from "../../services/tasks/store.ts";
 import { scopeConfig } from "../../../../lib/config.ts";
 import { getSourceIssueForPlanCapture, updateSourceIssue } from "../../integrations/linear/session-store/source-issue/index.ts";
 import { splicePlanSection } from "../../services/sessions/plan-capture.ts";
-import { changeTaskControl } from "../../services/tasks/control.ts";
 import { launchTask } from "../../services/tasks/launch.ts";
 import { isSafeBranchName } from "../../workers/product/workflow/branch.ts";
 import { askSessionQuestion, linkedSourceIssue } from "../../services/sessions/questions.ts";
@@ -102,15 +101,6 @@ taskRoutes.get("/", async (c) => {
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
   return task ? c.json({ task }) : c.json({ error: "Task not found" }, 404);
-});
-
-taskRoutes.post("/:taskId/control", async (c) => {
-  const parsed = z.object({ controllerId: z.string().min(16).max(128), action: z.enum(["take", "pause", "resume"]) }).strict().safeParse(await c.req.json());
-  if (!parsed.success) return c.json({ error: "Invalid control request" }, 400);
-  try {
-    const task = await changeTaskControl(c.get("prisma"), c.get("agentRuntime"), { taskId: c.req.param("taskId"), ...parsed.data });
-    return c.json({ task });
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {

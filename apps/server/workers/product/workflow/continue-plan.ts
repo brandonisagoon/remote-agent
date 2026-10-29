@@ -50,8 +50,8 @@ export async function continuePlanningSession(input: {
       return result("existing", `runtime_session:${session.id} already received workflow ${workflow.id}; instruction ${previous.state}`);
     }
     const task = await taskForSession(prisma, session.id);
-    if (task && (task.primarySessionId !== session.id || task.controlMode !== "agent" || task.phase === "closed")) {
-      throw new Error("Task is not available for automated workflow continuation; preserve its current owner and control");
+    if (task && (task.primarySessionId !== session.id || (task.ownerPaused || task.phase === "closed"))) {
+      throw new Error("Task is not available for automated workflow continuation; preserve its current owner");
     }
     if (config.repository.tooling && !task?.pinnedToolingRoot) throw new Error("Planning session has no pinned tooling source");
     const assertIdle = async () => {
@@ -106,10 +106,10 @@ export async function continuePlanningSession(input: {
     await prisma.$transaction(async (tx) => {
       if (task) {
         const available = await tx.remoteTask.updateMany({ where: {
-          id: task.id, primarySessionId: session.id, controlMode: "agent", controlGeneration: task.controlGeneration,
-          phase: { not: "closed" },
+          id: task.id, primarySessionId: session.id,
+          ownerPaused: false, phase: { not: "closed" },
         }, data: { phase: "preparing", recoveryDetail: `Workflow ${workflow.id} queued on the existing session` } });
-        if (!available.count) throw new Error("Task control changed during workflow preparation");
+        if (!available.count) throw new Error("Task identity changed during workflow preparation");
       }
       const changed = await tx.runtimeSession.updateMany({ where: {
         id: session.id, workflowId: session.workflowId, status: "idle",

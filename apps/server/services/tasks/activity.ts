@@ -3,7 +3,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { z } from "zod";
 import { listRuntimeProjectionRetries } from "../sessions/runtime-events/projection-retries.ts";
 
-type Task = Pick<RemoteTask, "id" | "phase" | "controlMode" | "recoveryDetail">;
+type Task = Pick<RemoteTask, "id" | "phase" | "recoveryDetail" | "ownerPaused">;
 type Session = Pick<RuntimeSession, "id" | "status" | "closedAt" | "recoveryDetail">;
 type Instruction = Pick<RuntimeInstruction, "id" | "state" | "detail" | "createdAt" | "updatedAt" | "sequence">;
 type Turn = Pick<RuntimeLifecycleEvent, "id" | "requestId" | "phase" | "occurredAt" | "sequence">;
@@ -66,8 +66,8 @@ export function deriveSessionActivity(input: {
   } else if (observation.state === "executing") {
     state = "executing"; cause = "The current daemon observes an active provider turn";
     if (observation.requestId === latestTurn?.requestId && latestTurn?.phase === "started") since = latestTurn.occurredAt;
-  } else if (task.controlMode !== "agent") {
-    state = "paused"; cause = `Task automation is ${task.controlMode}`;
+  } else if (task.ownerPaused) {
+    state = "paused"; cause = "The owner explicitly paused this task";
   } else if (unknown) {
     state = "stalled"; cause = unknown.detail ?? "Instruction delivery has no confirmed outcome; explicit resolution is required"; since = unknown.updatedAt;
   } else if (observation.state === "queued") {
@@ -88,7 +88,7 @@ export function deriveSessionActivity(input: {
     state: state as ActivityState, cause, observedAt: new Date(now).toISOString(), ...timing(since, now),
     correlation: { taskId: task.id, sessionId: session?.id ?? null, instructionId: (unknown ?? dispatching ?? preparing ?? queued)?.id ?? null, requestId: observation.requestId ?? null },
     execution: { ...observation, observedAt: new Date(observation.observedAt).toISOString(), persistedStatus: session?.status ?? null },
-    control: { mode: task.controlMode, reportedPhase: task.phase, reportedDetail: task.recoveryDetail },
+    progress: { ownerPaused: task.ownerPaused, reportedPhase: task.phase, reportedDetail: task.recoveryDetail },
     delivery: {
       counts: Object.fromEntries(unsettledStates.map((value) => [value, pending.filter((item) => item.state === value).length])),
       // Include oldest receipts even when the recent-history page is full.
@@ -174,7 +174,7 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
     activity.state = "waiting-active-work"; activity.cause = "The primary has no queued work; its delegates have observed active turns";
   }
   // Publication failure is independent of provider liveness. Preserve executing,
-  // queued and paused states; expose its bounded recovery separately in all cases.
+  // queued and closed states; expose its bounded recovery separately in all cases.
   const failedNotification = projectionRetries.find((retry) => retry.stage === "notify" && retry.state === "exhausted");
   if (failedNotification && ["idle", "unknown", "stalled"].includes(activity.state)) {
     activity.state = "stalled";

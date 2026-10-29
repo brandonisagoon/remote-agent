@@ -3,7 +3,7 @@ import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
-import { assertTaskAutomationAllowed } from "../tasks/control.ts";
+import { assertTaskOpen } from "../tasks/task-state.ts";
 import { findThreadSession, registerThread } from "./threads.ts";
 import { queueInstruction } from "./inbox.ts";
 
@@ -55,7 +55,7 @@ export async function deliverSessionQuestion(input: {
 export async function askSessionQuestion(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; body: string }) {
   const current = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
   if (current.status === "closed") throw new Error("Session is closed");
-  await assertTaskAutomationAllowed(input.prisma, current.cwd);
+  await assertTaskOpen(input.prisma, current.cwd);
   const source = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: current.id, provider: "linear", resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
   if (!source) {
     const question = await input.prisma.runtimeQuestion.upsert({ where: { runtimeSessionId_requestKey: { runtimeSessionId: current.id, requestKey: input.requestKey } }, update: {}, create: { runtimeSessionId: current.id, requestKey: input.requestKey, body: input.body, connectionId: "", issueId: "" } });
@@ -63,7 +63,7 @@ export async function askSessionQuestion(input: { prisma: PrismaClient; config: 
     return { questionId: question.id, state: question.state, surface: "task" };
   }
   const { session, link, config, issue } = await linkedSourceIssue(input);
-  await assertTaskAutomationAllowed(input.prisma, session.cwd);
+  await assertTaskOpen(input.prisma, session.cwd);
   return { ...await deliverSessionQuestion({ ...input, apiKey: config.linearApiKey, issueId: issue.id, connectionId: link.connectionId }), issueIdentifier: issue.identifier };
 }
 

@@ -79,7 +79,7 @@ const TOOLS = [
     },
   },
   { name: "inspect_delegates", description: "Read your own delegated sessions' actual models, recent history and instruction receipts. Optional sessionId selects one child. Queued or idle alone does not establish success.", inputSchema: { type: "object", properties: { sessionId: { type: "string" } }, additionalProperties: false } },
-  { name: "instruct_delegate", description: "Queue a follow-up for your own existing worker using a stable requestKey. Delivery respects active turns and human control. End your turn to free capacity; notifyParent workers return their result to your inbox.", inputSchema: { type: "object", properties: { sessionId: { type: "string" }, requestKey: { type: "string" }, text: { type: "string" } }, required: ["sessionId", "requestKey", "text"], additionalProperties: false } },
+  { name: "instruct_delegate", description: "Queue a follow-up for your own existing worker using a stable requestKey. Delivery respects active turns and an explicit owner pause. End your turn to free capacity; notifyParent workers return their result to your inbox.", inputSchema: { type: "object", properties: { sessionId: { type: "string" }, requestKey: { type: "string" }, text: { type: "string" } }, required: ["sessionId", "requestKey", "text"], additionalProperties: false } },
   {
     name: "register_thread",
     description:

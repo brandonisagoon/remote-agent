@@ -46,23 +46,23 @@ test("authorized input becomes a private local file outside the product; retries
   expect(JSON.stringify(result)).not.toContain(f.config.linearApiKey as string);
 });
 
-test("unrelated URLs and human control are rejected before downloading or writing", async () => {
+test("unrelated URLs and task closure are rejected before downloading or writing", async () => {
   const f = await fixture();
   await expect(downloadSourceAttachment({ ...f.input, url: f.input.url + "-unrelated" }, f.client)).rejects.toThrow("not linked");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "human" } });
-  await expect(downloadSourceAttachment(f.input, f.client)).rejects.toThrow("human");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(downloadSourceAttachment(f.input, f.client)).rejects.toThrow("closed");
   expect(f.downloads()).toBe(0);
   expect(await readdir(directory)).toEqual([]);
 });
 
-test("download failure, closure and control takeover leave no completed file", async () => {
+test("download failure, closure and task closure leave no completed file", async () => {
   const f = await fixture();
   await expect(downloadSourceAttachment(f.input, { ...f.client, download: async () => { throw new Error("HTTP 401"); } })).rejects.toThrow("401");
   await expect(downloadSourceAttachment(f.input, { ...f.client, download: async (...args) => {
-    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
     return f.client.download(...args);
-  } })).rejects.toThrow("paused");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent" } });
+  } })).rejects.toThrow("closed");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
   await expect(downloadSourceAttachment(f.input, f.client)).rejects.toThrow("closed");
   expect(await readdir(directory)).toEqual([]);

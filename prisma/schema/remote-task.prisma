@@ -16,9 +16,7 @@ model RemoteTask {
   primarySessionId   String?  @unique
   phase              String   @default("preparing")
   environmentStatus  String   @default("pending")
-  controlMode        String   @default("agent")
-  controllerId       String?
-  controlGeneration  Int      @default(0)
+  ownerPaused        Boolean  @default(false)
   recoveryDetail     String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

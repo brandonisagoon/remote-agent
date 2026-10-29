@@ -17,7 +17,7 @@ export async function resolveSessionToolingCapability(input: Context & z.infer<t
     if (!task || !session || session.role !== "primary" || session.status === "closed" || !task.worktreePath
       || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId
       || task.machineId !== input.config.machine) throw new Error("Only the open owning task primary may resolve tooling capabilities");
-    if (task.controlMode !== "agent" || task.phase === "closed") throw new Error("Task capability resolution is paused or closed; explicit resume is required");
+    if ((task.ownerPaused || task.phase === "closed")) throw new Error("Task capability resolution is closed");
     const repository = input.config.repositories[task.repositoryId];
     if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
     if (task.issueIdentifier) {
@@ -39,9 +39,9 @@ export async function resolveSessionToolingCapability(input: Context & z.infer<t
   const key = `${owned.task.id}:${createHash("sha256").update(JSON.stringify(result.receipt)).digest("hex")}`;
   await input.prisma.$transaction(async (tx) => {
     const current = await assertOwnership(tx);
-    if (current.task.id !== owned.task.id || current.task.controlGeneration !== owned.task.controlGeneration
+    if (current.task.id !== owned.task.id
       || current.task.worktreePath !== owned.task.worktreePath || current.task.toolingRevision !== owned.task.toolingRevision
-      || current.task.pinnedToolingRoot !== owned.task.pinnedToolingRoot) throw new Error("Task ownership or control changed during capability resolution");
+      || current.task.pinnedToolingRoot !== owned.task.pinnedToolingRoot) throw new Error("Task ownership changed during capability resolution");
     if (!(await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owned.session.id, action: "tooling-capability", key } }))) {
       await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: owned.session.id, action: "tooling-capability", key,
         source: `task:${owned.task.id}`, value: JSON.stringify(result.receipt) } });

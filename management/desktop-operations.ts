@@ -133,9 +133,8 @@ export async function desktopOperation(file: string, raw: unknown, serviceLabel?
         return { ok: checks.every((check) => check.status !== "fail"), summary: "Checks completed on this machine", detail: JSON.stringify(checks, null, 2) };
       }
       if (action === "check-update") return checkForUpdates();
-      const { tasks } = await control<{ tasks: DesktopTask[] }>("/api/tasks");
       const { sessions } = await control<{ sessions: Array<{ status: string }> }>("/api/sessions");
-      if (tasks.some((task) => ["human", "draining"].includes(task.controlMode)) || sessions.some((session) => ["active", "provisioning"].includes(session.status))) throw new Error("Pause active work and return browser control before restarting this machine's server");
+      if (sessions.some((session) => ["active", "provisioning"].includes(session.status))) throw new Error("Pause active work before restarting this machine's server");
       if (!serviceLabel) return restartService();
       const manifest = path.join(os.homedir(), "Library/LaunchAgents", `${serviceLabel}.plist`);
       const parsed = JSON.parse(await runOrThrow("plutil", ["-convert", "json", "-o", "-", manifest]));

@@ -16,7 +16,7 @@ export async function prepareTaskPrompt(input: {
   const { task } = input;
   const assertAvailable = async () => {
     const current = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
-    if (current.controlMode !== "agent" || current.phase === "closed") throw new Error("Task preparation is paused or closed; preserve its existing work and wait for explicit resume");
+    if ((current.ownerPaused || current.phase === "closed")) throw new Error("Task preparation is closed; preserve its existing work");
   };
   await assertAvailable();
   let toolingRoot: string | undefined;

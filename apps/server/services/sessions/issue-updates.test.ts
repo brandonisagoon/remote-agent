@@ -115,15 +115,15 @@ test("failed upload leaves status unchanged; capture changes and stale owner sta
   expect(f.steps).toEqual([]);
 });
 
-test("simultaneous retries share one delivery and unknown states, workers and human control are rejected", async () => {
+test("simultaneous retries share one delivery and unknown states, workers and task closure are rejected", async () => {
   const f = await fixture();
   await expect(publishSessionIssueUpdate({ ...f.input, state: "In Progress" }, f.client)).rejects.toThrow("not in the linked issue's team");
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
   await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("primary");
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "primary" } });
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "human" } });
-  await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("human");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(publishSessionIssueUpdate(f.input, f.client)).rejects.toThrow("closed");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
   const results = await Promise.all([publishSessionIssueUpdate(f.input, f.client), publishSessionIssueUpdate(f.input, f.client)]);
   expect(results[0]).toEqual(results[1]);
   expect(f.steps).toEqual(["upload", "attach", "comment", "state"]);
@@ -211,7 +211,7 @@ test("confirmed review publication feeds owner-wait activity without a question 
   const runtime = createFakeAgentRuntime([{ ...f.session, status: "idle" }]);
   expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity.state).toBe("idle");
   const result = await publishSessionIssueUpdate({ ...f.input, evidence: [] }, f.client);
-  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "waiting-owner", ownerQuestions: [], reviewHandoff: { receiptId: result.commentId, issueIdentifier: f.issue.identifier }, control: { reportedPhase: "working" } });
+  expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "waiting-owner", ownerQuestions: [], reviewHandoff: { receiptId: result.commentId, issueIdentifier: f.issue.identifier }, progress: { reportedPhase: "working" } });
   await publishSessionIssueUpdate({ ...f.input, requestKey: "resume-work", evidence: [], state: "On Course", expectedState: "Manual Review" }, f.client);
   expect((await readTaskActivity(f.prisma, runtime, f.task.id))!.activity).toMatchObject({ state: "idle", reviewHandoff: null });
   expect(runtime.sentMessages).toHaveLength(0);
@@ -231,13 +231,13 @@ test("required unfinished children prevent parent handoff before any external wr
   expect((await publishSessionIssueUpdate(f.input, client)).state).toBe("Manual Review");
 });
 
-test("child graph rejects delegates and paused task automation", async () => {
+test("child graph rejects delegates and closed tasks", async () => {
   const f = await fixture();
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
   await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("primary");
   await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "primary" } });
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("paused");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(readSessionWorkGraph(f.input, f.client)).rejects.toThrow("closed");
 });
 
 test("DRA-28 implementation scopes advance independently while verification waits for all three and gates parent review", async () => {

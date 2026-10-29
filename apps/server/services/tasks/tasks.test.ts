@@ -9,7 +9,6 @@ import { createApp } from "../../app.ts";
 import { beginTask } from "./store.ts";
 import { provisionTaskWorktree } from "./provision.ts";
 import { readToolingSource } from "../../../../lib/tooling-source.ts";
-import { assertTaskAutomationAllowed, changeTaskControl, reconcileTaskControls } from "./control.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { prepareTooling } from "./tooling.ts";
 
@@ -189,26 +188,37 @@ test("network task APIs require authentication and resource identity cannot be r
   expect(await db.prisma.remoteTaskResource.count()).toBe(1);
   const first = await db.prisma.remoteTaskResource.findFirstOrThrow();
   expect((await put({ ...resource, externalId: first.externalId, state: "ready" })).status).toBe(200);
+
+
 });
 
-test("human control blocks all worktree sessions, survives restart paused, and requires the same viewer to resume", async () => {
+
+test("task closure stops its sessions without browser control fields or a takeover endpoint", async () => {
   const repo = repository();
-  const task = await beginTask(db.prisma, { requestKey: "control-test", repository: repo, machineId: "macbook-air", branchName: "codex/control" });
-  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { worktreePath: "/task/control" } });
-  const runtime = createFakeAgentRuntime([{ id: "primary", cwd: "/task/control", status: "active" }, { id: "delegate", cwd: "/task/control", status: "active" }]);
-  runtime.cancel = async (id) => {
-    await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("draining");
-    runtime.cancelledSessionIds.push(id);
-    runtime.putSession({ id, cwd: "/task/control", status: "idle" });
-  };
-  const controllerId = "viewer-owner-123456";
-  const granted = await changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId, action: "take" });
-  expect(granted.controlMode).toBe("human");
-  expect(runtime.cancelledSessionIds.sort()).toEqual(["delegate", "primary"]);
-  await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("human");
-  await reconcileTaskControls(db.prisma);
-  await expect(assertTaskAutomationAllowed(db.prisma, "/task/control")).rejects.toThrow("paused");
-  await expect(changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId: "another-viewer-123", action: "resume" })).rejects.toThrow("Another viewer");
-  await changeTaskControl(db.prisma, runtime, { taskId: task.id, controllerId, action: "resume" });
-  await assertTaskAutomationAllowed(db.prisma, "/task/control");
+  const config = testConfig({ repository: repo });
+  const task = await beginTask(db.prisma, { requestKey: "close-task", repository: repo, machineId: config.machine, branchName: "codex/close" });
+  const worktreePath = path.join(directory, "close-worktree");
+  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { primarySessionId: "primary", worktreePath } });
+  const identity = { cwd: worktreePath, repositoryId: repo.id, machineId: config.machine };
+  const runtime = createFakeAgentRuntime([
+    { id: "primary", ...identity, status: "active" }, { id: "delegate", ...identity, status: "active" },
+    { id: "unrelated", ...identity, repositoryId: "another-repository", status: "active" },
+  ]);
+  await db.prisma.runtimeInstruction.createMany({ data: ["primary", "delegate"].map((sessionId) => ({ id: sessionId, sessionId, text: "pending", state: "queued" })) });
+  const app = createApp({ config, prisma: db.prisma, agentRuntime: runtime });
+  const post = (route: string, body: object) => app.request(`/api/tasks/${task.id}/${route}`, {
+    method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(body),
+  });
+  expect((await post("control", { controllerId: "old-viewer", action: "take" })).status).toBe(404);
+  expect((await post("automation", { action: "pause" })).status).toBe(200);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).ownerPaused).toBeTrue();
+  expect((await post("automation", { action: "resume" })).status).toBe(200);
+  const closed = await post("automation", { action: "close" });
+  expect(closed.status).toBe(200);
+  const value = await closed.json() as { task: Record<string, unknown> };
+  expect(value.task.phase).toBe("closed");
+  for (const field of ["controlMode", "controllerId", "controlGeneration"]) expect(field in value.task).toBeFalse();
+  expect(runtime.closedSessionIds.sort()).toEqual(["delegate", "primary"]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "cancelled" } })).toBe(2);
+  expect((await post("automation", { action: "close" })).status).toBe(200);
 });

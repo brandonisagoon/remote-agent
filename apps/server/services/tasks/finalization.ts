@@ -18,7 +18,7 @@ async function owned(input: FinalizationContext) {
   FinalizationInput.parse({ requestKey: input.requestKey });
   const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
   const session = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
-  if (!task || !task.worktreePath || !task.connectionId || !task.issueIdentifier || task.phase !== "complete" || task.controlMode !== "agent" || session.role !== "primary" || session.status === "closed" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Finalization requires the open complete task's original agent-controlled primary");
+  if (!task || !task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || task.phase !== "complete" || session.role !== "primary" || session.status === "closed" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Finalization requires the open complete task's original primary");
   return task;
 }
 
@@ -82,7 +82,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
   if (matching.length !== 1 || entry?.HEAD !== delivery.receipts.snapshot.head || entry?.branch !== `refs/heads/${task.branchName}`) throw new Error("Finalization Git registration does not match verified delivery");
   const prepared: PreparedFinalization = { taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey,
     repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId!, issueIdentifier: task.issueIdentifier!, issueId: source.issue.id,
-    contractRevision: delivery.receipts.contractRevision, controlGeneration: task.controlGeneration,
+    contractRevision: delivery.receipts.contractRevision,
     worktree, taskWorktree: task.worktreePath!, registeredWorktree: entry!.worktree!, revision: delivery.receipts.snapshot.head, branch: task.branchName, gitDirectory, gitCwd, delivery };
   const snapshot = await dependencies.snapshot(worktree);
   if (JSON.stringify(snapshot) !== JSON.stringify(delivery.receipts.snapshot)) throw new Error("Worktree changed during finalization preparation");

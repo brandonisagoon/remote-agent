@@ -76,11 +76,11 @@ test("ordinary queue/capacity waits, live turns and posted questions never creat
   expect(f.runtime.sentMessages).toEqual([]);
 });
 
-test("paused, complete, closed, stopped and terminal-source tasks stay silent", async () => {
+test("complete, closed, stopped and terminal-source tasks stay silent", async () => {
   const f = await fixture();
   await f.instruction();
-  for (const change of [{ controlMode: "paused" }, { phase: "complete" }, { phase: "closed" }, { environmentStatus: "stopped" }]) {
-    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent", phase: "working", environmentStatus: "ready", ...change } });
+  for (const change of [{ phase: "complete" }, { phase: "closed" }, { environmentStatus: "stopped" }]) {
+    await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working", environmentStatus: "ready", ...change } });
     await f.scan();
   }
   await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { environmentStatus: "ready" } });
@@ -118,7 +118,7 @@ test("ambiguous source, foreign delegates and changed local control cannot publi
   expect(f.comments.size).toBe(0);
   await f.prisma.runtimeSessionResourceLink.update({ where: { id: other.id }, data: { endedAt: new Date() } });
   const source = f.client.source;
-  f.client.source = async (input) => { await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } }); return source(input); };
+  f.client.source = async (input) => { await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } }); return source(input); };
   await f.scan();
   expect(f.comments.size).toBe(0);
 });

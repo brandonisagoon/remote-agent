@@ -147,9 +147,9 @@ test("exhausted task-owned projection is explicitly recoverable without replayin
   const retry = (value = payload, auth = true) => app.request("/api/tasks/task/projection-retries", { method: "POST", headers: { "content-type": "application/json", ...(auth ? { authorization: `Bearer ${input.config.apiKey}` } : {}) }, body: JSON.stringify(value) });
   expect((await retry(payload, false)).status).toBe(401);
   expect((await retry({ ...payload, sessionId: parent.id })).status).toBe(409);
-  await input.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode: "paused" } });
+  await input.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
   expect((await retry()).status).toBe(409);
-  await input.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode: "agent" } });
+  await input.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "working" } });
   expect((await retry()).status).toBe(202);
   const auditCount = await input.prisma.runtimeMetadataEvent.count();
   expect((await retry()).status).toBe(202);

@@ -110,7 +110,7 @@ test("stale verification, wrong PR head/base, and draft PRs cannot satisfy deliv
   await expect(assertCompletionAllowed(gate, observer)).rejects.toThrow("verification is missing, failed or stale");
 });
 
-test("owner contract retries are immutable, stale revisions fail, and revocation/pause block completion", async () => {
+test("owner contract retries are immutable, stale revisions fail, and revocation/closure block completion", async () => {
   const { context, gate, contract, verify } = await fixture();
   const input = contract();
   const saved = await setCompletionContract({ ...context, contract: input });
@@ -118,9 +118,9 @@ test("owner contract retries are immutable, stale revisions fail, and revocation
   await expect(setCompletionContract({ ...context, contract: { ...input, boundary: "local-only" } })).rejects.toThrow("different owner decision");
   await expect(setCompletionContract({ ...context, contract: contract("local-only", { requestKey: "stale" }) })).rejects.toThrow("authority changed");
   await verify();
-  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode: "paused" } });
-  await expect(assertCompletionAllowed(gate)).rejects.toThrow("paused");
-  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { controlMode: "agent" } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  await expect(assertCompletionAllowed(gate)).rejects.toThrow("closed");
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "working" } });
   await setCompletionContract({ ...context, contract: contract("revoked", { requestKey: "owner-revoked", expectedRevision: saved.revision }) });
   await expect(assertCompletionAllowed(gate)).rejects.toThrow("unknown or revoked");
 });
@@ -147,7 +147,7 @@ test("authority revoked during observation cannot authorize a terminal transitio
     await setCompletionContract({ ...context, contract: contract("revoked", { requestKey: "revoked-during-check", expectedRevision: saved.revision }) });
     return snapshot;
   } };
-  await expect(assertCompletionAllowed(gate, observer)).rejects.toThrow("authority or task control changed");
+  await expect(assertCompletionAllowed(gate, observer)).rejects.toThrow("authority or task identity changed");
 });
 
 test("completion contract writes require bearer even on a trusted local socket", async () => {

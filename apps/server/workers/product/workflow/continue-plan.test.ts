@@ -133,9 +133,9 @@ test.each(["queued", "dispatching", "unknown"])("does not overtake a %s instruct
   expect(f.runtime.sentMessages).toHaveLength(0);
 });
 
-test.each(["paused", "human", "draining"])("does not override %s task control", async (controlMode) => {
+test("does not continue a closed task", async () => {
   const f = await fixture();
-  await db.prisma.remoteTask.update({ where: { id: f.originalTask.id }, data: { controlMode } });
+  await db.prisma.remoteTask.update({ where: { id: f.originalTask.id }, data: { phase: "closed" } });
   expect((await continuePlanningSession(f.input))?.status).toBe("failed");
   expect(f.calls).toHaveLength(0);
 });
@@ -156,11 +156,11 @@ test("provider failure does not commit execution; a verified retry reuses its in
   expect(f.compositions).toHaveLength(1);
 });
 
-test("task control changing during preparation prevents execution", async () => {
+test("task closure during preparation prevents execution", async () => {
   const f = await fixture();
   const setModel = f.runtime.setConfigOption;
   f.runtime.setConfigOption = async (...args) => {
-    await db.prisma.remoteTask.update({ where: { id: f.originalTask.id }, data: { controlMode: "human", controlGeneration: { increment: 1 } } });
+    await db.prisma.remoteTask.update({ where: { id: f.originalTask.id }, data: { phase: "closed" } });
     return setModel(...args);
   };
   expect((await continuePlanningSession(f.input))?.status).toBe("failed");
