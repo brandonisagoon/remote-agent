@@ -70,13 +70,30 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
       if (task.phase === "closed") throw new Error("A closed task cannot be resumed");
       const paused = parsed.data.action === "pause";
       // Persist first: active turns and queued delegates observe the same pause.
-      await prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: paused } });
-      if (paused && task.worktreePath) {
-        for (const session of await runtime.listSessions({ cwd: task.worktreePath })) {
-          if (session.cwd === task.worktreePath && session.repositoryId === task.repositoryId && session.machineId === task.machineId && session.status !== "closed") {
-            await runtime.cancel(session.id, "Owner paused task");
-          }
-        }
+      if (task.ownerPaused !== paused) await prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: paused } });
+      if (paused) {
+        const liveSessions = async () => task.worktreePath ? (await runtime.listSessions({ cwd: task.worktreePath })).filter(session => {
+          if (session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.status === "closed") return false;
+          if (session.status === "active" || session.status === "provisioning") return true;
+          const observed = runtime.observeSessionActivity?.(session.id).state;
+          return observed === "executing" || observed === "queued";
+        }) : [];
+        const sessions = await liveSessions();
+        // Cancellation may fail or wait for a provider receipt. Start every
+        // owned session independently so neither case leaves delegates running.
+        const failures = (await Promise.all(sessions.map(async session => {
+          try { await runtime.cancel(session.id, "Owner paused task"); return null; }
+          catch (error) { return { sessionId: session.id, error: error instanceof Error ? error.message : String(error) }; }
+        }))).filter(failure => failure !== null);
+        // A successful cancellation request does not prove the turn stopped.
+        // Re-read terminal state; a retry only targets the remaining live work.
+        const pendingSessionIds = (await liveSessions()).map(session => session.id);
+        const pause = { state: pendingSessionIds.length ? "pending" : "paused", attemptedSessionIds: sessions.map(session => session.id), pendingSessionIds, failures };
+        const current = taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } }));
+        if (failures.length) return c.json({ task: current, pause,
+          error: `Task remains owner-paused. Cancellation failed: ${failures.map(failure => `${failure.sessionId}: ${failure.error}`).join("; ")}. Pending sessions: ${pendingSessionIds.join(", ") || "none"}.`,
+        }, 409);
+        return c.json({ task: current, pause }, pendingSessionIds.length ? 202 : 200);
       }
       return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
     }
