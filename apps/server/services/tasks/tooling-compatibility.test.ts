@@ -38,11 +38,15 @@ async function fixture(pinnedPreparation = false) {
     prepare: { instructions: "agent-skills/prepare/instructions.md", adapter: "src/cli.ts" },
     merge: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
     cleanup: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
+    runtime: { instructions: "projects/runtime.md", adapter: "src/cli.ts" },
+    browser: { instructions: "projects/browser.md", adapter: "src/cli.ts" },
     "development-credentials": { instructions: "credentials/README.md", adapter: "src/credentials-backup.ts" },
   } }));
   write(source, "agent-skills/prepare/instructions.md", "Host preparation capability: inspect the actual task services.");
   write(source, "agent-skills/merge/instructions.md", "Host merge capability: finish authorized commit, push, PR and cleanup; recheck Merge authority.");
   write(source, "src/cli.ts", "// committed adapter fixture");
+  write(source, "projects/runtime.md", "Reviewed remote runtime: reuse the exact recorded database and saved data.");
+  write(source, "projects/browser.md", "Reviewed headless browser: reuse the task-owned profile and verify the actual app.");
   write(source, "credentials/README.md", "Approved development recovery: inspect field names, verify integrity, export only task-required keys. Never use production fallback. Decryption is not provider validation.");
   write(source, "src/credentials-backup.ts", "throw new Error('Capability resolution must not execute this adapter');");
   const hostRevision = commit(source);
@@ -139,6 +143,22 @@ test("credential capability route rejects arbitrary names and paths and uses tas
   expect((await request({ capability: "development-credentials" }, "another-session")).status).toBe(409);
   expect((await request({ capability: "development-credentials" })).status).toBe(200);
 });
+
+for (const capability of ["runtime", "browser"] as const) {
+  test(`existing task resolves ${capability} from committed host tooling without repinning or starting work`, async () => {
+    const f = await fixture(true);
+    write(f.source, `projects/${capability}.md`, "UNCOMMITTED MUST NOT EXECUTE");
+    const result = await resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability });
+    expect(result.receipt).toMatchObject({ capability, source: "configured-host", capabilityRevision: f.hostRevision, taskToolingRevision: f.oldRevision,
+      adapter: realpathSync(path.join(f.hostPin, "src/cli.ts")) });
+    expect(result.instructions).toContain(capability === "runtime" ? "exact recorded database" : "task-owned profile");
+    expect(result.instructions).not.toContain("UNCOMMITTED");
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability })).rejects.toThrow("paused");
+  });
+}
 
 test("old pin resolves named cleanup without running effects, changing authority or repinning", async () => {
   const f = await fixture();

@@ -6,7 +6,7 @@ import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 
 // Merge is deliberately not exposed: its workflow has a separate owner
 // approval boundary. A caller may select a name, never a path or revision.
-export const ToolingCapabilityInput = z.object({ capability: z.enum(["development-credentials", "cleanup"]) }).strict();
+export const ToolingCapabilityInput = z.object({ capability: z.enum(["development-credentials", "cleanup", "runtime", "browser"]) }).strict();
 type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string };
 
 export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput>, resolve = resolveToolingCompatibility) {
@@ -17,7 +17,7 @@ export async function resolveSessionToolingCapability(input: Context & z.infer<t
     if (!task || !session || session.role !== "primary" || session.status === "closed" || !task.worktreePath
       || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId
       || task.machineId !== input.config.machine) throw new Error("Only the open owning task primary may resolve tooling capabilities");
-    if ((task.ownerPaused || task.phase === "closed")) throw new Error("Task capability resolution is closed");
+    if (task.ownerPaused || task.phase === "closed") throw new Error("Task capability resolution is paused or closed");
     const repository = input.config.repositories[task.repositoryId];
     if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
     if (task.issueIdentifier) {
@@ -35,6 +35,10 @@ export async function resolveSessionToolingCapability(input: Context & z.infer<t
     capability, worktreePath: owned.session.cwd, pinnedToolingRoot: owned.task.pinnedToolingRoot ?? undefined,
     seed: capability === "cleanup"
       ? "Recover this task's incomplete or unsupported cleanup receipts without changing its tooling pin. Inspect exact ownership, use supported lifecycle operations within existing authority, verify absence, then resume the original primary's finalizer. Never fabricate released state or broaden deletion targets."
+      : capability === "runtime"
+      ? "Use the reviewed remote environment commands for this existing task. Inspect and reuse its saved environment and data, select only needed services, check the approved test identity, and report actual setup progress. Preserve task and tooling identity."
+      : capability === "browser"
+      ? "Use reviewed headless browser commands for this existing task. Reuse its exact owned profile and purpose; capture actual feature evidence without changing its task or tooling pin."
       : "Recover only the development configuration required by this existing task; inspect names and integrity, then verify the original live operation. Distinguish missing configuration, authorization denial, invalid credentials and provider outage. Never use production fallback." });
   const key = `${owned.task.id}:${createHash("sha256").update(JSON.stringify(result.receipt)).digest("hex")}`;
   await input.prisma.$transaction(async (tx) => {
