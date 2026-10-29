@@ -16,6 +16,14 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version-file: package.json
+      # Video evidence tests encode, convert and decode real media.
+      - name: Install ffmpeg and ffprobe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders > "$RUNNER_TEMP/encoders.txt"
+          for encoder in libx264 aac libvpx libopus; do grep -q " $encoder " "$RUNNER_TEMP/encoders.txt" || { echo "ffmpeg lacks $encoder"; exit 1; }; done
+          ffprobe -hide_banner -version | head -1
       - run: bun install --frozen-lockfile
       - run: bun run lint
       - run: bun test

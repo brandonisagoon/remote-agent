@@ -1,4 +1,4 @@
-import path from "node:path";
+import { rm } from "node:fs/promises";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -12,7 +12,7 @@ import { taskForSession } from "../tasks/store.ts";
 import { assertCompletionAllowed } from "../tasks/completion.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { registerThread } from "./threads.ts";
-import { EvidenceReceipt, issueUpdateBody, readIssueEvidence } from "./issue-evidence.ts";
+import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
 
 export const IssueUpdateInput = z.object({
   requestKey: z.string().trim().min(1).max(200), body: z.string().trim().min(1).max(30_000),
@@ -50,20 +50,26 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   if (task && task.primarySessionId !== sessionId) throw new Error("Only the task's primary session may publish its issue updates");
   const payload = IssueUpdateInput.parse(inputPayload(input));
   const ownedPaths = task?.resources.filter((resource) => resource.kind === "evidence" && resource.state !== "released").map((resource) => resource.externalId) ?? [];
+  const context = { cwd: session.cwd, ownedPaths, cacheDirectory: evidenceCacheDirectory(config.acpxStateDir, sessionId, payload.requestKey) };
   let receipt = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: payload.requestKey } } });
   const target = payload.state ? issue.team.states.nodes.find((state) => state.name === payload.state) : undefined;
   if (!receipt?.published && payload.state && !target) throw new Error(`State '${payload.state}' is not in the linked issue's team; read_source_issue for current states`);
   if (!receipt) {
-    // Validate every capture before publishing anything. The digest binds retries
-    // to the same bytes even if a capture is subsequently overwritten on disk.
+    // Validate every capture, then prepare every video, before publishing
+    // anything. The source and prepared digests bind retries to the same bytes
+    // even if a capture is subsequently overwritten on disk.
     const evidence = [];
     for (const file of payload.evidence) evidence.push((await readIssueEvidence(file, session.cwd, ownedPaths)).receipt);
+    await prepareIssueEvidence(evidence, context);
     receipt = await prisma.runtimeIssueUpdate.create({ data: { runtimeSessionId: sessionId, requestKey: payload.requestKey, connectionId: link.connectionId, issueId: issue.id, input: payload, evidence } });
   }
   if (JSON.stringify(receipt.input) !== JSON.stringify(payload) || receipt.issueId !== issue.id || receipt.connectionId !== link.connectionId) throw new Error("Update requestKey already belongs to a different update; use the original payload to retry");
   const evidence = z.array(EvidenceReceipt).parse(receipt.evidence);
-  const result = () => ({ published: true, commentId: receipt.id, issueIdentifier: issue.identifier, state: payload.state ?? null, evidence: evidence.map(({ title, assetUrl, attachmentId }) => ({ title, url: assetUrl, attachmentId })) });
+  const result = () => ({ published: true, commentId: receipt.id, issueIdentifier: issue.identifier, state: payload.state ?? null, evidence: evidence.map((file) => ({ title: file.title, url: file.assetUrl, attachmentId: file.attachmentId, ...evidenceUpload(file) })) });
   if (receipt.published) return result(); // A retry must never rewind later owner changes.
+  // An unpublished receipt from before video preparation converts its
+  // not-yet-uploaded videos before this attempt's first remote effect.
+  if (await prepareIssueEvidence(evidence, context)) await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
   const checkState = async () => {
     await assertTaskOpen(prisma, session.cwd);
     const latest = await client.read(config, { id: issue.id });
@@ -93,9 +99,8 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   await checkState();
   for (const file of evidence) {
     if (!file.assetUrl) {
-      const capture = await readIssueEvidence(file, session.cwd, ownedPaths);
-      if (capture.receipt.sha256 !== file.sha256) throw new Error("Evidence changed since this update began; restore the capture before retrying");
-      file.assetUrl = await client.upload(config.linearApiKey, { name: path.basename(file.path), contentType: file.contentType, bytes: capture.bytes });
+      const upload = await readEvidenceUpload(file, context);
+      file.assetUrl = await client.upload(config.linearApiKey, { name: upload.name, contentType: upload.contentType, bytes: upload.bytes });
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
     if (!file.attachmentId) {
@@ -134,6 +139,8 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       value: JSON.stringify({ connectionId: link.connectionId, issueId: issue.id, issueIdentifier: issue.identifier, state: payload.state ?? null }),
     } });
   });
+  // Replays need only the receipt; this request's prepared copies are private.
+  await rm(context.cacheDirectory, { recursive: true, force: true }).catch(() => undefined);
   return result();
 }
 
