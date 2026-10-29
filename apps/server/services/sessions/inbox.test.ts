@@ -40,18 +40,6 @@ test("unknown prior delivery blocks later instructions after restart instead of 
   expect(runtime.sentMessages.map((message) => message.text)).toEqual(["next"]);
 });
 
-test("human control keeps queued instructions durable until explicit handback", async () => {
-  const runtime = createFakeAgentRuntime([{ id: "session", cwd: "/task" }]);
-  await db.prisma.remoteTask.create({ data: { requestKey: "task", repositoryId: "repo", machineId: "air", branchName: "codex/test", worktreePath: "/task", toolingRoot: "/tools", toolingRevision: "a".repeat(40), controlMode: "human" } });
-  await queueInstruction(db.prisma, { sessionId: "session", requestId: "paused", text: "wait" });
-  await deliverInstructions(db.prisma, runtime);
-  expect(runtime.sentMessages).toHaveLength(0);
-  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "paused" } })).state).toBe("queued");
-  await db.prisma.remoteTask.updateMany({ data: { controlMode: "agent" } });
-  await deliverInstructions(db.prisma, runtime);
-  for (let i = 0; i < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 1; i++) await Bun.sleep(5);
-  expect(runtime.sentMessages).toHaveLength(1);
-});
 
 test("capacity waits stay queued across daemon loss and dispatch once on recovery", async () => {
   const runtime = createFakeAgentRuntime([{ id: "one" }, { id: "two" }]);
@@ -102,13 +90,13 @@ test("a page of busy-session backlog cannot starve another owner's instruction",
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "owner-later" } })).state).toBe("queued");
 });
 
-test("paging preserves unknown, preparing and human-control guards without blocking other sessions", async () => {
+test("paging preserves unknown, preparing and owner-pause guards without blocking other sessions", async () => {
   const runtime = createFakeAgentRuntime([
     { id: "uncertain" }, { id: "preparing" }, { id: "paused", cwd: "/paused-task" }, { id: "ready" },
   ]);
   await db.prisma.remoteTask.create({ data: {
     requestKey: "paused-task", repositoryId: "repo", machineId: "air", branchName: "codex/paused",
-    worktreePath: "/paused-task", toolingRoot: "/tools", toolingRevision: "a".repeat(40), controlMode: "paused",
+    worktreePath: "/paused-task", toolingRoot: "/tools", toolingRevision: "a".repeat(40), ownerPaused: true,
   } });
   await db.prisma.runtimeInstruction.createMany({ data: [
     { id: "unknown", sessionId: "uncertain", text: "uncertain work", state: "unknown" },
@@ -149,7 +137,7 @@ test("repeated unknown reconciliation preserves the original stalled timestamp a
   expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unknown" } })).toMatchObject({ updatedAt: since, detail: "Original uncertain provider outcome" });
 });
 
-test("control handoff while waiting for capacity keeps the original queued instruction", async () => {
+test("owner pause while waiting for capacity keeps the original queued instruction", async () => {
   const runtime = createFakeAgentRuntime([{ id: "session", cwd: "/handoff" }]);
   await db.prisma.remoteTask.create({ data: { requestKey: "handoff", repositoryId: "repo", machineId: "air", branchName: "codex/handoff", worktreePath: "/handoff", toolingRoot: "/tools", toolingRevision: "a".repeat(40) } });
   let claim: (() => Promise<boolean>) | undefined;
@@ -162,7 +150,7 @@ test("control handoff while waiting for capacity keeps the original queued instr
   });
   await queueInstruction(db.prisma, { sessionId: "session", requestId: "waiting", text: "wait" });
   await deliverInstructions(db.prisma, runtime);
-  await db.prisma.remoteTask.updateMany({ data: { controlMode: "human" } });
+  await db.prisma.remoteTask.updateMany({ data: { ownerPaused: true } });
   expect(await claim!()).toBe(false);
   finish();
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "waiting" } })).state).toBe("queued");
@@ -228,7 +216,24 @@ test.each([undefined, 1])("owner cleanup progresses on its original primary with
   }
   expect(await db.prisma.runtimeInstruction.count({ where: { sessionId: "busy", state: "queued" } })).toBe(105);
   expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({
-    primarySessionId: "primary", worktreePath: "/cleanup-task", toolingRevision: "a".repeat(40), controlMode: "agent",
+    primarySessionId: "primary", worktreePath: "/cleanup-task", toolingRevision: "a".repeat(40),
   });
   expect(await db.prisma.remoteTask.count()).toBe(1);
+});
+
+
+test("explicit owner pause survives restart and holds primary and delegate messages until resume", async () => {
+  const cwd = "/task/owner-paused";
+  const runtime = createFakeAgentRuntime([{ id: "primary", cwd, status: "idle" }, { id: "delegate", cwd, status: "idle" }]);
+  await db.prisma.remoteTask.create({ data: { id: "paused-task", requestKey: "paused-task", repositoryId: "repo", machineId: "machine", branchName: "codex/task", worktreePath: cwd, toolingRoot: "/tooling", toolingRevision: "pinned", primarySessionId: "primary", phase: "review", ownerPaused: true } });
+  for (const sessionId of ["primary", "delegate"]) await queueInstruction(db.prisma, { sessionId, requestId: `paused-${sessionId}`, text: sessionId });
+  await db.prisma.$disconnect();
+  await deliverInstructions(db.prisma, runtime);
+  expect(runtime.sentMessages).toEqual([]);
+  expect(await db.prisma.runtimeInstruction.count({ where: { state: "queued" } })).toBe(2);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "paused-task" } })).phase).toBe("review");
+  await db.prisma.remoteTask.update({ where: { id: "paused-task" }, data: { ownerPaused: false } });
+  await deliverInstructions(db.prisma, runtime);
+  for (let attempt = 0; attempt < 50 && await db.prisma.runtimeInstruction.count({ where: { state: "completed" } }) < 2; attempt++) await Bun.sleep(5);
+  expect(runtime.sentMessages.map((message) => message.text).sort()).toEqual(["delegate", "primary"]);
 });

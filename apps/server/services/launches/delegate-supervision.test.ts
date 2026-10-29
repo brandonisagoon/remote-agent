@@ -18,9 +18,9 @@ async function fixture(notify = true) {
   return { prisma: db.prisma, parent, child, runtime };
 }
 
-test("terminal results survive replay, remain queued during human control, and return to the original parent", async () => {
+test("terminal results survive replay, remain queued during task closure, and return to the original parent", async () => {
   const { prisma, parent, child, runtime } = await fixture();
-  await prisma.remoteTask.create({ data: { id: "task-one", requestKey: "task-one", repositoryId: "test-repository", machineId: "macbook-air", branchName: "codex/task", toolingRoot: "/tooling", toolingRevision: "a".repeat(40), worktreePath: "/task", primarySessionId: parent.id, controlMode: "paused" } });
+  await prisma.remoteTask.create({ data: { id: "task-one", requestKey: "task-one", repositoryId: "test-repository", machineId: "macbook-air", branchName: "codex/task", toolingRoot: "/tooling", toolingRevision: "a".repeat(40), worktreePath: "/task", primarySessionId: parent.id, phase: "closed" } });
   const event = { kind: "turn" as const, id: "child-completed", sessionId: child.id, requestId: "work-1", createdAt: Date.now(), phase: "completed" as const, output: "Implementation result" };
   await queueDelegateResult(prisma, event);
   await prisma.$disconnect();
@@ -31,7 +31,7 @@ test("terminal results survive replay, remain queued during human control, and r
   expect(receipt.text).toContain("Implementation result");
   await deliverInstructions(prisma, runtime);
   expect(runtime.sentMessages).toHaveLength(0);
-  await prisma.remoteTask.update({ where: { id: "task-one" }, data: { controlMode: "agent" } });
+  await prisma.remoteTask.update({ where: { id: "task-one" }, data: { phase: "working" } });
   await deliverInstructions(prisma, runtime);
   // Delivery continues in the background; settle its receipt before closing SQLite.
   for (let i = 0; i < 50 && await prisma.runtimeInstruction.count({ where: { id: receipt.id, state: "completed" } }) < 1; i++) await Bun.sleep(5);

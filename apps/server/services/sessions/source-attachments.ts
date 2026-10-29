@@ -4,7 +4,7 @@ import path from "node:path";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { downloadLinearUpload, issueContainsUpload, linearUploadUrl } from "../../integrations/linear/downloads.ts";
-import { assertTaskAutomationAllowed } from "../tasks/control.ts";
+import { assertTaskOpen } from "../tasks/task-state.ts";
 import { linkedSourceIssue } from "./questions.ts";
 
 const client = { source: linkedSourceIssue, contains: issueContainsUpload, download: downloadLinearUpload };
@@ -18,12 +18,12 @@ const extensions: Record<string, string> = {
 export async function downloadSourceAttachment(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; url: string }, delivery = client) {
   const url = linearUploadUrl(input.url);
   const { session, config, issue } = await delivery.source(input);
-  await assertTaskAutomationAllowed(input.prisma, session.cwd);
+  await assertTaskOpen(input.prisma, session.cwd);
   if (!(await delivery.contains(config.linearApiKey, issue.id, issue.description, url))) {
     throw new Error("Attachment is not linked from this session's source issue or comments");
   }
   const { bytes, contentType } = await delivery.download(config.linearApiKey, url);
-  await assertTaskAutomationAllowed(input.prisma, session.cwd);
+  await assertTaskOpen(input.prisma, session.cwd);
   const current = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: session.id } });
   if (current.status === "closed") throw new Error("Session is closed");
   const sessionKey = createHash("sha256").update(session.id).digest("hex");

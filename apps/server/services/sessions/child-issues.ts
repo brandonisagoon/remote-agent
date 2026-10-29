@@ -4,7 +4,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { getIssueWorkGraph } from "../../integrations/linear/session-store/source-issue/work-graph.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { IssueUpdateInput, issueUpdateDelivery, publishSessionIssueUpdate } from "./issue-updates.ts";
-import { assertTaskAutomationAllowed } from "../tasks/control.ts";
+import { assertTaskOpen } from "../tasks/task-state.ts";
 import { taskForSession } from "../tasks/store.ts";
 
 type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string };
@@ -16,7 +16,7 @@ async function assertPrimary(input: Context) {
   if (session.status === "closed" || session.role !== "primary" || !task || task.primarySessionId !== session.id
     || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId
     || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Only the owning task primary may manage child issues");
-  await assertTaskAutomationAllowed(input.prisma, session.cwd);
+  await assertTaskOpen(input.prisma, session.cwd);
   return session;
 }
 

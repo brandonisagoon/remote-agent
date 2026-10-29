@@ -9,6 +9,12 @@ import { PrismaClient } from "../../generated/prisma/client.ts";
  * Node addon that fails under Bun with ERR_DLOPEN_FAILED
  * (https://github.com/oven-sh/bun/issues/4290). libSQL is the adapter that
  * actually works on this runtime.
+ *
+ * The pinned adapter is patched to reuse its mutex-protected connection for
+ * file transactions. Upstream libSQL detaches a native connection per
+ * transaction without releasing it deterministically (libsql-client-ts#350),
+ * which exhausted handles and stalled webhook launches. Keep the patch until
+ * an upstream replacement passes prisma.test.ts without forced GC.
  */
 export function createPrismaClient(databaseUrl: string): PrismaClient {
   const adapter = new PrismaLibSql({ url: databaseUrl });

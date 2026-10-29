@@ -7,7 +7,7 @@ import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../int
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
 import { getIssueWorkGraph } from "../../integrations/linear/session-store/source-issue/work-graph.ts";
 import { updateSourceIssue } from "../../integrations/linear/session-store/source-issue/update.ts";
-import { assertTaskAutomationAllowed } from "../tasks/control.ts";
+import { assertTaskOpen } from "../tasks/task-state.ts";
 import { taskForSession } from "../tasks/store.ts";
 import { assertCompletionAllowed } from "../tasks/completion.ts";
 import { linkedSourceIssue } from "./questions.ts";
@@ -43,7 +43,7 @@ export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaC
 async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof issueUpdateDelivery) {
   const { prisma, sessionId } = input;
   const { session, link, config, issue } = source;
-  await assertTaskAutomationAllowed(prisma, session.cwd);
+  await assertTaskOpen(prisma, session.cwd);
   const current = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
   if (current.status === "closed" || current.role === "delegate") throw new Error("Only an open primary session may publish source-issue updates");
   const task = await taskForSession(prisma, sessionId);
@@ -65,7 +65,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   const result = () => ({ published: true, commentId: receipt.id, issueIdentifier: issue.identifier, state: payload.state ?? null, evidence: evidence.map(({ title, assetUrl, attachmentId }) => ({ title, url: assetUrl, attachmentId })) });
   if (receipt.published) return result(); // A retry must never rewind later owner changes.
   const checkState = async () => {
-    await assertTaskAutomationAllowed(prisma, session.cwd);
+    await assertTaskOpen(prisma, session.cwd);
     const latest = await client.read(config, { id: issue.id });
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
@@ -99,7 +99,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
     if (!file.attachmentId) {
-      await assertTaskAutomationAllowed(prisma, session.cwd);
+      await assertTaskOpen(prisma, session.cwd);
       file.attachmentId = await client.attach(config.linearApiKey, { issueId: issue.id, title: file.title, url: file.assetUrl });
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }

@@ -43,7 +43,7 @@ export async function resolveTaskInstruction(prisma: PrismaClient, runtime: Agen
       return { ...owned, resolved: true };
     }
     if (owned.task.phase === "closed" || owned.session.status === "closed") throw new Error("Task or session is closed");
-    if (input.action === "retry" && owned.task.controlMode !== "agent") throw new Error("Resume task automation before retrying an instruction");
+    if (input.action === "retry" && owned.task.ownerPaused) throw new Error("Resume the owner-paused task before retrying an instruction");
     if (owned.instruction.state !== "unknown") throw new Error("Instruction is not awaiting resolution");
     return { ...owned, resolved: false };
   };
@@ -137,7 +137,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         }
         if (session.status === "active" || session.status === "provisioning") continue;
         const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
-        if (task && (task.controlMode !== "agent" || task.phase === "closed")) continue;
+        if (task && (task.ownerPaused || task.phase === "closed")) continue;
         if (!(await instructionAuthorityAllows(prisma, receipt))) continue;
         const requestId = await instructionRequestId(prisma, receipt);
         running.add(receipt.id);
@@ -145,7 +145,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
           try {
             const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: receipt.text, beforeStart: async () => prisma.$transaction(async (tx) => {
               const currentTask = await tx.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
-              if (currentTask && (currentTask.controlMode !== "agent" || currentTask.phase === "closed")) return false;
+              if (currentTask && (currentTask.ownerPaused || currentTask.phase === "closed")) return false;
               if (!(await instructionAuthorityAllows(tx, receipt))) return false;
               const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
               return claim.count > 0;

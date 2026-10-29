@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { assertTaskAutomationAllowed } from "../../services/tasks/control.ts";
+import { assertTaskOpen } from "../../services/tasks/task-state.ts";
 import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
 import { TurnCapacity } from "../../services/sessions/turn-capacity.ts";
 
@@ -421,17 +421,17 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           return;
         }
         const session = await this.requireSession(input.sessionId);
-        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        await assertTaskOpen(this.prisma, session.cwd);
         if (this.capacity.full) {
           queue.push({ kind: "update", id: `${requestId}:queued`, sessionId: session.id, requestId, createdAt: Date.now(), update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Queued — waiting for an available agent slot on this machine.\n" } } });
         }
         releaseCapacity = await this.capacity.acquire(signal);
         if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
         await this.requireSession(input.sessionId);
-        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        await assertTaskOpen(this.prisma, session.cwd);
         const handle = await this.handleFor(session);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
-        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        await assertTaskOpen(this.prisma, session.cwd);
         if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
@@ -445,7 +445,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           createdAt: Date.now(),
           phase: "started",
         });
-        await assertTaskAutomationAllowed(this.prisma, session.cwd);
+        await assertTaskOpen(this.prisma, session.cwd);
         current = this.runtimeFor(session.id).startTurn({
           handle,
           text: input.text,

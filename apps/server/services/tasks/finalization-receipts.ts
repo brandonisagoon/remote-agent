@@ -21,7 +21,7 @@ export type CompletionDelivery = z.infer<typeof CompletionDelivery>;
 export const PreparedFinalization = z.object({
   taskId: z.string(), sessionId: z.string(), requestKey: z.string(), repositoryId: z.string(), machineId: z.string(),
   connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(),
-  contractRevision: z.number().int(), controlGeneration: z.number().int(),
+  contractRevision: z.number().int(),
   worktree: z.string(), taskWorktree: z.string(), registeredWorktree: z.string(), revision: z.string(), branch: z.string(), gitDirectory: z.string(), gitCwd: z.string(),
   delivery: CompletionDelivery,
 });
@@ -60,7 +60,7 @@ export async function assertFinalizationRemoved(prepared: PreparedFinalization) 
 export async function assertFinalizationAuthority(prisma: Database, config: ServerConfig, prepared: PreparedFinalization, resourcesReleased = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: prepared.taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
-  if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.phase !== "complete" || task.controlMode !== "agent" || task.controlGeneration !== prepared.controlGeneration) throw new Error("Finalization ownership, phase or task control changed");
+  if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
   if (task.repositoryId !== prepared.repositoryId || task.machineId !== prepared.machineId || task.machineId !== config.machine || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.cwd !== task.worktreePath || task.branchName !== prepared.branch || task.connectionId !== prepared.connectionId || task.issueIdentifier !== prepared.issueIdentifier) throw new Error("Finalization task identity changed");
   // Compare configured path identity without requiring the removed checkout.
   if (task.worktreePath !== prepared.taskWorktree) throw new Error("Finalization worktree ownership changed");

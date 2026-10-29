@@ -11,7 +11,7 @@ const graceMs = 60_000;
 type Input = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
 type Signal = { kind: "instruction" | "question" | "result" | "projection"; sessionId: string; id: string; since: string; cause: string };
 const terminal = (issue: { state: { type: string } }) => ["completed", "canceled"].includes(issue.state.type);
-const eligible = { controlMode: "agent", phase: { notIn: ["complete", "closed"] }, environmentStatus: { not: "stopped" } };
+const eligible = { ownerPaused: false, phase: { notIn: ["complete", "closed"] }, environmentStatus: { not: "stopped" } };
 
 /** Low-frequency, receipt-driven publication only. Queued work, absent local
  * liveness and elapsed time alone are not proof of a stall. This never starts
@@ -84,7 +84,7 @@ export async function projectTaskStalls(input: Input, client = issueUpdateDelive
           source: async () => source,
           read: async (scopedConfig, query) => {
             const latest = await client.read(scopedConfig, query);
-            if (!await stillOwned()) throw new Error("Stall publication stopped: task control or source ownership changed");
+            if (!await stillOwned()) throw new Error("Stall publication stopped: task identity or source ownership changed");
             if (latest && terminal(latest)) throw new Error("Stall publication stopped: linked source issue is terminal");
             return latest;
           },

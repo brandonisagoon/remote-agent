@@ -38,11 +38,15 @@ async function fixture(pinnedPreparation = false) {
     prepare: { instructions: "agent-skills/prepare/instructions.md", adapter: "src/cli.ts" },
     merge: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
     cleanup: { instructions: "agent-skills/merge/instructions.md", adapter: "src/cli.ts" },
+    runtime: { instructions: "projects/runtime.md", adapter: "src/cli.ts" },
+    browser: { instructions: "projects/browser.md", adapter: "src/cli.ts" },
     "development-credentials": { instructions: "credentials/README.md", adapter: "src/credentials-backup.ts" },
   } }));
   write(source, "agent-skills/prepare/instructions.md", "Host preparation capability: inspect the actual task services.");
   write(source, "agent-skills/merge/instructions.md", "Host merge capability: finish authorized commit, push, PR and cleanup; recheck Merge authority.");
   write(source, "src/cli.ts", "// committed adapter fixture");
+  write(source, "projects/runtime.md", "Reviewed remote runtime: reuse the exact recorded database and saved data.");
+  write(source, "projects/browser.md", "Reviewed headless browser: reuse the task-owned profile and verify the actual app.");
   write(source, "credentials/README.md", "Approved development recovery: inspect field names, verify integrity, export only task-required keys. Never use production fallback. Decryption is not provider validation.");
   write(source, "src/credentials-backup.ts", "throw new Error('Capability resolution must not execute this adapter');");
   const hostRevision = commit(source);
@@ -140,6 +144,22 @@ test("credential capability route rejects arbitrary names and paths and uses tas
   expect((await request({ capability: "development-credentials" })).status).toBe(200);
 });
 
+for (const capability of ["runtime", "browser"] as const) {
+  test(`existing task resolves ${capability} from committed host tooling without repinning or starting work`, async () => {
+    const f = await fixture(true);
+    write(f.source, `projects/${capability}.md`, "UNCOMMITTED MUST NOT EXECUTE");
+    const result = await resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability });
+    expect(result.receipt).toMatchObject({ capability, source: "configured-host", capabilityRevision: f.hostRevision, taskToolingRevision: f.oldRevision,
+      adapter: realpathSync(path.join(f.hostPin, "src/cli.ts")) });
+    expect(result.instructions).toContain(capability === "runtime" ? "exact recorded database" : "task-owned profile");
+    expect(result.instructions).not.toContain("UNCOMMITTED");
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability })).rejects.toThrow("paused");
+  });
+}
+
 test("old pin resolves named cleanup without running effects, changing authority or repinning", async () => {
   const f = await fixture();
   const input = { prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "cleanup" as const };
@@ -150,8 +170,8 @@ test("old pin resolves named cleanup without running effects, changing authority
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "completion-contract" } })).toBe(0);
   expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  await expect(resolveSessionToolingCapability(input)).rejects.toThrow("paused");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(resolveSessionToolingCapability(input)).rejects.toThrow("closed");
 });
 
 test("undeclared development credential capability fails concretely without upgrading the task", async () => {
@@ -163,28 +183,28 @@ test("undeclared development credential capability fails concretely without upgr
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
 });
 
-test("pause and source ownership revocation block resolution before preparing a host checkout", async () => {
+test("closure and source ownership revocation block resolution before preparing a host checkout", async () => {
   const f = await fixture();
   const input = { prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "development-credentials" as const };
   let invoked = false;
   const resolve: typeof resolveToolingCompatibility = async () => { invoked = true; throw new Error("must not run"); };
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  await expect(resolveSessionToolingCapability(input, resolve)).rejects.toThrow("paused");
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await expect(resolveSessionToolingCapability(input, resolve)).rejects.toThrow("closed");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
   await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: new Date() } });
   await expect(resolveSessionToolingCapability(input, resolve)).rejects.toThrow("revoked");
   expect(invoked).toBeFalse();
   expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
 });
 
-test("control generation change during capability preparation prevents returning or recording authority", async () => {
+test("worktree identity change during capability preparation prevents returning or recording authority", async () => {
   const f = await fixture();
   await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "development-credentials" }, async (input) => {
     const resolved = await resolveToolingCompatibility(input);
-    // Even a pause/resume round trip invalidates the in-flight operation.
-    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlGeneration: { increment: 2 } } });
+    // A changed worktree cannot receive authority prepared for the old one.
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { worktreePath: "/changed-worktree" } });
     return resolved;
-  })).rejects.toThrow("control changed");
+  })).rejects.toThrow("owning task primary");
   expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
 });
 
@@ -206,14 +226,14 @@ test("old-pin Merge creates one durable continuation and provenance without a pr
   expect(await db.prisma.runtimeInstruction.count()).toBe(1);
 });
 
-test("pause and revoked authority block compatibility and retries before dispatch", async () => {
+test("closure and revoked authority block compatibility and retries before dispatch", async () => {
   const f = await fixture();
   let compositions = 0;
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "human" } });
-  expect((await f.merge({ compose: async () => { compositions++; return "unused"; } })).detail).toContain("paused");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  expect((await f.merge({ compose: async () => { compositions++; return "unused"; } })).detail).toContain("existing task primary");
   expect(compositions).toBe(0);
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "agent" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
   await f.merge();
   f.revoke();
   expect((await f.merge()).detail).toContain("revoked");
@@ -277,12 +297,12 @@ test("approval validation fails before composition or host capability effects", 
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
 });
 
-test("paused preparation cannot install or select a compatibility capability", async () => {
+test("closed preparation cannot install or select a compatibility capability", async () => {
   const f = await fixture(true);
-  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
   let composed = false;
   await expect(prepareTaskPrompt({ prisma: db.prisma, task: f.task, repository: f.repository, installRoot: f.config.installRoot, worktreePath: f.repository.root,
-    provider: "codex", seed: "Prepare", compose: async () => { composed = true; throw new Error("missing"); } })).rejects.toThrow("paused");
+    provider: "codex", seed: "Prepare", compose: async () => { composed = true; throw new Error("missing"); } })).rejects.toThrow("closed");
   expect(composed).toBeFalse();
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).recoveryDetail).toBeNull();
 });

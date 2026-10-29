@@ -7,7 +7,7 @@ import { runRuntimeProjectionAttempt } from "../sessions/runtime-events/projecti
 
 const now = new Date("2026-10-27T12:00:00Z").getTime();
 const before = (seconds: number) => new Date(now - seconds * 1000);
-const task = { id: "task", phase: "working", controlMode: "agent", recoveryDetail: null };
+const task = { id: "task", ownerPaused: false, phase: "working", recoveryDetail: null };
 const session = { id: "primary", status: "idle", closedAt: null, recoveryDetail: null };
 const instruction = (state: string, id = state) => ({ id, state, detail: null, createdAt: before(90), updatedAt: before(30), sequence: 1 });
 const derive = (input: Partial<Parameters<typeof deriveSessionActivity>[0]> = {}) => deriveSessionActivity({ task, session, now, pending: [], questions: [], latestTurn: null, ...input });
@@ -31,10 +31,7 @@ test("queued capacity/session waits are not executing or failed delivery", () =>
   expect(derive({ pending: [instruction("unknown"), ...pending] })).toMatchObject({ state: "stalled", durationMs: 30_000, delivery: { counts: { unknown: 1, queued: 1 } } });
 });
 
-test("control and unanswered questions are independent from execution and queue receipts", () => {
-  const pending = [instruction("queued")];
-  expect(derive({ task: { ...task, controlMode: "paused" }, pending })).toMatchObject({ state: "paused", durationMs: null, delivery: { counts: { queued: 1 } } });
-  expect(derive({ task: { ...task, controlMode: "draining" }, pending, observation: { state: "executing", observedAt: now } })).toMatchObject({ state: "executing", control: { mode: "draining" } });
+test("unanswered questions are independent from execution and queue receipts", () => {
   const question = { id: "question", state: "posted", createdAt: before(90), updatedAt: before(20) };
   expect(derive({ questions: [question] })).toMatchObject({ state: "waiting-owner", durationMs: 20_000 });
   expect(derive({ questions: [{ ...question, state: "unknown" }] }).state).toBe("stalled");
@@ -43,7 +40,7 @@ test("control and unanswered questions are independent from execution and queue 
 
 test("a completed turn does not fabricate task completion and closed tasks retain queued telemetry", () => {
   const latestTurn = { id: "event", requestId: "request", phase: "completed", occurredAt: before(10), sequence: 1 };
-  expect(derive({ latestTurn })).toMatchObject({ state: "idle", control: { reportedPhase: "working" }, latestTurn: { phase: "completed", ageMs: 10_000 } });
+  expect(derive({ latestTurn })).toMatchObject({ state: "idle", progress: { reportedPhase: "working" }, latestTurn: { phase: "completed", ageMs: 10_000 } });
   expect(derive({ task: { ...task, phase: "closed" }, pending: [instruction("queued")], latestTurn })).toMatchObject({ state: "closed", delivery: { counts: { queued: 1 } }, latestTurn: { phase: "completed" } });
   expect(derive({ session: { ...session, status: "closed", closedAt: before(5) } })).toMatchObject({ state: "closed", durationMs: 5000 });
 });
@@ -137,8 +134,8 @@ test("exhausted delivery retries expose bounded recovery without fabricating or 
   f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
   expect((await f.read())!.activity.state).toBe("executing");
   f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: now });
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  expect((await f.read())!.activity.state).toBe("paused");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  expect((await f.read())!.activity.state).toBe("closed");
 });
 
 async function reviewFixture() {
@@ -161,7 +158,7 @@ test("published source review waits for the owner without a question, survives r
   await f.prisma.$disconnect();
   expect((await f.read())!.activity).toMatchObject({ state: "waiting-owner", durationMs: 30_000, ownerQuestions: [], reviewHandoff: { receiptId: receipt.id, issueIdentifier: "DRA-57", issueId: "uuid:DRA-57", publishedAt: before(30).toISOString() } });
   await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.primary.id, action: "completion-contract", source: `owner:${f.task.id}`, key: "owner-merge", occurredAt: before(20), value: JSON.stringify({ boundary: "merge" }) } });
-  expect((await f.read())!.activity).toMatchObject({ state: "idle", reviewHandoff: null, control: { reportedPhase: "review" } });
+  expect((await f.read())!.activity).toMatchObject({ state: "idle", reviewHandoff: null, progress: { reportedPhase: "review" } });
   expect(f.runtime.sentMessages).toHaveLength(0);
 });
 
@@ -181,7 +178,7 @@ test("child, foreign connection, unconfirmed and legacy ambiguous review receipt
   expect((await f.read())!.activity.state).toBe("idle");
 });
 
-test("review handoff never hides executing, queued, active delegate, stalled, unknown or paused evidence", async () => {
+test("review handoff never hides executing, queued, active delegate, stalled, unknown or closed evidence", async () => {
   const f = await reviewFixture();
   await f.publish("review");
   f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
@@ -196,8 +193,8 @@ test("review handoff never hides executing, queued, active delegate, stalled, un
   await f.prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "completed" } });
   await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "active" } });
   expect((await f.read())!.activity.state).toBe("unknown");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  expect((await f.read())!.activity.state).toBe("paused");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  expect((await f.read())!.activity.state).toBe("closed");
 });
 
 test("owner Merge racing review publication acknowledgement suppresses stale owner wait", async () => {
@@ -213,7 +210,7 @@ test("explicit blocked or waiting progress exposes an unconfirmed dependency wit
   for (const phase of ["blocked", "waiting"]) {
     await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase, recoveryDetail: detail, updatedAt: before(90) } });
     await f.prisma.$disconnect();
-    expect((await f.read())!.activity).toMatchObject({ state: "waiting-dependency", cause: `Task reports a dependency; not independently confirmed: ${detail}`, since: null, durationMs: null, ownerQuestions: [], control: { reportedPhase: phase, reportedDetail: detail } });
+    expect((await f.read())!.activity).toMatchObject({ state: "waiting-dependency", cause: `Task reports a dependency; not independently confirmed: ${detail}`, since: null, durationMs: null, ownerQuestions: [], progress: { reportedPhase: phase, reportedDetail: detail } });
   }
   for (const recoveryDetail of [null, "", "  \n "]) {
     await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "blocked", recoveryDetail } });
@@ -224,7 +221,7 @@ test("explicit blocked or waiting progress exposes an unconfirmed dependency wit
   expect(f.runtime.sentMessages).toHaveLength(0);
 });
 
-test("reported dependency cannot override active work, queue, unknown result, or paused and closed control", async () => {
+test("reported dependency cannot override active work, queue, unknown result, or task closure", async () => {
   const f = await fixture();
   await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "blocked", recoveryDetail: "Awaiting dependency" } });
   f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: now });
@@ -244,9 +241,7 @@ test("reported dependency cannot override active work, queue, unknown result, or
   await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "active" } });
   expect((await f.read())!.activity.state).toBe("unknown");
   await f.prisma.runtimeSession.update({ where: { id: f.primary.id }, data: { status: "idle" } });
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { controlMode: "paused" } });
-  expect((await f.read())!.activity.state).toBe("paused");
-  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed", controlMode: "agent" } });
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
   expect((await f.read())!.activity.state).toBe("closed");
 });
 

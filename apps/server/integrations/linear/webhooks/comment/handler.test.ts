@@ -43,14 +43,14 @@ function comment(overrides: Partial<LinearCommentWebhook["data"]> = {}): LinearC
 function receive(webhook = comment(), deliveryId = "delivery", scopedConfig = config) {
   return handleCommentWebhook({ prisma: db.prisma, config: scopedConfig, agentRuntime: runtime, webhook, deliveryId });
 }
-async function primary(key = "one", overrides: { connectionId?: string; repositoryId?: string; machineId?: string; role?: string; status?: "active" | "idle" | "closed"; phase?: string; controlMode?: string } = {}) {
+async function primary(key = "one", overrides: { connectionId?: string; repositoryId?: string; machineId?: string; role?: string; status?: "active" | "idle" | "closed"; phase?: string } = {}) {
   const repositoryId = overrides.repositoryId ?? config.activeRepositoryId;
   const machineId = overrides.machineId ?? config.machine;
   const connectionId = overrides.connectionId ?? config.activeConnectionId;
   const session = await beginRuntimeSession(db.prisma, { sessionKey: key, agent: "codex", cwd: `/tmp/owner-comment-${key}`, repositoryId, machineId, role: overrides.role ?? "primary" });
   await db.prisma.runtimeSession.update({ where: { id: session.id }, data: { status: overrides.status ?? "active" } });
   await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId, resourceType: "issue-identifier", relationship: "handles", externalId: "DRA-28" } });
-  const task = await db.prisma.remoteTask.create({ data: { requestKey: key, repositoryId, machineId, connectionId, issueIdentifier: "DRA-28", branchName: key, worktreePath: session.cwd, toolingRoot: "/tmp/tooling", toolingRevision: "pinned", primarySessionId: session.id, phase: overrides.phase ?? "working", controlMode: overrides.controlMode ?? "agent" } });
+  const task = await db.prisma.remoteTask.create({ data: { requestKey: key, repositoryId, machineId, connectionId, issueIdentifier: "DRA-28", branchName: key, worktreePath: session.cwd, toolingRoot: "/tmp/tooling", toolingRevision: "pinned", primarySessionId: session.id, phase: overrides.phase ?? "working" } });
   runtime.putSession({ ...session, agent: "codex", status: overrides.status ?? "active" });
   return { session, task };
 }
@@ -90,17 +90,6 @@ test("edits are new instructions while identical repeated bodies deduplicate", a
   expect(await db.prisma.runtimeInstruction.count()).toBe(2);
 });
 
-test.each(["paused", "human", "draining"])("owner instruction waits during %s control and resumes only on explicit handback", async (controlMode) => {
-  const { session, task } = await primary("one", { controlMode, status: "idle" });
-  await receive();
-  await deliverInstructions(db.prisma, runtime);
-  expect(runtime.sentMessages).toHaveLength(0);
-  expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).state).toBe("queued");
-  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { controlMode: "agent" } });
-  await deliverInstructions(db.prisma, runtime);
-  await waitForCompletion();
-  expect(runtime.sentMessages[0]?.sessionId).toBe(session.id);
-});
 
 test.each([
   { connectionId: "other" }, { repositoryId: "other" }, { machineId: "other" },
@@ -349,18 +338,6 @@ test.each(["closed", "stale-link"])("a %s child ownership cannot fall through to
   expect(dispatch).not.toHaveBeenCalled();
 });
 
-test("child instructions queue through human control and return to the same parent after handback", async () => {
-  const { session, task } = await primary("one", { status: "idle", controlMode: "human" });
-  await bindChild(session.id);
-  await receive(childComment());
-  await deliverInstructions(db.prisma, runtime);
-  expect(runtime.sentMessages).toHaveLength(0);
-  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { controlMode: "agent" } });
-  await deliverInstructions(db.prisma, runtime);
-  await waitForCompletion();
-  expect(runtime.sentMessages[0]?.sessionId).toBe(session.id);
-});
-
 async function waitForCompletion(state = "completed") {
   for (let attempt = 0; attempt < 50; attempt++) {
     await deliverInstructions(db.prisma, runtime);
@@ -369,3 +346,17 @@ async function waitForCompletion(state = "completed") {
   }
   throw new Error("Instruction did not complete");
 }
+
+
+test("owner comments remain queued on the same task until its explicit owner pause is resumed", async () => {
+  const { session, task } = await primary("paused-owner", { status: "idle" });
+  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: true } });
+  await receive();
+  await deliverInstructions(db.prisma, runtime);
+  expect(runtime.sentMessages).toHaveLength(0);
+  expect((await db.prisma.runtimeInstruction.findFirstOrThrow()).state).toBe("queued");
+  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: false } });
+  await deliverInstructions(db.prisma, runtime);
+  await waitForCompletion();
+  expect(runtime.sentMessages[0]?.sessionId).toBe(session.id);
+});

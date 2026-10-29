@@ -114,7 +114,7 @@ export async function assertCompletionAllowed(input: { prisma: PrismaClient; con
   const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
   if (!task) throw new Error("Terminal completion requires an explicit managed-task completion boundary");
   const owned = await ownedTask({ ...input, taskId: task.id });
-  if (task.phase === "closed" || task.controlMode !== "agent" || owned.session.status === "closed") throw new Error("Task completion is paused, closed or under human control");
+  if ((task.ownerPaused || task.phase === "closed") || owned.session.status === "closed") throw new Error("Task completion is closed");
   const contract = await contractFor(input.prisma, task.id, input.sessionId);
   if (!contract || contract.value.boundary === "revoked") throw new Error("Completion boundary is unknown or revoked; an explicit owner decision is required");
   if (await worktreeIsMissing(task.worktreePath!)) return confirmedFinalizationDelivery({ ...input, taskId: task.id, contractRevision: contract.revision });
@@ -155,7 +155,7 @@ export async function assertCompletionAllowed(input: { prisma: PrismaClient; con
   if (boundary.boundary === "merge" && (pr?.state !== "MERGED" || !pr.mergeCommit?.oid)) throw new Error("The authorized pull request has not been merged");
   const latest = await contractFor(input.prisma, task.id, input.sessionId);
   const currentTask = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
-  if (latest?.revision !== contract.revision || currentTask.controlMode !== "agent" || currentTask.phase === "closed") throw new Error("Completion authority or task control changed during verification");
+  if (latest?.revision !== contract.revision || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Completion authority or task identity changed during verification");
   const current = await observer.snapshot(task.worktreePath!);
   if (current.fingerprint !== snapshot.fingerprint || current.branch !== snapshot.branch || current.head !== snapshot.head || current.clean !== snapshot.clean) throw new Error("Worktree changed during completion verification");
   return { boundary: boundary.boundary, receipts };
@@ -175,7 +175,7 @@ export async function recordOwnerMergeApproval(input: Context & {
   if (!subscribed || webhook.data.state?.name !== "Merge" || input.currentIssueState !== "Merge" || !webhook.updatedFrom?.stateId || workflow?.on !== "issue.state-changed" || !workflow.when?.some((condition) => condition["issue.state"]?.includes("Merge"))) {
     throw new Error("Completion authority requires the subscribed owner's current configured Merge transition");
   }
-  if (task.controlMode !== "agent" || task.phase === "closed" || session.status === "closed") throw new Error("Task completion authority is paused or closed");
+  if ((task.ownerPaused || task.phase === "closed") || session.status === "closed") throw new Error("Task completion authority is closed");
   const run = await input.prisma.workerRun.findUnique({ where: { id: input.runId }, include: { receipt: true } });
   const receipt = run?.receipt;
   if (!run || !receipt || run.workerKey !== `product.workflow:${input.workflowId}` || receipt.provider !== "linear" || receipt.eventType !== "issue" || receipt.webhookId !== config.activeWebhookId || receipt.connectionId !== task.connectionId || receipt.repositoryId !== task.repositoryId || receipt.resourceId !== task.issueIdentifier || receipt.resourceId !== webhook.data.identifier || !receipt.trigger?.split(",").includes(input.workflowId)) {
@@ -208,10 +208,10 @@ export async function recordOwnerMergeApproval(input: Context & {
     const currentTask = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
     if (duplicate) {
       const authority = latest && CompletionContractInput.parse(JSON.parse(latest.value!));
-      if (authority?.requestKey !== requestKey || authority.boundary !== "merge" || currentTask.controlMode !== "agent" || currentTask.phase === "closed") throw new Error("Owner completion authority or control changed during Merge acceptance");
+      if (authority?.requestKey !== requestKey || authority.boundary !== "merge" || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Owner completion authority or task closure changed during Merge acceptance");
       return JSON.parse(duplicate.value!);
     }
-    if ((latest?.sequence ?? 0) !== contract.expectedRevision || currentTask.controlMode !== "agent" || currentTask.phase === "closed") throw new Error("Owner completion authority or control changed during Merge acceptance");
+    if ((latest?.sequence ?? 0) !== contract.expectedRevision || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Owner completion authority or task closure changed during Merge acceptance");
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, action: CONTRACT, source, key: requestKey, value: JSON.stringify(contract) } });
     const approval = { ...provenance, contractRevision: event.sequence };
     await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, action: VERIFICATION, source, key: requestKey, value: JSON.stringify({ contractRevision: event.sequence, snapshot, verification: { requestKey, passed: true, evidence: [contract.basis] }, provenance: approval }) } });

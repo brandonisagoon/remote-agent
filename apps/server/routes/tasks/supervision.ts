@@ -2,10 +2,11 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { queueInstruction, deliverInstructions, resolveTaskInstruction } from "../../services/sessions/inbox.ts";
-import { changeTaskControl } from "../../services/tasks/control.ts";
 import { answerSessionQuestion } from "../../services/sessions/questions.ts";
 import { readTaskActivity } from "../../services/tasks/activity.ts";
 import { ProjectionRetryStage, retryTaskRuntimeProjection } from "../../services/sessions/runtime-events/projection-retries.ts";
+
+import { taskResponse } from "./response.ts";
 
 export const taskSupervisionRoutes = new Hono<AppEnv>();
 
@@ -57,28 +58,38 @@ taskSupervisionRoutes.post("/:taskId/instructions/:instructionId/resolve", async
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
+// Owner pause/resume is independent of browser viewing.
 taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
   const parsed = z.object({ action: z.enum(["pause", "resume", "close"]) }).strict().safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Choose pause, resume, or close" }, 400);
   const prisma = c.get("prisma"), runtime = c.get("agentRuntime");
   const task = await prisma.remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
   if (!task) return c.json({ error: "Task not found" }, 404);
-  const controllerId = `task-supervisor:${task.id}`;
   try {
-    if (task.controllerId && task.controllerId !== controllerId) throw new Error("Return control from the browser viewer first");
-    if (parsed.data.action === "resume") {
-      await changeTaskControl(prisma, runtime, { taskId: task.id, controllerId, action: "resume" });
-    } else {
-      await changeTaskControl(prisma, runtime, { taskId: task.id, controllerId, action: "take" });
-      await changeTaskControl(prisma, runtime, { taskId: task.id, controllerId, action: "pause" });
-      if (parsed.data.action === "close") {
-        if (task.primarySessionId) {
-          await runtime.close(task.primarySessionId, "Owner closed task; code, history and retained previews are preserved");
-          await prisma.runtimeInstruction.updateMany({ where: { sessionId: task.primarySessionId, state: "queued" }, data: { state: "cancelled", detail: "Task closed by owner" } });
+    if (parsed.data.action !== "close") {
+      if (task.phase === "closed") throw new Error("A closed task cannot be resumed");
+      const paused = parsed.data.action === "pause";
+      // Persist first: active turns and queued delegates observe the same pause.
+      await prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: paused } });
+      if (paused && task.worktreePath) {
+        for (const session of await runtime.listSessions({ cwd: task.worktreePath })) {
+          if (session.cwd === task.worktreePath && session.repositoryId === task.repositoryId && session.machineId === task.machineId && session.status !== "closed") {
+            await runtime.cancel(session.id, "Owner paused task");
+          }
         }
-        await prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "closed", recoveryDetail: "Agent closed. Resource cleanup is a separate operation; inspect retained resources." } });
+      }
+      return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
+    }
+    // Stop new deliveries before cancelling current work, including delegates.
+    await prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "closed", recoveryDetail: "Agent closed. Resource cleanup is a separate operation; inspect retained resources." } });
+    if (task.worktreePath) {
+      const sessions = await runtime.listSessions({ cwd: task.worktreePath });
+      for (const session of sessions) {
+        if (session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId) continue;
+        await runtime.close(session.id, "Owner closed task; code, history and retained previews are preserved");
+        await prisma.runtimeInstruction.updateMany({ where: { sessionId: session.id, state: "queued" }, data: { state: "cancelled", detail: "Task closed by owner" } });
       }
     }
-    return c.json({ task: await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } }) });
+    return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });

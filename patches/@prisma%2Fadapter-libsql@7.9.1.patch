@@ -1,0 +1,99 @@
+diff --git a/node_modules/@prisma/adapter-libsql/.bun-tag-29b507c8ee7a75af b/.bun-tag-29b507c8ee7a75af
+new file mode 100644
+index 0000000000000000000000000000000000000000..e69de29bb2d1d6434b8b29ae775ad8c2e48c5391
+diff --git a/dist/index-node.js b/dist/index-node.js
+index e2ce7ffba13e9ec10bb7f320facb71be90f042ed..e19a8553c390212240ca61451d5f3c55f782adf7 100644
+--- a/dist/index-node.js
++++ b/dist/index-node.js
+@@ -392,7 +392,42 @@ var PrismaLibSqlAdapter = class extends LibSqlQueryable {
+     debug2("%s options: %O", tag, options);
+     const release = await this[LOCK_TAG].acquire();
+     try {
+-      const tx = await this.client.transaction("deferred");
++      // The adapter holds LOCK_TAG until commit/rollback, so local transactions
++      // can use this connection. libSQL's transaction() detaches a native
++      // connection on every call and retains its handles until GC:
++      // https://github.com/tursodatabase/libsql-client-ts/issues/350
++      let tx;
++      if (this.client.protocol === "file") {
++        await this.client.execute("BEGIN DEFERRED");
++        let closed = false;
++        tx = {
++          execute: (query) => {
++            if (closed) throw new Error("The transaction is closed");
++            return this.client.execute(query);
++          },
++          commit: async () => {
++            if (closed) throw new Error("The transaction is closed");
++            try {
++              await this.client.execute("COMMIT");
++            } catch (error) {
++              await this.client.execute("ROLLBACK");
++              throw error;
++            } finally {
++              closed = true;
++            }
++          },
++          rollback: async () => {
++            if (closed) return;
++            try {
++              await this.client.execute("ROLLBACK");
++            } finally {
++              closed = true;
++            }
++          }
++        };
++      } else {
++        tx = await this.client.transaction("deferred");
++      }
+       return new LibSqlTransaction(tx, options, this.adapterOptions, release);
+     } catch (e) {
+       release();
+diff --git a/dist/index-node.mjs b/dist/index-node.mjs
+index 0913bc0339471e7a96594d5441b1dd39f9d9ec0e..be3f540fe9c6f61caace16c8bd268cae6b9a3a04 100644
+--- a/dist/index-node.mjs
++++ b/dist/index-node.mjs
+@@ -366,7 +366,42 @@ var PrismaLibSqlAdapter = class extends LibSqlQueryable {
+     debug2("%s options: %O", tag, options);
+     const release = await this[LOCK_TAG].acquire();
+     try {
+-      const tx = await this.client.transaction("deferred");
++      // The adapter holds LOCK_TAG until commit/rollback, so local transactions
++      // can use this connection. libSQL's transaction() detaches a native
++      // connection on every call and retains its handles until GC:
++      // https://github.com/tursodatabase/libsql-client-ts/issues/350
++      let tx;
++      if (this.client.protocol === "file") {
++        await this.client.execute("BEGIN DEFERRED");
++        let closed = false;
++        tx = {
++          execute: (query) => {
++            if (closed) throw new Error("The transaction is closed");
++            return this.client.execute(query);
++          },
++          commit: async () => {
++            if (closed) throw new Error("The transaction is closed");
++            try {
++              await this.client.execute("COMMIT");
++            } catch (error) {
++              await this.client.execute("ROLLBACK");
++              throw error;
++            } finally {
++              closed = true;
++            }
++          },
++          rollback: async () => {
++            if (closed) return;
++            try {
++              await this.client.execute("ROLLBACK");
++            } finally {
++              closed = true;
++            }
++          }
++        };
++      } else {
++        tx = await this.client.transaction("deferred");
++      }
+       return new LibSqlTransaction(tx, options, this.adapterOptions, release);
+     } catch (e) {
+       release();

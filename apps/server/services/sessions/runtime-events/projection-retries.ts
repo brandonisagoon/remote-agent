@@ -96,7 +96,7 @@ export async function retryTaskRuntimeProjection(prisma: PrismaClient, input: {
   return prisma.$transaction(async (tx) => {
     const task = await tx.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
     const session = await tx.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
-    if (!task.primarySessionId || task.phase === "closed" || task.controlMode !== "agent" || session.status === "closed") throw new Error("Projection recovery requires an open agent-controlled task and session");
+    if (!task.primarySessionId || (task.ownerPaused || task.phase === "closed") || session.status === "closed") throw new Error("Projection recovery requires an open task and session");
     const primary = session.id === task.primarySessionId ? session : await tx.runtimeSession.findUniqueOrThrow({ where: { id: task.primarySessionId } });
     if (primary.role !== "primary" || primary.status === "closed" || primary.cwd !== task.worktreePath || primary.repositoryId !== task.repositoryId || primary.machineId !== task.machineId) throw new Error("Projection task primary is closed or its ownership changed");
     if (session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId) throw new Error("Projection session does not belong to this task");
