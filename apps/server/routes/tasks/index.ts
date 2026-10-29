@@ -84,7 +84,21 @@ taskRoutes.post("/", async (c) => {
   return c.json({ task }, 201);
 });
 
-taskRoutes.get("/", async (c) => c.json({ tasks: await c.get("prisma").remoteTask.findMany({ include: { resources: true }, orderBy: { updatedAt: "desc" }, take: 100 }) }));
+taskRoutes.get("/", async (c) => {
+  const prisma = c.get("prisma");
+  // Preserve the desktop's recent-task view. Maintenance explicitly requests
+  // a stable ID order so activity cannot move tasks between cursor pages.
+  if (c.req.query("pagination") !== "id") return c.json({ tasks: await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { updatedAt: "desc" }, take: 100 }) });
+  const cursor = c.req.query("cursor");
+  const rows = await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { id: "asc" }, take: 101, ...(cursor ? { where: { id: { gt: cursor } } } : {}) });
+  const tasks = rows.slice(0, 100);
+  const complete = tasks.filter((task) => task.phase === "complete" && task.primarySessionId);
+  const prepared = complete.length ? await prisma.runtimeMetadataEvent.findMany({ where: {
+    action: "finalization-prepared", source: { in: complete.map((task) => `finalizer:${task.id}`) },
+    runtimeSessionId: { in: complete.map((task) => task.primarySessionId!) },
+  }, select: { source: true, runtimeSessionId: true } }) : [];
+  return c.json({ tasks: tasks.map((task) => ({ ...task, finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) })), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
+});
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
   return task ? c.json({ task }) : c.json({ error: "Task not found" }, 404);
