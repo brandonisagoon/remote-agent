@@ -210,7 +210,8 @@ test("task closure stops its sessions without a browser takeover endpoint", asyn
     method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(body),
   });
   expect((await post("control", { controllerId: "old-viewer", action: "take" })).status).toBe(404);
-  expect((await post("automation", { action: "pause" })).status).toBe(200);
+  // This fake accepts cancellation without publishing a terminal receipt.
+  expect((await post("automation", { action: "pause" })).status).toBe(202);
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).ownerPaused).toBeTrue();
   expect((await post("automation", { action: "resume" })).status).toBe(200);
   const closed = await post("automation", { action: "close" });
