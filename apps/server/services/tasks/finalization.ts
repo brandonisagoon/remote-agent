@@ -4,13 +4,15 @@ import { getRepositoryConfig } from "../../../../lib/config.ts";
 import { linkedSourceIssue } from "../sessions/questions.ts";
 import { assertCompletionAllowed } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
+import { latestExternalBinding } from "./external-deliveries.ts";
+import { prepareExternalFinalization, confirmExternalFinalization } from "./external-finalization.ts";
 import {
   FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization,
   assertFinalizationAuthority, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing,
   type FinalizationContext,
 } from "./finalization-receipts.ts";
 
-export const FinalizationInput = z.object({ requestKey: z.string().trim().min(1).max(180) }).strict();
+export const FinalizationInput = z.object({ requestKey: z.string().trim().min(1).max(180), finalizationVersion: z.literal(2).optional(), authorityOnly: z.literal(true).optional() }).strict().refine((value) => !value.authorityOnly || value.finalizationVersion === 2, "Authority-only checks require finalization version 2");
 export const finalizationDependencies = { source: linkedSourceIssue, completion: assertCompletionAllowed, snapshot: completionObservation.snapshot };
 type Dependencies = typeof finalizationDependencies;
 
@@ -46,6 +48,9 @@ function result(prepared: PreparedFinalization, preparedRevision: number, confir
  * creates no cleanup effects and never treats a model resource as authority. */
 export async function prepareTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
   const task = await owned(input);
+  if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) return prepareExternalFinalization(input);
+  if (input.authorityOnly) throw new Error("Authority-only checks require external finalization version 2");
+  if (input.finalizationVersion === 2) throw new Error("Finalization version 2 requires an adopted external delivery binding");
   const source = await sourceAuthority(input, task.id, dependencies);
   if (source.link.connectionId !== task.connectionId || source.issue.identifier !== task.issueIdentifier || source.session.id !== input.sessionId) throw new Error("Finalization source does not belong to this task");
   const where = { runtimeSessionId: input.sessionId, action: FINALIZATION_PREPARED, source: `finalizer:${task.id}`, key: input.requestKey };
@@ -103,6 +108,9 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
  * anything after an interrupted adapter. The provider remains open for Done. */
 export async function confirmTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
   const task = await owned(input);
+  if (input.authorityOnly) throw new Error("Authority-only checks cannot confirm finalization");
+  if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) return confirmExternalFinalization(input);
+  if (input.finalizationVersion === 2) throw new Error("Finalization version 2 requires an adopted external delivery binding");
   const source = await sourceAuthority(input, task.id, dependencies);
   const where = { runtimeSessionId: input.sessionId, source: `finalizer:${task.id}`, key: input.requestKey };
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_PREPARED } });

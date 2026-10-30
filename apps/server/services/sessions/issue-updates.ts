@@ -10,6 +10,8 @@ import { updateSourceIssue } from "../../integrations/linear/session-store/sourc
 import { assertTaskOpen } from "../tasks/task-state.ts";
 import { taskForSession } from "../tasks/store.ts";
 import { assertCompletionAllowed } from "../tasks/completion.ts";
+import { latestExternalBinding } from "../tasks/external-deliveries.ts";
+import { assertExternalDoneAllowed } from "../tasks/external-finalization.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { registerThread } from "./threads.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
@@ -24,7 +26,11 @@ type Input = z.infer<typeof IssueUpdateInput>;
 export const issueUpdateDelivery = {
   source: linkedSourceIssue, read: getSourceIssueForUpdate, update: updateSourceIssue,
   graph: getIssueWorkGraph,
-  complete: async (input: Parameters<typeof assertCompletionAllowed>[0]) => { await assertCompletionAllowed(input); },
+  complete: async (input: Parameters<typeof assertCompletionAllowed>[0] & Partial<Input>) => {
+    const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
+    if (task && await latestExternalBinding(input.prisma, task.id, input.sessionId)) await assertExternalDoneAllowed(input);
+    else await assertCompletionAllowed(input);
+  },
   upload: uploadIssueEvidence, attach: attachIssueEvidence, create: createThreadedIssueComment, comment: fetchIssueCommentIdentity,
 };
 
@@ -76,7 +82,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
     if (target?.name === "Merge" && latest.state.name !== "Merge") throw new Error("Only an owner-selected Merge state authorizes delivery; agents cannot select it");
-    if (target?.type === "completed" && target.name !== "Manual Review") await client.complete({ prisma, config, sessionId });
+    if (target?.type === "completed" && target.name !== "Manual Review") await client.complete({ ...payload, prisma, config, sessionId });
     if (task && target && (target.type === "completed" || target.name === "Manual Review" || target.name === "Merge")) {
       const graph = await client.graph(config, { id: issue.id });
       const unfinished = [];
@@ -128,6 +134,9 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     const confirmed = await client.read(config, { id: issue.id });
     if (confirmed?.state.id !== target.id) throw new Error("Issue state change is unconfirmed; inspect and retry the same update");
   }
+  // Revalidate completion after the state effect. This also reconciles an exact
+  // pending external Done handoff when its provider acknowledgement was lost.
+  await checkState();
   // Keep the resolved provider identity separate from the caller's immutable
   // retry payload. A primary can also publish child updates; consumers must not
   // mistake those receipts for a handoff of its source issue. Commit only after

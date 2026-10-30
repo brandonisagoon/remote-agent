@@ -1,5 +1,15 @@
 import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { linearGraphql } from "./client.ts";
+import { z } from "zod";
+
+/** Owner acceptance needs author, issue, organization and edit identity;
+ * a generic comment body or session-written resource receipt cannot supply it. */
+export async function fetchQualifiedIssueComment(apiKey: LinearCredential, commentId: string) {
+  const result = await linearGraphql<unknown>(apiKey,
+    "query AcceptedComment($commentId: String!) { organization { id } comment(id: $commentId) { id body createdAt updatedAt user { id } issue { id identifier } } }", { commentId });
+  return z.object({ organization: z.object({ id: z.string().min(1) }), comment: z.object({ id: z.string(), body: z.string(),
+    createdAt: z.iso.datetime(), updatedAt: z.iso.datetime(), user: z.object({ id: z.string() }), issue: z.object({ id: z.string(), identifier: z.string() }) }) }).parse(result);
+}
 
 const CREATE_ISSUE_COMMENT = `
   mutation CreateIssueComment($issueId: String!, $body: String!) {

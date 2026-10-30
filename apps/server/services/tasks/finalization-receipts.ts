@@ -26,7 +26,7 @@ export const PreparedFinalization = z.object({
   delivery: CompletionDelivery,
 });
 export type PreparedFinalization = z.infer<typeof PreparedFinalization>;
-export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string };
+export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true };
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
 
 export async function finalizationGit(cwd: string, args: string[]) {
@@ -46,7 +46,7 @@ export async function worktreeIsMissing(worktree: string) {
 }
 
 /** Only server-observed Git registration and absence count as removal proof. */
-export async function assertFinalizationRemoved(prepared: PreparedFinalization) {
+export async function assertFinalizationRemoved(prepared: Pick<PreparedFinalization, "worktree" | "registeredWorktree" | "gitDirectory" | "gitCwd" | "branch">) {
   if (!(await worktreeIsMissing(prepared.worktree)) || !(await worktreeIsMissing(prepared.registeredWorktree))) throw new Error("Finalization worktree still exists; cleanup is not confirmed");
   if (await realpath(prepared.gitDirectory) !== prepared.gitDirectory || await realpath(prepared.gitCwd) !== prepared.gitCwd) throw new Error("Finalization repository identity changed");
   const directory = await realpath(await finalizationGit(prepared.gitCwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
