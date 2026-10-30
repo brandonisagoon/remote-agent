@@ -1,8 +1,10 @@
+import { assertRequestActive } from "../../request-lifetime.ts";
+import { preparationStage } from "./preparation-diagnostics.ts";
 import { hasCleanupAdapter, hasHistoricalCleanupAdapter } from "./cleanup-adapter-resources.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { completionObservation } from "./completion-observation.ts";
-import { assertExternalBindingAuthority, assertExternalResourceRecords, externalBindingDependencies, externalOwnerHistory, externalTaskOwnership, latestExternalBinding } from "./external-deliveries.ts";
+import { requestExternalObservations, assertExternalBindingAuthority, assertExternalResourceRecords, externalBindingDependencies, externalOwnerHistory, externalTaskOwnership, latestExternalBinding } from "./external-deliveries.ts";
 import { EXTERNAL_BINDING, ExternalBinding, DeliveredRetirementBinding, DeliveredRetirementInput, externalDigest } from "./external-delivery-schema.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { originalWorkRetainedPlans } from "./original-work.ts";
@@ -27,7 +29,8 @@ async function source(input: Context, current: Awaited<ReturnType<typeof ownersh
 }
 
 export async function inspectLegacyDelivery(input: Context, dependencies = legacyDeliveryDependencies) {
-  const current = await ownership(input);
+  dependencies = { ...dependencies, ...requestExternalObservations(dependencies) };
+  const current = await preparationStage("ownership", () => ownership(input));
   const prior = await latestExternalBinding(input.prisma, input.taskId, current.session.id);
   return { taskId: input.taskId, sessionId: current.session.id, revision: prior?.sequence ?? 0, identity: current.identity, identityDigest: current.identityDigest,
     source: await source(input, current, dependencies), cleanupSnapshot: await dependencies.snapshot(current.identity.taskWorktree),
@@ -37,7 +40,9 @@ export async function inspectLegacyDelivery(input: Context, dependencies = legac
 /** Authenticated present-day acceptance, explicitly distinct from historical
  * Merge workflow approval. The original unmerged head is never called shipped. */
 export async function adoptLegacyDelivery(input: Context & { retirement: DeliveredRetirementInput }, dependencies = legacyDeliveryDependencies) {
-  const request = DeliveredRetirementInput.parse(input.retirement), current = await ownership(input);
+  assertRequestActive();
+  dependencies = { ...dependencies, ...requestExternalObservations(dependencies) };
+  const request = DeliveredRetirementInput.parse(input.retirement), current = await preparationStage("ownership", () => ownership(input));
   const where = { runtimeSessionId: current.session.id, source: `owner:${input.taskId}`, action: EXTERNAL_BINDING };
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, key: request.requestKey } });
   if (prior) {
@@ -81,14 +86,18 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
   const binding = DeliveredRetirementBinding.parse({ version: 2, input: request, identity: current.identity, contractRevision: null, contractDigest: null, verificationRevision: null,
     manifestDigest: externalDigest(request), acceptance: { kind: "present-day-owner", issueId: request.source.issueId, stateId: request.source.stateId, sourceUpdatedAt: request.source.updatedAt, basis: request.basis, createdAt: new Date().toISOString() },
     ownerHistoryRevision: current.ownerHistoryRevision, cleanupSnapshot: cleanup, deliveries, resources: plan, resourcePlanDigest: finalizationDigest(plan), ...(originalWork ? { originalWork } : {}) });
-  return input.prisma.$transaction(async tx => {
+  assertRequestActive();
+  return preparationStage("persistence", () => input.prisma.$transaction(async tx => {
+    assertRequestActive();
     const live = await externalTaskOwnership(tx, input.config, input.taskId);
     if (externalDigest(live.identity) !== externalDigest(current.identity) || live.task.phase !== current.task.phase || await externalOwnerHistory(tx, input.taskId, current.session.id) !== current.ownerHistoryRevision || ((await latestExternalBinding(tx, input.taskId, current.session.id))?.sequence ?? 0) !== request.expectedBindingRevision) throw new Error("Delivered retirement authority changed during adoption");
     if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: current.session.id, source: `finalizer:${input.taskId}`, action: "finalization-prepared" } })) throw new Error("Finalization was prepared concurrently");
     assertExternalResourceRecords(await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, false);
     await assertPreservationSources(tx, input.taskId, current.session.id, plan);
+    assertRequestActive();
     const event = await tx.runtimeMetadataEvent.create({ data: { ...where, key: request.requestKey, value: JSON.stringify(binding) } });
     await tx.remoteTask.update({ where: { id: input.taskId }, data: { phase: "complete" } });
+    assertRequestActive();
     return { revision: event.sequence, binding };
-  });
+  }));
 }

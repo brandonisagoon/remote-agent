@@ -1,3 +1,5 @@
+import { assertRequestActive } from "../../request-lifetime.ts";
+import { preparationStage } from "./preparation-diagnostics.ts";
 import { hasCleanupAdapter, hasHistoricalCleanupAdapter } from "./cleanup-adapter-resources.ts";
 import { resolveCleanupObserver } from "./cleanup-resource-observer.ts";
 import { prepareOriginalWork, assertOriginalWork, originalWorkRetainedPlans } from "./original-work.ts";
@@ -21,6 +23,27 @@ export const externalBindingDependencies = { source: linkedSourceIssue, comment:
   delivered: observeDeliveredScope, cleanupObserver: resolveCleanupObserver,
   handoffComment: fetchIssueCommentIdentity, snapshot: observeReadonlyCompletionSnapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
+
+/** Request-local checkpoints and safe stage names; internal callers keep the
+ * same observations and authority. No provider payload is used as diagnostics. */
+export function requestExternalObservations(dependencies: ExternalDependencies): ExternalDependencies {
+  return { ...dependencies,
+    source: (...args) => preparationStage("source", () => dependencies.source(...args)),
+    comment: (...args) => preparationStage("source", () => dependencies.comment(...args)),
+    snapshot: (...args) => preparationStage("fingerprint", () => dependencies.snapshot(...args)),
+    delivered: (...args) => preparationStage("delivery", () => dependencies.delivered(...args)),
+    cleanupObserver: (...args) => preparationStage("resource-plan", () => dependencies.cleanupObserver(...args)),
+    originalWork: (...args) => preparationStage("retained-archives", () => dependencies.originalWork(...args)),
+    resources: (...args) => preparationStage("resource-plan", () => dependencies.resources(...args)),
+    assertResources: (...args) => preparationStage("verification", () => dependencies.assertResources(...args)),
+    assertOriginalWork: (...args) => preparationStage("retained-archives", () => dependencies.assertOriginalWork(...args)),
+    observer: { ...dependencies.observer,
+      source: (...args) => preparationStage("fingerprint", () => dependencies.observer.source(...args)),
+      remote: (...args) => preparationStage("delivery", () => dependencies.observer.remote(...args)),
+    },
+  };
+}
+
 
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem
  * and provider observations finish before acquiring the database write lock. */
@@ -126,6 +149,8 @@ async function checkComment(input: Context, sessionId: string, bindingInput: Ext
 /** Bearer-owner-only scope adoption. Existing contracts and verification events
  * remain untouched. A model resource receipt cannot reach this authority. */
 export async function adoptExternalDeliveries(input: Context & { binding: ExternalDeliveryBindingInput }, dependencies = externalBindingDependencies) {
+  assertRequestActive();
+  dependencies = requestExternalObservations(dependencies);
   const manifest = ExternalDeliveryBindingInput.parse(input.binding);
   const current = await externalTaskAuthority(input.prisma, input.config, input.taskId);
   if (!current.task.pinnedToolingRoot) throw new Error("External adoption requires the task's immutable pinned tooling checkout");
@@ -183,7 +208,9 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   for (const observed of deliveries) if (externalDigest(await dependencies.observer.source(manifest.deliveries.find((delivery) => delivery.id === observed.id)!)) !== externalDigest(observed.snapshot)) throw new Error("External source changed during adoption");
   await dependencies.assertResources({ taskId: input.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, removed: false, ...(originalWork ? { originalWork: true } : {}) });
   if (originalWork) await dependencies.assertOriginalWork({ taskId: input.taskId, originalWork, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), removed: false });
-  return input.prisma.$transaction(async (tx) => {
+  assertRequestActive();
+  return preparationStage("persistence", () => input.prisma.$transaction(async (tx) => {
+    assertRequestActive();
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey } });
     if (duplicate) {
       const saved = ExternalBinding.parse(JSON.parse(duplicate.value!));
@@ -196,9 +223,11 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
     if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: current.session.id, source: `finalizer:${input.taskId}`, action: "finalization-prepared" } })) throw new Error("Finalization was prepared during external adoption");
     assertExternalResourceRecords(await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, false);
     await assertPreservationSources(tx, input.taskId, current.session.id, plan);
+    assertRequestActive();
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey, value: JSON.stringify(binding) } });
+    assertRequestActive();
     return { revision: event.sequence, binding };
-  });
+  }));
 }
 
 /** Revalidates owner comment and exact remote identity even after source roots
