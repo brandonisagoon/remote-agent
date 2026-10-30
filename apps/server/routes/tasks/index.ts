@@ -1,5 +1,6 @@
 import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
 import { CleanupEnqueueInput, enqueueTaskCleanup } from "../../services/tasks/cleanup-inbox.ts";
+import { CleanupRetryDeferred } from "../../services/tasks/cleanup-retry.ts";
 import { deliverInstructions } from "../../services/sessions/inbox.ts";
 import { archiveRetentionProjection, assertArchiveResourceUpdate } from "../../services/tasks/archive-retention.ts";
 import { Hono } from "hono";
@@ -43,7 +44,10 @@ taskRoutes.post("/:taskId/cleanup-request", async (c) => {
     const result = await enqueueTaskCleanup({ ...request.data, runtime: c.get("agentRuntime"), prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") });
     void deliverInstructions(c.get("prisma"), c.get("agentRuntime"), c.get("config")).catch(() => undefined);
     return c.json(result, 202);
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+  } catch (error) {
+    if (error instanceof CleanupRetryDeferred) return c.json({ error: error.message, code: "cleanup_retry_deferred", retryAt: error.retryAt }, 409);
+    return c.json({ error: error instanceof Error ? error.message : String(error) }, 409);
+  }
 });
 
 taskRoutes.post("/:taskId/cleanup-progress", async (c) => {

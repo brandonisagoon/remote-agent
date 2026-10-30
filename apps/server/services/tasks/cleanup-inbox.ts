@@ -8,13 +8,14 @@ import { queueInstruction } from "../sessions/inbox.ts";
 import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { externalOwnerHistory, latestExternalBinding } from "./external-deliveries.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
+import { cleanupRetryEligibility, recordCleanupRetryInput } from "./cleanup-retry.ts";
 
 export const CLEANUP_INSTRUCTION = "finalization-cleanup-instruction";
 export const CLEANUP_REQUEST = "finalization-cleanup-request";
 export const CLEANUP_SUPERSEDED = "finalization-cleanup-superseded";
-export const CleanupEnqueueInput = z.object({ requestKey: z.string().trim().min(1).max(180) }).strict();
+export const CleanupEnqueueInput = z.object({ requestKey: z.string().trim().min(1).max(180), retry: z.literal("now").optional() }).strict();
 export const AutomaticCleanup = z.object({ kind: z.literal("primary-inbox"), initialInstructionId: z.string() }).strict();
-export type CleanupInboxStore = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeInstruction" | "runtimeMetadataEvent" | "runtimeLifecycleEvent" | "runtimeSessionResourceLink" | "runtimeSourceMessage">;
+export type CleanupInboxStore = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeInstruction" | "runtimeMetadataEvent" | "runtimeLifecycleEvent" | "runtimeSessionResourceLink" | "runtimeSourceMessage" | "remoteTaskResource">;
 const Pending = ["preparing", "queued", "dispatching", "unknown"];
 const MarkerIdentity = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), requestKey: z.string(),
   worktree: z.string(), repositoryId: z.string(), machineId: z.string(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable(),
@@ -27,6 +28,7 @@ const Marker = z.union([
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'";
 export const cleanupInboxDependencies = { capability: resolveSessionToolingCapability };
+type EnqueueDependencies = typeof cleanupInboxDependencies & { now?: () => number };
 
 async function marker(store: CleanupInboxStore, instructionId: string, sessionId: string) {
   const event = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key: instructionId } });
@@ -116,6 +118,8 @@ export async function refreshQueuedCleanupInstruction(input: { prisma: PrismaCli
     if (cancelled.count !== 1) throw new Error("Queued cleanup changed before supersession");
     await queueInstruction(tx, { sessionId: saved.sessionId, requestId: successorId, text });
     await tx.runtimeMetadataEvent.create({ data: { ...where, key: successorId, value: nextValue } });
+    const task = await currentMarker(tx, next);
+    await recordCleanupRetryInput(tx, task, successorId, await cleanupRetryEligibility(tx, input.config, task));
     await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: saved.sessionId, source: "cleanup-inbox", action: CLEANUP_SUPERSEDED, key: instruction.id,
       value: JSON.stringify({ version: 1, taskId: saved.taskId, sessionId: saved.sessionId, requestKey: saved.requestKey,
         previous: { instructionId: instruction.id, instructionSha256: hash(original), markerRevision: event.sequence, markerSha256: hash(event.value!) },
@@ -157,8 +161,9 @@ function pendingFamilyIds(task: RemoteTask, sessions: Array<{ id: string; status
 
 /** An automatic request is a durable inbox instruction, never effect authority.
  * Its immutable capability is resolved outside the enqueue transaction. */
-export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; requestKey: string; runtime?: AgentSessionRuntime }, dependencies = cleanupInboxDependencies) {
-  CleanupEnqueueInput.parse({ requestKey: input.requestKey });
+export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; requestKey: string; retry?: "now"; runtime?: AgentSessionRuntime }, dependencies: EnqueueDependencies = cleanupInboxDependencies) {
+  CleanupEnqueueInput.parse({ requestKey: input.requestKey, retry: input.retry });
+  const now = dependencies.now ?? Date.now;
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
   const requestWhere = { runtimeSessionId: task.primarySessionId!, source: `finalizer:${task.id}`, action: CLEANUP_REQUEST, key: input.requestKey };
   const prior = task.primarySessionId && await input.prisma.runtimeMetadataEvent.findFirst({ where: requestWhere });
@@ -169,8 +174,10 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
   };
   if (prior) return result(input.prisma, JSON.parse(prior.value!).instructionId);
   if (!(await cleanupCandidates(input.prisma, input.config, [task])).has(task.id)) throw new Error("Task has no current accepted cleanup scheduling candidate");
+  await cleanupRetryEligibility(input.prisma, input.config, task, now(), input.retry);
   const resolved = await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: task.primarySessionId!, capability: "cleanup" });
   if (!resolved.receipt.adapter || resolved.receipt.capability !== "cleanup" || resolved.receipt.taskToolingRevision !== task.toolingRevision) throw new Error("Configured cleanup capability has no exact adapter");
+  await cleanupRetryEligibility(input.prisma, input.config, await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } }), now(), input.retry);
   if (input.runtime) await ensureTaskCleanupTransports({ ...input, runtime: input.runtime });
   const external = await latestExternalBinding(input.prisma, task.id, task.primarySessionId!);
   const contract = external ? null : await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: task.primarySessionId!, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
@@ -189,9 +196,12 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
     let instructionId: string | undefined;
     for (const instruction of existing) if (await marker(tx, instruction.id, instruction.sessionId)) { instructionId = instruction.id; break; }
     if (!instructionId) {
+      const currentTask = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+      const selection = await cleanupRetryEligibility(tx, input.config, currentTask, now(), input.retry);
       instructionId = `cleanup:${hash(`${task.id}:${input.requestKey}`)}`;
       await queueInstruction(tx, { sessionId: task.primarySessionId!, requestId: instructionId, text });
       await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: task.primarySessionId!, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key: instructionId, value: JSON.stringify(saved) } });
+      await recordCleanupRetryInput(tx, currentTask, instructionId, selection, input.retry);
     }
     await tx.runtimeMetadataEvent.create({ data: { ...requestWhere, value: JSON.stringify({ instructionId }) } });
     return result(tx, instructionId);
