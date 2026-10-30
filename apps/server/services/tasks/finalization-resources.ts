@@ -324,7 +324,7 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
   const exceptional: FinalizationResourcePlan[] = [...savedData];
   const active = resources.filter((resource) => {
     if (savedData.some(entry => entry.id === resource.id)) return false;
-    if (resource.state === "released" && input.originalWork && !(!ownership.sourceCopyResourceId && hasHistoricalCleanupAdapter(resource))) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
+    if (resource.state === "released" && input.originalWork && !(!ownership.sourceCopyResourceId && hasHistoricalCleanupAdapter(resource, resources))) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
     const archive = retainedArchives.find((entry) => entry.id === resource.id);
     if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest) throw new Error("Retained archive identity mismatch"); assertRetainedMaterialPlan(archive, retainedArchives); exceptional.push(archive); return false; }
     return true;

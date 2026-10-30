@@ -72,7 +72,7 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, current.resources) : [];
   const { preparePreservationEvidence, assertPreservationSources } = await import("./cleanup-preservation.ts");
   const preservation = await preparePreservationEvidence({ prisma: input.prisma, taskId: input.taskId, sessionId: current.session.id, resources: current.resources, plan: retainedArchives, selection: request.ownership.preservation });
-  const adapterContext = current.resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
+  const adapterContext = current.resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource, current.resources) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources: current.resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot!, sourcePaths: [], deliveries,
     ownership: request.ownership, originalWork: true, ...(adapterContext ? { adapterContext } : {}), retainedArchives, ...(preservation ? { preservation } : {}) });
