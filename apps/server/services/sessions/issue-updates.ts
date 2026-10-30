@@ -48,8 +48,13 @@ const writes = new Map<string, Promise<unknown>>();
 export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, client = issueUpdateDelivery, native?: NativePublication) {
   const source = await client.source(input);
   const key = `${source.link.connectionId}:${source.issue.id}`;
+  return serializeIssuePublication(key, () => publish(input, source, client, native));
+}
+
+/** Cleanup reporting shares the normal per-source publication ordering. */
+export async function serializeIssuePublication<T>(key: string, publish: () => Promise<T>): Promise<T> {
   const previous = writes.get(key) ?? Promise.resolve();
-  const run = previous.catch(() => undefined).then(() => publish(input, source, client, native));
+  const run = previous.catch(() => undefined).then(publish);
   writes.set(key, run);
   try { return await run; } finally { if (writes.get(key) === run) writes.delete(key); }
 }
@@ -74,6 +79,14 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   }
   const target = payload.state ? issue.team.states.nodes.find((state) => state.name === payload.state) : undefined;
   if (!receipt?.published && payload.state && !target) throw new Error(`State '${payload.state}' is not in the linked issue's team; read_source_issue for current states`);
+  const checkCleanupHandoff = async () => {
+    if (target?.name !== "Cleanup") return;
+    if (target.type !== "completed") throw new Error("Cleanup reporting requires its completed-category configuration");
+    const { assertCleanupStatusHandoff } = await import("../tasks/cleanup-status.ts");
+    await assertCleanupStatusHandoff({ ...payload, prisma, config, sessionId, issueId: issue.id, connectionId: link.connectionId });
+  };
+  // Refused child/foreign scope must not reserve the parent's stable key.
+  if (!receipt) await checkCleanupHandoff();
   if (!receipt) {
     // Validate every capture, then prepare every video, before publishing
     // anything. The source and prepared digests bind retries to the same bytes
@@ -96,7 +109,15 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
     if (target?.name === "Merge" && latest.state.name !== "Merge") throw new Error("Only an owner-selected Merge state authorizes delivery; agents cannot select it");
-    if (target?.type === "completed" && target.name !== "Manual Review") await client.complete({ ...payload, prisma, config, sessionId });
+    if (target?.name === "Cleanup") {
+      await checkCleanupHandoff();
+    } else if (target?.type === "completed" && target.name !== "Manual Review") {
+      if (latest.state.name === "Cleanup" && target.name === "Done" && task?.issueIdentifier === issue.identifier) {
+        const { assertCompletedCleanup } = await import("../tasks/cleanup-lifecycle.ts");
+        const completed = await assertCompletedCleanup({ prisma, config, sessionId, requestKey: `finalize:${task.id}` });
+        if (completed.prepared.issueId !== issue.id || completed.prepared.connectionId !== link.connectionId) throw new Error("Confirmed Cleanup handoff belongs to the original source issue");
+      } else await client.complete({ ...payload, prisma, config, sessionId });
+    }
     if (task && target && (target.type === "completed" || target.name === "Manual Review" || target.name === "Merge")) {
       const graph = await client.graph(config, { id: issue.id });
       if (task.issueIdentifier === issue.identifier && target.type === "completed" && target.name !== "Manual Review") await assertMappedIssueDelivery(input, graph, issue.id);
