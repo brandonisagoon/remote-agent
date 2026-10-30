@@ -64,9 +64,9 @@ export async function assertFinalizationRemoved(prepared: Pick<PreparedFinalizat
 export async function assertFinalizationAuthority(prisma: Database, config: ServerConfig, prepared: PreparedFinalization, resourcesReleased = false, cleanup = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: prepared.taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
-  const { hasPreparedCleanup, assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+  const { hasPreparedCleanup, assertPreparedCleanup, cleanupRetainedResourceIds } = await import("./cleanup-lifecycle.ts");
   const lifecycle = await hasPreparedCleanup(prisma, task.id, session.id, prepared.requestKey);
-  if (lifecycle) await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
+  const active = lifecycle ? await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey }) : undefined;
   if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase === "closed" || !lifecycle && !cleanup && task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
   if (task.repositoryId !== prepared.repositoryId || task.machineId !== prepared.machineId || task.machineId !== config.machine || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.cwd !== task.worktreePath || task.branchName !== prepared.branch || task.connectionId !== prepared.connectionId || task.issueIdentifier !== prepared.issueIdentifier) throw new Error("Finalization task identity changed");
   // Compare configured path identity without requiring the removed checkout.
@@ -82,7 +82,7 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
     if (grant.delivery.head !== prepared.revision || grant.delivery.mergeCommit !== prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.pullRequest.url?.toLowerCase() !== `https://github.com/${grant.delivery.repository}/pull/${grant.delivery.pullRequest}`) throw new Error("Finalization differs from the owner's exact retirement delivery");
   }
   if (resourcesReleased) {
-    const retained = await retainedArchiveResourceIds(prisma, config, prepared);
+    const retained = active ? await cleanupRetainedResourceIds(prisma, config, active) : await retainedArchiveResourceIds(prisma, config, prepared);
     const remaining = await prisma.remoteTaskResource.findMany({ where: { taskId: task.id, purpose: { in: ["browser", "development", "review"] }, state: { not: "released" } } });
     if (remaining.some(resource => !retained.has(resource.id))) throw new Error("Finalization has unreleased task resources");
   }

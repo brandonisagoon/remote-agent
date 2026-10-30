@@ -2,7 +2,7 @@ import { startRuntimeEventProjection } from "../sessions/runtime-events/projecti
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { taskSupervisionRoutes } from "../../routes/tasks/supervision.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
@@ -24,6 +24,8 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { completeDevelopmentIntent, recordDevelopmentIntent, renewDevelopmentAuthority } from "./development-intent.ts";
 import { assertRetirementResourcePreflight } from "./retirement-preview.ts";
 import { retainedDevelopmentFixture } from "../../../../test-support/retained-development-fixture.ts";
+import { cleanupProjection, cleanupReportDelivery } from "./cleanup-report.ts";
+import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -68,6 +70,159 @@ async function preparedFixture() {
   const observe = async () => { expect(await completionObservation.snapshot(f.worktree)).toEqual(JSON.parse(frozen.find(row => row.sequence === prepared.preparedRevision)!.value!).delivery.receipts.snapshot); };
   return { ...f, prepared, frozen, observe };
 }
+
+test("frozen v1 accepted PR history remains Ready through preparation, confirmation retry and closure", async () => {
+  const f = await fixture();
+  const reference = await db.prisma.remoteTaskResource.create({ data: { id: "accepted-pr", taskId: f.task.id, key: "development-pull-request", kind: "github-pull-request", purpose: "development", externalId: f.remote.pullRequest.url, state: "ready",
+    metadata: { draft: true, head: "d".repeat(40), remoteCI: "Queued at publication", acceptance: "Merge not yet authorized at publication" } } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies);
+  const active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const before = await cleanupProjection(db.prisma, f.config, f.task);
+  expect(before).toMatchObject({ finalizationRetention: { version: 1, preparedRevision: prepared.preparedRevision, operationRevision: active.operationRevision } });
+  if (!("finalizationRetention" in before) || !before.finalizationRetention) throw new Error("Missing accepted reference projection");
+  expect(before.finalizationRetention).not.toHaveProperty("confirmedRevision");
+  expect(before.finalizationRetention.resourcePlanDigest).toBe(finalizationDigest(before.finalizationRetention.resources));
+  expect(await prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).toMatchObject({ preparedRevision: prepared.preparedRevision, cleanup: { operationRevision: active.operationRevision } });
+  expect(await prepareTaskFinalization({ ...f.input, cleanup: true, authorityOnly: true }, f.dependencies)).toMatchObject({ preparedRevision: prepared.preparedRevision });
+  const progress = await recordCleanupProgress({ ...f.context, progress: { requestKey: f.input.requestKey, operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation), outcomes: [] } });
+  expect(progress.resources).toEqual([{ id: reference.id, key: reference.key, state: "ready", outcome: "retained" }]);
+  f.remove();
+  const confirmed = await confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  expect(confirmed).toMatchObject({ preparedRevision: prepared.preparedRevision, cleanup: { operationRevision: active.operationRevision } });
+  expect(await confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).toEqual(confirmed);
+  const projected = await cleanupProjection(db.prisma, f.config, f.task);
+  expect(projected).toMatchObject({ finalizationRetention: { version: 1, requestKey: f.input.requestKey, taskId: f.task.id, sessionId: f.session.id,
+    preparedRevision: prepared.preparedRevision, confirmedRevision: confirmed.confirmedRevision, operationRevision: active.operationRevision,
+    operationDigest: retirementDigest(active.operation), resources: [{ ...finalizationResourceIdentity(reference), disposition: "retain-reference",
+      reference: { deliveryId: `finalizer:${f.task.id}:${prepared.preparedRevision}`, type: "pull-request", repository: "owner/product", number: 12, reviewedHead: f.remote.remoteHead, mergeCommit: "c".repeat(40) } }] } });
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient })).route("/api/tasks", taskSupervisionRoutes);
+  const close = await app.request(`/api/tasks/${f.task.id}/automation`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close", cleanup: true }) });
+  expect(close.status).toBe(200); expect(runtime.closedSessionIds).toEqual([f.session.id]);
+  const closed = await cleanupProjection(db.prisma, f.config, f.task);
+  expect("finalizationRetention" in closed && closed.finalizationRetention).toEqual("finalizationRetention" in projected && projected.finalizationRetention);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: reference.id } })).toEqual(reference);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(event => event.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
+});
+
+async function referenceFixture(options: { bound?: boolean; data?: Record<string, unknown>; duplicate?: boolean; physical?: boolean } = {}) {
+  const f = await fixture();
+  const reference = await db.prisma.remoteTaskResource.create({ data: { id: "accepted-pr", taskId: f.task.id, key: "development-pull-request", kind: "github-pull-request", purpose: "development",
+    externalId: f.remote.pullRequest.url, state: "ready", metadata: { draft: true, head: "d".repeat(40) }, ...options.data } });
+  if (options.duplicate) await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "alias", kind: "pull-request", purpose: "review", externalId: reference.externalId, state: "ready" } });
+  if (options.physical) await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "remaining-store", kind: "docker-volume", purpose: "development", externalId: "exact-store", state: "ready" } });
+  await prepareTaskFinalization(f.input, f.dependencies);
+  const active = options.bound === false ? undefined : await bindPreparedCleanup(f.input, async () => {});
+  return { ...f, reference, active };
+}
+
+test.each(["unbound", "duplicate", "other-url", "wrong-kind", "allocated"])("v1 PR retention refuses %s reference history", async shape => {
+  const f = await referenceFixture({ bound: shape !== "unbound", duplicate: shape === "duplicate", data: shape === "other-url" ? { externalId: "https://github.com/owner/product/pull/13" }
+    : shape === "wrong-kind" ? { kind: "delivery-receipt" } : shape === "allocated" ? { state: "allocated" } : {} });
+  expect(await cleanupProjection(db.prisma, f.config, f.task)).not.toHaveProperty("finalizationRetention");
+  // Unbound legacy confirmation cannot gain retention from a resource URL.
+  f.remove();
+  await expect(confirmTaskFinalization(f.input, f.dependencies)).rejects.toThrow();
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.reference.id } })).state).toBe(shape === "allocated" ? "allocated" : "ready");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+});
+
+test.each(["key", "kind", "purpose", "url", "metadata", "expiry", "new-alias", "pause", "revoke"])("v1 PR retention rejects current %s drift before confirmation", async change => {
+  const f = await referenceFixture();
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  else if (change === "revoke") await f.revoke();
+  else if (change === "new-alias") await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "new-alias", kind: "pull-request", purpose: "review", externalId: f.reference.externalId, state: "ready" } });
+  else await db.prisma.remoteTaskResource.update({ where: { id: f.reference.id }, data: change === "key" ? { key: "new-key" } : change === "kind" ? { kind: "pull-request" }
+    : change === "purpose" ? { purpose: "review" } : change === "url" ? { externalId: "https://github.com/owner/product/pull/13" }
+    : change === "expiry" ? { expiresAt: new Date("2030-01-01T00:00:00Z") } : { metadata: { draft: false, head: f.remote.remoteHead } } });
+  expect(await cleanupProjection(db.prisma, f.config, f.task)).not.toHaveProperty("finalizationRetention");
+  await expect(confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+});
+
+test("v1 PR retention does not exempt an unrelated physical resource or a Released reference", async () => {
+  const f = await referenceFixture({ physical: true });
+  expect(await cleanupProjection(db.prisma, f.config, f.task)).toHaveProperty("finalizationRetention");
+  f.remove();
+  await expect(confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow("unreleased");
+  await db.prisma.remoteTaskResource.update({ where: { id: f.reference.id }, data: { state: "released" } });
+  expect(await cleanupProjection(db.prisma, f.config, f.task)).not.toHaveProperty("finalizationRetention");
+  await expect(confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow("unreleased");
+});
+
+test("v1 PR retention derives only from exact immutable accepted delivery, never optimistic registry metadata", async () => {
+  const f = await referenceFixture();
+  const active = f.active!;
+  if (active.kind !== "v1") throw new Error("Wrong fixture version");
+  expect(cleanupDeliveryRetention(active)).toBeDefined();
+  for (const mutate of [
+    (value: typeof active) => { value.prepared.delivery.receipts.merge.merged = false; },
+    (value: typeof active) => { value.prepared.delivery.receipts.merge.observed = false; },
+    (value: typeof active) => { value.prepared.delivery.receipts.pullRequest.matchesHead = false; },
+    (value: typeof active) => { value.prepared.delivery.receipts.pullRequest.observed = false; },
+    (value: typeof active) => { value.prepared.delivery.receipts.merge.sha = "invalid"; },
+    (value: typeof active) => { value.prepared.delivery.receipts.snapshot.clean = false; },
+    (value: typeof active) => { value.prepared.delivery.receipts.pullRequest.url += "?new=1"; },
+  ]) {
+    // Even an internally self-consistent invalid receipt cannot become an
+    // accepted reference; no database event is changed by this parser test.
+    const invalid = structuredClone(active); mutate(invalid);
+    invalid.preparation.value = JSON.stringify(invalid.prepared);
+    invalid.operation.binding.preparedDigest = createHash("sha256").update(invalid.preparation.value).digest("hex");
+    expect(cleanupDeliveryRetention(invalid)).toBeUndefined();
+  }
+  const rawChanged = structuredClone(active); rawChanged.preparation.value += " ";
+  expect(cleanupDeliveryRetention(rawChanged)).toBeUndefined();
+  const unbound = structuredClone(active); unbound.operation.binding.resources = [];
+  expect(cleanupDeliveryRetention(unbound)).toBeUndefined();
+});
+
+test.skipIf(!process.env.DRAFTED_REFERENCE_INTEGRATION_ROOT)("actual Drafted v1 reference retention removes the clean worktree and retries lost confirmation with Ready history intact", async () => {
+  const f = await referenceFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const savedReport = { ...cleanupReportDelivery };
+  Object.assign(cleanupReportDelivery, { read: async () => { throw new Error("Fixture reporting offline"); } });
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes);
+  let lostResponse = false;
+  const socket = path.join(directory, "reference.sock"), server = Bun.serve({ unix: socket, fetch: async req => {
+    const response = await app.fetch(req);
+    if (!lostResponse && new URL(req.url).pathname.endsWith("confirm-finalization") && response.ok) {
+      const value = await response.clone().json() as { confirmation?: { state?: string } };
+      if (value.confirmation?.state === "ready") { lostResponse = true; await Bun.sleep(1200); }
+    }
+    return response;
+  } }); await chmod(socket, 0o600);
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {});
+  try {
+    const root = process.env.DRAFTED_REFERENCE_INTEGRATION_ROOT!;
+    const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { finalizeTask } = await import(path.join(root, "src/finalize.ts"));
+    let registry = taskRegistry(socket, f.task.id, 1000);
+    await expect(finalizeTask({ registry, cleanup: true, close: async () => { throw new Error("fixture interrupted before closure"); } })).rejects.toThrow("fixture interrupted before closure");
+    expect(lostResponse).toBeTrue();
+    expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeFalse();
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    const progress = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: CLEANUP_PROGRESS }, orderBy: { sequence: "desc" } });
+    expect(JSON.parse(progress.value!).resources).toEqual([{ id: f.reference.id, key: f.reference.key, state: "ready", outcome: "retained", detail: "Confirmed retained resource" }]);
+    await db.prisma.$disconnect(); registry = taskRegistry(socket, f.task.id, 20_000);
+    const close = async () => {
+      const response = await app.request(`/api/tasks/${f.task.id}/automation`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close", cleanup: true }) });
+      if (!response.ok) throw new Error(await response.text());
+    };
+    expect(await finalizeTask({ registry, cleanup: true, close, runner: async () => { throw new Error("Confirmed retry cannot remove again"); } })).toMatchObject({ closed: true, reporting: { state: "pending" } });
+    expect(runtime.closedSessionIds).toEqual([f.session.id]);
+    expect(await finalizeTask({ registry, cleanup: true, close })).toMatchObject({ closed: true, alreadyClosed: true });
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.reference.id } })).toEqual(f.reference);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(event => event.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    for (const action of [FINALIZATION_PREPARED, CLEANUP_OPERATION, FINALIZATION_CONFIRMED]) expect(await db.prisma.runtimeMetadataEvent.count({ where: { action } })).toBe(1);
+  } finally { await stopPreparation(); await server.stop(true); Object.assign(cleanupReportDelivery, savedReport); }
+}, 30_000);
 
 test("explicit paused compute stop records Allocated against the original cleanup binding without altering metadata, data or proofs", async () => {
   const f = await fixture();
