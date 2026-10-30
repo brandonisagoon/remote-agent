@@ -574,6 +574,62 @@ test.each(["accountId", "zoneId", "tunnelId", "dnsRecordId", "config", "source",
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: value.id } })).toEqual(before);
 });
 
+test("previous frozen layout with UUID externalId and extra config keeps its existing validation", async () => {
+  const f = await legacyPreviewFixture(false, values => {
+    const tunnel = values.find(value => value.id === "tunnel");
+    tunnel.externalId = tunnel.metadata.tunnelId;
+    tunnel.metadata.config = tunnel.metadata.configPath;
+  });
+  const tunnel = f.values.find(value => value.id === "tunnel");
+  expect((await f.put(tunnel.id, { ...tunnel.metadata, ...f.canonical })).status).toBe(200);
+  expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+});
+
+test("UUID layout accepts equal optional endpoint aliases and explicit dedicated sharing", async () => {
+  const f = await legacyPreviewFixture(false, values => {
+    const endpoint = values.find(value => value.id === "endpoint"), tunnel = values.find(value => value.id === "tunnel"), dns = values.find(value => value.id === "dns");
+    Object.assign(endpoint.metadata.tunnel, { shared: false, tunnelId: tunnel.externalId, account: dns.metadata.account, accountId: dns.metadata.account,
+      zone: dns.metadata.zone, zoneId: dns.metadata.zone, dnsRecordId: dns.metadata.routeResult.dnsTag,
+      configPath: tunnel.metadata.config, source: endpoint.externalId, sourceAddress: tunnel.metadata.source });
+  }, true);
+  for (const value of f.values.filter(value => value.id !== "environment")) expect((await f.put(value.id, { ...value.metadata, ...f.canonical })).status).toBe(200);
+  expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+});
+
+const unsupportedUuidAliases = [
+  ["shared", true], ["shared", "false"], ["accountId", "e".repeat(32)], ["account", "e".repeat(32)],
+  ["zoneId", "e".repeat(32)], ["zone", "e".repeat(32)], ["tunnelId", "99999999-2222-3333-4444-555555555555"],
+  ["dnsRecordId", "e".repeat(32)], ["source", "http://127.0.0.1:5173"], ["sourceAddress", "127.0.0.1:5173"], ["configPath", "/foreign/cloudflared.yml"],
+] as const;
+test.each(unsupportedUuidAliases)("UUID transition refuses unsupported nested %s=%s before receipt acknowledgment", async (field, value) => {
+  const f = await legacyPreviewFixture(false, values => { values.find(item => item.id === "endpoint").metadata.tunnel[field] = value; }, true);
+  const dns = f.values.find(item => item.id === "dns"), before = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  expect((await f.put(dns.id, { ...dns.metadata, ...f.canonical })).status).toBe(409);
+  expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(before);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+});
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(unsupportedUuidAliases)("actual UUID preview adapter performs zero DELETE for unsupported nested %s=%s", async (field, value) => {
+  const f = await legacyPreviewFixture(false, values => { values.find(item => item.id === "endpoint").metadata.tunnel[field] = value; }, true);
+  const { taskRegistry } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
+  const { releasePublicPreview } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/public-preview.ts"));
+  const before = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } }), calls: string[] = [];
+  const socket = path.join(directory, "unsupported-preview.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const provider = { request: async (method: string, route: string) => {
+      calls.push(`${method} ${route}`);
+      if (method === "GET" && route === `/zones/${f.zone}/dns_records/${f.dnsId}`) return { id: f.dnsId, name: f.hostname, type: "CNAME", content: `${f.tunnelId}.cfargotunnel.com` };
+      throw new Error("Unexpected provider effect in rejected association");
+    } };
+    await expect(releasePublicPreview({ registry: taskRegistry(socket, f.task.id, 3000), key: `${f.purpose}-cloudflare-tunnel`, provider,
+      releaseConnector: async () => { throw new Error("Unexpected connector effect"); } })).rejects.toThrow("Frozen UUID preview");
+    expect(calls).toEqual([`GET /zones/${f.zone}/dns_records/${f.dnsId}`]);
+    expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(before);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+  } finally { server.stop(true); }
+});
+
 test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(["development", "review", "uuid"])("actual legacy preview adapter uses the original operation through discovery/deletion retry (format=%s)", async format => {
   const review = format === "review";
   const f = await legacyPreviewFixture(review, undefined, format === "uuid"), root = process.env.DRAFTED_INTEGRATION_ROOT!;

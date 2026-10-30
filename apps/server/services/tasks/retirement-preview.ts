@@ -44,9 +44,14 @@ function legacyUuidScope(resource: Resource, resources: Resource[], named: Resou
     if (value.zone !== undefined && value.zone !== zoneId || value.account !== undefined && value.account !== accountId) throw new Error("Frozen UUID preview account or zone conflicts");
   }
   const publicTunnel = object(endpointMeta.publicTunnel);
-  if (publicTunnel.id !== undefined && publicTunnel.id !== tunnelId || publicTunnel.hostname !== undefined && publicTunnel.hostname !== hostname
-    || publicTunnel.zoneId !== undefined && publicTunnel.zoneId !== zoneId || publicTunnel.accountId !== undefined && publicTunnel.accountId !== accountId
-    || publicTunnel.config !== undefined && publicTunnel.config !== config || publicTunnel.source !== undefined && publicTunnel.source !== source.origin) throw new Error("Frozen UUID preview endpoint association conflicts");
+  // The current adapter reads sharing only from publicTunnel/tunnel metadata.
+  // Never normalize an ignored legacy shared flag into dedicated deletion.
+  const sharing = [metadata.shared, publicTunnel.shared, endpointTunnel.shared].filter(value => value !== undefined);
+  if (endpointTunnel.shared === true || sharing.some(value => typeof value !== "boolean" || value !== sharing[0])) throw new Error("Frozen UUID preview sharing is unsupported or conflicting");
+  const aliases = { ...canonical, id: tunnelId, account: accountId, zone: zoneId, config, configPath: config, source: source.origin, sourceAddress };
+  for (const value of [endpointTunnel, publicTunnel]) {
+    for (const [key, expected] of Object.entries(aliases)) if (value[key] !== undefined && value[key] !== expected) throw new Error("Frozen UUID preview endpoint association conflicts");
+  }
   if (!named.some(item => item.id === resource.id)) throw new Error("Resource is outside the frozen UUID preview association");
   const shared = publicTunnel.shared === true || metadata.shared === true;
   return { kind: "named" as const, hostname, tunnelId, zoneId, dnsRecordId, shared, related: named, legacyCanonical: canonical };
@@ -60,7 +65,7 @@ function legacyNamedScope(resource: Resource, resources: Resource[], hostname: s
   const tunnels = named.filter(item => item.kind === "cloudflare-tunnel");
   if (tunnels.length !== 1 || named.some(item => item.purpose !== resource.purpose)) throw new Error("Frozen legacy preview association is ambiguous");
   const tunnel = tunnels[0]!, metadata = object(tunnel.metadata);
-  if (UUID.safeParse(tunnel.externalId).success && metadata.config !== undefined) return legacyUuidScope(resource, resources, named, tunnel, hostname);
+  if (metadata.tunnelId === undefined && UUID.safeParse(tunnel.externalId).success && metadata.config !== undefined) return legacyUuidScope(resource, resources, named, tunnel, hostname);
   const tunnelId = UUID.parse(metadata.tunnelId), zoneId = Hex.parse(metadata.zone), accountId = Hex.parse(metadata.account);
   if (metadata.hostname !== hostname || typeof metadata.configPath !== "string" || !metadata.configPath) throw new Error("Frozen legacy preview tunnel identity is incomplete");
   const source = z.string().parse(metadata.sourceAddress), url = new URL(source);
