@@ -2,17 +2,40 @@ import { Hono } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
 import { CompletionContractInput, CompletionVerificationInput, inspectTaskCompletion, recordCompletionVerification, setCompletionContract } from "../../services/tasks/completion.ts";
-import { ExternalDeliveryBindingInput } from "../../services/tasks/external-delivery-schema.ts";
+import { DeliveredRetirementInput, ExternalDeliveryBindingInput } from "../../services/tasks/external-delivery-schema.ts";
 import { adoptExternalDeliveries, inspectExternalDeliveries } from "../../services/tasks/external-deliveries.ts";
 import { inspectRetirementAuthority, RetirementAuthorityInput, setRetirementAuthority } from "../../services/tasks/retirement-authority.ts";
 import { CleanupResumeInput } from "../../services/tasks/cleanup-resume-schema.ts";
 import { inspectCleanupResume, resumePreparedCleanup } from "../../services/tasks/cleanup-resume.ts";
+import { DoneRetirementInput, adoptDoneRetirement, inspectDoneRetirement } from "../../services/tasks/delivered-retirement.ts";
+import { adoptLegacyDelivery, inspectLegacyDelivery } from "../../services/tasks/legacy-delivery.ts";
+import { z } from "zod";
+import { DeliveredRetirementRevocation, revokeDeliveredRetirement } from "../../services/tasks/delivered-retirement-revocation.ts";
 
 export const taskCompletionRoutes = new Hono<AppEnv>();
 
 // Unlike normal task/session IPC, contract writes always require the owner's
 // API credential, including on the otherwise trusted local control socket.
 taskCompletionRoutes.use("/:taskId/completion/*", apiAuthMiddleware());
+taskCompletionRoutes.delete("/:taskId/completion/delivered-retirement", async c => {
+  const parsed = DeliveredRetirementRevocation.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Exact retirement revision and revocation are required" }, 400);
+  try { return c.json(await revokeDeliveredRetirement({ prisma: c.get("prisma"), taskId: c.req.param("taskId"), revocation: parsed.data })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+taskCompletionRoutes.get("/:taskId/completion/delivered-retirement", async c => {
+  try { return c.json(await (c.req.query("mode") === "legacy-delivery" ? inspectLegacyDelivery : inspectDoneRetirement)({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+taskCompletionRoutes.put("/:taskId/completion/delivered-retirement", async c => {
+  const parsed = z.discriminatedUnion("mode", [DoneRetirementInput, DeliveredRetirementInput]).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Exact delivered-retirement evidence is required", details: parsed.error.issues }, 400);
+  try {
+    const context = { prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") };
+    return c.json(parsed.data.mode === "existing-preparation" ? await adoptDoneRetirement({ ...context, retirement: parsed.data }) : await adoptLegacyDelivery({ ...context, retirement: parsed.data }));
+  }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 taskCompletionRoutes.get("/:taskId/completion/cleanup-resume", async (c) => {
   try { return c.json(await inspectCleanupResume({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }

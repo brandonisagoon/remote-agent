@@ -12,6 +12,8 @@ import { taskForSession } from "../tasks/store.ts";
 import { assertCompletionAllowed } from "../tasks/completion.ts";
 import { latestExternalBinding } from "../tasks/external-deliveries.ts";
 import { assertExternalDoneAllowed } from "../tasks/external-finalization.ts";
+import { latestDoneRetirement } from "../tasks/delivered-retirement.ts";
+import { assertPreparedDoneHandoff } from "../tasks/finalization.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { registerThread } from "./threads.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
@@ -29,6 +31,7 @@ export const issueUpdateDelivery = {
   complete: async (input: Parameters<typeof assertCompletionAllowed>[0] & Partial<Input>) => {
     const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
     if (task && await latestExternalBinding(input.prisma, task.id, input.sessionId)) await assertExternalDoneAllowed(input);
+    else if (task && await latestDoneRetirement(input.prisma, task.id, input.sessionId)) await assertPreparedDoneHandoff({ ...input, requestKey: input.requestKey ?? "" });
     else await assertCompletionAllowed(input);
   },
   upload: uploadIssueEvidence, attach: attachIssueEvidence, create: createThreadedIssueComment, comment: fetchIssueCommentIdentity,

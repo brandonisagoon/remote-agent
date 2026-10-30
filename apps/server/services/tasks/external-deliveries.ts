@@ -10,18 +10,20 @@ import { CompletionContractInput } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { EXTERNAL_BINDING, EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryBindingInput, ExternalTaskIdentity, externalDigest } from "./external-delivery-schema.ts";
 import { externalDeliveryObservation, observeExternalDeliveries } from "./external-delivery-observation.ts";
+import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { assertFinalizationResources, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, RetainedArchivePlan, RetainedResultPlan, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
 export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
+  delivered: observeDeliveredScope,
   handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem
  * and provider observations finish before acquiring the database write lock. */
 export function assertExternalResourceRecords(records: FinalizationResourceRecord[], plan: FinalizationResourcePlan[], removed: boolean) {
-  const resources = records.filter((record) => ["browser", "development", "review"].includes(record.purpose));
+  const resources = records.filter((record) => ["browser", "development", "review"].includes(record.purpose) || record.purpose === "tooling" && plan.some(entry => entry.id === record.id && (entry.disposition === "retain-archive" || (entry.disposition as string) === "retain-archive-member")));
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
@@ -29,7 +31,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   }
 }
 
-export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
+export async function externalTaskOwnership(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
   if (!session || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase === "closed" || !task.worktreePath || !task.connectionId || !task.issueIdentifier || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== config.machine) throw new Error("External delivery requires the open original primary and unchanged task ownership");
@@ -37,6 +39,10 @@ export async function externalTaskAuthority(prisma: ExternalDatabase, config: Se
   const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", endedAt: null } });
   if (!link) throw new Error("External delivery source ownership changed");
   const identity = ExternalTaskIdentity.parse({ taskId: task.id, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, taskWorktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
+  return { task, session, identity };
+}
+export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
+  const { task, session, identity } = await externalTaskOwnership(prisma, config, taskId);
   const where = { runtimeSessionId: session.id, source: `owner:${task.id}` };
   const contractEvent = await prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: "completion-contract" }, orderBy: { sequence: "desc" } });
   if (!contractEvent) throw new Error("External delivery has no owner completion contract");
@@ -74,11 +80,22 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 }
 
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number) {
+  if (binding.version === 2) {
+    const current = await externalTaskOwnership(prisma, config, binding.identity.taskId);
+    const event = await latestExternalBinding(prisma, current.task.id, current.session.id);
+    if (externalDigest(current.identity) !== externalDigest(binding.identity) || event?.sequence !== revision || event.value !== JSON.stringify(binding) || await externalOwnerHistory(prisma, current.task.id, current.session.id) !== binding.ownerHistoryRevision) throw new Error("Present-day retirement task, binding or owner authority changed");
+    return { ...current, contract: null };
+  }
   const current = await externalTaskAuthority(prisma, config, binding.identity.taskId);
   if (externalDigest(current.identity) !== externalDigest(binding.identity) || current.contractEvent.sequence !== binding.contractRevision || externalDigest(current.contract) !== binding.contractDigest || current.verification.sequence !== binding.verificationRevision || current.binding?.sequence !== revision || current.binding.value !== JSON.stringify(binding)) throw new Error("External delivery task, binding, contract or verification authority changed");
   const approval = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: binding.acceptance.approvalEventSequence } });
   if (!approval || externalDigest(JSON.parse(approval.value!)) !== binding.acceptance.approvalDigest) throw new Error("External acceptance provenance changed");
   return current;
+}
+
+export async function externalOwnerHistory(prisma: ExternalDatabase, taskId: string, sessionId: string) {
+  const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `owner:${taskId}`, action: { in: ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "delivered-retirement-revoked"] } }, orderBy: { sequence: "desc" } });
+  return latest?.sequence ?? 0;
 }
 
 async function checkComment(input: Context, sessionId: string, bindingInput: ExternalDeliveryBindingInput, dependencies: ExternalDependencies) {
@@ -112,7 +129,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (originalSnapshot.branch !== current.identity.branch || (manifest.originalWork ? originalSnapshot.head !== lineage.approval.snapshot.head : !originalSnapshot.clean || originalSnapshot.fingerprint !== lineage.approval.snapshot.fingerprint)) throw new Error("Original cleanup worktree changed from the owner's accepted content");
   const deliveries = await observeExternalDeliveries(manifest.deliveries, manifest.mergeOrder, current.contract.reviewRequired === true, dependencies.observer);
   const resources = await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } });
-  const resourceIds = resources.filter((resource) => ["development", "review", "browser"].includes(resource.purpose)).map((resource) => resource.id).sort();
+  const resourceIds = resources.map((resource) => resource.id).sort();
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
   const retainedArchives = originalWork ? [originalWork.archive, ...originalWork.additionalArchives ?? []].map((archive) => RetainedArchivePlan.parse({ ...finalizationResourceIdentity(resources.find((entry) => entry.id === archive.resourceId)!), disposition: "retain-archive", archive: { root: archive.root, manifestPath: archive.manifestPath, manifestSha256: archive.manifestSha256, inventoryDigest: archive.inventoryDigest } })) : [];
@@ -154,12 +171,23 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
  * have been retired. Frozen reports are not reread from a removed directory. */
 export async function observeBoundExternalDelivery(input: Context & { revision: number; binding: ExternalBinding; sources: boolean }, dependencies = externalBindingDependencies) {
   const authority = await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
+  if (input.binding.version === 2) {
+    const observations = [];
+    for (const frozen of input.binding.deliveries) {
+      const delivery = input.binding.input.deliveries.find(entry => entry.id === frozen.id)!;
+      const observed = await dependencies.delivered(delivery);
+      if (observed.mergeCommit !== frozen.mergeCommit || observed.mergedAt !== frozen.mergedAt || externalDigest(observed.checks) !== externalDigest(frozen.checks)) throw new Error("Delivered retirement provider evidence changed");
+      observations.push(observed);
+    }
+    await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
+    return observations;
+  }
   const checked = await checkComment(input, input.binding.identity.sessionId, input.binding.input, dependencies);
   if (externalDigest(checked.acceptance) !== externalDigest(input.binding.acceptance)) throw new Error("Accepted owner comment changed since external adoption");
   const observations = [];
   for (const frozen of input.binding.deliveries) {
     const delivery = input.binding.input.deliveries.find((entry) => entry.id === frozen.id)!;
-    const remote = await dependencies.observer.remote(delivery, authority.contract.reviewRequired === true);
+    const remote = await dependencies.observer.remote(delivery, authority.contract?.reviewRequired === true);
     if (remote.mergeCommit !== frozen.mergeCommit || remote.mergedAt !== frozen.mergedAt || externalDigest(remote.ci) !== externalDigest(frozen.ci)) throw new Error("External merge or CI evidence changed since adoption");
     if (input.sources && (externalDigest(await dependencies.observer.source(delivery)) !== externalDigest(frozen.snapshot) || externalDigest(await dependencies.observer.reports(delivery)) !== externalDigest(frozen.reports))) throw new Error("External source or accepted report changed since adoption");
     observations.push({ ...frozen, ...remote });
