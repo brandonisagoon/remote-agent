@@ -13,6 +13,7 @@ import { IssueUpdateInput, publishSessionIssueUpdate } from "../../services/sess
 import { downloadSourceAttachment } from "../../services/sessions/source-attachments.ts";
 import { ChildIssueUpdateInput, publishChildIssueUpdate, readSessionWorkGraph } from "../../services/sessions/child-issues.ts";
 import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../services/tasks/tooling-capabilities.ts";
+import { BrowserStopInput, resolveBrowserStopAuthority } from "../../services/tasks/browser-stop-authority.ts";
 import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
@@ -53,6 +54,14 @@ sessionTaskRoutes.post("/:sessionId/tooling-capability", async (c) => {
   if (!parsed.success) return c.json({ error: "An allowlisted tooling capability name is required" }, 400);
   try {
     return c.json(await resolveSessionToolingCapability({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+sessionTaskRoutes.post("/:sessionId/browser-stop-authority", async (c) => {
+  const parsed = BrowserStopInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "An exact browser resource key is required" }, 400);
+  try {
+    return c.json(await resolveBrowserStopAuthority({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId") }));
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 

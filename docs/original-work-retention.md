@@ -235,8 +235,18 @@ Confirmation independently observes named-session absence through the configured
 capability even after the original paths have moved, and verifies the marker and
 profile identity at their captured paths. Released state alone is insufficient.
 Active browsers require verified stop-only handling before capture; owner pause
-is not overridden. The server fixtures cover both parent shapes, historical
+is not overridden. The existing resource `stop` operation obtains a read-only
+`browser-stop-authority` response from the original primary's session route. It
+binds the current executing request and started lifecycle sequence, exact task,
+profile receipt and configured cleanup capability. The client renews that full
+authority before closing only the named browser; profile, marker, cookies and
+receipt remain unchanged. A changed turn, paused/closed task, revoked source
+ownership or shared profile refuses stop. No completed phase, source issue state
+or full cleanup plan is required to stop the owned browser.
+
+The server fixtures cover both parent shapes, historical
 metadata-tooling mismatch, source recreation, shared profiles, marker/context
-substitution and capture replay. Live legacy adapter inspection and paired client
-execution are separate acceptance checks; these schema/observer tests do not
-claim a live browser has been stopped or retired.
+substitution and capture replay. Paired fixtures run the real client resource-stop
+and capture dispatcher against server authority and proof checks. The browser
+provider is replaced only in disposable fixtures; no live browser has been
+stopped or retired by those tests.
