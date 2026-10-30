@@ -7,12 +7,14 @@ import { EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryObservation, ext
 import { FinalizationResourcePlan, assertFinalizationResources, finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { FINALIZATION_CONFIRMED, FINALIZATION_PREPARED, PreparedFinalization, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing, type FinalizationContext } from "./finalization-receipts.ts";
 
-const CleanupSnapshot = z.object({ head: z.string(), branch: z.string(), clean: z.literal(true), fingerprint: z.string() }).strict();
+import { OriginalWork } from "./original-work-schema.ts";
+
+const CleanupSnapshot = z.object({ head: z.string(), branch: z.string(), clean: z.boolean(), fingerprint: z.string() }).strict();
 export const PreparedExternalFinalization = PreparedFinalization.omit({ delivery: true }).extend({
   version: z.literal(2), bindingRevision: z.number().int().positive(), bindingDigest: z.string(), resourcePlanDigest: z.string(),
   baseCommit: z.string().nullable(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable(), cleanupSnapshot: CleanupSnapshot,
   delivery: z.object({ kind: z.literal("external-merges/v1"), observationRevision: z.number().int().positive(), deliveries: z.array(ExternalDeliveryObservation).min(1) }).strict(),
-  resources: z.array(FinalizationResourcePlan).min(1),
+  resources: z.array(FinalizationResourcePlan).min(1), originalWork: OriginalWork.optional(),
   doneHandoff: z.object({ requestKey: z.string(), body: z.string(), expectedState: z.literal("Merge"), state: z.literal("Done") }).strict(),
 }).strict();
 export type PreparedExternalFinalization = z.infer<typeof PreparedExternalFinalization>;
@@ -23,7 +25,7 @@ export function externalFinalizationResult(prepared: PreparedExternalFinalizatio
   return { version: 2 as const, requestKey: prepared.requestKey, taskId: prepared.taskId, sessionId: prepared.sessionId, preparedRevision,
     ...(confirmedRevision ? { confirmedRevision } : {}), worktree: prepared.worktree, revision: prepared.revision, branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
     contractRevision: prepared.contractRevision, bindingRevision: prepared.bindingRevision, bindingDigest: prepared.bindingDigest,
-    delivery: prepared.delivery, resources: prepared.resources, resourcePlanDigest: prepared.resourcePlanDigest, doneHandoff: prepared.doneHandoff };
+    delivery: prepared.delivery, ...(prepared.originalWork ? { originalWork: prepared.originalWork } : {}), resources: prepared.resources, resourcePlanDigest: prepared.resourcePlanDigest, doneHandoff: prepared.doneHandoff };
 }
 
 async function active(input: Context) {
@@ -68,6 +70,7 @@ async function sourceAuthority(input: Context, taskId: string, dependencies: Ext
 async function preparedAuthority(input: Context, prepared: PreparedExternalFinalization, binding: ExternalBinding) {
   const current = await assertExternalBindingAuthority(input.prisma, input.config, binding, prepared.bindingRevision);
   if (current.task.phase !== "complete" || prepared.taskId !== current.task.id || prepared.sessionId !== input.sessionId || prepared.requestKey !== input.requestKey || prepared.contractRevision !== binding.contractRevision || prepared.bindingDigest !== binding.manifestDigest || prepared.resourcePlanDigest !== binding.resourcePlanDigest || finalizationDigest(prepared.resources) !== binding.resourcePlanDigest || prepared.baseCommit !== current.task.baseCommit || prepared.toolingRevision !== current.task.toolingRevision || prepared.pinnedToolingRoot !== current.task.pinnedToolingRoot || prepared.taskWorktree !== current.task.worktreePath || prepared.revision !== prepared.cleanupSnapshot.head || prepared.branch !== current.task.branchName || prepared.cleanupSnapshot.branch !== prepared.branch) throw new Error("External finalization preparation identity changed");
+  if (finalizationDigest(prepared.originalWork ?? null) !== finalizationDigest(binding.originalWork ?? null) || prepared.originalWork && prepared.originalWork.restore.gitDirectory !== prepared.gitDirectory || !prepared.originalWork && !prepared.cleanupSnapshot.clean) throw new Error("Original-work preservation authority changed");
   if (await realpath(getRepositoryConfig(input.config, current.task.repositoryId).root) !== prepared.gitCwd) throw new Error("Original cleanup repository identity changed");
   const observation = await input.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: prepared.delivery.observationRevision } });
   if (!observation || observation.action !== EXTERNAL_OBSERVATION || observation.runtimeSessionId !== input.sessionId || observation.source !== `observer:${prepared.taskId}` || observation.key !== prepared.requestKey) throw new Error("External finalization has no matching server observation");
@@ -76,7 +79,8 @@ async function preparedAuthority(input: Context, prepared: PreparedExternalFinal
 }
 
 async function resources(input: Context, prepared: PreparedExternalFinalization, removed: boolean, dependencies: ExternalDependencies) {
-  await dependencies.assertResources({ taskId: prepared.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed });
+  await dependencies.assertResources({ taskId: prepared.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed, ...(prepared.originalWork ? { originalWork: true } : {}) });
+  if (prepared.originalWork) await dependencies.assertOriginalWork({ taskId: prepared.taskId, originalWork: prepared.originalWork, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), removed });
 }
 
 async function assertResourceProofs(prisma: Pick<PrismaClient, "runtimeMetadataEvent">, prepared: PreparedExternalFinalization, preparedRevision: number, value: string | null) {
@@ -116,7 +120,8 @@ export async function prepareExternalFinalization(input: Context, dependencies =
   }
   if (input.authorityOnly) throw new Error("Authority-only checks require an existing unconfirmed preparation");
   const deliveries = await observeBoundExternalDelivery({ ...input, taskId: task.id, binding, revision, sources: true }, dependencies);
-  await dependencies.assertResources({ taskId: task.id, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), plan: binding.resources, removed: false });
+  await dependencies.assertResources({ taskId: task.id, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), plan: binding.resources, removed: false, ...(binding.originalWork ? { originalWork: true } : {}) });
+  if (binding.originalWork) await dependencies.assertOriginalWork({ taskId: task.id, originalWork: binding.originalWork, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), removed: false });
   const cleanupSnapshot = CleanupSnapshot.parse(await dependencies.snapshot(task.worktreePath!));
   const worktree = await realpath(task.worktreePath!);
   const gitCwd = await realpath(getRepositoryConfig(input.config, task.repositoryId).root);
@@ -128,14 +133,14 @@ export async function prepareExternalFinalization(input: Context, dependencies =
   for (const entry of entries) if (entry.worktree && await realpath(entry.worktree).catch(() => "") === worktree) matching.push(entry);
   if (matching.length !== 1 || matching[0]!.HEAD !== cleanupSnapshot.head || matching[0]!.branch !== `refs/heads/${task.branchName}` || cleanupSnapshot.branch !== task.branchName) throw new Error("Original cleanup Git registration does not match the prepared identity");
   const approval = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: binding.acceptance.approvalEventSequence } });
-  if (JSON.parse(approval.value!).snapshot.fingerprint !== cleanupSnapshot.fingerprint) throw new Error("Original cleanup content changed since owner acceptance");
-  const body = [`Delivered and verified:`, ...deliveries.map((delivery) => `- ${delivery.url} — merged as ${delivery.mergeCommit}.`), "", `Removed the original ${task.repositoryId} task worktree (${task.branchName}, cleanup revision ${cleanupSnapshot.head}). Retired owned filesystem resources to verified retained quarantine; their original active paths are absent. Retained the linked PR and CI history.`, "", `Acceptance: existing owner comment ${binding.acceptance.ownerCommentId}. Local verification reports remain owner-attested; CI was independently observed.`, "Coding session is about to close."].join("\n");
+  if (binding.originalWork ? finalizationDigest({ head: binding.originalWork.snapshot.head, branch: binding.originalWork.snapshot.branch, clean: binding.originalWork.snapshot.clean, fingerprint: binding.originalWork.snapshot.fingerprint }) !== finalizationDigest(cleanupSnapshot) : !cleanupSnapshot.clean || JSON.parse(approval.value!).snapshot.fingerprint !== cleanupSnapshot.fingerprint) throw new Error("Original cleanup content changed since owner acceptance");
+  const body = [`Delivered and verified:`, ...deliveries.map((delivery) => `- ${delivery.url} — merged as ${delivery.mergeCommit}.`), "", `Removed the original ${task.repositoryId} task worktree (${task.branchName}, cleanup revision ${cleanupSnapshot.head}). Retired owned filesystem resources to verified retained quarantine; their original active paths are absent. Retained the linked PR and CI history.${binding.originalWork ? " Unfinished original work remains in its independently restored archive and exact whole-worktree quarantine; it is not claimed as delivered." : ""}`, "", `Acceptance: existing owner comment ${binding.acceptance.ownerCommentId}. Local verification reports remain owner-attested; CI was independently observed.`, "Coding session is about to close."].join("\n");
   const original = { taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey, repositoryId: task.repositoryId, machineId: task.machineId,
     connectionId: task.connectionId!, issueId: source.issue.id, issueIdentifier: task.issueIdentifier!, contractRevision: binding.contractRevision,
     worktree, taskWorktree: task.worktreePath!, registeredWorktree: matching[0]!.worktree!, revision: cleanupSnapshot.head, branch: task.branchName, gitDirectory, gitCwd,
     version: 2 as const, bindingRevision: revision, bindingDigest: binding.manifestDigest, resourcePlanDigest: binding.resourcePlanDigest,
     baseCommit: task.baseCommit, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot, cleanupSnapshot,
-    resources: binding.resources, doneHandoff: { requestKey: `${input.requestKey}:done`, body, expectedState: "Merge" as const, state: "Done" as const } };
+    resources: binding.resources, ...(binding.originalWork ? { originalWork: binding.originalWork } : {}), doneHandoff: { requestKey: `${input.requestKey}:done`, body, expectedState: "Merge" as const, state: "Done" as const } };
   if (externalDigest(await dependencies.snapshot(worktree)) !== externalDigest(cleanupSnapshot)) throw new Error("Original cleanup worktree changed during preparation");
   await sourceAuthority(input, task.id, dependencies);
   return input.prisma.$transaction(async (tx) => {
@@ -204,7 +209,7 @@ export async function assertExternalDoneAllowed(input: { prisma: PrismaClient; c
  * entries survive, never a global exemption for PR/CI resource kinds. */
 export async function externalFinalizationProjection(prisma: PrismaClient, task: { id: string; primarySessionId: string | null; resources?: Array<Parameters<typeof finalizationResourceIdentity>[0]> }): Promise<{
   finalizationVersion?: 2;
-  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" }>> };
+  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" | "retain-archive" | "retain-result" }>> };
 }> {
   if (!task.primarySessionId) return {};
   const binding = await latestExternalBinding(prisma, task.id, task.primarySessionId);
@@ -217,11 +222,11 @@ export async function externalFinalizationProjection(prisma: PrismaClient, task:
     const data = z.object({ version: z.literal(2), preparedRevision: z.number().int(), resourceProofs: z.array(z.number().int()) }).parse(JSON.parse(confirmed.value!));
     const preparation = await prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: data.preparedRevision } });
     const prepared = PreparedExternalFinalization.parse(JSON.parse(preparation.value!));
-    if (preparation.action !== FINALIZATION_PREPARED || preparation.source !== confirmed.source || preparation.runtimeSessionId !== task.primarySessionId || preparation.key !== confirmed.key || prepared.taskId !== task.id || prepared.sessionId !== task.primarySessionId || prepared.requestKey !== confirmed.key || prepared.bindingRevision !== binding.sequence || prepared.bindingDigest !== adopted.manifestDigest || prepared.resourcePlanDigest !== adopted.resourcePlanDigest || finalizationDigest(prepared.resources) !== prepared.resourcePlanDigest || finalizationDigest(adopted.resources) !== prepared.resourcePlanDigest) return hint;
+    if (preparation.action !== FINALIZATION_PREPARED || preparation.source !== confirmed.source || preparation.runtimeSessionId !== task.primarySessionId || preparation.key !== confirmed.key || prepared.taskId !== task.id || prepared.sessionId !== task.primarySessionId || prepared.requestKey !== confirmed.key || prepared.bindingRevision !== binding.sequence || prepared.bindingDigest !== adopted.manifestDigest || prepared.resourcePlanDigest !== adopted.resourcePlanDigest || finalizationDigest(prepared.resources) !== prepared.resourcePlanDigest || finalizationDigest(adopted.resources) !== prepared.resourcePlanDigest || finalizationDigest(prepared.originalWork ?? null) !== finalizationDigest(adopted.originalWork ?? null)) return hint;
     const records = task.resources ?? await prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
     const relevant = records.filter((record) => ["browser", "development", "review"].includes(record.purpose));
-    if (relevant.length !== records.length || relevant.length !== prepared.resources.length || prepared.resources.some((entry) => !relevant.some((record) => record.id === entry.id && finalizationResourceIdentity(record).identityDigest === entry.identityDigest && (entry.disposition === "retain-reference" ? record.state !== "released" : record.state === "released")))) return hint;
+    if (relevant.length !== records.length || relevant.length !== prepared.resources.length || prepared.resources.some((entry) => !relevant.some((record) => record.id === entry.id && finalizationResourceIdentity(record).identityDigest === entry.identityDigest && (entry.disposition.startsWith("retain-") ? record.state !== "released" : record.state === "released")))) return hint;
     await assertResourceProofs(prisma, prepared, preparation.sequence, confirmed.value);
-    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference") } };
+    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference" || entry.disposition === "retain-archive" || entry.disposition === "retain-result") } };
   } catch { return hint; }
 }
