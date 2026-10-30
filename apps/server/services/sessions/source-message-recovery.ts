@@ -1,3 +1,4 @@
+import { QueuedNativeReport, inspectQueuedReportDisposition, recordQueuedReportDisposition } from "./source-report-disposition.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient, Prisma, RuntimeSourceMessage } from "../../../../generated/prisma/client.ts";
@@ -22,6 +23,7 @@ export const ExternalSourceDispositionInput = OperatorRequest.extend({
   owner: z.object({ kind: z.literal("native-codex-chat"), threadId: z.string().min(1).max(256), hostId: z.string().min(1).max(256) }).strict(),
   outcome: z.enum(["handled", "assigned", "informational", "needs-action"]),
   evidence: z.array(z.string().trim().min(1).max(2000)).min(1).max(20),
+  queuedReport: QueuedNativeReport.optional(),
 }).strict();
 
 function fingerprint(action: string, value: unknown) {
@@ -55,7 +57,7 @@ export async function inspectSourceMessage(prisma: PrismaClient, config: ServerC
   const source = await sourceForOperator(prisma, config, id);
   const owners = await fetchRouteCandidates(scoped(config, source), prisma, source.resourceIdentifier);
   const resolutions = await prisma.runtimeSourceMessageResolution.findMany({ where: { sourceMessageId: id }, orderBy: { sequence: "desc" }, take: 100 });
-  return { source, publicationOrigin: await sourcePublicationOrigin(prisma, source),
+  return { source, queuedReport: await inspectQueuedReportDisposition(prisma, config, source), publicationOrigin: await sourcePublicationOrigin(prisma, source),
     managedOwners: await Promise.all(owners.map(async owner => {
       const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: owner.runtime.runtimeSessionId! } });
       const task = await prisma.remoteTask.findUnique({ where: { primarySessionId: session.id } });
@@ -165,6 +167,7 @@ export async function retrySourceMessage(input: { prisma: PrismaClient; config: 
 
 export async function recordExternalSourceDisposition(input: { prisma: PrismaClient; config: ServerConfig; id: string; request: z.infer<typeof ExternalSourceDispositionInput> }) {
   const { prisma, config, id, request } = input;
+  if (request.queuedReport) return recordQueuedReportDisposition({ prisma, config, id, request: { ...request, queuedReport: request.queuedReport } });
   const hash = fingerprint("record-external", request);
   await sourceForOperator(prisma, config, id);
   const previous = await previousRequest(prisma, id, request.requestKey, hash);

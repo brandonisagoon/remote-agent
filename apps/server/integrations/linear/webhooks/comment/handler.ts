@@ -1,3 +1,4 @@
+import { nativeReportIngress } from "../../../../services/sessions/source-message-publication.ts";
 import type { PrismaClient } from "../../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../../../types/runtime/index.ts";
@@ -12,7 +13,7 @@ import { getIssueWorkGraph } from "../../session-store/source-issue/work-graph.t
 import { getSourceIssueParent } from "../../session-store/source-issue/read.ts";
 import { withToolingInstructions } from "../../../../../../lib/skills/compose.ts";
 import { matchWorkflows } from "../../../../workflows/match.ts";
-import { recordSourceMessage, sourceMessageId } from "../../../../services/sessions/source-messages.ts";
+import { recordSourceMessage, sourceMessageId, type SourceMessageInput } from "../../../../services/sessions/source-messages.ts";
 import { readDeliveryComment } from "../../comment-context.ts";
 
 function messageSource(config: ServerConfig, webhook: LinearCommentWebhook) {
@@ -76,7 +77,9 @@ async function queueOwnerComment(input: {
   const data = webhook.data;
   // A Linear retry can carry a different delivery ID. An unchanged comment
   // still has one instruction, while a genuine edit is a new owner message.
-  const sourceInput = messageSource(config, webhook);
+  let sourceInput: SourceMessageInput = messageSource(config, webhook);
+  const report = await nativeReportIngress(prisma, config, sourceInput);
+  if (report && !report.informational) sourceInput = { ...sourceInput, revision: report.revision };
   const requestId = sourceMessageId(sourceInput);
   const queued = await prisma.$transaction(async (tx) => {
     const session = await tx.runtimeSession.findUnique({ where: { id: sessionId } });
@@ -105,6 +108,14 @@ async function queueOwnerComment(input: {
       commentId: data.id, status: "accepted", detail: `instruction:${requestId}`,
     });
     if (!receipt) return false;
+    if (report) {
+      const current = await tx.runtimeSourceMessageResolution.findUnique({ where: { id: report.receiptId } });
+      if (current?.fingerprint !== report.fingerprint) throw new Error("Native report provenance changed during ingress");
+      if (report.informational) {
+        await tx.webhookReceipt.update({ where: { id: receipt.id }, data: { status: "ignored", detail: "external_informational_report" } });
+        return false;
+      }
+    }
     const source = await recordSourceMessage(tx, sourceInput);
     const question = input.questionId ? await tx.runtimeQuestion.findFirst({ where: {
       id: input.questionId, runtimeSessionId: sessionId, connectionId: config.activeConnectionId,

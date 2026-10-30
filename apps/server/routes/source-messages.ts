@@ -1,3 +1,6 @@
+import { apiAuthMiddleware } from "../middleware/api-auth.ts";
+import { TASK_READ_DEADLINE_MS, taskRequest } from "../middleware/request-lifetime.ts";
+import { RequestLifetimeError } from "../request-lifetime.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../middleware/context.ts";
 import { ExternalSourceDispositionInput, inspectSourceMessage, ListSourceMessagesInput, listSourceMessages,
@@ -28,10 +31,17 @@ sourceMessageRoutes.post("/:sourceId/retry", async c => {
     return c.json(result, result.replayed ? 200 : 202);
   } catch (error) { return c.json({ error: failure(error) }, 409); }
 });
+// Native report attestations require the owner credential even on session IPC.
+sourceMessageRoutes.use("/:sourceId/external-disposition", async (c, next) => {
+  const body = await c.req.json().catch(() => null);
+  if (body?.queuedReport) return apiAuthMiddleware()(c, next);
+  await next();
+});
 sourceMessageRoutes.post("/:sourceId/external-disposition", async c => {
   const parsed = ExternalSourceDispositionInput.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: "Provide a native chat owner, outcome, evidence, inspected revision, reason and stable requestKey", details: parsed.error.issues }, 400);
   try {
-    return c.json(await recordExternalSourceDisposition({ prisma: c.get("prisma"), config: c.get("config"), id: c.req.param("sourceId"), request: parsed.data }));
-  } catch (error) { return c.json({ error: failure(error) }, 409); }
+    const record = () => recordExternalSourceDisposition({ prisma: c.get("prisma"), config: c.get("config"), id: c.req.param("sourceId"), request: parsed.data });
+    return parsed.data.queuedReport ? await taskRequest(c, TASK_READ_DEADLINE_MS, async () => c.json(await record())) : c.json(await record());
+  } catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: failure(error) }, 409); }
 });

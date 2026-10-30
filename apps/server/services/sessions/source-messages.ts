@@ -11,16 +11,19 @@ export interface SourceMessageInput {
   provider: string; connectionId: string; repositoryId: string; machineId: string;
   resourceId: string; resourceIdentifier: string; commentId: string; threadRootId: string; authorId: string; body: string;
   presentation: Record<string, string | undefined>;
+  /** Canonical provider version for an edit of an attested outbound report. */
+  revision?: string;
 }
 
-export function sourceMessageId(input: Pick<SourceMessageInput, "provider" | "connectionId" | "commentId" | "body">) {
-  return `${input.provider}-comment:${input.connectionId}:${input.commentId}:${createHash("sha256").update(input.body).digest("hex")}`;
+export function sourceMessageId(input: Pick<SourceMessageInput, "provider" | "connectionId" | "commentId" | "body" | "revision">) {
+  return `${input.provider}-comment:${input.connectionId}:${input.commentId}:${createHash("sha256").update(input.body).digest("hex")}${input.revision ? `:revision:${createHash("sha256").update(input.revision).digest("hex")}` : ""}`;
 }
 
 export async function recordSourceMessage(store: SourceMessageStore, input: SourceMessageInput) {
   const id = sourceMessageId(input);
+  const { revision: _revision, ...record } = input;
   const row = await store.runtimeSourceMessage.upsert({ where: { id }, update: {}, create: {
-    ...input, id, presentation: JSON.parse(JSON.stringify(input.presentation)) as Prisma.InputJsonObject,
+    ...record, id, presentation: JSON.parse(JSON.stringify(input.presentation)) as Prisma.InputJsonObject,
   } });
   if (["provider", "connectionId", "repositoryId", "machineId", "resourceId", "commentId", "threadRootId", "authorId", "body"].some((key) => row[key as keyof typeof row] !== input[key as keyof SourceMessageInput])) {
     throw new Error("Source message identity changed; refusing to reroute an accepted comment");
