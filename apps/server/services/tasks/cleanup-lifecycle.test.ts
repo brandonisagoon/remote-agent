@@ -1369,8 +1369,12 @@ test.skipIf(!process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT)("actual privat
   try {
     const { finalizeTask } = await import(path.join(root, "src/finalize.ts"));
     const { taskRegistry } = await import(path.join(root, "src/control.ts")), { manageResource } = await import(path.join(root, "src/resources.ts"));
-    const base = taskRegistry(socket, f.task.id, 3000); let loseWrite = true, writes = 0, captures = 0;
-    const registry = { ...base, resource: async (value: unknown) => { await base.resource(value); writes++; if (loseWrite) { loseWrite = false; throw Error("Lost applied Released acknowledgment"); } } };
+    const base = taskRegistry(socket, f.task.id, 3000); let loseWrite = true, writes = 0, captures = 0, lateClaimAfterTask = false;
+    const registry = { ...base, task: async () => {
+      const observed = await base.task();
+      if (lateClaimAfterTask) { lateClaimAfterTask = false; await db.prisma.remoteTaskResource.create({ data: { id: "late-final-task", taskId: "foreign", key: "late-final-task", kind: "private-file", purpose: "development", state: "ready", externalId: p.scope.quarantine.path } }); }
+      return observed;
+    }, resource: async (value: unknown) => { await base.resource(value); writes++; if (loseWrite) { loseWrite = false; throw Error("Lost applied Released acknowledgment"); } } };
     const before = await lstat(p.file), bytes = await readFile(p.file), backup = await readFile(p.backupFile), key = await readFile(p.keyFile);
     await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", branchName: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: f.task.toolingRevision } });
     const run = (extra = {}) => manageResource({ registry, key: p.resource.key, action: "release", docker: p.docker, privateExport: { keyFile: p.keyFile, observation: p.input.observation, composeJournalRoot: p.input.composeJournalRoot,
@@ -1378,6 +1382,12 @@ test.skipIf(!process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT)("actual privat
     await expect(run({ afterPlan: async () => { await db.prisma.remoteTaskResource.create({ data: { id: "late", taskId: "foreign", key: "claim", kind: "private-file", purpose: "development", state: "ready", externalId: p.scope.quarantine.path } }); } })).rejects.toThrow();
     expect((await lstat(p.file)).ino).toBe(before.ino); expect(captures).toBe(0); expect(writes).toBe(0);
     await db.prisma.remoteTaskResource.delete({ where: { id: "late" } });
+    let insideCapture = false;
+    p.state.onIdle = () => { if (insideCapture) { lateClaimAfterTask = true; p.state.onIdle = undefined; } };
+    await expect(run({ captureHooks: { beforeCapture: () => { insideCapture = true; }, afterCapture: () => { captures++; } } })).rejects.toThrow();
+    expect((await lstat(p.file)).ino).toBe(before.ino); expect(captures).toBe(0); expect(writes).toBe(0);
+    expect(await db.prisma.remoteTaskResource.count({ where: { id: "late-final-task" } })).toBe(1);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-final-task" } });
     const finalize = () => finalizeTask({ registry, cleanup: true, manage: (input: any) => manageResource({ ...input, docker: p.docker, compose: { journalRoot: p.input.composeJournalRoot },
       privateExport: { keyFile: p.keyFile, observation: p.input.observation, composeJournalRoot: p.input.composeJournalRoot, captureHooks: { afterCapture: () => { captures++; } } } }), close: async () => { throw Error("Retained source must not close"); } });
     await expect(finalize()).rejects.toThrow("Cleanup preserved task resources"); expect(captures).toBe(1);
