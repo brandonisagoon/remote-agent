@@ -17,6 +17,8 @@ import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } f
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
+import { cleanupCandidates } from "../../services/tasks/cleanup-candidates.ts";
+import { CleanupProgressInput, recordCleanupProgress } from "../../services/tasks/cleanup-progress.ts";
 import { CleanupReportRequest, publishCleanupReport, cleanupProjection } from "../../services/tasks/cleanup-report.ts";
 
 import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
@@ -25,6 +27,13 @@ import { taskResponse } from "./response.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
+
+taskRoutes.post("/:taskId/cleanup-progress", async (c) => {
+  const parsed = CleanupProgressInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Use the bound cleanup operation and bounded resource diagnostics" }, 400);
+  try { return c.json(await recordCleanupProgress({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), progress: parsed.data })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 taskRoutes.post("/:taskId/cleanup-report", async (c) => {
   const request = CleanupReportRequest.safeParse(await c.req.json());
@@ -134,12 +143,12 @@ taskRoutes.get("/", async (c) => {
   const cursor = c.req.query("cursor");
   const rows = await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { id: "asc" }, take: 101, ...(cursor ? { where: { id: { gt: cursor } } } : {}) });
   const tasks = rows.slice(0, 100);
-  const complete = tasks.filter((task) => task.phase === "complete" && task.primarySessionId);
-  const prepared = complete.length ? await prisma.runtimeMetadataEvent.findMany({ where: {
-    action: "finalization-prepared", source: { in: complete.map((task) => `finalizer:${task.id}`) },
-    runtimeSessionId: { in: complete.map((task) => task.primarySessionId!) },
-  }, select: { source: true, runtimeSessionId: true } }) : [];
-  return c.json({ tasks: await Promise.all(tasks.map(async (task) => ({ ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), ...await cleanupProjection(prisma, c.get("config"), task), finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) }))), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
+  const eligible = await cleanupCandidates(prisma, c.get("config"), tasks);
+  return c.json({ tasks: await Promise.all(tasks.map(async (task) => {
+    const cleanup = await cleanupProjection(prisma, c.get("config"), task);
+    return { ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), ...cleanup,
+      finalizationPending: task.phase === "closed" ? Boolean("cleanupOperation" in cleanup && cleanup.cleanupOperation?.reportingPending) : eligible.has(task.id) };
+  })), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
 });
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });

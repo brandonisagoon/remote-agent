@@ -6,7 +6,7 @@ import { createTestDatabase, type TestDatabase } from "../../../../test-support/
 import { testConfig } from "../../../../test-support/config.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
-import { confirmTaskFinalization, prepareTaskFinalization } from "./finalization.ts";
+import { confirmTaskFinalization, prepareTaskFinalization, finalizationDependencies } from "./finalization.ts";
 import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED } from "./finalization-receipts.ts";
 import { CLEANUP_OPERATION, assertPreparedCleanup, bindPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { createHash } from "node:crypto";
@@ -14,7 +14,7 @@ import { Hono } from "hono";
 import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
-import { taskRoutes } from "../../routes/tasks/index.ts";
+import { taskRoutes, sessionTaskRoutes } from "../../routes/tasks/index.ts";
 import { taskSupervisionRoutes } from "../../routes/tasks/supervision.ts";
 import { CLEANUP_REPORT, cleanupReportDelivery, publishCleanupReport } from "./cleanup-report.ts";
 
@@ -32,7 +32,7 @@ async function fixture() {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree");
   await mkdir(root); git(root, "init", "-b", "main");
   git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
-  await writeFile(path.join(root, "README.md"), "accepted content\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture");
+  await writeFile(path.join(root, "README.md"), "accepted content\n"); await writeFile(path.join(root, ".gitignore"), "node_modules/\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture");
   git(root, "worktree", "add", "-b", "codex/task", worktree);
   const config = testConfig({ repository: { ...testConfig().repository, root } });
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", cwd: worktree, repositoryId: config.repository.id, machineId: config.machine } });
@@ -152,6 +152,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
   const original = await prepareTaskFinalization(f.input, f.dependencies);
   const preparation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.preparedRevision } });
   f.issue.state = f.states[2]!;
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
   const comments = new Map<string, { id: string; issue: { id: string }; body: string }>();
   let creates = 0, offline = true, lostClose = true, closures = 0;
   const identity = { cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "idle" as const };
@@ -173,7 +174,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
       expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
       try { return c.json(await publishCleanupReport({ ...f.context, requestKey: f.input.requestKey }, client)); }
       catch (error) { return c.json({ error: (error as Error).message }, 409); }
-    }).route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes);
+    }).route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
   const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
   try {
     const { taskRegistry, closeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
@@ -191,4 +192,47 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
     expect(f.issue.state.name).toBe("Blocked");
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.preparedRevision } })).value).toBe(preparation.value);
   } finally { await server.stop(true); }
+}, 30_000);
+
+
+for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)(`actual ${automatic ? "automatic upkeep" : "destroy CLI"} prepares waiting accepted work, closes through control routes and retries its pending report`, async () => {
+  const f = await fixture();
+  f.issue.state = { id: "custom", name: "Owner selected status", type: "started" };
+  const modules = path.join(f.worktree, "node_modules"); await mkdir(modules);
+  await Promise.all(Array.from({ length: 2200 }, (_, index) => writeFile(path.join(modules, `generated-${index}.js`), "disposable dependency")));
+  await db.prisma.remoteTaskResource.create({ data: { id: "dependency", taskId: f.task.id, key: "dependencies", kind: "dependency-install", purpose: "development", externalId: modules, state: "ready", metadata: { trackedChanges: false } } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting", ownerPaused: true } });
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "idle", role: "primary" }]);
+  const saved = { ...finalizationDependencies };
+  Object.assign(finalizationDependencies, f.dependencies);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .post("/api/tasks/task/cleanup-report", c => c.json({ error: "Linear is offline" }, 503))
+    .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(directory, "cli.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const cli = async (args: string[] = ["task", "destroy", "--task", f.task.id]) => {
+    const child = Bun.spawn([process.execPath, path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts"), ...args, "--socket", socket], { cwd: directory, stdout: "pipe", stderr: "pipe" });
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    return { code, stdout, stderr };
+  };
+  try {
+    const denied = await cli();
+    expect(denied.code).toBe(1); expect(denied.stderr).toContain("paused");
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(0);
+    expect(git(f.worktree, "rev-parse", "HEAD")).toBe(f.remote.remoteHead);
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    const result = await cli(automatic ? ["upkeep", "expired"] : undefined);
+    if (result.code) throw new Error(JSON.stringify({ result, progress: await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "finalization-cleanup-progress" }, orderBy: { sequence: "desc" } }) }));
+    expect(result.stderr).toBe(""); expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ taskId: f.task.id, closed: true, reporting: { state: "pending" } });
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
+    expect(runtime.closedSessionIds).toEqual([f.session.id]);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "dependency" } })).state).toBe("released");
+    expect(f.issue.state.name).toBe("Owner selected status");
+    const retry = await cli(["upkeep", "expired"]);
+    expect(retry.code).toBe(0); expect(JSON.parse(retry.stdout)).toMatchObject({ alreadyClosed: true, reporting: { state: "pending" } });
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
+  } finally { Object.assign(finalizationDependencies, saved); await server.stop(true); }
 }, 30_000);

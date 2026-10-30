@@ -57,3 +57,34 @@ retained 8 MiB archive and performs 128 renewals within a real 10-second deadlin
 with no task GETs, including database/client reconnection, pause rejection and
 full-boundary rejection of changed retained bytes. Run with
 `DRAFTED_INTEGRATION_ROOT` pointing at the matching Drafted checkout.
+
+The current client exposes `drafted task destroy --task ID --socket PATH` as an
+entry point to the existing finalizer; `upkeep finalize` uses the same operation.
+Automatic expired upkeep also selects locally accepted merge contracts with
+matching verification, then lets ordinary first preparation verify delivery.
+Paused tasks, changed original session ownership and revoked decisions are not
+scheduled. Closed operations retry only their pending frozen report.
+
+Resource results are recorded against the same operation. The server validates
+keys and the operation epoch, caps/redacts diagnostic text, and derives terminal
+progress from its resource receipts and retained-archive proof. A reported
+success cannot release a resource. Unresolved required resources prevent closure;
+progress remains inspectable after restart.
+
+The v1 directory-evidence and installed-dependency paths accept the same bound
+cleanup witness in a waiting phase. Directory capture keeps its independent
+archive/inode/inactivity checks. Native dependency batches use the cheap local
+authority request, while full entry/completion checks still observe Git and
+preservation. Existing dependency journals exclude only the additive operation
+witness from their original preparation digest, so interrupted removals resume
+without replacing the journal or original preparation.
+
+The actual CLI/control integration removes 2,200 disposable dependency files,
+closes through the real server automation route and retries offline reporting.
+A separate real 2,300-file native test resumes an old journal and asserts that
+batch checks cannot call full task projections, provider preparation or Git.
+The retained-backup/directory fixture verifies pause before capture, same-proof
+retry, unchanged original receipts, retained SQL bytes and an unresolved foreign
+provider resource. Stop-first dependency scheduling and legacy native source
+reconciliation are being integrated separately; external/v2 continuation is
+owned by the companion legacy-delivery change. No live teardown was performed.

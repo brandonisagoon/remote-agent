@@ -203,7 +203,11 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
   return input.prisma.$transaction(async (tx) => {
     await loadProof(tx, input.config, task.id, result.proofRevision);
     const currentTask = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
-    if (currentTask.phase !== "complete") throw new Error("Legacy evidence task changed before confirmation");
+    const { hasPreparedCleanup, assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+    if (currentTask.phase !== "complete" || await hasPreparedCleanup(tx, task.id, input.sessionId, proof.finalizationRequestKey)) {
+      const active = await assertPreparedCleanup({ prisma: tx, config: input.config, sessionId: input.sessionId, requestKey: proof.finalizationRequestKey });
+      if (active.preparation.sequence !== proof.preparedRevision) throw new Error("Legacy evidence cleanup preparation changed before confirmation");
+    }
     const existing = await tx.runtimeMetadataEvent.findFirst({ where: confirmWhere });
     if (existing && existing.value !== JSON.stringify(confirmation)) throw new Error("Legacy evidence confirmation linkage changed");
     const record = await tx.remoteTaskResource.findUniqueOrThrow({ where: { id: entry.resourceId } });

@@ -5,6 +5,7 @@ import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../int
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
 import { registerThread } from "../sessions/threads.ts";
 import { assertCompletedCleanup, assertPreparedCleanup, hasPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { cleanupProgressProjection } from "./cleanup-progress.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 
 export const CLEANUP_REPORT = "finalization-cleanup-report";
@@ -90,7 +91,8 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
     const input = { prisma, config, sessionId: task.primarySessionId, requestKey };
     const active = confirmed ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
     const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: task.primarySessionId, requestKey: `${requestKey}:cleanup-report` } } });
-    return { cleanupRequired: true as const, cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
+    const progress = await cleanupProgressProjection(prisma, task, { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation) });
+    return { ...progress, cleanupRequired: true as const, cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
       preparedRevision: active.preparation.sequence, ...(confirmed ? { confirmedRevision: confirmed.sequence } : {}), reportingPending: Boolean(confirmed && !report?.published) } };
   } catch (error) { return { cleanupRequired: true as const, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
 }

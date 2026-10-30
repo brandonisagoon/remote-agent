@@ -9,6 +9,8 @@ import { completionObservation } from "./completion-observation.ts";
 import { confirmTaskFinalization, prepareTaskFinalization } from "./finalization.ts";
 import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED } from "./finalization-receipts.ts";
 import { CLEANUP_OPERATION, assertPreparedCleanup, bindPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { CLEANUP_PROGRESS, recordCleanupProgress, cleanupProgressProjection } from "./cleanup-progress.ts";
+import { retirementDigest } from "./retirement-receipts.ts";
 import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
@@ -270,3 +272,43 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual control client and se
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
   } finally { await server.stop(true); }
 }, 30_000);
+
+
+test("cleanup progress survives restart but diagnostic success cannot release resources or expand the bound scope", async () => {
+  const f = await preparedFixture(), active = await bindPreparedCleanup(f.input, f.observe);
+  const operation = { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation) };
+  const progress = { ...operation, requestKey: f.input.requestKey, outcomes: [{ key: "data", outcome: "released", detail: "provider password=do-not-store\n403 " + "x".repeat(2000) }] };
+  const input = { ...f.context, progress };
+  const first = await recordCleanupProgress(input);
+  expect(first.resources).toMatchObject([{ key: "data", state: "ready", outcome: "blocked" }]);
+  expect(first.resources[0]!.detail).not.toContain("do-not-store"); expect(first.resources[0]!.detail!.length).toBe(1000);
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "volume" } })).state).toBe("ready");
+  expect((await recordCleanupProgress(input)).revision).toBe(first.revision);
+  await db.prisma.$disconnect();
+  expect((await cleanupProgressProjection(db.prisma, f.task, operation)).cleanupProgress?.resources).toEqual(first.resources);
+  await expect(recordCleanupProgress({ ...input, progress: { ...progress, outcomes: [{ key: "foreign", outcome: "released" }] } })).rejects.toThrow("unknown or duplicate");
+  await expect(recordCleanupProgress({ ...input, progress: { ...progress, operationDigest: "f".repeat(64) } })).rejects.toThrow("operation changed");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  await expect(recordCleanupProgress(input)).rejects.toThrow("paused");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  await db.prisma.remoteTaskResource.update({ where: { id: "volume" }, data: { state: "released" } });
+  expect((await recordCleanupProgress(input)).resources[0]!.outcome).toBe("released");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_PROGRESS } })).toBe(2);
+  await f.revoke();
+  await expect(recordCleanupProgress(input)).rejects.toThrow("revoked");
+});
+
+
+test("automatic cleanup candidates exclude pause, changed original ownership and revoked acceptance", async () => {
+  const f = await fixture(); f.issue.state.name = "Custom owner status";
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes);
+  const candidate = async () => (await (await app.request("/api/tasks?pagination=id")).json()).tasks.find((task: { id: string }) => task.id === f.task.id).finalizationPending;
+  expect(await candidate()).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(0);
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); expect(await candidate()).toBeFalse();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { cwd: f.root } }); expect(await candidate()).toBeFalse();
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { cwd: f.worktree } }); expect(await candidate()).toBeTrue();
+  await f.revoke(); expect(await candidate()).toBeFalse();
+});
