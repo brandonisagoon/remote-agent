@@ -273,3 +273,28 @@ DRA231 adds a whole-finalizer case under the same opt-in. It calls the actual cl
 The retained-spatial variant of that whole-finalizer test binds the existing migrated cutover receipt and freezes the protected spatial container/volume/network in the client's private member journal. Four other development containers and three volumes are removed, while the retained source stays stopped and all original resource metadata and preparation/operation bytes remain unchanged. A lost partial removal and an independent review Released response recover through normal Unix routes. The existing v1 progress remains Ready/blocked and confirmation/closure do not occur; this test does not introduce a retained disposition or change server authority.
 
 DRA-173 adds optional visible progress through the existing issue publisher and confirmed report outbox. `cleanup-status` saves only reporting intent; it cannot bind an operation or grant effects. The final report captures a reference only when that intent predates confirmation. Existing reports remain comment-only. Missing configuration and reporting failures leave physical cleanup independent, while source serialization and confirmed-start supersession prevent an obsolete Cleanup update from following final Done. Owner changes are preserved. No task/session schema, immutable preparation, retry fingerprint or cleanup adapter changes.
+
+### Legacy disposable review databases
+
+The optional selected-resource renewal also supports the exact original
+`spatial-neon-review` database receipt with an explicit database-only DROP
+instruction. Its same-task development cutover is preserved provenance, never
+another deletion target. All registered review consumers must already be
+Released. Bounded global ownership checks reject another active claim on the
+exact database or whole Neon branch, including task-runtime provider claims.
+The unchanged original preparation/operation and resource identity remain the
+only authority; no new preparation, proof or live receipt is manufactured.
+The client separately verifies provider lifetime, consumers, durable retry and
+physical absence before the ordinary metadata-preserving Released write.
+
+Actual disposable Unix control coverage exercises the normal Drafted resource
+dispatch and Neon HTTP adapter: late foreign ownership and owner pause refuse
+before DELETE; lost provider response resumes with one exact DELETE and raw
+original metadata events unchanged. The read-only original71 compatibility
+preflight confirms current legacy shape only, not live retirement.
+
+### Original private credential exports
+
+The selected-key v1 authority route recognizes only the exact recorded `credentials-export-development` private export recipe and its original same-task environment/Compose association. It checks the source, deterministic private journal and external capture storage against source/tooling, retained archives, other tasks' resource paths and registered worktrees. This is a local scope witness for an already-accepted operation, not new preparation or physical absence proof. The client separately authenticates the original committed encrypted backup/key, verifies exact export bytes and stopped consumers, and preserves the source inode through native capture before writing Released with unchanged metadata.
+
+The disposable Unix route/whole-finalizer regression covers a late foreign capture-path claim, an initially absent Compose journal, native capture, a lost applied registry acknowledgment, exact retained-source preservation and unchanged original preparation/operation events. No live original71 private-export action is claimed by these tests.
