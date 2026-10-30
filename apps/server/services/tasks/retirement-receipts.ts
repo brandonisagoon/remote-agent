@@ -41,10 +41,10 @@ function stableMetadata(value: unknown) {
   return stable;
 }
 
-export async function retirementBinding(prisma: RetirementDatabase, config: ServerConfig, taskId: string, issueId: string): Promise<RetirementBinding> {
+export async function retirementBinding(prisma: RetirementDatabase, config: ServerConfig, taskId: string, issueId: string, interrupted = false): Promise<RetirementBinding> {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!session || session.role !== "primary" || session.status === "closed" || task.phase !== "complete" || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier
+  if (!session || session.role !== "primary" || session.status === "closed" || !(interrupted ? ["waiting", "blocked", "complete"].includes(task.phase) : task.phase === "complete") || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier
     || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Retirement requires the open complete task's original primary");
   const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, externalId: task.issueIdentifier, resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
   if (!link) throw new Error("Retirement source ownership changed");
@@ -71,11 +71,15 @@ export async function assertRetirementAuthority(prisma: RetirementDatabase, conf
   const current = await retirementBinding(prisma, config, taskId, issueId);
   const expected = grant.data.binding;
   if (current.sessionId !== sessionId || expected.sessionId !== sessionId) throw new Error("Retirement primary identity changed");
+  assertRetirementBinding(current, expected);
+  return { grant: grant.data, reference: { revision: event.sequence, digest } };
+}
+
+export function assertRetirementBinding(current: RetirementBinding, expected: RetirementBinding) {
   // Release is the only terminal transition accepted from a frozen resource.
   // Newly added or rebound resources and resurrected released receipts fail.
   if (current.resources.length !== expected.resources.length || current.resources.some((resource, index) => {
     const saved = expected.resources[index]!;
     return saved.state === "released" && resource.state !== "released" || retirementDigest({ ...resource, state: saved.state, metadata: normalizeRetirementPreviewTransition(saved, resource, expected.resources, current.resources) }) !== retirementDigest(saved);
   }) || retirementDigest({ ...current, resources: expected.resources }) !== retirementDigest(expected)) throw new Error("Retirement task, resource, tooling or verification binding changed");
-  return { grant: grant.data, reference: { revision: event.sequence, digest } };
 }
