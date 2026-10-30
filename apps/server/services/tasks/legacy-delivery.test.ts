@@ -16,6 +16,7 @@ import { assertExternalDoneAllowed, confirmExternalFinalization, prepareExternal
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { revokeDeliveredRetirement } from "./delivered-retirement-revocation.ts";
 import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts";
+import { cleanupObserverFixture } from "../../../../test-support/cleanup-observer.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "legacy-delivered-"))); });
@@ -47,6 +48,29 @@ test("present-day acceptance freezes clean staging correspondence without invent
   await assertExternalDoneAllowed({ ...f.finalizer, ...confirmed.doneHandoff }, f.dependencies);
   await expect(assertExternalDoneAllowed({ ...f.finalizer, ...confirmed.doneHandoff, body: "different" }, f.dependencies)).rejects.toThrow("immutable");
   expect(f.issue.state.name).toBe("Done");
+});
+
+test("direct adoption returns the exact safe observer failure without a binding or resource mutation", async () => {
+  const f = await fixture();
+  const record = await db.prisma.remoteTaskResource.create({ data: { id: "tunnel", taskId: "task", key: "development-tunnel", kind: "cloudflare-tunnel", purpose: "development", externalId: "original-tunnel", state: "ready", metadata: { source: "private-original-metadata" } } });
+  const capability = await cleanupObserverFixture(directory, `const input=JSON.parse(await Bun.stdin.text()); const selected=input.resources.find(r=>r.id===input.observations[0].resourceId); console.error(JSON.stringify({version:1,type:"cleanup-observer-failure",stage:"resource",code:"preview-binding-missing",resource:{id:selected.id,key:selected.key,kind:selected.kind,adapter:"preview"}})); process.exit(1);`);
+  const request = await f.request(), original = { ...legacyDeliveryDependencies };
+  Object.assign(legacyDeliveryDependencies, f.dependencies, { cleanupObserver: async () => capability });
+  const app = createApp({ ...f.context, agentRuntime: createFakeAgentRuntime() });
+  try {
+    for (let retry = 0; retry < 2; retry++) {
+      const response = await app.request("/api/tasks/task/completion/delivered-retirement", { method: "PUT", headers: { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(request) });
+      expect(response.status).toBe(409);
+      const result = await response.json();
+      expect(result.error).toContain("[OBSERVER_PREVIEW_BINDING_MISSING]");
+      expect(result.error).toContain("development-tunnel (cloudflare-tunnel/preview)");
+      expect(JSON.stringify(result)).not.toMatch(/private-original-metadata|observer\/adapter|original-tunnel/);
+      expect(result.binding).toBeUndefined();
+    }
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["external-delivery-binding", "finalization-prepared", "finalization-confirmed", "finalization-cleanup-started"] } } })).toBe(0);
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: record.id } })).toEqual(record);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toolingRevision).toBe("a".repeat(40));
+  } finally { Object.assign(legacyDeliveryDependencies, original); }
 });
 
 test.each(["branch", "head", "dirty", "source", "pin", "resource"])("changed %s during observation refuses adoption before any authority is stored", async changed => {
