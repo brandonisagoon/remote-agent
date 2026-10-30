@@ -133,3 +133,34 @@ test.skipIf(!draftedRoot)("actual native standalone capture retries its journal 
   await expect(raced.verify(racedPlan)).rejects.toThrow();
   expect(await readFile(retained, "utf8")).toBe("original retained bytes\n"); expect(await readFile(target.quarantine.path, "utf8")).toBe("new owner bytes");
 });
+
+test.skipIf(!draftedRoot).each(["files", "checkpoint"])("actual prepared dispatcher retains %s across lost capture acknowledgment and server confirmation", async kind => {
+  const f = kind === "checkpoint" ? await checkpoint() : await fixture();
+  if (kind === "files") {
+    const second = path.join(f.directory, "scenario.ts"); await writeFile(second, "saved scenario bytes\n", { mode: 0o600 });
+    f.resources.push({ id: "second", key: "scenario", kind: "scenario-fixture", purpose: "development", externalId: second, state: "ready", metadata: { sha256: { "scenario.ts": sha("saved scenario bytes\n") } } });
+    f.input.ownership.ownedPaths.push(second);
+  }
+  const plan = await f.prepare(), { releasePreparedResources } = await import(path.join(draftedRoot!, "src/finalization-resources.ts"));
+  const { assertResourcePlan, FinalizationResourcePlan: ClientPlan } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(f.directory, "original-product"), toolingRevision: "a".repeat(40), phase: "waiting", finalizationVersion: 2, resources: f.resources };
+  const prepared = adapterReceipt(task, plan.map(entry => ClientPlan.parse(entry))), writes: string[] = [], batches: string[][] = []; let lost = true;
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    writes.push(update.key); Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  const afterCapture = () => { if (lost) { lost = false; throw new Error("lost capture acknowledgment"); } };
+  const run = () => releasePreparedResources({ registry, prepared, observation: { ...quiet, pathsIdle: async (paths: string[]) => { batches.push(paths); } },
+    assertAuthority: () => f.verify(plan), assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); },
+    ...(kind === "files" ? { fileCaptureHooks: { afterCapture } } : { captureHooks: { afterCapture } }) });
+  const partial = await run(); expect(partial.results.some((entry: { outcome: string }) => entry.outcome === "failed")).toBeTrue();
+  expect(writes).toEqual(kind === "files" ? ["scenario"] : []); await f.verify(plan);
+  const target = plan[0]!; if (target.disposition !== "retire-file" && target.disposition !== "retire-tree") throw new Error("Missing capture plan");
+  const journal = await readFile(target.target.quarantine.journal), captured = await lstat(target.target.quarantine.path);
+  if (kind === "files") expect(batches).toHaveLength(2);
+  const retried = await run(); expect(retried.results.every((entry: { outcome: string }) => entry.outcome === "retired-to-recoverable-quarantine")).toBeTrue(); await f.verify(plan, true);
+  await run(); await f.verify(plan, true); expect(writes).toEqual(kind === "files" ? ["scenario", "capture"] : ["capture"]);
+  expect(await readFile(target.target.quarantine.journal)).toEqual(journal); expect((await lstat(target.target.quarantine.path)).ino).toBe(captured.ino);
+  if (kind === "checkpoint") expect(await readFile(path.join(target.target.quarantine.path, "README.md"), "utf8")).toBe("ancillary notes stay retained\n");
+  else expect(await readFile(target.target.quarantine.path, "utf8")).toBe("original retained bytes\n");
+}, 30_000);
