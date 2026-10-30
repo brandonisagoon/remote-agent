@@ -206,3 +206,38 @@ async function fixture() {
   const request = async () => { const observed = await inspectLegacyDelivery(context, dependencies); return DeliveredRetirementInput.parse({ version: 1, mode: "legacy-delivery", requestKey: "present-day-retirement", expectedBindingRevision: observed.revision, expectedIdentityDigest: observed.identityDigest, source: observed.source, basis: "Standing owner direction to finish delivered non-workflow work", cleanupSnapshot: observed.cleanupSnapshot, deliveries: [delivery], mergeOrder: [delivery.id], resourceIds: observed.resources.map(resource => resource.id), ownership: { ownedPaths: [] } }); };
   return { root, worktree, reviewed, merge, session, issue, config, context, finalizer, dependencies, delivery, client, request, set providerFault(value: string) { fault = value; } };
 }
+
+test("present-day adoption binds the actual adapter plan and requires independent absence before confirmed cleanup", async () => {
+  const { prepareFinalizationResources, assertFinalizationResources, finalizationResourceObservation, finalizationResourceIdentity } = await import("./finalization-resources.ts");
+  const { CleanupObserverBatchInput, CleanupTarget, cleanupTargetDigest } = await import("./cleanup-observer-schema.ts");
+  const f = await fixture();
+  const record = await db.prisma.remoteTaskResource.create({ data: { id: "container", taskId: "task", key: "original-container", kind: "docker-container", purpose: "development", externalId: "c".repeat(64), state: "ready", metadata: { image: "owned-image" } } });
+  const capability = { version: 1 as const, source: "configured-host" as const, checkout: directory, revision: "b".repeat(40), adapter: path.join(directory, "cleanup.ts"), adapterSha256: "d".repeat(64) };
+  let present = true, observations = 0;
+  const observation = { ...finalizationResourceObservation, adapters: async ({ request }: { request: unknown }) => {
+    observations++;
+    const input = CleanupObserverBatchInput.parse(request);
+    expect(input.task).toEqual({ id: "task", primarySessionId: "primary", worktreePath: f.worktree, toolingRevision: "a".repeat(40) });
+    const rawTargets = input.observations[0]!.expectedTargets ?? [{ kind: "docker-container", id: record.externalId, presentAtPrepare: true, identityDigest: "e".repeat(64), scope: { taskId: "task", purpose: "development" }, identity: { createdAt: "2026-10-30T00:00:00Z", labelsDigest: "f".repeat(64), image: "owned-image", networks: [], volumes: [] } }];
+    const targets = rawTargets.map(target => { const value = CleanupTarget.parse(target); return { ...value, identityDigest: cleanupTargetDigest(value) }; });
+    return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: record.id, resourceIdentityDigest: finalizationResourceIdentity(record).identityDigest,
+      dependencies: [], adapter: "docker", targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
+  } };
+  const dependencies = { ...f.dependencies, cleanupObserver: async () => capability,
+    resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, observation),
+    assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, observation) };
+  const adopted = await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, dependencies);
+  expect(observations).toBe(2);
+  expect(adopted.binding.resources[0]).toMatchObject({ id: record.id, disposition: "retire-adapter", observer: { capability }, adapter: "docker" });
+  const prepared = await prepareExternalFinalization(f.finalizer, dependencies);
+  await db.prisma.remoteTaskResource.update({ where: { id: record.id }, data: { state: "released" } });
+  git(f.root, "worktree", "remove", f.worktree);
+  await expect(confirmExternalFinalization(f.finalizer, dependencies)).rejects.toThrow("independently verified");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+  present = false;
+  const confirmed = await confirmExternalFinalization(f.finalizer, dependencies);
+  expect(confirmed.preparedRevision).toBe(prepared.preparedRevision);
+  expect(await confirmExternalFinalization(f.finalizer, dependencies)).toEqual(confirmed);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toolingRevision).toBe("a".repeat(40));
+  expect(f.issue.state.name).toBe("Done");
+});

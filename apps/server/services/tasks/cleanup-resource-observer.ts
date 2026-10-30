@@ -31,6 +31,19 @@ function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
   return { result, cancel: () => reader.cancel().catch(() => {}) };
 }
 
+async function waitForOwnedGroupExit(group: number) {
+  const deadline = Date.now() + 1000;
+  while (true) {
+    // The helper has already killed its group. This is observation only:
+    // never signal a numeric group after its leader could have been reaped.
+    const current = Bun.spawnSync(["/bin/ps", "-axo", "pgid="], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 250, maxBuffer: 1024 * 1024 });
+    if (current.exitCode !== 0 || current.stderr.length || current.stdout.length > 1024 * 1024) throw failure();
+    if (!current.stdout.toString().split("\n").some(line => Number(line.trim()) === group)) return;
+    if (Date.now() >= deadline) throw failure();
+    await Bun.sleep(10);
+  }
+}
+
 async function execute(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string> }) {
   if (!["darwin", "linux"].includes(process.platform)) throw failure();
   let complete: { code: number } | undefined;
@@ -67,9 +80,12 @@ async function execute(args: string[], options: { cwd: string; input?: string; t
   } catch { throw failure(); }
   finally {
     cancel();
-    await child.exited.catch(() => {});
-    await output.catch(() => {});
-    clearTimeout(timer);
+    try {
+      await child.exited.catch(() => {});
+      await output.catch(() => {});
+      await waitForOwnedGroupExit(child.pid);
+    } finally { clearTimeout(timer); }
+    if (timedOut) throw failure();
   }
 }
 

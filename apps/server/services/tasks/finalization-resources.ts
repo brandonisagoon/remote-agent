@@ -1,3 +1,6 @@
+import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
+import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
+import type { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { observeInactiveUnixSocket } from "./unix-socket.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -26,6 +29,7 @@ export const RetainedArchivePlan = z.object({ ...Identity, purpose: z.enum(["dev
 export const RetainedArchiveMemberPlan = z.object({ ...Identity, kind: z.literal("resource-inventory"), purpose: z.literal("tooling"), disposition: z.literal("retain-archive-member"), archive: z.object({ resourceId: z.string().min(1), root: Absolute, inventoryDigest: Sha }).strict(), file: z.object({ path: Absolute, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedResultPlan = z.object({ ...Identity, disposition: z.literal("retain-result"), reference: z.object({ archiveResourceId: z.string(), provenancePath: Absolute, provenanceSha256: Sha }).strict() }).strict();
 export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
+  CleanupAdapterPlan,
   z.object({ ...Identity, disposition: z.literal("retain-reference"), reference: z.object({ deliveryId: z.string(), type: z.enum(["pull-request", "ci-run"]), repository: z.string(), number: z.number().int().positive(), reviewedHead: z.string(), mergeCommit: z.string().optional() }).strict() }).strict(),
   z.object({ ...Identity, disposition: z.literal("already-released") }).strict(),
   RetainedArchivePlan,
@@ -120,6 +124,7 @@ async function fileIdentity(file: string) {
 }
 
 export type ResourceObservation = {
+  adapters?: typeof runCleanupResourceObserver;
   endpointAbsent(target: { url: string; pid: number; script: string }): Promise<void>;
   rootIdle(root: string): Promise<void>;
   browserAbsent(target: { session: string; toolingRoot: string }): Promise<void>;
@@ -224,7 +229,26 @@ function referencePlan(resource: FinalizationResourceRecord, deliveries: Deliver
   return FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retain-reference", reference: { deliveryId: delivery.id, type: resource.kind === "ci-run" ? "ci-run" : "pull-request", repository: delivery.repository, number, reviewedHead: delivery.reviewedHead, ...(resource.kind !== "ci-run" ? { mergeCommit: delivery.mergeCommit } : {}) } });
 }
 
-export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; originalWork?: boolean }, observation = finalizationResourceObservation) {
+function observerResources(resources: FinalizationResourceRecord[]) {
+  return resources.map(resource => CleanupObserverResource.parse({ id: resource.id, key: resource.key, kind: resource.kind, purpose: resource.purpose, externalId: resource.externalId, state: resource.state, expiresAt: resource.expiresAt instanceof Date ? resource.expiresAt.toISOString() : resource.expiresAt ?? null, metadata: resource.metadata ?? {} }));
+}
+function assertPlanDependencies(plan: FinalizationResourcePlan[]) {
+  const entries = new Map(plan.map(entry => [entry.id, entry])), visiting = new Set<string>(), visited = new Set<string>();
+  function visit(id: string) {
+    if (visiting.has(id)) throw new Error("Prepared cleanup dependency graph contains a cycle");
+    if (visited.has(id)) return;
+    const entry = entries.get(id); if (!entry) throw new Error("Prepared cleanup dependency is outside its resource set");
+    visiting.add(id);
+    if ("dependencies" in entry) {
+      if (new Set(entry.dependencies).size !== entry.dependencies.length || entry.dependencies.includes(id)) throw new Error("Prepared cleanup dependency identity changed");
+      for (const dependency of entry.dependencies) visit(dependency);
+    }
+    visiting.delete(id); visited.add(id);
+  }
+  for (const entry of plan) visit(entry.id);
+}
+
+export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; originalWork?: boolean; adapterContext?: CleanupAdapterContext }, observation = finalizationResourceObservation) {
   const ownership = ExternalResourceOwnership.parse(input.ownership);
   const resources = input.resources;
   assertFinalizationPlanPurposes(resources, input.retainedArchives ?? []);
@@ -238,9 +262,17 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
     return true;
   });
   if (!ownership.sourceCopyResourceId && input.originalWork) {
-    const unsupported = active.filter((resource) => !["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
+    const adapters = active.filter(resource => hasCleanupAdapter(resource.kind));
+    const references = active.filter(resource => ["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
+    const unsupported = active.filter(resource => !adapters.includes(resource) && !references.includes(resource));
     if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
-    for (const resource of active) exceptional.push(referencePlan(resource, input.deliveries));
+    for (const resource of references) exceptional.push(referencePlan(resource, input.deliveries));
+    if (adapters.length) {
+      const context = input.adapterContext;
+      if (!context || context.task.id !== input.taskId || context.task.primarySessionId !== input.sessionId) throw new Error("Physical adapter preparation requires the server-bound original task and committed cleanup capability");
+      exceptional.push(...await prepareCleanupAdapterResources({ context, resources: observerResources(resources), identities: adapters.map(resource => ({ ...finalizationResourceIdentity(resource), purpose: z.enum(["development", "browser", "review"]).parse(resource.purpose) })) }, observation.adapters));
+    }
+    assertPlanDependencies(exceptional);
     return exceptional;
   }
   const source = active.find((resource) => resource.id === ownership.sourceCopyResourceId);
@@ -407,6 +439,9 @@ export async function assertFinalizationResources(input: { taskId: string; resou
     if (["retain-archive", "retain-result", "retain-archive-member"].includes(entry.disposition)) assertRetainedMaterialPlan(entry as RetainedMaterialPlan, plan);
     if (entry.disposition === "already-released" && record.state !== "released" || entry.disposition.startsWith("retain-") && record.state === "released") throw new Error("Retained history was falsely marked released or an already-released resource changed");
   }
+  assertPlanDependencies(plan);
+  const adapters = plan.filter((entry): entry is CleanupAdapterPlan => entry.disposition === "retire-adapter");
+  if (adapters.length) await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed }, observation.adapters);
   if (trees.length === 0 && input.originalWork && plan.every((entry) => entry.disposition !== "retire-owned")) return;
   if (trees.length !== 1) throw new Error("Finalization requires one exact retained source-root capture");
   const tree = trees[0]!, target = tree.target;
