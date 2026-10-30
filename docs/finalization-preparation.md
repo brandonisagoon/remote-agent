@@ -46,6 +46,24 @@ resolved. Progress logs include source, delivery, fingerprint, retained-archive,
 persistence and response timings when those stages execute, without file bytes
 or credential-bearing provider messages.
 
+Nested stages restore their parent after completion. End events now carry an
+explicit `outcome` (`succeeded` or `failed`); a propagated failure records the
+deepest failed stage, so a successful fingerprint cannot be blamed for a later
+delivery error. Existing end events remain readable; absence of an outcome in
+historical rows is not proof of success.
+
+Failed rows include a bounded `diagnostic` code and reason. The same code/reason
+appears in the existing progress `error` string, preserving released clients'
+strict response schema. Only reviewed fixed classifications are saved, including
+missing PR versus other PR lookup failures, known worktree/archive/authority
+guards, and selected filesystem/network codes. Arbitrary exception messages,
+names, stacks, causes, command output, paths, private URLs and payloads are not
+copied. Unknown failures explicitly report `UNCLASSIFIED_FAILURE`; they are not
+silently reclassified as fingerprint drift. These diagnostics add no cleanup
+authority, automatic retry or repair, and cannot reconstruct an earlier lost
+exception. In particular, DRA-42's unchanged existing retry succeeded after its
+initial failure; no persistent fingerprint defect is established by that history.
+
 Drafted polls only this idempotent protocol. Each HTTP call keeps its ordinary
 finite deadline, reduced to the remaining overall ten-minute polling budget.
 Late ready responses do not extend that budget. Exhaustion reports the exact

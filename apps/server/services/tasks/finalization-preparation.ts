@@ -9,6 +9,7 @@ import { automaticCleanupTurn } from "./cleanup-inbox.ts";
 import { assertPreparedCleanup, hasPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 import { preparationStage, withPreparationDiagnostics } from "./preparation-diagnostics.ts";
+import { PreparationFailure, preparationFailure } from "./preparation-errors.ts";
 
 export const PreparationAttempt = z.object({ version: z.literal(1), attemptId: z.uuid(), boundary: z.string().regex(/^[a-z0-9][a-z0-9:._-]{0,119}$/) }).strict();
 export type PreparationAttempt = z.infer<typeof PreparationAttempt>;
@@ -16,7 +17,7 @@ const ACCEPTED = "finalization-preparation-accepted", STATUS = "finalization-pre
 const source = (taskId: string) => `preparation:${taskId}`;
 const Input = z.object({ requestKey: z.string(), cleanup: z.literal(true), finalizationVersion: z.literal(2).optional() }).strict();
 const Accepted = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), input: Input, attempt: PreparationAttempt, epoch: z.string(), acceptedAt: z.string() }).strict();
-const State = z.object({ state: z.enum(["pending", "running", "ready", "failed"]), stage: z.string(), event: z.enum(["start", "end"]).optional(), worker: z.string().optional(), elapsedMs: z.number().optional(), result: z.unknown().optional(), error: z.string().optional(), retryable: z.boolean().optional() }).strict();
+const State = z.object({ state: z.enum(["pending", "running", "ready", "failed"]), stage: z.string(), event: z.enum(["start", "end"]).optional(), activeStage: z.string().nullable().optional(), outcome: z.enum(["succeeded", "failed"]).optional(), failedStage: z.string().optional(), diagnostic: PreparationFailure.optional(), worker: z.string().optional(), elapsedMs: z.number().optional(), result: z.unknown().optional(), error: z.string().optional(), retryable: z.boolean().optional() }).strict();
 type Context = FinalizationContext & { cleanup: true };
 type WorkerInput = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
 const execution = new AsyncLocalStorage<{ sessionId: string; requestKey: string }>();
@@ -106,7 +107,7 @@ export async function requestFinalizationPreparation(input: Context, attempt: Pr
     value: JSON.stringify({ acceptedRevision: accepted.sequence, stage: "response", event: "end", state: state.state, elapsedMs: Math.round(performance.now() - responseStarted) }),
   } });
   return { preparation: { version: 1 as const, requestKey: input.requestKey, taskId: saved.taskId, sessionId: input.sessionId, attemptId: attempt.attemptId, boundary: attempt.boundary,
-    acceptedRevision: accepted.sequence, state: state.state, stage: state.stage, elapsedMs: Date.now() - Date.parse(saved.acceptedAt), ...(state.error ? { error: state.error, retryable: state.retryable } : {}) },
+    acceptedRevision: accepted.sequence, state: state.state, stage: state.state === "running" ? state.failedStage ?? state.activeStage ?? state.stage : state.stage, elapsedMs: Date.now() - Date.parse(saved.acceptedAt), ...(state.error ? { error: state.error, retryable: state.retryable } : {}) },
     ...(state.state === "ready" ? { receipt: state.result } : {}) };
 }
 
@@ -162,8 +163,8 @@ export function preparationJournalWorker(input: WorkerInput, prepare?: (input: F
           if ((await epoch(context)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed");
           await append(input, record, { state: "running", stage, worker });
           const result = await withPreparationDiagnostics(async diagnostic => {
-            if (diagnostic.event === "start") stage = diagnostic.stage;
-            await append(input, record, { state: "running", stage: diagnostic.stage, event: diagnostic.event, worker, elapsedMs: diagnostic.elapsedMs });
+            stage = diagnostic.failedStage ?? diagnostic.activeStage ?? diagnostic.stage;
+            await append(input, record, { state: "running", ...diagnostic, worker });
           }, () => preparationStage("verification", async () => {
             const actual = prepare ?? (await import("./finalization.ts")).prepareTaskFinalization;
             return execution.run({ sessionId: context.sessionId, requestKey: context.requestKey }, () => actual(context));
@@ -176,14 +177,15 @@ export function preparationJournalWorker(input: WorkerInput, prepare?: (input: F
             await append({ ...input, prisma: tx as PrismaClient }, record, { state: "ready", stage, worker, elapsedMs: Math.round(performance.now() - start), result });
           });
         } catch (error) {
-          // Error diagnostics must not publish credentials, source bytes or
-          // arbitrary provider response bodies. The failed stage is actionable.
-          await append(input, record, { state: "failed", stage, worker, elapsedMs: Math.round(performance.now() - start), error: `Preparation failed during ${stage}; full verification did not grant cleanup authority`, retryable: true });
-          console.error(`[preparation] ${record.sequence} failed at ${stage}`, error instanceof Error ? error.name : "Error");
+          const diagnostic = preparationFailure(error);
+          // Keep the released client's strict progress shape: its existing error
+          // field carries exactly the same safe code/reason as the durable row.
+          await append(input, record, { state: "failed", stage, diagnostic, worker, elapsedMs: Math.round(performance.now() - start), error: `Preparation failed during ${stage}: [${diagnostic.code}] ${diagnostic.reason} Full verification did not grant cleanup authority.`, retryable: true });
+          console.error(`[preparation] ${record.sequence} failed at ${stage}: [${diagnostic.code}] ${diagnostic.reason}`);
         } finally { scans.delete(key); }
         return;
       }
-    })().catch(error => { console.error("[preparation] journal reconciliation failed", error instanceof Error ? error.name : "Error"); }).finally(() => { running = undefined; });
+    })().catch(error => { const diagnostic = preparationFailure(error); console.error(`[preparation] journal reconciliation failed: [${diagnostic.code}] ${diagnostic.reason}`); }).finally(() => { running = undefined; });
   };
   const result = { tick, async stop() { stopped = true; await running; activeWorkers.delete(input.prisma); }, async idle() { await running; } };
   activeWorkers.set(input.prisma, result);

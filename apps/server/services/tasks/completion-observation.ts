@@ -1,4 +1,5 @@
 import { preparationStage } from "./preparation-diagnostics.ts";
+import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { createHash } from "node:crypto";
 import { lstat, readlink } from "node:fs/promises";
 import path from "node:path";
@@ -13,6 +14,12 @@ export interface PullRequestObservation {
 
 async function run(client: CommandClient, cwd: string, command: string, args: string[]) {
   const result = await client.run(command, args, { cwd });
+  if (!result.ok && command === "gh" && args[0] === "pr" && args[1] === "view") {
+    // Classify the expected CLI failure, but never retain stderr, arguments or
+    // private repository URLs. Other access/provider failures stay distinct.
+    const missing = /^(?:no pull requests found for branch|GraphQL: Could not resolve to a PullRequest with the number of)\b/m.test(result.stderr.slice(0, 4096));
+    throw new PreparationDiagnosticError(missing ? "PR_NOT_FOUND" : "PR_LOOKUP_FAILED");
+  }
   if (!result.ok) throw new Error(`Completion evidence could not be verified (${command} ${args[0] ?? ""})`);
   return result.stdout.trimEnd();
 }

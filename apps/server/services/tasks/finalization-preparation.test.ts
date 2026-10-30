@@ -16,6 +16,8 @@ import { preparationJournalWorker, requestFinalizationPreparation } from "./fina
 import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
 import { taskRoutes } from "../../routes/tasks/index.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
+import { preparationStage } from "./preparation-diagnostics.ts";
+import { PreparationDiagnosticError } from "./preparation-errors.ts";
 let db: TestDatabase, directory: string;
 let worker: ReturnType<typeof preparationJournalWorker> | undefined;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); });
@@ -62,13 +64,55 @@ async function preparedFixture() {
 }
 
 
-function controls(f: Awaited<ReturnType<typeof preparedFixture>>) {
+function controls(f: Awaited<ReturnType<typeof fixture>>) {
   const runtime = createFakeAgentRuntime();
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient })).route("/api/tasks", taskRoutes);
   const input = { ...f.input, runtime, cleanup: true as const };
   const post = (preparation?: ReturnType<typeof attempt>) => app.request(`/api/tasks/${f.task.id}/prepare-finalization`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: input.requestKey, cleanup: true, ...(preparation ? { preparation } : {}) }) });
   return { input, runtime, app, post };
 }
+
+test.each([false, true])("failed journal and progress preserve the exact safe nested diagnostic (nested=%s) without authority", async nested => {
+  const f = await fixture(), c = controls(f), input = c.input, request = attempt();
+  await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "saved", kind: "docker-volume", purpose: "development", externalId: "saved", state: "ready" } });
+  const original = await db.prisma.remoteTaskResource.findMany();
+  expect((await c.post(request)).status).toBe(202);
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>(resolve => entered = resolve), resumed = new Promise<void>(resolve => release = resolve);
+  worker = preparationJournalWorker(input, () => preparationStage("delivery", async () => {
+    await preparationStage("fingerprint", async () => { if (nested) throw Object.assign(new Error("private path /Users/owner/secret and Bearer value"), { code: "ENOENT" }); });
+    entered(); await resumed;
+    throw new PreparationDiagnosticError("PR_NOT_FOUND");
+  }));
+  worker.tick();
+  if (!nested) {
+    try {
+      await waiting;
+      const running = await (await c.post(request)).json();
+      expect(running.preparation).toMatchObject({ state: "running", stage: "delivery" });
+      expect(running.receipt).toBeUndefined();
+    } finally { release(); }
+  }
+  await worker.idle();
+  const result = await (await c.post(request)).json();
+  expect(result.preparation).toMatchObject({ state: "failed", stage: nested ? "fingerprint" : "delivery" });
+  const rows = (await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" }, orderBy: { sequence: "asc" } })).map(row => JSON.parse(row.value!));
+  const failed = rows.at(-1);
+  expect(failed.diagnostic.code).toBe(nested ? "ENOENT" : "PR_NOT_FOUND");
+  expect(result.preparation.error).toBe(failed.error);
+  expect(result.preparation.error).toContain(failed.diagnostic.reason);
+  expect(JSON.stringify(rows)).not.toMatch(/Bearer|\/Users\/owner|secret/);
+  expect(rows.filter(row => row.event === "end" && ["delivery", "verification"].includes(row.stage)).every(row => row.outcome === "failed")).toBe(true);
+  expect(result.receipt).toBeUndefined();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(0);
+  expect(await db.prisma.remoteTaskResource.findMany()).toEqual(original);
+  const { assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+  await expect(assertPreparedCleanup(input)).rejects.toThrow();
+  await worker.stop();
+  worker = preparationJournalWorker(input, async () => { throw new Error("failed attempts cannot rerun"); });
+  worker.tick(); await worker.idle();
+  expect((await (await c.post(request)).json()).preparation.error).toBe(failed.error);
+});
 
 test("lost acceptance joins one durable scan, old synchronous callers are busy, and ready replay preserves original receipts", async () => {
   const f = await preparedFixture(), c = controls(f), request = attempt();
