@@ -250,3 +250,25 @@ substitution and capture replay. Paired fixtures run the real client resource-st
 and capture dispatcher against server authority and proof checks. The browser
 provider is replaced only in disposable fixtures; no live browser has been
 stopped or retired by those tests.
+
+## Exact browser vault entry retention
+
+The supported legacy auth vault is global even when browser sessions use the
+`drafted` namespace. The configured agent-browser 0.39.1 implementation selects
+`~/.agent-browser/auth/<entry>.json` independently of that namespace; its auth-show
+operation exposes identity metadata without the saved password. See the pinned
+[upstream implementation](https://github.com/vercel-labs/agent-browser/blob/v0.39.1/cli/src/native/auth.rs).
+
+A `retire-vault` plan binds the original task receipt, exact synthetic user and
+local origin, configured cleanup capability, encrypted entry bytes and retained
+encryption-key digest. The exact entry file is an adopted owned path; neither the
+shared auth directory nor the key becomes task-owned. Existing native file
+capture moves the encrypted entry into a private sibling quarantine, preserving
+its inode and every byte. No auth-delete or broad vault deletion is performed.
+
+Confirmation requires original-path absence plus the frozen journal and retained
+bytes. A recreated entry, changed key, substituted capture, shared claim or lost
+authority refuses completion while preserving available material. An initially
+absent legacy entry cannot invent a saved-file proof. Paired disposable tests use
+the actual server plan, client dispatcher and native capture, including lost
+acknowledgment and retry without rerunning auth-show on missing credentials.

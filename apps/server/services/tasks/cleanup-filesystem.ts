@@ -31,10 +31,10 @@ function referencePaths(value: unknown, depth = 0): string[] {
 }
 export function captureAdapterDependencies(root: string, resources: FinalizationResourceRecord[], plan: FinalizationResourcePlan[]) {
   const dependencies = new Set<string>(), stoppedConsumers = new Set<string>();
-  for (const adapter of plan.filter(entry => entry.disposition === "retire-adapter")) {
+  for (const adapter of plan.flatMap(entry => entry.disposition === "retire-adapter" ? [entry] : entry.disposition === "retire-vault" ? [entry.vault] : [])) {
     for (const target of adapter.targets) {
       const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file]
-        : "credentials" in target.scope ? [target.scope.credentials.backupFile, target.scope.credentials.keyFile] : [];
+        : "credentials" in target.scope ? [target.scope.credentials.backupFile, target.scope.credentials.keyFile] : target.kind === "browser-auth-entry" ? [target.scope.keyFile] : [];
       if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
     }
     const record = resources.find(other => other.id === adapter.id)!;
@@ -152,13 +152,14 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
 /** This query is local authority, not a filesystem observer. It also runs on
  * renewals so another task cannot acquire a recorded path inside the capture. */
 export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
-  const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file");
+  const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file" || entry.disposition === "retire-vault");
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
   if (!scopes.length) return;
   const ancestors = new Set<string>();
   for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
   const shared = await prisma.remoteTaskResource.findFirst({ where: { taskId: { not: taskId }, OR: [
+    { externalId: { in: plan.filter(entry => entry.disposition === "retire-vault").map(entry => entry.externalId) } },
     { externalId: { in: [...ancestors] } }, ...scopes.map(scope => ({ externalId: { startsWith: `${scope}${path.sep}` } })),
   ] } });
   if (shared) throw new Error("Registered capture overlaps another task's recorded resource");

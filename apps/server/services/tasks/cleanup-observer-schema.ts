@@ -40,13 +40,15 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
     creation: z.strictObject({ createdAt: z.number().int().nonnegative(), emailDigest: Hash }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("clerk-session"), id: z.string().regex(/^sess_[A-Za-z0-9]+$/), userId: z.string().regex(/^user_[A-Za-z0-9]+$/), scope: ClerkScope,
     creation: z.strictObject({ createdAt: z.number().int().nonnegative() }).nullable() }),
+  z.strictObject({ ...Common, kind: z.literal("browser-auth-entry"), id: z.string().regex(/^[A-Za-z0-9_-]+$/), scope: z.strictObject({ ...Scope, namespace: z.literal("drafted"), keyFile: Absolute, keySha256: Hash }),
+    origin: z.url(), usernameDigest: Hash, file: z.strictObject({ path: Absolute, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), size: z.number().int().nonnegative(), sha256: Hash }) }),
 ]);
 export type CleanupTarget = z.infer<typeof CleanupTarget>;
 export function cleanupTargetDigest(target: Omit<CleanupTarget, "identityDigest"> | CleanupTarget) {
   const { identityDigest: _, ...identity } = target as CleanupTarget;
   return cleanupDigest(identity);
 }
-export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk"]);
+export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk", "vault"]);
 export const CleanupObserverResource = z.strictObject({ id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.string().min(1), externalId: z.string().min(1), state: z.string(), expiresAt: z.string().nullable(), metadata: z.json().nullable() });
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])) : value;
 export const cleanupDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
