@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
+import { assertRetirementAuthority, RetirementReference } from "./retirement-receipts.ts";
 
 export const FINALIZATION_PREPARED = "finalization-prepared";
 export const FINALIZATION_CONFIRMED = "finalization-confirmed";
@@ -24,6 +25,7 @@ export const PreparedFinalization = z.object({
   contractRevision: z.number().int(),
   worktree: z.string(), taskWorktree: z.string(), registeredWorktree: z.string(), revision: z.string(), branch: z.string(), gitDirectory: z.string(), gitCwd: z.string(),
   delivery: CompletionDelivery,
+  retirementAuthority: RetirementReference.optional(),
 });
 export type PreparedFinalization = z.infer<typeof PreparedFinalization>;
 export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true };
@@ -70,6 +72,10 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
   const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${task.id}` }, orderBy: { sequence: "desc" } });
   if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Finalization completion authority was revoked or replaced");
   if (prepared.delivery.boundary !== "merge" || prepared.delivery.receipts.contractRevision !== prepared.contractRevision || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha || !prepared.delivery.receipts.snapshot.clean || prepared.delivery.receipts.snapshot.head !== prepared.revision || prepared.delivery.receipts.snapshot.branch !== prepared.branch) throw new Error("Finalization has no successful merge-delivery receipt");
+  if (prepared.retirementAuthority) {
+    const { grant } = await assertRetirementAuthority(prisma, config, task.id, session.id, prepared.issueId, prepared.retirementAuthority);
+    if (grant.delivery.head !== prepared.revision || grant.delivery.mergeCommit !== prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.pullRequest.url?.toLowerCase() !== `https://github.com/${grant.delivery.repository}/pull/${grant.delivery.pullRequest}`) throw new Error("Finalization differs from the owner's exact retirement delivery");
+  }
   if (resourcesReleased && await prisma.remoteTaskResource.count({ where: { taskId: task.id, purpose: { in: ["browser", "development", "review"] }, state: { not: "released" } } })) throw new Error("Finalization has unreleased task resources");
   return task;
 }
