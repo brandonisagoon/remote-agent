@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { originalArchiveFixture, originalDigest, originalGit } from "../../../../test-support/original-work.ts";
@@ -43,6 +43,18 @@ test("new original or staged material invalidates the immutable adoption", async
   const f = await fixture(), proof = await prepareOriginalWork(f.input, noProcesses);
   originalGit(f.worktree, ["add", "README.md"]);
   await expect(assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: false }, noProcesses)).rejects.toThrow("state changed");
+});
+test("a restore cannot silently turn an intent-to-add index entry into an untracked file", async () => {
+  const f = await fixture();
+  originalGit(f.worktree, ["add", "--intent-to-add", "untracked.bin"]);
+  await writeFile(path.join(f.archive, "worktree.diff"), originalGit(f.worktree, ["diff", "--binary"]));
+  const tar = Bun.spawnSync(["tar", "-cf", path.join(f.archive, "untracked.tar"), "--files-from", "/dev/null"], { stdout: "pipe", stderr: "pipe" });
+  if (tar.exitCode) throw new Error(tar.stderr.toString());
+  const lines = [];
+  for (const name of (await readdir(f.archive)).sort()) if (name !== "MANIFEST.sha256") lines.push(`${originalDigest(await readFile(path.join(f.archive, name)))}  ${name}`);
+  const manifest = lines.join("\n") + "\n"; await writeFile(f.selection.manifestPath, manifest);
+  f.selection.manifestSha256 = originalDigest(manifest);
+  await expect(prepareOriginalWork(f.input, noProcesses)).rejects.toThrow("staged or untracked classification");
 });
 test("ignored original material requires explicit ownership and remains in full capture", async () => {
   const f = await fixture();

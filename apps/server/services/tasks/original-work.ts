@@ -197,11 +197,9 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
     const indexTree = await textGit(temporary, ["write-tree"]);
     if (worktreePatch.length) await git(temporary, ["apply", "--binary", member(root, selection.worktreePatchPath)]);
     for (const [relative, entry] of untracked) { const file = member(temporary, relative); await assertFinalizationPath(file); await mkdir(path.dirname(file), { recursive: true }); await writeFile(file, entry.bytes, { flag: "wx", mode: entry.executable ? 0o700 : 0o600 }); }
-    const restored = await observeCompletionSnapshot(temporary, { async run(command, args, options) {
-      if (command !== "git" || !options?.cwd) throw new Error("Unexpected restore observation command");
-      return { ok: true, stdout: (await git(options.cwd, args)).toString(), stderr: "" };
-    } });
+    const restored = await dirtySnapshot(temporary);
     if (restored.fingerprint !== snapshot.fingerprint) throw new Error("Independent archive restore differs from the original working content");
+    if (finalizationDigest(restored) !== finalizationDigest(snapshot)) throw new Error("Independent archive restore changed the original staged or untracked classification");
     await git(temporary, ["add", "--all", "--force", "--", "."]);
     const workingTree = await textGit(temporary, ["write-tree"]);
     if (workingTree !== selection.expectedWorkingTree) throw new Error("Independent archive restore differs from the selected content tree");
