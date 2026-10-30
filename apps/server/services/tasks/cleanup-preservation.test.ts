@@ -87,6 +87,17 @@ test("omitting recorded preservation or selecting only one preserved target cann
   f.selection.targets.pop(); await expect(f.prepare()).rejects.toThrow("complete exact target selection");
   expect(f.resources.every(resource => resource.state === "ready")).toBeTrue();
 });
+test.each(["large-video", "json-lookalike"])("preservation recognition does not read unrelated retained %s members", async shape => {
+  const f = await fixture(), record = { ...f.inventory, id: "unrelated", key: "unrelated-member", kind: "evidence", purpose: "review" };
+  const bytes = shape === "large-video" ? Buffer.alloc(2 * 1024 * 1024 + 1, 1) : Buffer.from(JSON.stringify(f.saved));
+  await writeFile(record.externalId, bytes);
+  const observed = await observeLegacyEvidenceFile(record.externalId, true, bytes.length);
+  // Exercise this helper's recognition boundary separately from the stricter
+  // public plan parser. A noninventory member cannot select this parser by shape.
+  const member = { ...f.retainedArchives[1]!, ...finalizationResourceIdentity(record), file: { path: record.externalId, size: observed.size, sha256: observed.sha256 } } as unknown as typeof f.retainedArchives[number];
+  const proof = await preparePreservationEvidence({ prisma: f.database, taskId: f.taskId, sessionId: f.sessionId, resources: [f.archive, record], plan: [f.retainedArchives[0]!, member] });
+  expect(proof).toBeUndefined(); expect((await observeLegacyEvidenceFile(record.externalId, true, bytes.length)).sha256).toBe(observed.sha256);
+});
 test("capture cannot sweep retained Compose configuration or Clerk credentials", async () => {
   const f = await fixture(), plan = await f.prepare();
   expect(() => captureAdapterDependencies("/private/environment", f.resources, plan)).toThrow("confirmation inputs");

@@ -57,9 +57,10 @@ async function requiredSelection(input: { taskId: string; resources: Finalizatio
   const recognized: Array<{ inventoryResourceId: string; targets: PreservationProof["targets"] }> = [];
   for (const member of input.plan) {
     if (member.disposition !== "retain-archive-member") continue;
-    assertRetainedMaterialPlan(member, input.plan);
     const record = input.resources.find(record => record.id === member.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== member.identityDigest || record.state === "released") throw new Error("Retained inventory resource changed");
+    if (!record || record.kind !== "resource-inventory" || record.purpose !== "tooling" || member.kind !== "resource-inventory" || member.purpose !== "tooling") continue;
+    assertRetainedMaterialPlan(member, input.plan);
+    if (finalizationResourceIdentity(record).identityDigest !== member.identityDigest || record.state === "released") throw new Error("Retained inventory resource changed");
     const file = await observeLegacyEvidenceFile(member.file.path, false, 2 * 1024 * 1024), bytes = await readArchiveBytes(file.path, 2 * 1024 * 1024);
     if (file.sha256 !== member.file.sha256 || file.size !== member.file.size || sha(bytes) !== file.sha256) throw new Error("Retained inventory bytes changed");
     let value: unknown;
