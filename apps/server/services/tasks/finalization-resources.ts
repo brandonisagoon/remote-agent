@@ -1,3 +1,4 @@
+import { observeInactiveUnixSocket } from "./unix-socket.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, readFile, readlink, readdir, realpath } from "node:fs/promises";
@@ -15,6 +16,7 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
   z.object({ ...Entry, kind: z.literal("directory") }).strict(),
   z.object({ ...Entry, kind: z.literal("file"), size: z.number().int().nonnegative(), sha256: Sha, dependencyResourceId: z.string().optional() }).strict(),
   z.object({ ...Entry, kind: z.literal("symlink"), link: z.string().min(1) }).strict(),
+  z.object({ ...Entry, kind: z.literal("socket"), uid: z.number().int().nonnegative(), gid: z.number().int().nonnegative(), nlink: z.literal(1), size: z.number().int().nonnegative(), mtimeNs: z.string().regex(/^\d+$/), ctimeNs: z.string().regex(/^\d+$/) }).strict(),
   z.object({ ...Entry, kind: z.literal("opaque"), dependencyResourceId: z.string().min(1) }).strict(),
 ]);
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
@@ -71,7 +73,7 @@ export async function assertFinalizationPath(file: string) {
 }
 async function fileIdentity(file: string) {
   await assertFinalizationPath(file);
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = await handle.stat();
     if (!before.isFile() || before.nlink !== 1) throw new Error("Finalization requires an unshared regular file");
@@ -163,6 +165,7 @@ async function inventory(root: string, allowed: string[], opaque: Map<string, st
       entries.push({ ...common, kind: "opaque", dependencyResourceId: opaque.get(file)! });
     } else if (stat.isSymbolicLink()) entries.push({ ...common, kind: "symlink", link: await readlink(file) });
     else if (stat.isFile()) entries.push({ path: common.path, kind: "file", ...await fileIdentity(file), ...(managedFiles.has(file) ? { dependencyResourceId: managedFiles.get(file)! } : {}) });
+    else if (stat.isSocket()) entries.push({ path: common.path, kind: "socket", ...await observeInactiveUnixSocket(file) });
     else if (stat.isDirectory()) {
       entries.push({ ...common, kind: "directory" });
       const names = (await readdir(file)).sort();
@@ -277,6 +280,7 @@ export async function assertFinalizationTree(target: TreeTarget, physicalPath = 
     if (entry.kind === "opaque") { if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Browser dependency changed"); return; }
     if (entry.kind === "directory") { if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Prepared directory changed"); for (const name of await readdir(file)) await visit(path.join(file, name)); }
     else if (entry.kind === "symlink") { if (!stat.isSymbolicLink() || await readlink(file) !== entry.link) throw new Error("Prepared symlink changed"); }
+    else if (entry.kind === "socket") { const { path: _path, kind: _kind, ...expected } = entry; await observeInactiveUnixSocket(file, expected); }
     else { const identity = await fileIdentity(file); if (identity.dev !== entry.dev || identity.ino !== entry.ino || identity.mode !== entry.mode || identity.sha256 !== entry.sha256 || identity.size !== entry.size) throw new Error("Prepared file contents changed"); }
   }
   await visit(physicalPath);
@@ -288,7 +292,7 @@ export async function assertFinalizationTree(target: TreeTarget, physicalPath = 
 
 async function readQuarantineJournal(file: string) {
   await assertFinalizationPath(file);
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const before = await handle.stat();
     const limit = 64 * 1024;

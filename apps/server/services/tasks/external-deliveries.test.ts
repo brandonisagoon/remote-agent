@@ -20,9 +20,10 @@ import { prepareExternalFinalization, confirmExternalFinalization, assertExterna
 import { prepareTaskFinalization } from "./finalization.ts";
 import { prepareFinalizationResources, assertFinalizationResources, finalizationDigest, inspectFinalizationQuarantine, type ResourceObservation } from "./finalization-resources.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
+import { fixtureSocket } from "./unix-socket.test-support.ts";
 
 let db: TestDatabase, directory: string;
-beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "external-delivery-"))); });
+beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "external-delivery-"))); });
 afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: true, force: true }); });
 const digest = (text: string | Buffer) => createHash("sha256").update(text).digest("hex");
 function git(cwd: string, ...args: string[]) {
@@ -295,6 +296,10 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(["state-response", "rece
   const clientRoot = await realpath(process.env.DRAFTED_INTEGRATION_ROOT!);
   const { finalizeTask } = await import(path.join(clientRoot, "src/finalize.ts"));
   const { TaskRecord, FinalizationReceipt } = await import(path.join(clientRoot, "src/control.ts"));
+  const leak = path.join(f.copies, "tmp", "leak"); await mkdir(leak, { recursive: true });
+  fixtureSocket(path.join(leak, "stream.sock")); fixtureSocket(path.join(leak, "dgram.sock"), "stale-datagram");
+  const socketBefore = await lstat(path.join(leak, "stream.sock"));
+  f.manifest.ownership.ownedPaths.push(leak);
   const profileRoot = path.join(f.copies, "review-browser"), profile = path.join(profileRoot, "profile"), ownerFile = path.join(profileRoot, "profile-owner.json"), contextFile = path.join(profileRoot, "browser-task.json");
   await mkdir(profile, { recursive: true });
   const marker = JSON.stringify({ taskId: f.task.id, session: `${f.task.id}-review`, profile, nonce: "b2177987-dc54-4c15-89eb-ce14236fdb57" });
@@ -371,6 +376,11 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(["state-response", "rece
   const captured = sealed.resources.find((resource) => resource.disposition === "retire-owned" && resource.target.type === "tree");
   if (!captured || captured.disposition !== "retire-owned" || captured.target.type !== "tree") throw new Error("Missing captured root");
   expect(await inspectFinalizationQuarantine({ taskId: f.task.id, resourceId: captured.id, target: captured.target })).toMatchObject({ captured: true });
+  const retainedSocket = path.join(captured.target.quarantine.path, "tmp/leak/stream.sock");
+  expect(retainedSocket.length).toBeGreaterThan(108);
+  expect((await lstat(retainedSocket)).ino).toBe(socketBefore.ino);
+  expect((await lstat(retainedSocket)).isSocket()).toBeTrue();
+  expect(captured.target.inventory.filter(entry => entry.kind === "socket")).toHaveLength(2);
   expect(await readFile(path.join(captured.target.quarantine.path, "evidence-one.mp4"), "utf8")).toBe("existing owned evidence-one bytes");
   expect(await readFile(path.join(captured.target.quarantine.path, "evidence-two.mp4"), "utf8")).toBe("existing owned evidence-two bytes");
   expect(await readFile(path.join(captured.target.quarantine.path, "review-browser", "profile", "Cookies"), "utf8")).toBe("opaque fixture browser bytes");
