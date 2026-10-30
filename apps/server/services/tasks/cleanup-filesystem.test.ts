@@ -73,7 +73,14 @@ test.each(["changed", "missing", "replacement", "symlink", "new-member"])("captu
   const file = path.join(tree.target.quarantine.path, "evidence/capture.txt");
   if (change === "changed") await writeFile(file, "changed");
   if (change === "missing") await rm(file);
-  if (change === "replacement") { const bytes = await readFile(file); await rm(file); await writeFile(file, bytes, { mode: 0o600 }); }
+  if (change === "replacement") {
+    // Keep the original inode alive: unlink/recreate may reuse its persisted
+    // identity, which identical bytes cannot distinguish as a new generation.
+    const original = await lstat(file), bytes = await readFile(file), retained = path.join(f.directory, "original-evidence-retained");
+    await rename(file, retained); await writeFile(file, bytes, { mode: 0o600 });
+    expect((await lstat(file)).ino).not.toBe(original.ino);
+    expect(await readFile(retained)).toEqual(bytes);
+  }
   if (change === "symlink") { await rm(file); await symlink(f.secret, file); }
   if (change === "new-member") await writeFile(path.join(tree.target.quarantine.path, "new"), "new material");
   for (const resource of f.resources) resource.state = "released";
