@@ -220,29 +220,58 @@ function sameDevelopmentIdentity(original: FinalizationResourceRecord, updated: 
   // container, network, volume and every other immutable field stay exact.
   return finalizationResourceIdentity(original).identityDigest === finalizationResourceIdentity({ ...updated, metadata: { ...next.data, progress: old.data.progress } }).identityDigest;
 }
+function acknowledgmentAction(task: RemoteTask, value: z.infer<typeof Intent>, resource: RemoteTaskResource, state: string) {
+  return value.action === "stop" ? value.reason === "owner-pause" && task.ownerPaused && state === "allocated"
+    : !task.ownerPaused && (state === "ready" || resource.kind === "task-runtime" && state === resource.state);
+}
+type ResourceSelection = Awaited<ReturnType<typeof selection>> & z.infer<typeof DevelopmentReference>;
+const retainedAppMarker = (resource: RemoteTaskResource) => resource.metadata !== null && typeof resource.metadata === "object" && Object.hasOwn(resource.metadata, "retainedStudio");
+
+/** Only the existing cleanup acknowledgment exception needs a retained scope.
+ * Inspect it before PUT opens its transaction; no local files are read in SQL. */
+export async function developmentResourceSelection(input: Context & { sessionId: string }, key: string, state: string): Promise<ResourceSelection | undefined> {
+  if (!["allocated", "ready"].includes(state)) return;
+  const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
+  if (task.primarySessionId !== input.sessionId) return;
+  const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: eventWhere(task), orderBy: { sequence: "desc" } });
+  if (!event?.value) return;
+  const operation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${task.id}`, action: "finalization-cleanup-started", key: `finalize:${task.id}` } });
+  if (!operation) return;
+  const records = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } }), resource = records.find(value => value.key === key);
+  if (!resource || !developmentCompute(resource) || !records.some(retainedAppMarker)) return;
+  const value = Intent.parse(JSON.parse(event.value));
+  if (!acknowledgmentAction(task, value, resource, state)) return;
+  const reference = { intentRevision: event.sequence, intentDigest: finalizationDigest(value) };
+  return { ...await selection({ ...input, ...reference }), ...reference };
+}
 
 /** Explicit intent may acknowledge stopped compute, or the same saved compute
  * after cleanup has been revoked and work restored. No receipt is Released or
  * resurrected, and the original preparation/operation bytes are never changed. */
 export async function developmentResourceUpdate(input: Context & { sessionId: string }, resource: RemoteTaskResource,
-  next: { state: string; metadata?: unknown; expiresAt: Date | null }) {
+  next: { state: string; metadata?: unknown; expiresAt: Date | null }, scope?: ResourceSelection) {
   if (!["allocated", "ready"].includes(next.state) || !developmentCompute(resource) || resource.state === "released") return false;
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
   if (task.primarySessionId !== input.sessionId) return false;
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: eventWhere(task), orderBy: { sequence: "desc" } });
   if (!event?.value) return false;
   const value = Intent.parse(JSON.parse(event.value));
-  if (value.action === "stop" ? value.reason !== "owner-pause" || !task.ownerPaused || next.state !== "allocated"
-    : task.ownerPaused || next.state !== "ready" && !(resource.kind === "task-runtime" && next.state === resource.state)) return false;
+  if (!acknowledgmentAction(task, value, resource, next.state)) return false;
   const { inspectSavedCleanup } = await import("./cleanup-inspection.ts");
   const saved = await inspectSavedCleanup(input.prisma, task.id);
   if (!saved) return false;
+  const records = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
+  if (scope || records.some(retainedAppMarker)) {
+    if (!scope || scope.intentRevision !== event.sequence || scope.intentDigest !== finalizationDigest(value)
+      || resourceSnapshot(records) !== scope.snapshot || scope.retained.has(resource.id)) throw new Error("Development acknowledgment is outside the verified current app selection");
+  }
   const binding = saved.operation.binding;
   const original = binding.resources.find(record => record.id === resource.id);
   if (saved.history.recordedConfirmationRevision || !original || original.state === "released" || !sameDevelopmentIdentity(original, resource, true)
     || binding.sessionId !== task.primarySessionId || binding.worktree !== task.worktreePath || binding.branch !== task.branchName || binding.repositoryId !== task.repositoryId
     || binding.machineId !== task.machineId || binding.toolingRevision !== task.toolingRevision || binding.toolingRoot !== task.toolingRoot || binding.pinnedToolingRoot !== task.pinnedToolingRoot) throw new Error("Development acknowledgment does not match the original cleanup resource");
   const active = await assertDevelopmentIntent({ ...input, intentRevision: event.sequence, intentDigest: finalizationDigest(value) });
+  if (scope && active.identityDigest !== scope.identityDigest) throw new Error("Development acknowledgment task identity changed");
   const updated = { ...resource, state: next.state, metadata: next.metadata ?? resource.metadata, expiresAt: next.expiresAt };
   if (!sameDevelopmentIdentity(resource, updated, active.intent.action === "resume")) throw new Error("Development acknowledgment cannot change saved resource identity or metadata");
   return true;

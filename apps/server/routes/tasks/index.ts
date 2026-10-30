@@ -24,7 +24,7 @@ import { CleanupResourceKeys } from "../../services/tasks/cleanup-resource-scope
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
-import { developmentProjection, developmentResourceUpdate } from "../../services/tasks/development-intent.ts";
+import { developmentProjection, developmentResourceSelection, developmentResourceUpdate } from "../../services/tasks/development-intent.ts";
 import { cleanupCandidates } from "../../services/tasks/cleanup-candidates.ts";
 import { CleanupProgressInput, recordCleanupProgress } from "../../services/tasks/cleanup-progress.ts";
 import { CleanupReportRequest, publishCleanupReport, cleanupProjection } from "../../services/tasks/cleanup-report.ts";
@@ -268,6 +268,7 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
   const { key, expiresAt, ...data } = parsed.data;
   const values = { ...data, expiresAt: expiresAt ? new Date(expiresAt) : null };
   try {
+    const development = await developmentResourceSelection({ prisma, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, key, values.state);
     const resource = await prisma.$transaction(async (tx) => {
       const existing = await tx.remoteTaskResource.upsert({
         where: { taskId_key: { taskId: task.id, key } }, create: { taskId: task.id, key, ...values }, update: {},
@@ -275,7 +276,7 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
       if (existing.externalId !== data.externalId || existing.kind !== data.kind || existing.purpose !== data.purpose) throw new Error("Resource key already belongs to another resource; record a new key");
       await assertLegacyEvidenceResourceUpdate(tx, existing, values);
       await assertArchiveResourceUpdate(tx, existing, values);
-      if (!await developmentResourceUpdate({ prisma: tx, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values)) {
+      if (!await developmentResourceUpdate({ prisma: tx, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values, development)) {
         await assertCleanupResourceUpdate({ prisma: tx, config: c.get("config"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values);
       }
       return tx.remoteTaskResource.update({ where: { id: existing.id }, data: { state: values.state, metadata: values.metadata, expiresAt: values.expiresAt } });

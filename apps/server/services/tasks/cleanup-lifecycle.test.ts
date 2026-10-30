@@ -23,6 +23,7 @@ import { taskRoutes, sessionTaskRoutes } from "../../routes/tasks/index.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { completeDevelopmentIntent, recordDevelopmentIntent, renewDevelopmentAuthority } from "./development-intent.ts";
 import { assertRetirementResourcePreflight } from "./retirement-preview.ts";
+import { retainedDevelopmentFixture } from "../../../../test-support/retained-development-fixture.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -128,6 +129,39 @@ test.each(["docker-container", "task-runtime"])("explicit %s resume after cleanu
   expect((await write({ ...receipt, state: "ready", metadata: resumed })).status).toBe(409);
   expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: data.id } })).toEqual(data);
   expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test("cleanup-bound development acknowledgments exclude protected migration sources and recheck their selection snapshot", async () => {
+  const f = await fixture(), retained = await retainedDevelopmentFixture({ taskId: f.task.id, primarySessionId: f.session.id, worktreePath: f.worktree, toolingRevision: f.task.toolingRevision });
+  try {
+    for (const resource of retained.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...resource, id: resource.id!, taskId: f.task.id, metadata: resource.metadata as any } });
+    await prepareTaskFinalization(f.input, f.dependencies); const bound = await bindPreparedCleanup(f.input, async () => {});
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [bound.preparation.sequence, bound.operationRevision] } }, orderBy: { sequence: "asc" } });
+    await recordDevelopmentIntent({ ...f.context, request: { action: "pause", development: true, requestKey: "pause-retained-app" } });
+    let lateAlias = false;
+    const prisma = new Proxy(db.prisma, { get(target, key) {
+      if (key === "$transaction") return async (...args: any[]) => {
+        if (lateAlias) {
+          lateAlias = false;
+          await target.remoteTaskResource.create({ data: { ...retained.mysql, taskId: f.task.id, id: "late-alias", key: "late-alias", purpose: "review" } });
+        }
+        return (target.$transaction as any)(...args);
+      };
+      return Reflect.get(target, key);
+    } });
+    const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/sessions", sessionTaskRoutes);
+    const write = (record: typeof retained.app, state: string) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: record.key, kind: record.kind, purpose: record.purpose, externalId: record.externalId, metadata: record.metadata, state }) });
+    expect((await write(retained.mysql, "allocated")).status).toBe(409);
+    lateAlias = true; expect((await write(retained.app, "allocated")).status).toBe(409);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: retained.app.id } })).state).toBe("ready");
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-alias" } });
+    expect((await write(retained.app, "allocated")).status).toBe(200);
+    await f.revoke(); await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+    await recordDevelopmentIntent({ ...f.context, request: { action: "resume", development: true, requestKey: "resume-retained-app" } });
+    expect((await write(retained.mysql, "ready")).status).toBe(409);
+    expect((await write(retained.app, "ready")).status).toBe(200);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  } finally { await rm(retained.root, { recursive: true, force: true }); }
 });
 
 test.each(["resume", "review-handoff"] as const)("a completed %s stays non-actionable when later cleanup changes the resource epoch", async reason => {

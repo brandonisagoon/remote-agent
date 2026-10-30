@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type { RetainedDevelopmentTask } from "../apps/server/services/tasks/retained-development.ts";
 const hash=(value:unknown)=>createHash('sha256').update(typeof value==='string'?value:JSON.stringify(value)).digest('hex');
-export async function retainedDevelopmentFixture(){
+export async function retainedDevelopmentFixture(overrides: Partial<{taskId:string;primarySessionId:string;worktreePath:string;toolingRevision:string}> = {}){
  const root=await mkdtemp(path.join(await realpath(tmpdir()),'retained-selection-'));
- const identity={taskId:'task',primarySessionId:'primary',worktreePath:path.join(root,'product'),toolingRevision:'a'.repeat(40),purpose:'development'};
+ const identity={taskId:'task',primarySessionId:'primary',worktreePath:path.join(root,'product'),toolingRevision:'a'.repeat(40),purpose:'development',...overrides};
  const task:RetainedDevelopmentTask & {ownerPaused:boolean;phase:string}={id:identity.taskId,...identity,resources:[],ownerPaused:false,phase:'waiting'};
  const file=async(name:string,value:unknown)=>{const file=path.join(root,name);await mkdir(path.dirname(file),{recursive:true,mode:0o700});await writeFile(file,JSON.stringify(value),{mode:0o600});return {file,sha256:hash(value)};};
  const record=(key:string,kind:string,externalId:string,metadata:any)=>{const r={id:`id-${key}`,key,kind,purpose:'development',state:'ready',externalId,metadata};task.resources.push(r);return r;};
