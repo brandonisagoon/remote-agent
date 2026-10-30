@@ -1,5 +1,6 @@
 import path from "node:path";
 import { assertFinalizationPath } from "./finalization-resources.ts";
+import { unidentifiedFilesystemHandle } from "./filesystem-handle-diagnostic.ts";
 
 const MAX_BYTES = 8 * 1024 * 1024;
 type Result = { exitCode: number | null; stdout: Buffer; stderr: Buffer; signalCode?: string | null };
@@ -34,7 +35,7 @@ function assertPathsHandleInventory(roots: string[], output: Buffer) {
       files++; current = undefined; return;
     }
     if (!current.type || !current.name && !NAMELESS_KERNEL_HANDLES.has(current.type) || ["unknown", "UNKN"].includes(current.type)
-      || ["DIR", "REG"].includes(current.type) && (!current.name || !path.isAbsolute(current.name))) throw new Error(`An open filesystem handle could not be identified (process ${processId}, descriptor ${JSON.stringify(current.descriptor.slice(0, 32))}, type ${JSON.stringify((current.type ?? "missing").slice(0, 32))})`);
+      || ["DIR", "REG"].includes(current.type) && (!current.name || !path.isAbsolute(current.name))) throw unidentifiedFilesystemHandle(processId, current);
     if (current.name && roots.some(root => contains(root, current!.name!))) active = true;
     files++; current = undefined;
   };
