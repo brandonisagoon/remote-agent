@@ -125,6 +125,23 @@ test("a failed adoption transaction restores neither phase nor partial authority
   await expect(Promise.resolve(db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: event.runtimeSessionId, action: event.action, source: event.source, key: event.key, value: event.value } }))).rejects.toThrow();
 });
 
+test("revocation during a new adoption's provider read wins the authority CAS; only a newly inspected decision can resume", async () => {
+  const f = await fixture();
+  const first = await adoptDoneRetirement({ ...f.context, retirement: await f.request() }, f.dependencies);
+  const stale = { ...await f.request(), requestKey: "second-adoption" };
+  await expect(adoptDoneRetirement({ ...f.context, retirement: stale }, { ...f.dependencies, remote: async () => {
+    await revokeDeliveredRetirement({ ...f.context, revocation: { requestKey: "concurrent-revoke", expectedRevision: first.revision, basis: "Owner stopped during observation" } });
+    return f.dependencies.remote();
+  } })).rejects.toThrow("changed during adoption");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: DONE_RETIREMENT } })).toBe(1);
+  await expect(prepareTaskFinalization(f.finalizer, f.finalization)).rejects.toThrow("revoked");
+  const inspection = await inspectDoneRetirement(f.context, f.dependencies);
+  expect(inspection.revoked).toBeTrue(); expect(inspection.revision).toBeGreaterThan(first.revision);
+  const fresh = { ...await f.request(), requestKey: "fresh-after-revocation" };
+  await adoptDoneRetirement({ ...f.context, retirement: fresh }, f.dependencies);
+  expect((await prepareTaskFinalization(f.finalizer, f.finalization)).preparedRevision).toBe(f.prepared.preparedRevision);
+});
+
 test("an existing retained-evidence proof authorizes and independently confirms capture under the supplement without rewriting proof or unrelated failed resources", async () => {
   const historical = path.join(directory, "historical"), archive = path.join(directory, "retained");
   await mkdir(historical, { mode: 0o700 }); await mkdir(archive, { mode: 0o700 });

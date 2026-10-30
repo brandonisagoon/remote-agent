@@ -21,6 +21,7 @@ type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const doneRetirementDependencies = { source: linkedSourceIssue, snapshot: completionObservation.snapshot, remote: observeRetirementDelivery };
 const bytesDigest = (value: string) => createHash("sha256").update(value).digest("hex");
 export const latestDoneRetirement = (prisma: RetirementDatabase, taskId: string, sessionId: string) => prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `owner:${taskId}`, action: DONE_RETIREMENT }, orderBy: { sequence: "desc" } });
+const latestDoneDecision = (prisma: RetirementDatabase, taskId: string, sessionId: string) => prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `owner:${taskId}`, action: { in: [DONE_RETIREMENT, "delivered-retirement-revoked"] } }, orderBy: { sequence: "desc" } });
 
 async function preparation(prisma: RetirementDatabase, taskId: string, sessionId: string, revision?: number) {
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `finalizer:${taskId}`, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });
@@ -54,10 +55,10 @@ export async function inspectDoneRetirement(input: Context, dependencies = doneR
   assertPreparedBinding(current.prepared, binding);
   const accepted = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: binding.verificationRevision } });
   if (accepted.sequence > current.event.sequence || JSON.parse(accepted.value!).snapshot?.fingerprint !== current.prepared.delivery.receipts.snapshot.fingerprint) throw new Error("Original preparation verification changed");
-  const latest = await latestDoneRetirement(input.prisma, task.id, task.primarySessionId);
+  const latest = await latestDoneDecision(input.prisma, task.id, task.primarySessionId);
   return { taskId: task.id, sessionId: task.primarySessionId, revision: latest?.sequence ?? 0, bindingDigest: retirementDigest(binding),
     preparedRevision: current.event.sequence, preparedDigest: current.digest, source: sourceIdentity(source, binding),
-    ...(latest ? { saved: DoneRetirementGrant.parse(JSON.parse(latest.value!)).input } : {}) };
+    ...(latest?.action === DONE_RETIREMENT ? { saved: DoneRetirementGrant.parse(JSON.parse(latest.value!)).input } : {}), revoked: latest?.action === "delivered-retirement-revoked" };
 }
 
 export async function assertDoneRetirement(prisma: RetirementDatabase, config: ServerConfig, taskId: string, sessionId: string, issueId: string, reference?: z.infer<typeof RetirementReference>) {
@@ -109,7 +110,7 @@ export async function adoptDoneRetirement(input: Context & { retirement: z.infer
   sourceIdentity(await dependencies.source({ ...input, sessionId }), binding, request.source);
   const grant = DoneRetirementGrant.parse({ version: 1, input: request, binding, delivery, baseHead: remote.baseHead, preparedRevision: request.preparedRevision, preparedDigest: digest });
   return input.prisma.$transaction(async tx => {
-    const latest = await latestDoneRetirement(tx, task.id, sessionId);
+    const latest = await latestDoneDecision(tx, task.id, sessionId);
     if ((latest?.sequence ?? 0) !== request.expectedRevision) throw new Error("Done retirement changed during adoption; replay the same request");
     if (retirementDigest(await retirementBinding(tx, input.config, task.id, binding.issueId, true)) !== request.expectedBindingDigest || (await preparation(tx, task.id, sessionId, request.preparedRevision)).digest !== request.preparedDigest) throw new Error("Done retirement task or preparation changed during adoption");
     const event = await tx.runtimeMetadataEvent.create({ data: { ...where, key: request.requestKey, value: JSON.stringify(grant) } });
