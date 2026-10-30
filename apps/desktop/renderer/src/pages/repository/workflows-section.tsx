@@ -228,8 +228,10 @@ function WorkflowEditor({
               })}
             />
             <p className="text-muted-foreground text-xs">
-              Comma-separated; any listed value triggers. Leave empty to always trigger. Richer
-              conditions are editable in the JSON.
+              {workflow.on === "comment.reaction"
+                ? "Choose at least one reaction to request steering. "
+                : "Comma-separated; any listed value triggers. Leave empty to always trigger. "}
+              Richer conditions are editable in the JSON.
             </p>
           </div>
           {!workflow.on.startsWith("comment.") && <div className="grid gap-2">
