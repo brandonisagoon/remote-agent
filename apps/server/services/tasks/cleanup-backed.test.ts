@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
 import { CleanupObserverBatchInput, CleanupTarget, cleanupTargetDigest } from "./cleanup-observer-schema.ts";
+import { hasHistoricalCleanupAdapter } from "./cleanup-adapter-resources.ts";
 import { assertFinalizationResources, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 
 type Shape = "development-fixture" | "review-fixture" | "old-object" | "r2-objects" | "bucket";
@@ -10,7 +11,7 @@ function fixture(shape: Shape = "development-fixture") {
   const volume = `${project}-${shape.endsWith("fixture") ? "redis" : "objects"}`;
   const backing: FinalizationResourceRecord = { id: "store", key: "development-compose", kind: "docker-compose-project", purpose, externalId: project, state: shape === "old-object" ? "released" : "ready", metadata: { volumes: [volume] } };
   if (shape === "old-object") backing.metadata = { configPath: "/private/original/compose.yml", containers: {}, volumes: { [volume]: { createdAt: "recorded" } } };
-  if (shape === "r2-objects") { backing.kind = "task-runtime"; backing.externalId = "/private/runtime.json"; backing.metadata = {}; }
+  if (shape === "r2-objects") { backing.kind = "task-runtime"; backing.key = "runtime-development"; backing.externalId = "/private/runtime.json"; backing.metadata = { recipeHash: "b".repeat(64), providers: [{ provider: "storage", id: "drafted-task-bucket", name: "drafted-task-bucket", released: true }] }; }
   const record: FinalizationResourceRecord = shape.endsWith("fixture") ? { id: "logical", key: "saved-fixture", kind: "fixture", purpose, externalId: "rubin-chats", state: "ready", metadata: {
     owner: "user_Shared (existing synthetic pilot identity; no new Clerk user, no metadata changes)", chats: ["8a000000-0000-4000-8000-000000000001", "8a000000-0000-4000-8000-000000000002", "8a000000-0000-4000-8000-000000000003"], store: purpose === "development" ? "task Redis only" : "review Redis only" } }
     : shape === "r2-objects" ? { id: "logical", key: "saved-objects", kind: "s3-object", purpose, externalId: "drafted-task-bucket/fixture/", state: "ready", metadata: { bucket: "drafted-task-bucket (task R2)", objects: [{ key: "fixture/image.png", sha256: "a".repeat(64) }, { key: "fixture/result.json", sha256: "b".repeat(64) }] } }
@@ -84,7 +85,79 @@ test("no independent observation can be replaced by a released backing receipt",
   await expect(f.verify(plan, true)).rejects.toThrow("provider unavailable");
 });
 
+test("an unresolved object can reuse its exact released runtime only after independent absence", async () => {
+  const f = fixture("r2-objects"); f.backing.state = "released";
+  const before = JSON.stringify(f.resources);
+  await expect(f.prepare()).rejects.toThrow("Historical released adapter is still present");
+  for (const target of f.targets) { target.presentAtPrepare = false; if ("identity" in target) target.identity = null; target.identityDigest = cleanupTargetDigest(target); }
+  f.present.clear();
+  const plan = await f.prepare();
+  expect(plan.find(entry => entry.id === f.backing.id)).toMatchObject({ disposition: "retire-adapter", adapter: "runtime" });
+  expect(plan.find(entry => entry.id === f.record.id)).toMatchObject({ disposition: "retire-backed", storage: { resourceId: f.backing.id, targetDigests: [f.target.identityDigest] } });
+  await f.verify(plan); expect(JSON.stringify(f.resources)).toBe(before);
+  f.present.add(f.target.identityDigest); await expect(f.verify(plan)).rejects.toThrow(); f.present.clear();
+  f.observation.adapters = async () => { throw new Error("provider unavailable"); };
+  await expect(f.prepare()).rejects.toThrow("provider unavailable");
+});
+
+test("released runtime history is observed only for its unresolved same-purpose bucket receipt", () => {
+  const f = fixture("r2-objects"); f.backing.state = "released";
+  expect(hasHistoricalCleanupAdapter(f.backing)).toBeFalse();
+  expect(hasHistoricalCleanupAdapter(f.backing, f.resources)).toBeTrue();
+  f.record.state = "released"; expect(hasHistoricalCleanupAdapter(f.backing, f.resources)).toBeFalse();
+  f.record.state = "ready"; f.record.purpose = "review"; expect(hasHistoricalCleanupAdapter(f.backing, f.resources)).toBeFalse();
+  f.record.purpose = "development"; (f.record.metadata as Record<string, unknown>).bucket = "drafted-another (task R2)";
+  expect(hasHistoricalCleanupAdapter(f.backing, f.resources)).toBeFalse();
+});
+
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+test.skipIf(!draftedRoot)("actual runtime observer and client settle old objects after the original bucket was deleted", async () => {
+  const { mkdtemp, realpath, readFile, rm } = await import("node:fs/promises"), { tmpdir } = await import("node:os");
+  const { RuntimeConfig, RuntimeReceipt, digest, savePrivate } = await import(path.join(draftedRoot!, "src/runtime-config.ts"));
+  const { observeCleanupBatch } = await import(path.join(draftedRoot!, "src/cleanup-observer.ts"));
+  const { releasePreparedBackedResources } = await import(path.join(draftedRoot!, "src/prepared-backed.ts"));
+  const { FinalizationResourcePlan: ClientPlan, assertResourcePlan } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "released-runtime-backing-"))), f = fixture("r2-objects");
+  try {
+    const credentialsFile = path.join(root, "credentials.json"); await savePrivate(credentialsFile, { PRIVATE: "synthetic-not-output" });
+    const recipe = RuntimeConfig.parse({ version: 1, profile: "platform", image: "fixture", credentialsFile,
+      planetscale: { organization: "org", database: "db", baseBranch: "main", baseBranchId: "baseline" }, storage: { accountId: "a".repeat(32) },
+      services: { api: { command: ["bun", "index.ts"], port: 8080 } }, checks: [{ service: "api", path: "/", representative: true }] });
+    const file = path.join(root, "runtimes", f.taskId, "development", "runtime.json");
+    const state = RuntimeReceipt.parse({ version: 1, taskId: f.taskId, worktree: f.context.task.worktreePath, revision: "b".repeat(40), purpose: "development",
+      recipeHash: digest(recipe), recipe, phase: "released", resources: [
+        { provider: "planetscale", id: "original-branch", name: "original-name", released: true },
+        { provider: "storage", id: "drafted-task-bucket", name: "drafted-task-bucket", createdAt: "2026-10-28T00:00:00.000Z", released: true },
+      ] });
+    await savePrivate(file, state);
+    f.backing.externalId = file; f.backing.state = "released"; f.backing.metadata = { recipeHash: state.recipeHash, providers: state.resources };
+    const bytes = await readFile(file), original = JSON.stringify(f.backing), calls: string[] = []; let present = false, unavailable = false;
+    const services = { docker: { inspect: async () => { throw new Error("No Docker target was recorded"); } }, providers: () => ({ inspect: async (resource: { id: string }) => {
+      expect(state.resources.some((saved: { id: string }) => saved.id === resource.id)).toBeTrue(); calls.push(resource.id);
+      if (unavailable) throw new Error("Provider unavailable"); return present;
+    } }) };
+    f.observation.adapters = async ({ request }) => observeCleanupBatch(request, services);
+    const plan = await f.prepare(); await f.verify(plan);
+    expect(plan.find(entry => entry.id === f.backing.id)).toMatchObject({ disposition: "retire-adapter", adapter: "runtime" });
+    const task = { ...f.context.task, phase: "complete", finalizationVersion: 2, ownerPaused: false, resources: f.resources };
+    const prepared = adapterReceipt(task, plan.map(entry => ClientPlan.parse(entry))), writes: string[] = []; let lost = true;
+    const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+      expect(update.key).toBe(f.record.key); writes.push(update.key); Object.assign(f.record, update); await f.verify(plan);
+      if (lost) { lost = false; throw new Error("Lost receipt acknowledgement"); }
+    } };
+    const run = () => releasePreparedBackedResources({ registry, prepared, assertAuthority: () => f.verify(plan),
+      assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, adapters: { observer: services } });
+    expect((await run()).incomplete).toBeTrue(); expect(f.record.state).toBe("released");
+    expect((await run()).incomplete).toBeFalse(); expect(writes).toEqual([f.record.key]); await f.verify(plan, true);
+    expect(calls).toContain("original-branch"); expect(calls).toContain("drafted-task-bucket");
+    expect(JSON.stringify(f.backing)).toBe(original); expect(await readFile(file)).toEqual(bytes);
+    present = true; expect((await run()).incomplete).toBeTrue(); await expect(f.verify(plan, true)).rejects.toThrow();
+    present = false; unavailable = true; expect((await run()).incomplete).toBeTrue(); expect(writes).toHaveLength(1);
+    expect(JSON.stringify(plan)).not.toContain("synthetic-not-output");
+  } finally { await rm(root, { recursive: true, force: true }); }
+}, 30_000);
+
 test.skipIf(!draftedRoot).each<Shape>(["development-fixture", "review-fixture", "old-object"])("actual client retires only the %s logical receipt and reconciles a lost write acknowledgment", async shape => {
   const f = fixture(shape), plan = await f.prepare(); f.present.delete(f.target.identityDigest);
   const { releasePreparedBackedResources } = await import(path.join(draftedRoot!, "src/prepared-backed.ts"));
