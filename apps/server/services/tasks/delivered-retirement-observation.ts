@@ -19,12 +19,13 @@ export async function observeDeliveredScope(input: z.infer<typeof ProviderDelive
   const names = required.map(check => check.name).sort();
   if (new Set(names).size !== names.length || JSON.stringify(names) !== JSON.stringify([...delivery.requiredChecks].sort())) throw new Error("Required delivery checks changed or were not explicitly bound");
   const runs = z.object({ total_count: z.number().int().max(100), check_runs: z.array(z.object({ id: z.number().int().positive(), name: z.string(), head_sha: Sha,
-    status: z.string(), conclusion: z.string().nullable(), html_url: z.string(), app: z.object({ id: z.number().int().positive() }).nullable() })) }).parse(await read(["api", `repos/${delivery.repository}/commits/${delivery.reviewedHead}/check-runs?per_page=100&filter=latest`]));
+    status: z.string(), conclusion: z.string().nullable(), html_url: z.string(), details_url: z.string().nullable().optional(), app: z.object({ id: z.number().int().positive() }).nullable() })) }).parse(await read(["api", `repos/${delivery.repository}/commits/${delivery.reviewedHead}/check-runs?per_page=100&filter=latest`]));
   if (runs.total_count !== runs.check_runs.length) throw new Error("Required delivery check inventory is incomplete");
   const statuses = z.object({ sha: Sha, total_count: z.number().int().max(100), statuses: z.array(z.object({ id: z.number().int().positive(), context: z.string(), state: z.string(), target_url: z.string().nullable() })) }).parse(await read(["api", `repos/${delivery.repository}/commits/${delivery.reviewedHead}/status?per_page=100`]));
   if (statuses.sha !== delivery.reviewedHead || statuses.total_count !== statuses.statuses.length) throw new Error("Required delivery statuses do not belong to the complete reviewed head");
   const checks = required.map(required => {
-    const matching = runs.check_runs.filter(check => check.name === required.name && check.html_url === required.link);
+    const matching = runs.check_runs.filter(check => check.head_sha === delivery.reviewedHead && check.name === required.name
+      && (check.details_url === required.link || check.html_url === required.link));
     const status = statuses.statuses.filter(check => check.context === required.name && check.target_url === required.link);
     if (matching.length + status.length !== 1) throw new Error("Required delivery check cannot be identified uniquely on the exact head");
     if (matching.length) {

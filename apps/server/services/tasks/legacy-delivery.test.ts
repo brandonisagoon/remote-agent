@@ -11,6 +11,7 @@ import { adoptLegacyDelivery, inspectLegacyDelivery, legacyDeliveryDependencies 
 import { assertExternalDoneAllowed, confirmExternalFinalization, prepareExternalFinalization } from "./external-finalization.ts";
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { revokeDeliveredRetirement } from "./delivered-retirement-revocation.ts";
+import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "legacy-delivered-"))); });
@@ -92,6 +93,88 @@ test("provider evidence binds external required check IDs to the exact reviewed 
   }
 });
 
+test.each([
+  { id: 121817873626, details: "https://depot.dev/orgs/7s7fb9j5td/workflows/5lcp6gfk35?job=6hkb8bsbbn&repo=drafted-ai%2Fgreenfield" },
+  { id: 123564855823, details: "https://depot.dev/orgs/7s7fb9j5td/workflows/bmnfmqqshb?job=8z0zh5cb3g&repo=drafted-ai%2Fgreenfield" },
+])("Depot details URL preserves the real check and app identities ($id)", async check => {
+  const f = await fixture();
+  let fault = "";
+  const html = `https://github.com/owner/product/runs/${check.id}`;
+  const client = { run: async (command: string, args: string[]) => {
+    const result = await f.client.run(command, args);
+    const body = JSON.parse(result.stdout);
+    if (args[0] === "pr") body[0].link = fault === "html fallback" ? html : check.details;
+    if (args[1]?.includes("/check-runs")) {
+      Object.assign(body.check_runs[0], { id: check.id, app: { id: 219785 }, html_url: html,
+        details_url: fault === "wrong URL" ? "https://depot.dev/unrelated" : fault === "html fallback" ? null : check.details });
+      if (fault === "wrong head") body.check_runs[0].head_sha = f.merge;
+      if (fault === "duplicate") { body.check_runs.push({ ...body.check_runs[0], id: check.id + 1 }); body.total_count++; }
+    }
+    return { ...result, stdout: JSON.stringify(body) };
+  } };
+  for (const variant of ["", "html fallback"]) {
+    fault = variant;
+    const observed = await observeDeliveredScope(f.delivery, client);
+    expect(observed.checks).toEqual([{ name: "CI / CI Passed", head: f.reviewed, kind: "check-run", id: check.id, appId: 219785, conclusion: "success" }]);
+    expect(observed.ci).toEqual([]);
+  }
+  for (const variant of ["wrong URL", "wrong head", "duplicate"]) {
+    fault = variant;
+    await expect(observeDeliveredScope(f.delivery, client)).rejects.toThrow("uniquely on the exact head");
+  }
+});
+
+test("accepted external cleanup has local authority across status and phase changes without changing preparation bytes", async () => {
+  const f = await fixture();
+  await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalizer, f.dependencies);
+  const before = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  f.issue.state = { id: "blocked", name: "Blocked", type: "started" };
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "waiting" } });
+  const active = await inspectExternalCleanupAuthority(f.finalizer);
+  expect(active.task.phase).toBe("waiting");
+  expect(active.prepared.branch).toBe("staging");
+  expect(active.prepared.deliveredRetirement?.recordedBranch).toBe("codex/original-task");
+  expect(active.preparation.value).toBe(before.value);
+  expect(active.authorityEvents.map(event => event.action)).toEqual(["external-delivery-binding", "external-delivery-observation"]);
+  expect(active.retainedResourceIds.size).toBe(0);
+});
+
+test.each(["pause", "pin", "link", "resource", "revocation", "preparation", "observation"])("local external cleanup rejects changed %s", async changed => {
+  const f = await fixture();
+  const adopted = await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalizer, f.dependencies);
+  if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  if (changed === "pin") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { toolingRevision: "f".repeat(40) } });
+  if (changed === "link") await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: "primary" }, data: { endedAt: new Date() } });
+  if (changed === "resource") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "foreign", kind: "evidence", purpose: "development", externalId: "/foreign" } });
+  if (changed === "revocation") await revokeDeliveredRetirement({ prisma: db.prisma, taskId: "task", revocation: { requestKey: "revoke", expectedRevision: adopted.revision, basis: "Owner stopped cleanup" } });
+  if (changed === "preparation") {
+    const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+    await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: JSON.stringify({ ...JSON.parse(event.value!), branch: "foreign" }) } });
+  }
+  if (changed === "observation") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: prepared.delivery.observationRevision }, data: { value: "{}" } });
+  await expect(inspectExternalCleanupAuthority(f.finalizer)).rejects.toThrow();
+});
+
+test("closed local external reporting requires the exact confirmation and retained-resource proofs", async () => {
+  const f = await fixture();
+  await db.prisma.remoteTaskResource.create({ data: { id: "pr-resource", taskId: "task", key: "delivered-pr", kind: "pull-request", purpose: "development", externalId: "https://github.com/owner/product/pull/4190", state: "ready" } });
+  await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, f.dependencies);
+  await prepareExternalFinalization(f.finalizer, f.dependencies);
+  await expect(inspectExternalCleanupAuthority({ ...f.finalizer, allowConfirmedClosed: true })).rejects.toThrow("exact confirmation");
+  git(f.root, "worktree", "remove", f.worktree);
+  await confirmExternalFinalization(f.finalizer, f.dependencies);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed" } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: "primary" }, data: { endedAt: new Date() } });
+  await expect(inspectExternalCleanupAuthority(f.finalizer)).rejects.toThrow();
+  const active = await inspectExternalCleanupAuthority({ ...f.finalizer, allowConfirmedClosed: true });
+  expect([...active.retainedResourceIds]).toEqual(["pr-resource"]);
+  await db.prisma.runtimeMetadataEvent.deleteMany({ where: { action: "finalization-resource-proof" } });
+  await expect(inspectExternalCleanupAuthority({ ...f.finalizer, allowConfirmedClosed: true })).rejects.toThrow("proof is missing");
+});
+
 async function fixture() {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree");
   await mkdir(root); git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
@@ -120,6 +203,6 @@ async function fixture() {
     return { ok: true, stdout: JSON.stringify(value), stderr: "" };
   } };
   const dependencies = { ...legacyDeliveryDependencies, source: async () => ({ session, link, config, issue }), delivered: (input: typeof delivery) => observeDeliveredScope(input, client) };
-  const request = async () => { const observed = await inspectLegacyDelivery(context, dependencies); return DeliveredRetirementInput.parse({ version: 1, mode: "legacy-delivery", requestKey: "present-day-retirement", expectedBindingRevision: observed.revision, expectedIdentityDigest: observed.identityDigest, source: observed.source, basis: "Standing owner direction to finish delivered non-workflow work", cleanupSnapshot: observed.cleanupSnapshot, deliveries: [delivery], mergeOrder: [delivery.id], resourceIds: [], ownership: { ownedPaths: [] } }); };
+  const request = async () => { const observed = await inspectLegacyDelivery(context, dependencies); return DeliveredRetirementInput.parse({ version: 1, mode: "legacy-delivery", requestKey: "present-day-retirement", expectedBindingRevision: observed.revision, expectedIdentityDigest: observed.identityDigest, source: observed.source, basis: "Standing owner direction to finish delivered non-workflow work", cleanupSnapshot: observed.cleanupSnapshot, deliveries: [delivery], mergeOrder: [delivery.id], resourceIds: observed.resources.map(resource => resource.id), ownership: { ownedPaths: [] } }); };
   return { root, worktree, reviewed, merge, session, issue, config, context, finalizer, dependencies, delivery, client, request, set providerFault(value: string) { fault = value; } };
 }

@@ -13,7 +13,7 @@ import { externalDeliveryObservation, observeExternalDeliveries } from "./extern
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { assertFinalizationResources, assertFinalizationPlanPurposes, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
-export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
+export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
   delivered: observeDeliveredScope,
@@ -32,18 +32,19 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   }
 }
 
-export async function externalTaskOwnership(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
+export async function externalTaskOwnership(prisma: ExternalDatabase, config: ServerConfig, taskId: string, options: { allowConfirmedClosed?: boolean } = {}) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!session || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase === "closed" || !task.worktreePath || !task.connectionId || !task.issueIdentifier || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== config.machine) throw new Error("External delivery requires the open original primary and unchanged task ownership");
+  if (!session || session.role !== "primary" || !options.allowConfirmedClosed && (session.status === "closed" || task.phase === "closed") || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== config.machine) throw new Error("External delivery requires the open original primary and unchanged task ownership");
   getRepositoryConfig(config, task.repositoryId);
-  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", endedAt: null } });
+  const closed = session.status === "closed" || task.phase === "closed";
+  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(options.allowConfirmedClosed && closed ? {} : { endedAt: null }) } });
   if (!link) throw new Error("External delivery source ownership changed");
   const identity = ExternalTaskIdentity.parse({ taskId: task.id, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, taskWorktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
   return { task, session, identity };
 }
-export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
-  const { task, session, identity } = await externalTaskOwnership(prisma, config, taskId);
+export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string, options: { allowConfirmedClosed?: boolean } = {}) {
+  const { task, session, identity } = await externalTaskOwnership(prisma, config, taskId, options);
   const where = { runtimeSessionId: session.id, source: `owner:${task.id}` };
   const contractEvent = await prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: "completion-contract" }, orderBy: { sequence: "desc" } });
   if (!contractEvent) throw new Error("External delivery has no owner completion contract");
@@ -80,14 +81,14 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
   return { event, approval, config };
 }
 
-export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number) {
+export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
   if (binding.version === 2) {
-    const current = await externalTaskOwnership(prisma, config, binding.identity.taskId);
+    const current = await externalTaskOwnership(prisma, config, binding.identity.taskId, options);
     const event = await latestExternalBinding(prisma, current.task.id, current.session.id);
     if (externalDigest(current.identity) !== externalDigest(binding.identity) || event?.sequence !== revision || event.value !== JSON.stringify(binding) || await externalOwnerHistory(prisma, current.task.id, current.session.id) !== binding.ownerHistoryRevision) throw new Error("Present-day retirement task, binding or owner authority changed");
     return { ...current, contract: null };
   }
-  const current = await externalTaskAuthority(prisma, config, binding.identity.taskId);
+  const current = await externalTaskAuthority(prisma, config, binding.identity.taskId, options);
   if (externalDigest(current.identity) !== externalDigest(binding.identity) || current.contractEvent.sequence !== binding.contractRevision || externalDigest(current.contract) !== binding.contractDigest || current.verification.sequence !== binding.verificationRevision || current.binding?.sequence !== revision || current.binding.value !== JSON.stringify(binding)) throw new Error("External delivery task, binding, contract or verification authority changed");
   const approval = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: binding.acceptance.approvalEventSequence } });
   if (!approval || externalDigest(JSON.parse(approval.value!)) !== binding.acceptance.approvalDigest) throw new Error("External acceptance provenance changed");
