@@ -109,7 +109,6 @@ export function ConnectionPage({ id, value, mutate }: { id: string; value: Servi
       >
         <SettingsCard>
           <Field label="Agent user ID" value={connection.agentUserId} onChange={(next) => mutate((file) => { file.connections[id]!.agentUserId = next; })} />
-          <Field label="Agent handle" value={connection.agentHandle ?? ""} onChange={(next) => mutate((file) => { file.connections[id]!.agentHandle = next || undefined; })} />
         </SettingsCard>
       </SettingsSection>
       <SettingsSection

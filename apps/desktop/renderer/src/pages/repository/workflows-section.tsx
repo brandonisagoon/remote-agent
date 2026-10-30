@@ -38,6 +38,8 @@ type Workflow = RepoConfig["workflows"][string];
 const EVENT_LABELS: Record<Workflow["on"], string> = {
   "issue.state-changed": "Issue enters state",
   "issue.reaction": "Issue reaction",
+  "comment.created": "Comment posted or edited",
+  "comment.reaction": "Comment reaction",
 };
 
 /** The condition field each event type filters on. Richer conditions stay
@@ -45,6 +47,8 @@ const EVENT_LABELS: Record<Workflow["on"], string> = {
 const EVENT_CONDITION_FIELD: Record<Workflow["on"], string> = {
   "issue.state-changed": "issue.state",
   "issue.reaction": "reaction.emoji",
+  "comment.created": "comment.action",
+  "comment.reaction": "reaction.emoji",
 };
 
 function conditionSummary(workflow: Workflow): string {
@@ -72,11 +76,11 @@ export function WorkflowsSection({ value, root, repo }: { value: ServiceFile; ro
                 </TableCell>
                 <TableCell>
                   <div className="truncate font-mono text-xs">
-                    {workflow.skill.skillset}
+                    {workflow.skill.skillset || "Original comment"}
                     {workflow.skill.flags.length > 0 && `+${workflow.skill.flags.join("+")}`}
                   </div>
                   <div className="text-muted-foreground/70 text-xs">
-                    {workflow.deliver === "start-session" ? "starts a session" : "messages the session"}
+                    {{ "start-session": "starts a session", "message-session": "messages the session", "queue-session": "queues the comment", "steer-session": "requests active-turn steering" }[workflow.deliver]}
                   </div>
                 </TableCell>
                 <TableCell className="w-40 pr-4 text-right">
@@ -98,7 +102,7 @@ export function WorkflowsSection({ value, root, repo }: { value: ServiceFile; ro
             {Object.keys(workflows).length === 0 && (
               <TableRow>
                 <TableCell className="text-muted-foreground p-6 text-center">
-                  No workflows — sessions start only from mentions and assignments.
+                  No workflows — configure an event to start work. Existing conversations retain their owner.
                 </TableCell>
               </TableRow>
             )}
@@ -198,6 +202,11 @@ function WorkflowEditor({
               onValueChange={(next) => edit((entry) => {
                 entry.on = next as Workflow["on"];
                 entry.when = undefined;
+                if (next.startsWith("comment.")) {
+                  entry.deliver = next === "comment.reaction" ? "steer-session" : "queue-session";
+                  entry.skill = { skillset: "", flags: [] };
+                  entry.plan = undefined;
+                } else if (["queue-session", "steer-session"].includes(entry.deliver)) entry.deliver = "message-session";
               })}
             >
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
@@ -209,10 +218,10 @@ function WorkflowEditor({
             </Select>
           </div>
           <div className="grid gap-2">
-            <Label>{workflow.on === "issue.state-changed" ? "States" : "Reactions"}</Label>
+            <Label>{workflow.on === "issue.state-changed" ? "States" : workflow.on === "comment.created" ? "Actions" : "Reactions"}</Label>
             <Input
               value={conditionValues.join(", ")}
-              placeholder={workflow.on === "issue.state-changed" ? "Planning, In Progress" : "pencil2"}
+              placeholder={workflow.on === "issue.state-changed" ? "Planning, In Progress" : workflow.on === "comment.created" ? "create, update" : "Emoji or shortcode"}
               onChange={(event) => edit((entry) => {
                 const values = event.target.value.split(",").map((part) => part.trim()).filter(Boolean);
                 entry.when = values.length > 0 ? [{ [conditionField]: values }] : undefined;
@@ -223,7 +232,7 @@ function WorkflowEditor({
               conditions are editable in the JSON.
             </p>
           </div>
-          <div className="grid gap-2">
+          {!workflow.on.startsWith("comment.") && <div className="grid gap-2">
             <Label>Skillset</Label>
             <Select
               value={workflow.skill.skillset || undefined}
@@ -241,7 +250,7 @@ function WorkflowEditor({
                 )}
               </SelectContent>
             </Select>
-          </div>
+          </div>}
           {selected && selected.flags.length > 0 && (
             <div className="grid gap-2">
               <Label>Flags</Label>
@@ -274,8 +283,10 @@ function WorkflowEditor({
             >
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
-                <SelectItem value="start-session">Start a session in a new worktree</SelectItem>
-                <SelectItem value="message-session">Message the issue's running session</SelectItem>
+                {workflow.on === "comment.created" ? <SelectItem value="queue-session">Queue the original comment for its owning session</SelectItem>
+                  : workflow.on === "comment.reaction" ? <SelectItem value="steer-session">Request steering using the original comment</SelectItem>
+                  : <><SelectItem value="start-session">Start a session in a new worktree</SelectItem>
+                    <SelectItem value="message-session">Message the issue's running session</SelectItem></>}
               </SelectContent>
             </Select>
           </div>

@@ -127,7 +127,7 @@ describe("dispatch event failure reaction", () => {
         event: issueEvent(),
       },
       dependencies(
-        worker("product.agent-mention", async () => ({
+        worker("product.comment", async () => ({
           status: "failed",
           detail: "routing failed",
           targetResourceId: null,

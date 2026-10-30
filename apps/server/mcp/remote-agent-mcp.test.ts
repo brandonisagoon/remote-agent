@@ -63,7 +63,7 @@ describe("remote-agent MCP server", () => {
         expect((init.result as { serverInfo: { name: string } }).serverInfo.name).toBe("remote-agent");
         const list = await rpc({ method: "tools/list" });
         const names = (list.result as { tools: Array<{ name: string }> }).tools.map((tool) => tool.name);
-        expect(names).toEqual(["read_work_graph", "publish_child_issue_update", "read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "resolve_tooling_capability", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
+        expect(names).toEqual(["read_reply_context", "reply_to_source", "read_work_graph", "publish_child_issue_update", "read_source_issue", "download_source_attachment", "ask_question", "inspect_task", "resolve_tooling_capability", "report_task", "register_resource", "publish_plan", "publish_issue_update", "delegate_session", "inspect_delegates", "instruct_delegate", "register_thread"]);
         const call = await rpc({
           method: "tools/call",
           params: { name: "delegate_session", arguments: { prompt: "Research auth", name: "research" } },

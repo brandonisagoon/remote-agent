@@ -141,13 +141,13 @@ test("missing actor, another actor, self-authored comments and wildcard subscrip
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
 });
 
-test("unmanaged registered questions and explicit mentions retain their existing routing semantics", async () => {
+test("registered questions still route while an unconfigured mention has no special entry path", async () => {
   const session = await beginRuntimeSession(db.prisma, { sessionKey: "unmanaged", agent: "codex", cwd: "/tmp/unmanaged-owner" });
   await registerThread(db.prisma, { provider: "linear", connectionId: config.activeConnectionId, runtimeSessionId: session.id, threadRootCommentId: "question", relationship: "question" });
   await receive(comment({ parentId: "question" }));
   expect(dispatch.mock.calls[0]?.[0].event).toMatchObject({ routedSessionId: session.id, threadRelationship: "question" });
   await receive(comment({ id: "mention", body: "@cubic-agent continue" }), "mention");
-  expect(dispatch).toHaveBeenCalledTimes(2);
+  expect(dispatch).toHaveBeenCalledTimes(1);
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
 });
 

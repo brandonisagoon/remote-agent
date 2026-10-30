@@ -60,6 +60,21 @@
       "deliver": "start-session",
       "providerId": "claude",
       "model": "opus"
+    },
+    "comments": {
+      "on": "comment.created",
+      "deliver": "queue-session"
+    },
+    "steer": {
+      "on": "comment.reaction",
+      "when": [
+        {
+          "reaction.emoji": [
+            "compass"
+          ]
+        }
+      ],
+      "deliver": "steer-session"
     }
   },
   "labels": {
@@ -75,5 +90,12 @@
   },
   "sessionDefaults": {
     "labels": {}
+  },
+  "conversationReactions": {
+    "queued": "hourglass_flowing_sand",
+    "processing": "eyes",
+    "replied": "speech_balloon",
+    "attention": "warning",
+    "failed": "x"
   }
 }

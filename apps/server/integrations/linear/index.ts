@@ -9,8 +9,6 @@ export {
 export type { CreatedIssueComment } from "./comments.ts";
 export { fetchCommentContext } from "./comment-context.ts";
 export type { CommentContext } from "./comment-context.ts";
-export { mentionsAgent } from "./mentions.ts";
-export type { MentionMatchOptions } from "./mentions.ts";
 export {
   TrackerReaction,
   reactToComment,

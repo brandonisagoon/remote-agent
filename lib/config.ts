@@ -40,15 +40,15 @@ const RoutingConditionSchema = z.record(
 const RepositoryWorkflowSchema = z.object({
   /** Restricts the workflow to events arriving via one connection. */
   connectionId: ConfigIdSchema.optional(),
-  on: z.enum(["issue.state-changed", "issue.reaction"]),
+  on: z.enum(["issue.state-changed", "issue.reaction", "comment.created", "comment.reaction"]),
   /** OR of AND-groups over event fields (same semantics as connection
       repository routing). Absent = always. */
   when: z.array(RoutingConditionSchema).min(1).optional(),
   skill: z.object({
-    skillset: z.string().min(1),
+    skillset: z.string(),
     flags: z.array(z.string().min(1)).default([]),
-  }),
-  deliver: z.enum(["start-session", "message-session"]),
+  }).default({ skillset: "", flags: [] }),
+  deliver: z.enum(["start-session", "message-session", "queue-session", "steer-session"]),
   /** Session provider; defaults to the machine's ACP provider. */
   providerId: z.enum(["codex", "claude"]).optional(),
   model: z.string().min(1).optional(),
@@ -129,6 +129,12 @@ export const RepoConfigSchema = z.object({
     )
     .default({ "*": "{branch}" }),
   workflows: z.record(ConfigIdSchema, RepositoryWorkflowSchema).default({}),
+  /** Integration presentation of shared delivery facts; absent = no reactions. */
+  conversationReactions: z.object({
+    queued: z.string().trim().min(1), processing: z.string().trim().min(1),
+    replied: z.string().trim().min(1), attention: z.string().trim().min(1), failed: z.string().trim().min(1),
+    planUpdate: z.string().trim().min(1), codeChange: z.string().trim().min(1),
+  }).partial().strict().optional(),
   /** Label groups sessions in this repository are labeled by. */
   labels: z.record(ConfigIdSchema, LabelGroupSchema).default({}),
   /** Labels stamped on every new session, keyed by group. */
@@ -139,6 +145,14 @@ export const RepoConfigSchema = z.object({
     .default({ labels: {} }),
 }).superRefine((settings, context) => {
   for (const [workflowId, workflow] of Object.entries(settings.workflows)) {
+    const conversation = workflow.on.startsWith("comment.");
+    const valid = conversation
+      ? workflow.skill.skillset === "" && workflow.skill.flags.length === 0 && (workflow.on === "comment.created" ? workflow.deliver === "queue-session" : workflow.deliver === "steer-session")
+      : workflow.skill.skillset.trim().length > 0 && ["start-session", "message-session"].includes(workflow.deliver);
+    if (!valid) context.addIssue({ code: "custom", path: ["workflows", workflowId], message: "Comment workflows deliver raw input using queue-session/steer-session; issue workflows require a skill and start-session/message-session" });
+    if (workflow.on === "comment.reaction" && !workflow.when?.every((condition) => condition["reaction.emoji"]?.length)) {
+      context.addIssue({ code: "custom", path: ["workflows", workflowId, "when"], message: "Steering requires an explicit reaction.emoji condition" });
+    }
     if (workflow.plan && workflow.deliver !== "start-session") {
       context.addIssue({ code: "custom", path: ["workflows", workflowId, "plan"], message: "plan capture requires deliver: start-session" });
     }
@@ -214,6 +228,7 @@ const LinearConnectionSchema = z.object({
   name: z.string().min(1),
   apiKey: LinearCredentialSchema,
   agentUserId: z.string().min(1),
+  /** Read compatibility only; mentions no longer trigger delivery. */
   agentHandle: z.string().min(1).optional(),
   /** Portable workspace identity (Linear workspace URL key). Committed
       repo configs reference this — never the machine-local connection id. */
@@ -353,10 +368,10 @@ export interface WorkflowConfig {
   id: string;
   /** null = events from any connection routing to this repository. */
   connectionId: string | null;
-  on: "issue.state-changed" | "issue.reaction";
+  on: "issue.state-changed" | "issue.reaction" | "comment.created" | "comment.reaction";
   when: Array<Record<string, string[]>> | null;
   skill: { skillset: string; flags: string[] };
-  deliver: "start-session" | "message-session";
+  deliver: "start-session" | "message-session" | "queue-session" | "steer-session";
   providerId: "codex" | "claude" | null;
   model: string | null;
   plan: { captureToIssue: true; thenState: string | null } | null;
@@ -377,6 +392,7 @@ export interface RepositoryConfig {
   /** Branch template per connection id; "*" is the default. */
   branchNaming: Record<string, string>;
   workflows: Readonly<Record<string, WorkflowConfig>>;
+  conversationReactions?: Partial<Record<"queued" | "processing" | "replied" | "attention" | "failed" | "planUpdate" | "codeChange", string>>;
   labels: Record<string, LabelGroupConfig>;
   sessionDefaults: { labels: Record<string, string[]> };
 }
@@ -566,6 +582,7 @@ export function readConfig(filePath: string = configFilePath()): ServerConfig {
           ),
         },
         skillsRoot: settings.skillsRoot,
+        conversationReactions: settings.conversationReactions,
         worktreeNaming: { ...repository.worktreeNaming },
         branchNaming: { ...settings.branchNaming },
         workflows: Object.fromEntries(
