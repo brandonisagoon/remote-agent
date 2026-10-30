@@ -191,3 +191,30 @@ checkout. The final run took 9.0–19.6 seconds per checkout. DRA8's review chec
 correctly refused its still-running API/web handles. These observations do not
 adopt a plan, stop processes or remove any live checkout. Other unsupported task
 resources still require their own exact plan before whole-task adoption.
+
+## Legacy browser capture
+
+A `retire-browser` plan keeps the original browser receipt and tooling pin. Its
+session observation runs through the immutable cleanup capability selected by
+the server, never through the receipt's historical `toolingRoot`. The exact
+`drafted` namespace, task/purpose session, profile directory identity and private
+ownership marker must match the supported legacy format.
+
+When an existing registered private directory owns the browser parent, its
+capture preserves the profile as one opaque child, the marker, offline command
+context and every other inventoried file. The parent has a separate stopped
+consumer edge for the named browser. A standalone browser uses only its exact
+owner-selected marker/profile parent, with a complete frozen inventory and the
+same native retained quarantine; no broader environment root is inferred.
+Cookie contents are neither read nor individually hashed. The browser profile
+is retained, not deleted.
+
+Confirmation independently observes named-session absence through the configured
+capability even after the original paths have moved, and verifies the marker and
+profile identity at their captured paths. Released state alone is insufficient.
+Active browsers require verified stop-only handling before capture; owner pause
+is not overridden. The server fixtures cover both parent shapes, historical
+metadata-tooling mismatch, source recreation, shared profiles, marker/context
+substitution and capture replay. Live legacy adapter inspection and paired client
+execution are separate acceptance checks; these schema/observer tests do not
+claim a live browser has been stopped or retired.

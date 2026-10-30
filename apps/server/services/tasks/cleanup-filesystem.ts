@@ -43,12 +43,12 @@ export function captureAdapterDependencies(root: string, resources: Finalization
 export function assertCapturedDependencies(entry: { dependencies: string[]; stoppedConsumers: string[] }, resources: FinalizationResourceRecord[], observed?: z.infer<typeof CleanupObserverBatchResult>) {
   for (const id of entry.dependencies) if (resources.find(record => record.id === id)?.state !== "released") throw new Error("Captured directory still has an unreleased dependent adapter");
   for (const id of entry.stoppedConsumers) {
-    const consumer = observed?.observations.find(entry => entry.resourceId === id), families = consumer?.targets.filter(target => target.kind === "native-family") ?? [];
+    const consumer = observed?.observations.find(entry => entry.resourceId === id), families = consumer?.targets.filter(target => target.kind === "native-family" || target.kind === "browser-session") ?? [];
     if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Captured directory still has an active or unverified native consumer");
   }
 }
 
-async function privateRoot(root: string) {
+export async function privateRoot(root: string) {
   await assertFinalizationPath(root);
   const stat = await lstat(root), parent = await lstat(path.dirname(root));
   if (path.parse(root).root === root || !stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o7777) !== 0o700
@@ -73,11 +73,13 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
       if (entry.disposition === "retain-archive" && overlaps(root, entry.archive.root) || entry.disposition === "retain-archive-member" && within(root, entry.file.path)) throw new Error("Retained archive must survive outside registered cleanup roots");
     }
     const edges = captureAdapterDependencies(root, input.resources, input.plan);
+    const browsers = input.plan.filter(entry => entry.disposition === "retire-browser" && entry.capture.type === "registered" && entry.capture.parentResourceId === resource.id);
+    edges.stoppedConsumers.push(...browsers.map(entry => entry.id));
     await privateRoot(root);
     await observation.rootIdle(root);
     const children = input.resources.filter(other => other.id !== resource.id && path.isAbsolute(other.externalId) && within(root, other.externalId));
-    if (children.some(child => child.externalId === root || !files.has(child.kind) || child.state === "released")) throw new Error("Registered root contains a resource without an exact contained-file plan");
-    const inventory = await finalizationInventory(root, [root], new Map(), new Map(children.map(child => [child.externalId, child.id])));
+    if (children.some(child => child.externalId === root || !files.has(child.kind) && !browsers.some(browser => browser.id === child.id) || child.state === "released")) throw new Error("Registered root contains a resource without an exact contained-file plan");
+    const inventory = await finalizationInventory(root, [root], new Map(browsers.map(browser => [browser.externalId, browser.id])), new Map(children.filter(child => files.has(child.kind)).map(child => [child.externalId, child.id])));
     if (inventory.some(entry => entry.path.split(path.sep).includes(".git"))) throw new Error("Registered directory contains Git metadata requiring a worktree plan");
     for (const entry of inventory) {
       const stat = await lstat(path.join(root, entry.path));
@@ -89,6 +91,7 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
         quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
     result.push(tree);
     for (const child of children) {
+      if (browsers.some(browser => browser.id === child.id)) continue;
       const entry = inventory.find(entry => entry.path === path.relative(root, child.externalId));
       if (!entry || entry.kind !== "file") throw new Error("Contained file receipt is not an exact regular inventory member");
       const metadata = child.metadata as Record<string, unknown> | null;
@@ -107,8 +110,9 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
  * renewals so another task cannot acquire a recorded path inside the capture. */
 export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
   const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree");
-  if (!roots.length) return;
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.retainedAdministration.path] : [])]);
+  for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
+  if (!scopes.length) return;
   const ancestors = new Set<string>();
   for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
   const shared = await prisma.remoteTaskResource.findFirst({ where: { taskId: { not: taskId }, OR: [

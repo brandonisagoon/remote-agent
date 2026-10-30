@@ -34,7 +34,12 @@ test("actual disposable cwd writer is refused without walking a dependency tree"
   const program = path.join(root, "idle.ts"); await writeFile(program, 'console.log("ready"); setTimeout(() => {}, 30000);\n');
   const child = Bun.spawn([process.execPath, "--no-env-file", "idle.ts"], { cwd: root, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   const reader = child.stdout.getReader(); await reader.read(); await reader.cancel();
-  try { await expect(assertLinkedRootIdle(root)).rejects.toThrow("still holds"); }
+  // Keep real kernel descriptor/path observation, scoped to this disposable
+  // writer. Unrelated CI processes may correctly make the global scan unknown.
+  const observeWriter = (args: string[]) => Bun.spawnSync(args[0] === "lsof" ? [...args, "-a", "-p", String(child.pid)] : args,
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+  try { await expect(assertLinkedRootIdle(root, observeWriter)).rejects.toThrow("still holds"); }
   finally { child.kill(9); await child.exited; }
-  await assertLinkedRootIdle(root);
+  const gone = observeWriter(["lsof", "-nP", "-F0pftn"]);
+  expect(gone.exitCode).toBe(1); expect(gone.stdout.length).toBe(0); expect(gone.stderr.length).toBe(0);
 }, 20_000);
