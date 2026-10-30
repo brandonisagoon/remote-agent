@@ -10,7 +10,7 @@ export async function revokeDeliveredRetirement(input: { prisma: PrismaClient; t
   return input.prisma.$transaction(async tx => {
     const prior = await tx.runtimeMetadataEvent.findFirst({ where: { ...where, action: DELIVERED_RETIREMENT_REVOKED, key: request.requestKey } });
     if (prior) { if (prior.value !== JSON.stringify(request)) throw new Error("Revocation requestKey belongs to another decision"); return { revision: prior.sequence }; }
-    const latest = await tx.runtimeMetadataEvent.findFirst({ where: { ...where, action: { in: ["prepared-done-retirement", DELIVERED_RETIREMENT_REVOKED] } }, orderBy: { sequence: "desc" } });
+    const latest = await tx.runtimeMetadataEvent.findFirst({ where: { ...where, action: { in: ["prepared-done-retirement", "external-delivery-binding", DELIVERED_RETIREMENT_REVOKED] } }, orderBy: { sequence: "desc" } });
     if (latest?.sequence !== request.expectedRevision) throw new Error("Delivered retirement changed before revocation");
     const event = await tx.runtimeMetadataEvent.create({ data: { ...where, action: DELIVERED_RETIREMENT_REVOKED, key: request.requestKey, value: JSON.stringify(request) } });
     return { revision: event.sequence };

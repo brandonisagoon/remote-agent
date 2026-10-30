@@ -22,6 +22,26 @@ export const ExternalDeliveryInput = z.object({
   verificationRefs: z.array(ExternalEvidence).min(1).max(20),
 }).strict();
 export type ExternalDeliveryInput = z.infer<typeof ExternalDeliveryInput>;
+export const ProviderDeliveryInput = ExternalDeliveryInput.omit({ sourcePath: true, verificationRefs: true }).extend({
+  requiredChecks: z.array(z.string().trim().min(1).max(200)).min(1).max(100),
+}).strict();
+export type ProviderDeliveryInput = z.infer<typeof ProviderDeliveryInput>;
+export const CleanupSnapshot = z.object({ head: Sha, branch: Ref, clean: z.boolean(), fingerprint: Digest }).strict();
+export const DeliveredRetirementInput = z.object({ version: z.literal(1), mode: z.literal("legacy-delivery"), requestKey: z.string().trim().min(1).max(180),
+  expectedBindingRevision: z.number().int().nonnegative(), expectedIdentityDigest: Digest,
+  source: z.object({ issueId: z.string().min(1), stateId: z.string().min(1), updatedAt: z.iso.datetime() }).strict(),
+  basis: z.string().trim().min(1).max(4000), cleanupSnapshot: CleanupSnapshot,
+  deliveries: z.array(ProviderDeliveryInput).min(1).max(10), mergeOrder: z.array(z.string()).min(1).max(10),
+  resourceIds: z.array(z.string().min(1)).max(1000), originalWork: OriginalWorkInput.optional(),
+  ownership: z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(AbsolutePath).max(100) }).strict(),
+}).strict().superRefine((value, ctx) => {
+  const ids = value.deliveries.map(d => d.id);
+  if (new Set(ids).size !== ids.length || new Set(value.deliveries.map(d => `${d.repository}/${d.pullRequest}`)).size !== ids.length || new Set(value.resourceIds).size !== value.resourceIds.length || new Set(value.mergeOrder).size !== ids.length || value.mergeOrder.length !== ids.length || value.mergeOrder.some(id => !ids.includes(id))) ctx.addIssue({ code: "custom", message: "Delivered scopes, merge order and exact resources must be unique and complete" });
+  if (!value.cleanupSnapshot.clean && !value.originalWork) ctx.addIssue({ code: "custom", message: "Unfinished original work requires independently verified recovery" });
+  if (value.originalWork && !value.resourceIds.includes(value.originalWork.archiveResourceId)) ctx.addIssue({ code: "custom", message: "Original-work archive must belong to the exact resource set" });
+  if (value.originalWork && ("format" in value.originalWork ? value.originalWork.retainedArchiveMembers ?? [] : [...value.originalWork.retainedResults ?? [], ...value.originalWork.additionalArchives ?? []]).some(entry => !value.resourceIds.includes(entry.resourceId))) ctx.addIssue({ code: "custom", message: "Every retained resource must belong to the exact resource set" });
+});
+export type DeliveredRetirementInput = z.infer<typeof DeliveredRetirementInput>;
 export const ExternalDeliveryBindingInput = z.object({
   version: z.literal(1), requestKey: z.string().trim().min(1).max(180),
   expectedContractRevision: z.number().int().positive(), expectedBindingRevision: z.number().int().nonnegative(),
@@ -46,18 +66,26 @@ export const ExternalDeliveryObservation = z.object({
   mergedAt: z.iso.datetime(), baseHead: Sha,
   ci: z.array(z.object({ runId: z.number().int().positive(), head: Sha, workflowId: z.number().int().positive(), name: z.string(), conclusion: z.literal("success") }).strict()),
   reports: z.array(z.object({ path: AbsolutePath, sha256: Digest, head: Sha, attribution: z.literal("owner-attested") }).strict()),
-  snapshot: ExternalSnapshot,
+  snapshot: ExternalSnapshot.optional(),
+  checks: z.array(z.object({ name: z.string(), head: Sha, kind: z.enum(["check-run", "status"]), id: z.number().int().positive(), appId: z.number().int().nullable(), conclusion: z.literal("success") }).strict()).optional(),
 }).strict();
 export type ExternalDeliveryObservation = z.infer<typeof ExternalDeliveryObservation>;
 export const ExternalTaskIdentity = z.object({ taskId: z.string(), sessionId: z.string(), repositoryId: z.string(), machineId: z.string(),
   connectionId: z.string(), issueIdentifier: z.string(), taskWorktree: z.string(), branch: z.string(), baseCommit: z.string().nullable(), toolingRoot: z.string(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable() }).strict();
 export function externalDigest(value: unknown) { return createHash("sha256").update(JSON.stringify(value)).digest("hex"); }
 
-export const ExternalBinding = z.object({ version: z.literal(1), input: ExternalDeliveryBindingInput, identity: ExternalTaskIdentity,
+export const HistoricalExternalBinding = z.object({ version: z.literal(1), input: ExternalDeliveryBindingInput, identity: ExternalTaskIdentity,
   contractRevision: z.number().int(), contractDigest: Digest, verificationRevision: z.number().int(), manifestDigest: Digest,
   acceptance: z.object({ approvalEventSequence: z.number().int(), approvalDigest: Digest, ownerCommentId: z.string(), ownerCommentDigest: Digest,
     actorId: z.string(), issueId: z.string(), organizationId: z.string(), createdAt: z.iso.datetime(), updatedAt: z.iso.datetime() }).strict(),
   deliveries: z.array(ExternalDeliveryObservation),
   resources: z.array(FinalizationResourcePlan), resourcePlanDigest: Digest, originalWork: OriginalWork.optional(),
 }).strict();
+export const DeliveredRetirementBinding = z.object({ version: z.literal(2), input: DeliveredRetirementInput, identity: ExternalTaskIdentity,
+  contractRevision: z.null(), contractDigest: z.null(), verificationRevision: z.null(), manifestDigest: Digest,
+  acceptance: z.object({ kind: z.literal("present-day-owner"), issueId: z.string(), stateId: z.string(), sourceUpdatedAt: z.iso.datetime(), basis: z.string(), createdAt: z.iso.datetime() }).strict(),
+  cleanupSnapshot: CleanupSnapshot, ownerHistoryRevision: z.number().int().nonnegative(),
+  deliveries: z.array(ExternalDeliveryObservation).min(1), resources: z.array(FinalizationResourcePlan), resourcePlanDigest: Digest, originalWork: OriginalWork.optional(),
+}).strict();
+export const ExternalBinding = z.discriminatedUnion("version", [HistoricalExternalBinding, DeliveredRetirementBinding]);
 export type ExternalBinding = z.infer<typeof ExternalBinding>;
