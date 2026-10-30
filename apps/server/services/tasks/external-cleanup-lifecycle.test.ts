@@ -295,3 +295,39 @@ test("shared cleanup requires independent adapter absence even after a generic R
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toolingRevision).toBe("a".repeat(40));
   expect(f.issue.state.name).toBe("Blocked");
 });
+
+test("queued external cleanup refresh preserves its accepted binding, preparation and operation bytes", async () => {
+  const { createHash } = await import("node:crypto");
+  const { refreshQueuedCleanupInstruction, CLEANUP_INSTRUCTION, CLEANUP_SUPERSEDED } = await import("./cleanup-inbox.ts");
+  const f = await adoptedFixture();
+  const prepared = await prepareExternalFinalization(f.input, f.dependencies);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "waiting" } });
+  f.config.repository.tooling = { root: directory, revision: "b".repeat(40) };
+  f.config.repositories = { ...f.config.repositories, [f.config.repository.id]: f.config.repository };
+  const capability = async () => {
+    const revision = f.config.repository.tooling!.revision;
+    const receipt = { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
+      taskToolingRevision: "a".repeat(40), capabilityRevision: revision, checkout: `${directory}/${revision}`, instructions: `${directory}/${revision}/cleanup.md`, adapter: `${directory}/${revision}/src/cli.ts` };
+    const key = `task:${createHash("sha256").update(JSON.stringify(receipt)).digest("hex")}`;
+    if (!await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "tooling-capability", key } })) await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key, value: JSON.stringify(receipt) } });
+    return { receipt, instructions: `Reviewed capability ${revision}` };
+  };
+  const queued = await enqueueTaskCleanup({ ...f.context, requestKey: "original-external-cleanup" }, { capability });
+  const marker = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: CLEANUP_INSTRUCTION, key: queued.instructionId } });
+  const original = JSON.parse(marker.value!); expect(original.externalBinding).toBeDefined(); expect(original.contractRevision).toBeUndefined();
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { lte: marker.sequence } }, orderBy: { sequence: "asc" } });
+  const taskBefore = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } });
+  f.config.repository.tooling.revision = "c".repeat(40);
+  const runtime = createFakeAgentRuntime([{ id: "primary", cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
+  expect(await refreshQueuedCleanupInstruction({ prisma: db.prisma, config: f.config, runtime, receipt: { id: queued.instructionId, sessionId: "primary" } }, { capability })).toBe(false);
+  const successor = await db.prisma.runtimeInstruction.findFirstOrThrow({ where: { state: "queued" } });
+  const current = JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: CLEANUP_INSTRUCTION, key: successor.id } })).value!);
+  expect(current.externalBinding).toEqual(original.externalBinding);
+  expect({ ...current, capability: original.capability }).toEqual(original);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { lte: marker.sequence } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toEqual(taskBefore);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_SUPERSEDED } })).toBe(1);
+  expect(await prepareExternalFinalization({ ...f.input, authorityOnly: true }, f.dependencies)).toEqual(prepared);
+});
