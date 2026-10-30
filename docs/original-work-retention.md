@@ -272,3 +272,26 @@ authority refuses completion while preserving available material. An initially
 absent legacy entry cannot invent a saved-file proof. Paired disposable tests use
 the actual server plan, client dispatcher and native capture, including lost
 acknowledgment and retry without rerunning auth-show on missing credentials.
+
+## Task test authentication
+
+The Clerk adapter accepts the supported exact legacy test-instance descriptors,
+task-prefixed synthetic email and registered user/session relationship. It reads
+only the configured encrypted development credential backup and fixed key, pins
+their identity, and verifies the provider's instance is the recorded development
+instance. User creation time and email identity, and session creation time and
+user relationship, stay frozen through retries. The shared prepared authority is
+renewed after credential/provider reads immediately before each mutation.
+
+An exact registered session is revoked before its user is removed. A revoked or
+otherwise terminal session can remain as a provider record; confirmation proves
+authentication authority is inactive rather than claiming the record vanished.
+Provider denial or failed observation never counts as absence. A lost deletion
+acknowledgment is reconciled with a fresh instance and user observation.
+
+Local binding renewals also reject another active task or purpose claiming the
+same provider user/session, including IDs held in legacy metadata instead of the
+external-ID field. The shared pilot user and explicitly preserved identities do
+not become deletion targets. The actual DRA42 recorded preservation intent must
+be reconciled with its current owner-selected plan before live adoption; this
+adapter does not override it. Tests use disposable provider responses only.
