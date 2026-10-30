@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import type { Context } from "hono";
 import { routeLinearDelivery } from "../../services/tasks/routing.ts";
 import { completeLinearRouting } from "../../integrations/linear/webhooks/routing.ts";
+import { readDeliveryComment } from "../../integrations/linear/comment-context.ts";
 
 import { MAX_REQUEST_BYTES } from "../../../../lib/config.ts";
 import {
@@ -102,7 +103,8 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
         "linear.userId": record.type === "Issue"
           ? record.actor?.id
           : data.userId ?? data.user?.id,
-      }, record.type === "Issue" ? data.id : data.issueId ?? issueRoutingData.id);
+      }, record.type === "Issue" ? data.id : data.issueId ?? issueRoutingData.id,
+      record.type === "Comment" ? data.id : data.commentId ?? data.comment?.id);
       repository = routeWebhookRepository(config, webhookId, attributes);
     } catch (error) {
       // A valid delivery outside the owner's subscription is consumed without
@@ -125,6 +127,13 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
     }
     if (!forwarded && config.routing?.ingress) {
       try {
+        if (record.type !== "Issue" && !data.issueId && !data.issue?.id) {
+          const commentId = record.type === "Comment" ? data.id : data.commentId ?? data.comment?.id;
+          if (typeof commentId === "string") {
+            const source = await readDeliveryComment(scopedConfig.linearApiKey, commentId);
+            if (source?.issue) data.issue = source.issue;
+          }
+        }
         const queued = await routeLinearDelivery({ prisma, config, webhookId, connectionId: webhookConfig.connectionId, repositoryId: repository.id, deliveryId, webhook: record });
         return c.json({ accepted: true, placementId: queued.placement.id, deliveryId: queued.delivery.id, state: queued.delivery.state }, 202);
       } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }

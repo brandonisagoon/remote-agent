@@ -117,7 +117,7 @@ export async function continuePlanningSession(input: {
       if (!changed.count) throw new Error("Session changed during workflow preparation");
       await tx.runtimeInstruction.update({ where: { id: instructionId }, data: { state: "queued", detail: null } });
     });
-    void (input.wakeDelivery?.() ?? deliverInstructions(prisma, runtime)).catch(() => undefined);
+    void (input.wakeDelivery?.() ?? deliverInstructions(prisma, runtime, config)).catch(() => undefined);
     return result("delivered", `runtime_session:${session.id} continued from ${session.workflowId} to ${workflow.id}; execution queued in its existing worktree`);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);

@@ -1,5 +1,13 @@
 const EMOJI_ALIASES: Record<string, readonly string[]> = {
   pencil2: ["✏️", "✏"],
+  compass: ["🧭"],
+  hourglass_flowing_sand: ["⏳"],
+  eyes: ["👀"],
+  speech_balloon: ["💬"],
+  memo: ["📝"],
+  rocket: ["🚀"],
+  warning: ["⚠️", "⚠"],
+  x: ["❌"],
 };
 
 export function normalizeReactionEmoji(value: string): string {
@@ -12,9 +20,7 @@ export function matchesReactionEmoji(
 ): boolean {
   const expected = normalizeReactionEmoji(configured);
   if (normalizeReactionEmoji(raw) === expected) return true;
-  return (EMOJI_ALIASES[expected] ?? []).some(
-    (alias) => normalizeReactionEmoji(alias) === normalizeReactionEmoji(raw),
-  );
+  return reactionEmojiTokens(raw).includes(expected);
 }
 
 /** Every token a raw reaction can match in workflow conditions: the
@@ -23,9 +29,9 @@ export function reactionEmojiTokens(raw: string): string[] {
   const normalized = normalizeReactionEmoji(raw);
   const tokens = [normalized];
   for (const [name, aliases] of Object.entries(EMOJI_ALIASES)) {
-    if (aliases.some((alias) => normalizeReactionEmoji(alias) === normalized)) {
-      tokens.push(name);
+    if (normalized === name || aliases.some((alias) => normalizeReactionEmoji(alias) === normalized)) {
+      tokens.push(name, ...aliases.map(normalizeReactionEmoji));
     }
   }
-  return tokens;
+  return [...new Set(tokens)];
 }

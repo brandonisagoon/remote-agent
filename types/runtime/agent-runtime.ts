@@ -144,7 +144,10 @@ export interface AgentSessionRuntime {
     sessionId: string;
     text: string;
     requestId?: string;
+    sourceMessageId?: string;
   }): Promise<string>;
+  /** Optional native active-turn control. Unsupported adapters must say so. */
+  steer?(input: { sessionId: string; requestId: string; targetRequestId: string; text: string; beforeSend: () => Promise<boolean> }): Promise<{ status: "applied" | "idle" | "unsupported"; detail?: string }>;
   setMode(sessionId: string, mode: string): Promise<void>;
   setConfigOption(
     sessionId: string,

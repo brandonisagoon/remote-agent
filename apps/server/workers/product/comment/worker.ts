@@ -4,45 +4,34 @@ import {
   type Worker,
 } from "../../../../../types/dispatcher/index.ts";
 import { fetchCommentContext } from "../../../integrations/linear/comment-context.ts";
-import {
-  TrackerReaction,
-  reactToComment,
-} from "../../../integrations/linear/reactions.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
 import {
   registerThread,
   resolveQuestionThread,
 } from "../../../services/sessions/threads.ts";
-import { buildAgentMentionMessage, excerpt } from "./message.ts";
-import { selectOutcomeReactions } from "./reactions.ts";
+import { buildCommentMessage, excerpt } from "./message.ts";
 
-type MentionEvent = Extract<
+type CommentEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.TrackerCommentMentioned }
+  { type: typeof DispatchEventType.TrackerCommentReceived }
 >;
 
-export interface AgentMentionWorkerDependencies {
+export interface CommentWorkerDependencies {
   forward: typeof forwardMessage;
   fetchContext: typeof fetchCommentContext;
-  react: typeof reactToComment;
 }
 
-export function createAgentMentionWorker({
+export function createCommentWorker({
   forward = forwardMessage,
   fetchContext = fetchCommentContext,
-  react = reactToComment,
-}: Partial<AgentMentionWorkerDependencies> = {}): Worker<MentionEvent> {
+}: Partial<CommentWorkerDependencies> = {}): Worker<CommentEvent> {
   return {
-    key: "product.agent-mention",
-    supports(event): event is MentionEvent {
-      return event.type === DispatchEventType.TrackerCommentMentioned;
+    key: "product.comment",
+    supports(event): event is CommentEvent {
+      return event.type === DispatchEventType.TrackerCommentReceived;
     },
     async execute(event, context) {
       const data = event.webhook.data;
-
-      // Re-deliveries are harmless: duplicate reactions are best-effort and the
-      // Linear client intentionally swallows any duplicate-emoji rejection.
-      await react(context.config.linearApiKey, data.id, TrackerReaction.Received);
 
       const commentContext = await fetchContext(
         context.config.linearApiKey,
@@ -51,11 +40,6 @@ export function createAgentMentionWorker({
       const sourceIssueIdentifier =
         data.issue?.identifier ?? commentContext.sourceIssueIdentifier;
       if (!sourceIssueIdentifier) {
-        await react(
-          context.config.linearApiKey,
-          data.id,
-          TrackerReaction.Unrouted,
-        );
         return {
           status: "ignored",
           detail: "unresolved_source_issue",
@@ -97,7 +81,7 @@ export function createAgentMentionWorker({
       const routedSessionId = event.routedSessionId ?? null;
       const answersQuestion = event.threadRelationship === "question";
 
-      let message = buildAgentMentionMessage(
+      let message = buildCommentMessage(
         sourceIssueIdentifier,
         data.user?.name ?? null,
         data.body,
@@ -120,7 +104,7 @@ ${message}`;
         agentRuntime: context.agentRuntime!,
         sourceIssueIdentifier,
         workerContext: {
-          key: "product.agent-mention",
+          key: "product.comment",
           routingHint:
             "Prefer the Primary session whose current activity owns the Linear thread. Planning replies belong to the active planning or orchestrated-planning session; description-augmentation replies belong to the active describe-linear-issue session; otherwise prefer the only eligible Primary.",
         },
@@ -151,6 +135,7 @@ ${message}`;
             }
           : {}),
         message,
+        ...(event.sourceMessageId ? { sourceMessageId: event.sourceMessageId, requestId: event.sourceMessageId } : {}),
       });
 
       // Keep the registry current: successful deliveries own their thread,
@@ -173,8 +158,15 @@ ${message}`;
         }
       }
 
-      for (const reaction of selectOutcomeReactions(result)) {
-        await react(context.config.linearApiKey, data.id, reaction);
+      if (event.sourceMessageId && result.status === "delivered") {
+        await context.prisma.runtimeSourceMessage.update({ where: { id: event.sourceMessageId }, data: {
+          requestedActions: result.decision?.expectedActions ?? [], projectionPending: true,
+        } });
+      } else if (event.sourceMessageId) {
+        await context.prisma.runtimeSourceMessage.updateMany({ where: { id: event.sourceMessageId, state: "routing", sessionId: null }, data: {
+          state: "unrouted", detail: result.detail, projectionPending: true,
+          replyBody: "I couldn't identify an eligible owning session for this comment. No new task was started.",
+        } });
       }
 
       return {
@@ -186,4 +178,4 @@ ${message}`;
   };
 }
 
-export const agentMentionWorker = createAgentMentionWorker();
+export const commentWorker = createCommentWorker();

@@ -5,7 +5,7 @@ import type {
 } from "../../apps/server/integrations/tracker/index.ts";
 
 export const DispatchEventType = {
-  TrackerCommentMentioned: "tracker.comment.mentioned",
+  TrackerCommentReceived: "tracker.comment.received",
   /** A repository workflow's trigger matched an incoming event. */
   TrackerWorkflowTriggered: "tracker.workflow.triggered",
   TrackerIssueEndRequested: "tracker.issue.end-requested",
@@ -16,8 +16,9 @@ export type DispatchEventTypeValue =
 
 export type DispatchEvent =
   | {
-      type: typeof DispatchEventType.TrackerCommentMentioned;
+      type: typeof DispatchEventType.TrackerCommentReceived;
       webhook: TrackerCommentWebhook;
+      sourceMessageId?: string;
       /** Set when the comment's thread is registered to a session: delivery
           bypasses the semantic router. */
       routedSessionId?: string;

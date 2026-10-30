@@ -22,7 +22,7 @@ const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   mcpServers: [remoteAgentMcpServer()],
 });
 const acpIpcServer = await startAcpIpcServer({ config, runtime: agentRuntime });
-const stopInstructionDelivery = startInstructionDelivery(prisma, agentRuntime);
+const stopInstructionDelivery = startInstructionDelivery(prisma, agentRuntime, config);
 // Drains the lifecycle journal into Linear (mirror state, checkpoint
 // comments) and prunes it; without this the journal grows unbounded.
 const stopProjection = startRuntimeEventProjection({

@@ -8,13 +8,12 @@ import {
   type DispatchEvent,
 } from "../../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../../test-support/config.ts";
-import { TrackerReaction } from "../../../integrations/tracker/index.ts";
 import type { ForwardMessageOptions } from "../../../services/messages/index.ts";
-import { createAgentMentionWorker } from "./worker.ts";
+import { createCommentWorker } from "./worker.ts";
 
 type MentionEvent = Extract<
   DispatchEvent,
-  { type: typeof DispatchEventType.TrackerCommentMentioned }
+  { type: typeof DispatchEventType.TrackerCommentReceived }
 >;
 
 function event(
@@ -22,7 +21,7 @@ function event(
   routed: { routedSessionId?: string; threadRelationship?: "thread" | "question" } = {},
 ): MentionEvent {
   return {
-    type: DispatchEventType.TrackerCommentMentioned,
+    type: DispatchEventType.TrackerCommentReceived,
     ...routed,
     webhook: {
       type: "Comment" as const,
@@ -68,11 +67,10 @@ function delivered(): MessageDispatchResult {
   };
 }
 
-describe("createAgentMentionWorker", () => {
-  test("acknowledges receipt, forwards nested reply context, then reacts to the outcome", async () => {
-    const reactions: string[] = [];
+describe("createCommentWorker", () => {
+  test("forwards nested reply context; the shared delivery projection owns reactions", async () => {
     const forwarded: ForwardMessageOptions[] = [];
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -83,10 +81,6 @@ describe("createAgentMentionWorker", () => {
         forwarded.push(options);
         return delivered();
       },
-      react: async (_key, _commentId, reaction) => {
-        reactions.push(reaction);
-        return true;
-      },
     });
 
     const result = await worker.execute(event(), context());
@@ -96,12 +90,6 @@ describe("createAgentMentionWorker", () => {
       detail: "actions:reply,code_change reply_to:thread-root",
       targetResourceId: "AGENT-9",
     });
-    expect(reactions).toEqual([
-      TrackerReaction.Received,
-      TrackerReaction.Delivered,
-      TrackerReaction.Reply,
-      TrackerReaction.CodeChange,
-    ]);
     expect(forwarded[0]?.replyContext).toEqual({
       threadRootCommentId: "thread-root",
       targets: [
@@ -121,9 +109,9 @@ describe("createAgentMentionWorker", () => {
     });
   });
 
-  test("uses the source comment as the thread root for top-level mentions", async () => {
+  test("uses the source comment as the thread root for top-level comments", async () => {
     let replyContext: unknown;
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -134,7 +122,6 @@ describe("createAgentMentionWorker", () => {
         replyContext = options.replyContext;
         return delivered();
       },
-      react: async () => true,
     });
 
     await worker.execute(event(null), context());
@@ -153,11 +140,10 @@ describe("createAgentMentionWorker", () => {
   });
 
   test("warns and stops when the source issue cannot be resolved", async () => {
-    const reactions: string[] = [];
     let forwarded = false;
     const unresolved = event();
     unresolved.webhook.data.issue = null;
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: null,
         quotedText: null,
@@ -167,10 +153,6 @@ describe("createAgentMentionWorker", () => {
       forward: async () => {
         forwarded = true;
         return delivered();
-      },
-      react: async (_key, _commentId, reaction) => {
-        reactions.push(reaction);
-        return true;
       },
     });
 
@@ -182,12 +164,10 @@ describe("createAgentMentionWorker", () => {
       targetResourceId: null,
     });
     expect(forwarded).toBeFalse();
-    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Unrouted]);
   });
 
   test("warns after a no-candidate routing outcome", async () => {
-    const reactions: string[] = [];
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -200,20 +180,14 @@ describe("createAgentMentionWorker", () => {
         targetResourceId: null,
         decision: null,
       }),
-      react: async (_key, _commentId, reaction) => {
-        reactions.push(reaction);
-        return true;
-      },
     });
 
     await worker.execute(event(), context());
 
-    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Unrouted]);
   });
 
-  test("marks a delivery failure after acknowledging receipt", async () => {
-    const reactions: string[] = [];
-    const worker = createAgentMentionWorker({
+  test("records a delivery failure without rendering lifecycle reactions", async () => {
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -226,20 +200,15 @@ describe("createAgentMentionWorker", () => {
         targetResourceId: "AGENT-9",
         decision: null,
       }),
-      react: async (_key, _commentId, reaction) => {
-        reactions.push(reaction);
-        return true;
-      },
     });
 
     await worker.execute(event(), context());
 
-    expect(reactions).toEqual([TrackerReaction.Received, TrackerReaction.Failed]);
   });
 
   test("registered threads route deterministically without the semantic router", async () => {
     const forwarded: ForwardMessageOptions[] = [];
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -250,7 +219,6 @@ describe("createAgentMentionWorker", () => {
         forwarded.push(options);
         return delivered();
       },
-      react: async () => true,
     });
 
     await worker.execute(
@@ -264,7 +232,7 @@ describe("createAgentMentionWorker", () => {
       sourceIssueIdentifier: "CUBE-2827",
       sourceIssue: null,
       comment: "ship it",
-      workerContext: { key: "product.agent-mention", routingHint: "" },
+      workerContext: { key: "product.comment", routingHint: "" },
       candidates: [
         {
           agentIssueId: "runtime-9",
@@ -296,7 +264,7 @@ describe("createAgentMentionWorker", () => {
 
   test("question-thread replies are framed as answers", async () => {
     const forwarded: ForwardMessageOptions[] = [];
-    const worker = createAgentMentionWorker({
+    const worker = createCommentWorker({
       fetchContext: async () => ({
         sourceIssueIdentifier: "CUBE-2827",
         quotedText: null,
@@ -307,7 +275,6 @@ describe("createAgentMentionWorker", () => {
         forwarded.push(options);
         return delivered();
       },
-      react: async () => true,
     });
 
     await worker.execute(

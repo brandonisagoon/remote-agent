@@ -1,6 +1,15 @@
 import type { LinearCredential } from "../../../../lib/linear-auth.ts";
 import { linearGraphql } from "./client.ts";
 
+/** Canonical source for comment controls and document-anchored comments. */
+export async function readDeliveryComment(credential: LinearCredential, id: string) {
+  type Issue = { id: string; identifier: string; title?: string };
+  const data = await linearGraphql<{ comment: { id: string; body: string; parentId: string | null;
+    user: { id: string } | null; issue: Issue | null; documentContent: { issue: Issue | null } | null } | null }>(credential,
+    "query DeliveryComment($id: String!) { comment(id: $id) { id body parentId user { id } issue { id identifier title } documentContent { issue { id identifier title } } } }", { id });
+  return data.comment ? { ...data.comment, issue: data.comment.issue ?? data.comment.documentContent?.issue ?? null } : null;
+}
+
 const COMMENT_CONTEXT = `
   query CommentContext($id: String!) {
     comment(id: $id) {

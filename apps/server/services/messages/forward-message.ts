@@ -29,6 +29,7 @@ export interface ForwardMessageOptions {
   sourceIssueIdentifier: string;
   message: string;
   requestId?: string;
+  sourceMessageId?: string;
   workerContext: RoutingInput["workerContext"];
   replyContext?: ReplyContext;
   finalizeMessage?: (
@@ -147,7 +148,7 @@ async function route(
   const baseMessage = options.finalizeMessage
     ? await options.finalizeMessage(fresh)
     : options.message;
-  const message = normalized.replyRequested && options.replyContext
+  const message = normalized.replyRequested && options.replyContext && !options.sourceMessageId
     ? `${baseMessage}\n\n${buildReplyDirective(
         options.sourceIssueIdentifier,
         options.replyContext.threadRootCommentId,
@@ -157,6 +158,7 @@ async function route(
     await options.agentRuntime.enqueue({
       sessionId: session.id,
       text: message,
+      ...(options.sourceMessageId ? { sourceMessageId: options.sourceMessageId } : {}),
       ...(options.requestId ? { requestId: options.requestId } : {}),
     });
   } catch (error) {

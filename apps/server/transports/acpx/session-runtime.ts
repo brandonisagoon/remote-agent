@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { assertTaskOpen } from "../../services/tasks/task-state.ts";
 import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
 import { TurnCapacity } from "../../services/sessions/turn-capacity.ts";
+import { recordSourceLifecycle } from "../../services/sessions/source-messages.ts";
 
 import type {
   AcpRuntimeEvent,
@@ -432,18 +433,14 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         const handle = await this.handleFor(session);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
         await assertTaskOpen(this.prisma, session.cwd);
-        if (input.beforeStart && !(await input.beforeStart())) throw new Error("Instruction was already claimed or cancelled");
+        if (input.beforeStart && !(await input.beforeStart())) {
+          completion.resolve({ status: "cancelled", stopReason: "instruction-not-claimed" });
+          queue.close();
+          return;
+        }
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
-        });
-        await this.emitLifecycle({
-          kind: "turn",
-          id: `${requestId}:started`,
-          sessionId: session.id,
-          requestId,
-          createdAt: Date.now(),
-          phase: "started",
         });
         await assertTaskOpen(this.prisma, session.cwd);
         current = this.runtimeFor(session.id).startTurn({
@@ -478,6 +475,15 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         waitingForSession.delete(waiting);
         let index = 0;
         try {
+          await current.promptStarted;
+          await this.emitLifecycle({
+            kind: "turn",
+            id: `${requestId}:started`,
+            sessionId: session.id,
+            requestId,
+            createdAt: Date.now(),
+            phase: "started",
+          });
           for await (const event of current.events) {
             for (const update of await this.toAcpUpdates(session.id, handle, event)) {
               const projected: AgentRuntimeEvent = {
@@ -586,12 +592,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     sessionId: string;
     text: string;
     requestId?: string;
+    sourceMessageId?: string;
   }): Promise<string> {
     const session = await this.requireSession(input.sessionId);
     if (session.status === "closed") throw new Error("Session is closed");
-    const receipt = await queueInstruction(this.prisma, input);
-    void deliverInstructions(this.prisma, this).catch(() => undefined);
+    // A fallback router can race its recovery pass. Claim source ownership
+    // with the instruction so a losing route cannot publish false failure.
+    const receipt = await this.prisma.$transaction((tx) => queueInstruction(tx, input));
+    void deliverInstructions(this.prisma, this, this.config).catch(() => undefined);
     return receipt.id;
+  }
+
+  async steer(_input: { sessionId: string; requestId: string; targetRequestId: string; text: string; beforeSend: () => Promise<boolean> }) {
+    // acpx 0.13.2 forwards mode=steer but its manager never interprets it.
+    // Starting a concurrent prompt would create a second provider writer.
+    return { status: "unsupported" as const, detail: "Installed acpx has no confirmed native active-turn steering capability; this comment remains queued." };
   }
 
   async setMode(sessionId: string, mode: string): Promise<void> {
@@ -888,7 +903,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       const output = (await this.output(event.sessionId))?.trim() ?? "";
       event = { ...event, output: output.length > 8000 ? `…${output.slice(-8000)}` : output };
     }
-    await this.emit(await appendRuntimeLifecycleEvent(this.prisma, event));
+    const saved = await appendRuntimeLifecycleEvent(this.prisma, event);
+    await recordSourceLifecycle(this.prisma, saved);
+    await this.emit(saved);
   }
 }
 

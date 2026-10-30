@@ -79,7 +79,7 @@ function routingInput(
     },
     comment: "@agent yes always",
     workerContext: {
-      key: "product.agent-mention",
+      key: "product.comment",
       routingHint: "Prefer the only eligible Primary.",
     },
     candidates,

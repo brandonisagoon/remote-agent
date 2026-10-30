@@ -101,10 +101,13 @@ export async function createThreadedIssueComment(
 }
 
 /** Reconcile a client-assigned comment ID after an uncertain create response. */
-export async function fetchIssueCommentIdentity(apiKey: LinearCredential, commentId: string): Promise<{ id: string; body: string; issue: { id: string } | null } | null> {
-  const data = await linearGraphql<{ comment: { id: string; body: string; issue: { id: string } | null } | null }>(apiKey,
-    "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body issue { id } } }", { commentId });
-  return data.comment;
+export async function fetchIssueCommentIdentity(apiKey: LinearCredential, commentId: string): Promise<{ id: string; body: string; parentId?: string | null; issue: { id: string } | null } | null> {
+  const data = await linearGraphql<{ comment: { id: string; body: string; parentId?: string | null; issue: { id: string } | null;
+    documentContent?: { issue: { id: string } | null } | null } | null }>(apiKey,
+    "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body parentId issue { id } documentContent { issue { id } } } }", { commentId });
+  // Description-anchored threads are attached through documentContent. Use
+  // the same issue identity for ingress, context and outbox reconciliation.
+  return data.comment ? { ...data.comment, issue: data.comment.issue ?? data.comment.documentContent?.issue ?? null } : null;
 }
 
 export async function updateIssueComment(

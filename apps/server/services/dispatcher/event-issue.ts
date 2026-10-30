@@ -5,7 +5,7 @@ import {
 
 export function eventIssueId(event: DispatchEvent): string | null {
   switch (event.type) {
-    case DispatchEventType.TrackerCommentMentioned:
+    case DispatchEventType.TrackerCommentReceived:
       return event.webhook.data.issueId ?? event.webhook.data.issue?.id ?? null;
     case DispatchEventType.TrackerWorkflowTriggered: {
       // Reaction payloads reference an issue; issue payloads are one.
