@@ -1,6 +1,8 @@
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { RetirementGrant } from "./retirement-receipts.ts";
+import { assertExternalBindingAuthority, latestExternalBinding } from "./external-deliveries.ts";
+import { ExternalBinding } from "./external-delivery-schema.ts";
 
 /** Scheduling hint only. First preparation still independently proves the
  * accepted delivery, exact Git identity and retention before any effect. */
@@ -20,6 +22,12 @@ export async function cleanupCandidates(prisma: PrismaClient, config: ServerConf
       || !links.some(link => link.runtimeSessionId === session.id && link.connectionId === task.connectionId && link.externalId === task.issueIdentifier)) continue;
     const latest = (action: string) => events.find(event => event.runtimeSessionId === session.id && event.source === `owner:${task.id}` && event.action === action);
     try {
+      const adopted = await latestExternalBinding(prisma, task.id, session.id);
+      if (adopted) {
+        await assertExternalBindingAuthority(prisma, config, ExternalBinding.parse(JSON.parse(adopted.value!)), adopted.sequence);
+        result.add(task.id);
+        continue;
+      }
       const contract = latest("completion-contract"), value = JSON.parse(contract?.value ?? "null");
       if (!contract || value?.boundary !== "merge") continue;
       const verification = JSON.parse(latest("completion-verification")?.value ?? "null");

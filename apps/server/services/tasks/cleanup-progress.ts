@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
-import { assertPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { assertPreparedCleanup, cleanupRetainedResourceIds } from "./cleanup-lifecycle.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 
 export const CLEANUP_PROGRESS = "finalization-cleanup-progress";
@@ -30,8 +30,7 @@ export async function recordCleanupProgress(input: { prisma: PrismaClient; confi
     if (request.operationRevision !== active.operationRevision || request.operationDigest !== retirementDigest(active.operation)) throw new Error("Cleanup progress operation changed");
     const known = new Set(active.binding.resources.map(resource => resource.key));
     if (new Set(request.outcomes.map(outcome => outcome.key)).size !== request.outcomes.length || request.outcomes.some(outcome => !known.has(outcome.key))) throw new Error("Cleanup progress names an unknown or duplicate resource");
-    const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
-    const retained = await retainedArchiveResourceIds(tx, input.config, active.prepared);
+    const retained = await cleanupRetainedResourceIds(tx, input.config, active);
     const value = CleanupProgress.parse({ operationRevision: active.operationRevision, operationDigest: request.operationDigest,
       resources: active.binding.resources.map(resource => {
         const reported = request.outcomes.find(outcome => outcome.key === resource.key);

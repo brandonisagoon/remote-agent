@@ -1,3 +1,5 @@
+import { hasCleanupAdapter, hasHistoricalCleanupAdapter } from "./cleanup-adapter-resources.ts";
+import { resolveCleanupObserver } from "./cleanup-resource-observer.ts";
 import { prepareOriginalWork, assertOriginalWork, originalWorkRetainedPlans } from "./original-work.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -10,11 +12,13 @@ import { CompletionContractInput } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { EXTERNAL_BINDING, EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryBindingInput, ExternalTaskIdentity, externalDigest } from "./external-delivery-schema.ts";
 import { externalDeliveryObservation, observeExternalDeliveries } from "./external-delivery-observation.ts";
+import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { assertFinalizationResources, assertFinalizationPlanPurposes, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
-export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
+export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource"> & Partial<Pick<PrismaClient, "runtimeInstruction">>;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
+  delivered: observeDeliveredScope, cleanupObserver: resolveCleanupObserver,
   handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
@@ -26,18 +30,23 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition === "retire-owned" && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
-export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string) {
+export async function externalTaskOwnership(prisma: ExternalDatabase, config: ServerConfig, taskId: string, options: { allowConfirmedClosed?: boolean } = {}) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!session || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase === "closed" || !task.worktreePath || !task.connectionId || !task.issueIdentifier || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== config.machine) throw new Error("External delivery requires the open original primary and unchanged task ownership");
+  if (!session || session.role !== "primary" || !options.allowConfirmedClosed && (session.status === "closed" || task.phase === "closed") || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== config.machine) throw new Error("External delivery requires the open original primary and unchanged task ownership");
   getRepositoryConfig(config, task.repositoryId);
-  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", endedAt: null } });
+  const closed = session.status === "closed" || task.phase === "closed";
+  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(options.allowConfirmedClosed && closed ? {} : { endedAt: null }) } });
   if (!link) throw new Error("External delivery source ownership changed");
   const identity = ExternalTaskIdentity.parse({ taskId: task.id, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, taskWorktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
+  return { task, session, identity };
+}
+export async function externalTaskAuthority(prisma: ExternalDatabase, config: ServerConfig, taskId: string, options: { allowConfirmedClosed?: boolean } = {}) {
+  const { task, session, identity } = await externalTaskOwnership(prisma, config, taskId, options);
   const where = { runtimeSessionId: session.id, source: `owner:${task.id}` };
   const contractEvent = await prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: "completion-contract" }, orderBy: { sequence: "desc" } });
   if (!contractEvent) throw new Error("External delivery has no owner completion contract");
@@ -74,12 +83,30 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
   return { event, approval, config };
 }
 
-export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number) {
-  const current = await externalTaskAuthority(prisma, config, binding.identity.taskId);
+export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
+  const { assertPreservationSources } = await import("./cleanup-preservation.ts");
+  await assertPreservationSources(prisma, binding.identity.taskId, binding.identity.sessionId, binding.resources);
+  const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
+  await assertRegisteredCaptureSharing(prisma, binding.identity.taskId, binding.resources);
+  // Historical approvals must also honor a later explicit revocation. The
+  // present-day branch below binds the complete owner-history revision.
+  if (binding.version === 1 && await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: binding.identity.sessionId, source: `owner:${binding.identity.taskId}`, action: "delivered-retirement-revoked", sequence: { gt: revision } } })) throw new Error("External cleanup was explicitly revoked after this binding");
+  if (binding.version === 2) {
+    const current = await externalTaskOwnership(prisma, config, binding.identity.taskId, options);
+    const event = await latestExternalBinding(prisma, current.task.id, current.session.id);
+    if (externalDigest(current.identity) !== externalDigest(binding.identity) || event?.sequence !== revision || event.value !== JSON.stringify(binding) || await externalOwnerHistory(prisma, current.task.id, current.session.id) !== binding.ownerHistoryRevision) throw new Error("Present-day retirement task, binding or owner authority changed");
+    return { ...current, contract: null };
+  }
+  const current = await externalTaskAuthority(prisma, config, binding.identity.taskId, options);
   if (externalDigest(current.identity) !== externalDigest(binding.identity) || current.contractEvent.sequence !== binding.contractRevision || externalDigest(current.contract) !== binding.contractDigest || current.verification.sequence !== binding.verificationRevision || current.binding?.sequence !== revision || current.binding.value !== JSON.stringify(binding)) throw new Error("External delivery task, binding, contract or verification authority changed");
   const approval = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: binding.acceptance.approvalEventSequence } });
   if (!approval || externalDigest(JSON.parse(approval.value!)) !== binding.acceptance.approvalDigest) throw new Error("External acceptance provenance changed");
   return current;
+}
+
+export async function externalOwnerHistory(prisma: Pick<PrismaClient, "runtimeMetadataEvent">, taskId: string, sessionId: string) {
+  const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `owner:${taskId}`, action: { in: ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "delivered-retirement-revoked"] } }, orderBy: { sequence: "desc" } });
+  return latest?.sequence ?? 0;
 }
 
 async function checkComment(input: Context, sessionId: string, bindingInput: ExternalDeliveryBindingInput, dependencies: ExternalDependencies) {
@@ -117,10 +144,26 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
-  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const { preparePreservationEvidence, assertPreservationSources } = await import("./cleanup-preservation.ts");
+  const preservation = await preparePreservationEvidence({ prisma: input.prisma, taskId: input.taskId, sessionId: current.session.id, resources, plan: retainedArchives, selection: manifest.ownership.preservation });
+  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
+    ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
+  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(preservation ? { preservation } : {}), ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
+  await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
-    for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") {
+    for (const entry of plan) {
+      if (entry.disposition === "retire-file") {
+        for (const file of [entry.target.path, entry.target.quarantine.directory]) if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(file, archive.root)) || overlaps(file, originalWork.target.path)) throw new Error("Standalone file capture must stay outside original-work archives and capture");
+        continue;
+      }
+      if (entry.disposition === "retire-browser" && entry.capture.type === "standalone") {
+        const root = entry.capture.target.path;
+        if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Browser capture must stay outside original-work archives and capture");
+        continue;
+      }
+      if (entry.disposition !== "retire-tree" && entry.disposition !== "retire-worktree" && entry.disposition !== "retire-owned" || entry.target.type !== "tree") continue;
       const root = entry.target.path;
       if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some((archive) => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Archive and original-work capture must stay outside every other cleanup root");
     }
@@ -145,6 +188,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
     if (externalDigest(latest.identity) !== externalDigest(current.identity) || latest.contractEvent.sequence !== current.contractEvent.sequence || latest.verification.sequence !== current.verification.sequence || (latest.binding?.sequence ?? 0) !== manifest.expectedBindingRevision) throw new Error("External delivery authority changed during adoption");
     if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: current.session.id, source: `finalizer:${input.taskId}`, action: "finalization-prepared" } })) throw new Error("Finalization was prepared during external adoption");
     assertExternalResourceRecords(await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, false);
+    await assertPreservationSources(tx, input.taskId, current.session.id, plan);
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey, value: JSON.stringify(binding) } });
     return { revision: event.sequence, binding };
   });
@@ -152,14 +196,34 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
 
 /** Revalidates owner comment and exact remote identity even after source roots
  * have been retired. Frozen reports are not reread from a removed directory. */
-export async function observeBoundExternalDelivery(input: Context & { revision: number; binding: ExternalBinding; sources: boolean }, dependencies = externalBindingDependencies) {
+export async function observeBoundExternalDelivery(input: Context & { revision: number; binding: ExternalBinding; sources: boolean; acceptedCleanup?: true }, dependencies = externalBindingDependencies) {
   const authority = await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
-  const checked = await checkComment(input, input.binding.identity.sessionId, input.binding.input, dependencies);
-  if (externalDigest(checked.acceptance) !== externalDigest(input.binding.acceptance)) throw new Error("Accepted owner comment changed since external adoption");
+  if (input.binding.version === 2) {
+    const observations = [];
+    for (const frozen of input.binding.deliveries) {
+      const delivery = input.binding.input.deliveries.find(entry => entry.id === frozen.id)!;
+      const observed = await dependencies.delivered(delivery);
+      if (observed.mergeCommit !== frozen.mergeCommit || observed.mergedAt !== frozen.mergedAt || externalDigest(observed.checks) !== externalDigest(frozen.checks)) throw new Error("Delivered retirement provider evidence changed");
+      observations.push(observed);
+    }
+    await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
+    return observations;
+  }
+  if (input.acceptedCleanup) {
+    // The server's accepted cleanup path retains the frozen comment proof and
+    // revalidates its local owner/workflow lineage. Linear availability is not
+    // a recurring cleanup gate; explicit local revocation still applies above.
+    const lineage = await approvalLineage(input, input.binding.identity.sessionId, input.binding.acceptance.approvalEventSequence);
+    if (externalDigest(JSON.parse(lineage.event.value!)) !== input.binding.acceptance.approvalDigest || lineage.approval.actorId !== input.binding.acceptance.actorId
+      || lineage.approval.issueId !== input.binding.acceptance.issueId || lineage.approval.organizationId && lineage.approval.organizationId !== input.binding.acceptance.organizationId) throw new Error("Accepted external comment provenance changed");
+  } else {
+    const checked = await checkComment(input, input.binding.identity.sessionId, input.binding.input, dependencies);
+    if (externalDigest(checked.acceptance) !== externalDigest(input.binding.acceptance)) throw new Error("Accepted owner comment changed since external adoption");
+  }
   const observations = [];
   for (const frozen of input.binding.deliveries) {
     const delivery = input.binding.input.deliveries.find((entry) => entry.id === frozen.id)!;
-    const remote = await dependencies.observer.remote(delivery, authority.contract.reviewRequired === true);
+    const remote = await dependencies.observer.remote(delivery, authority.contract?.reviewRequired === true);
     if (remote.mergeCommit !== frozen.mergeCommit || remote.mergedAt !== frozen.mergedAt || externalDigest(remote.ci) !== externalDigest(frozen.ci)) throw new Error("External merge or CI evidence changed since adoption");
     if (input.sources && (externalDigest(await dependencies.observer.source(delivery)) !== externalDigest(frozen.snapshot) || externalDigest(await dependencies.observer.reports(delivery)) !== externalDigest(frozen.reports))) throw new Error("External source or accepted report changed since adoption");
     observations.push({ ...frozen, ...remote });

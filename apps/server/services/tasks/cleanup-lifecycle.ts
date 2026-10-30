@@ -8,6 +8,8 @@ import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization } f
 import { RetirementBinding, RetirementGrant, retirementDigest } from "./retirement-receipts.ts";
 import { normalizeRetirementPreviewTransition } from "./retirement-preview.ts";
 import { DoneRetirementGrant } from "./delivered-retirement.ts";
+import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts";
+import type { PreparedExternalFinalization } from "./external-finalization-schema.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeMetadataEvent">;
@@ -51,6 +53,20 @@ async function current(input: Context, allowConfirmedClosed = false) {
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });
   if (!preparation?.value || preparation.key !== input.requestKey) throw new Error("Cleanup requires the exact existing preparation");
   const raw = JSON.parse(preparation.value);
+  if (raw.version === 2) {
+    const external = await inspectExternalCleanupAuthority({ ...input, allowConfirmedClosed });
+    const resources = (await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id }, orderBy: { id: "asc" } })).map(resource => Resource.parse({
+      id: resource.id, key: resource.key, kind: resource.kind, purpose: resource.purpose, externalId: resource.externalId, state: resource.state,
+      expiresAt: resource.expiresAt?.toISOString() ?? null, metadata: stableMetadata(resource.metadata),
+    }));
+    const binding = CleanupBinding.parse({ taskId: task.id, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId,
+      connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, worktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit,
+      toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot, repositoryRoot: getRepositoryConfig(input.config, task.repositoryId).root,
+      preparedRevision: preparation.sequence, preparedDigest: sha(preparation.value), resources,
+      authority: external.authorityEvents.map(event => ({ revision: event.sequence, source: event.source, action: event.action, key: event.key, digest: sha(event.value ?? "") })),
+    });
+    return { kind: "v2" as const, ...external, binding, retirementSupplement: undefined };
+  }
   if (raw.version !== undefined) throw new Error("Prepared lifecycle currently requires version 1 preparation");
   const prepared = PreparedFinalization.parse(raw);
   if (allowConfirmedClosed) {
@@ -100,7 +116,7 @@ async function current(input: Context, allowConfirmedClosed = false) {
     assertResources(resources, saved.resources);
     if ("preparedRevision" in grant && (grant.preparedRevision !== preparation.sequence || grant.preparedDigest !== binding.preparedDigest)) throw new Error("Cleanup Done supplement preparation changed");
   }
-  return { task, prepared, preparation, binding, retirementSupplement: done ? { revision: done.sequence, digest: retirementDigest(JSON.parse(done.value!)) } : undefined };
+  return { kind: "v1" as const, task, prepared, preparation, binding, retirementSupplement: done ? { revision: done.sequence, digest: retirementDigest(JSON.parse(done.value!)) } : undefined };
 }
 
 function assertResources(current: z.infer<typeof Resource>[], expected: z.infer<typeof Resource>[]) {
@@ -149,11 +165,18 @@ export async function assertCompletedCleanup(input: Context) {
   return localSnapshot(input, async scope => {
     const active = await activeOperation(scope, true);
     const confirmed = await scope.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: scope.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: scope.requestKey } });
-    const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
-    const retained = await retainedArchiveResourceIds(scope.prisma, scope.config, active.prepared);
+    const retained = await cleanupRetainedResourceIds(scope.prisma, scope.config, active);
     if (active.binding.resources.some(resource => ["development", "browser", "review"].includes(resource.purpose) && resource.state !== "released" && !retained.has(resource.id))) throw new Error("Cleanup reporting has unresolved required resources");
     return { ...active, confirmed };
   });
+}
+
+/** Accepted v2 plan dispositions and v1 archive proofs remain distinct. Neither
+ * a registry Released flag nor a reported adapter result creates a proof. */
+export async function cleanupRetainedResourceIds(prisma: Database, config: ServerConfig, active: Awaited<ReturnType<typeof current>>) {
+  if (active.kind === "v2") return active.retainedResourceIds;
+  const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
+  return retainedArchiveResourceIds(prisma, config, active.prepared);
 }
 
 /** Registry writes cannot expand an active operation or resurrect a released
@@ -180,7 +203,7 @@ export async function assertCleanupResourceUpdate(input: { prisma: Database; con
 /** A genuine persisted preparation is sufficient authority. The caller makes
  * bounded filesystem/retention observations outside SQL, then this CAS binds
  * their exact local epoch. It never replaces a prior operation to bypass drift. */
-export async function bindPreparedCleanup(input: Omit<Context, "prisma"> & { prisma: PrismaClient }, observe: (prepared: PreparedFinalization, revision: number) => Promise<void>) {
+export async function bindPreparedCleanup(input: Omit<Context, "prisma"> & { prisma: PrismaClient }, observe: (prepared: PreparedFinalization | PreparedExternalFinalization, revision: number) => Promise<void>) {
   const initial = await current(input);
   const automatic = await automaticCleanupTurn(inboxStore(input.prisma), initial.task, false, input.runtime);
   const where = operationWhere(initial.task.id, input.sessionId, input.requestKey);

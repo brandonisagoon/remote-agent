@@ -1,0 +1,54 @@
+import { afterEach, expect, test } from "bun:test";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { assertLinkedPathsIdle, assertLinkedRootIdle, assertRootHandleInventory } from "./cleanup-open-handles.ts";
+const roots: string[] = [];
+afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+const record = (name: string, fd = "cwd", type = "DIR") => Buffer.from(`p123\0f${fd}\0t${type}\0n${name}\0\n`);
+test.each(["/private/task", "/private/task/file with spaces", "/private/task/file\nwith newline", "/private/task (deleted)"])("exact open handle refuses %s without pathname tokenization", file => {
+  expect(() => assertRootHandleInventory("/private/task", record(file))).toThrow("still holds");
+});
+test("unrelated paths and non-filesystem handles do not invent a root match", () => {
+  assertRootHandleInventory("/private/task", Buffer.concat([record("/private/task-other"), record("0x123 -> 0x456", "5", "PIPE")]));
+});
+test.each(["NPOLICY", "NEXUS", "PIPE"])("a nameless %s kernel descriptor does not hide filesystem handles", type => {
+  const kernel = Buffer.from(`p123\0f5\0t${type}\0\n`);
+  assertRootHandleInventory("/private/task", kernel);
+  expect(() => assertRootHandleInventory("/private/task", Buffer.concat([kernel, record("/private/task", "6")]))).toThrow("still holds");
+});
+test.each(["DIR", "REG", "FIFO", "UNKN", "NEW-TYPE"])("a nameless %s handle fails closed", type => {
+  expect(() => assertRootHandleInventory("/private/task", Buffer.from(`p123\0f5\0t${type}\0\n`))).toThrow();
+});
+test.each(["", "p1\0", "p1\0fcwd\0tDIR\0nunknown\0", "p1\0fcwd\0n/private/elsewhere\0", "p1\0f3\0tunknown\0nunknown\0", "p1\0xunexpected\0"])("unknown or incomplete handle inventory fails closed", value => {
+  expect(() => assertRootHandleInventory("/private/task", Buffer.from(value))).toThrow();
+});
+test.each(["timeout", "diagnostic", "empty", "malformed", "command"])("an uncertain %s observation cannot become absence", async failure => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "handle-observer-"))); roots.push(root);
+  const result = { exitCode: 0, stdout: record("/outside"), stderr: Buffer.alloc(0) };
+  await expect(assertLinkedRootIdle(root, args => args[0] === "ps" ? { ...result, stdout: Buffer.from(failure === "command" ? `123 bun ${root}/server.ts\n` : "123 unrelated\n") }
+    : { ...result, ...(failure === "timeout" ? { exitCode: null, signalCode: "SIGKILL" } : failure === "diagnostic" ? { stderr: Buffer.from("partial data") } : failure === "empty" ? { stdout: Buffer.alloc(0) } : failure === "malformed" ? { stdout: Buffer.from("partial") } : {}) })).rejects.toThrow();
+});
+test("actual disposable cwd writer is refused without walking a dependency tree", async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "handle-live-fixture-"))); roots.push(root);
+  const program = path.join(root, "idle.ts"); await writeFile(program, 'console.log("ready"); setTimeout(() => {}, 30000);\n');
+  const child = Bun.spawn([process.execPath, "--no-env-file", "idle.ts"], { cwd: root, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const reader = child.stdout.getReader(); await reader.read(); await reader.cancel();
+  // Keep real kernel descriptor/path observation, scoped to this disposable
+  // writer. Unrelated CI processes may correctly make the global scan unknown.
+  const observeWriter = (args: string[]) => Bun.spawnSync(args[0] === "lsof" ? [...args, "-a", "-p", String(child.pid)] : args,
+    { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000, maxBuffer: 8 * 1024 * 1024 });
+  try { await expect(assertLinkedRootIdle(root, observeWriter)).rejects.toThrow("still holds"); }
+  finally { child.kill(9); await child.exited; }
+  const gone = observeWriter(["lsof", "-nP", "-F0pftn"]);
+  expect(gone.exitCode).toBe(1); expect(gone.stdout.length).toBe(0); expect(gone.stderr.length).toBe(0);
+}, 20_000);
+
+test("one complete handle snapshot covers every selected exact file", async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "handles-batch-"))); roots.push(root);
+  const files = [path.join(root, "one"), path.join(root, "two")], calls: string[] = [];
+  const run = (args: string[]) => { calls.push(args[0]!); return { exitCode: 0, stdout: args[0] === "ps" ? Buffer.from("123 unrelated\n") : record("/outside"), stderr: Buffer.alloc(0) }; };
+  await assertLinkedPathsIdle(files, run); expect(calls).toEqual(["ps", "lsof"]);
+  await expect(assertLinkedPathsIdle(files, args => ({ ...run(args), ...(args[0] === "lsof" ? { stdout: record(files[1]!, "7", "REG") } : {}) }))).rejects.toThrow("still holds");
+  await expect(assertLinkedPathsIdle(files, args => ({ ...run(args), ...(args[0] === "lsof" ? { stdout: Buffer.from("partial") } : {}) }))).rejects.toThrow("incomplete");
+});

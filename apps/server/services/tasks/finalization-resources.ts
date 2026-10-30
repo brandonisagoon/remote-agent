@@ -1,3 +1,7 @@
+import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
+import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
+import { PreservationInput, PreservationProof } from "./cleanup-preservation-schema.ts";
+import type { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { observeInactiveUnixSocket } from "./unix-socket.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -22,10 +26,53 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
 export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Sha };
+const FrozenFile = z.object({ path: Absolute, ...NodeIdentity, size: z.number().int().nonnegative(), sha256: Sha }).strict();
+export const BrowserRetirementPlan = z.object({ ...Identity, kind: z.literal("browser-profile"), disposition: z.literal("retire-browser"), dependencies: z.array(z.string().min(1)).max(1),
+  session: CleanupAdapterPlan, capture: z.discriminatedUnion("type", [
+    z.object({ type: z.literal("registered"), parentResourceId: z.string().min(1), root: Absolute }).strict(),
+    z.object({ type: z.literal("standalone"), target: FinalizationTreeTarget }).strict(),
+  ]) }).strict();
+export const LinkedWorktreePlan = z.object({ ...Identity, kind: z.literal("git-worktree"), disposition: z.literal("retire-worktree"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), target: FinalizationTreeTarget,
+  git: z.object({ repositoryRoot: Absolute, commonDirectory: Absolute, administrativeDirectory: Absolute,
+    repositoryIdentity: z.object(NodeIdentity).strict(), commonIdentity: z.object(NodeIdentity).strict(), administrativeIdentity: z.object(NodeIdentity).strict(),
+    head: z.string().regex(/^[a-f0-9]{40}$/), branch: z.string().min(1).nullable(), pointer: FrozenFile, index: FrozenFile,
+    administrativeInventory: z.array(FinalizationInventoryEntry).min(1).max(256) }).strict(),
+  administrationCapture: FinalizationTreeTarget.extend({ sourceParent: z.object({ path: Absolute, ...NodeIdentity }).strict(), quarantineParent: z.object({ path: Absolute, ...NodeIdentity }).strict() }).strict(),
+  installedDependencies: z.array(z.object({ path: Absolute, ...NodeIdentity, packageFiles: z.array(FrozenFile).min(2).max(10) }).strict()).max(100),
+}).strict();
+const TreePlanIdentity = { ...Identity, disposition: z.literal("retire-tree"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), target: FinalizationTreeTarget };
+export const RegisteredTreePlan = z.discriminatedUnion("treeKind", [
+  z.object({ ...TreePlanIdentity, treeKind: z.literal("registered-directory") }).strict(),
+  z.object({ ...TreePlanIdentity, kind: z.literal("source-checkpoint"), treeKind: z.literal("source-checkpoint"), manifest: FrozenFile }).strict(),
+]);
+export const FinalizationFileTarget = FrozenFile.extend({ type: z.literal("file"), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
+export const BrowserVaultPlan = z.object({ ...Identity, kind: z.literal("browser-auth"), purpose: z.literal("browser"), disposition: z.literal("retire-vault"), dependencies: z.array(z.string().min(1)).max(0), vault: CleanupAdapterPlan, target: FinalizationFileTarget }).strict();
+export const BackedResourcePlan = z.object({ ...Identity, kind: z.enum(["fixture", "s3-object", "s3-bucket"]), purpose: z.enum(["development", "review"]), disposition: z.literal("retire-backed"),
+  storage: z.object({ resourceId: z.string().min(1), targetDigests: z.array(Sha).length(1) }).strict(),
+  members: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("redis-chats"), chatIds: z.array(z.uuid()).min(1).max(100), preservedUserId: z.string().regex(/^user_[A-Za-z0-9]+$/) }).strict(),
+    z.object({ kind: z.literal("s3-objects"), bucket: z.string().min(1).max(255), objects: z.array(z.object({ key: z.string().min(1).max(4096), sha256: Sha.nullable() }).strict()).min(1).max(1000) }).strict(),
+    z.object({ kind: z.literal("s3-bucket"), bucket: z.string().min(1).max(255) }).strict(),
+  ]) }).strict();
+export const RetainedAdapterPlan = z.object({ ...Identity, kind: z.enum(["clerk-test-user", "docker-compose", "docker-compose-project"]), disposition: z.literal("retain-adapter"),
+  adapterPlan: CleanupAdapterPlan, retainedTargetDigests: z.array(Sha).min(1).max(16), preservation: PreservationProof }).strict();
+export const RetainedBackedPlan = BackedResourcePlan.extend({ kind: z.literal("s3-bucket"), disposition: z.literal("retain-backed"), members: z.object({ kind: z.literal("s3-bucket"), bucket: z.string().min(1).max(255) }).strict() }).strict();
+export const StandaloneFilePlan = z.object({ ...Identity, kind: z.enum(["evidence", "private-file", "scenario-fixture"]), disposition: z.literal("retire-file"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), target: FinalizationFileTarget }).strict();
+export const ContainedFilePlan = z.object({ ...Identity, disposition: z.literal("retire-contained"), parentResourceId: z.string().min(1), dependencies: z.array(z.string().min(1)).length(1), target: z.object({ type: z.literal("file"), path: Absolute, ...NodeIdentity, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedArchivePlan = z.object({ ...Identity, purpose: z.enum(["development", "browser", "review", "tooling"]), disposition: z.literal("retain-archive"), archive: z.object({ root: Absolute, manifestPath: Absolute, manifestSha256: Sha, inventoryDigest: Sha }).strict() }).strict();
 export const RetainedArchiveMemberPlan = z.object({ ...Identity, kind: z.literal("resource-inventory"), purpose: z.literal("tooling"), disposition: z.literal("retain-archive-member"), archive: z.object({ resourceId: z.string().min(1), root: Absolute, inventoryDigest: Sha }).strict(), file: z.object({ path: Absolute, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedResultPlan = z.object({ ...Identity, disposition: z.literal("retain-result"), reference: z.object({ archiveResourceId: z.string(), provenancePath: Absolute, provenanceSha256: Sha }).strict() }).strict();
 export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
+  CleanupAdapterPlan,
+  BrowserRetirementPlan,
+  BrowserVaultPlan,
+  BackedResourcePlan,
+  RetainedAdapterPlan,
+  RetainedBackedPlan,
+  LinkedWorktreePlan,
+  RegisteredTreePlan,
+  StandaloneFilePlan,
+  ContainedFilePlan,
   z.object({ ...Identity, disposition: z.literal("retain-reference"), reference: z.object({ deliveryId: z.string(), type: z.enum(["pull-request", "ci-run"]), repository: z.string(), number: z.number().int().positive(), reviewedHead: z.string(), mergeCommit: z.string().optional() }).strict() }).strict(),
   z.object({ ...Identity, disposition: z.literal("already-released") }).strict(),
   RetainedArchivePlan,
@@ -67,7 +114,7 @@ export const FinalizationQuarantineJournal = z.object({
 export type FinalizationQuarantineJournal = z.infer<typeof FinalizationQuarantineJournal>;
 export type FinalizationResourceRecord = { id: string; key: string; kind: string; purpose: string; externalId: string; state: string; expiresAt?: string | Date | null; metadata?: unknown };
 type Delivery = { id: string; repository: string; pullRequest: number; url: string; reviewedHead: string; mergeCommit: string; ci: Array<{ runId: number; head: string }> };
-export const ExternalResourceOwnership = z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(Absolute).max(1000) }).strict();
+export const ExternalResourceOwnership = z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(Absolute).max(1000), preservation: PreservationInput.optional() }).strict();
 export type ExternalResourceOwnership = z.infer<typeof ExternalResourceOwnership>;
 
 function canonical(value: unknown): unknown {
@@ -120,8 +167,12 @@ async function fileIdentity(file: string) {
 }
 
 export type ResourceObservation = {
+  browserVaultRoot?: () => string;
+  adapters?: typeof runCleanupResourceObserver;
   endpointAbsent(target: { url: string; pid: number; script: string }): Promise<void>;
   rootIdle(root: string): Promise<void>;
+  linkedRootIdle?(root: string): Promise<void>;
+  pathsIdle?(paths: string[]): Promise<void>;
   browserAbsent(target: { session: string; toolingRoot: string }): Promise<void>;
 };
 async function processList() {
@@ -130,6 +181,8 @@ async function processList() {
   return result.stdout.split("\n");
 }
 export const finalizationResourceObservation: ResourceObservation = {
+  async linkedRootIdle(root) { await (await import("./cleanup-open-handles.ts")).assertLinkedRootIdle(root); },
+  async pathsIdle(paths) { await (await import("./cleanup-open-handles.ts")).assertLinkedPathsIdle(paths); },
   async endpointAbsent(target) {
     const url = new URL(target.url);
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || !url.port || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error("Only exact loopback fixture endpoints can be adopted");
@@ -224,23 +277,82 @@ function referencePlan(resource: FinalizationResourceRecord, deliveries: Deliver
   return FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retain-reference", reference: { deliveryId: delivery.id, type: resource.kind === "ci-run" ? "ci-run" : "pull-request", repository: delivery.repository, number, reviewedHead: delivery.reviewedHead, ...(resource.kind !== "ci-run" ? { mergeCommit: delivery.mergeCommit } : {}) } });
 }
 
-export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; originalWork?: boolean }, observation = finalizationResourceObservation) {
+function observerResources(resources: FinalizationResourceRecord[]) {
+  return resources.map(resource => CleanupObserverResource.parse({ id: resource.id, key: resource.key, kind: resource.kind, purpose: resource.purpose, externalId: resource.externalId, state: resource.state, expiresAt: resource.expiresAt instanceof Date ? resource.expiresAt.toISOString() : resource.expiresAt ?? null, metadata: resource.metadata ?? {} }));
+}
+function assertPlanDependencies(plan: FinalizationResourcePlan[]) {
+  const entries = new Map(plan.map(entry => [entry.id, entry])), visiting = new Set<string>(), visited = new Set<string>();
+  function visit(id: string) {
+    if (visiting.has(id)) throw new Error("Prepared cleanup dependency graph contains a cycle");
+    if (visited.has(id)) return;
+    const selected = entries.get(id); if (!selected) throw new Error("Prepared cleanup dependency is outside its resource set");
+    const entry = selected.disposition === "retain-adapter" ? selected.adapterPlan : selected;
+    visiting.add(id);
+    if ("dependencies" in entry) {
+      if (new Set(entry.dependencies).size !== entry.dependencies.length || entry.dependencies.includes(id)) throw new Error("Prepared cleanup dependency identity changed");
+      for (const dependency of entry.dependencies) visit(dependency);
+    }
+    if ("stoppedConsumers" in entry) {
+      if (new Set(entry.stoppedConsumers).size !== entry.stoppedConsumers.length || entry.stoppedConsumers.includes(id) || entry.stoppedConsumers.some(id => entry.dependencies.includes(id))) throw new Error("Prepared stopped-consumer identity changed");
+      for (const id of entry.stoppedConsumers) {
+        const consumer = entries.get(id);
+        if (!consumer || !(consumer.disposition === "retire-adapter" && consumer.targets.some(target => target.kind === "native-family") || consumer.disposition === "retire-browser" && consumer.session.targets.some(target => target.kind === "browser-session"))) throw new Error("Prepared stopped consumer has no exact native-family proof or browser-session proof");
+      }
+    }
+    visiting.delete(id); visited.add(id);
+  }
+  for (const entry of plan) visit(entry.id);
+}
+
+export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; preservation?: z.infer<typeof PreservationProof>; originalWork?: boolean; adapterContext?: CleanupAdapterContext }, observation = finalizationResourceObservation) {
   const ownership = ExternalResourceOwnership.parse(input.ownership);
+  if (Boolean(ownership.preservation) !== Boolean(input.preservation) || ownership.preservation && input.preservation && finalizationDigest(ownership.preservation) !== finalizationDigest({ instruction: { id: input.preservation.instruction.id, sequence: input.preservation.instruction.sequence }, inventoryResourceId: input.preservation.inventory.resourceId, targets: input.preservation.targets })) throw new Error("Preservation requires its matching server-verified existing source proof");
   const resources = input.resources;
   assertFinalizationPlanPurposes(resources, input.retainedArchives ?? []);
   if (new Set(resources.map((r) => r.id)).size !== resources.length || new Set(resources.map((r) => r.key)).size !== resources.length) throw new Error("Resource inventory has duplicate identities");
   const retainedArchives = input.retainedArchives ?? [];
   const exceptional: FinalizationResourcePlan[] = [];
   const active = resources.filter((resource) => {
-    if (resource.state === "released" && input.originalWork) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
+    if (resource.state === "released" && input.originalWork && !(!ownership.sourceCopyResourceId && hasHistoricalCleanupAdapter(resource))) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
     const archive = retainedArchives.find((entry) => entry.id === resource.id);
     if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest) throw new Error("Retained archive identity mismatch"); assertRetainedMaterialPlan(archive, retainedArchives); exceptional.push(archive); return false; }
     return true;
   });
   if (!ownership.sourceCopyResourceId && input.originalWork) {
-    const unsupported = active.filter((resource) => !["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
+    const { prepareRegisteredCaptures, hasRegisteredCaptureResource } = await import("./cleanup-filesystem.ts");
+    const { prepareLinkedWorktreeCaptures } = await import("./cleanup-worktrees.ts");
+    const { hasStandaloneFileResource, prepareStandaloneFiles } = await import("./cleanup-files.ts");
+    const { hasBackedResource, prepareBackedResources } = await import("./cleanup-backed.ts");
+    const adapters = active.filter(resource => hasCleanupAdapter(resource.kind));
+    const references = active.filter(resource => ["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
+    const unsupportedKinds = active.filter(resource => !adapters.includes(resource) && !references.includes(resource) && resource.kind !== "git-worktree" && !hasRegisteredCaptureResource(resource, active) && !hasStandaloneFileResource(resource) && !hasBackedResource(resource));
+    if (unsupportedKinds.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupportedKinds.map(resource => `${resource.key} (${resource.kind})`).join(", ")}`);
+    for (const resource of references) exceptional.push(referencePlan(resource, input.deliveries));
+    if (adapters.length) {
+      const context = input.adapterContext;
+      if (!context || context.task.id !== input.taskId || context.task.primarySessionId !== input.sessionId) throw new Error("Physical adapter preparation requires the server-bound original task and committed cleanup capability");
+      exceptional.push(...await prepareCleanupAdapterResources({ context, resources: observerResources(resources), identities: adapters.map(resource => ({ ...finalizationResourceIdentity(resource), purpose: z.enum(["development", "browser", "review"]).parse(resource.purpose) })) }, observation.adapters));
+    }
+    const { partitionPreservedAdapters, assertPreservedAdapters } = await import("./cleanup-preservation.ts");
+    await partitionPreservedAdapters({ taskId: input.taskId, sessionId: input.sessionId, resources, plan: exceptional, proof: input.preservation });
+    exceptional.push(...prepareBackedResources({ taskId: input.taskId, resources, plan: exceptional }));
+    if (input.preservation) await assertPreservedAdapters({ taskId: input.taskId, resources, plan: exceptional });
+    const { prepareVaultCaptures } = await import("./cleanup-vault.ts");
+    for (const vault of await prepareVaultCaptures({ taskId: input.taskId, resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation)) exceptional[exceptional.findIndex(entry => entry.id === vault.id)] = vault;
+    const { prepareBrowserCaptures } = await import("./cleanup-browsers.ts");
+    const browserPlans = await prepareBrowserCaptures({ taskId: input.taskId, resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation);
+    for (const browser of browserPlans) exceptional[exceptional.findIndex(entry => entry.id === browser.id)] = browser;
+    exceptional.push(...await prepareRegisteredCaptures({ resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation));
+    exceptional.push(...await prepareLinkedWorktreeCaptures({ resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation));
+    exceptional.push(...await prepareStandaloneFiles({ resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation));
+    const unsupported = active.filter(resource => !exceptional.some(entry => entry.id === resource.id));
     if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
-    for (const resource of active) exceptional.push(referencePlan(resource, input.deliveries));
+    assertPlanDependencies(exceptional);
     return exceptional;
   }
   const source = active.find((resource) => resource.id === ownership.sourceCopyResourceId);
@@ -357,14 +469,14 @@ async function readQuarantineJournal(file: string) {
 /** Observes a frozen capture; never creates, repairs, restores, or removes its
  * contents. A pending journal can precede rename, but missing source without a
  * matching capture is never proof of retirement. */
-export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget; quarantineParent?: { path: string; dev: number; ino: number; mode: number }; sourceParent?: { path: string; dev: number; ino: number; mode: number } }) {
+export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget; quarantineParent?: { path: string; dev: number; ino: number; mode: number }; sourceParent?: { path: string; dev: number; ino: number; mode: number }; ownedQuarantineParent?: boolean }) {
   const { target } = input, { quarantine } = target;
   const destinationParent = input.quarantineParent;
   if (destinationParent && !input.sourceParent) throw new Error("External quarantine requires both frozen parent identities");
   if (destinationParent) {
     await assertFinalizationPath(destinationParent.path);
     const parent = await lstat(destinationParent.path);
-    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o7777) !== 0o700 || parent.dev !== destinationParent.dev || parent.ino !== destinationParent.ino || parent.mode !== destinationParent.mode || parent.dev !== target.inventory[0]?.dev) throw new Error("Quarantine destination parent identity changed");
+    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (input.ownedQuarantineParent ? (parent.mode & 0o022) !== 0 : (parent.mode & 0o7777) !== 0o700) || parent.dev !== destinationParent.dev || parent.ino !== destinationParent.ino || parent.mode !== destinationParent.mode || parent.dev !== target.inventory[0]?.dev) throw new Error("Quarantine destination parent identity changed");
   }
   if (path.dirname(quarantine.directory) !== (destinationParent?.path ?? path.dirname(target.path)) || quarantine.directory === target.path || quarantine.path !== path.join(quarantine.directory, "contents") || quarantine.journal !== path.join(quarantine.directory, "pending.json") || !/^\.drafted-finalization-[0-9a-f-]{36}$/.test(path.basename(quarantine.directory))) throw new Error("Quarantine location does not match its frozen source root");
   await assertFinalizationPath(target.path);
@@ -406,6 +518,38 @@ export async function assertFinalizationResources(input: { taskId: string; resou
     if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest) throw new Error("Finalization resource identity changed");
     if (["retain-archive", "retain-result", "retain-archive-member"].includes(entry.disposition)) assertRetainedMaterialPlan(entry as RetainedMaterialPlan, plan);
     if (entry.disposition === "already-released" && record.state !== "released" || entry.disposition.startsWith("retain-") && record.state === "released") throw new Error("Retained history was falsely marked released or an already-released resource changed");
+  }
+  assertPlanDependencies(plan);
+  const adapters = plan.flatMap(entry => entry.disposition === "retire-adapter" ? [entry] : entry.disposition === "retire-browser" ? [entry.session] : entry.disposition === "retire-vault" ? [entry.vault] : entry.disposition === "retain-adapter" ? [entry.adapterPlan] : []);
+  const retainedTargets = new Map(plan.filter(entry => entry.disposition === "retain-adapter").map(entry => [entry.id, entry.retainedTargetDigests]));
+  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed, retainedTargets }, observation.adapters) : undefined;
+  if (retainedTargets.size) {
+    const { assertPreservedAdapters } = await import("./cleanup-preservation.ts");
+    await assertPreservedAdapters({ ...input, plan });
+  }
+  if (plan.some(entry => entry.disposition === "retire-backed" || entry.disposition === "retain-backed")) {
+    const { assertBackedResources } = await import("./cleanup-backed.ts");
+    assertBackedResources({ ...input, plan, adapterObservation });
+  }
+  if (plan.some(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-contained")) {
+    const { assertRegisteredCaptures } = await import("./cleanup-filesystem.ts");
+    await assertRegisteredCaptures({ ...input, plan, adapterObservation }, observation);
+  }
+  if (plan.some(entry => entry.disposition === "retire-worktree")) {
+    const { assertLinkedWorktreeCaptures } = await import("./cleanup-worktrees.ts");
+    await assertLinkedWorktreeCaptures({ ...input, plan, adapterObservation }, observation);
+  }
+  if (plan.some(entry => entry.disposition === "retire-file")) {
+    const { assertStandaloneFiles } = await import("./cleanup-files.ts");
+    await assertStandaloneFiles({ ...input, plan, adapterObservation }, observation);
+  }
+  if (plan.some(entry => entry.disposition === "retire-browser")) {
+    const { assertBrowserCaptures } = await import("./cleanup-browsers.ts");
+    await assertBrowserCaptures({ ...input, plan, adapterObservation }, observation);
+  }
+  if (plan.some(entry => entry.disposition === "retire-vault")) {
+    const { assertVaultCaptures } = await import("./cleanup-vault.ts");
+    await assertVaultCaptures({ ...input, plan, adapterObservation }, observation);
   }
   if (trees.length === 0 && input.originalWork && plan.every((entry) => entry.disposition !== "retire-owned")) return;
   if (trees.length !== 1) throw new Error("Finalization requires one exact retained source-root capture");
