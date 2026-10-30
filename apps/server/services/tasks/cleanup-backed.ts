@@ -1,9 +1,9 @@
 import { z } from "zod";
 import type { CleanupAdapterPlan } from "./cleanup-adapter-resources.ts";
 import type { CleanupObserverBatchResult, CleanupTarget } from "./cleanup-observer-schema.ts";
-import { BackedResourcePlan, finalizationDigest, finalizationResourceIdentity, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
+import { BackedResourcePlan, RetainedBackedPlan, finalizationDigest, finalizationResourceIdentity, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
-type Backed = z.infer<typeof BackedResourcePlan>;
+type Backed = z.infer<typeof BackedResourcePlan> | z.infer<typeof RetainedBackedPlan>;
 type Input = { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[] };
 const metadata = (record: FinalizationResourceRecord) => z.record(z.string(), z.unknown()).parse(record.metadata ?? {});
 const unique = (values: string[]) => values.length === new Set(values).size;
@@ -16,7 +16,7 @@ function scope(input: Input, resource: FinalizationResourceRecord, adapter: Clea
   return { resourceId: adapter.id, targetDigests: [target.identityDigest] };
 }
 function composeVolume(input: Input, resource: FinalizationResourceRecord, project: string, volume: string, owner?: { key: string; id: string }) {
-  const candidates = input.plan.filter((entry): entry is CleanupAdapterPlan => entry.disposition === "retire-adapter" && entry.adapter === "compose" && entry.externalId === project && entry.purpose === resource.purpose);
+  const candidates = input.plan.flatMap(entry => entry.disposition === "retain-adapter" ? [entry.adapterPlan] : entry.disposition === "retire-adapter" ? [entry] : []).filter(entry => entry.adapter === "compose" && entry.externalId === project && entry.purpose === resource.purpose);
   if (candidates.length !== 1) throw new Error("Fixture needs one exact observed Compose backing resource");
   const adapter = candidates[0]!, record = input.resources.find(record => record.id === adapter.id)!, meta = metadata(record);
   if (owner && (record.id !== owner.id || record.key !== owner.key)) throw new Error("Object receipt names another owner Compose record");
@@ -60,7 +60,13 @@ function derive(input: Input, resource: FinalizationResourceRecord): Backed {
     owner = { key: match[1]!, id: match[2]! };
   }
   const storage = composeVolume(input, resource, project, volume, owner);
-  if (resource.kind === "s3-bucket") return BackedResourcePlan.parse({ ...identity, disposition: "retire-backed", storage, members: { kind: "s3-bucket", bucket } });
+  const parent = input.plan.find(entry => entry.id === storage.resourceId);
+  const retained = parent?.disposition === "retain-adapter" && storage.targetDigests.every(digest => parent.retainedTargetDigests.includes(digest));
+  if (resource.kind === "s3-bucket") {
+    if (retained && resource.state !== "ready") throw new Error("Preserved bucket must keep its original Ready state");
+    return (retained ? RetainedBackedPlan : BackedResourcePlan).parse({ ...identity, disposition: retained ? "retain-backed" : "retire-backed", storage, members: { kind: "s3-bucket", bucket } });
+  }
+  if (retained) throw new Error("Stored object retirement cannot claim absence of intentionally preserved storage");
   const key = z.string().min(1).max(4096).parse(meta.key);
   if (resource.externalId !== `${bucket}/${key}`) throw new Error("Legacy object receipt key changed");
   // The old probe has no established retained object copy or content digest.
@@ -69,12 +75,16 @@ function derive(input: Input, resource: FinalizationResourceRecord): Backed {
 }
 
 export function assertBackedResources(input: Input & { removed: boolean; adapterObservation?: z.infer<typeof CleanupObserverBatchResult> }) {
-  for (const entry of input.plan.filter((entry): entry is Backed => entry.disposition === "retire-backed")) {
+  for (const entry of input.plan.filter((entry): entry is Backed => entry.disposition === "retire-backed" || entry.disposition === "retain-backed")) {
     const record = input.resources.find(record => record.id === entry.id);
     if (!record || finalizationDigest(derive(input, record)) !== finalizationDigest(entry)) throw new Error("Stored resource correspondence changed since preparation");
     const observed = input.adapterObservation?.observations.find(observation => observation.resourceId === entry.storage.resourceId);
     if (!observed || entry.storage.targetDigests.some(digest => !observed.targets.some(target => target.identityDigest === digest))) throw new Error("Stored resource backing targets were not independently observed");
-    if ((input.removed || record.state === "released") && entry.storage.targetDigests.some(digest => observed.presentTargetDigests.includes(digest))) throw new Error("Stored resource still has a present backing target");
-    if (input.removed && record.state !== "released") throw new Error("Stored resource retirement was not recorded");
+    if (entry.disposition === "retain-backed") {
+      if (record.state !== "ready" || entry.storage.targetDigests.some(digest => !observed.presentTargetDigests.includes(digest))) throw new Error("Preserved bucket storage is missing or its Ready state changed");
+    } else {
+      if ((input.removed || record.state === "released") && entry.storage.targetDigests.some(digest => observed.presentTargetDigests.includes(digest))) throw new Error("Stored resource still has a present backing target");
+      if (input.removed && record.state !== "released") throw new Error("Stored resource retirement was not recorded");
+    }
   }
 }

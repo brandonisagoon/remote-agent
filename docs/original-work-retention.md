@@ -321,3 +321,50 @@ These facts are not upgraded into new copy claims by logical receipt retirement.
 The DRA8 shared pilot user is recorded as preserved context and receives no
 authentication operation. DRA42's intentionally retained user and objects volume
 require the separate retained-target plan, not this absence disposition.
+
+### Explicit preserved provider targets
+
+An original preservation instruction can restrict an authenticated adoption with
+`ownership.preservation`. It names the existing instruction ID/sequence, an exact
+retained `resource-inventory` member, and selected `{resourceId, kind, id}` targets.
+The server freezes the original primary, instruction text digest, retained file
+identity/digest and independently observed target identity. It checks this local
+source again in the adoption transaction and on operation renewals; complete
+boundaries re-read the preserved inventory and provider targets outside the
+transaction. No new owner decision or issue-state transition is introduced.
+
+The initial supported shape is DRA42's recorded `sharedIdentity`, `objectBucket`
+and exact Docker `volumes` inventory. The preserved Clerk user must match the
+recorded ID; its current test-instance, creation and email identity remain in the
+existing observer proof. The objects volume must match its saved creation time,
+complete labels, original task/purpose/project and bucket correspondence.
+An unsupported selected inventory shape or unknown source remains unadoptable.
+A recognized retained inventory with these explicit dispositions also restricts
+adoption when the optional field was omitted: both exact targets must be bound,
+so omission or a partial selection cannot turn recorded preservation into
+delete authority. Unrelated retained inventories keep their existing rules.
+
+`retain-adapter` embeds the full original adapter plan and its exact preserved
+target digests. Cleanup can retire the other Compose targets using the existing
+scoped adapter; it must continuously verify the preserved targets and leave the
+parent receipt Ready without metadata or lifecycle writes. A preserved Clerk
+user is observed only. `retain-backed` records the bucket's relationship to the
+exact retained objects volume. It describes honest offline retention, not a
+claim that a bucket provider remains reachable or has been deleted. The Compose
+source and provider credential inputs must survive every capture.
+
+Confirmation requires all nonpreserved targets absent and all preserved targets
+unchanged/present. It keeps the user, Compose and bucket receipts Ready and
+projects their exact confirmed retention so closed-task maintenance preserves
+them. Missing preserved data, a changed target lifetime, changed instruction or
+inventory, an unfinished dependent, or a falsely Released receipt prevents
+completion. A lost removal response retries only the unfinished partition.
+
+Disposable paired coverage uses a server-produced plan, the actual Drafted
+observer/executor, and independent server confirmation. Only Docker/Clerk
+boundaries are faked; retained bytes and original receipt identities are checked
+through partial removal, lost acknowledgment and replay. Actual DRA42 read-only
+inspection also matched instruction 1503, its 19,916-byte retained inventory,
+10 Compose targets and the selected volume/user. That compatibility inspection
+performed no adoption or resource effects; full original-work archive proof
+remains part of the owner's normal adoption.
