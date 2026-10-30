@@ -96,3 +96,48 @@ test("delegate inbox claims wait for the running automatic primary and remain qu
   await db.prisma.runtimeInstruction.update({ where: { id: cleanup.instructionId }, data: { state: "completed" } });
   expect(await cleanupInstructionAllows(db.prisma, { id: instruction.id, sessionId: child.id })).toBeTrue();
 });
+
+async function closedDelegateHistory(f: Awaited<ReturnType<typeof fixture>>) {
+  const child = await db.prisma.runtimeSession.create({ data: { id: "closed-child", scopeKey: "closed-child", role: "delegate", status: "closed", agentCommand: "codex", cwd: f.session.cwd, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  f.runtime.putSession({ id: child.id, status: "closed", role: "delegate", cwd: child.cwd, repositoryId: child.repositoryId, machineId: child.machineId, agent: "codex" });
+  await queueInstruction(db.prisma, { sessionId: child.id, requestId: "old-unknown", text: "Old diagnostic with an uncertain delivery" });
+  await db.prisma.runtimeInstruction.update({ where: { id: "old-unknown" }, data: { state: "unknown", detail: "Preserve the original uncertainty" } });
+  await queueInstruction(db.prisma, { sessionId: child.id, requestId: "old-queued", text: "Old diagnostic follow-up" });
+  return child;
+}
+
+test("closed delegate history stays intact while the original primary receives automatic cleanup", async () => {
+  const f = await fixture(), cleanup = await f.enqueue(), child = await closedDelegateHistory(f);
+  const before = await db.prisma.runtimeInstruction.findMany({ where: { sessionId: child.id }, orderBy: { sequence: "asc" } });
+  await deliverInstructions(db.prisma, f.runtime, f.config);
+  for (let i = 0; i < 100 && !f.runtime.sentMessages.length; i++) await Bun.sleep(5);
+  expect(f.runtime.sentMessages).toHaveLength(1);
+  expect(f.runtime.sentMessages[0]!.sessionId).toBe(f.session.id);
+  expect(f.runtime.sentMessages[0]!.text).toContain("Automatic cleanup continuation");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: cleanup.instructionId } })).state).not.toBe("queued");
+  expect(await db.prisma.runtimeInstruction.findMany({ where: { sessionId: child.id }, orderBy: { sequence: "asc" } })).toEqual(before);
+});
+
+test("cleanup renewal ignores closed history but still refuses live activity and reopened pending work", async () => {
+  const f = await fixture(), cleanup = await f.enqueue(), child = await closedDelegateHistory(f);
+  expect(await cleanupInstructionAllows(db.prisma, { id: cleanup.instructionId, sessionId: f.session.id })).toBeTrue();
+  await db.prisma.runtimeInstruction.update({ where: { id: cleanup.instructionId }, data: { state: "dispatching", executionRequestId: "turn" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "started", runtimeSessionId: f.session.id, requestId: "turn", phase: "started", occurredAt: new Date() } });
+  const runtime = { observeSessionActivity: (id: string) => id === f.session.id ? ({ state: "executing" as const, requestId: "turn", observedAt: Date.now() }) : ({ state: "unknown" as const, observedAt: Date.now() }) };
+  expect(await automaticCleanupTurn(db.prisma, f.task, true, runtime)).toMatchObject({ initialInstructionId: cleanup.instructionId });
+  await expect(automaticCleanupTurn(db.prisma, f.task, true, { observeSessionActivity: id => id === child.id ? ({ state: "executing", requestId: "old-unknown", observedAt: Date.now() }) : runtime.observeSessionActivity(id) })).rejects.toThrow("active delegates");
+  await db.prisma.runtimeSession.update({ where: { id: child.id }, data: { status: "idle" } });
+  expect(await cleanupInstructionAllows(db.prisma, { id: cleanup.instructionId, sessionId: f.session.id })).toBeFalse();
+  await expect(automaticCleanupTurn(db.prisma, f.task, true, runtime)).rejects.toThrow("pending task instructions");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-unknown" } })).state).toBe("unknown");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-queued" } })).state).toBe("queued");
+});
+
+test.each([null, "primary"])("closed non-delegate role %s keeps uncertain work blocking cleanup", async role => {
+  const f = await fixture(), cleanup = await f.enqueue(), child = await closedDelegateHistory(f);
+  await db.prisma.runtimeSession.update({ where: { id: child.id }, data: { role } });
+  expect(await cleanupInstructionAllows(db.prisma, { id: cleanup.instructionId, sessionId: f.session.id })).toBeFalse();
+  await db.prisma.runtimeInstruction.update({ where: { id: cleanup.instructionId }, data: { state: "dispatching", executionRequestId: "turn" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "started", runtimeSessionId: f.session.id, requestId: "turn", phase: "started", occurredAt: new Date() } });
+  await expect(automaticCleanupTurn(db.prisma, f.task, true)).rejects.toThrow("pending task instructions");
+});
