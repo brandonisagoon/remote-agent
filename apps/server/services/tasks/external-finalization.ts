@@ -293,7 +293,7 @@ export async function assertExternalDoneAllowed(input: { prisma: PrismaClient; c
  * entries survive, never a global exemption for PR/CI resource kinds. */
 export async function externalFinalizationProjection(prisma: PrismaClient, task: { id: string; primarySessionId: string | null; resources?: Array<Parameters<typeof finalizationResourceIdentity>[0]> }): Promise<{
   finalizationVersion?: 2;
-  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" | "retain-archive" | "retain-result" | "retain-archive-member" | "retain-adapter" | "retain-backed" }>> };
+  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" | "retain-archive" | "retain-result" | "retain-archive-member" | "retain-adapter" | "retain-backed" | "retain-data" }>> };
 }> {
   if (!task.primarySessionId) return {};
   const binding = await latestExternalBinding(prisma, task.id, task.primarySessionId);
@@ -312,7 +312,7 @@ export async function externalFinalizationProjection(prisma: PrismaClient, task:
     assertExternalResourceRecords(relevant, prepared.resources, true);
     if (relevant.length !== records.length || relevant.length !== prepared.resources.length || prepared.resources.some((entry) => !relevant.some((record) => record.id === entry.id && finalizationResourceIdentity(record).identityDigest === entry.identityDigest && (entry.disposition.startsWith("retain-") ? record.state !== "released" : record.state === "released")))) return hint;
     await assertExternalResourceProofs(prisma, prepared, preparation.sequence, confirmed.value);
-    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference" || entry.disposition === "retain-archive" || entry.disposition === "retain-result" || entry.disposition === "retain-archive-member" || entry.disposition === "retain-adapter" || entry.disposition === "retain-backed") } };
+    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference" || entry.disposition === "retain-archive" || entry.disposition === "retain-result" || entry.disposition === "retain-archive-member" || entry.disposition === "retain-adapter" || entry.disposition === "retain-backed" || entry.disposition === "retain-data") } };
   } catch { return hint; }
 }
 

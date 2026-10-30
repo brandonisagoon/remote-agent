@@ -71,6 +71,8 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources: current.resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot!, sourcePaths: [], deliveries,
     ownership: request.ownership, originalWork: true, ...(adapterContext ? { adapterContext } : {}), retainedArchives, ...(preservation ? { preservation } : {}) });
+  const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
+  assertSavedDataCaptureSeparation(plan, originalWork ? [originalWork.target.path, originalWork.target.quarantine.directory, ...(originalWork.administration ? [originalWork.administration.administrationCapture.path, originalWork.administration.administrationCapture.quarantine.directory] : [])] : []);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   await dependencies.assertResources({ taskId: input.taskId, resources: current.resources, plan, removed: false, originalWork: true });

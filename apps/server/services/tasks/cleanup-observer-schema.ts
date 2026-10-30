@@ -8,7 +8,7 @@ const Absolute = z.string().max(4096).refine(value => path.isAbsolute(value) && 
 const Purpose = z.enum(["development", "review", "browser"]);
 const Scope = { taskId: z.string().min(1), purpose: Purpose };
 const Common = { id: z.string().min(1), presentAtPrepare: z.boolean(), identityDigest: Hash };
-const DockerScope = z.strictObject({ ...Scope, project: Nonempty.optional(), operation: Nonempty.optional(), name: Nonempty.optional(),
+const DockerScope = z.strictObject({ ...Scope, purpose: z.enum(["development", "review", "browser", "tooling"]), project: Nonempty.optional(), operation: Nonempty.optional(), name: Nonempty.optional(),
   compose: z.strictObject({ file: Absolute, sha256: Hash, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), member: Nonempty }).optional(),
 });
 const DockerIdentity = z.strictObject({ createdAt: z.string().min(1), labelsDigest: Hash });

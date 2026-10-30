@@ -3,7 +3,7 @@ import { CleanupAdapter, CleanupObserverBatchInput, CleanupObserverBatchResult, 
 import { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
-const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Hash };
+const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review", "tooling"]), savedDataResourceId: z.string().min(1).optional(), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Hash };
 export const CleanupAdapterPlan = z.strictObject({ ...Identity, disposition: z.literal("retire-adapter"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), adapter: CleanupAdapter,
   targets: z.array(CleanupTarget).min(1).max(1000), observer: z.strictObject({ capability: CleanupObserverCapability, task: CleanupObserverInput.shape.task }) });
 export type CleanupAdapterPlan = z.infer<typeof CleanupAdapterPlan>;

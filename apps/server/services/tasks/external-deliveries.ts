@@ -30,7 +30,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed" || entry.disposition === "retain-data") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -86,6 +86,8 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
   const { assertPreservationSources } = await import("./cleanup-preservation.ts");
   await assertPreservationSources(prisma, binding.identity.taskId, binding.identity.sessionId, binding.resources);
+  const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
+  assertSavedDataCaptureSeparation(binding.resources, binding.originalWork ? [binding.originalWork.target.path, binding.originalWork.target.quarantine.directory, ...(binding.originalWork.administration ? [binding.originalWork.administration.administrationCapture.path, binding.originalWork.administration.administrationCapture.quarantine.directory] : [])] : []);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(prisma, binding.identity.taskId, binding.resources);
   // Historical approvals must also honor a later explicit revocation. The
@@ -114,7 +116,10 @@ async function checkComment(input: Context, sessionId: string, bindingInput: Ext
   const observed = await dependencies.comment(lineage.config.linearApiKey, bindingInput.acceptance.ownerCommentId);
   const comment = observed.comment;
   const digest = createHash("sha256").update(comment.body).digest("hex");
-  if (comment.id !== bindingInput.acceptance.ownerCommentId || comment.user.id !== lineage.approval.actorId || comment.issue.id !== lineage.approval.issueId || comment.issue.identifier !== lineage.approval.issueIdentifier || digest !== bindingInput.acceptance.ownerCommentDigest || lineage.approval.organizationId && observed.organization.id !== lineage.approval.organizationId || Date.parse(comment.createdAt) > Date.parse(comment.updatedAt) || Date.parse(comment.updatedAt) > Date.now()) throw new Error("Owner acceptance comment author, issue, organization, digest or timestamps do not match");
+  const createdAt = Date.parse(comment.createdAt), updatedAt = Date.parse(comment.updatedAt), now = Date.now();
+  // Provider timestamps can be slightly out of order. Preserve both exact values
+  // for the second-read comparison instead of assuming a shared write clock.
+  if (comment.id !== bindingInput.acceptance.ownerCommentId || comment.user.id !== lineage.approval.actorId || comment.issue.id !== lineage.approval.issueId || comment.issue.identifier !== lineage.approval.issueIdentifier || digest !== bindingInput.acceptance.ownerCommentDigest || lineage.approval.organizationId && observed.organization.id !== lineage.approval.organizationId || !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || createdAt > now || updatedAt > now) throw new Error("Owner acceptance comment author, issue, organization, digest or timestamps do not match");
   return { lineage, acceptance: { approvalEventSequence: lineage.event.sequence, approvalDigest: externalDigest(JSON.parse(lineage.event.value!)), ownerCommentId: comment.id, ownerCommentDigest: digest, actorId: comment.user.id, issueId: comment.issue.id, organizationId: observed.organization.id, createdAt: comment.createdAt, updatedAt: comment.updatedAt } };
 }
 
@@ -149,6 +154,8 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(preservation ? { preservation } : {}), ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
+  assertSavedDataCaptureSeparation(plan, originalWork ? [originalWork.target.path, originalWork.target.quarantine.directory, ...(originalWork.administration ? [originalWork.administration.administrationCapture.path, originalWork.administration.administrationCapture.quarantine.directory] : [])] : []);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   if (originalWork) {

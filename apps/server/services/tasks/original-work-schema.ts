@@ -49,6 +49,7 @@ export const OriginalWork = z.object({ version: z.literal(1), captureId: z.strin
   ]),
   target: FinalizationTreeTarget,
   administration: OriginalWorkAdministration.optional(),
+  installedDependencies: LinkedWorktreePlan.shape.installedDependencies.optional(),
 }).strict();
 export type OriginalWork = z.infer<typeof OriginalWork>;
 

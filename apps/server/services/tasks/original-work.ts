@@ -1,3 +1,4 @@
+import { prepareInstalledDependencies, assertInstalledDependencies } from "./installed-dependencies.ts";
 import { assertOriginalAdministration, prepareOriginalAdministration } from "./original-work-administration.ts";
 import { archiveMember as member, readArchiveBytes as bytes, observeArchive as archiveObservation } from "./archive-observation.ts";
 import { createHash, randomUUID } from "node:crypto";
@@ -141,10 +142,12 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
   } finally { await rm(temporary, { recursive: true, force: true }); }
   const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])).toString().split("\0").filter(Boolean);
   for (const name of ignored) if (!selection.ownedPaths.some((owned) => member(worktree, name) === owned || inside(owned, member(worktree, name)))) throw new Error("Ignored original material needs explicit owner-adopted paths");
-  await observation.rootIdle(worktree);
-  const inventory = await finalizationInventory(worktree, [worktree], new Map(), new Map());
+  const installedDependencies = await prepareInstalledDependencies(worktree);
+  const idle = installedDependencies.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle;
+  await idle(worktree);
+  const inventory = await finalizationInventory(worktree, [worktree], new Map(installedDependencies.map(dependency => [dependency.path, `original-worktree:${input.taskId}`])), new Map());
   const directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
-  const proof = OriginalWork.parse({ version: 1, captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(additionalArchives.length ? { additionalArchives } : {}), ...(retainedResults.length ? { retainedResults } : {}), snapshot, restore,
+  const proof = OriginalWork.parse({ version: 1, ...(installedDependencies.length ? { installedDependencies } : {}), captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(additionalArchives.length ? { additionalArchives } : {}), ...(retainedResults.length ? { retainedResults } : {}), snapshot, restore,
     target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
   proof.administration = await prepareOriginalAdministration(input.taskId, proof);
   await assertOriginalWork({ taskId: input.taskId, originalWork: proof, resources: input.resources, removed: false }, observation);
@@ -224,9 +227,11 @@ async function prepareRecoveryOriginalWork(input: RecoveryOriginalInput, observa
   const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])).toString().split("\0").filter(Boolean);
   for (const name of ignored) if (!selection.ownedPaths.some(owned => member(worktree, name) === owned || inside(owned, member(worktree, name)))) throw new Error("Ignored original material needs explicit owner-adopted paths");
   if (finalizationDigest(await dirtySnapshot(worktree)) !== finalizationDigest(original)) throw new Error("Original source changed during recovery verification");
-  await observation.rootIdle(worktree);
-  const inventory = await finalizationInventory(worktree, [worktree], new Map(), new Map()), directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
-  const proof = OriginalWork.parse({ version: 1, captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, format: selection.format, recovery: selection, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(retainedArchiveMembers.length ? { retainedArchiveMembers } : {}), snapshot: original, restore, target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
+  const installedDependencies = await prepareInstalledDependencies(worktree);
+  const idle = installedDependencies.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle;
+  await idle(worktree);
+  const inventory = await finalizationInventory(worktree, [worktree], new Map(installedDependencies.map(dependency => [dependency.path, `original-worktree:${input.taskId}`])), new Map()), directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
+  const proof = OriginalWork.parse({ version: 1, ...(installedDependencies.length ? { installedDependencies } : {}), captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, format: selection.format, recovery: selection, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(retainedArchiveMembers.length ? { retainedArchiveMembers } : {}), snapshot: original, restore, target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
   proof.administration = await prepareOriginalAdministration(input.taskId, proof);
   await assertOriginalWork({ taskId: input.taskId, originalWork: proof, resources: input.resources, removed: false }, observation);
   return proof;
@@ -255,10 +260,12 @@ export async function assertOriginalWork(input: { taskId: string; originalWork: 
   if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
   for (const prerequisite of "prerequisiteCommits" in proof.restore ? proof.restore.prerequisiteCommits : []) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
   const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
+  await assertInstalledDependencies(proof.target, proof.installedDependencies ?? [], proof.captureId, capture.physicalPath);
   await assertFinalizationTree(proof.target, capture.physicalPath);
   if (input.removed && !capture.captured) throw new Error("Original work has not been preserved in quarantine");
   if (!capture.captured && finalizationDigest(await dirtySnapshot(proof.target.path)) !== finalizationDigest(proof.snapshot)) throw new Error("Original staged, unstaged or untracked state changed since adoption");
-  await observation.rootIdle(proof.target.path);
-  if (capture.captured) await observation.rootIdle(capture.physicalPath);
+  const idle = proof.installedDependencies?.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle;
+  await idle(proof.target.path);
+  if (capture.captured) await idle(capture.physicalPath);
   if (proof.administration) await assertOriginalAdministration({ taskId: input.taskId, originalWork: proof, administration: proof.administration, removed: input.removed }, observation);
 }

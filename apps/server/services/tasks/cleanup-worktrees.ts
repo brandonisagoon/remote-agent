@@ -1,3 +1,4 @@
+import { prepareInstalledDependencies, assertInstalledDependencies } from "./installed-dependencies.ts";
 import { randomUUID } from "node:crypto";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -84,24 +85,6 @@ async function inspectGit(worktree: string) {
   return { repositoryRoot, commonDirectory, administrativeDirectory, repositoryIdentity, commonIdentity, administrativeIdentity, head, branch: branch || null, pointer, index, administrativeInventory: administration };
 }
 
-async function installedDependencies(worktree: string) {
-  const tracked = new Set((await git(worktree, ["ls-files", "-z"])).split("\0").filter(Boolean));
-  const lockNames = ["bun.lock", "bun.lockb", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"].filter(file => tracked.has(file));
-  const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])).split("\0").filter(Boolean);
-  const result: Worktree["installedDependencies"] = [];
-  for (const value of ignored) {
-    const relative = value.endsWith("/") ? value.slice(0, -1) : value;
-    if (path.basename(relative) !== "node_modules") continue;
-    if (path.isAbsolute(relative) || path.normalize(relative) !== relative || relative.split(path.sep).includes("..")) throw new Error("Installed dependency path is invalid");
-    const file = path.join(worktree, relative), packageFile = path.join(path.dirname(relative), "package.json");
-    if (!lockNames.length || !tracked.has(packageFile) || await git(worktree, ["ls-files", "-z", "--", relative])) throw new Error("Installed dependencies need their tracked package and lock pins");
-    const stat = await directory(file);
-    const packageFiles = await Promise.all([packageFile, ...lockNames].map(relative => observeLegacyEvidenceFile(path.join(worktree, relative), false, 16 * 1024 * 1024)));
-    result.push({ path: file, dev: stat.dev, ino: stat.ino, mode: stat.mode, packageFiles });
-  }
-  return result;
-}
-
 /** Installed dependencies remain in the retained capture. Only their exact
  * directory identities are opaque; all other source and ignored bytes hash. */
 export async function prepareLinkedWorktreeCaptures(input: { resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; ownedPaths: string[]; protectedPaths: string[] }, observation: ResourceObservation) {
@@ -112,7 +95,7 @@ export async function prepareLinkedWorktreeCaptures(input: { resources: Finaliza
     if (!path.isAbsolute(root) || path.normalize(root) !== root || !input.ownedPaths.includes(root) || input.protectedPaths.some(file => overlaps(root, file))) throw new Error("Linked worktree requires its exact separately owned cleanup path");
     if (input.resources.some(other => other.id !== resource.id && path.isAbsolute(other.externalId) && overlaps(root, other.externalId))) throw new Error("Linked worktree overlaps another registered resource requiring its contained plan");
     for (const retained of input.plan) if (retained.disposition === "retain-archive" && overlaps(root, retained.archive.root)) throw new Error("Linked worktree archive must survive outside its capture");
-    const state = await inspectGit(root), dependencies = await installedDependencies(root), edges = captureAdapterDependencies(root, input.resources, input.plan);
+    const state = await inspectGit(root), dependencies = await prepareInstalledDependencies(root), edges = captureAdapterDependencies(root, input.resources, input.plan);
     await idle(root);
     const inventory = await finalizationInventory(root, [root], new Map(dependencies.map(dependency => [dependency.path, resource.id])), new Map());
     const name = randomUUID(), directory = path.join(path.dirname(root), `.drafted-finalization-${name}`);
@@ -180,12 +163,7 @@ export async function assertLinkedWorktreeCaptures(input: { taskId: string; reso
     if (administration.captured && !capture.captured) throw new Error("Linked administration cannot retire before its source capture");
     if (removed && !administration.captured) throw new Error("Linked worktree has no verified administration capture");
     await assertRegistration(plan, capture.captured, administration.captured, removed);
-    const opaque = plan.target.inventory.filter(entry => entry.kind === "opaque");
-    if (opaque.length !== plan.installedDependencies.length || opaque.some(entry => entry.dependencyResourceId !== plan.id || !plan.installedDependencies.some(dependency => dependency.path === path.join(plan.target.path, entry.path) && dependency.dev === entry.dev && dependency.ino === entry.ino && dependency.mode === entry.mode))) throw new Error("Opaque dependency scope changed");
-    for (const dependency of plan.installedDependencies) for (const file of dependency.packageFiles) {
-      if (!within(plan.target.path, file.path)) throw new Error("Dependency package pin is outside its worktree");
-      await unchangedFile(file, path.join(capture.physicalPath, path.relative(plan.target.path, file.path)));
-    }
+    await assertInstalledDependencies(plan.target, plan.installedDependencies, plan.id, capture.physicalPath);
     if (capture.captured) assertCapturedDependencies(plan, input.resources, input.adapterObservation);
     await idle(plan.target.path);
     if (capture.captured) await idle(capture.physicalPath);
