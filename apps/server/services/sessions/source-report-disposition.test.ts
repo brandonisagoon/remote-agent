@@ -23,7 +23,7 @@ beforeEach(async () => {
   config.webhooks[config.activeWebhookId]!.repositoryRouting[config.activeRepositoryId] = { when: [{ "linear.userId": ["owner"] }] };
   globalThis.fetch = (async (_url, init) => {
     const { query } = JSON.parse(String(init?.body));
-    if (query.includes("DeliveryComment")) { await onRead?.(); return Response.json({ data: { comment } }); }
+    if (query.includes("DeliveryComment")) { expect(query).toContain("editedAt"); await onRead?.(); return Response.json({ data: { comment } }); }
     throw new Error(`Unexpected provider request: ${query}`);
   }) as typeof fetch;
 });
@@ -34,7 +34,7 @@ async function fixture() {
   runtime.putSession({ ...session, agent: "codex", status: "idle" });
   const task = await db.prisma.remoteTask.create({ data: { requestKey: "report-task", primarySessionId: session.id, repositoryId: session.repositoryId, machineId: session.machineId, connectionId: config.activeConnectionId, issueIdentifier: "DRA-98", branchName: "codex/original", worktreePath: session.cwd, toolingRoot: "/tools", toolingRevision: "a".repeat(40), pinnedToolingRoot: "/pinned/original", phase: "waiting" } });
   await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-98", relationship: "handles" } });
-  comment = { id: "native-report", body: "Inspection completed; no cleanup ran.", parentId: null, issue: { id: "issue-98", identifier: "DRA-98" }, user: { id: "owner" }, documentContent: null, createdAt: "2026-10-29T12:51:03.780Z", updatedAt: "2026-10-29T12:51:05.412Z" };
+  comment = { id: "native-report", body: "Inspection completed; no cleanup ran.", parentId: null, issue: { id: "issue-98", identifier: "DRA-98" }, user: { id: "owner" }, documentContent: null, createdAt: "2026-10-29T12:51:03.780Z", updatedAt: "2026-10-29T12:51:05.412Z", editedAt: null };
   const source = await recordSourceMessage(db.prisma, { provider: "linear", connectionId: config.activeConnectionId, repositoryId: session.repositoryId, machineId: session.machineId, resourceId: comment.issue.id, resourceIdentifier: comment.issue.identifier, commentId: comment.id, threadRootId: comment.id, authorId: "owner", body: comment.body, presentation: {} });
   const instruction = await queueInstruction(db.prisma, { sessionId: session.id, requestId: source.id, sourceMessageId: source.id, text: `Pinned instructions\n${comment.body}` });
   const current = await db.prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: source.id } });
@@ -135,7 +135,7 @@ test("duplicate ingress preserves the external outcome while a real human edit r
   expect((await webhook(f, f.source.body, "duplicate-report")).kind).toBe("duplicate");
   expect(await db.prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: f.source.id } })).toEqual(before);
   expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.instruction.id } })).toEqual(instruction);
-  comment.body = "Please change the original behavior"; comment.updatedAt = "2026-10-29T12:52:00.000Z";
+  comment.body = "Please change the original behavior"; comment.editedAt = comment.updatedAt = "2026-10-29T12:52:00.000Z";
   expect((await webhook(f, comment.body, "human-edit")).kind).toBe("accepted");
   const rows = await db.prisma.runtimeInstruction.findMany({ orderBy: { sequence: "asc" } });
   expect(rows.map(row => row.state)).toEqual(["acknowledged", "queued"]);
@@ -201,12 +201,12 @@ test("human edits of an attested report keep distinct provider generations even 
   const f = await fixture(); expect((await f.post()).status).toBe(200);
   runtime.putSession({ ...f.session, status: "active" });
   const original = await db.prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: f.source.id } });
-  comment.body = "New actual owner instruction"; comment.updatedAt = "2026-10-29T12:53:00.000Z";
+  comment.body = "New actual owner instruction"; comment.editedAt = comment.updatedAt = "2026-10-29T12:53:00.000Z";
   expect((await webhook(f, comment.body, "edit-b")).kind).toBe("accepted");
-  comment.body = original.body; comment.updatedAt = "2026-10-29T12:54:00.000Z";
+  comment.body = original.body; comment.editedAt = comment.updatedAt = "2026-10-29T12:54:00.000Z";
   expect((await webhook(f, comment.body, "edit-back-to-a")).kind).toBe("accepted");
   await webhook(f, comment.body, "duplicate-edited-a");
-  comment.updatedAt = "2026-10-29T12:55:00.000Z";
+  comment.editedAt = comment.updatedAt = "2026-10-29T12:55:00.000Z";
   expect((await webhook(f, comment.body, "later-same-body")).kind).toBe("accepted");
   const rows = await db.prisma.runtimeSourceMessage.findMany({ orderBy: { sequence: "asc" } });
   expect(rows.map(row => row.body)).toEqual([original.body, "New actual owner instruction", original.body, original.body]);
@@ -218,7 +218,7 @@ test("human edits of an attested report keep distinct provider generations even 
 
 test("stale native-report webhook cannot suppress a changed canonical human comment", async () => {
   const f = await fixture(); expect((await f.post()).status).toBe(200);
-  comment.body = "Changed human instruction"; comment.updatedAt = "2026-10-29T12:54:00.000Z";
+  comment.body = "Changed human instruction"; comment.editedAt = comment.updatedAt = "2026-10-29T12:54:00.000Z";
   await expect(webhook(f, f.source.body, "stale-original")).rejects.toThrow("generation changed");
   expect(await db.prisma.runtimeSourceMessage.count()).toBe(1);
 });
@@ -232,4 +232,99 @@ test.each(["older-update", "changed-creation", "changed-body-same-version"])("%s
   await expect(webhook(f, comment.body, `invalid-${kind}`)).rejects.toThrow("not a later generation");
   expect(await db.prisma.runtimeSourceMessage.count()).toBe(1);
   expect(await db.prisma.runtimeInstruction.count()).toBe(1);
+});
+
+
+test("unedited provider metadata update preserves the native receipt and settles the original report once", async () => {
+  const f = await fixture();
+  comment.editedAt = null;
+  f.request.queuedReport.publication.updatedAt = "2026-10-29T12:51:03.758Z";
+  const attestation = structuredClone(f.request.queuedReport);
+  const response = await f.post();
+  const result = await response.json();
+  expect(response.status).toBe(200);
+  expect(result.receipt.evidence.attestation).toEqual(attestation);
+  expect(result.receipt.evidence.providerGeneration).toEqual({ version: 1, kind: "linear-author-edit", createdAt: comment.createdAt, updatedAt: comment.updatedAt, editedAt: null });
+  const retry = await (await f.post()).json();
+  expect(retry.receipt).toEqual(result.receipt);
+  expect(retry.replayed).toBe(true);
+  expect(await db.prisma.runtimeSourceMessageResolution.count()).toBe(1);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(f.task);
+  expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).toMatchObject({ status: "idle", cwd: f.session.cwd });
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.instruction.id } })).text).toBe(f.instruction.text);
+  expect(runtime.sentMessages).toEqual([]);
+});
+
+
+test.each(["edited-back", "missing-edit-fact", "malformed-edit-fact", "regressed-version", "changed-author", "changed-parent"])("%s cannot bridge a native creation receipt", async kind => {
+  const f = await fixture();
+  f.request.queuedReport.publication.updatedAt = "2026-10-29T12:51:03.758Z";
+  if (kind === "edited-back") comment.editedAt = "2026-10-29T12:51:04.000Z";
+  if (kind === "missing-edit-fact") delete comment.editedAt;
+  if (kind === "malformed-edit-fact") comment.editedAt = "unknown";
+  if (kind === "regressed-version") comment.updatedAt = "2026-10-29T12:51:03.700Z";
+  if (kind === "changed-author") comment.user.id = "another-owner";
+  if (kind === "changed-parent") comment.parentId = "another-thread";
+  expect((await f.post()).status).toBe(409);
+  expect(await db.prisma.runtimeSourceMessageResolution.count()).toBe(0);
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.instruction.id } })).toEqual(f.instruction);
+  expect(await db.prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: f.source.id } })).toEqual(f.source);
+});
+
+test.each(["author-edit", "metadata-update", "edit-fact-disappears"])("a second-read %s keeps the original report queued", async kind => {
+  const f = await fixture(); let reads = 0;
+  f.request.queuedReport.publication.updatedAt = "2026-10-29T12:51:03.758Z";
+  onRead = async () => {
+    if (++reads !== 2) return;
+    if (kind === "author-edit") comment.editedAt = "2026-10-29T12:51:05.000Z";
+    if (kind === "metadata-update") comment.updatedAt = "2026-10-29T12:51:06.000Z";
+    if (kind === "edit-fact-disappears") delete comment.editedAt;
+  };
+  expect((await f.post()).status).toBe(409);
+  expect(await db.prisma.runtimeSourceMessageResolution.count()).toBe(0);
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.instruction.id } })).toEqual(f.instruction);
+});
+
+test("later metadata updates do not create owner work, while edit A→B→A and edited duplicates remain distinct", async () => {
+  const f = await fixture();
+  f.request.queuedReport.publication.updatedAt = "2026-10-29T12:51:03.758Z";
+  expect((await f.post()).status).toBe(200);
+  runtime.putSession({ ...f.session, status: "active" });
+  const original = await db.prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: f.source.id } });
+  comment.updatedAt = "2026-10-29T12:52:00.000Z";
+  expect((await webhook(f, comment.body, "metadata-only")).kind).toBe("duplicate");
+  expect(await db.prisma.runtimeSourceMessage.count()).toBe(1);
+  comment.body = "New owner input"; comment.editedAt = comment.updatedAt = "2026-10-29T12:53:00.000Z";
+  expect((await webhook(f, comment.body, "actual-edit-b")).kind).toBe("accepted");
+  comment.updatedAt = "2026-10-29T12:53:01.000Z";
+  await webhook(f, comment.body, "edited-metadata-only");
+  expect(await db.prisma.runtimeSourceMessage.count()).toBe(2);
+  comment.body = original.body; comment.editedAt = comment.updatedAt = "2026-10-29T12:54:00.000Z";
+  expect((await webhook(f, comment.body, "actual-edit-a")).kind).toBe("accepted");
+  comment.updatedAt = "2026-10-29T12:54:01.000Z";
+  await webhook(f, comment.body, "back-to-a-metadata-only");
+  const rows = await db.prisma.runtimeSourceMessage.findMany({ orderBy: { sequence: "asc" } });
+  expect(rows.map(row => row.body)).toEqual([original.body, "New owner input", original.body]);
+  expect(rows[0]).toEqual(original);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(3);
+});
+
+test.each([undefined, "invalid", "2026-10-29T12:50:00.000Z"])("missing or impossible editedAt %s never becomes informational input", async editedAt => {
+  const f = await fixture(); expect((await f.post()).status).toBe(200);
+  comment.editedAt = editedAt;
+  comment.updatedAt = "2026-10-29T12:53:00.000Z";
+  await expect(webhook(f, comment.body, "unknown-generation")).rejects.toThrow();
+  expect(await db.prisma.runtimeSourceMessage.count()).toBe(1);
+});
+
+test("historical attestation without a provider edit observation keeps its old exact version contract", async () => {
+  const f = await fixture(); const result = await (await f.post()).json();
+  const { providerGeneration: _generation, ...oldEvidence } = result.receipt.evidence;
+  await db.prisma.runtimeSourceMessageResolution.update({ where: { id: result.receipt.id }, data: { evidence: oldEvidence } });
+  runtime.putSession({ ...f.session, status: "active" });
+  expect((await webhook(f, comment.body, "old-duplicate")).kind).toBe("duplicate");
+  comment.updatedAt = "2026-10-29T12:53:00.000Z";
+  expect((await webhook(f, comment.body, "old-later-generation")).kind).toBe("accepted");
+  expect(await db.prisma.runtimeSourceMessage.count()).toBe(2);
+  expect((await db.prisma.runtimeSourceMessageResolution.findUniqueOrThrow({ where: { id: result.receipt.id } })).evidence).toEqual(oldEvidence);
 });

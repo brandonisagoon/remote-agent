@@ -4,6 +4,7 @@ import type { PrismaClient, RuntimeSourceMessage } from "../../../../generated/p
 import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { assertRequestActive } from "../../request-lifetime.ts";
 import { readDeliveryComment } from "../../integrations/linear/comment-context.ts";
+import { observeLinearCommentGeneration } from "../../integrations/linear/comment-generation.ts";
 
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
 const Id = z.string().trim().min(1).max(2000);
@@ -77,11 +78,16 @@ export async function recordQueuedReportDisposition(input: { prisma: PrismaClien
   const observe = async () => {
     const current = await readDeliveryComment(scoped.linearApiKey, source.commentId);
     assertRequestActive();
-    if (!current || current.id !== publication.commentId || current.issue?.id !== publication.issueId || current.user?.id !== publication.authorId || (current.parentId ?? current.id) !== publication.threadRootId || current.body !== source.body || current.createdAt !== publication.createdAt || current.updatedAt !== publication.updatedAt) throw new Error("Published report was changed, removed or does not match the native receipt");
+    if (!current || current.id !== publication.commentId || current.issue?.id !== publication.issueId || current.user?.id !== publication.authorId || (current.parentId ?? current.id) !== publication.threadRootId || current.body !== source.body || current.createdAt !== publication.createdAt) throw new Error("Published report was changed, removed or does not match the native receipt");
+    const generation = observeLinearCommentGeneration(current);
+    // Preserve the original receipt. Only a provider-confirmed never-edited
+    // comment can bridge its creation response and a later metadata update.
+    if (Date.parse(generation.updatedAt) < Date.parse(publication.updatedAt) || (generation.updatedAt !== publication.updatedAt && generation.editedAt !== null)) throw new Error("Published report was changed, removed or does not match the native receipt");
+    return generation;
   };
-  await observe();
+  const providerGeneration = await observe();
   await currentBinding(prisma, config, source);
-  await observe();
+  if (digest(await observe()) !== digest(providerGeneration)) throw new Error("Published report generation changed during verification");
   return prisma.$transaction(async tx => {
     assertRequestActive();
     const old = await replay(tx); if (old) return old;
@@ -89,7 +95,7 @@ export async function recordQueuedReportDisposition(input: { prisma: PrismaClien
     const checked = await currentBinding(tx, config, current);
     if (checked.sourceDigest !== before.sourceDigest || digest(checked.binding) !== digest(before.binding)) throw new Error("Report changed during publication verification");
     assertRequestActive();
-    const receipt = await tx.runtimeSourceMessageResolution.create({ data: { sourceMessageId: id, requestKey: request.requestKey, fingerprint: hash, action, reason: request.reason, externalOwner: request.owner, outcome: "informational", sessionId: current.sessionId, evidence: { version: 1, attestation: report, evidence: request.evidence, sourceDigest: before.sourceDigest }, revisionSequence: current.sequence } });
+    const receipt = await tx.runtimeSourceMessageResolution.create({ data: { sourceMessageId: id, requestKey: request.requestKey, fingerprint: hash, action, reason: request.reason, externalOwner: request.owner, outcome: "informational", sessionId: current.sessionId, evidence: { version: 1, attestation: report, providerGeneration, evidence: request.evidence, sourceDigest: before.sourceDigest }, revisionSequence: current.sequence } });
     const detail = `External informational report; no managed execution (${receipt.id})`;
     const instruction = await tx.runtimeInstruction.updateMany({ where: { id: checked.instruction.id, sequence: checked.instruction.sequence, sessionId: current.sessionId!, sourceMessageId: id, state: "queued", executionRequestId: null, updatedAt: checked.instruction.updatedAt, text: checked.instruction.text }, data: { state: "acknowledged", detail } });
     if (instruction.count !== 1) throw new Error("Report instruction changed before disposition");
