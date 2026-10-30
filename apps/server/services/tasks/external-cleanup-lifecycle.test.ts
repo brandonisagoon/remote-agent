@@ -259,7 +259,7 @@ test("shared cleanup requires independent adapter absence even after a generic R
     const rawTargets = input.observations[0]!.expectedTargets ?? [{ kind: "docker-container", id: record.externalId, presentAtPrepare: true, identityDigest: "e".repeat(64), scope: { taskId: "task", purpose: "development" }, identity: { createdAt: "2026-10-30T00:00:00Z", labelsDigest: "f".repeat(64), image: "owned-image", networks: [], volumes: [] } }];
     const targets = rawTargets.map(target => { const value = CleanupTarget.parse(target); return { ...value, identityDigest: cleanupTargetDigest(value) }; });
     return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: record.id, resourceIdentityDigest: finalizationResourceIdentity(record).identityDigest,
-      dependencies: [], adapter: "docker", targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
+      dependencies: [], stoppedConsumers: [], adapter: "docker", targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
   } };
   const dependencies = { ...f.dependencies, cleanupObserver: async () => capability,
     resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, observation),
