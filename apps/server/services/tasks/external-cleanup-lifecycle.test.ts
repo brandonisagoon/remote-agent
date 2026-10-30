@@ -21,6 +21,7 @@ import { cleanupReportDelivery, cleanupProjection, publishCleanupReport } from "
 import { recordCleanupProgress } from "./cleanup-progress.ts";
 import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { enqueueTaskCleanup, cleanupInstructionAllows } from "./cleanup-inbox.ts";
+import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "external-cleanup-"))); });
@@ -89,6 +90,9 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted v2 destroy pr
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
     .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes);
   const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch }); await chmod(socket, 0o600);
+  // HTTP acknowledges full checks; the existing projection lifecycle owns their
+  // execution. Keep its real v1/v2 dispatcher and only fake external providers.
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {});
   try {
     const { taskRegistry } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
     const { finalizeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/finalize.ts"));
@@ -99,6 +103,15 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted v2 destroy pr
     };
     const first = await finalizeTask({ registry, close, cleanup: true });
     expect(first).toMatchObject({ closed: true, branch: "staging", reporting: { state: "pending" } });
+    const attempts = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-accepted" } });
+    const preparationStates = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" } });
+    expect(attempts.length).toBeGreaterThan(0);
+    expect(preparationStates.some(event => JSON.parse(event.value!).state === "failed")).toBeFalse();
+    for (const attempt of attempts) {
+      expect(JSON.parse(attempt.value!).input.finalizationVersion).toBe(2);
+      expect(preparationStates.some(event => event.key === String(attempt.sequence) && JSON.parse(event.value!).state === "ready"
+        && JSON.parse(event.value!).result.version === 2)).toBeTrue();
+    }
     const task = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } });
     expect(task).toMatchObject({ phase: "closed", branchName: "codex/original-task", toolingRevision: "a".repeat(40), primarySessionId: "primary" });
     expect(runtime.closedSessionIds).toEqual(["primary"]); expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
@@ -110,7 +123,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted v2 destroy pr
     expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(1);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
-  } finally { await server.stop(true); Object.assign(externalBindingDependencies, savedDependencies); Object.assign(cleanupReportDelivery, savedReport); }
+  } finally { await stopPreparation(); await server.stop(true); Object.assign(externalBindingDependencies, savedDependencies); Object.assign(cleanupReportDelivery, savedReport); }
 }, 30_000);
 
 test("existing v2 preparation continues in waiting/custom status with one raw receipt and one shared operation", async () => {
