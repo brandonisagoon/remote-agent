@@ -14,10 +14,12 @@ import { legacyEvidenceRoutes } from "./tasks/legacy-evidence.ts";
 import { archiveRetentionRoutes } from "./tasks/archive-retention.ts";
 import { taskRoutingRoutes } from "./tasks/routing.ts";
 import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
+import { sourceMessageRoutes } from "./source-messages.ts";
 
 export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/health", healthRoutes);
   app.route("/api/diagnostics", diagnosticsRoutes);
+  app.route("/api/source-messages", sourceMessageRoutes);
   app.route("/webhooks", webhookRoutes);
   app.route("/api/sessions", sessionRoutes);
   app.route("/api/sessions", sessionTaskRoutes);
