@@ -1,4 +1,3 @@
-import { prepareSavedData, assertSavedData, assertSavedDataPlanLinks, assertSavedDataCaptureSeparation } from "./cleanup-saved-data.ts";
 import { SavedDataSelections, SavedScratchBinding } from "./cleanup-saved-data-schema.ts";
 import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
@@ -311,6 +310,7 @@ function assertPlanDependencies(plan: FinalizationResourcePlan[]) {
 }
 
 export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; preservation?: z.infer<typeof PreservationProof>; originalWork?: boolean; adapterContext?: CleanupAdapterContext }, observation = finalizationResourceObservation) {
+  const { prepareSavedData, assertSavedDataPlanLinks, assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
   const ownership = ExternalResourceOwnership.parse(input.ownership);
   if (Boolean(ownership.preservation) !== Boolean(input.preservation) || ownership.preservation && input.preservation && finalizationDigest(ownership.preservation) !== finalizationDigest({ instruction: { id: input.preservation.instruction.id, sequence: input.preservation.instruction.sequence }, inventoryResourceId: input.preservation.inventory.resourceId, targets: input.preservation.targets })) throw new Error("Preservation requires its matching server-verified existing source proof");
   const resources = input.resources;
@@ -525,6 +525,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   const resources = input.resources;
   if (new Set(plan.map((r) => r.id)).size !== plan.length || resources.length !== plan.length || resources.length !== input.resources.length) throw new Error("Finalization resource set changed");
   assertFinalizationPlanPurposes(resources, plan);
+  const { assertSavedData } = await import("./cleanup-saved-data.ts");
   await assertSavedData({ resources, plan });
   const trees = plan.filter((entry): entry is Retirement & { target: TreeTarget } => entry.disposition === "retire-owned" && entry.target.type === "tree");
   for (const entry of plan) {
