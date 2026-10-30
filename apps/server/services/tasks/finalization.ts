@@ -241,17 +241,23 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   if (input.finalizationVersion === 2) throw new Error("Prepared cleanup lifecycle requires its original v1 preparation");
   if (input.authorityOnly) {
     const active = await assertPreparedCleanup(input);
+    if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
     if (confirmed && JSON.parse(confirmed.value!).preparedRevision !== active.preparation.sequence) throw new Error("Cleanup confirmation belongs to another preparation");
     return result(active.prepared, active.preparation.sequence, confirmed?.sequence, await cleanupArchives(input, active.task.id), active.retirementSupplement, cleanupReference(input, active));
   }
   const candidate = await inspectPreparedCleanupAuthority(input);
+  if (candidate.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: candidate.task.id, preparedRevision: candidate.preparation.sequence });
-  await bindPreparedCleanup(input, prepared => observePreparedFilesystem(input, prepared, dependencies));
+  await bindPreparedCleanup(input, prepared => {
+    if ("version" in prepared) throw new Error("External cleanup must use its v2 finalizer");
+    return observePreparedFilesystem(input, prepared, dependencies);
+  });
   // Full boundaries re-observe physical targets and retained archives. Native
   // batches explicitly request authorityOnly and avoid all these observations.
   await observePreparedFilesystem(input, candidate.prepared, dependencies);
   const active = await assertPreparedCleanup(input);
+  if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
   if (confirmed) await assertFinalizationRemoved(active.prepared);
   return result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active));
@@ -263,6 +269,7 @@ function cleanupReference(input: FinalizationContext, active: Awaited<ReturnType
 
 async function confirmCleanupFinalization(input: FinalizationContext) {
   const active = await assertPreparedCleanup(input);
+  if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   await assertFinalizationAuthority(input.prisma, input.config, active.prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
   await assertFinalizationRemoved(active.prepared);

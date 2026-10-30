@@ -22,7 +22,10 @@ const where = (taskId: string, sessionId: string, requestKey: string) => ({ runt
  * cleanup fact before closure; it neither reads nor changes Linear. */
 export async function queueCleanupReport(prisma: Database, active: Active, confirmedRevision: number) {
   const prepared = active.prepared;
-  const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. Its accepted work at ${prepared.revision} is preserved. Required task resources are retired, explicitly retained evidence remains recorded, and the original development worktree and Git registration are absent.`, evidence: [] as [] };
+  const accepted = active.kind === "v2"
+    ? `Accepted external deliveries are preserved: ${active.prepared.delivery.deliveries.map(delivery => `${delivery.url} (reviewed ${delivery.reviewedHead}, merged ${delivery.mergeCommit})`).join("; ")}.${active.prepared.originalWork ? " Unfinished original work remains preserved in its verified archive and exact quarantine; it is not claimed as delivered." : ""}`
+    : `Its accepted work at ${prepared.revision} is preserved.`;
+  const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. ${accepted} Required task resources are retired, explicitly retained evidence remains recorded, and the original development worktree and Git registration are absent.`, evidence: [] as [] };
   const report = await prisma.runtimeIssueUpdate.upsert({ where: { runtimeSessionId_requestKey: { runtimeSessionId: prepared.sessionId, requestKey: payload.requestKey } }, update: {},
     create: { runtimeSessionId: prepared.sessionId, requestKey: payload.requestKey, connectionId: prepared.connectionId, issueId: prepared.issueId, input: payload, evidence: [] } });
   if (report.connectionId !== prepared.connectionId || report.issueId !== prepared.issueId || retirementDigest(report.input) !== retirementDigest(payload) || retirementDigest(report.evidence) !== retirementDigest([])) throw new Error("Cleanup report identity already belongs to another publication");

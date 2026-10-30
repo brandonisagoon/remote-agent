@@ -125,6 +125,26 @@ async function originalFixture(recovery = false) {
   return { ...f, input: { ...f.input, binding }, dependencies, archive, archiveRecord: record, released, captureOriginal };
 }
 
+test("bound historical v2 cleanup retains approval lineage while Linear comment reads are unavailable", async () => {
+  const f = await fixture();
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  const input = { ...f.finalize, cleanup: true as const };
+  await prepareExternalFinalization(input, f.dependencies);
+  f.issue.state = f.states[1]!;
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const offline = { ...f.dependencies, source: async () => { throw new Error("Linear source unavailable"); }, comment: async () => { throw new Error("Linear comment unavailable"); } };
+  expect((await prepareExternalFinalization(input, offline)).preparedRevision).toBe(prepared.preparedRevision);
+  await f.remove();
+  const confirmed = await confirmExternalFinalization(input, offline);
+  expect(confirmed.confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "completion-owner-approval" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-cleanup-report" } })).toBe(1);
+  expect(f.issue.state.name).toBe("Blocked");
+});
+
 test("historical adoption preserves recovery archive purpose and exact archive-member retention after confirmation", async () => {
   const f = await originalFixture(true);
   const adopted = await adoptExternalDeliveries(f.input, f.dependencies);

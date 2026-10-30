@@ -5,6 +5,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { queueInstruction } from "../sessions/inbox.ts";
 import { cleanupCandidates } from "./cleanup-candidates.ts";
+import { externalOwnerHistory, latestExternalBinding } from "./external-deliveries.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
 
 export const CLEANUP_INSTRUCTION = "finalization-cleanup-instruction";
@@ -13,10 +14,14 @@ export const CleanupEnqueueInput = z.object({ requestKey: z.string().trim().min(
 export const AutomaticCleanup = z.object({ kind: z.literal("primary-inbox"), initialInstructionId: z.string() }).strict();
 export type CleanupInboxStore = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeInstruction" | "runtimeMetadataEvent" | "runtimeLifecycleEvent" | "runtimeSessionResourceLink" | "runtimeSourceMessage">;
 const Pending = ["preparing", "queued", "dispatching", "unknown"];
-const Marker = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), requestKey: z.string(),
+const MarkerIdentity = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), requestKey: z.string(),
   worktree: z.string(), repositoryId: z.string(), machineId: z.string(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable(),
-  contractRevision: z.number().int(), contractDigest: z.string(), capability: z.object({ checkout: z.string(), adapter: z.string().nullable(), capabilityRevision: z.string(), taskToolingRevision: z.string() }).passthrough(),
+  capability: z.object({ checkout: z.string(), adapter: z.string().nullable(), capabilityRevision: z.string(), taskToolingRevision: z.string() }).passthrough(),
 }).strict();
+const Marker = z.union([
+  MarkerIdentity.extend({ contractRevision: z.number().int(), contractDigest: z.string() }).strict(),
+  MarkerIdentity.extend({ externalBinding: z.object({ revision: z.number().int().positive(), digest: z.string(), ownerHistoryRevision: z.number().int().nonnegative() }).strict() }).strict(),
+]);
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'";
 export const cleanupInboxDependencies = { capability: resolveSessionToolingCapability };
@@ -29,6 +34,12 @@ async function currentMarker(store: CleanupInboxStore, saved: z.infer<typeof Mar
   const task = await store.remoteTask.findUniqueOrThrow({ where: { id: saved.taskId } });
   if (task.primarySessionId !== saved.sessionId || task.worktreePath !== saved.worktree || task.repositoryId !== saved.repositoryId || task.machineId !== saved.machineId
     || task.toolingRevision !== saved.toolingRevision || task.pinnedToolingRoot !== saved.pinnedToolingRoot || task.ownerPaused || task.phase === "closed") throw new Error("Scheduled cleanup original ownership changed or is paused");
+  if ("externalBinding" in saved) {
+    const event = await latestExternalBinding(store, task.id, saved.sessionId);
+    if (!event || event.sequence !== saved.externalBinding.revision || hash(event.value ?? "") !== saved.externalBinding.digest
+      || await externalOwnerHistory(store, task.id, saved.sessionId) !== saved.externalBinding.ownerHistoryRevision) throw new Error("Scheduled cleanup external acceptance changed");
+    return task;
+  }
   const contract = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: saved.sessionId, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
   if (!contract || contract.sequence !== saved.contractRevision || hash(contract.value ?? "") !== saved.contractDigest || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Scheduled cleanup acceptance changed");
   return task;
@@ -53,10 +64,13 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
   if (!(await cleanupCandidates(input.prisma, input.config, [task])).has(task.id)) throw new Error("Task has no current accepted cleanup scheduling candidate");
   const resolved = await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: task.primarySessionId!, capability: "cleanup" });
   if (!resolved.receipt.adapter || resolved.receipt.capability !== "cleanup" || resolved.receipt.taskToolingRevision !== task.toolingRevision) throw new Error("Configured cleanup capability has no exact adapter");
-  const contract = await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: task.primarySessionId!, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
+  const external = await latestExternalBinding(input.prisma, task.id, task.primarySessionId!);
+  const contract = external ? null : await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: task.primarySessionId!, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
+  const acceptance = external ? { externalBinding: { revision: external.sequence, digest: hash(external.value ?? ""), ownerHistoryRevision: await externalOwnerHistory(input.prisma, task.id, task.primarySessionId!) } }
+    : { contractRevision: contract!.sequence, contractDigest: hash(contract!.value ?? "") };
   const saved = Marker.parse({ version: 1, taskId: task.id, sessionId: task.primarySessionId!, requestKey: `finalize:${task.id}`,
     worktree: task.worktreePath, repositoryId: task.repositoryId, machineId: task.machineId, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot,
-    contractRevision: contract.sequence, contractDigest: hash(contract.value ?? ""), capability: resolved.receipt });
+    ...acceptance, capability: resolved.receipt });
   const text = [resolved.instructions, "", "Automatic cleanup continuation for this original primary.",
     `Use the same finalization identity ${saved.requestKey}. This scheduling instruction is not acceptance or cleanup proof.`,
     "First inspect current task activity. If another instruction or delegate needs work, stop this cleanup turn and allow the existing inbox to deliver it. Never cancel or acknowledge another instruction to make cleanup proceed.",

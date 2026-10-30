@@ -1,6 +1,6 @@
 # Cleanup uses persisted delivery authority
 
-The prepared-v1 lifecycle binds the existing `finalize:<taskId>` preparation to
+The cleanup lifecycle binds the existing `finalize:<taskId>` preparation to
 an immutable local cleanup operation. It does not replace the original
 preparation, completion contract, verification, retirement grant, retained
 evidence proof or tooling pin. A current Linear status is neither new cleanup
@@ -44,12 +44,10 @@ preparation, comment UUID and body. They reconcile a lost response without
 repeating cleanup. Pending publication never becomes a claim that publication
 succeeded, and a pause/revocation still prevents a new reporting effect.
 
-These increments cover existing preparations and first-time preparation from
-existing accepted v1 delivery authority. The shared destroy CLI,
-dependency-aware adapter scheduling and external/older delivery correspondence
-are subsequent integration work.
-It does not treat a merely Done task as accepted delivery authority, and it does not alter
-live resources or declare DRA-194 complete.
+The shared destroy CLI and dependency-aware adapter scheduling use this same
+operation. A merely Done task is not accepted delivery authority. Older external
+deliveries require their authenticated adoption and independently observed exact
+delivery/preservation plan before this operation can bind them.
 
 Validation includes real Git/SQLite fixtures and the actual Drafted control
 client over a disposable Unix socket into the server routes. The latter binds a
@@ -108,5 +106,47 @@ legacy native reconciliation observes supported source consumers and writes only
 private proof plus observation fields on their existing receipts. Unsupported
 sources remain unresolved. A real-process fixture confirms this hook precedes
 preparation without signals, new resources, pin changes or saved-data loss.
-External/v2 continuation remains the companion legacy-delivery change. No live
-teardown was performed.
+No live teardown was performed by these tests.
+
+## External delivery continuation
+
+An adopted external delivery uses the same `finalize:<taskId>` operation with
+`finalizationVersion: 2, cleanup: true`. The original v2 preparation remains
+byte-for-byte unchanged; the cleanup witness is a response overlay. Accepted
+external bindings, their owner history and independent delivery observations are
+the local authority references. A present-day acceptance may have no historical
+merge contract or verification, and its exact cleanup branch can differ from the
+recorded task branch. Neither identity is rewritten and no aggregate merge is
+invented. First preparation still checks the actual Git correspondence, provider
+delivery, preserved original work and the complete resource plan.
+
+After adoption, current Linear status and task waiting/complete phase do not
+revoke cleanup. Explicit revocation, owner pause, changed binding, original
+ownership, pin or resource identity do. Full boundaries continue to inspect
+providers, retained bytes and physical targets; `authorityOnly` renewals use only
+the common local epoch. Historical acceptance reuses its frozen owner-comment
+lineage instead of fetching Linear again; current provider checks and explicit
+local revocation remain mandatory. Retained references come from the exact frozen v2 plan.
+A Released adapter receipt is not evidence of absence: confirmation independently
+observes every physical target before recording the per-resource proofs and the
+cleanup report in one transaction. Unknown or unsupported targets remain blockers.
+
+Automatic requests reuse the original inbox with an external-binding marker;
+they do not manufacture a completion contract. The same pending-work, active-turn
+and pause guards apply. Confirmation queues a comment-only report that names each
+actual reviewed head and merge. Original unfinished bytes are described as
+preserved, not shipped. The report can retry after verified closure, with its
+original comment identity/body, without overwriting a newer source status or
+repeating cleanup.
+
+`external-cleanup-lifecycle.test.ts` covers first/existing preparations, source and
+phase changes, original branch correspondence, revocation and observation races,
+128 real Unix-control renewals under a ten-second deadline, physical adapter
+absence, confirmation/report transaction rollback, actual closure routing and
+closed reporting retries. It uses only disposable Git/SQLite fixtures and fake
+provider observations. With `DRAFTED_INTEGRATION_ROOT` set, the actual Drafted
+finalizer/control client executes the clean correspondence case, retains its PR,
+closes through the server route and retries offline reporting after restart.
+Live older tasks still require matching concrete resource
+adapters and exact ownership; this continuation layer does not exempt their
+unhandled records.
