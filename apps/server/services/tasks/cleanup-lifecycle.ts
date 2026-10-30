@@ -10,6 +10,7 @@ import { normalizeRetirementPreviewTransition } from "./retirement-preview.ts";
 import { DoneRetirementGrant } from "./delivered-retirement.ts";
 import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts";
 import type { PreparedExternalFinalization } from "./external-finalization-schema.ts";
+import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
 export const CLEANUP_EVIDENCE_SUPPLEMENT = "finalization-cleanup-evidence-supplement";
@@ -218,12 +219,14 @@ export async function assertCompletedCleanup(input: Context) {
   });
 }
 
-/** Accepted v2 plan dispositions and v1 archive proofs remain distinct. Neither
+/** Accepted v2 dispositions, v1 archive proofs and exact accepted PR history remain distinct. Neither
  * a registry Released flag nor a reported adapter result creates a proof. */
-export async function cleanupRetainedResourceIds(prisma: Database, config: ServerConfig, active: Awaited<ReturnType<typeof current>>) {
+export async function cleanupRetainedResourceIds(prisma: Database, config: ServerConfig, active: Awaited<ReturnType<typeof activeOperation>>) {
   if (active.kind === "v2") return active.retainedResourceIds;
   const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
-  return retainedArchiveResourceIds(prisma, config, active.prepared);
+  const retained = await retainedArchiveResourceIds(prisma, config, active.prepared);
+  for (const resource of cleanupDeliveryRetention(active)?.resources ?? []) retained.add(resource.id);
+  return retained;
 }
 
 /** Registry writes cannot expand an active operation or resurrect a released

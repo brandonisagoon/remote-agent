@@ -8,6 +8,7 @@ import { assertCompletedCleanup, assertPreparedCleanup } from "./cleanup-lifecyc
 import { inspectSavedCleanup } from "./cleanup-inspection.ts";
 import { cleanupProgressProjection } from "./cleanup-progress.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
+import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
 
 export const CLEANUP_REPORT = "finalization-cleanup-report";
 export const CleanupReportRequest = z.object({ requestKey: z.string().min(1).max(180) }).strict();
@@ -102,7 +103,8 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
     const active = saved.history.recordedConfirmationRevision ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
     if (active.operationRevision !== saved.history.operationRevision || retirementDigest(active.operation) !== saved.history.operationDigest) throw new Error("Cleanup operation changed during inspection");
     const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
-    return { ...history, cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
+    const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined);
+    return { ...history, ...(finalizationRetention ? { finalizationRetention } : {}), cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
       preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !report?.published) } };
   } catch (error) { return { ...history, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
 }

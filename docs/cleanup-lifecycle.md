@@ -206,3 +206,33 @@ mock provider, including one lost DNS deletion response. The read-only DRA-80
 check matches all four original records without submitting a receipt or provider
 mutation; live removal remains an original-primary acceptance step under
 DRA-127/DRA-227.
+
+# Accepted pull request history in older cleanup
+
+A v1 cleanup can retain its one original Ready pull request receipt when the
+unchanged preparation records that exact canonical GitHub URL as observed,
+matching the accepted head and merged. The already-bound cleanup operation must
+still contain the exact original resource identity and metadata. Historical
+draft, CI or head annotations are left intact; they do not replace the accepted
+delivery proof. Missing, changed, duplicate, unrelated or unbound references do
+not qualify, and every physical resource keeps its existing removal checks.
+
+The existing `finalizationRetention` task projection has an additive `version: 1`
+variant containing exactly one `retain-reference` / `pull-request` entry. It
+binds task, primary, request, preparation revision, operation revision/digest and
+the retained-array digest; confirmation revision appears only after confirmation.
+The reference's `deliveryId` is `finalizer:<taskId>:<preparedRevision>`, a locator
+for the original preparation, not a new delivery event. Existing confirmed v2
+projections are unchanged. Prepare, confirmation, progress and closure use the
+same validated operation; no preparation, operation or resource row is rewritten.
+
+The genuine v1 Git fixture first reproduced confirmation refusing the Ready PR.
+It now projects retention before removal, confirms and retries after ordinary
+clean-worktree removal, and closes with the PR and old event bytes unchanged.
+An opt-in actual Drafted/Unix control-route fixture also removes the real Git
+worktree, loses the committed confirmation response, then resumes and closes
+without a second removal or changing Ready history. Negative cases cover
+ambiguous aliases, unrelated resources, missing binding,
+identity changes, unmerged or malformed delivery, pause and revocation. Live
+acceptance remains with the original task owner; these tests create no provider
+resources or live cleanup effects.
