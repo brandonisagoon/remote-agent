@@ -60,5 +60,5 @@ export async function publishNativeReport(input: { prisma: PrismaClient; config:
     read: async (...args) => { const result = await client.read(...args); await guard(); return result; },
     create: async (...args) => { await guard(); const result = await client.create(...args); await guard(); return result; },
     comment: async (...args) => { const result = await client.comment(...args); await guard(); return result; },
-  });
+  }, { receiptId: prepared.receipt.id, assertAuthority: guard });
 }

@@ -288,6 +288,8 @@ tooling pin, pause and request lifetime are checked around provider observations
 and immediately before publication. Session IPC alone cannot use this endpoint;
 it always requires the configured owner credential. Native thread/turn identifiers
 describe the caller's attested origin, not a fabricated ACP execution.
+The generic managed issue-update route cannot replay a reserved native outbox;
+the publisher requires the native wrapper's internal receipt-bound authority.
 
 An exact signed create webhook for that reserved UUID/body is informational even
 if it arrives before publication acknowledgment. A different comment with the

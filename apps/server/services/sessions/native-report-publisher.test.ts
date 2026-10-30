@@ -136,6 +136,38 @@ test("owner-only HTTP publication uses the real outbox and denies session IPC pr
   expect(await f.prisma.runtimeInstruction.count()).toBe(0);
 });
 
+test.each([false, true])("managed HTTP replay cannot publish a reserved native report (paused=%s)", async paused => {
+  const f = await fixture();
+  f.setOnRead(async () => { throw new Error("publication observation interrupted"); });
+  await expect(f.publish()).rejects.toThrow("publication observation interrupted");
+  f.setOnRead(undefined); Object.assign(issueUpdateDelivery, f.client);
+  if (paused) await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  const receipt = await f.prisma.runtimeIssueUpdate.findFirstOrThrow();
+  const origin = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } });
+  const response = await f.app.request(`/api/sessions/${f.session.id}/issue-update`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(receipt.input) });
+  expect(response.status).toBe(409); expect((await response.json()).error).toContain(paused ? "paused or closed" : "owner-authenticated publisher");
+  expect(f.writes()).toBe(0); expect(await f.prisma.runtimeIssueUpdate.findFirstOrThrow()).toEqual(receipt);
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } })).toEqual(origin);
+  if (!paused) expect((await f.publish()).published).toBe(true);
+});
+
+test.each(["owner", "app"])("signed %s-created native publication cannot enter the inbox before its acknowledgment", async author => {
+  const f = await fixture();
+  f.client.create = async (_key, value) => {
+    expect(await readNativeReportOrigin(f.prisma, f.config.activeConnectionId, value.id!)).not.toBeNull();
+    const comment = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: author === "app" ? f.config.agentUserId : "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" };
+    const body = JSON.stringify(f.event(comment, "create", comment.user.id));
+    const secret = f.config.webhooks[f.config.activeWebhookId]!.webhookSecret;
+    const response = await f.app.request(`/webhooks/${f.config.activeWebhookId}`, { method: "POST", headers: { "content-type": "application/json", "linear-delivery": `signed-${author}-create`, "linear-signature": createHmac("sha256", secret).update(body).digest("hex") }, body });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ignored: true, reason: author === "app" ? "outside_subscription" : "native_report_publication" });
+    expect(await f.prisma.runtimeSourceMessage.count()).toBe(0); expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+    expect((await f.prisma.runtimeIssueUpdate.findFirstOrThrow()).commentPosted).toBe(false);
+    return { id: value.id! };
+  };
+  expect((await f.publish()).published).toBe(true);
+});
+
 test("later human A→B→A and same-body edits retain exact provider generations", async () => {
   const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
   const original = comment.body;
