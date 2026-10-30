@@ -1151,3 +1151,54 @@ test("automatic operation keeps exact turn protection across omitted flags, defe
   expect(explicitOwner.status).toBe(200);
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "after-confirm" } })).state).toBe("cancelled");
 });
+
+test.skipIf(process.platform !== "darwin" || !process.env.DRAFTED_PROXY_INTEGRATION_ROOT)("actual recorded proxy stop preserves bound preparation and operation through late pause and lost signal", async () => {
+  const f = await fixture("proxy-task"), client = process.env.DRAFTED_PROXY_INTEGRATION_ROOT!;
+  const { homedir } = await import("node:os");
+  const { taskRegistry } = await import(path.join(client, "src/control.ts"));
+  const { manageResource } = await import(path.join(client, "src/resources.ts"));
+  const { reconcileLegacyNativeResources, legacyNativeLink } = await import(path.join(client, "src/legacy-native.ts"));
+  const { inspectHostProcess } = await import(path.join(client, "src/runtime-transfer-host.ts"));
+  const { terminateHostProcess } = await import(path.join(client, "src/runtime-transfer-signal.ts"));
+  const environment = path.join(directory, "environments", f.task.id), script = path.join(environment, "scripts/preview-proxy.ts"), pidFile = path.join(environment, "proxy.pid");
+  await mkdir(path.dirname(script), { recursive: true });
+  const reservation = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() }), port = reservation.port!; reservation.stop(true);
+  await writeFile(script, `Bun.serve({hostname:'127.0.0.1',port:${port},fetch:()=>new Response('existing data')});\n`);
+  await writeFile(path.join(environment, "run.sh"), `#!/bin/bash\nW="${f.worktree}"\nD="${environment}"\nexport PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="${homedir()}" REMOTE_AGENT_TASK_ID=${f.task.id} TZ=UTC\ncase "$1" in\n  proxy) exec bun --no-env-file run "$D/scripts/preview-proxy.ts" ;;\nesac\n`, { mode: 0o700 });
+  await writeFile(path.join(environment, "compose.yml"), "name: exact-original\n", { mode: 0o600 });
+  const saved = path.join(environment, "retained-data"); await writeFile(saved, "original PostGIS bytes", { mode: 0o600 });
+  const child = Bun.spawn(["bun", "--no-env-file", "run", script], { cwd: f.worktree, detached: true, stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+  await writeFile(pidFile, `${child.pid}\n`);
+  const until = async (check: () => Promise<boolean>) => { const deadline = Date.now() + 5000; do { if (await check()) return; await Bun.sleep(20); } while (Date.now() < deadline); throw Error("Proxy fixture did not settle"); };
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    await until(async () => fetch(`http://127.0.0.1:${port}`).then(r => r.ok, () => false));
+    const metadata = { pid: child.pid, pidFile, script, supersedesProxyPid: 123, observed: "historical unchanged" };
+    const proxy = await db.prisma.remoteTaskResource.create({ data: { id: "original-proxy", taskId: f.task.id, key: "proxy-development-r4", kind: "local-http", purpose: "development", externalId: `http://127.0.0.1:${port}`, state: "allocated", metadata } });
+    const group = await db.prisma.remoteTaskResource.create({ data: { id: "original-compose", taskId: f.task.id, key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, state: "ready", metadata: { composeFile: path.join(environment, "compose.yml") } } });
+    const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {}), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+    const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+    const socket = path.join(directory, "proxy.sock"); server = Bun.serve({ unix: socket, fetch: app.fetch });
+    const registry = taskRegistry(socket, f.task.id, 3000), effects: number[] = []; let pause = false, loseSignal = true;
+    const provider = { inspect: inspectHostProcess, managers: async () => [], processes: async () => {
+      const rows = await inspectHostProcess(child.pid) ? [{ pid: child.pid, ppid: process.pid, pgid: child.pid, uid: process.getuid!(), cwd: f.worktree }] : [];
+      if (pause) { pause = false; await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); } return rows;
+    }, terminate: async (value: any) => { effects.push(value.pid); await terminateHostProcess(value, inspectHostProcess); } };
+    const proofDirectory = path.join(directory, "native-proof");
+    expect((await reconcileLegacyNativeResources({ registry, key: proxy.key, provider, proofDirectory })).results[0]).toMatchObject({ reconciled: true });
+    const link = legacyNativeLink((await registry.task()).resources.find((r: any) => r.id === proxy.id).metadata), proof = await readFile(link.file);
+    const stop = () => manageResource({ registry, key: proxy.key, action: "stop", serviceStop: { provider, proofDirectory, afterSignal: async () => { if (loseSignal) { loseSignal = false; throw Error("lost signal response"); } } } });
+    pause = true; await expect(stop()).rejects.toThrow(); expect(effects).toEqual([]); expect(await inspectHostProcess(child.pid)).not.toBeNull();
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    await expect(stop()).rejects.toThrow("lost signal response"); await child.exited;
+    expect(await stop()).toMatchObject({ observed: "stopped-process-family" }); expect(effects).toEqual([child.pid]);
+    const current = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: proxy.id } });
+    expect(current.state).toBe("allocated"); expect(finalizationResourceIdentity(current)).toEqual(finalizationResourceIdentity(proxy));
+    expect(legacyNativeLink(current.metadata)).toEqual(link); expect(await readFile(link.file)).toEqual(proof);
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: group.id } })).toEqual(group);
+    expect(await readFile(saved, "utf8")).toBe("original PostGIS bytes");
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(active.operation);
+    expect((await registry.task()).cleanupOperation.preparedRevision).toBe(prepared.preparedRevision);
+  } finally { const current = await inspectHostProcess(child.pid); if (current?.cwd === f.worktree) await terminateHostProcess(current, inspectHostProcess); await child.exited; await server?.stop(true); }
+}, 30000);

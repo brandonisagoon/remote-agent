@@ -265,3 +265,5 @@ The pair verifies a late pause, interrupted removal and lost aggregate receipt
 response with no new child records, metadata rewrite or preparation/operation
 event change. It uses disposable provider objects, not host Docker resources.
 No server runtime contract was added for this compatibility path.
+
+The opt-in macOS `DRAFTED_PROXY_INTEGRATION_ROOT` test in `cleanup-lifecycle.test.ts` runs the real Drafted recorded-proxy stop through the Unix task registry against a genuine v1 preparation and cleanup operation. A late database owner pause prevents signaling; a lost signal response reuses the exact private native proof without another signal. The original raw preparation/operation events, immutable resource identities, enclosing Compose receipt and saved data remain unchanged. The fixture process is disposable; it does not query or mutate a live task or provider.
