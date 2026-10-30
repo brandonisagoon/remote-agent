@@ -141,9 +141,13 @@ processes only). Sessions' MCP tools use the socket.
 
 ## Features
 
-- Workflows: `issue.state-changed` and `issue.reaction` triggers with
+- Workflows: `issue.state-changed`, `issue.reaction`, `comment.created` and
+  `comment.reaction` triggers with
   conditions, mapped to skillsets, delivered as a new session or a message
-  to the running one.
+  to the running one. Conversation deliveries queue original comments or request
+  native steering without composing a new skill.
+- [Comment delivery](docs/comment-delivery.md): durable thread replies, configured
+  queued/processing/replied reactions, and capability-checked steering controls.
 - Isolated worktrees with branch and worktree naming templates
   (`{branch}`, `{issue}`, `{title}`), per integration or per workspace.
 - Thread routing: registered threads deliver without a mention; question

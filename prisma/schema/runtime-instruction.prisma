@@ -6,6 +6,8 @@ model RuntimeInstruction {
   text      String
   state     String   @default("queued")
   detail    String?
+  sourceMessageId String? @unique
+  executionRequestId String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

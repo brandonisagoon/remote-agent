@@ -5,7 +5,7 @@ export function excerpt(text: string, limit = 240): string {
   return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
 }
 
-export function buildAgentMentionMessage(
+export function buildCommentMessage(
   sourceIssueIdentifier: string,
   authorName: string | null,
   body: string,

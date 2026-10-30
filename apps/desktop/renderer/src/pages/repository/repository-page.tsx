@@ -21,6 +21,7 @@ import { BootstrapSection, GitSection } from "./git-section.tsx";
 import { SkillsTab } from "./skills-tab.tsx";
 import { LabelsSection } from "./labels-section.tsx";
 import { WorkflowsSection } from "./workflows-section.tsx";
+import { ConversationReactionsSection } from "./conversation-reactions-section.tsx";
 import type { Mutate } from "@renderer/lib/types.ts";
 import { OpenInEditorMenu } from "@renderer/components/open-in-editor-menu.tsx";
 import {
@@ -177,6 +178,7 @@ function RepositorySettings({ id, value, mutate }: { id: string; value: ServiceF
       >
         <WorkflowsSection value={value} root={repository.tooling?.root ?? repository.root} repo={repo} />
       </SettingsSection>
+      <ConversationReactionsSection repo={repo} />
       <SettingsSection
         value="labels"
         title="Labels"

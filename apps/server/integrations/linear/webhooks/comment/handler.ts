@@ -1,8 +1,6 @@
 import type { PrismaClient } from "../../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../../../types/runtime/index.ts";
-import { createHash } from "node:crypto";
-import { mentionsAgent } from "../../index.ts";
 import { bunCommandClient } from "../../../../transports/command/index.ts";
 import { DispatchEventType } from "../../../../../../types/dispatcher/index.ts";
 import type { LinearCommentWebhook } from "../../webhook-types/index.ts";
@@ -13,6 +11,17 @@ import { deliverInstructions, queueInstruction } from "../../../../services/sess
 import { getIssueWorkGraph } from "../../session-store/source-issue/work-graph.ts";
 import { getSourceIssueParent } from "../../session-store/source-issue/read.ts";
 import { withToolingInstructions } from "../../../../../../lib/skills/compose.ts";
+import { matchWorkflows } from "../../../../workflows/match.ts";
+import { recordSourceMessage, sourceMessageId } from "../../../../services/sessions/source-messages.ts";
+import { readDeliveryComment } from "../../comment-context.ts";
+
+function messageSource(config: ServerConfig, webhook: LinearCommentWebhook) {
+  const data = webhook.data;
+  return { provider: "linear", connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId,
+    machineId: config.machine, resourceId: data.issue!.id, resourceIdentifier: data.issue!.identifier,
+    commentId: data.id, threadRootId: data.parentId ?? data.id, authorId: data.userId ?? data.user!.id,
+    body: data.body, presentation: config.repository.conversationReactions ?? {} };
+}
 
 /** A subscription without an explicit actor is not owner authorization. The
  * ingress has already checked the complete subscription before this handler. */
@@ -67,8 +76,8 @@ async function queueOwnerComment(input: {
   const data = webhook.data;
   // A Linear retry can carry a different delivery ID. An unchanged comment
   // still has one instruction, while a genuine edit is a new owner message.
-  const digest = createHash("sha256").update(data.body).digest("hex");
-  const requestId = `linear-comment:${config.activeConnectionId}:${data.id}:${digest}`;
+  const sourceInput = messageSource(config, webhook);
+  const requestId = sourceMessageId(sourceInput);
   const queued = await prisma.$transaction(async (tx) => {
     const session = await tx.runtimeSession.findUnique({ where: { id: sessionId } });
     const task = await tx.remoteTask.findUnique({ where: { primarySessionId: sessionId } });
@@ -96,15 +105,20 @@ async function queueOwnerComment(input: {
       commentId: data.id, status: "accepted", detail: `instruction:${requestId}`,
     });
     if (!receipt) return false;
+    const source = await recordSourceMessage(tx, sourceInput);
     const question = input.questionId ? await tx.runtimeQuestion.findFirst({ where: {
       id: input.questionId, runtimeSessionId: sessionId, connectionId: config.activeConnectionId,
     } }) : null;
     const previous = await tx.runtimeInstruction.findUnique({ where: { id: requestId } });
+    if (source.state !== "routing" && !previous) {
+      await tx.webhookReceipt.update({ where: { id: receipt.id }, data: { status: "ignored", detail: "comment_already_handled" } });
+      return false;
+    }
     if (previous && previous.sessionId !== sessionId) throw new Error("Owner comment is already bound to another primary");
     const prompt = `${question ? `This answers your earlier question in this thread.\nQuestion: ${question.body}\n\n` : ""}[Linear ${data.issue!.identifier}${input.parentIdentifier ? ` — direct child of ${input.parentIdentifier}` : ""} — owner comment ${data.id}]\n${data.body}`;
     // An accepted message retains its exact pinned-policy payload on retry,
     // even if the checkout becomes unavailable before acknowledgement.
-    await queueInstruction(tx, { sessionId, requestId, text: previous?.text ?? (task.pinnedToolingRoot
+    await queueInstruction(tx, { sessionId, requestId, sourceMessageId: source.id, text: previous?.text ?? (task.pinnedToolingRoot
       ? withToolingInstructions(prompt, session.cwd, task.pinnedToolingRoot) : prompt) });
     if (question) {
       await tx.runtimeQuestion.update({ where: { id: question.id }, data: { state: "answered", error: null } });
@@ -114,7 +128,7 @@ async function queueOwnerComment(input: {
   });
   // The daemon also drains this durable inbox after restart. A failed wake-up
   // cannot erase the accepted instruction or cause a blind second delivery.
-  void deliverInstructions(prisma, input.agentRuntime).catch(() => undefined);
+  void deliverInstructions(prisma, input.agentRuntime, config).catch(() => undefined);
   return queued ? { kind: "accepted", deliveryId: input.deliveryId, resourceId: data.issue!.identifier } : { kind: "duplicate" };
 }
 
@@ -133,17 +147,23 @@ export async function handleCommentWebhook(input: {
   agentRuntime: AgentSessionRuntime;
   deliveryId: string;
   webhook: LinearCommentWebhook;
+  resumeRouting?: boolean;
+  configuredControl?: boolean;
 }): Promise<CommentWebhookResult> {
-  const { prisma, config, agentRuntime, deliveryId, webhook } = input;
+  const { prisma, config, agentRuntime, deliveryId } = input;
+  let webhook = input.webhook;
+  if (!webhook.data.issue && (webhook.data.userId ?? webhook.data.user?.id) !== config.agentUserId) {
+    const source = await readDeliveryComment(config.linearApiKey, webhook.data.id);
+    if (source?.issue) webhook = { ...webhook, data: { ...webhook.data, issue: source.issue, parentId: webhook.data.parentId ?? source.parentId } };
+    input = { ...input, webhook };
+  }
   const data = webhook.data;
   const authorId = data.userId ?? data.user?.id ?? null;
   const selfAuthored = authorId === config.agentUserId;
-  const mentioned =
-    !selfAuthored &&
-    mentionsAgent(data.body, {
-      agentUserId: config.agentUserId,
-      agentHandle: config.agentHandle,
-    });
+  const commentWorkflows = matchWorkflows({ config, on: "comment.created", fields: {
+    "comment.action": webhook.action, "comment.authorId": authorId ?? undefined,
+    "issue.identifier": data.issue?.identifier,
+  } }).filter((workflow) => workflow.deliver === "queue-session");
   // Registered threads are conversations: replies deliver without a mention,
   // like replying to a person. Linear threads are single-level, so
   // parentId ?? id is the thread root.
@@ -203,27 +223,40 @@ export async function handleCommentWebhook(input: {
       }
     } else childRoutingFailure = ownership.reason;
   }
-  const accepted = !childRoutingFailure && !ownerRoutingFailure && (mentioned || registration !== null);
+  const accepted = !selfAuthored && Boolean(authorId) && !childRoutingFailure && !ownerRoutingFailure && (commentWorkflows.length > 0 || registration !== null || input.configuredControl === true);
   const detail = selfAuthored
     ? "self_authored"
     : accepted
       ? null
-      : childRoutingFailure ?? ownerRoutingFailure ?? "no_agent_mention";
-  const receipt = await createWebhookReceipt(prisma, {
+      : childRoutingFailure ?? ownerRoutingFailure ?? "no_comment_workflow";
+  const recorded = await prisma.$transaction(async (tx) => {
+  let receipt = await createWebhookReceipt(tx as PrismaClient, {
     webhookId: config.activeWebhookId,
     connectionId: config.activeConnectionId,
     repositoryId: config.activeRepositoryId,
     provider: "linear",
     deliveryId,
     eventType: "comment",
-    trigger: mentioned ? "mention" : "thread",
+    trigger: registration ? "thread" : "comment",
     resourceId: data.issue?.identifier ?? null,
     commentId: data.id,
     status: accepted ? "accepted" : "ignored",
     detail,
   });
-  if (!receipt) return { kind: "duplicate" };
+  if (!receipt && input.resumeRouting) receipt = await tx.webhookReceipt.findFirst({ where: { provider: "linear", connectionId: config.activeConnectionId, deliveryId } });
+  if (!receipt) return null;
+  const needsFeedback = !selfAuthored && isSubscribedOwner(config, authorId) && (ownerRoutingFailure || childRoutingFailure);
+  const source = data.issue && authorId && (accepted || needsFeedback) ? await recordSourceMessage(tx, messageSource(config, webhook)) : null;
+  if (!accepted && source) {
+      await tx.runtimeSourceMessage.updateMany({ where: { id: source.id, state: "routing", sessionId: null }, data: { state: "unrouted", detail,
+        replyBody: "I couldn't deliver this comment because its owning session is unavailable or ambiguous. No new task was started.", projectionPending: true } });
+  }
+  return { receipt, source };
+  });
+  if (!recorded) return { kind: "duplicate" };
   if (!accepted) return { kind: "ignored", reason: detail! };
+  const { receipt, source } = recorded;
+  if (source && source.state !== "routing") return { kind: "duplicate" };
 
   void dispatchEvent({
     prisma,
@@ -232,8 +265,9 @@ export async function handleCommentWebhook(input: {
     agentRuntime,
     receiptId: receipt.id,
     event: {
-      type: DispatchEventType.TrackerCommentMentioned,
+      type: DispatchEventType.TrackerCommentReceived,
       webhook,
+      ...(source ? { sourceMessageId: source.id } : {}),
       ...(registration
         ? {
             routedSessionId: registration.runtimeSessionId,

@@ -15,6 +15,8 @@ import type {
   AgentRuntimeLifecycleEvent,
   AgentSessionRuntime,
 } from "../../../../../types/runtime/index.ts";
+import { projectSourceReply } from "../source-messages.ts";
+import { reconcileSourceMessages, reconcileControlNotices } from "../../../integrations/linear/message-delivery.ts";
 import { AgentIssueState } from "../../../../../types/sessions/index.ts";
 import type { AgentIssueStateValue, SessionLifecycle } from "../../../../../types/sessions/index.ts";
 import {
@@ -70,13 +72,15 @@ export async function projectRuntimeEvent(
     (sequence > 0n && cursor.generation >= sequence)
   ) return true;
 
+  const sourceReply = await projectSourceReply(config, prisma, event);
+
   const session = await prisma.runtimeSession.findUnique({
     where: { id: event.sessionId },
     include: { sessionMirror: true },
   });
   const record = session?.sessionMirror;
   if (!record) {
-    if (await projectSourceCheckpoint(config, prisma, runtime, event)) {
+    if (sourceReply || await projectSourceCheckpoint(config, prisma, runtime, event)) {
       await advanceRuntimeEventCursor(prisma, { runtimeSessionId: event.sessionId, consumer: CONSUMER, sourceCursor: event.id, generation: sequence > 0n ? sequence : cursor.generation + 1n });
       return true;
     }
@@ -100,7 +104,7 @@ export async function projectRuntimeEvent(
     });
   }
 
-  if (event.phase === "completed" || event.phase === "failed") {
+  if (!sourceReply && (event.phase === "completed" || event.phase === "failed")) {
     const sourceIdentifier = parseAgentIssueSourceIdentifier(issue.description);
     const source = sourceIdentifier
       ? await getSourceIssue(config, { id: sourceIdentifier })
@@ -211,6 +215,8 @@ export async function drainRuntimeEventProjection(
 
 export function startRuntimeEventProjection(input: ProjectionInput, work = async () => {
   await drainRuntimeEventProjection(input);
+  await reconcileSourceMessages(input.config, input.prisma, input.runtime);
+  await reconcileControlNotices(input.config, input.prisma);
   await projectTaskStalls(input);
 }): () => Promise<void> {
   let running: Promise<void> | undefined;

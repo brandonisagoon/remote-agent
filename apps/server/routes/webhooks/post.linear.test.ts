@@ -18,6 +18,11 @@ const config: ServerConfig = testConfig({
   agentUserId: AGENT_USER_ID,
 });
 
+(config.repository.workflows as Record<string, import("../../../../lib/config.ts").WorkflowConfig>).comments = {
+  id: "comments", connectionId: null, on: "comment.created", when: null,
+  skill: { skillset: "", flags: [] }, deliver: "queue-session", providerId: null, model: null, plan: null,
+};
+
 let db: TestDatabase;
 let prisma: PrismaClient;
 const dispatchEvent = dispatcher.dispatchEvent;
@@ -185,6 +190,7 @@ function post(
 describe("user-scoped routing", () => {
   const requestConfig = testConfig({
     webhookSecret: SECRET,
+    repository: config.repository,
     webhooks: {
       ...config.webhooks,
       "linear-test": {
@@ -339,7 +345,7 @@ describe("description reaction trigger", () => {
 
   test.each([
     ["remove action", { action: "remove" }, "not_create"],
-    ["comment target", { target: "comment" as const }, "comment_target"],
+    ["comment target", { target: "comment" as const }, "no_matching_workflow"],
     [
       "self-authored memo",
       { userId: AGENT_USER_ID, emoji: "memo" },
@@ -438,18 +444,19 @@ describe("event filtering", () => {
     expect(await response.json()).toMatchObject({ ignored: true });
   });
 
-  test("records but ignores a comment with no mention", async () => {
+  test("ignores ordinary comments when no comment workflow or owner is configured", async () => {
     const payload = commentPayload();
     payload.data.body = "just a normal comment";
-
-    const response = await post(payload);
+    const requestConfig = structuredClone(config);
+    delete (requestConfig.repository.workflows as Record<string, unknown>).comments;
+    const response = await post(payload, { requestConfig });
 
     expect(response.status).toBe(200);
     expect(await response.json()).toMatchObject({ ignored: true });
 
     const row = await prisma.webhookReceipt.findFirst();
     expect(row?.status).toBe("ignored");
-    expect(row?.detail).toBe("no_agent_mention");
+    expect(row?.detail).toBe("no_comment_workflow");
   });
 
   test("ignores a mention the agent wrote itself, preventing a loop", async () => {
@@ -466,7 +473,7 @@ describe("event filtering", () => {
     expect(row?.detail).toBe("self_authored");
   });
 
-  test("accepts a mention and stores it pending routing", async () => {
+  test("accepts an ordinary comment and stores it pending routing", async () => {
     const response = await post(commentPayload());
 
     expect(response.status).toBe(202);
@@ -479,10 +486,10 @@ describe("event filtering", () => {
     expect(row?.status).toBe("accepted");
     expect(row?.resourceId).toBe("CUBE-2600");
     expect(row?.eventType).toBe("comment");
-    expect(row?.trigger).toBe("mention");
+    expect(row?.trigger).toBe("comment");
   });
 
-  test("accepts a threaded mention with its parent id", async () => {
+  test("accepts an ordinary threaded comment with its parent id", async () => {
     const payload = commentPayload();
     payload.data.parentId = "root-1";
 

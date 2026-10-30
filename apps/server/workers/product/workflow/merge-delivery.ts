@@ -70,7 +70,7 @@ export async function deliverManagedMerge(input: {
           source: `worker:${context.runId}`, value: JSON.stringify({ workflowId: workflow.id, state: "Merge", taskId: task.id, completionApproval: { requestKey: approval.requestKey, contractRevision: approval.contractRevision }, taskToolingRevision: task.toolingRevision, compatibility }) } });
       }
     });
-    if (context.agentRuntime) void deliverInstructions(prisma, context.agentRuntime).catch(() => undefined);
+    if (context.agentRuntime) void deliverInstructions(prisma, context.agentRuntime, config).catch(() => undefined);
     return result("delivered", `Merge queued on the existing primary; instruction ${instructionId}${compatibility ? `; compatibility ${compatibility.capabilityRevision}` : ""}`);
   } catch (error) {
     return result("failed", `Merge continuation failed: ${error instanceof Error ? error.message : String(error)}`);

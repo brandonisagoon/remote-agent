@@ -1,4 +1,6 @@
 import * as linear from "../linear/index.ts";
+import { readDeliveryComment } from "../linear/comment-context.ts";
+import { publishSourceReply, validateSourceMessageOwner } from "../linear/message-delivery.ts";
 
 /** Environment-driven workflow triggers consumed by the tracker adapter. */
 export interface TrackerTriggerConfig {
@@ -20,6 +22,12 @@ export interface TrackerTriggerConfig {
  * directory; it never invents names.
  */
 export interface TrackerPort {
+  sourceMessages: {
+    provider: string;
+    publishReply: typeof publishSourceReply;
+    readComment: typeof readDeliveryComment;
+    validateOwner: typeof validateSourceMessageOwner;
+  };
   verifyWebhookSignature: typeof linear.verifyLinearSignature;
   webhook: {
     envelopeSchema: typeof linear.LinearWebhookEnvelopeSchema;
@@ -42,8 +50,7 @@ export interface TrackerPort {
     comment: typeof linear.reactToComment;
     issue: typeof linear.reactToIssue;
   };
-  mentions: {
-    matchesAgent: typeof linear.mentionsAgent;
+  commentContext: {
     fetchContext: typeof linear.fetchCommentContext;
   };
   sessions: {
@@ -63,6 +70,7 @@ export interface TrackerPort {
 }
 
 export const tracker: TrackerPort = {
+  sourceMessages: { provider: "linear", publishReply: publishSourceReply, readComment: readDeliveryComment, validateOwner: validateSourceMessageOwner },
   verifyWebhookSignature: linear.verifyLinearSignature,
   webhook: {
     envelopeSchema: linear.LinearWebhookEnvelopeSchema,
@@ -85,8 +93,7 @@ export const tracker: TrackerPort = {
     comment: linear.reactToComment,
     issue: linear.reactToIssue,
   },
-  mentions: {
-    matchesAgent: linear.mentionsAgent,
+  commentContext: {
     fetchContext: linear.fetchCommentContext,
   },
   sessions: {
