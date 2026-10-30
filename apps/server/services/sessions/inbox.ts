@@ -117,7 +117,8 @@ export async function queueInstruction(prisma: Pick<PrismaClient, "runtimeInstru
 }
 
 async function sourceAuthorityAllows(prisma: PrismaClient, config: ServerConfig | undefined, receipt: { id: string; sourceMessageId: string | null }) {
-  if (!receipt.sourceMessageId || !config) return true;
+  if (!receipt.sourceMessageId) return true;
+  if (!config) return false;
   try {
     const { tracker } = await import("../../integrations/tracker/port.ts");
     const source = await prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: receipt.sourceMessageId } });
@@ -170,6 +171,9 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         if (visited.has(receipt.sessionId)) continue;
         visited.add(receipt.sessionId);
         if (running.has(receipt.id)) continue;
+        // Legacy callers may drain non-source instructions without config;
+        // comment-origin work always requires current integration authority.
+        if (receipt.sourceMessageId && !config) continue;
         if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown", "preparing"] } } })) continue;
         const session = await runtime.getSession(receipt.sessionId);
         if (!session || session.status === "closed") {

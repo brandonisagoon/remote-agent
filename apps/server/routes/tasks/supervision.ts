@@ -43,7 +43,7 @@ taskSupervisionRoutes.post("/:taskId/instructions", async (c) => {
   if (!session || session.status === "closed") return c.json({ error: "Session is unavailable or closed" }, 409);
   try {
     const instruction = await queueInstruction(prisma, { sessionId: session.id, requestId: `task:${task.id}:${parsed.data.requestKey}`, text: parsed.data.text });
-    void deliverInstructions(prisma, runtime).catch(() => undefined);
+    void deliverInstructions(prisma, runtime, c.get("config")).catch(() => undefined);
     return c.json({ instruction }, 202);
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
