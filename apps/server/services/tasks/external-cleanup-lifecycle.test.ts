@@ -51,16 +51,26 @@ test("128 actual control-route renewals stay local, preserve retention, and enfo
     const response = await fetch("http://local/api/tasks/task/prepare-finalization", { unix: socket, method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request), signal: AbortSignal.timeout(1000) });
     return { status: response.status, body: await response.json() };
   };
+  const compact = async () => {
+    const response = await fetch("http://local/api/tasks/task/cleanup-authority", { unix: socket, method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ requestKey: request.requestKey, finalizationVersion: 2 }), signal: AbortSignal.timeout(1000) });
+    return { status: response.status, body: await response.json() };
+  };
   try {
     const before = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), start = performance.now();
     for (let batch = 0; batch < 128; batch++) {
       if (batch === 64) await db.prisma.$disconnect();
       expect(await renew()).toEqual({ status: 200, body: bound });
     }
+    const acknowledged = await compact();
+    expect(acknowledged).toEqual({ status: 200, body: { version: 1, taskId: bound.taskId, sessionId: bound.sessionId,
+      requestKey: bound.requestKey, preparedRevision: bound.preparedRevision, cleanup: bound.cleanup } });
+    expect(JSON.stringify(acknowledged.body).length).toBeLessThan(512);
     expect(performance.now() - start).toBeLessThan(10_000); expect(taskReads).toBe(0);
     expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(before);
     await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
     expect((await renew()).status).toBe(409);
+    expect((await compact()).status).toBe(409);
   } finally { await server.stop(true); }
 }, 30_000);
 
