@@ -9,7 +9,7 @@ import { getRepositoryConfig, scopeConfig, type ServerConfig } from "../../../..
 import { fetchIssueCommentIdentity, fetchQualifiedIssueComment } from "../../integrations/linear/comments.ts";
 import { linkedSourceIssue } from "../sessions/questions.ts";
 import { CompletionContractInput } from "./completion.ts";
-import { completionObservation } from "./completion-observation.ts";
+import { observeReadonlyCompletionSnapshot } from "./completion-observation.ts";
 import { EXTERNAL_BINDING, EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryBindingInput, ExternalTaskIdentity, externalDigest } from "./external-delivery-schema.ts";
 import { externalDeliveryObservation, observeExternalDeliveries } from "./external-delivery-observation.ts";
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
@@ -19,7 +19,7 @@ export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
   delivered: observeDeliveredScope, cleanupObserver: resolveCleanupObserver,
-  handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
+  handoffComment: fetchIssueCommentIdentity, snapshot: observeReadonlyCompletionSnapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem

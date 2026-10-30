@@ -1,12 +1,13 @@
+import { assertOriginalAdministration, prepareOriginalAdministration } from "./original-work-administration.ts";
 import { archiveMember as member, readArchiveBytes as bytes, observeArchive as archiveObservation } from "./archive-observation.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import { observeCompletionSnapshot } from "./completion-observation.ts";
+import { originalWorkGit as git, originalWorkTextGit as textGit, originalWorkDirtySnapshot as dirtySnapshot } from "./original-work-git.ts";
 import { assertFinalizationPath, assertFinalizationTree, finalizationDigest, finalizationInventory, finalizationResourceIdentity, finalizationResourceObservation, inspectFinalizationQuarantine, RetainedArchivePlan, RetainedArchiveMemberPlan, RetainedResultPlan, type RetainedMaterialPlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
-import { OriginalWork, OriginalWorkInput, OriginalWorkSnapshot, type RecoveryWorkInput } from "./original-work-schema.ts";
+import { OriginalWork, OriginalWorkInput, type RecoveryWorkInput } from "./original-work-schema.ts";
 import { observeRecoveryArchive, assertRecoveryContents, recoveryTarMembers } from "./recovery-archive.ts";
 import { restoreRecoveryTar, type RecoveryTarMember } from "./recovery-tar.ts";
 
@@ -22,28 +23,6 @@ export function originalWorkRetainedPlans(originalWork: OriginalWork, resources:
     ...(proof.retainedArchiveMembers ?? []).map(member => RetainedArchiveMemberPlan.parse({ ...identity(member.resourceId, member.identityDigest), disposition: "retain-archive-member", archive: { resourceId: member.archiveResourceId, root: proof.archive.root, inventoryDigest: proof.archive.inventoryDigest }, file: { path: member.path, size: member.size, sha256: member.sha256 } })),
   ];
 }
-async function git(cwd: string, args: string[]) {
-  const child = Bun.spawn(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
-    cwd, env: { PATH: process.env.PATH ?? "", HOME: os.tmpdir(), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-  });
-  let timedOut = false; const timeout = setTimeout(() => { timedOut = true; child.kill(9); }, 30_000);
-  const bounded = async (stream: ReadableStream<Uint8Array>, limit: number) => {
-    const reader = stream.getReader(), chunks: Uint8Array[] = []; let length = 0;
-    try { while (true) { const { value, done } = await reader.read(); if (done) return Buffer.concat(chunks); length += value.byteLength; if (length > limit) { child.kill(9); throw new Error("Original-work Git output exceeded its bound"); } chunks.push(value); } }
-    finally { reader.releaseLock(); }
-  };
-  try {
-    const [out, err, code] = await Promise.all([bounded(child.stdout, MAX_BYTES), bounded(child.stderr, 1024 * 1024), child.exited]);
-    if (timedOut || code !== 0 || out.byteLength > MAX_BYTES || err.byteLength > 1024 * 1024) throw new Error("Original-work Git proof failed");
-    return Buffer.from(out);
-  } finally { clearTimeout(timeout); }
-}
-const textGit = async (cwd: string, args: string[]) => (await git(cwd, args)).toString().trimEnd();
-const snapshot = (cwd: string) => observeCompletionSnapshot(cwd, { async run(command, args, options) {
-  if (command !== "git" || !options?.cwd) throw new Error("Unexpected original-work observation command");
-  return { ok: true, stdout: (await git(options.cwd, args)).toString(), stderr: "" };
-} });
-
 /** Decode only regular files/directories. Never extract archive-supplied links,
  * devices, absolute names or traversal paths through a host tar command. */
 export function originalWorkTar(buffer: Buffer) {
@@ -89,15 +68,6 @@ export function originalWorkTar(buffer: Buffer) {
   return files;
 }
 
-async function dirtySnapshot(worktree: string) {
-  const observed = await snapshot(worktree);
-  const indexPatch = await git(worktree, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "--cached", "HEAD"]);
-  const worktreePatch = await git(worktree, ["diff", "--binary", "--no-ext-diff", "--no-textconv"]);
-  const paths = (await git(worktree, ["ls-files", "--others", "--exclude-standard", "-z"])).toString().split("\0").filter(Boolean).sort();
-  const untracked = [];
-  for (const relative of paths) { const file = member(worktree, relative), content = await bytes(file); untracked.push({ path: relative, size: content.length, sha256: sha(content), executable: Boolean((await lstat(file)).mode & 0o111) }); }
-  return OriginalWorkSnapshot.parse({ ...observed, indexPatchSha256: sha(indexPatch), worktreePatchSha256: sha(worktreePatch), untracked });
-}
 
 export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
   const selection = OriginalWorkInput.parse(input.originalWork);
@@ -176,6 +146,7 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
   const directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
   const proof = OriginalWork.parse({ version: 1, captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(additionalArchives.length ? { additionalArchives } : {}), ...(retainedResults.length ? { retainedResults } : {}), snapshot, restore,
     target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
+  proof.administration = await prepareOriginalAdministration(input.taskId, proof);
   await assertOriginalWork({ taskId: input.taskId, originalWork: proof, resources: input.resources, removed: false }, observation);
   return proof;
 }
@@ -256,6 +227,7 @@ async function prepareRecoveryOriginalWork(input: RecoveryOriginalInput, observa
   await observation.rootIdle(worktree);
   const inventory = await finalizationInventory(worktree, [worktree], new Map(), new Map()), directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
   const proof = OriginalWork.parse({ version: 1, captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, format: selection.format, recovery: selection, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(retainedArchiveMembers.length ? { retainedArchiveMembers } : {}), snapshot: original, restore, target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
+  proof.administration = await prepareOriginalAdministration(input.taskId, proof);
   await assertOriginalWork({ taskId: input.taskId, originalWork: proof, resources: input.resources, removed: false }, observation);
   return proof;
 }
@@ -288,4 +260,5 @@ export async function assertOriginalWork(input: { taskId: string; originalWork: 
   if (!capture.captured && finalizationDigest(await dirtySnapshot(proof.target.path)) !== finalizationDigest(proof.snapshot)) throw new Error("Original staged, unstaged or untracked state changed since adoption");
   await observation.rootIdle(proof.target.path);
   if (capture.captured) await observation.rootIdle(capture.physicalPath);
+  if (proof.administration) await assertOriginalAdministration({ taskId: input.taskId, originalWork: proof, administration: proof.administration, removed: input.removed }, observation);
 }

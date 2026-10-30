@@ -66,6 +66,8 @@ test("ignored original material requires explicit ownership and remains in full 
 });
 test("confirmation requires exact whole-root capture and keeps archive and branch recoverable", async () => {
   const f = await fixture(), proof = await prepareOriginalWork(f.input, noProcesses), target = proof.target;
+  // Historical source-only receipt remains confirmable after its registration was already retired.
+  delete proof.administration;
   await expect(assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: true }, noProcesses)).rejects.toThrow("not been preserved");
   const root = target.inventory.find((entry) => entry.path === ".")!;
   await mkdir(target.quarantine.directory, { mode: 0o700 }); const location = await lstat(target.quarantine.directory);
@@ -125,4 +127,25 @@ test("additional runtime archives need exact JSON root, member digests and immut
   expect(proof.additionalArchives?.[0]?.resourceId).toBe(record.id);
   await writeFile(path.join(archive, "record.json"), "[]");
   await expect(assertOriginalWork({ taskId: "task", resources: input.resources, originalWork: proof, removed: false }, noProcesses)).rejects.toThrow("manifest");
+});
+
+test("new original receipts preserve exact index and both captures without Git removal", async () => {
+  const f = await fixture(), proof = await prepareOriginalWork(f.input, noProcesses), admin = proof.administration!;
+  const originalIndex = await readFile(admin.git.index.path);
+  const capture = async (target: typeof proof.target) => {
+    const source = target.inventory[0]!;
+    await mkdir(target.quarantine.directory, { mode: 0o700 }); const location = await lstat(target.quarantine.directory);
+    await writeFile(target.quarantine.journal, JSON.stringify({ version: 1, taskId: "task", resourceId: proof.captureId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path,
+      source: { dev: source.dev, ino: source.ino, mode: source.mode }, quarantine: { dev: location.dev, ino: location.ino } }), { mode: 0o600 });
+    await rename(target.path, target.quarantine.path);
+  };
+  await capture(proof.target);
+  await expect(assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: true }, noProcesses)).rejects.toThrow("exact administration");
+  await capture(admin.administrationCapture);
+  await assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: true }, noProcesses);
+  expect(await readFile(path.join(admin.administrationCapture.quarantine.path, "index"))).toEqual(originalIndex);
+  expect(originalGit(f.product, ["worktree", "list", "--porcelain"]).toString()).not.toContain(f.worktree);
+  expect(originalGit(f.product, ["rev-parse", "refs/heads/codex/task"]).toString().trim()).toBe(proof.snapshot.head);
+  await writeFile(path.join(admin.administrationCapture.quarantine.path, "index"), "changed retained index");
+  await expect(assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: true }, noProcesses)).rejects.toThrow();
 });

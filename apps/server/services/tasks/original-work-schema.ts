@@ -1,6 +1,6 @@
 import path from "node:path";
 import { z } from "zod";
-import { FinalizationInventoryEntry, FinalizationTreeTarget } from "./finalization-resources.ts";
+import { FinalizationInventoryEntry, FinalizationTreeTarget, LinkedWorktreePlan } from "./finalization-resources.ts";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const Sha = z.string().regex(/^[a-f0-9]{40}$/);
@@ -35,6 +35,8 @@ export const OriginalWorkArchive = z.object({ resourceId: z.string(), identityDi
   recovery: RecoveryWorkInput.optional(),
   inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), inventoryDigest: Digest }).strict();
 const RestoreIdentity = { gitDirectory: Absolute, head: Sha, indexTree: Sha, workingTree: Sha, fingerprint: Digest };
+export const OriginalWorkAdministration = LinkedWorktreePlan.pick({ git: true, administrationCapture: true }).strict();
+export type OriginalWorkAdministration = z.infer<typeof OriginalWorkAdministration>;
 export const OriginalWork = z.object({ version: z.literal(1), captureId: z.string().min(1),
   archive: OriginalWorkArchive,
   additionalArchives: z.array(OriginalWorkArchive).max(20).optional(),
@@ -46,5 +48,14 @@ export const OriginalWork = z.object({ version: z.literal(1), captureId: z.strin
     z.object({ ...RestoreIdentity, format: z.literal("base-work-tar/v1"), baseArchiveSha256: Digest, workArchiveSha256: Digest }).strict(),
   ]),
   target: FinalizationTreeTarget,
+  administration: OriginalWorkAdministration.optional(),
 }).strict();
 export type OriginalWork = z.infer<typeof OriginalWork>;
+
+export const OriginalAdministrationProof = z.object({
+  version: z.literal(1), taskId: z.string().min(1), sessionId: z.string().min(1), requestKey: z.string().min(1),
+  preparedRevision: z.number().int().positive(), preparedDigest: z.string().regex(/^[a-f0-9]{64}$/), originalWorkDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  administration: OriginalWorkAdministration.nullable(),
+}).strict();
+export const OriginalAdministrationReceipt = z.object({ revision: z.number().int().positive(), digest: z.string().regex(/^[a-f0-9]{64}$/), proof: OriginalAdministrationProof }).strict();
+export type OriginalAdministrationReceipt = z.infer<typeof OriginalAdministrationReceipt>;
