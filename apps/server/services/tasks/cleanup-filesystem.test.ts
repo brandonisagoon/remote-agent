@@ -176,3 +176,27 @@ test.skipIf(!draftedRoot)("native last-window replacement preserves both trees a
   expect(await readFile(path.join(moved, "private.env"), "utf8")).toBe("PRIVATE_FIXTURE=preserved\n");
   expect(await readFile(path.join(tree.target.quarantine.path, "new-material"), "utf8")).toBe("new bytes");
 });
+
+test.skipIf(!draftedRoot)("actual prepared client executes the server directory plan and retries lost capture acknowledgment", async () => {
+  const f = await fixture(), plan = await f.prepare(), tree = rootPlan(plan);
+  const { releasePreparedResources } = await import(path.join(draftedRoot!, "src/finalization-resources.ts"));
+  const { assertResourcePlan, FinalizationResourcePlan: ClientPlan } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(f.directory, "original-worktree"), toolingRevision: "a".repeat(40), phase: "waiting", finalizationVersion: 2, resources: f.resources };
+  const prepared = adapterReceipt(task, plan.map(entry => ClientPlan.parse(entry))), writes: string[] = [];
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    writes.push(update.key); Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  let once = true;
+  const run = () => releasePreparedResources({ registry, prepared, observation: quiet, assertAuthority: () => f.verify(plan),
+    assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, captureHooks: { afterCapture: () => { if (once) { once = false; throw new Error("lost server/client capture response"); } } } });
+  const partial = await run(); expect(partial.results.every((entry: { outcome: string }) => entry.outcome === "failed")).toBeTrue();
+  expect(writes).toEqual([]); await f.verify(plan);
+  const captured = await lstat(tree.target.quarantine.path), journal = await readFile(tree.target.quarantine.journal);
+  const retried = await run(); expect(retried.results.every((entry: { outcome: string }) => entry.outcome === "retired-to-recoverable-quarantine")).toBeTrue();
+  await f.verify(plan, true); await run(); await f.verify(plan, true);
+  expect(writes).toEqual(["task-env", "capture", "private-env"]);
+  expect((await lstat(tree.target.quarantine.path)).ino).toBe(captured.ino);
+  expect(await readFile(tree.target.quarantine.journal)).toEqual(journal);
+  expect(await readFile(path.join(tree.target.quarantine.path, "private.env"), "utf8")).toBe("PRIVATE_FIXTURE=preserved\n");
+});

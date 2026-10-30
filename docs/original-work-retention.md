@@ -145,3 +145,49 @@ cleanup adapters. DRA42's current Done state still needs the separately supporte
 retirement/adoption path and exact plans for its remaining physical resources.
 Deploy the server publisher before selecting the matching immutable Drafted
 client; an old strict client refuses the added format/disposition.
+
+## Additional registered linked checkouts
+
+A `retire-worktree` plan covers an exact existing `git-worktree` resource and
+its owner-selected path. It freezes the main/common Git directory identities,
+per-worktree administrative directory, registration, HEAD and branch (including
+an explicitly detached checkout), `.git` pointer and index. Dirty, split-index,
+sparse and submodule states require a separate preservation plan and are refused.
+No reset, relabel, prune, forced removal or branch deletion is authorized.
+
+The whole checkout moves into its existing retained-quarantine protocol. Every
+source and ignored file is inventoried, except exact untracked `node_modules`
+directories with tracked package and lock files. Those dependency directories
+remain in the capture, bound by directory identity and package/lock hashes; their
+individual installed files are not content-hashed or deleted. All other ignored
+material remains fully hashed.
+
+Before capture and normal unregister, the client must publish a complete private
+copy of the small administrative directory, including `index`, `logs/HEAD`,
+`ORIG_HEAD` and any other observed regular files. The source inventory is bounded
+to 256 entries, 16 MiB per file and 64 MiB total. The frozen destination must
+contain exactly those bytes, with private directories/files; partial copies,
+extra material, links and changed source administration cannot be acknowledged.
+The shared common repository and its branches stay intact. Confirmation requires
+the retained checkout and administration, original-path absence and exact Git
+registration/administrative-path absence. A generic Released receipt proves none
+of these facts.
+
+Process checks enumerate bounded NUL-delimited open-handle records rather than
+recursively traversing every installed dependency. Any handle or command naming
+the checkout/capture rejects inactivity; unknown filesystem names and observation
+errors also reject it. Darwin's explicitly typed anonymous pipes, network-policy
+and nexus descriptors do not name filesystem nodes. The type distinction comes
+from [XNU's process descriptor types](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info.h)
+and [lsof's Darwin pipe observer](https://github.com/apple-oss-distributions/lsof/blob/main/lsof/dialects/darwin/libproc/dfile.c).
+There is no process-ID or read-only-directory-handle exemption.
+
+Disposable Darwin and Linux fixtures cover branch/detached registration, complete
+administration preservation, copy/source substitution, captured-root retries,
+package/lock changes and an actual process retaining its working directory. A
+read-only DRA98 preflight covered all three linked checkouts, with six retained
+opaque dependency roots each, and fully hashed 1.26–2.04 GB of other bytes per
+checkout. The final run took 9.0–19.6 seconds per checkout. DRA8's review check
+correctly refused its still-running API/web handles. These observations do not
+adopt a plan, stop processes or remove any live checkout. Other unsupported task
+resources still require their own exact plan before whole-task adoption.

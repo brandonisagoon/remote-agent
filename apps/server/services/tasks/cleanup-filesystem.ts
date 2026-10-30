@@ -26,6 +26,27 @@ function referencePaths(value: unknown, depth = 0): string[] {
   if (value && typeof value === "object") return Object.values(value).flatMap(item => referencePaths(item, depth + 1));
   return [];
 }
+export function captureAdapterDependencies(root: string, resources: FinalizationResourceRecord[], plan: FinalizationResourcePlan[]) {
+  const dependencies = new Set<string>(), stoppedConsumers = new Set<string>();
+  for (const adapter of plan.filter(entry => entry.disposition === "retire-adapter")) {
+    for (const target of adapter.targets) {
+      const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file] : [];
+      if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
+    }
+    const record = resources.find(other => other.id === adapter.id)!;
+    if (![...referencePaths(record.metadata), ...referencePaths(adapter.targets)].some(file => within(root, file))) continue;
+    if (adapter.targets.some(target => target.kind === "native-family")) stoppedConsumers.add(adapter.id);
+    else dependencies.add(adapter.id);
+  }
+  return { dependencies: [...dependencies].sort(), stoppedConsumers: [...stoppedConsumers].sort() };
+}
+export function assertCapturedDependencies(entry: { dependencies: string[]; stoppedConsumers: string[] }, resources: FinalizationResourceRecord[], observed?: z.infer<typeof CleanupObserverBatchResult>) {
+  for (const id of entry.dependencies) if (resources.find(record => record.id === id)?.state !== "released") throw new Error("Captured directory still has an unreleased dependent adapter");
+  for (const id of entry.stoppedConsumers) {
+    const consumer = observed?.observations.find(entry => entry.resourceId === id), families = consumer?.targets.filter(target => target.kind === "native-family") ?? [];
+    if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Captured directory still has an active or unverified native consumer");
+  }
+}
 
 async function privateRoot(root: string) {
   await assertFinalizationPath(root);
@@ -50,11 +71,8 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
     if (input.protectedPaths.some(file => overlaps(root, file)) || roots.some(other => other.id !== resource.id && overlaps(root, other.externalId))) throw new Error("Registered directory overlaps a protected or another capture root");
     for (const entry of input.plan) {
       if (entry.disposition === "retain-archive" && overlaps(root, entry.archive.root) || entry.disposition === "retain-archive-member" && within(root, entry.file.path)) throw new Error("Retained archive must survive outside registered cleanup roots");
-      if (entry.disposition === "retire-adapter") for (const target of entry.targets) {
-        const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file] : [];
-        if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
-      }
     }
+    const edges = captureAdapterDependencies(root, input.resources, input.plan);
     await privateRoot(root);
     await observation.rootIdle(root);
     const children = input.resources.filter(other => other.id !== resource.id && path.isAbsolute(other.externalId) && within(root, other.externalId));
@@ -65,16 +83,9 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
       const stat = await lstat(path.join(root, entry.path));
       if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 && entry.kind !== "symlink") throw new Error("Registered inventory contains unowned or shared writable material");
     }
-    const dependencies = new Set<string>(), stoppedConsumers = new Set<string>();
-    for (const adapter of input.plan.filter(entry => entry.disposition === "retire-adapter")) {
-      const record = input.resources.find(other => other.id === adapter.id)!;
-      if (![...referencePaths(record.metadata), ...referencePaths(adapter.targets)].some(file => within(root, file))) continue;
-      if (adapter.targets.some(target => target.kind === "native-family")) stoppedConsumers.add(adapter.id);
-      else dependencies.add(adapter.id);
-    }
     const directory = path.join(path.dirname(root), `.drafted-finalization-${randomUUID()}`);
     const tree = RegisteredTreePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-tree", treeKind: "registered-directory",
-      dependencies: [...dependencies].sort(), stoppedConsumers: [...stoppedConsumers].sort(), target: { type: "tree", path: root, inventory, sourcePaths: [root],
+      ...edges, target: { type: "tree", path: root, inventory, sourcePaths: [root],
         quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
     result.push(tree);
     for (const child of children) {
@@ -95,9 +106,9 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
 /** This query is local authority, not a filesystem observer. It also runs on
  * renewals so another task cannot acquire a recorded path inside the capture. */
 export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
-  const roots = plan.filter((entry): entry is Tree => entry.disposition === "retire-tree");
+  const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree");
   if (!roots.length) return;
-  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory]);
+  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.retainedAdministration.path] : [])]);
   const ancestors = new Set<string>();
   for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
   const shared = await prisma.remoteTaskResource.findFirst({ where: { taskId: { not: taskId }, OR: [
@@ -117,14 +128,7 @@ export async function assertRegisteredCaptures(input: { taskId: string; resource
     const captured = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target: tree.target });
     if ((input.removed || record.state === "released") && !captured.captured) throw new Error("Registered directory has no verified retained capture");
     await assertFinalizationTree(tree.target, captured.physicalPath);
-    if (captured.captured) for (const id of tree.dependencies) {
-      if (input.resources.find(record => record.id === id)?.state !== "released") throw new Error("Captured directory still has an unreleased dependent adapter");
-    }
-    if (captured.captured) for (const id of tree.stoppedConsumers) {
-      const observed = input.adapterObservation?.observations.find(entry => entry.resourceId === id);
-      const families = observed?.targets.filter(target => target.kind === "native-family") ?? [];
-      if (!observed || !families.length || families.some(target => observed.presentTargetDigests.includes(target.identityDigest))) throw new Error("Captured directory still has an active or unverified native consumer");
-    }
+    if (captured.captured) assertCapturedDependencies(tree, input.resources, input.adapterObservation);
     for (const child of children.filter(child => child.parentResourceId === tree.id)) {
       const current = input.resources.find(record => record.id === child.id)!;
       const relative = path.relative(tree.target.path, child.target.path), member = tree.target.inventory.find(member => member.path === relative);

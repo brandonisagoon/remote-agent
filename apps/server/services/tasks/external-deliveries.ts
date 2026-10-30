@@ -150,7 +150,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
     for (const entry of plan) {
-      if (entry.disposition !== "retire-tree" && entry.disposition !== "retire-owned" || entry.target.type !== "tree") continue;
+      if (entry.disposition !== "retire-tree" && entry.disposition !== "retire-worktree" && entry.disposition !== "retire-owned" || entry.target.type !== "tree") continue;
       const root = entry.target.path;
       if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some((archive) => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Archive and original-work capture must stay outside every other cleanup root");
     }
