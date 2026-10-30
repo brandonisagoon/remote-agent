@@ -12,6 +12,7 @@ import { OriginalWork, OriginalWorkInput, type RecoveryWorkInput } from "./origi
 import { observeRecoveryArchive, assertRecoveryContents, recoveryTarMembers } from "./recovery-archive.ts";
 import { restoreRecoveryTar, type RecoveryTarMember } from "./recovery-tar.ts";
 import { assertMacArchiveMetadata } from "./apple-double.ts";
+import { preparationStage } from "./preparation-diagnostics.ts";
 
 const MAX_BYTES = 512 * 1024 * 1024;
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -275,16 +276,18 @@ export async function assertOriginalWork(input: { taskId: string; originalWork: 
     const record = input.resources.find((entry) => entry.id === result.resourceId);
     if (!record || record.state === "released" || finalizationResourceIdentity(record).identityDigest !== result.identityDigest || sha(await bytes(result.provenancePath)) !== result.provenanceSha256) throw new Error("Historical result identity or provenance changed");
   }
-  await assertFinalizationPath(proof.restore.gitDirectory);
-  if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
-  for (const prerequisite of "prerequisiteCommits" in proof.restore ? proof.restore.prerequisiteCommits : []) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
-  const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
-  await assertInstalledDependencies(proof.target, proof.installedDependencies ?? [], proof.captureId, capture.physicalPath);
-  await assertFinalizationTree(proof.target, capture.physicalPath);
-  if (input.removed && !capture.captured) throw new Error("Original work has not been preserved in quarantine");
-  if (!capture.captured && finalizationDigest(await dirtySnapshot(proof.target.path)) !== finalizationDigest(proof.snapshot)) throw new Error("Original staged, unstaged or untracked state changed since adoption");
-  const idle = proof.installedDependencies?.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle;
-  await idle(proof.target.path);
-  if (capture.captured) await idle(capture.physicalPath);
-  if (proof.administration) await assertOriginalAdministration({ taskId: input.taskId, originalWork: proof, administration: proof.administration, removed: input.removed }, observation);
+  await preparationStage("original-worktree", async () => {
+    await assertFinalizationPath(proof.restore.gitDirectory);
+    if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
+    for (const prerequisite of "prerequisiteCommits" in proof.restore ? proof.restore.prerequisiteCommits : []) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
+    const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
+    await assertInstalledDependencies(proof.target, proof.installedDependencies ?? [], proof.captureId, capture.physicalPath);
+    await assertFinalizationTree(proof.target, capture.physicalPath);
+    if (input.removed && !capture.captured) throw new Error("Original work has not been preserved in quarantine");
+    if (!capture.captured && finalizationDigest(await dirtySnapshot(proof.target.path)) !== finalizationDigest(proof.snapshot)) throw new Error("Original staged, unstaged or untracked state changed since adoption");
+    const idle = proof.installedDependencies?.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle;
+    await idle(proof.target.path);
+    if (capture.captured) await idle(capture.physicalPath);
+  });
+  if (proof.administration) await preparationStage("git-administration", () => assertOriginalAdministration({ taskId: input.taskId, originalWork: proof, administration: proof.administration!, removed: input.removed }, observation));
 }

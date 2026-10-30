@@ -3,7 +3,7 @@ import { realpath } from "node:fs/promises";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
-import { assertExternalBindingAuthority, assertExternalResourceRecords, externalBindingDependencies, latestExternalBinding, observeBoundExternalDelivery, type ExternalDependencies } from "./external-deliveries.ts";
+import { assertExternalBindingAuthority, assertExternalResourceRecords, externalBindingDependencies, latestExternalBinding, observeBoundExternalDelivery, requestExternalObservations, type ExternalDependencies } from "./external-deliveries.ts";
 import { EXTERNAL_OBSERVATION, ExternalBinding, externalDigest } from "./external-delivery-schema.ts";
 import { FinalizationResourcePlan, assertFinalizationResources, finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { FINALIZATION_CONFIRMED, FINALIZATION_PREPARED, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing, type FinalizationContext } from "./finalization-receipts.ts";
@@ -110,6 +110,7 @@ async function resources(input: Context, prepared: PreparedExternalFinalization,
 
 
 export async function prepareExternalFinalization(input: Context, dependencies = externalBindingDependencies): Promise<Awaited<ReturnType<typeof externalFinalizationResult>>> {
+  dependencies = requestExternalObservations(dependencies);
   if (input.finalizationVersion !== 2) throw new Error("External delivery requires finalizationVersion 2; v1 cannot authorize cleanup");
   const { task, binding, revision } = await loadExternalBinding(input);
   if (input.cleanup) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
@@ -244,6 +245,7 @@ async function confirmExternalCleanup(input: Context, dependencies: ExternalDepe
 }
 
 export async function confirmExternalFinalization(input: Context, dependencies = externalBindingDependencies) {
+  dependencies = requestExternalObservations(dependencies);
   if (input.finalizationVersion !== 2) throw new Error("External delivery requires finalizationVersion 2; v1 cannot confirm cleanup");
   if (input.authorityOnly) throw new Error("Authority-only checks cannot confirm finalization");
   const owned = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });

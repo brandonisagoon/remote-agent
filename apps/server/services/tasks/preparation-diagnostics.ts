@@ -1,7 +1,7 @@
 import { assertRequestActive, enterRequestStage } from "../../request-lifetime.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export type PreparationStage = "source" | "delivery" | "fingerprint" | "retained-archives" | "persistence" | "verification" | "response" | "ownership" | "resource-plan" | "activity-history" | "activity-session" | "activity";
+export type PreparationStage = "source" | "delivery" | "fingerprint" | "retained-archives" | "persistence" | "verification" | "response" | "ownership" | "resource-plan" | "resource-verification" | "original-worktree" | "git-administration" | "activity-history" | "activity-session" | "activity";
 const currentStage = new AsyncLocalStorage<PreparationStage>();
 export type PreparationDiagnostic = { stage: PreparationStage; event: "start" | "end"; activeStage: PreparationStage | null; outcome?: "succeeded" | "failed"; failedStage?: PreparationStage; elapsedMs?: number };
 const observer = new AsyncLocalStorage<{ record: (value: PreparationDiagnostic) => Promise<void>; failures: Map<unknown, PreparationStage> }>();
