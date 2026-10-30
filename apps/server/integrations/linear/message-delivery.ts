@@ -54,8 +54,16 @@ export async function publishSourceReply(config: ServerConfig, prisma: PrismaCli
       const existing = await fetchIssueCommentIdentity(scoped.linearApiKey, input.id);
       if (existing?.issue?.id !== input.issueId || existing.body !== input.body || existing.parentId !== input.parentId) throw new Error("Reply publication is unconfirmed; the outbox will reconcile the same comment ID");
     }
-    await prisma.runtimeSourceMessage.update({ where: { id }, data: { replyPosted: true, projectionPending: true } });
-    if (message.sessionId) await registerThread(prisma, { provider: message.provider, connectionId: message.connectionId,
+    // Operator recovery can replace an unrouted failure notice with a fresh
+    // conversational outbox while this network request is in flight. Its old
+    // acknowledgement must never mark the new answer as published.
+    const confirmed = await prisma.$transaction(async (tx) => {
+      const current = await tx.runtimeSourceMessage.updateMany({ where: { id, replyId: message.replyId, replyBody: message.replyBody },
+        data: { replyPosted: true, projectionPending: true } });
+      if (!current.count) await tx.runtimeSourceMessageResolution.updateMany({ where: { sourceMessageId: id, priorReplyId: message.replyId }, data: { priorReplyPosted: true } });
+      return current.count > 0;
+    });
+    if (confirmed && message.sessionId) await registerThread(prisma, { provider: message.provider, connectionId: message.connectionId,
       runtimeSessionId: message.sessionId, threadRootCommentId: message.threadRootId });
   });
   publishing.set(id, run);
@@ -74,7 +82,7 @@ export async function projectMessageReactions(config: ServerConfig, prisma: Pris
     for (const value of Object.values(previous.presentation as Record<string, string>)) managed.add(value);
     if (Array.isArray(previous.projectedReactions)) for (const value of previous.projectedReactions) if (typeof value === "string") managed.add(value);
   }
-  if (!managed.size) return;
+  if (!managed.size) return true;
   const scoped = scopeConfig(config, { connectionId: message.connectionId, repositoryId: message.repositoryId });
   const state = { queued: "queued", processing: "processing", failed: "failed", unknown: "attention", attention: "attention", unrouted: "attention" }[message.state];
   const desired = new Set([state ? mapping[state] : null, message.replyPosted ? mapping.replied : null].filter((value): value is string => Boolean(value)));
@@ -100,7 +108,20 @@ export async function projectMessageReactions(config: ServerConfig, prisma: Pris
       "mutation RemoveDeliveryReaction($id: String!) { reactionDelete(id: $id) { success } }", { id: reaction.id });
     if (!deleted.reactionDelete.success) throw new Error("Old reaction removal was not confirmed");
   }
-  await prisma.runtimeSourceMessage.updateMany({ where: { id: message.id, updatedAt: message.updatedAt }, data: { projectedReactions: [...desired] } });
+  const projected = await prisma.runtimeSourceMessage.updateMany({ where: { id: message.id, updatedAt: message.updatedAt }, data: { projectedReactions: [...desired] } });
+  // A newer projection may already have finished while our stale network
+  // writes were pending. Schedule the current truth again even in that case.
+  if (!projected.count) await prisma.runtimeSourceMessage.update({ where: { id: await reactionSourceId(prisma, message) }, data: { projectionPending: true } });
+  return projected.count > 0;
+}
+
+async function reactionSourceId(prisma: PrismaClient, message: RuntimeSourceMessage) {
+  const identity = { provider: message.provider, connectionId: message.connectionId, commentId: message.commentId };
+  const latest = await prisma.runtimeSourceMessage.findFirstOrThrow({ where: identity, orderBy: { sequence: "desc" } });
+  const recovery = await prisma.runtimeSourceMessageResolution.findFirst({ where: { action: "retry", sourceMessage: identity }, orderBy: { sequence: "desc" } });
+  // A canonical recovery may select an earlier-arriving revision. Its explicit
+  // selection remains authoritative until genuinely new ingress arrives.
+  return recovery?.revisionSequence != null && latest.sequence <= recovery.revisionSequence ? recovery.sourceMessageId : latest.id;
 }
 
 export async function reconcileSourceMessages(config: ServerConfig, prisma: PrismaClient, runtime?: AgentSessionRuntime) {
@@ -124,7 +145,7 @@ export async function reconcileSourceMessages(config: ServerConfig, prisma: Pris
         }
         continue;
       }
-      const latest = await prisma.runtimeSourceMessage.findFirst({ where: { provider: message.provider, connectionId: message.connectionId, commentId: message.commentId }, orderBy: { sequence: "desc" } });
+      const projectionId = await reactionSourceId(prisma, message);
       try {
         let pendingReply = false;
         if (message.replyBody && !message.replyPosted) {
@@ -132,7 +153,12 @@ export async function reconcileSourceMessages(config: ServerConfig, prisma: Pris
           catch { pendingReply = true; }
         }
         message = await prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: message.id } });
-        if (latest?.id === message.id) await projectMessageReactions(config, prisma, message);
+        if (projectionId === message.id && !(await projectMessageReactions(config, prisma, message))) continue;
+        const currentProjectionId = await reactionSourceId(prisma, message);
+        if (projectionId === message.id && currentProjectionId !== message.id) {
+          await prisma.runtimeSourceMessage.update({ where: { id: currentProjectionId }, data: { projectionPending: true } });
+          continue;
+        }
         // Reaction writes update updatedAt: reread before the compare-and-swap.
         const current = await prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: message.id } });
         if (!pendingReply && current.state === message.state && current.replyPosted === message.replyPosted) await prisma.runtimeSourceMessage.updateMany({ where: { id: current.id, updatedAt: current.updatedAt }, data: { projectionPending: false } });

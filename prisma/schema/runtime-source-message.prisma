@@ -28,9 +28,36 @@ model RuntimeSourceMessage {
   projectedReactions Json     @default("[]")
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
+  resolutions        RuntimeSourceMessageResolution[]
 
   @@index([provider, connectionId, commentId, sequence])
   @@index([sessionId, requestId])
+}
+
+/// Operator recovery is distinct from provider execution and native-chat work.
+model RuntimeSourceMessageResolution {
+  sequence           Int @id @default(autoincrement())
+  id                 String @unique @default(uuid())
+  sourceMessageId    String
+  requestKey         String
+  fingerprint        String
+  action             String
+  reason             String
+  authorityRef       String?
+  sessionId          String?
+  externalOwner      Json?
+  outcome            String?
+  evidence           Json
+  /// Local arrival high-water mark at explicit recovery, not provider edit order.
+  revisionSequence   Int?
+  priorReplyId       String? @unique
+  priorReplyBody     String?
+  priorReplyPosted   Boolean @default(false)
+  createdAt          DateTime @default(now())
+  sourceMessage      RuntimeSourceMessage @relation(fields: [sourceMessageId], references: [id], onDelete: Restrict)
+
+  @@unique([sourceMessageId, requestKey])
+  @@index([sourceMessageId, sequence])
 }
 
 /// A control can arrive before its comment webhook; replay is idempotent.

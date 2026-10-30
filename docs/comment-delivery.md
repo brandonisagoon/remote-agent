@@ -87,6 +87,65 @@ of differences in final prose. `publish_issue_update` remains a separate,
 intentional task progress/review update. Workflow turns without a comment origin
 retain their existing checkpoint behavior.
 
+## Retained comments and operator recovery
+
+An unrouted source is retained with its original body, origin and failure reply.
+Linking an owner later or replaying an unchanged webhook does not automatically
+execute it. Use the authenticated operator API to inspect and resolve that gap:
+
+- `GET /api/source-messages` lists the local machine's retained messages, defaulting
+  to `state=unrouted`. Optional `connectionId`, `repositoryId` and
+  `resourceIdentifier` filters select the source. `limit` (1–100) and
+  `afterSequence` paginate deterministically; follow `nextAfterSequence`.
+- `GET /api/source-messages/:sourceId` returns the immutable body/origin, current
+  issue-linked managed owners, publication provenance and recovery history.
+  URL-encode the opaque source ID. A native Codex chat reference is never a
+  managed-session registration; `nativeCodexChatTransport` is `unsupported`.
+- `POST /api/source-messages/:sourceId/external-disposition` records an operator's
+  attestation that a native chat handled, was assigned, or merely reported the
+  message, or that it still `needs-action`. Supply `requestKey`,
+  `expectedUpdatedAt`, `reason`, `owner: { kind: "native-codex-chat", threadId,
+  hostId }`, `outcome` (`handled`, `assigned`, `informational`, `needs-action`)
+  and nonempty `evidence` references. This appends an audit receipt and leaves
+  the source `unrouted` with no managed session or execution request. It does
+  not contact or verify that chat and is never proof of server delivery.
+- `POST /api/source-messages/:sourceId/retry` requires `requestKey`,
+  `expectedUpdatedAt`, `reason`, an explicit `authorityRef` and `sessionId`.
+  The operator must establish that replay is authorized and still needed.
+  Only a unique eligible existing primary linked to that exact issue is
+  supported. Current subscription, source content/revision, task and thread
+  ownership are checked again; ambiguous, stale, closed or mismatched owners
+  are rejected. Parent-owned child recovery is not supported by this endpoint.
+  An existing instruction, including an uncertain one, cannot be replayed
+  through it; inspect and resolve that instruction through the existing task
+  supervisor instead. A recorded external outcome other than `needs-action`
+  also prevents retry.
+
+Retry atomically archives the original failure reply's UUID/body/publication
+receipt, creates a fresh answer outbox, and queues one instruction through the
+existing inbox. Its canonical revision also owns reaction presentation until
+new input arrives; a delayed obsolete edit cannot mask the recovered queue or
+reply. A late acknowledgement for the old failure can only confirm the
+archived receipt. HTTP 202 means accepted durably, not actively processing or
+replied. Busy/paused tasks retain the queue and the owner's pause. A repeated
+identical request key returns its receipt; different content under that key is
+rejected. Re-inspect after a 409 conflict. No bulk retry or replacement primary
+is created, and existing task tooling pins are preserved.
+
+Only scoped server-held publication UUIDs identify known agent output (issue
+updates, questions, source replies or control notices). Such output cannot be
+retried as a human command through recovery. Connector-authored native chat
+reports may use the same Linear account as a human and have no server receipt;
+their origin remains unverified. Neither prose nor author name establishes
+agent origin or human authority. Record external handling from actual evidence;
+do not automatically suppress or replay those comments.
+
+These endpoints use the existing operator boundary: network bearer authentication
+or the private local control socket. They add no native Codex transport and make
+no comment/reaction publication for an external disposition. The additive
+`20261030063000_source_message_recovery` migration creates only the resolution
+receipt table; it does not modify retained comments or existing sessions.
+
 ## Steering capability
 
 The owner's configured control reaction requests steering; it is not a receipt
