@@ -37,6 +37,12 @@ async function family(store: CleanupInboxStore, task: RemoteTask) {
   return store.runtimeSession.findMany({ where: { cwd: task.worktreePath!, repositoryId: task.repositoryId, machineId: task.machineId } });
 }
 
+// Closed delegates cannot receive more work. Keep their uncertain delivery
+// history intact; live runtime activity is still checked before cleanup effects.
+function pendingFamilyIds(task: RemoteTask, sessions: Array<{ id: string; status: string; role: string | null }>) {
+  return sessions.filter(session => session.id === task.primarySessionId || session.role !== "delegate" || session.status !== "closed").map(session => session.id);
+}
+
 /** An automatic request is a durable inbox instruction, never effect authority.
  * Its immutable capability is resolved outside the enqueue transaction. */
 export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; requestKey: string }, dependencies = cleanupInboxDependencies) {
@@ -102,7 +108,7 @@ export async function cleanupInstructionAllows(store: CleanupInboxStore, receipt
     await store.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "cancelled", detail: "Scheduled cleanup ownership or accepted delivery changed; no cleanup effects ran." } });
     return false;
   }
-  const sessions = await family(store, task), ids = sessions.map(session => session.id);
+  const sessions = await family(store, task), ids = pendingFamilyIds(task, sessions);
   const pending = await store.runtimeInstruction.findMany({ where: { sessionId: { in: ids }, id: { not: receipt.id }, state: { in: Pending } } });
   if (pending.some(instruction => instruction.sessionId === receipt.sessionId)) {
     await store.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "cancelled", detail: "Cleanup deferred to another original-primary instruction; that instruction is preserved." } });
@@ -128,7 +134,7 @@ export async function automaticCleanupTurn(store: CleanupInboxStore, task: Remot
     const observed = runtime.observeSessionActivity?.(instruction.sessionId);
     if (observed?.state !== "executing" || observed.requestId !== instruction.executionRequestId) throw new Error("Automatic cleanup is not the current executing turn");
   }
-  const sessions = await family(store, task), ids = sessions.map(session => session.id);
+  const sessions = await family(store, task), ids = pendingFamilyIds(task, sessions);
   if (await store.runtimeInstruction.count({ where: { sessionId: { in: ids }, id: { not: instruction.id }, state: { in: Pending } } })) throw new Error("Automatic cleanup yields to pending task instructions");
   if (sessions.some(session => session.id !== task.primarySessionId && !["idle", "closed"].includes(session.status)
     || session.id !== task.primarySessionId && runtime?.observeSessionActivity && runtime.observeSessionActivity(session.id).state !== "unknown")) throw new Error("Automatic cleanup yields to active delegates");
