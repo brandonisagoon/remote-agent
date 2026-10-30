@@ -1,4 +1,5 @@
 import path from "node:path";
+import { legacyNeonReviewScope } from "./legacy-neon-scope.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { z } from "zod";
 import { assertClerkResourceSharing } from "./cleanup-clerk.ts";
@@ -62,6 +63,18 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     const ancestors = new Set<string>();
     for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
     if (await prisma.remoteTask.findFirst({ where: { OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: `${scope}${path.sep}` } }))] } })) throw new Error("Legacy environment overlaps a registered task worktree");
+  } else if (resources.length === 1 && resources[0]!.kind === "neon-branch-database") {
+    const resource = resources[0]!, scope = legacyNeonReviewScope({ id: active.task.id, resources: active.binding.resources }, resource);
+    const claims = await prisma.remoteTaskResource.findMany({ where: { kind: { in: ["neon-branch-database", "neon-branch", "task-runtime"] }, state: { not: "released" } }, take: 10001 });
+    if (claims.length > 10000) throw new Error("Neon ownership inventory exceeds its bounded scope");
+    for (const claim of claims) {
+      const metadata = z.record(z.string(), z.unknown()).parse(claim.metadata ?? {});
+      const direct = claim.externalId === resource.externalId || claim.kind === "neon-branch" && claim.externalId === scope.branchId;
+      const providers = Array.isArray(metadata.providers) ? metadata.providers : [];
+      const branchClaim = providers.some(value => value && typeof value === "object" && (value as { provider?: unknown }).provider === "neon" && (value as { id?: unknown }).id === scope.branchId);
+      if ((direct || branchClaim) && (claim.taskId !== active.task.id || claim.id !== resource.id
+        || finalizationResourceIdentity(claim).identityDigest !== identities[0]!.identityDigest)) throw new Error("Neon database or branch is shared with another active resource");
+    }
   } else {
     const resource = resources[0]!;
     const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
