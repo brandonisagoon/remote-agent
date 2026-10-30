@@ -103,6 +103,17 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       const unfinished = [];
       for (const child of graph.children) {
         if (child.state.type === "canceled" || (child.state.type === "completed" && child.state.name !== "Manual Review")) continue;
+        // Review readiness is not completed delivery. Reuse the owning primary's
+        // latest successful handoff, including historical receipts, without
+        // treating unrelated provider metadata edits as invalidated verification.
+        if (target.name === "Manual Review" && child.state.name === "Manual Review") {
+          const review = await prisma.runtimeIssueUpdate.findFirst({ where: { runtimeSessionId: sessionId, issueId: child.id, connectionId: link.connectionId, published: true }, orderBy: { updatedAt: "desc" } });
+          const saved = review ? IssueUpdateInput.safeParse(review.input) : null;
+          const captures = review ? z.array(EvidenceReceipt).safeParse(review.evidence) : null;
+          if (review?.commentPosted && saved?.success && saved.data.state === "Manual Review" && captures?.success
+            && captures.data.length === saved.data.evidence.length && captures.data.every((file, index) =>
+              file.path === saved.data.evidence[index]!.path && file.title === saved.data.evidence[index]!.title && file.assetUrl && file.attachmentId)) continue;
+        }
         // Review may explicitly expose blocked child work, but Merge/Done may
         // not silently treat it as delivered. Require a published child receipt
         // so a bare stale status is not a substitute for the actual blocker.
