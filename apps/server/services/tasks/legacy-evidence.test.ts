@@ -608,7 +608,8 @@ test.skipIf(!draftedRoot || process.platform !== "darwin")("actual stopped nativ
       for (const resource of writer.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: task.id } });
     } });
     const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies), receipt = await f.adopt();
-    const before = await db.prisma.runtimeMetadataEvent.findMany({ where: { OR: [{ sequence: f.prepared.preparedRevision }, { action: { in: ["cleanup-operation", "saved-archives-retained"] } }] }, orderBy: { sequence: "asc" } });
+    const before = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-archive-retention"] } }, orderBy: { sequence: "asc" } });
+    expect(before.length).toBe(3);
     const tree = receipt.proof.entries.find(isEvidenceTree)!;
     legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
     evidenceWriterObservation.resolve = async () => ({ version: 1, source: "configured-host", checkout: draftedRoot!, revision: "a".repeat(40), adapter: path.join(draftedRoot!, "src/cli.ts"), adapterSha256: "a".repeat(64) });

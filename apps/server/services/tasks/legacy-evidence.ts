@@ -210,13 +210,15 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
     const prepared = await prepareAuthority();
     if (prepared.preparedRevision !== proof.preparedRevision || "version" in prepared) throw new Error("Legacy evidence finalization authority changed");
   }
+  await inspectLegacyEvidenceCapture(proof, entry, operation.action === "confirm" || Boolean(prior));
+  // Hash saved copies first; fresh writer and open-handle observations should
+  // be next to the final authority check, not before a potentially long scan.
   let assertWritersUnchanged: Awaited<ReturnType<typeof assertLegacyEvidenceWriters>> | undefined;
   if (isEvidenceTree(entry) && operation.action !== "inspect") {
     assertWritersUnchanged = await (dependencies.writers ?? assertLegacyEvidenceWriters)({ prisma: input.prisma, config: input.config, task, entry });
     await finalizationResourceObservation.rootIdle(entry.target.path);
     await finalizationResourceObservation.rootIdle(entry.target.quarantine.path);
   }
-  await inspectLegacyEvidenceCapture(proof, entry, operation.action === "confirm" || Boolean(prior));
   if (operation.action !== "inspect") {
     const fresh = await prepareAuthority();
     if (fresh.preparedRevision !== proof.preparedRevision || "version" in fresh) throw new Error("Legacy evidence finalization authority changed during observation");
