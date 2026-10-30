@@ -21,10 +21,11 @@ export async function cleanupStatusReceipt(prisma: Pick<PrismaClient, "runtimeIs
   return receipt;
 }
 
-export async function assertCleanupStatusHandoff(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; body: string; state?: string; expectedState?: string; evidence?: unknown[] }) {
+export async function assertCleanupStatusHandoff(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; issueId: string; connectionId: string; requestKey: string; body: string; state?: string; expectedState?: string; evidence?: unknown[] }) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
   const requestKey = `finalize:${task.id}`;
   const active = await assertPreparedCleanup({ ...input, requestKey });
+  if (active.prepared.issueId !== input.issueId || active.prepared.connectionId !== input.connectionId) throw new Error("Cleanup status belongs to the original prepared source issue");
   if (await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${task.id}`, action: FINALIZATION_CONFIRMED, key: requestKey } })) throw new Error("Cleanup start publication is superseded by confirmed cleanup");
   const payload = cleanupStatusPayload(active);
   if (retirementDigest({ requestKey: input.requestKey, body: input.body, state: input.state, expectedState: input.expectedState, evidence: input.evidence ?? [] }) !== retirementDigest(payload)) throw new Error("Cleanup status requires the existing prepared handoff");
