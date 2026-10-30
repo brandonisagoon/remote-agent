@@ -1,3 +1,4 @@
+import { publishCleanupStatus } from "../../services/tasks/cleanup-status.ts";
 import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
 import { CleanupEnqueueInput, enqueueTaskCleanup } from "../../services/tasks/cleanup-inbox.ts";
 import { CleanupRetryDeferred } from "../../services/tasks/cleanup-retry.ts";
@@ -55,6 +56,13 @@ taskRoutes.post("/:taskId/cleanup-progress", async (c) => {
   const parsed = CleanupProgressInput.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Use the bound cleanup operation and bounded resource diagnostics" }, 400);
   try { return c.json(await recordCleanupProgress({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), progress: parsed.data })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+taskRoutes.post("/:taskId/cleanup-status", async c => {
+  const request = CleanupReportRequest.safeParse(await c.req.json());
+  if (!request.success) return c.json({ error: "Use the existing finalization requestKey; cleanup status is server-owned" }, 400);
+  try { return c.json(await publishCleanupStatus({ ...request.data, prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
