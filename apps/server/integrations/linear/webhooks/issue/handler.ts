@@ -11,6 +11,7 @@ import {
 import { dispatchEvent } from "../../../../services/dispatcher/index.ts";
 import { matchWorkflows } from "../../../../workflows/match.ts";
 import { createWebhookReceipt } from "../../../../services/receipts/store.ts";
+import { isCleanupResumeWebhook } from "../../../../services/tasks/cleanup-resume-webhook.ts";
 
 export type { IssueWebhookResult } from "../../webhook-types/index.ts";
 
@@ -29,6 +30,7 @@ export async function handleIssueWebhook(input: {
 
   const stateName = data.state?.name;
   if (!stateName) return { kind: IssueWebhookResultKind.Ignored };
+  if (await isCleanupResumeWebhook(prisma, config, webhook)) return { kind: IssueWebhookResultKind.Ignored };
   const matched = matchWorkflows({
     config,
     on: "issue.state-changed",

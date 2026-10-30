@@ -5,12 +5,24 @@ import { CompletionContractInput, CompletionVerificationInput, inspectTaskComple
 import { ExternalDeliveryBindingInput } from "../../services/tasks/external-delivery-schema.ts";
 import { adoptExternalDeliveries, inspectExternalDeliveries } from "../../services/tasks/external-deliveries.ts";
 import { inspectRetirementAuthority, RetirementAuthorityInput, setRetirementAuthority } from "../../services/tasks/retirement-authority.ts";
+import { CleanupResumeInput } from "../../services/tasks/cleanup-resume-schema.ts";
+import { inspectCleanupResume, resumePreparedCleanup } from "../../services/tasks/cleanup-resume.ts";
 
 export const taskCompletionRoutes = new Hono<AppEnv>();
 
 // Unlike normal task/session IPC, contract writes always require the owner's
 // API credential, including on the otherwise trusted local control socket.
 taskCompletionRoutes.use("/:taskId/completion/*", apiAuthMiddleware());
+taskCompletionRoutes.get("/:taskId/completion/cleanup-resume", async (c) => {
+  try { return c.json(await inspectCleanupResume({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+taskCompletionRoutes.post("/:taskId/completion/cleanup-resume", async (c) => {
+  const parsed = CleanupResumeInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "The existing preparation and exact cleanup-resume binding are required", details: parsed.error.issues }, 400);
+  try { return c.json(await resumePreparedCleanup({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), resume: parsed.data })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 taskCompletionRoutes.get("/:taskId/completion/retirement", async (c) => {
   try { return c.json(await inspectRetirementAuthority({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }

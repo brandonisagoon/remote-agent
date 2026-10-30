@@ -10,7 +10,7 @@ export const LinearIssueWebhookSchema = z.object({
     id: z.string(),
     identifier: z.string(),
     assigneeId: z.string().nullish(),
-    state: z.object({ name: z.string(), type: z.string() }).nullish(),
+    state: z.object({ id: z.string().optional(), name: z.string(), type: z.string() }).nullish(),
     team: z.object({ key: z.string() }).nullish(),
   }),
   updatedFrom: z.object({ stateId: z.string().nullish() }).nullish(),
