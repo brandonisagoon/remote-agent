@@ -6,6 +6,7 @@ import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { ArchiveRetentionProof } from "./archive-retention-schema.ts";
 import { assertPreparedCleanup, cleanupRetainedResourceIds } from "./cleanup-lifecycle.ts";
+import { assertPrivateExportScope } from "./cleanup-private-export-scope.ts";
 
 export const CleanupResourceKeys = z.array(z.string().min(1).max(100)).min(1).max(100)
   .refine(keys => new Set(keys).size === keys.length, "Cleanup resource keys must be unique");
@@ -62,6 +63,8 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     const ancestors = new Set<string>();
     for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
     if (await prisma.remoteTask.findFirst({ where: { OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: `${scope}${path.sep}` } }))] } })) throw new Error("Legacy environment overlaps a registered task worktree");
+  } else if (resources.length === 1 && resources[0]!.kind === "private-file") {
+    await assertPrivateExportScope(prisma, active, resources[0]!.key);
   } else {
     const resource = resources[0]!;
     const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
