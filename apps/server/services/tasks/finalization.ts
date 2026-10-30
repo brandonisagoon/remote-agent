@@ -6,6 +6,8 @@ import { assertCompletionAllowed } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { latestExternalBinding } from "./external-deliveries.ts";
 import { prepareExternalFinalization, confirmExternalFinalization } from "./external-finalization.ts";
+import { observeRetirementDelivery } from "./retirement-authority.ts";
+import { assertRetirementAuthority, latestRetirement } from "./retirement-receipts.ts";
 import {
   FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization,
   assertFinalizationAuthority, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing,
@@ -14,7 +16,7 @@ import {
 
 export const FinalizationInput = z.object({ requestKey: z.string().trim().min(1).max(180), finalizationVersion: z.literal(2).optional(), authorityOnly: z.literal(true).optional() }).strict().refine((value) => !value.authorityOnly || value.finalizationVersion === 2, "Authority-only checks require finalization version 2");
 export const finalizationDependencies = { source: linkedSourceIssue, completion: assertCompletionAllowed, snapshot: completionObservation.snapshot };
-type Dependencies = typeof finalizationDependencies;
+type Dependencies = typeof finalizationDependencies & { retirementRemote?: typeof observeRetirementDelivery };
 
 async function owned(input: FinalizationContext) {
   FinalizationInput.parse({ requestKey: input.requestKey });
@@ -24,12 +26,22 @@ async function owned(input: FinalizationContext) {
   return task;
 }
 
-async function sourceAuthority(input: FinalizationContext, taskId: string, dependencies: Dependencies) {
+async function sourceAuthority(input: FinalizationContext, taskId: string, dependencies: Dependencies): Promise<Awaited<ReturnType<typeof linkedSourceIssue>> & { retirementAuthority?: PreparedFinalization["retirementAuthority"] }> {
   const source = await dependencies.source(input);
   if (source.issue.state.name === "Merge") return source;
   // A lost close response after successful publication may be retried, but a
   // bare Done state is not authority to clean up somebody else's delivery.
   if (source.issue.state.name === "Done") {
+    if (await latestRetirement(input.prisma, taskId, input.sessionId)) {
+      const { grant, reference } = await assertRetirementAuthority(input.prisma, input.config, taskId, input.sessionId, source.issue.id);
+      const contract = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: grant.binding.contractRevision } });
+      await (dependencies.retirementRemote ?? observeRetirementDelivery)(grant.delivery, grant.binding.branch, JSON.parse(contract.value!).reviewRequired ?? false);
+      // A remote observation can take time; refresh mutable owner authority.
+      await assertRetirementAuthority(input.prisma, input.config, taskId, input.sessionId, source.issue.id, reference);
+      const current = await dependencies.source(input);
+      if (current.issue.state.name !== "Done" || current.issue.id !== source.issue.id || current.issue.identifier !== source.issue.identifier || current.link.connectionId !== source.link.connectionId || current.session.id !== input.sessionId) throw new Error("Retirement source authority changed during delivery observation");
+      return { ...source, retirementAuthority: reference };
+    }
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, action: FINALIZATION_CONFIRMED, source: `finalizer:${taskId}`, key: input.requestKey } });
     const update = await input.prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: input.sessionId, requestKey: `${input.requestKey}:done` } } });
     const payload = update?.input as { state?: string; expectedState?: string } | undefined;
@@ -41,7 +53,10 @@ async function sourceAuthority(input: FinalizationContext, taskId: string, depen
 function result(prepared: PreparedFinalization, preparedRevision: number, confirmedRevision?: number) {
   return { requestKey: prepared.requestKey, taskId: prepared.taskId, sessionId: prepared.sessionId, preparedRevision,
     ...(confirmedRevision ? { confirmedRevision } : {}), worktree: prepared.worktree, revision: prepared.revision,
-    branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd };
+    branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
+    ...(prepared.retirementAuthority ? { retirement: { authorityRevision: prepared.retirementAuthority.revision, authorityDigest: prepared.retirementAuthority.digest,
+      doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
+        body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, recorded development, browser and review resources are released, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
 }
 
 /** Verify delivery before deleting the only checkout that can prove it. This
@@ -57,6 +72,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where });
   if (prior) {
     const prepared = PreparedFinalization.parse(JSON.parse(prior.value!));
+    if (Boolean(prepared.retirementAuthority) !== Boolean(source.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
     if (prepared.issueId !== source.issue.id || prepared.requestKey !== input.requestKey) throw new Error("Finalization requestKey belongs to a different source");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
     await assertFinalizationAuthority(input.prisma, input.config, prepared, Boolean(confirmed));
@@ -88,7 +104,8 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
   const prepared: PreparedFinalization = { taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey,
     repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId!, issueIdentifier: task.issueIdentifier!, issueId: source.issue.id,
     contractRevision: delivery.receipts.contractRevision,
-    worktree, taskWorktree: task.worktreePath!, registeredWorktree: entry!.worktree!, revision: delivery.receipts.snapshot.head, branch: task.branchName, gitDirectory, gitCwd, delivery };
+    worktree, taskWorktree: task.worktreePath!, registeredWorktree: entry!.worktree!, revision: delivery.receipts.snapshot.head, branch: task.branchName, gitDirectory, gitCwd, delivery,
+    ...(source.retirementAuthority ? { retirementAuthority: source.retirementAuthority } : {}) };
   const snapshot = await dependencies.snapshot(worktree);
   if (JSON.stringify(snapshot) !== JSON.stringify(delivery.receipts.snapshot)) throw new Error("Worktree changed during finalization preparation");
   await sourceAuthority(input, task.id, dependencies);
@@ -116,6 +133,7 @@ export async function confirmTaskFinalization(input: FinalizationContext, depend
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_PREPARED } });
   if (!preparation) throw new Error("Finalization was not prepared; missing cleanup cannot prove delivery");
   const prepared = PreparedFinalization.parse(JSON.parse(preparation.value!));
+  if (Boolean(prepared.retirementAuthority) !== Boolean(source.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
   if (prepared.taskId !== task.id || prepared.sessionId !== input.sessionId || prepared.requestKey !== input.requestKey || prepared.issueId !== source.issue.id || prepared.connectionId !== source.link.connectionId) throw new Error("Finalization source identity changed");
   await assertFinalizationAuthority(input.prisma, input.config, prepared, true);
   await assertFinalizationRemoved(prepared);
