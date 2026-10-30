@@ -12,6 +12,7 @@ import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts
 import type { PreparedExternalFinalization } from "./external-finalization-schema.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
+export const CLEANUP_EVIDENCE_SUPPLEMENT = "finalization-cleanup-evidence-supplement";
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeMetadataEvent">;
 function inboxStore(prisma: Database): CleanupInboxStore {
   for (const model of ["runtimeInstruction", "runtimeLifecycleEvent", "runtimeSourceMessage"]) if (!(model in prisma)) throw new Error("Cleanup requires the full local instruction store");
@@ -133,6 +134,51 @@ function assertBinding(current: z.infer<typeof CleanupBinding>, expected: z.infe
   if (retirementDigest({ ...current, resources: expected.resources }) !== retirementDigest(expected)) throw new Error("Cleanup authority, retention proof or original task pin changed");
 }
 const operationWhere = (taskId: string, sessionId: string, requestKey: string) => ({ runtimeSessionId: sessionId, source: `finalizer:${taskId}`, action: CLEANUP_OPERATION, key: requestKey });
+const EvidenceSupplement = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), requestKey: z.string(),
+  operationRevision: z.number().int().positive(), operationDigest: Digest,
+  preparedRevision: z.number().int().positive(), preparedDigest: Digest, evidence: EventReference,
+}).strict();
+const supplementWhere = (taskId: string, sessionId: string, requestKey: string) => ({ ...operationWhere(taskId, sessionId, requestKey), action: CLEANUP_EVIDENCE_SUPPLEMENT });
+type OperationEvent = { sequence: number; value: string | null };
+
+function supplementedBinding(operation: CleanupOperation, event: OperationEvent, supplement: z.infer<typeof EvidenceSupplement>) {
+  const binding = operation.binding, evidence = supplement.evidence;
+  if (supplement.taskId !== binding.taskId || supplement.sessionId !== binding.sessionId || supplement.requestKey !== operation.requestKey
+    || supplement.operationRevision !== event.sequence || supplement.operationDigest !== sha(event.value!)
+    || supplement.preparedRevision !== binding.preparedRevision || supplement.preparedDigest !== binding.preparedDigest
+    || evidence.revision <= event.sequence || evidence.source !== `owner:${binding.taskId}` || evidence.action !== "legacy-evidence-retained"
+    || binding.authority.some(reference => reference.action === evidence.action)) throw new Error("Cleanup evidence supplement does not match its original operation");
+  return { ...binding, authority: [...binding.authority, evidence].sort((a, b) => a.revision - b.revision) };
+}
+
+/** Called only by the existing authenticated adoption transaction, after full
+ * saved-copy observation. This adds proof to an existing operation; it cannot
+ * replace its authority, scope or automatic origin, or create an operation. */
+export async function supplementCleanupEvidence(input: Context, proofRevision: number) {
+  const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
+  const event = await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey);
+  if (!event?.value) return;
+  const observed = await current(input);
+  if (observed.kind !== "v1") throw new Error("Saved evidence requires its original version 1 cleanup");
+  const operation = CleanupOperation.parse(JSON.parse(event.value));
+  if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
+  const { inspectLegacyEvidenceAuthority } = await import("./legacy-evidence.ts");
+  const retained = await inspectLegacyEvidenceAuthority(input.prisma, input.config, observed.task.id, proofRevision);
+  const evidence = observed.binding.authority.find(reference => reference.action === "legacy-evidence-retained" && reference.revision === proofRevision);
+  if (!evidence || retained.receipt.proof.preparedRevision !== observed.preparation.sequence) throw new Error("Cleanup evidence does not match the current preparation");
+  // A proof accepted before the operation is already in its immutable epoch.
+  if (operation.binding.authority.some(reference => reference.action === evidence.action)) { assertBinding(observed.binding, operation.binding); return; }
+  const supplement = EvidenceSupplement.parse({ version: 1, taskId: observed.task.id, sessionId: input.sessionId, requestKey: input.requestKey,
+    operationRevision: event.sequence, operationDigest: sha(event.value), preparedRevision: operation.binding.preparedRevision,
+    preparedDigest: operation.binding.preparedDigest, evidence });
+  assertBinding(observed.binding, supplementedBinding(operation, event, supplement));
+  const where = supplementWhere(observed.task.id, input.sessionId, input.requestKey);
+  const existing = await input.prisma.runtimeMetadataEvent.findFirst({ where });
+  const value = JSON.stringify(supplement);
+  if (existing) { if (existing.value !== value) throw new Error("Cleanup evidence supplement changed"); return; }
+  if (await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...operationWhere(observed.task.id, input.sessionId, input.requestKey), action: FINALIZATION_CONFIRMED } })) throw new Error("Confirmed cleanup cannot adopt additional evidence");
+  await input.prisma.runtimeMetadataEvent.create({ data: { ...where, value } });
+}
 
 export const inspectPreparedCleanupAuthority = current;
 export function hasPreparedCleanup(prisma: Database, taskId: string, sessionId: string, requestKey: string) {
@@ -145,7 +191,8 @@ async function activeOperation(input: Context, allowConfirmedClosed = false) {
   if (!event?.value) throw new Error("Cleanup operation is not bound; perform full preparation first");
   const operation = CleanupOperation.parse(JSON.parse(event.value));
   if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
-  assertBinding(observed.binding, operation.binding);
+  const supplement = await input.prisma.runtimeMetadataEvent.findFirst({ where: supplementWhere(observed.task.id, input.sessionId, input.requestKey) });
+  assertBinding(observed.binding, supplement ? supplementedBinding(operation, event, EvidenceSupplement.parse(JSON.parse(supplement.value!))) : operation.binding);
   if (!allowConfirmedClosed) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
   return { ...observed, operation, operationRevision: event.sequence };
 }

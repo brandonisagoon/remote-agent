@@ -12,10 +12,11 @@ import { inspectLegacyEvidenceCapture, observeLegacyArchive, observeLegacyEviden
 import { LEGACY_EVIDENCE_CONFIRMED, LEGACY_EVIDENCE_RETAINED, LegacyEvidenceAdoptionInput, LegacyEvidenceOperationInput, LegacyEvidenceProof, LegacyEvidenceReceipt } from "./legacy-evidence-schema.ts";
 
 import { isEvidenceTree, matchLegacyEvidenceTrees, observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
+import { assertLegacyEvidenceWriters } from "./legacy-evidence-writers.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
-export const legacyEvidenceDependencies = { prepare: prepareTaskFinalization };
+export const legacyEvidenceDependencies = { prepare: prepareTaskFinalization, writers: assertLegacyEvidenceWriters };
 
 export function legacyEvidenceResourceDigest(resource: RemoteTaskResource) {
   const metadata = resource.metadata && typeof resource.metadata === "object" && !Array.isArray(resource.metadata) ? resource.metadata as Record<string, unknown> : {};
@@ -93,6 +94,10 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   return { ...current, receipt: receipt(event.sequence, proof) };
 }
 
+// Local authority only: physical saved-copy/capture checks stay at adoption and
+// every evidence operation. The cleanup supplement reuses this exact binding.
+export const inspectLegacyEvidenceAuthority = loadProof;
+
 /** Only the owner's authenticated route can adopt old receipts. The old
  * preparation and metadata remain byte-for-byte untouched; missing hashes are
  * explicitly new observations, never retroactive historical evidence. */
@@ -104,6 +109,11 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
     const loaded = await loadProof(input.prisma, input.config, input.taskId, prior.sequence);
     if (finalizationDigest(loaded.receipt.proof.input) !== finalizationDigest(adoption)) throw new Error("Legacy evidence already has a different immutable retention proof");
     for (const entry of loaded.receipt.proof.entries) await inspectLegacyEvidenceCapture(loaded.receipt.proof, entry, false);
+    await input.prisma.$transaction(async tx => {
+      await loadProof(tx, input.config, input.taskId, prior.sequence);
+      const { supplementCleanupEvidence } = await import("./cleanup-lifecycle.ts");
+      await supplementCleanupEvidence({ prisma: tx, config: input.config, sessionId: current.session.id, requestKey: current.prepared.requestKey }, prior.sequence);
+    });
     return loaded.receipt;
   }
   const resources = await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } });
@@ -165,13 +175,15 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
     const records = await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId, kind: "evidence", state: { not: "released" } } });
     if (records.length !== entries.length || entries.some((entry) => !records.some((record) => record.id === entry.resourceId && legacyEvidenceResourceDigest(record) === entry.identityDigest))) throw new Error("Legacy evidence inventory changed during observation");
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.session.id, source: `owner:${input.taskId}`, action: LEGACY_EVIDENCE_RETAINED, key: adoption.requestKey, value: JSON.stringify(proof) } });
+    const { supplementCleanupEvidence } = await import("./cleanup-lifecycle.ts");
+    await supplementCleanupEvidence({ prisma: tx, config: input.config, sessionId: current.session.id, requestKey: current.prepared.requestKey }, event.sequence);
     return receipt(event.sequence, proof);
   });
 }
 
 /** The normal primary gets only the frozen owner proof. Inspection grants no
  * cleanup permission; both effect boundaries revalidate ordinary finalization. */
-export async function manageLegacyEvidence(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operation: LegacyEvidenceOperationInput }, dependencies = legacyEvidenceDependencies) {
+export async function manageLegacyEvidence(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operation: LegacyEvidenceOperationInput }, dependencies: { prepare: typeof prepareTaskFinalization; writers?: typeof assertLegacyEvidenceWriters } = legacyEvidenceDependencies) {
   const operation = LegacyEvidenceOperationInput.parse(input.operation);
   const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
   if (!task) throw new Error("Legacy evidence requires the original primary");
@@ -198,19 +210,24 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
     const prepared = await prepareAuthority();
     if (prepared.preparedRevision !== proof.preparedRevision || "version" in prepared) throw new Error("Legacy evidence finalization authority changed");
   }
-  if (isEvidenceTree(entry) && operation.action !== "inspect") {
-    const writers = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, purpose: entry.purpose, state: { not: "released" }, kind: { in: ["native-app", "launch-agent", "launch-agents", "docker-container", "docker-compose-project", "task-runtime", "local-http"] } } });
-    if (writers.length) throw new Error("Directory evidence writers must finish verified retirement before capture");
-    await finalizationResourceObservation.rootIdle(entry.target.path);
-  }
   await inspectLegacyEvidenceCapture(proof, entry, operation.action === "confirm" || Boolean(prior));
+  // Hash saved copies first; fresh writer and open-handle observations should
+  // be next to the final authority check, not before a potentially long scan.
+  let assertWritersUnchanged: Awaited<ReturnType<typeof assertLegacyEvidenceWriters>> | undefined;
+  if (isEvidenceTree(entry) && operation.action !== "inspect") {
+    assertWritersUnchanged = await (dependencies.writers ?? assertLegacyEvidenceWriters)({ prisma: input.prisma, config: input.config, task, entry });
+    await finalizationResourceObservation.rootIdle(entry.target.path);
+    await finalizationResourceObservation.rootIdle(entry.target.quarantine.path);
+  }
   if (operation.action !== "inspect") {
     const fresh = await prepareAuthority();
     if (fresh.preparedRevision !== proof.preparedRevision || "version" in fresh) throw new Error("Legacy evidence finalization authority changed during observation");
     await loadProof(input.prisma, input.config, task.id, operation.proofRevision);
+    await assertWritersUnchanged?.();
   }
   if (operation.action !== "confirm") return { ...result, resourceId: entry.resourceId, ...(prior ? { confirmedRevision: prior.sequence } : {}) };
   return input.prisma.$transaction(async (tx) => {
+    await assertWritersUnchanged?.(tx);
     await loadProof(tx, input.config, task.id, result.proofRevision);
     const currentTask = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
     const { hasPreparedCleanup, assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
