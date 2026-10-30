@@ -150,3 +150,23 @@ closes through the server route and retries offline reporting after restart.
 Live older tasks still require matching concrete resource
 adapters and exact ownership; this continuation layer does not exempt their
 unhandled records.
+
+Task, task-list and session-task GETs expose `cleanupHistory` independently of
+whether an automatic cleanup turn is executing. This read-only view validates
+saved operation/preparation bytes and original identities, and lists the bound
+resource receipt states. Pausing, revocation, or changed current ownership keeps
+that history visible alongside `cleanupBlocked`. Missing or changed resource
+identities are `unknown`, not successful removals; additional current resources
+are listed as unbound. Existing `cleanupProgress` remains the saved diagnostic
+record with current identity-checked states. When no progress event exists, the
+API does not invent one.
+
+`cleanupHistory.readOnly` is always true. It contains no prepared cleanup
+witness, cannot schedule work, and grants no adapter authority. The existing
+`cleanupOperation` field retains its original execution checks for compatibility
+with clients that use its presence to select lifecycle behavior. A disposable
+actual-client regression verifies that idle and paused history cannot enable
+dependency removal. Full preparation, mutation, confirmation and reporting
+guards are unchanged. The DRA-199 acceptance fixture also covers active/idle
+transitions, restart, revocation, changed resource/primary identity and corrupted
+preparation links through the real GET routes.

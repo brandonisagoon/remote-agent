@@ -45,7 +45,7 @@ export async function recordCleanupProgress(input: { prisma: PrismaClient; confi
   });
 }
 
-export async function cleanupProgressProjection(prisma: Pick<PrismaClient, "runtimeMetadataEvent" | "remoteTaskResource">, task: { id: string; primarySessionId: string | null }, operation: { operationRevision: number; operationDigest: string }) {
+export async function cleanupProgressProjection(prisma: Pick<PrismaClient, "runtimeMetadataEvent" | "remoteTaskResource">, task: { id: string; primarySessionId: string | null }, operation: { operationRevision: number; operationDigest: string }, identities?: readonly { id: string; key: string; identity: string; state: string }[]) {
   if (!task.primarySessionId) return {};
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: CLEANUP_PROGRESS, key: `finalize:${task.id}` }, orderBy: { sequence: "desc" } });
   if (!event?.value) return {};
@@ -53,10 +53,11 @@ export async function cleanupProgressProjection(prisma: Pick<PrismaClient, "runt
   try { decoded = JSON.parse(event.value); } catch { return {}; }
   const parsed = CleanupProgress.safeParse(decoded);
   if (!parsed.success || parsed.data.operationRevision !== operation.operationRevision || parsed.data.operationDigest !== operation.operationDigest) return {};
-  const resources = await prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
+  const resources = identities ?? await prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
   // Diagnostic history cannot turn a newer required receipt into success.
   const current = parsed.data.resources.map(entry => {
-    const resource = resources.find(resource => resource.id === entry.id && resource.key === entry.key);
+    const identity = identities?.find(resource => resource.id === entry.id && resource.key === entry.key);
+    const resource = !identities || identity?.identity === "matched" ? resources.find(resource => resource.id === entry.id && resource.key === entry.key) : undefined;
     return { ...entry, state: resource?.state ?? "unknown", outcome: resource?.state === "released" ? "released" as const : resource?.state === entry.state ? entry.outcome : "pending" as const };
   });
   return { cleanupProgress: { revision: event.sequence, ...parsed.data, resources: current } };
