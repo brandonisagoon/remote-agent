@@ -1,4 +1,4 @@
-import { prepareOriginalWork, assertOriginalWork } from "./original-work.ts";
+import { prepareOriginalWork, assertOriginalWork, originalWorkRetainedPlans } from "./original-work.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
@@ -11,7 +11,7 @@ import { completionObservation } from "./completion-observation.ts";
 import { EXTERNAL_BINDING, EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryBindingInput, ExternalTaskIdentity, externalDigest } from "./external-delivery-schema.ts";
 import { externalDeliveryObservation, observeExternalDeliveries } from "./external-delivery-observation.ts";
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
-import { assertFinalizationResources, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, RetainedArchivePlan, RetainedResultPlan, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
+import { assertFinalizationResources, assertFinalizationPlanPurposes, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
 export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
@@ -23,7 +23,8 @@ export type ExternalDependencies = typeof externalBindingDependencies;
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem
  * and provider observations finish before acquiring the database write lock. */
 export function assertExternalResourceRecords(records: FinalizationResourceRecord[], plan: FinalizationResourcePlan[], removed: boolean) {
-  const resources = records.filter((record) => ["browser", "development", "review"].includes(record.purpose) || record.purpose === "tooling" && plan.some(entry => entry.id === record.id && (entry.disposition === "retain-archive" || (entry.disposition as string) === "retain-archive-member")));
+  const resources = records;
+  assertFinalizationPlanPurposes(resources, plan);
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
@@ -132,9 +133,8 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const resourceIds = resources.map((resource) => resource.id).sort();
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
-  const retainedArchives = originalWork ? [originalWork.archive, ...originalWork.additionalArchives ?? []].map((archive) => RetainedArchivePlan.parse({ ...finalizationResourceIdentity(resources.find((entry) => entry.id === archive.resourceId)!), disposition: "retain-archive", archive: { root: archive.root, manifestPath: archive.manifestPath, manifestSha256: archive.manifestSha256, inventoryDigest: archive.inventoryDigest } })) : [];
-  const retainedResults = originalWork?.retainedResults?.map((result) => RetainedResultPlan.parse({ ...finalizationResourceIdentity(resources.find((entry) => entry.id === result.resourceId)!), disposition: "retain-result", reference: { archiveResourceId: originalWork.archive.resourceId, provenancePath: result.provenancePath, provenanceSha256: result.provenanceSha256 } })) ?? [];
-  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(originalWork ? { originalWork: true, retainedArchives: [...retainedArchives, ...retainedResults] } : {}) });
+  const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
+  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
     for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") {

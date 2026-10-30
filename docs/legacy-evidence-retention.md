@@ -42,8 +42,8 @@ The manifest is at most 8 MiB, with at most 10,000 members and 512 MiB total.
 All archive directories must be owned and mode 0700; files must be owned,
 unshared regular files with mode 0600. Symlinks, conflicting size fields,
 changed bytes, duplicate original paths, receipts created after preparation,
-and copies within cleanup roots are refused. Captured originals must also
-remain outside registered whole-tree cleanup roots. Historical archive input
+and copies within cleanup roots are refused. File captures must also remain outside registered whole-tree cleanup roots.
+Directory captures use the separately pinned external destination described below. Historical archive input
 paths are never silently relocated: the submitted retained path must be an
 actual member of the pinned current manifest.
 
@@ -99,3 +99,42 @@ receipts are rewritten. Release the server endpoint and matching Drafted capabil
 adoption. Select that immutable capability without repinning the task. The
 original primary must resume its existing preparation under current valid
 completion authority. Implementation tests are not evidence of live retirement.
+
+## Directory evidence and historical task backups
+
+The complete inventory can contain both the unchanged file entry and a typed
+`{ type: "tree", resourceId, retainedPath, inventoryDigest }` entry. The latter
+binds the full original directory inventory; it does not pretend a directory is
+a file with a historical hash or byte size. Every source file must match its
+independent retained member in the pinned manifest. The proof freezes source and
+retained directories, files, modes, inodes and digests. Links, shared files,
+unsupported entries, overlapping evidence/foreign task resources, unsafe modes,
+changed parents and omitted evidence receipts fail before capture. Original
+metadata and preparation bytes are unchanged.
+
+For the existing DRA80 backup, explicit manifest format
+`task-backup-evidence-v1` reads its task-bound `MANIFEST.json` and the four
+hash-bound browser/worktree/runtime-config component manifests. It verifies every
+component member with bounded streaming reads (10,000 members, 2 GiB per member,
+4 GiB aggregate), preserving owner-only 0400/0600/0700 files without executing
+scripts. Ordinary file-list manifests retain their original 512 MiB limit and
+0600-file rule. The root and component documents are independently rechecked;
+this evidence proof does not claim retention authority for unrelated backup
+members or automatically exempt a `private-backup` resource from cleanup.
+
+A directory can be nested under an environment scheduled for later removal.
+Its retained quarantine is therefore an exact new slot beneath the existing
+private parent of the archive, outside every cleanup root and on the same
+filesystem. Both source and destination parent identities are frozen. Native
+capture holds those parents through exclusive rename; it closes its own source
+handles before refreshing authority, then reopens and verifies the exact source
+through the held parent. The normal process/open-file observer has no PID or
+read-directory exemption. Same-purpose registered writers must have completed
+verified retirement before tree capture. Parent cleanup is guarded before client
+adapter effects and before the server accepts its Released receipt, until the
+child capture is independently confirmed. No bytes are unlinked from either copy.
+
+Partial intent, completed capture and lost confirmation recover the same journal,
+proof and preparation. A confirmed capture can still be inspected after its empty
+original parent is removed. Recreated source parents, replaced retained bytes or
+new overlapping ownership refuse continuation and preserve all material.

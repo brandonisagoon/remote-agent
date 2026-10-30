@@ -12,7 +12,8 @@ const inside = (root: string, file: string) => file.startsWith(`${root}${path.se
 
 /** Bounded, private regular-file inventory shared by backup restore and saved
  * archive retention. File hashing uses the existing streaming evidence reader. */
-export async function privateArchiveInventory(root: string) {
+export async function privateArchiveInventory(root: string, backup = false) {
+  const byteLimit = backup ? 8 * 1024 * 1024 * 1024 : MAX_BYTES;
   await assertFinalizationPath(root);
   const rootStat = await lstat(root);
   if (await realpath(root) !== root || !rootStat.isDirectory()) throw new Error("Retained archive root is not an exact directory");
@@ -20,7 +21,7 @@ export async function privateArchiveInventory(root: string) {
   async function visit(file: string) {
     if (inventory.length >= 250_000) throw new Error("Archive inventory exceeds its entry bound");
     const before = await lstat(file), relative = path.relative(root, file) || ".";
-    if (before.dev !== rootStat.dev || before.uid !== process.getuid?.() || (before.mode & 0o7777) !== (before.isDirectory() ? 0o700 : 0o600)) throw new Error("Retained archive must be private and task-owned");
+    if (before.dev !== rootStat.dev || before.uid !== process.getuid?.() || (before.isDirectory() ? (before.mode & 0o7777) !== 0o700 : !(backup ? [0o400, 0o600, 0o700] : [0o600]).includes(before.mode & 0o7777))) throw new Error("Retained archive must be private and task-owned");
     if (before.isDirectory()) {
       inventory.push({ path: relative, kind: "directory", dev: before.dev, ino: before.ino, mode: before.mode });
       const children = (await readdir(file)).sort();
@@ -28,9 +29,9 @@ export async function privateArchiveInventory(root: string) {
       const after = await lstat(file);
       if (before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode || before.uid !== after.uid || JSON.stringify(children) !== JSON.stringify((await readdir(file)).sort())) throw new Error("Archive directory changed during observation");
     } else {
-      if (!before.isFile() || before.size + total > MAX_BYTES || ++files > 10_025) throw new Error("Archive contains unsupported or excessive material");
-      const observed = await observeLegacyEvidenceFile(file, true); total += observed.size;
-      if (total > MAX_BYTES || before.dev !== observed.dev || before.ino !== observed.ino || before.mode !== observed.mode) throw new Error("Archive file changed during observation");
+      if (!before.isFile() || before.size + total > byteLimit || ++files > 10_025) throw new Error("Archive contains unsupported or excessive material");
+      const observed = backup ? await observeBackupFile(file, byteLimit - total) : await observeLegacyEvidenceFile(file, true); total += observed.size;
+      if (total > byteLimit || before.dev !== observed.dev || before.ino !== observed.ino || before.mode !== observed.mode) throw new Error("Archive file changed during observation");
       inventory.push({ kind: "file", path: relative, dev: observed.dev, ino: observed.ino, mode: observed.mode, size: observed.size, sha256: observed.sha256 });
     }
   }
@@ -90,7 +91,9 @@ export async function observeArchive(root: string, manifestPath: string, manifes
 }
 
 const ManifestReference = z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/), entries: z.number().int().nonnegative().optional() }).strict();
-export const SavedArchiveSelection = z.object({ root: z.string(), manifests: z.array(ManifestReference).min(1).max(21), taskId: z.string(), issueIdentifier: z.string(), mergeCommit: z.string().regex(/^[a-f0-9]{40}$/) }).strict();
+const FlatSavedArchiveSelection = z.object({ root: z.string(), manifests: z.array(ManifestReference).min(1).max(21), taskId: z.string(), issueIdentifier: z.string(), mergeCommit: z.string().regex(/^[a-f0-9]{40}$/) }).strict();
+export const PrivateBackupSelection = z.object({ format: z.literal("task-private-backup/v1"), root: z.string(), manifests: z.tuple([ManifestReference]), taskId: z.string(), issueIdentifier: z.string() }).strict();
+export const SavedArchiveSelection = z.union([FlatSavedArchiveSelection, PrivateBackupSelection]);
 export type SavedArchiveSelection = z.infer<typeof SavedArchiveSelection>;
 
 /** Legacy saved archives can carry separately hashed addenda. Manifest-covered
@@ -98,6 +101,7 @@ export type SavedArchiveSelection = z.infer<typeof SavedArchiveSelection>;
  * retained observations. Neither category is discarded or mislabeled. */
 export async function observeSavedArchive(value: SavedArchiveSelection) {
   const selection = SavedArchiveSelection.parse(value), { root } = selection;
+  if ("format" in selection) return observePrivateBackup(selection);
   const documents = new Map<string, string>(), entries = new Map<string, { sha256: string; size?: number }>();
   for (const [index, reference] of selection.manifests.entries()) {
     const file = archiveMember(root, reference.path);
@@ -122,6 +126,92 @@ export async function observeSavedArchive(value: SavedArchiveSelection) {
     if (!file || file.sha256 !== expected.sha256 || expected.size !== undefined && file.size !== expected.size) throw new Error("Saved archive member differs from its manifest");
   }
   for (const [name, expected] of documents) if (files.get(name)?.sha256 !== expected) throw new Error("Saved archive manifest changed during observation");
+  const ancillary = [...files.values()].filter(entry => !entries.has(entry.path) && !documents.has(entry.path)).map(({ path, size, sha256 }) => ({ path, size, sha256 }));
+  return { inventory, inventoryDigest: finalizationDigest(inventory), ancillary, manifestEntries: entries.size };
+}
+
+/** Backup payloads can be large logs or database exports. Keep a fixed buffer,
+ * exact pre-read size and descriptor identity, never an allocation per file. */
+async function observeBackupFile(file: string, limit: number) {
+  await assertFinalizationPath(file);
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = await handle.stat();
+    if (!before.isFile() || before.nlink !== 1 || before.uid !== process.getuid?.() || before.size > limit || ![0o400, 0o600, 0o700].includes(before.mode & 0o7777)) throw new Error("Backup file must be bounded, private and unshared");
+    const hash = createHash("sha256"), buffer = Buffer.alloc(64 * 1024); let offset = 0;
+    while (offset < before.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, before.size - offset), offset);
+      if (!bytesRead) throw new Error("Backup file changed during observation");
+      hash.update(buffer.subarray(0, bytesRead)); offset += bytesRead;
+    }
+    const after = await handle.stat(), leaf = await lstat(file);
+    if (["dev", "ino", "mode", "uid", "nlink", "size", "mtimeMs", "ctimeMs"].some(key => before[key as keyof typeof before] !== after[key as keyof typeof after] || before[key as keyof typeof before] !== leaf[key as keyof typeof leaf])) throw new Error("Backup file changed during observation");
+    await assertFinalizationPath(file);
+    return { dev: before.dev, ino: before.ino, mode: before.mode, size: before.size, sha256: hash.digest("hex") };
+  } finally { await handle.close(); }
+}
+
+/** This historical format records hashes in nested descriptors, component
+ * manifests and object inventories. Other files remain newly observed retained
+ * bytes; they never acquire historical backup or restore provenance. */
+async function observePrivateBackup(selection: z.infer<typeof PrivateBackupSelection>) {
+  const { root } = selection, Digest = z.string().regex(/^[a-f0-9]{64}$/);
+  const File = z.object({ file: z.string(), sha256: Digest, bytes: z.number().int().nonnegative().optional() }).passthrough();
+  const Component = z.object({ dir: z.string(), manifest: z.string(), manifestSha256: Digest, files: z.number().int().nonnegative().optional() }).passthrough();
+  const Purpose = z.object({ mysql: File, postgis: File, redis: File,
+    objects: z.object({ manifest: z.string(), manifestSha256: Digest, count: z.number().int().nonnegative(), bytes: z.number().int().nonnegative() }).passthrough(),
+    runtimeConfig: Component, receipt: File.optional(),
+  }).passthrough();
+  const Manifest = z.object({ version: z.literal(1), taskId: z.string(), issue: z.string().optional(),
+    purposes: z.object({ development: Purpose, review: Purpose }).strict(),
+    evidence: z.object({ browserEvidence: Component, worktreeLocal: Component }).strict().optional(),
+    git: z.object({ bundle: z.string(), sha256: Digest, bytes: z.number().int().nonnegative() }).passthrough().optional(),
+  }).passthrough();
+  const documents = new Map<string, string>(), entries = new Map<string, { sha256: string; size?: number }>();
+  async function document(name: string, expected: string) {
+    if (documents.has(name) || entries.has(name)) throw new Error("Backup has duplicate or recursive manifest references");
+    const content = await readArchiveBytes(archiveMember(root, name), 8 * 1024 * 1024);
+    if (sha(content) !== expected) throw new Error("Backup manifest digest changed");
+    documents.set(name, expected); return content;
+  }
+  function member(name: string, expected: string, size?: number) {
+    archiveMember(root, name);
+    if (entries.has(name) || documents.has(name) || entries.size >= 10_000) throw new Error("Backup has duplicate, recursive or excessive members");
+    entries.set(name, { sha256: expected, ...(size === undefined ? {} : { size }) });
+  }
+  async function component(value: z.infer<typeof Component>) {
+    archiveMember(root, value.dir);
+    const bytes = await document(value.manifest, value.manifestSha256), lines = bytes.toString("utf8").split("\n").filter(Boolean);
+    if (value.files !== undefined && value.files !== lines.length) throw new Error("Backup component count changed");
+    if (!lines.length) throw new Error("Backup component manifest is empty");
+    for (const line of lines) {
+      const match = /^([a-f0-9]{64}) [ *](.+)$/.exec(line);
+      if (!match) throw new Error("Unsupported backup component manifest");
+      const relative = match[2]!.startsWith("./") ? match[2]!.slice(2) : match[2]!;
+      const file = archiveMember(archiveMember(root, value.dir), relative);
+      member(path.relative(root, file), match[1]!);
+    }
+  }
+  const first = selection.manifests[0], manifest = Manifest.parse(JSON.parse((await document(first.path, first.sha256)).toString("utf8")));
+  if (manifest.taskId !== selection.taskId || manifest.issue !== undefined && manifest.issue !== selection.issueIdentifier) throw new Error("Backup belongs to another task");
+  for (const value of Object.values(manifest.purposes)) {
+    for (const file of [value.mysql, value.postgis, value.redis, ...(value.receipt ? [value.receipt] : [])]) member(file.file, file.sha256, file.bytes);
+    const objects = z.object({ count: z.number().int().nonnegative(), bytes: z.number().int().nonnegative(), objects: z.array(z.object({ key: z.string(), size: z.number().int().nonnegative(), sha256: Digest }).passthrough()).max(10_000) }).passthrough()
+      .parse(JSON.parse((await document(value.objects.manifest, value.objects.manifestSha256)).toString("utf8")));
+    if (objects.count !== value.objects.count || objects.bytes !== value.objects.bytes || objects.count !== objects.objects.length || objects.bytes !== objects.objects.reduce((sum, entry) => sum + entry.size, 0)) throw new Error("Backup object inventory count or bytes changed");
+    const objectRoot = path.join(path.dirname(archiveMember(root, value.objects.manifest)), "objects");
+    for (const entry of objects.objects) member(path.relative(root, archiveMember(objectRoot, entry.key)), entry.sha256, entry.size);
+    await component(value.runtimeConfig);
+  }
+  if (manifest.evidence) for (const value of Object.values(manifest.evidence)) await component(value);
+  if (manifest.git) member(manifest.git.bundle, manifest.git.sha256, manifest.git.bytes);
+  if (first.entries !== undefined && first.entries !== entries.size) throw new Error("Backup manifest count changed");
+  const inventory = await privateArchiveInventory(root, true), files = new Map(inventory.filter(entry => entry.kind === "file").map(entry => [entry.path, entry]));
+  for (const [name, expected] of entries) {
+    const file = files.get(name);
+    if (!file || file.sha256 !== expected.sha256 || expected.size !== undefined && file.size !== expected.size) throw new Error("Backup member differs from its historical manifest");
+  }
+  for (const [name, expected] of documents) if (files.get(name)?.sha256 !== expected) throw new Error("Backup manifest changed during observation");
   const ancillary = [...files.values()].filter(entry => !entries.has(entry.path) && !documents.has(entry.path)).map(({ path, size, sha256 }) => ({ path, size, sha256 }));
   return { inventory, inventoryDigest: finalizationDigest(inventory), ancillary, manifestEntries: entries.size };
 }

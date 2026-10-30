@@ -3,7 +3,8 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { assertExternalBindingAuthority, assertExternalResourceRecords, externalBindingDependencies, externalOwnerHistory, externalTaskOwnership, latestExternalBinding } from "./external-deliveries.ts";
 import { EXTERNAL_BINDING, ExternalBinding, DeliveredRetirementBinding, DeliveredRetirementInput, externalDigest } from "./external-delivery-schema.ts";
-import { RetainedArchivePlan, RetainedResultPlan, finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { originalWorkRetainedPlans } from "./original-work.ts";
 
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const legacyDeliveryDependencies = { ...externalBindingDependencies, repository: completionObservation.repository };
@@ -62,10 +63,9 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
   if (request.originalWork && cleanup.branch !== current.identity.branch) throw new Error("Archived original work no longer has its recorded task branch");
   const originalWork = request.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree,
     branch: current.identity.branch, approvedHead: cleanup.head, resources: current.resources, originalWork: request.originalWork }) : undefined;
-  const retainedArchives = originalWork ? [originalWork.archive, ...originalWork.additionalArchives ?? []].map(archive => RetainedArchivePlan.parse({ ...finalizationResourceIdentity(current.resources.find(record => record.id === archive.resourceId)!), disposition: "retain-archive", archive: { root: archive.root, manifestPath: archive.manifestPath, manifestSha256: archive.manifestSha256, inventoryDigest: archive.inventoryDigest } })) : [];
-  const retainedResults = originalWork?.retainedResults?.map(result => RetainedResultPlan.parse({ ...finalizationResourceIdentity(current.resources.find(record => record.id === result.resourceId)!), disposition: "retain-result", reference: { archiveResourceId: originalWork.archive.resourceId, provenancePath: result.provenancePath, provenanceSha256: result.provenanceSha256 } })) ?? [];
+  const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, current.resources) : [];
   const plan = await dependencies.resources({ resources: current.resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot!, sourcePaths: [], deliveries,
-    ownership: request.ownership, originalWork: true, retainedArchives: [...retainedArchives, ...retainedResults] });
+    ownership: request.ownership, originalWork: true, retainedArchives });
   await dependencies.assertResources({ taskId: input.taskId, resources: current.resources, plan, removed: false, originalWork: true });
   if (originalWork) await dependencies.assertOriginalWork({ taskId: input.taskId, originalWork, resources: current.resources, removed: false });
   if (externalDigest(await dependencies.snapshot(current.identity.taskWorktree)) !== externalDigest(cleanup) || externalDigest(await source(input, current, dependencies)) !== externalDigest(request.source)) throw new Error("Original source or owner decision changed during retirement observation");

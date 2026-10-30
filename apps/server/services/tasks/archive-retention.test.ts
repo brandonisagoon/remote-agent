@@ -4,6 +4,7 @@ import { chmod, link, lstat, mkdir, mkdtemp, open, readFile, realpath, rename, r
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import { privateBackupFixture } from "../../../../test-support/private-backup.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { createApp } from "../../app.ts";
@@ -13,6 +14,7 @@ import { RetirementAuthorityInput, inspectRetirementAuthority, setRetirementAuth
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 import { ARCHIVE_RETENTION, ArchiveRetentionProof, type ArchiveRetentionReceipt } from "./archive-retention-schema.ts";
 import { archiveRetentionProjection, verifyArchiveRetention } from "./archive-retention.ts";
+import { observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { observeSavedArchive } from "./archive-observation.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { adoptLegacyEvidence, manageLegacyEvidence } from "./legacy-evidence.ts";
@@ -94,6 +96,27 @@ async function fixture(options: { prepare?: boolean } = {}) {
   return { ...f, archive, files, manifests, resources, identity, grant, prepared, prepare, app, check };
 }
 
+async function privateFixture(options: { prepare?: boolean; directoryEvidence?: boolean } = {}) {
+  const f = await baseFixture(), backups = [], resources = [];
+  for (const extended of [false, true]) {
+    const backup = await privateBackupFixture(path.join(directory, extended ? "current-backup" : "older-backup"), f.task.id, f.task.issueIdentifier!, extended);
+    backups.push(backup);
+    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: extended ? "current-backup" : "older-backup", kind: "private-backup", purpose: "development", externalId: backup.root, state: "ready", metadata: backup.metadata } }));
+  }
+  let treeResource;
+  if (options.directoryEvidence) {
+    const environment = path.join(directory, "environment"), original = path.join(environment, "evidence");
+    await mkdir(original, { recursive: true, mode: 0o700 });
+    for (const name of ["secret.env", "run.sh"]) await writeFile(path.join(original,name), await readFile(path.join(backups[1]!.root,"evidence/browser",name)), { mode:0o600 });
+    treeResource = await db.prisma.remoteTaskResource.create({data:{taskId:f.task.id,key:"original-evidence",kind:"evidence",purpose:"browser",externalId:original,state:"ready",metadata:{description:"exact original directory"}}});
+    await db.prisma.remoteTaskResource.create({data:{taskId:f.task.id,key:"environment",kind:"directory",purpose:"development",externalId:environment,state:"allocated"}});
+  }
+  const grant = await f.grant(), prepare = () => prepareTaskFinalization(f.input, f.finalizationDependencies);
+  const prepared = options.prepare === false ? undefined : await prepare();
+  const app = createApp({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  return { ...f, archive: backups[0]!.root, files: backups[0]!.files, backups, resources, grant, prepared, prepare, app, treeResource };
+}
+
 function retention(prepared: Awaited<ReturnType<typeof prepareTaskFinalization>>) {
   if (!("archiveRetention" in prepared) || !prepared.archiveRetention) throw new Error("Missing archive proof");
   return prepared.archiveRetention;
@@ -124,6 +147,54 @@ test("five original archive receipts stay ready through old-preparation adoption
   await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
   await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: new Date() } });
   expect(await f.check(saved)).toEqual(saved);
+});
+
+test("two existing private backups preserve the original v1 preparation and immutable Ready receipts across retry", async () => {
+  const f = await privateFixture(), original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared!.preparedRevision } });
+  await db.prisma.runtimeMetadataEvent.deleteMany({ where: { action: ARCHIVE_RETENTION } });
+  const saved = retention(await f.prepare());
+  expect(saved.resources.map(x => x.kind)).toEqual(["private-backup", "private-backup"]);
+  const proofEvent = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: saved.proofRevision } });
+  const proof = ArchiveRetentionProof.parse(JSON.parse(proofEvent.value!));
+  expect(proof.archives.map(x=>x.manifestEntries).sort((a,b)=>a-b)).toEqual([12,18]);
+  expect(proof.archives.every(x=>x.ancillary.length===1)).toBeTrue();
+  await db.prisma.$disconnect(); expect(retention(await f.prepare())).toEqual(saved);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+  for (const record of f.resources) expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: record.id } })).toEqual(record);
+  await writeFile(path.join(f.backups[1]!.root,"README.md"),"changed ancillary bytes");
+  await expect(f.prepare()).rejects.toThrow("contents or inode inventory changed");
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+});
+
+test("retained private backup proof allows exact directory evidence adoption without weakening its cleanup-root guard", async () => {
+  const f = await privateFixture({directoryEvidence:true}), backup=f.backups[1]!, original=await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({where:{sequence:f.prepared!.preparedRevision}});
+  const tree=await observeLegacyEvidenceTree(f.treeResource!.externalId);
+  const adoption={requestKey:"retain-backup-evidence",finalizationRequestKey:f.prepared!.requestKey,expectedPreparedRevision:f.prepared!.preparedRevision,
+    manifest:{path:path.join(backup.root,"MANIFEST.json"),sha256:backup.selection.manifests[0].sha256,format:"task-backup-evidence-v1" as const},
+    entries:[{type:"tree" as const,resourceId:f.treeResource!.id,retainedPath:path.join(backup.root,"evidence/browser"),inventoryDigest:tree.inventoryDigest}]};
+  await db.prisma.runtimeMetadataEvent.deleteMany({where:{action:ARCHIVE_RETENTION}});
+  await expect(adoptLegacyEvidence({...f.context,adoption})).rejects.toThrow("cleanup root");
+  const retained=retention(await f.prepare());
+  const evidence=await adoptLegacyEvidence({...f.context,adoption});
+  expect(evidence.proof.entries).toHaveLength(1);expect(evidence.proof.manifests).toHaveLength(4);
+  const entry=evidence.proof.entries[0]!;
+  await manageLegacyEvidence({...f.input,operation:{resourceKey:entry.key,action:"authorize",proofRevision:evidence.proofRevision,proofDigest:evidence.proofDigest,preparedRevision:original.sequence,finalizationRequestKey:f.prepared!.requestKey}},
+    {prepare:()=>f.prepare()});
+  expect(retention(await f.prepare())).toEqual(retained);
+  for(const record of f.resources)expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({where:{id:record.id}})).toEqual(record);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({where:{sequence:original.sequence}})).value).toBe(original.value);
+  expect(await lstat(entry.target.path)).toBeDefined();
+});
+
+test.each(["late", "unbound-manifest", "overlap"])("private backup %s cannot acquire a retention exception", async variant => {
+  const f = await privateFixture(), original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared!.preparedRevision } });
+  await db.prisma.runtimeMetadataEvent.deleteMany({ where: { action: ARCHIVE_RETENTION } });
+  if (variant === "late") await db.prisma.remoteTaskResource.update({ where:{id:f.resources[1]!.id},data:{createdAt:new Date(original.occurredAt.getTime()+1)} });
+  if (variant === "unbound-manifest") await db.prisma.remoteTaskResource.update({ where:{id:f.resources[1]!.id},data:{metadata:{retention:"please retain",manifest:"MANIFEST.json"}} });
+  if (variant === "overlap") await db.prisma.remoteTaskResource.create({ data:{taskId:f.task.id,key:"new-cleanup-root",kind:"directory",purpose:"development",externalId:path.dirname(f.archive),state:"ready"} });
+  await expect(f.prepare()).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({where:{action:ARCHIVE_RETENTION}})).toBe(0);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
 });
 
 test.each(["ARCHIVE-MANIFEST.json", "ARCHIVE-ADDENDUM-4.json", "env/saved.txt", "README.md"])("changed %s blocks preparation and confirmation while cheap status projection stays read-only", async name => {
@@ -224,7 +295,7 @@ test("Done retirement adopts and captures three original evidence files beneath 
   for (const entry of proof.proof.entries) {
     const operation = { resourceKey: entry.key, proofRevision: proof.proofRevision, proofDigest: proof.proofDigest, preparedRevision: prepared.preparedRevision, finalizationRequestKey: prepared.requestKey };
     await manageLegacyEvidence({ ...f.input, operation: { ...operation, action: "authorize" } }, dependencies);
-    const target = entry.target, q = target.quarantine; await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
+    const target = entry.target, q = target.quarantine; if (target.type !== "file") throw new Error("Expected file fixture"); await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
     await writeFile(q.journal, JSON.stringify({ version: 1, taskId: f.task.id, resourceId: entry.resourceId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: q.path,
       source: { dev: target.dev, ino: target.ino, mode: target.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });
     await rename(target.path, q.path);
@@ -260,8 +331,8 @@ test.skipIf(process.env.DRA_ARCHIVE_VOLUME_TEST !== "1")("disposable 459 MB arch
 }, 60_000);
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
-test.skipIf(!draftedRoot)("actual original-primary finalizer retains five archives through lost prepare and confirm responses, then closed upkeep rechecks contents", async () => {
-  const f = await fixture({ prepare: false });
+test.skipIf(!draftedRoot).each(["evidence-archive", "private-backup"])("actual original-primary finalizer retains %s through lost responses, then closed upkeep rechecks contents", async kind => {
+  const f = kind === "private-backup" ? await privateFixture({ prepare: false }) : await fixture({ prepare: false });
   let lostPrepare = true, lostConfirm = true, comments = 0, stateWrites = 0, closed = 0;
   const provider = { ...issueUpdateDelivery, source: f.dependencies.source, read: async () => f.issue,
     graph: async () => ({ id: f.issue.id, identifier: f.issue.identifier, children: [], states: f.states }),
@@ -308,7 +379,7 @@ test.skipIf(!draftedRoot)("actual original-primary finalizer retains five archiv
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: grant.sequence } })).value).toBe(grant.value);
     const upkeep = await upkeepTask(registry, "closed", async () => { throw new Error("Retained archives must not reach a release adapter"); });
-    expect(upkeep.results.filter((entry: { outcome: string }) => entry.outcome === "retained")).toHaveLength(5);
+    expect(upkeep.results.filter((entry: { outcome: string }) => entry.outcome === "retained")).toHaveLength(f.resources.length);
     expect(await manageResource({ registry, key: f.resources[0]!.key, action: "release" })).toMatchObject({ retained: true, state: "ready" });
     for (const record of f.resources) expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: record.id } })).toEqual(record);
     await rm(path.join(f.archive, "README.md"));
