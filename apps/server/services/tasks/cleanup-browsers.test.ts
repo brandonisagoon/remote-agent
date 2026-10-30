@@ -81,3 +81,32 @@ test.each(["marker", "profile", "source-recreated", "context"])("captured browse
   if (change === "context") { const file = path.join(target.quarantine.path, "browser-task.json"); await rename(file, path.join(f.directory, "context-retained")); await symlink(path.join(f.directory, "context-retained"), file); }
   await expect(f.verify(plan)).rejects.toThrow();
 });
+
+const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+test.skipIf(!draftedRoot).each([false, true])("actual prepared client closes only the selected browser and retains native capture across retry (registered=%s)", async registered => {
+  const f = await fixture(registered), plan = await f.prepare(), selected = captureTarget(plan);
+  const { releasePreparedResources } = await import(path.join(draftedRoot!, "src/finalization-resources.ts"));
+  const { assertResourcePlan, FinalizationResourcePlan: ClientPlan } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const task = { id: "task", primarySessionId: "primary", worktreePath: f.input.adapterContext.task.worktreePath, toolingRevision: "a".repeat(40), phase: "waiting", finalizationVersion: 2, resources: f.resources };
+  const prepared = adapterReceipt(task, plan.map(entry => ClientPlan.parse(entry))), writes: string[] = [], closes: string[] = [];
+  let running = true, lost = true;
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    writes.push(update.key); Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  const browser = { sessions: async () => running ? ["task", "unrelated-session"] : ["unrelated-session"],
+    close: async (session: string) => { expect(session).toBe("task"); closes.push(session); running = false; f.setRunning(false); },
+    assertCapability: async (capability: unknown) => { expect(capability).toEqual(f.input.adapterContext.capability); } };
+  const run = () => releasePreparedResources({ registry, prepared, observation: { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => { throw new Error("Old receipt-selected browser must not execute"); } },
+    adapters: { observer: { browser } }, assertAuthority: () => f.verify(plan), assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); },
+    captureHooks: { afterCapture: () => { if (lost) { lost = false; throw new Error("lost browser capture acknowledgment"); } } } });
+  const partial = await run(); expect(partial.results.some((entry: { outcome: string }) => entry.outcome === "failed")).toBeTrue(); expect(writes).toEqual([]); expect(closes).toEqual(["task"]);
+  await f.verify(plan); const journal = await readFile(selected.target.quarantine.journal), captured = await lstat(selected.target.quarantine.path);
+  const retried = await run(); expect(retried.results.every((entry: { outcome: string }) => entry.outcome === "retired-to-recoverable-quarantine")).toBeTrue();
+  await f.verify(plan, true); await run(); await f.verify(plan, true);
+  expect(closes).toEqual(["task"]); expect(writes).toEqual(registered ? ["environment", "browser-profile"] : ["browser-profile"]);
+  expect((await lstat(selected.target.quarantine.path)).ino).toBe(captured.ino); expect(await readFile(selected.target.quarantine.journal)).toEqual(journal);
+  expect(await readFile(path.join(selected.target.quarantine.path, path.relative(selected.target.path, f.profile), "Cookies"), "utf8")).toBe("private opaque cookie bytes");
+  expect((f.browser.metadata as Record<string, unknown>).toolingRoot).toBe(path.join(f.directory, "historical-tooling-do-not-execute"));
+  running = true; f.setRunning(true); const recreated = await run(); expect(recreated.results.some((entry: { outcome: string }) => entry.outcome === "failed")).toBeTrue(); expect(closes).toEqual(["task"]);
+}, 30000);

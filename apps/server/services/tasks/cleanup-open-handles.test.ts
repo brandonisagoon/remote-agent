@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertLinkedRootIdle, assertRootHandleInventory } from "./cleanup-open-handles.ts";
+import { assertLinkedPathsIdle, assertLinkedRootIdle, assertRootHandleInventory } from "./cleanup-open-handles.ts";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const record = (name: string, fd = "cwd", type = "DIR") => Buffer.from(`p123\0f${fd}\0t${type}\0n${name}\0\n`);
@@ -43,3 +43,12 @@ test("actual disposable cwd writer is refused without walking a dependency tree"
   const gone = observeWriter(["lsof", "-nP", "-F0pftn"]);
   expect(gone.exitCode).toBe(1); expect(gone.stdout.length).toBe(0); expect(gone.stderr.length).toBe(0);
 }, 20_000);
+
+test("one complete handle snapshot covers every selected exact file", async () => {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "handles-batch-"))); roots.push(root);
+  const files = [path.join(root, "one"), path.join(root, "two")], calls: string[] = [];
+  const run = (args: string[]) => { calls.push(args[0]!); return { exitCode: 0, stdout: args[0] === "ps" ? Buffer.from("123 unrelated\n") : record("/outside"), stderr: Buffer.alloc(0) }; };
+  await assertLinkedPathsIdle(files, run); expect(calls).toEqual(["ps", "lsof"]);
+  await expect(assertLinkedPathsIdle(files, args => ({ ...run(args), ...(args[0] === "lsof" ? { stdout: record(files[1]!, "7", "REG") } : {}) }))).rejects.toThrow("still holds");
+  await expect(assertLinkedPathsIdle(files, args => ({ ...run(args), ...(args[0] === "lsof" ? { stdout: Buffer.from("partial") } : {}) }))).rejects.toThrow("incomplete");
+});

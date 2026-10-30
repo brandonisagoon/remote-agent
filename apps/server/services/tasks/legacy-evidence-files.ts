@@ -117,7 +117,14 @@ export async function inspectLegacyEvidenceCapture(proof: LegacyEvidenceProof, e
     await assertLegacyEvidenceTree(entry, capture.physicalPath);
     return capture.captured ? "captured" as const : "intact" as const;
   }
-  const target = entry.target, q = target.quarantine;
+  return inspectPreparedFileCapture({ taskId: proof.taskId, resourceId: entry.resourceId, target: entry.target }, removed);
+}
+
+/** Shared exact-file capture observer. Legacy evidence still verifies its
+ * independent retained copy before entering this unchanged journal protocol. */
+export async function inspectPreparedFileCapture(input: { taskId: string; resourceId: string; target: Extract<LegacyEvidenceProof["entries"][number]["target"], { type: "file" }> }, removed: boolean) {
+  const { target } = input;
+  const q = target.quarantine;
   if (path.dirname(q.directory) !== path.dirname(target.path) || q.path !== path.join(q.directory, "contents") || q.journal !== path.join(q.directory, "pending.json") || !path.basename(q.directory).startsWith(".drafted-evidence-")) throw new Error("Evidence quarantine identity is invalid");
   await assertFinalizationPath(target.path);
   const missing = await absent(target.path);
@@ -139,7 +146,7 @@ export async function inspectLegacyEvidenceCapture(proof: LegacyEvidenceProof, e
   const journalBytes = await readFile(q.journal);
   if (createHash("sha256").update(journalBytes).digest("hex") !== journalIdentity.sha256) throw new Error("Evidence quarantine journal changed");
   const journal = FinalizationQuarantineJournal.parse(JSON.parse(journalBytes.toString("utf8")));
-  if (journal.taskId !== proof.taskId || journal.resourceId !== entry.resourceId || journal.planDigest !== finalizationDigest(target) || journal.sourcePath !== target.path || journal.capturedPath !== q.path || journal.source.dev !== target.dev || journal.source.ino !== target.ino || journal.source.mode !== target.mode || journal.quarantine.dev !== directory.dev || journal.quarantine.ino !== directory.ino || directory.dev !== target.dev) throw new Error("Evidence quarantine journal does not match the immutable proof");
+  if (journal.taskId !== input.taskId || journal.resourceId !== input.resourceId || journal.planDigest !== finalizationDigest(target) || journal.sourcePath !== target.path || journal.capturedPath !== q.path || journal.source.dev !== target.dev || journal.source.ino !== target.ino || journal.source.mode !== target.mode || journal.quarantine.dev !== directory.dev || journal.quarantine.ino !== directory.ino || directory.dev !== target.dev) throw new Error("Evidence quarantine journal does not match the immutable proof");
   const capturedMissing = await absent(q.path);
   if (!missing) {
     if (!capturedMissing || removed) throw new Error("Original evidence is still present or capture is ambiguous");

@@ -15,7 +15,7 @@ import { externalDeliveryObservation, observeExternalDeliveries } from "./extern
 import { observeDeliveredScope } from "./delivered-retirement-observation.ts";
 import { assertFinalizationResources, assertFinalizationPlanPurposes, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
-export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
+export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource"> & Partial<Pick<PrismaClient, "runtimeInstruction">>;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
   delivered: observeDeliveredScope, cleanupObserver: resolveCleanupObserver,
@@ -30,7 +30,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -84,6 +84,8 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 }
 
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
+  const { assertPreservationSources } = await import("./cleanup-preservation.ts");
+  await assertPreservationSources(prisma, binding.identity.taskId, binding.identity.sessionId, binding.resources);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(prisma, binding.identity.taskId, binding.resources);
   // Historical approvals must also honor a later explicit revocation. The
@@ -142,14 +144,20 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
+  const { preparePreservationEvidence, assertPreservationSources } = await import("./cleanup-preservation.ts");
+  const preservation = await preparePreservationEvidence({ prisma: input.prisma, taskId: input.taskId, sessionId: current.session.id, resources, plan: retainedArchives, selection: manifest.ownership.preservation });
   const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
-  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(preservation ? { preservation } : {}), ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
     for (const entry of plan) {
+      if (entry.disposition === "retire-file") {
+        for (const file of [entry.target.path, entry.target.quarantine.directory]) if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(file, archive.root)) || overlaps(file, originalWork.target.path)) throw new Error("Standalone file capture must stay outside original-work archives and capture");
+        continue;
+      }
       if (entry.disposition === "retire-browser" && entry.capture.type === "standalone") {
         const root = entry.capture.target.path;
         if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Browser capture must stay outside original-work archives and capture");
@@ -180,6 +188,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
     if (externalDigest(latest.identity) !== externalDigest(current.identity) || latest.contractEvent.sequence !== current.contractEvent.sequence || latest.verification.sequence !== current.verification.sequence || (latest.binding?.sequence ?? 0) !== manifest.expectedBindingRevision) throw new Error("External delivery authority changed during adoption");
     if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: current.session.id, source: `finalizer:${input.taskId}`, action: "finalization-prepared" } })) throw new Error("Finalization was prepared during external adoption");
     assertExternalResourceRecords(await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, false);
+    await assertPreservationSources(tx, input.taskId, current.session.id, plan);
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey, value: JSON.stringify(binding) } });
     return { revision: event.sequence, binding };
   });

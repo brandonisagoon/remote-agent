@@ -181,6 +181,21 @@ and other registrations stay intact. Recreated checkout or administrative paths
 remain untouched and block completion. Both captured inventories and journals
 must verify; Released state alone is not a retirement proof.
 
+Standalone `evidence`, `private-file` and scenario entrypoint receipts can use
+`retire-file`. Each plan freezes its exact owned regular file, bytes, inode and
+private sibling quarantine. It uses the existing evidence capture protocol;
+interrupted capture, replaced files and recreated originals never authorize
+unlinking bytes. A scenario digest map binds only the named registered entrypoint;
+other wrapper, receipt and preserved files are not inferred as removal targets.
+Known recorded digests and sizes must match. One bounded process/handle snapshot
+covers all selected file paths, with bytes checked again afterward.
+
+A `source-checkpoint` uses a distinct `retire-tree` variant containing its frozen
+manifest identity. All listed members must match and the complete inventory also
+retains ancillary files. Its recorded root may be owner-writable 0755, while the
+quarantine remains private 0700. This does not widen ordinary private-directory
+capture or allow arbitrary ignored folders to become disposable.
+
 Process checks enumerate bounded NUL-delimited open-handle records rather than
 recursively traversing every installed dependency. Any handle or command naming
 the checkout/capture rejects inactivity; unknown filesystem names and observation
@@ -221,11 +236,139 @@ Confirmation independently observes named-session absence through the configured
 capability even after the original paths have moved, and verifies the marker and
 profile identity at their captured paths. Released state alone is insufficient.
 Active browsers require verified stop-only handling before capture; owner pause
-is not overridden. The server fixtures cover both parent shapes, historical
+is not overridden. The existing resource `stop` operation obtains a read-only
+`browser-stop-authority` response from the original primary's session route. It
+binds the current executing request and started lifecycle sequence, exact task,
+profile receipt and configured cleanup capability. The client renews that full
+authority before closing only the named browser; profile, marker, cookies and
+receipt remain unchanged. A changed turn, paused/closed task, revoked source
+ownership or shared profile refuses stop. No completed phase, source issue state
+or full cleanup plan is required to stop the owned browser.
+
+The server fixtures cover both parent shapes, historical
 metadata-tooling mismatch, source recreation, shared profiles, marker/context
-substitution and capture replay. Live legacy adapter inspection and paired client
-execution are separate acceptance checks; these schema/observer tests do not
-claim a live browser has been stopped or retired.
+substitution and capture replay. Paired fixtures run the real client resource-stop
+and capture dispatcher against server authority and proof checks. The browser
+provider is replaced only in disposable fixtures; no live browser has been
+stopped or retired by those tests.
+
+## Exact browser vault entry retention
+
+The supported legacy auth vault is global even when browser sessions use the
+`drafted` namespace. The configured agent-browser 0.39.1 implementation selects
+`~/.agent-browser/auth/<entry>.json` independently of that namespace; its auth-show
+operation exposes identity metadata without the saved password. See the pinned
+[upstream implementation](https://github.com/vercel-labs/agent-browser/blob/v0.39.1/cli/src/native/auth.rs).
+
+A `retire-vault` plan binds the original task receipt, exact synthetic user and
+local origin, configured cleanup capability, encrypted entry bytes and retained
+encryption-key digest. The exact entry file is an adopted owned path; neither the
+shared auth directory nor the key becomes task-owned. Existing native file
+capture moves the encrypted entry into a private sibling quarantine, preserving
+its inode and every byte. No auth-delete or broad vault deletion is performed.
+
+Confirmation requires original-path absence plus the frozen journal and retained
+bytes. A recreated entry, changed key, substituted capture, shared claim or lost
+authority refuses completion while preserving available material. An initially
+absent legacy entry cannot invent a saved-file proof. Paired disposable tests use
+the actual server plan, client dispatcher and native capture, including lost
+acknowledgment and retry without rerunning auth-show on missing credentials.
+
+## Task test authentication
+
+The Clerk adapter accepts the supported exact legacy test-instance descriptors,
+task-prefixed synthetic email and registered user/session relationship. It reads
+only the configured encrypted development credential backup and fixed key, pins
+their identity, and verifies the provider's instance is the recorded development
+instance. User creation time and email identity, and session creation time and
+user relationship, stay frozen through retries. The shared prepared authority is
+renewed after credential/provider reads immediately before each mutation.
+
+An exact registered session is revoked before its user is removed. A revoked or
+otherwise terminal session can remain as a provider record; confirmation proves
+authentication authority is inactive rather than claiming the record vanished.
+Provider denial or failed observation never counts as absence. A lost deletion
+acknowledgment is reconciled with a fresh instance and user observation.
+
+Local binding renewals also reject another active task or purpose claiming the
+same provider user/session, including IDs held in legacy metadata instead of the
+external-ID field. The shared pilot user and explicitly preserved identities do
+not become deletion targets. The actual DRA42 recorded preservation intent must
+be reconciled with its current owner-selected plan before live adoption; this
+adapter does not override it. Tests use disposable provider responses only.
+
+## Receipts backed by existing storage
+
+`retire-backed` represents a logical fixture, object or bucket receipt whose
+storage already has an independently observed adapter plan. It freezes the
+original receipt, one exact backing resource and storage-target digest, and its
+concrete chat IDs or bucket/object keys and recorded hashes. Task Redis fixtures
+must match the declared, observed task/purpose Compose volume; legacy MinIO
+objects must also match their recorded owner receipt ID and key. R2 objects must
+match the exact observed runtime bucket and recorded object prefix.
+
+This disposition grants no storage operation, object deletion, key deletion or
+export. The client retires only the logical receipt after observing that selected
+storage target absent. Other targets may remain present and the backing receipt
+may remain Ready. An unrelated DNS/provider failure cannot stand in for a
+selected-store check, and no generic Released flag substitutes for observation.
+Full task confirmation still independently verifies every existing plan target.
+
+Existing retained archives and preservation choices remain separate obligations.
+There is no established DRA8 Redis archive, and the old DRA98 MinIO probe has no
+established retained copy or digest; the latter stays `sha256: null`. The two
+DRA98 R2 fixture hashes independently match existing retained archive members.
+These facts are not upgraded into new copy claims by logical receipt retirement.
+The DRA8 shared pilot user is recorded as preserved context and receives no
+authentication operation. DRA42's intentionally retained user and objects volume
+require the separate retained-target plan, not this absence disposition.
+
+### Explicit preserved provider targets
+
+An original preservation instruction can restrict an authenticated adoption with
+`ownership.preservation`. It names the existing instruction ID/sequence, an exact
+retained `resource-inventory` member, and selected `{resourceId, kind, id}` targets.
+The server freezes the original primary, instruction text digest, retained file
+identity/digest and independently observed target identity. It checks this local
+source again in the adoption transaction and on operation renewals; complete
+boundaries re-read the preserved inventory and provider targets outside the
+transaction. No new owner decision or issue-state transition is introduced.
+
+The initial supported shape is DRA42's recorded `sharedIdentity`, `objectBucket`
+and exact Docker `volumes` inventory. The preserved Clerk user must match the
+recorded ID; its current test-instance, creation and email identity remain in the
+existing observer proof. The objects volume must match its saved creation time,
+complete labels, original task/purpose/project and bucket correspondence.
+An unsupported selected inventory shape or unknown source remains unadoptable.
+A recognized retained inventory with these explicit dispositions also restricts
+adoption when the optional field was omitted: both exact targets must be bound,
+so omission or a partial selection cannot turn recorded preservation into
+delete authority. Unrelated retained inventories keep their existing rules.
+
+`retain-adapter` embeds the full original adapter plan and its exact preserved
+target digests. Cleanup can retire the other Compose targets using the existing
+scoped adapter; it must continuously verify the preserved targets and leave the
+parent receipt Ready without metadata or lifecycle writes. A preserved Clerk
+user is observed only. `retain-backed` records the bucket's relationship to the
+exact retained objects volume. It describes honest offline retention, not a
+claim that a bucket provider remains reachable or has been deleted. The Compose
+source and provider credential inputs must survive every capture.
+
+Confirmation requires all nonpreserved targets absent and all preserved targets
+unchanged/present. It keeps the user, Compose and bucket receipts Ready and
+projects their exact confirmed retention so closed-task maintenance preserves
+them. Missing preserved data, a changed target lifetime, changed instruction or
+inventory, an unfinished dependent, or a falsely Released receipt prevents
+completion. A lost removal response retries only the unfinished partition.
+
+Disposable paired coverage uses a server-produced plan, the actual Drafted
+observer/executor, and independent server confirmation. Only Docker/Clerk
+boundaries are faked; retained bytes and original receipt identities are checked
+through partial removal, lost acknowledgment and replay. Actual DRA42 read-only
+inspection also matched instruction 1503, its 19,916-byte retained inventory,
+10 Compose targets and the selected volume/user. That compatibility inspection
+performed no adoption or resource effects; full original-work archive proof
+remains part of the owner's normal adoption.
 
 ## Archived-original administration recovery (DRA-201)
 
