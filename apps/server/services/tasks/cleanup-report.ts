@@ -4,7 +4,8 @@ import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
 import { registerThread } from "../sessions/threads.ts";
-import { assertCompletedCleanup, assertPreparedCleanup, hasPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { assertCompletedCleanup, assertPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { inspectSavedCleanup } from "./cleanup-inspection.ts";
 import { cleanupProgressProjection } from "./cleanup-progress.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 
@@ -81,18 +82,24 @@ export async function publishCleanupReport(input: Context, client = cleanupRepor
   return { published: true as const, reportId: frozen.reportId };
 }
 
-/** Small local progress projection. It grants no resource exemptions. */
+/** Saved visibility is independent of effect authority. Keep the original
+ * cleanupOperation field guarded for existing clients that select adapters
+ * from its presence; cleanupHistory is explicitly read-only. */
 export async function cleanupProjection(prisma: PrismaClient, config: ServerConfig, task: { id: string; primarySessionId: string | null }) {
-  if (!task.primarySessionId) return {};
-  const requestKey = `finalize:${task.id}`;
-  if (!await hasPreparedCleanup(prisma, task.id, task.primarySessionId, requestKey)) return {};
+  let saved: Awaited<ReturnType<typeof inspectSavedCleanup>>;
+  try { saved = await inspectSavedCleanup(prisma, task.id); }
+  catch (error) { return { cleanupRequired: true as const, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
+  if (!saved) return {};
+  const requestKey = `finalize:${task.id}`, sessionId = saved.history.originalSessionId;
+  const progress = await cleanupProgressProjection(prisma, { id: task.id, primarySessionId: sessionId }, saved.history, saved.history.resources);
+  const history = { ...progress, cleanupRequired: true as const, cleanupHistory: saved.history };
   try {
-    const confirmed = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: "finalization-confirmed", key: requestKey } });
-    const input = { prisma, config, sessionId: task.primarySessionId, requestKey };
-    const active = confirmed ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
-    const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: task.primarySessionId, requestKey: `${requestKey}:cleanup-report` } } });
-    const progress = await cleanupProgressProjection(prisma, task, { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation) });
-    return { ...progress, cleanupRequired: true as const, cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
-      preparedRevision: active.preparation.sequence, ...(confirmed ? { confirmedRevision: confirmed.sequence } : {}), reportingPending: Boolean(confirmed && !report?.published) } };
-  } catch (error) { return { cleanupRequired: true as const, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
+    if (task.primarySessionId !== sessionId) throw new Error("Cleanup original primary identity changed");
+    const input = { prisma, config, sessionId, requestKey };
+    const active = saved.history.recordedConfirmationRevision ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
+    if (active.operationRevision !== saved.history.operationRevision || retirementDigest(active.operation) !== saved.history.operationDigest) throw new Error("Cleanup operation changed during inspection");
+    const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
+    return { ...history, cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
+      preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !report?.published) } };
+  } catch (error) { return { ...history, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
 }
