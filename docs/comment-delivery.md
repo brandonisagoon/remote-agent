@@ -93,6 +93,8 @@ The owner's configured control reaction requests steering; it is not a receipt
 that steering happened. `RuntimeMessageControl` survives out-of-order webhooks
 and atomically promotes the same queued instruction through the optional native
 runtime capability. Successful promotion prevents a later duplicate queued turn.
+The control records the canonical comment revision at ingress; delayed edit
+webhooks and retries cannot substitute another revision's instruction.
 Idle races use the original normal instruction; already-handled input is not
 injected again. Interrupted sends become unknown and are never blindly replayed.
 

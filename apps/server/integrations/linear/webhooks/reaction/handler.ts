@@ -16,6 +16,7 @@ import { readDeliveryComment } from "../../comment-context.ts";
 import { handleCommentWebhook } from "../comment/handler.ts";
 import { deliverMessageControls } from "../../../../services/sessions/message-controls.ts";
 import { validateSourceMessageOwner } from "../../message-delivery.ts";
+import { sourceMessageId } from "../../../../services/sessions/source-messages.ts";
 
 function reactionTarget(data: LinearReactionWebhook["data"]): string {
   if (data.commentId || data.comment) return "comment";
@@ -67,6 +68,7 @@ export async function handleReactionWebhook(input: {
     const control = await tx.runtimeMessageControl.upsert({ where: { id }, update: {}, create: {
       id, provider: "linear", connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId,
       machineId: config.machine, commentId, authorId,
+      sourceMessageId: sourceMessageId({ provider: "linear", connectionId: config.activeConnectionId, commentId, body: comment.body }),
     } });
     if (control.authorId !== authorId || control.commentId !== commentId || control.repositoryId !== config.activeRepositoryId || control.machineId !== config.machine) throw new Error("Control identity changed");
     await createWebhookReceipt(tx as PrismaClient, { provider: "linear", webhookId: config.activeWebhookId,

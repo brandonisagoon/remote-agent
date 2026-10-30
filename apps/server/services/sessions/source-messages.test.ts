@@ -306,7 +306,7 @@ test("a new content revision replaces obsolete integration reactions even when p
   expect(emoji(old.commentId)).toEqual(["new_queue"]);
 });
 
-test("an authorized compass webhook arriving first converges with its ordinary comment onto one instruction", async () => {
+async function ownerControlPolicy() {
   const policy = testConfig();
   policy.webhooks[policy.activeWebhookId]!.repositoryRouting[policy.activeRepositoryId] = { when: [{ "linear.userId": ["owner"] }] };
   Object.assign(policy.repository.workflows, { steer: { id: "steer", connectionId: null, on: "comment.reaction", when: [{ "reaction.emoji": ["🧭"] }],
@@ -316,6 +316,11 @@ test("an authorized compass webhook arriving first converges with its ordinary c
     issueIdentifier: "ISSUE-1", primarySessionId: sessionId, phase: "working" } });
   await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: sessionId, provider: "linear", connectionId: policy.activeConnectionId,
     resourceType: "issue-identifier", externalId: "ISSUE-1", relationship: "handles" } });
+  return policy;
+}
+
+test("an authorized compass webhook arriving first converges with its ordinary comment onto one instruction", async () => {
+  const policy = await ownerControlPolicy();
   comments.set("feedback", { id: "feedback", body: "Change direction", parentId: null, issue: { id: "issue-one", identifier: "ISSUE-1" }, user: { id: "owner" }, documentContent: null });
   const webhook = { type: "Reaction" as const, action: "create", webhookTimestamp: Date.now(), data: { id: "owner-reaction", emoji: "compass", commentId: "feedback", userId: "owner" } };
   expect(await handleReactionWebhook({ prisma: db.prisma, config: policy, agentRuntime: runtime, deliveryId: "control-first", webhook })).toMatchObject({ kind: "triggered" });
@@ -326,6 +331,29 @@ test("an authorized compass webhook arriving first converges with its ordinary c
   expect(await db.prisma.runtimeInstruction.count()).toBe(1); expect(await db.prisma.runtimeSourceMessage.count()).toBe(1);
   expect(await db.prisma.runtimeMessageControl.count()).toBe(1); expect(runtime.sentMessages).toHaveLength(0);
   expect((await db.prisma.runtimeMessageControl.findFirstOrThrow()).state).toBe("unsupported");
+});
+
+test("a steering reaction binds the canonical content revision despite a late older edit webhook", async () => {
+  const policy = await ownerControlPolicy();
+  const issue = { id: "issue-one", identifier: "ISSUE-1" };
+  comments.set("feedback", { id: "feedback", body: "Current edit", parentId: null, issue, user: { id: "owner" }, documentContent: null });
+  for (const body of ["Current edit", "Older edit received late"]) await handleCommentWebhook({
+    prisma: db.prisma, config: policy, agentRuntime: runtime, deliveryId: `revision:${body}`, webhook: {
+      type: "Comment", action: "update", webhookTimestamp: Date.now(), data: { id: "feedback", body, userId: "owner", issue },
+    },
+  });
+  const current = await db.prisma.runtimeSourceMessage.findFirstOrThrow({ where: { body: "Current edit" } });
+  const older = await db.prisma.runtimeSourceMessage.findFirstOrThrow({ where: { body: "Older edit received late" } });
+  const injected: string[] = [];
+  runtime.steer = async (input) => { expect(await input.beforeSend()).toBe(true); injected.push(input.text); return { status: "applied" }; };
+  await handleReactionWebhook({ prisma: db.prisma, config: policy, agentRuntime: runtime, deliveryId: "revision-control", webhook: {
+    type: "Reaction", action: "create", webhookTimestamp: Date.now(), data: { id: "revision-reaction", emoji: "compass", commentId: "feedback", userId: "owner" },
+  } });
+  expect(injected).toHaveLength(1); expect(injected[0]).toContain("Current edit");
+  expect(injected[0]).not.toContain("Older edit received late");
+  expect((await db.prisma.runtimeMessageControl.findFirstOrThrow()).sourceMessageId).toBe(current.id);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: current.id } })).state).toBe("steered");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: older.id } })).state).toBe("queued");
 });
 
 test("a target turn finishing is not proof that an uncertain steering input was applied", async () => {

@@ -38,7 +38,8 @@ export async function deliverMessageControls(prisma: PrismaClient, runtime: Agen
     for (const control of pending) {
       cursor = { createdAt: control.createdAt, id: control.id };
       const message = await prisma.runtimeSourceMessage.findFirst({ where: { provider: control.provider, connectionId: control.connectionId,
-        repositoryId: control.repositoryId, machineId: control.machineId, commentId: control.commentId, authorId: control.authorId }, orderBy: { sequence: "desc" } });
+        repositoryId: control.repositoryId, machineId: control.machineId, commentId: control.commentId, authorId: control.authorId,
+        ...(control.sourceMessageId ? { id: control.sourceMessageId } : {}) }, orderBy: { sequence: "desc" } });
       if (!message) continue;
       if (!message.sessionId) {
         if (message.state === "unrouted") await prisma.runtimeMessageControl.update({ where: { id: control.id }, data: { state: "rejected", sourceMessageId: message.id } });
