@@ -1,3 +1,4 @@
+import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { originalAdministrationReceipt } from "./original-work-supplement.ts";
 import path from "node:path";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
@@ -25,6 +26,7 @@ export async function assertExternalResourceProofs(prisma: Pick<PrismaClient, "r
  * This seam binds that existing receipt to the common cleanup operation. */
 export async function inspectExternalCleanupAuthority(input: { prisma: ExternalDatabase; config: ServerConfig; sessionId: string; requestKey: string; allowConfirmedClosed?: boolean }) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
+  await assertNoRemainingConsumers(input.prisma, task);
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("External cleanup requires the original finalization request");
   const where = { runtimeSessionId: input.sessionId, source: `finalizer:${task.id}`, key: input.requestKey };
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: where.source, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });

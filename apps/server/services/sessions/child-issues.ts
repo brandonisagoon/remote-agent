@@ -1,3 +1,4 @@
+import { workMapProjection, assertMappedIssueDelivery } from "./work-map.ts";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -30,7 +31,7 @@ export async function readSessionWorkGraph(input: Context, client = graphDeliver
     const identity = { runtimeSessionId: input.sessionId, provider: "linear", connectionId: source.link.connectionId, resourceType: "issue-identifier", externalId: child.identifier, relationship: "child" };
     await input.prisma.runtimeSessionResourceLink.upsert({ where: { runtimeSessionId_provider_connectionId_resourceType_externalId_relationship: identity }, create: identity, update: { endedAt: null } });
   }
-  return graph;
+  return { ...graph, ...await workMapProjection(input, graph) };
 }
 
 export const ChildIssueUpdateInput = IssueUpdateInput.safeExtend({ childIssueId: z.string().trim().min(1).max(200) });
@@ -54,6 +55,7 @@ export async function publishChildIssueUpdate(input: Context & z.infer<typeof Ch
         if (!dependency || !["completed", "canceled"].includes(dependency.state.type)) throw new Error(`Child prerequisite ${dependency?.identifier ?? prerequisite} is not complete`);
       }
     }
+    if (target?.type === "completed" && target.name !== "Manual Review") await assertMappedIssueDelivery(input, graph, child.id);
     return issue;
   };
   const child = await readChild(parent.config, { id: input.childIssueId });
