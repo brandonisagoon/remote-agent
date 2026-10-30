@@ -7,9 +7,10 @@ import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.t
 import { beginRuntimeSession } from "./runtime-registry.ts";
 import { issueUpdateDelivery } from "./issue-updates.ts";
 import { inspectNativeReportPublisher, publishNativeReport } from "./native-report-publisher.ts";
-import { NATIVE_REPORT_ORIGIN, readNativeReportOrigin } from "./native-report-origin.ts";
+import { NATIVE_REPORT_ORIGIN, readNativeReportOrigin, nativeReportDigest } from "./native-report-origin.ts";
 import { handleCommentWebhook } from "../../integrations/linear/webhooks/comment/handler.ts";
 import { LinearCommentWebhookSchema, type LinearCommentWebhook } from "../../integrations/linear/webhook-types/comment.ts";
+import { observeNativeReportWebhook, assertNativeReportWebhook } from "../../integrations/linear/native-report-ingress.ts";
 import { withRequestLifetime } from "../../request-lifetime.ts";
 
 let db: TestDatabase;
@@ -39,7 +40,7 @@ async function fixture() {
       await beforeCreate?.(); writes++;
       expect(await readNativeReportOrigin(prisma, config.activeConnectionId, value.id!)).not.toBeNull();
       expect(await prisma.runtimeLifecycleEvent.count()).toBe(0);
-      if (!comments.has(value.id!)) comments.set(value.id!, { id: value.id!, body: value.body, issue: { id: issue.id, identifier: issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" });
+      if (!comments.has(value.id!)) comments.set(value.id!, { id: value.id!, body: value.body, issue: { id: issue.id, identifier: issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z", editedAt: null });
       expect(await receive(event(comments.get(value.id!)))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
       return { id: value.id! };
     },
@@ -155,7 +156,8 @@ test.each(["owner", "app"])("signed %s-created native publication cannot enter t
   const f = await fixture();
   f.client.create = async (_key, value) => {
     expect(await readNativeReportOrigin(f.prisma, f.config.activeConnectionId, value.id!)).not.toBeNull();
-    const comment = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: author === "app" ? f.config.agentUserId : "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" };
+    const comment = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: author === "app" ? f.config.agentUserId : "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z", editedAt: null };
+    f.comments.set(value.id!, comment);
     const body = JSON.stringify(f.event(comment, "create", comment.user.id));
     const secret = f.config.webhooks[f.config.activeWebhookId]!.webhookSecret;
     const response = await f.app.request(`/webhooks/${f.config.activeWebhookId}`, { method: "POST", headers: { "content-type": "application/json", "linear-delivery": `signed-${author}-create`, "linear-signature": createHmac("sha256", secret).update(body).digest("hex") }, body });
@@ -172,7 +174,7 @@ test("later human A→B→A and same-body edits retain exact provider generation
   const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
   const original = comment.body;
   for (const [seconds, body] of [[1, "Please continue with this correction"], [2, original], [3, original]] as const) {
-    comment.body = body; comment.updatedAt = `2026-10-29T12:00:0${seconds}.000Z`;
+    comment.body = body; comment.editedAt = comment.updatedAt = `2026-10-29T12:00:0${seconds}.000Z`;
     expect(await f.receive(f.event(comment, "update"))).toMatchObject({ kind: "accepted" });
   }
   const sources = await f.prisma.runtimeSourceMessage.findMany({ orderBy: { sequence: "asc" } });
@@ -185,11 +187,15 @@ test("later human A→B→A and same-body edits retain exact provider generation
 test("human edit delivered before the initial create is preserved when create arrives later", async () => {
   const f = await fixture();
   f.client.create = async (_key, value) => {
-    const original = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" };
-    const edited = { ...original, body: "Please address the new owner request", updatedAt: "2026-10-29T12:01:00.000Z" };
+    const original = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z", editedAt: null };
+    const edited = { ...original, body: "Please address the new owner request", updatedAt: "2026-10-29T12:01:00.000Z", editedAt: "2026-10-29T12:01:00.000Z" };
     f.comments.set(value.id!, edited);
     expect(await f.receive(f.event(edited, "update"))).toMatchObject({ kind: "accepted" });
     expect(await f.receive(f.event(original))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+    expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "native-report-created" } })).toBe(0);
+    edited.updatedAt = "2026-10-29T12:01:01.000Z";
+    await f.receive(f.event(edited, "update"));
+    expect(await f.prisma.runtimeSourceMessage.count()).toBe(1);
     return { id: value.id! };
   };
   await f.publish();
@@ -220,11 +226,11 @@ test("signed owner edit of an app-created native report routes by its actor, not
   const f = await fixture();
   const create = f.client.create;
   f.client.create = async (key, value) => {
-    f.comments.set(value.id!, { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: f.config.agentUserId }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" });
+    f.comments.set(value.id!, { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: f.config.agentUserId }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z", editedAt: null });
     return create(key, value);
   };
   const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
-  comment.body = "Human edit to the native report"; comment.updatedAt = "2026-10-29T12:01:00.000Z";
+  comment.body = "Human edit to the native report"; comment.editedAt = comment.updatedAt = "2026-10-29T12:01:00.000Z";
   const webhook = f.event(comment, "update", "owner");
   expect(LinearCommentWebhookSchema.parse(webhook).actor?.id).toBe("owner");
   const body = JSON.stringify(webhook); const secret = f.config.webhooks[f.config.activeWebhookId]!.webhookSecret;
@@ -233,4 +239,100 @@ test("signed owner edit of an app-created native report routes by its actor, not
   const source = await f.prisma.runtimeSourceMessage.findFirstOrThrow();
   expect(source.authorId).toBe("owner"); expect(source.body).toBe(comment.body);
   expect(await f.prisma.runtimeInstruction.count()).toBe(1);
+});
+
+test("native metadata updates do not become owner work after the initial publication", async () => {
+  const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  comment.editedAt = null;
+  const initial = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+  comment.updatedAt = "2026-10-29T12:00:02.000Z";
+  expect(await f.receive(f.event(comment, "update"))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await f.prisma.runtimeSourceMessage.count()).toBe(0);
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } })).toEqual(initial);
+});
+
+
+test("metadata on an edited report cannot duplicate the human edit or rewrite the initial witness", async () => {
+  const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  const initial = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+  for (const [seconds, body] of [[1, "A real owner correction"], [2, f.input.request.body]] as const) {
+    comment.body = body; comment.editedAt = comment.updatedAt = `2026-10-29T12:01:0${seconds}.000Z`;
+    expect(await f.receive(f.event(comment, "update"))).toMatchObject({ kind: "accepted" });
+    comment.updatedAt = `2026-10-29T12:01:0${seconds}.500Z`;
+    await f.receive(f.event(comment, "update"));
+  }
+  expect(await f.prisma.runtimeSourceMessage.count()).toBe(2);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(2);
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } })).toEqual(initial);
+});
+
+test("an unedited metadata update before create establishes one canonical witness without owner work", async () => {
+  const f = await fixture();
+  f.client.create = async (_key, value) => {
+    const original = { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z", editedAt: null };
+    const current = { ...original, updatedAt: "2026-10-29T12:00:00.500Z" };
+    f.comments.set(value.id!, current);
+    expect(await f.receive(f.event(current, "update"))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+    const initial = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+    expect(JSON.parse(initial.value!)).toMatchObject({ version: 2, providerGeneration: { updatedAt: current.updatedAt, editedAt: null } });
+    expect(await f.receive(f.event(original))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+    expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } })).toEqual(initial);
+    return { id: value.id! };
+  };
+  expect((await f.publish()).published).toBe(true);
+  expect(await f.prisma.runtimeSourceMessage.count()).toBe(0);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test.each([undefined, "unknown", "2026-10-29T11:00:00.000Z"])("unknown canonical edit fact %s cannot suppress a native update", async editedAt => {
+  const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  const initial = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+  comment.editedAt = editedAt; comment.updatedAt = "2026-10-29T12:00:02.000Z";
+  await expect(f.receive(f.event(comment, "update"))).rejects.toThrow();
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } })).toEqual(initial);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test.each(["changed", "removed", "appeared"])("initial witness %s after observation refuses the ingress transaction", async kind => {
+  const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  const initial = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+  if (kind === "appeared") await f.prisma.runtimeMetadataEvent.delete({ where: { sequence: initial.sequence } });
+  comment.updatedAt = "2026-10-29T12:00:02.000Z";
+  const observed = await observeNativeReportWebhook(f.prisma, f.config, f.event(comment, "update"));
+  expect(observed).not.toBeNull();
+  if (kind === "changed") await f.prisma.runtimeMetadataEvent.update({ where: { sequence: initial.sequence }, data: { value: initial.value + " " } });
+  if (kind === "removed") await f.prisma.runtimeMetadataEvent.delete({ where: { sequence: initial.sequence } });
+  if (kind === "appeared") await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, action: initial.action, source: initial.source, key: initial.key, value: null } });
+  globalThis.fetch = (async () => { throw new Error("No provider reads in CAS"); }) as unknown as typeof fetch;
+  await expect(f.prisma.$transaction(tx => assertNativeReportWebhook(tx as any, observed!))).rejects.toThrow("initial generation changed");
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test("old proactive witnesses remain immutable and retain their original strict timestamp contract", async () => {
+  const f = await fixture(); const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  const row = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } });
+  const value = JSON.stringify({ createdAt: comment.createdAt, updatedAt: comment.updatedAt, authorId: comment.user.id, bodyDigest: nativeReportDigest(comment.body) });
+  const old = await f.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value } });
+  expect(await f.receive(f.event(comment))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+  comment.updatedAt = "2026-10-29T12:00:02.000Z";
+  expect(await f.receive(f.event(comment, "update"))).toMatchObject({ kind: "accepted" });
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "native-report-created" } })).toEqual(old);
+});
+
+test("a create with missing canonical edit evidence waits without inventing a witness and retries safely", async () => {
+  const f = await fixture();
+  f.client.create = async (_key, value) => {
+    f.comments.set(value.id!, { id: value.id!, body: value.body, issue: { id: f.issue.id, identifier: f.issue.identifier }, parentId: null, user: { id: "owner" }, createdAt: "2026-10-29T12:00:00.000Z", updatedAt: "2026-10-29T12:00:00.010Z" });
+    return { id: value.id! };
+  };
+  const result = await f.publish(); const comment = f.comments.get(result.commentId)!;
+  const origin = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } });
+  await expect(f.receive(f.event(comment))).rejects.toThrow("author-edit generation is unavailable");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "native-report-created" } })).toBe(0);
+  expect(await f.prisma.runtimeSourceMessage.count()).toBe(0);
+  comment.editedAt = null;
+  expect(await f.receive(f.event(comment))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } })).toEqual(origin);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
 });

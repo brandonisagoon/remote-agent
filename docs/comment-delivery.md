@@ -332,3 +332,18 @@ Disposable tests deliver the real publisher's webhook before its create call
 returns, simulate response loss/restart and simultaneous retries, exercise the
 actual authenticated HTTP and signed webhook routes, and check pin/pause/source,
 origin and cancellation refusal. No live report was posted by verification.
+
+The proactive publisher uses the same author-edit classifier for new initial
+witnesses. An exact canonical, never-edited publication creates a versioned
+`native-report-created` witness; its UUID/outbox origin remains unchanged. The
+existing ingress transaction compares the prior witness's exact sequence and raw
+value, including its absence, before it can save the observation or owner input.
+Metadata-only updates retain that witness and do not enqueue work.
+
+When a human edit arrives before the original create webhook, the edit is still
+normal owner input. A delayed signed create matching the reserved publication is
+informational but does not manufacture a never-edited witness from the edited
+comment. Subsequent metadata changes deduplicate against that edit's timestamp.
+Old raw initial witnesses retain their original timestamp behavior, without an
+implicit migration. Missing canonical edit evidence holds the webhook for retry;
+it cannot establish an unedited publication.

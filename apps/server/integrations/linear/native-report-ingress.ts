@@ -1,3 +1,5 @@
+import { z } from "zod";
+import { LinearCommentGeneration, observeLinearCommentGeneration, classifyLinearCommentGeneration } from "./comment-generation.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { nativeReportDigest, readNativeReportOrigin } from "../../services/sessions/native-report-origin.ts";
@@ -17,6 +19,10 @@ export async function nativeReportRoutingActor(store: Store, machineId: string, 
   return parsed.actor.id;
 }
 
+const LegacyInitial = z.object({ createdAt: z.iso.datetime(), updatedAt: z.iso.datetime(), authorId: z.string().min(1), bodyDigest: z.string().regex(/^[a-f0-9]{64}$/) }).strict();
+const Initial = z.union([z.object({ version: z.literal(2), authorId: z.string().min(1), bodyDigest: z.string().regex(/^[a-f0-9]{64}$/), providerGeneration: LinearCommentGeneration.extend({ editedAt: z.null() }) }).strict(), LegacyInitial]);
+type Witness = z.infer<typeof Initial>;
+
 export async function observeNativeReportWebhook(store: Store, config: ServerConfig, webhook: LinearCommentWebhook) {
   const saved = await readNativeReportOrigin(store, config.activeConnectionId, webhook.data.id);
   if (!saved) return null;
@@ -27,18 +33,52 @@ export async function observeNativeReportWebhook(store: Store, config: ServerCon
   const generation = { createdAt: data.createdAt, updatedAt: data.updatedAt, authorId: creator, bodyDigest: nativeReportDigest(data.body) };
   const old = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: origin.sessionId, action: GENERATION, source: "native-report-webhook", key: origin.commentId } });
   if (old.length > 1) throw new Error("Native report has ambiguous initial generation");
-  const initial = old[0]?.value ? JSON.parse(old[0].value) as typeof generation : null;
-  if (webhook.action === "create") {
-    if (data.body !== origin.request.body || (initial && nativeReportDigest(initial) !== nativeReportDigest(generation))) throw new Error("Native report create does not match the reserved publication");
-    return { ...saved, informational: true as const, generation, revision: `${data.createdAt}:${data.updatedAt}`, authorId: creator };
-  }
+  const previousValue = old[0]?.value ?? null;
+  const previousRevision = old[0]?.sequence ?? null;
+  const initial = old.length ? Initial.parse(JSON.parse(previousValue!)) : null;
+  const result = (informational: boolean, revision: string, authorId: string, nextInitial: Witness | null = null) => ({ ...saved, informational, revision, authorId, previousValue, previousRevision, nextInitial });
   const actor = webhook.actor?.id;
   const subscribed = actor && config.webhooks[config.activeWebhookId]?.repositoryRouting[config.activeRepositoryId]?.when?.some(rule => rule["linear.userId"]?.includes(actor));
-  if (!subscribed) throw new Error("Native report edit has no subscribed human actor");
+  if (webhook.action === "create") {
+    if (data.body !== origin.request.body) throw new Error("Native report create does not match the reserved publication");
+    if (initial && !("version" in initial)) {
+      if (nativeReportDigest(initial) !== nativeReportDigest(generation)) throw new Error("Native report create does not match the reserved publication");
+      return result(true, `${data.createdAt}:${data.updatedAt}`, creator);
+    }
+  } else if (!subscribed) throw new Error("Native report edit has no subscribed human actor");
+
   const current = await readDeliveryComment(config.linearApiKey, data.id);
-  if (!current || current.id !== data.id || current.issue?.id !== origin.issueId || current.user?.id !== creator || current.parentId || current.body !== data.body || current.createdAt !== data.createdAt || current.updatedAt !== data.updatedAt) throw new Error("Native report edit changed during provider observation");
-  if (initial && (initial.createdAt !== data.createdAt || initial.authorId !== creator || Date.parse(data.updatedAt) <= Date.parse(initial.updatedAt))) throw new Error("Native report edit is not a later provider generation");
-  return { ...saved, informational: false as const, generation, revision: `${data.createdAt}:${data.updatedAt}`, authorId: actor! };
+  if (!current || current.id !== data.id || current.issue?.id !== origin.issueId || current.user?.id !== creator || current.parentId || current.createdAt !== data.createdAt || !current.updatedAt || Date.parse(current.updatedAt) < Date.parse(data.updatedAt)) throw new Error("Native report edit changed during provider observation");
+  if (webhook.action === "update" && (current.body !== data.body || current.updatedAt !== data.updatedAt)) throw new Error("Native report edit changed during provider observation");
+  if (initial && !("version" in initial)) {
+    // Never rewrite or invent author-edit evidence for old raw witnesses.
+    if (initial.createdAt !== data.createdAt || initial.authorId !== creator || Date.parse(data.updatedAt) <= Date.parse(initial.updatedAt)) throw new Error("Native report edit is not a later provider generation");
+    return result(false, `${data.createdAt}:${data.updatedAt}`, actor!);
+  }
+  const providerGeneration = observeLinearCommentGeneration(current);
+  if (initial && (initial.authorId !== creator || initial.bodyDigest !== nativeReportDigest(origin.request.body) || initial.providerGeneration.createdAt !== data.createdAt)) throw new Error("Native report initial generation changed");
+  const samePublication = current.body === origin.request.body;
+  const revision = `${providerGeneration.createdAt}:author-edit:${providerGeneration.editedAt ?? "none"}`;
+  if (webhook.action === "create") {
+    // A delayed signed original create remains the reserved publication, even
+    // after a human edit was delivered first. Do not invent an unedited witness.
+    if (providerGeneration.editedAt !== null) {
+      if (initial) classifyLinearCommentGeneration(initial.providerGeneration, providerGeneration, samePublication);
+      if (Date.parse(providerGeneration.editedAt) <= Date.parse(providerGeneration.createdAt)) throw new Error("Native report edit generation is unavailable");
+      return result(true, revision, creator);
+    }
+    if (!samePublication) throw new Error("Native report create changed during provider observation");
+  }
+  if (initial) {
+    const classified = classifyLinearCommentGeneration(initial.providerGeneration, providerGeneration, samePublication);
+    return result(classified.informational, classified.revision, classified.informational ? creator : actor!);
+  }
+  if (providerGeneration.editedAt === null) {
+    if (!samePublication) throw new Error("Native report unedited content changed");
+    return result(true, revision, creator, { version: 2, authorId: creator, bodyDigest: nativeReportDigest(origin.request.body), providerGeneration: { ...providerGeneration, editedAt: null } });
+  }
+  if (Date.parse(providerGeneration.editedAt) <= Date.parse(providerGeneration.createdAt)) throw new Error("Native report edit generation is unavailable");
+  return result(false, revision, actor!);
 }
 
 export type NativeReportWebhook = NonNullable<Awaited<ReturnType<typeof observeNativeReportWebhook>>>;
@@ -47,10 +87,9 @@ export async function assertNativeReportWebhook(store: Store, observed: NativeRe
   const current = await readNativeReportOrigin(store, observed.origin.connectionId, observed.origin.commentId);
   if (current?.fingerprint !== observed.fingerprint) throw new Error("Native report provenance changed during ingress");
   const rows = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: observed.origin.sessionId, action: GENERATION, source: "native-report-webhook", key: observed.origin.commentId } });
-  if (rows.length > 1) throw new Error("Native report has ambiguous initial generation");
-  const old = rows[0]?.value ? JSON.parse(rows[0].value) as NativeReportWebhook["generation"] : null;
-  if (observed.informational) {
-    if (old && nativeReportDigest(old) !== nativeReportDigest(observed.generation)) throw new Error("Native report initial generation changed");
-    if (!old) await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: observed.origin.sessionId, action: GENERATION, source: "native-report-webhook", key: observed.origin.commentId, value: JSON.stringify(observed.generation) } });
-  } else if (old && (old.createdAt !== observed.generation.createdAt || old.authorId !== observed.generation.authorId || Date.parse(observed.generation.updatedAt) <= Date.parse(old.updatedAt))) throw new Error("Native report edit generation changed");
+  if (rows.length > 1 || (rows[0]?.sequence ?? null) !== observed.previousRevision || (rows[0]?.value ?? null) !== observed.previousValue) throw new Error("Native report initial generation changed");
+  if (observed.nextInitial) {
+    if (rows.length || !observed.informational) throw new Error("Native report initial generation changed");
+    await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: observed.origin.sessionId, action: GENERATION, source: "native-report-webhook", key: observed.origin.commentId, value: JSON.stringify(observed.nextInitial) } });
+  }
 }
