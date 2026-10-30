@@ -105,7 +105,7 @@ test("async preparation persists and replays the safe real-process observer fail
 test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual pinned Drafted third-resource failure crosses the subprocess and async journal without partial proof", async () => {
   const f = await fixture(), c = controls(f), capability = await existingCleanupObserverFixture(process.env.DRAFTED_INTEGRATION_ROOT!);
   const selected = ["first", "second", "development-tunnel"].map((key, index) => ({ id: `resource-${index}`, key, kind: index === 2 ? "cloudflare-tunnel" : "docker-container", purpose: "development", state: "ready", expiresAt: null,
-    externalId: index === 2 ? "original-tunnel" : String(index + 1).repeat(64), metadata: index === 2 ? { tunnelId: "11111111-2222-3333-4444-555555555555", ingress: "private.invalid -> http://127.0.0.1:19913", configPath: "/private/not-read.yml" } : {} }));
+    externalId: index === 2 ? "original-tunnel" : String(index + 1).repeat(64), metadata: index === 2 ? { tunnelId: "11111111-2222-3333-4444-555555555555", configPath: "/private/not-read.yml" } : {} }));
   for (const resource of selected) await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: f.task.id } });
   const before = await db.prisma.remoteTaskResource.findMany();
   const bin = path.join(directory, "bin"), log = path.join(directory, "docker-calls.jsonl"); await mkdir(bin);
