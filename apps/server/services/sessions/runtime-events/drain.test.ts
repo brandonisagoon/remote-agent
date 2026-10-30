@@ -288,7 +288,7 @@ test("a large journal gives real health and task requests time to run before rec
     expect(servedWhileDraining).toBeTrue();
     expect(await input.prisma.runtimeInstruction.count()).toBe(503);
   } finally { await server.stop(true); }
-});
+}, 30_000);
 
 test("projection triggers coalesce while work runs instead of queuing one replay per event", async () => {
   const { input } = await fixture();

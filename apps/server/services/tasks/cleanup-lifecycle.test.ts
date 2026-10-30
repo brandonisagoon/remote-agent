@@ -1,3 +1,4 @@
+import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { taskSupervisionRoutes } from "../../routes/tasks/supervision.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -250,6 +251,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual control client and se
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient }))
     .use("*", async (c, next) => { if (c.req.method === "GET") taskReads++; await next(); }).route("/api/tasks", taskRoutes);
   const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime: createFakeAgentRuntime() }, async () => {}, { prepareFinalization: input => prepareTaskFinalization(input, f.dependencies) });
   try {
     const { taskRegistry } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
     let registry = taskRegistry(socket, f.task.id, 1000);
@@ -272,7 +274,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual control client and se
     await writeFile(path.join(archive, "snapshot.bin"), "changed retained bytes", { mode: 0o600 });
     await expect(registry.prepareFinalization!(request)).rejects.toThrow();
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
-  } finally { await server.stop(true); }
+  } finally { await stopPreparation(); await server.stop(true); }
 }, 30_000);
 
 
