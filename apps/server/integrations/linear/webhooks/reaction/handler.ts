@@ -16,7 +16,7 @@ import { readDeliveryComment } from "../../comment-context.ts";
 import { handleCommentWebhook } from "../comment/handler.ts";
 import { deliverMessageControls } from "../../../../services/sessions/message-controls.ts";
 import { validateSourceMessageOwner } from "../../message-delivery.ts";
-import { sourceMessageId } from "../../../../services/sessions/source-messages.ts";
+import { recordSourceMessage, sourceMessageId } from "../../../../services/sessions/source-messages.ts";
 
 function reactionTarget(data: LinearReactionWebhook["data"]): string {
   if (data.commentId || data.comment) return "comment";
@@ -64,23 +64,39 @@ export async function handleReactionWebhook(input: {
     const comment = await readDeliveryComment(config.linearApiKey, commentId);
     if (!comment?.issue || comment.user?.id !== authorId) return { kind: ReactionWebhookResultKind.Ignored, reason: "unauthorized_comment" };
     const id = `linear-steer:${config.activeConnectionId}:${data.id}`;
-    await prisma.$transaction(async (tx) => {
+    const origin = { provider: "linear", connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId,
+      machineId: config.machine, resourceId: comment.issue.id, resourceIdentifier: comment.issue.identifier,
+      commentId, threadRootId: comment.parentId ?? commentId, authorId, body: comment.body,
+      presentation: config.repository.conversationReactions ?? {} };
+    const canonicalId = sourceMessageId(origin);
+    const source = await prisma.$transaction(async (tx) => {
     const control = await tx.runtimeMessageControl.upsert({ where: { id }, update: {}, create: {
       id, provider: "linear", connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId,
       machineId: config.machine, commentId, authorId,
-      sourceMessageId: sourceMessageId({ provider: "linear", connectionId: config.activeConnectionId, commentId, body: comment.body }),
+      sourceMessageId: canonicalId,
     } });
     if (control.authorId !== authorId || control.commentId !== commentId || control.repositoryId !== config.activeRepositoryId || control.machineId !== config.machine) throw new Error("Control identity changed");
+    const pinnedId = control.sourceMessageId ?? canonicalId;
+    let snapshot = await tx.runtimeSourceMessage.findUnique({ where: { id: pinnedId } });
+    if (!snapshot) {
+      if (pinnedId !== canonicalId) throw new Error("Pinned control source is unavailable; refusing to substitute an edited comment");
+      snapshot = await recordSourceMessage(tx, origin);
+    }
+    if (snapshot.provider !== control.provider || snapshot.connectionId !== control.connectionId || snapshot.repositoryId !== control.repositoryId ||
+      snapshot.machineId !== control.machineId || snapshot.commentId !== control.commentId || snapshot.authorId !== control.authorId) throw new Error("Control source identity changed");
+    if (!control.sourceMessageId) await tx.runtimeMessageControl.update({ where: { id }, data: { sourceMessageId: snapshot.id } });
     await createWebhookReceipt(tx as PrismaClient, { provider: "linear", webhookId: config.activeWebhookId,
       connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId, deliveryId,
-      eventType: "reaction", trigger: workflows.map((workflow) => workflow.id).join(","), resourceId: comment.issue!.identifier,
+      eventType: "reaction", trigger: workflows.map((workflow) => workflow.id).join(","), resourceId: snapshot.resourceIdentifier,
       commentId, status: "accepted", detail: `control:${id}` });
+    return snapshot;
     });
     // A control can precede the comment webhook. Canonical source identity and
     // the comment-content hash converge onto the same durable instruction.
     await handleCommentWebhook({ ...input, deliveryId: `control-source:${id}`, configuredControl: true, webhook: {
       type: "Comment", action: "create", webhookTimestamp: webhook.webhookTimestamp,
-      data: { id: comment.id, body: comment.body, parentId: comment.parentId, userId: authorId, user: { id: authorId }, issue: comment.issue },
+      data: { id: source.commentId, body: source.body, parentId: source.threadRootId === source.commentId ? null : source.threadRootId,
+        userId: source.authorId, user: { id: source.authorId }, issue: { id: source.resourceId, identifier: source.resourceIdentifier } },
     } });
     await deliverMessageControls(prisma, agentRuntime, (message) => validateSourceMessageOwner(config, prisma, message));
     return { kind: ReactionWebhookResultKind.Triggered, workflowIds: workflows.map((workflow) => workflow.id) };
