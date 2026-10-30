@@ -114,7 +114,10 @@ async function checkComment(input: Context, sessionId: string, bindingInput: Ext
   const observed = await dependencies.comment(lineage.config.linearApiKey, bindingInput.acceptance.ownerCommentId);
   const comment = observed.comment;
   const digest = createHash("sha256").update(comment.body).digest("hex");
-  if (comment.id !== bindingInput.acceptance.ownerCommentId || comment.user.id !== lineage.approval.actorId || comment.issue.id !== lineage.approval.issueId || comment.issue.identifier !== lineage.approval.issueIdentifier || digest !== bindingInput.acceptance.ownerCommentDigest || lineage.approval.organizationId && observed.organization.id !== lineage.approval.organizationId || Date.parse(comment.createdAt) > Date.parse(comment.updatedAt) || Date.parse(comment.updatedAt) > Date.now()) throw new Error("Owner acceptance comment author, issue, organization, digest or timestamps do not match");
+  const createdAt = Date.parse(comment.createdAt), updatedAt = Date.parse(comment.updatedAt), now = Date.now();
+  // Provider timestamps can be slightly out of order. Preserve both exact values
+  // for the second-read comparison instead of assuming a shared write clock.
+  if (comment.id !== bindingInput.acceptance.ownerCommentId || comment.user.id !== lineage.approval.actorId || comment.issue.id !== lineage.approval.issueId || comment.issue.identifier !== lineage.approval.issueIdentifier || digest !== bindingInput.acceptance.ownerCommentDigest || lineage.approval.organizationId && observed.organization.id !== lineage.approval.organizationId || !Number.isFinite(createdAt) || !Number.isFinite(updatedAt) || createdAt > now || updatedAt > now) throw new Error("Owner acceptance comment author, issue, organization, digest or timestamps do not match");
   return { lineage, acceptance: { approvalEventSequence: lineage.event.sequence, approvalDigest: externalDigest(JSON.parse(lineage.event.value!)), ownerCommentId: comment.id, ownerCommentDigest: digest, actorId: comment.user.id, issueId: comment.issue.id, organizationId: observed.organization.id, createdAt: comment.createdAt, updatedAt: comment.updatedAt } };
 }
 
