@@ -11,6 +11,7 @@ import { taskRoutes, sessionTaskRoutes } from "./tasks/index.ts";
 import { taskSupervisionRoutes } from "./tasks/supervision.ts";
 import { taskCompletionRoutes } from "./tasks/completion.ts";
 import { legacyEvidenceRoutes } from "./tasks/legacy-evidence.ts";
+import { archiveRetentionRoutes } from "./tasks/archive-retention.ts";
 import { taskRoutingRoutes } from "./tasks/routing.ts";
 import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
 
@@ -24,6 +25,7 @@ export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/api/tasks", taskSupervisionRoutes);
   app.route("/api/tasks", taskCompletionRoutes);
   app.route("/api", legacyEvidenceRoutes);
+  app.route("/api", archiveRetentionRoutes);
   app.route("/api/routing", taskRoutingRoutes);
   app.route("/api/routing/linear", forwardedLinearRoute);
   app.route("/api/session-events", sessionEventRoutes);

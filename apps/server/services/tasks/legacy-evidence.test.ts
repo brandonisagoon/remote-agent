@@ -203,6 +203,20 @@ test("a later cleanup resource cannot absorb the retained archive or captured or
   expect(await readFile(f.resources[0]!.externalId, "utf8")).toBe("saved capture\n");
 });
 
+test("an original retained tooling parent is not a whole-tree cleanup operation", async () => {
+  const f = await fixture();
+  const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } });
+  const parent = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "task-evidence-archive", kind: "directory", purpose: "tooling", externalId: f.historical, state: "ready", metadata: { archive: true, retained: true, root: f.historical } } });
+  const receipt = await f.adopt();
+  await f.manage(receipt, "capture-0", "authorize"); await capture(receipt); await f.manage(receipt, "capture-0", "confirm");
+  expect((await lstat(f.historical)).isDirectory()).toBeTrue();
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: parent.id } })).toEqual(parent);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+  await db.prisma.remoteTaskResource.update({ where: { id: parent.id }, data: { purpose: "development" } });
+  await expect(f.manage(receipt, "capture-1", "authorize")).rejects.toThrow("overlaps");
+  expect(await readFile(f.resources[1]!.externalId, "utf8")).toBe("sentinel without historical proof\n");
+});
+
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
 test.skipIf(!draftedRoot)("actual Drafted adapter, control socket and server confirm retain bytes across lost response", async () => {
   const f = await fixture(), receipt = await f.adopt();

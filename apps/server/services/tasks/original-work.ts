@@ -1,6 +1,6 @@
+import { archiveMember as member, readArchiveBytes as bytes, observeArchive as archiveObservation } from "./archive-observation.ts";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, open, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
@@ -11,25 +11,6 @@ import { OriginalWork, OriginalWorkInput, OriginalWorkSnapshot } from "./origina
 const MAX_BYTES = 512 * 1024 * 1024;
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const inside = (root: string, file: string) => file.startsWith(`${root}${path.sep}`);
-function member(root: string, relative: string) {
-  if (!relative || relative === "." || path.isAbsolute(relative) || path.normalize(relative) !== relative || relative.split(path.sep).includes("..") || relative.includes("\0")) throw new Error("Archive member has an unsafe path");
-  const file = path.join(root, relative);
-  if (!inside(root, file)) throw new Error("Archive member escapes its root");
-  return file;
-}
-async function bytes(file: string, limit = MAX_BYTES) {
-  await assertFinalizationPath(file);
-  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const before = await handle.stat();
-    if (!before.isFile() || before.nlink !== 1 || before.uid !== process.getuid?.() || before.size > limit) throw new Error("Archive input must be a bounded owned regular file");
-    const output = Buffer.alloc(before.size); let offset = 0;
-    while (offset < output.length) { const read = await handle.read(output, offset, output.length - offset, offset); if (!read.bytesRead) throw new Error("Archive input changed"); offset += read.bytesRead; }
-    const after = await handle.stat(), leaf = await lstat(file);
-    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mode !== after.mode || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs || leaf.ino !== before.ino || leaf.dev !== before.dev || leaf.mode !== before.mode || leaf.isSymbolicLink()) throw new Error("Archive input changed during observation");
-    return output;
-  } finally { await handle.close(); }
-}
 async function git(cwd: string, args: string[]) {
   const child = Bun.spawn(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
     cwd, env: { PATH: process.env.PATH ?? "", HOME: os.tmpdir(), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
@@ -105,35 +86,6 @@ async function dirtySnapshot(worktree: string) {
   const untracked = [];
   for (const relative of paths) { const file = member(worktree, relative), content = await bytes(file); untracked.push({ path: relative, size: content.length, sha256: sha(content), executable: Boolean((await lstat(file)).mode & 0o111) }); }
   return OriginalWorkSnapshot.parse({ ...observed, indexPatchSha256: sha(indexPatch), worktreePatchSha256: sha(worktreePatch), untracked });
-}
-
-async function archiveObservation(root: string, manifestPath: string, manifestSha256: string, format: "sha256-lines" | "files-v1" = "sha256-lines") {
-  if (!inside(root, manifestPath)) throw new Error("Manifest must be inside its registered archive");
-  const manifest = await bytes(manifestPath, 8 * 1024 * 1024);
-  if (sha(manifest) !== manifestSha256) throw new Error("Archive manifest digest changed");
-  const entries = new Map<string, string>(); let total = 0;
-  const listed = format === "files-v1" ? (() => {
-    const value = z.object({ root: z.literal(root), files: z.array(z.object({ path: z.string(), bytes: z.number().int().nonnegative(), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).min(1).max(10000) }).passthrough().parse(JSON.parse(manifest.toString()));
-    return value.files.map((entry) => ({ name: entry.path, digest: entry.sha256, size: entry.bytes }));
-  })() : manifest.toString().split("\n").filter(Boolean).map((line) => {
-    const match = /^([a-f0-9]{64}) [ *](.+)$/.exec(line);
-    if (!match) throw new Error("Unsupported archive manifest entry");
-    return { name: match[2]!.startsWith("./") ? match[2]!.slice(2) : match[2]!, digest: match[1]!, size: undefined };
-  });
-  for (const { name, digest, size } of listed) {
-    const file = member(root, name);
-    if (file === manifestPath || entries.has(name) || entries.size >= 10000) throw new Error("Archive manifest has duplicate or recursive members");
-    const content = await bytes(file); total += content.length;
-    if (total > MAX_BYTES || sha(content) !== digest || size !== undefined && content.length !== size) throw new Error("Archive member does not match its manifest");
-    entries.set(name, digest);
-  }
-  if (!entries.size) throw new Error("Archive manifest is empty");
-  const inventory = await finalizationInventory(root, [root], new Map(), new Map());
-  for (const entry of inventory) {
-    if (entry.kind === "symlink" || entry.kind === "opaque" || entry.kind === "file" && path.join(root, entry.path) !== manifestPath && entries.get(entry.path) !== entry.sha256) throw new Error("Archive contains unmanifested or unsupported material");
-    if ((entry.mode & 0o7777) !== (entry.kind === "directory" ? 0o700 : 0o600)) throw new Error("Retained archive must be private");
-  }
-  return { inventory, inventoryDigest: finalizationDigest(inventory), entries };
 }
 
 export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
