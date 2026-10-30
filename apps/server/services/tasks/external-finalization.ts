@@ -209,7 +209,7 @@ export async function assertExternalDoneAllowed(input: { prisma: PrismaClient; c
  * entries survive, never a global exemption for PR/CI resource kinds. */
 export async function externalFinalizationProjection(prisma: PrismaClient, task: { id: string; primarySessionId: string | null; resources?: Array<Parameters<typeof finalizationResourceIdentity>[0]> }): Promise<{
   finalizationVersion?: 2;
-  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" | "retain-archive" | "retain-result" }>> };
+  finalizationRetention?: { requestKey: string; taskId: string; sessionId: string; preparedRevision: number; confirmedRevision: number; resourcePlanDigest: string; resources: Array<Extract<FinalizationResourcePlan, { disposition: "retain-reference" | "retain-archive" | "retain-result" | "retain-archive-member" }>> };
 }> {
   if (!task.primarySessionId) return {};
   const binding = await latestExternalBinding(prisma, task.id, task.primarySessionId);
@@ -224,9 +224,10 @@ export async function externalFinalizationProjection(prisma: PrismaClient, task:
     const prepared = PreparedExternalFinalization.parse(JSON.parse(preparation.value!));
     if (preparation.action !== FINALIZATION_PREPARED || preparation.source !== confirmed.source || preparation.runtimeSessionId !== task.primarySessionId || preparation.key !== confirmed.key || prepared.taskId !== task.id || prepared.sessionId !== task.primarySessionId || prepared.requestKey !== confirmed.key || prepared.bindingRevision !== binding.sequence || prepared.bindingDigest !== adopted.manifestDigest || prepared.resourcePlanDigest !== adopted.resourcePlanDigest || finalizationDigest(prepared.resources) !== prepared.resourcePlanDigest || finalizationDigest(adopted.resources) !== prepared.resourcePlanDigest || finalizationDigest(prepared.originalWork ?? null) !== finalizationDigest(adopted.originalWork ?? null)) return hint;
     const records = task.resources ?? await prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
-    const relevant = records.filter((record) => ["browser", "development", "review"].includes(record.purpose));
+    const relevant = records;
+    assertExternalResourceRecords(relevant, prepared.resources, true);
     if (relevant.length !== records.length || relevant.length !== prepared.resources.length || prepared.resources.some((entry) => !relevant.some((record) => record.id === entry.id && finalizationResourceIdentity(record).identityDigest === entry.identityDigest && (entry.disposition.startsWith("retain-") ? record.state !== "released" : record.state === "released")))) return hint;
     await assertResourceProofs(prisma, prepared, preparation.sequence, confirmed.value);
-    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference" || entry.disposition === "retain-archive" || entry.disposition === "retain-result") } };
+    return { ...hint, finalizationRetention: { requestKey: prepared.requestKey, taskId: task.id, sessionId: task.primarySessionId, preparedRevision: preparation.sequence, confirmedRevision: confirmed.sequence, resourcePlanDigest: prepared.resourcePlanDigest, resources: prepared.resources.filter((entry) => entry.disposition === "retain-reference" || entry.disposition === "retain-archive" || entry.disposition === "retain-result" || entry.disposition === "retain-archive-member") } };
   } catch { return hint; }
 }
