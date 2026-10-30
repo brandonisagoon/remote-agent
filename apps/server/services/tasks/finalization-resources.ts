@@ -243,6 +243,13 @@ function assertPlanDependencies(plan: FinalizationResourcePlan[]) {
       if (new Set(entry.dependencies).size !== entry.dependencies.length || entry.dependencies.includes(id)) throw new Error("Prepared cleanup dependency identity changed");
       for (const dependency of entry.dependencies) visit(dependency);
     }
+    if (entry.disposition === "retire-adapter") {
+      if (new Set(entry.stoppedConsumers).size !== entry.stoppedConsumers.length || entry.stoppedConsumers.includes(id) || entry.stoppedConsumers.some(id => entry.dependencies.includes(id))) throw new Error("Prepared stopped-consumer identity changed");
+      for (const id of entry.stoppedConsumers) {
+        const consumer = entries.get(id);
+        if (!consumer || consumer.disposition !== "retire-adapter" || !consumer.targets.some(target => target.kind === "native-family")) throw new Error("Prepared stopped consumer has no exact native-family proof");
+      }
+    }
     visiting.delete(id); visited.add(id);
   }
   for (const entry of plan) visit(entry.id);

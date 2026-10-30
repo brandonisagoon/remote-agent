@@ -4,7 +4,7 @@ import { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Hash };
-export const CleanupAdapterPlan = z.strictObject({ ...Identity, disposition: z.literal("retire-adapter"), dependencies: z.array(z.string().min(1)).max(1000), adapter: CleanupAdapter,
+export const CleanupAdapterPlan = z.strictObject({ ...Identity, disposition: z.literal("retire-adapter"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), adapter: CleanupAdapter,
   targets: z.array(CleanupTarget).min(1).max(1000), observer: z.strictObject({ capability: CleanupObserverCapability, task: CleanupObserverInput.shape.task }) });
 export type CleanupAdapterPlan = z.infer<typeof CleanupAdapterPlan>;
 export type CleanupAdapterContext = z.infer<typeof CleanupAdapterPlan>["observer"];
@@ -13,7 +13,7 @@ type Identity = z.infer<z.ZodObject<typeof Identity>>;
 type Observe = typeof runCleanupResourceObserver;
 const adapters: Record<string, z.infer<typeof CleanupAdapter>> = {
   "docker-container": "docker", "docker-network": "docker", "docker-volume": "docker", "docker-compose": "compose", "docker-compose-project": "compose",
-  "task-runtime": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-tunnel": "preview",
+  "task-runtime": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
 };
 export const hasCleanupAdapter = (kind: string) => Object.hasOwn(adapters, kind);
 const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
@@ -28,7 +28,7 @@ function resultScope(input: z.infer<typeof CleanupObserverBatchInput>, value: un
     const record = input.resources.find(record => record.id === item.resourceId);
     if (!selected || !record || !hasCleanupAdapter(record.kind) || item.adapter !== adapters[record.kind] || item.resourceIdentityDigest !== identities.get(item.resourceId)
       || item.targets.some(target => target.scope.taskId !== input.task.id || target.scope.purpose !== record.purpose)
-      || item.dependencies.some(id => !input.resources.some(record => record.id === id))) throw new Error("Cleanup observer resource ownership or dependencies changed");
+      || [...item.dependencies, ...item.stoppedConsumers].some(id => !input.resources.some(record => record.id === id))) throw new Error("Cleanup observer resource ownership or dependencies changed");
     if (input.stage === "confirm" && !same(item.targets, selected.expectedTargets)) throw new Error("Cleanup observer target identity changed since preparation");
   }
   return result;
@@ -41,7 +41,7 @@ export async function prepareCleanupAdapterResources(input: { context: CleanupAd
   const result = resultScope(request, await observe({ capability: input.context.capability, request }), new Map(input.identities.map(identity => [identity.id, identity.identityDigest])));
   return input.identities.map(identity => {
     const observed = result.observations.find(item => item.resourceId === identity.id)!;
-    return CleanupAdapterPlan.parse({ ...identity, disposition: "retire-adapter", dependencies: observed.dependencies, adapter: observed.adapter, targets: observed.targets, observer: input.context });
+    return CleanupAdapterPlan.parse({ ...identity, disposition: "retire-adapter", dependencies: observed.dependencies, stoppedConsumers: observed.stoppedConsumers, adapter: observed.adapter, targets: observed.targets, observer: input.context });
   });
 }
 
@@ -56,7 +56,12 @@ export async function assertCleanupAdapterResources(input: { taskId: string; res
   for (const plan of plans) {
     const current = result.observations.find(item => item.resourceId === plan.id)!;
     const record = input.resources.find(record => record.id === plan.id)!;
-    if (current.adapter !== plan.adapter || !same([...current.dependencies].sort(), [...plan.dependencies].sort())) throw new Error("Cleanup observer adapter or dependency plan changed");
+    if (current.adapter !== plan.adapter || !same([...current.dependencies].sort(), [...plan.dependencies].sort()) || !same([...current.stoppedConsumers].sort(), [...plan.stoppedConsumers].sort())) throw new Error("Cleanup observer adapter or dependency plan changed");
     if (input.removed && record.state !== "released" || (input.removed || record.state === "released") && !current.absent) throw new Error("Prepared physical resource has no independently verified retirement");
+    if (record.state === "released") for (const id of plan.stoppedConsumers) {
+      const consumer = result.observations.find(item => item.resourceId === id);
+      const families = consumer?.targets.filter(target => target.kind === "native-family") ?? [];
+      if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Prepared store retirement still has an active or unverified native consumer");
+    }
   }
 }

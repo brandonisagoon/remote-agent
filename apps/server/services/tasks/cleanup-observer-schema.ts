@@ -29,6 +29,7 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
   z.strictObject({ ...Common, kind: z.literal("cloudflare-dns-record"), scope: z.strictObject({ ...Scope, zoneId: z.string().regex(/^[a-f0-9]{32}$/) }), name: z.string().min(1), type: z.string().min(1), contentDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("cloudflare-tunnel"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/) }), name: z.string().min(1) }),
   z.strictObject({ ...Common, kind: z.literal("cloudflare-ingress-route"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/), tunnelId: z.string().min(1) }), hostname: z.string().min(1), routeDigest: Hash }),
+  z.strictObject({ ...Common, kind: z.literal("local-ingress-route"), scope: z.strictObject({ ...Scope, configFile: Absolute, tunnelId: Nonempty }), hostname: Nonempty, sourceDigest: Hash, routeDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("native-family"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), proof: z.strictObject({ file: Absolute, sha256: Hash }), planDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-endpoint"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), url: z.url(), nativeProofDigest: Hash }),
 ]);
@@ -50,8 +51,9 @@ export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task
   });
 export type CleanupObserverInput = z.infer<typeof CleanupObserverInput>;
 export const CleanupObserverResult = z.strictObject({ version: z.literal(1), taskId: z.string(), resourceId: z.string(), resourceIdentityDigest: Hash,
-  adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
+  adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), stoppedConsumers: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
     if (new Set(result.dependencies).size !== result.dependencies.length || result.dependencies.includes(result.resourceId)) ctx.addIssue({ code: "custom", message: "Observer dependencies must be unique other resource IDs" });
+    if (new Set(result.stoppedConsumers).size !== result.stoppedConsumers.length || result.stoppedConsumers.includes(result.resourceId) || result.stoppedConsumers.some(id => result.dependencies.includes(id))) ctx.addIssue({ code: "custom", message: "Stopped consumers must be unique other resource IDs, separate from full dependencies" });
     if (!uniqueTargets(result.targets) || new Set(result.targets.map(target => target.identityDigest)).size !== result.targets.length || new Set(result.presentTargetDigests).size !== result.presentTargetDigests.length) ctx.addIssue({ code: "custom", message: "Observer targets must be unique" });
     if (result.absent !== (result.presentTargetDigests.length === 0) || result.presentTargetDigests.some(digest => !result.targets.some(target => target.identityDigest === digest && target.presentAtPrepare))) ctx.addIssue({ code: "custom", message: "Observer presence changed outside the prepared target set" });
     if (result.targets.some(target => target.identityDigest !== cleanupTargetDigest(target))) ctx.addIssue({ code: "custom", message: "Observer target digest does not match its exact identity" });

@@ -18,7 +18,7 @@ function fixture() {
       const rawTargets = item.expectedTargets ?? [{ kind: "docker-container" as const, id: resource.externalId, presentAtPrepare: true, identityDigest: hash(String(resources.indexOf(resource))), scope: { taskId: task.id, purpose: resource.purpose }, identity: { createdAt: "2026-10-30T00:00:00Z", labelsDigest: hash("d"), image: "sha256:owned-image", networks: [], volumes: [] } }];
       const targets = rawTargets.map(target => { const parsed = CleanupTarget.parse(target); return { ...parsed, identityDigest: cleanupTargetDigest(parsed) }; });
       return { version: 1 as const, taskId: task.id, resourceId: resource.id, resourceIdentityDigest: finalizationResourceIdentity(resource).identityDigest,
-        dependencies: resource.id === "resource-0" ? ["resource-1"] : [], adapter: "docker" as const, targets, presentTargetDigests: absent ? [] : targets.map(target => target.identityDigest), absent };
+        dependencies: resource.id === "resource-0" ? ["resource-1"] : [], stoppedConsumers: [], adapter: "docker" as const, targets, presentTargetDigests: absent ? [] : targets.map(target => target.identityDigest), absent };
     }) };
   };
   const prepare = () => prepareCleanupAdapterResources({ context, resources, identities }, observe);
@@ -136,4 +136,46 @@ test("malformed observer keys and values are never exposed as validation diagnos
     expect(String(error)).toContain("absence is unverified");
     expect(String(error)).not.toContain("private-provider");
   }
+});
+
+test("store retirement requires stopped native consumers but does not wait for their unresolved DNS preview", async () => {
+  const { prepareFinalizationResources, assertFinalizationResources } = await import("./finalization-resources.ts");
+  const f = fixture(), resources = f.resources.slice(0, 5);
+  resources[1]!.kind = "local-http"; resources[1]!.externalId = "http://127.0.0.1:12345";
+  let consumerRunning = true, storePresent = true;
+  const observer = async (input: Parameters<typeof f.observe>[0]) => {
+    const result = await f.observe(input);
+    return { ...result, observations: result.observations.map(item => {
+      if (item.resourceId === "resource-0") return { ...item, dependencies: [], stoppedConsumers: ["resource-1"], absent: !storePresent, presentTargetDigests: storePresent ? item.targets.map(target => target.identityDigest) : [] };
+      if (item.resourceId !== "resource-1") return item;
+      const scope = { taskId: f.task.id, purpose: "development", anchorKey: "source-family" };
+      const targets = [
+        { kind: "native-family", id: "source-family", scope, proof: { file: "/private/source-family.json", sha256: hash("a") }, planDigest: hash("b"), presentAtPrepare: true },
+        { kind: "local-endpoint", id: resources[1]!.externalId, scope, url: resources[1]!.externalId, nativeProofDigest: hash("a"), presentAtPrepare: true },
+        { kind: "cloudflare-dns-record", id: "dns-record", scope: { taskId: f.task.id, purpose: "development", zoneId: "d".repeat(32) }, name: "task.example.test", type: "CNAME", contentDigest: hash("e"), presentAtPrepare: true },
+      ].map(value => { const target = CleanupTarget.parse({ ...value, identityDigest: hash("0") }); return { ...target, identityDigest: cleanupTargetDigest(target) }; });
+      return { ...item, adapter: "endpoint", targets, absent: false, presentTargetDigests: targets.filter(target => consumerRunning || target.kind === "cloudflare-dns-record").map(target => target.identityDigest) };
+    }) };
+  };
+  const observation = { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
+  const plan = await prepareFinalizationResources({ resources, taskId: f.task.id, sessionId: f.task.primarySessionId, toolingRoot: f.context.capability.checkout,
+    sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true, adapterContext: f.context }, observation);
+  resources[0]!.state = "released"; storePresent = false;
+  const input = { taskId: f.task.id, resources, plan, removed: false, originalWork: true };
+  await expect(assertFinalizationResources(input, observation)).rejects.toThrow("active or unverified native consumer");
+  consumerRunning = false;
+  await assertFinalizationResources(input, observation);
+  expect(resources[1]!.state).toBe("ready");
+  await expect(assertFinalizationResources({ ...input, removed: true }, observation)).rejects.toThrow("independently verified");
+});
+
+test("a stopped-consumer edge cannot stand in for a missing native ownership proof", async () => {
+  const { prepareFinalizationResources } = await import("./finalization-resources.ts");
+  const f = fixture();
+  const observation = { adapters: async (input: Parameters<typeof f.observe>[0]) => {
+    const result = await f.observe(input);
+    return { ...result, observations: result.observations.map(item => item.resourceId === "resource-0" ? { ...item, dependencies: [], stoppedConsumers: ["resource-1"] } : item) };
+  }, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
+  await expect(prepareFinalizationResources({ resources: f.resources.slice(0, 5), taskId: f.task.id, sessionId: f.task.primarySessionId,
+    toolingRoot: f.context.capability.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true, adapterContext: f.context }, observation)).rejects.toThrow("no exact native-family proof");
 });
