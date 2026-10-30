@@ -264,6 +264,32 @@ concurrent/lost-response replay, pause/ownership/publication races and HTTP
 cancellation before a late provider observation. No original task was changed by
 these tests.
 
+### Native receipt timestamps and author edits
+
+Linear's primary GraphQL `Comment` schema defines `editedAt` as the last author
+edit, or `null` when the comment has never been edited. `updatedAt` is the entity
+update timestamp and can advance without an author edit. The original DRA-98
+publication demonstrated that distinction: its current body/author/thread/creation
+matched the native receipt, `updatedAt` advanced, and the provider returned
+`editedAt: null`. Only scoped read-only GraphQL inspection established this; no
+live disposition was performed during implementation.
+
+New dispositions preserve the supplied native receipt and attestation unchanged.
+They save a separate `providerGeneration` observation after two identical
+canonical reads. A later update timestamp is compatible with the original
+publication only when the provider explicitly proves it has never been edited;
+missing/invalid edit information, a regressed timestamp, changed identity/content
+or a changing observation refuses the disposition. This does not waive the
+original never-started queue, owner, pause, request and transaction checks.
+
+Ingress for these observations uses the author-edit timestamp for deterministic
+revision IDs. Metadata updates alone cannot generate owner work; actual later
+edits, including A→B→A and a later same-body edit, remain distinct owner inputs.
+A changed body under the same edit fact is refused. Historical resolutions that
+lack this observation retain their original exact update-timestamp contract and
+are not rewritten or silently upgraded. This change adds no wire request field,
+new approval, provider mutation or execution authority.
+
 ## Publishing native reports before ingress
 
 An authorized native coordinator should use the existing server publisher for
@@ -306,3 +332,18 @@ Disposable tests deliver the real publisher's webhook before its create call
 returns, simulate response loss/restart and simultaneous retries, exercise the
 actual authenticated HTTP and signed webhook routes, and check pin/pause/source,
 origin and cancellation refusal. No live report was posted by verification.
+
+The proactive publisher uses the same author-edit classifier for new initial
+witnesses. An exact canonical, never-edited publication creates a versioned
+`native-report-created` witness; its UUID/outbox origin remains unchanged. The
+existing ingress transaction compares the prior witness's exact sequence and raw
+value, including its absence, before it can save the observation or owner input.
+Metadata-only updates retain that witness and do not enqueue work.
+
+When a human edit arrives before the original create webhook, the edit is still
+normal owner input. A delayed signed create matching the reserved publication is
+informational but does not manufacture a never-edited witness from the edited
+comment. Subsequent metadata changes deduplicate against that edit's timestamp.
+Old raw initial witnesses retain their original timestamp behavior, without an
+implicit migration. Missing canonical edit evidence holds the webhook for retry;
+it cannot establish an unedited publication.

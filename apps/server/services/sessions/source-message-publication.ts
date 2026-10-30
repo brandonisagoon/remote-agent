@@ -1,5 +1,6 @@
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { readDeliveryComment } from "../../integrations/linear/comment-context.ts";
+import { LinearCommentGeneration, observeLinearCommentGeneration, classifyLinearCommentGeneration } from "../../integrations/linear/comment-generation.ts";
 import type { SourceMessageInput } from "./source-messages.ts";
 import { createHash } from "node:crypto";
 import { QueuedNativeReport } from "./source-report-disposition.ts";
@@ -52,6 +53,15 @@ export async function nativeReportIngress(prisma: Store, config: ServerConfig, i
   const saved = QueuedNativeReport.parse((receipt.evidence as { attestation: unknown }).attestation).publication;
   const current = await readDeliveryComment(config.linearApiKey, input.commentId);
   if (!current || current.id !== input.commentId || current.issue?.id !== input.resourceId || current.user?.id !== input.authorId || (current.parentId ?? current.id) !== input.threadRootId || current.body !== input.body || !current.createdAt || !current.updatedAt || !Number.isFinite(Date.parse(current.updatedAt)) || !Number.isFinite(Date.parse(current.createdAt))) throw new Error("Comment generation changed during native report ingress");
+  const evidence = receipt.evidence as { providerGeneration?: unknown };
+  if (Object.hasOwn(evidence, "providerGeneration")) {
+    const generation = LinearCommentGeneration.parse(evidence.providerGeneration);
+    if (generation.createdAt !== saved.createdAt) throw new Error("Native report generation does not match its attestation");
+    const result = classifyLinearCommentGeneration(generation, observeLinearCommentGeneration(current), createHash("sha256").update(input.body).digest("hex") === saved.bodySha256 && input.authorId === saved.authorId && input.threadRootId === saved.threadRootId);
+    return { receiptId: receipt.id, fingerprint: receipt.fingerprint, ...result };
+  }
+  // Historical receipts have no author-edit observation. Keep their original
+  // strict version contract; never silently manufacture that missing proof.
   const same = current.createdAt === saved.createdAt && current.updatedAt === saved.updatedAt && createHash("sha256").update(input.body).digest("hex") === saved.bodySha256 && input.authorId === saved.authorId && input.threadRootId === saved.threadRootId;
   if (!same && (current.createdAt !== saved.createdAt || Date.parse(current.updatedAt) <= Date.parse(saved.updatedAt))) throw new Error("Comment is not a later generation of the attested publication");
   return { receiptId: receipt.id, fingerprint: receipt.fingerprint, informational: same, revision: `${current.createdAt}:${current.updatedAt}` };
