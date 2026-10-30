@@ -308,7 +308,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
-      if (this.recoveringSessions.has(row.id)) throw new Error("Session transport transition is in progress");
+      if (this.recoveringSessions.has(row.id)) throw new CleanupTransportBlockedError("Session transport transition is in progress");
       await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: row.id });
       const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
       const handle = await this.runtimeFor(row.id).ensureSession({

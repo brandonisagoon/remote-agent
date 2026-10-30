@@ -176,8 +176,12 @@ test("pause and new local turns cannot cross the release reservation", async () 
     if ((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } })).ownerPaused) throw new Error("Owner paused"); }, commit: async () => { throw new Error("Must not commit"); } });
   await entered;
   expect(() => f.runtime.startTurn({ sessionId: f.session.id, text: "Competing writer", requestId: "competing" })).toThrow("reconciled");
+  const before = await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } });
+  await expect(f.runtime.ensureSession({ sessionKey: "primary", agent: "codex", cwd: f.source, repositoryId: f.session.repositoryId!, machineId: f.config.machine, role: "primary", lifecycle: "persistent" })).rejects.toThrow("transition");
+  const after = await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } });
   await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { ownerPaused: true } }); proceed();
   await expect(release).rejects.toThrow("Owner paused"); expect(alive(record.pid!)).toBe(true);
+  expect(after).toEqual(before);
   expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
 }, 30_000);
 
