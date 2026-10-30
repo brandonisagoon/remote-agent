@@ -11,7 +11,46 @@ function host(resource: Resource) {
   try { return typeof value === "string" ? new URL(value.startsWith("http") ? value : `https://${value}`).hostname : undefined; } catch { return undefined; }
 }
 function activePreview(resource: Resource) { return resource.state !== "released" && (kinds.includes(resource.kind) || resource.kind === "local-http" && Boolean(object(resource.metadata).publicUrl)); }
-function previewScope(resource: Resource, resources: Resource[]) {
+/** Older accepted operations froze these aliases before canonical discovery.
+ * Derive only identities already present in that exact recorded association;
+ * a missing DNS ID permits null, never a newly discovered deletion target. */
+function legacyNamedScope(resource: Resource, resources: Resource[], hostname: string) {
+  const named = resources.filter(item => (kinds.includes(item.kind) || item.kind === "local-http") && host(item) === hostname);
+  const tunnels = named.filter(item => item.kind === "cloudflare-tunnel");
+  if (tunnels.length !== 1 || named.some(item => item.purpose !== resource.purpose)) throw new Error("Frozen legacy preview association is ambiguous");
+  const tunnel = tunnels[0]!, metadata = object(tunnel.metadata);
+  const tunnelId = UUID.parse(metadata.tunnelId), zoneId = Hex.parse(metadata.zone), accountId = Hex.parse(metadata.account);
+  if (metadata.hostname !== hostname || typeof metadata.configPath !== "string" || !metadata.configPath) throw new Error("Frozen legacy preview tunnel identity is incomplete");
+  const source = z.string().parse(metadata.sourceAddress), url = new URL(source);
+  if (url.protocol !== "http:" || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || !url.port || url.port === "0" || source !== url.origin
+    || metadata.configIngress !== undefined && metadata.configIngress !== `${hostname} -> ${source}; fallback http_status:404`) throw new Error("Frozen legacy preview source identity changed");
+  const endpoints = resources.filter(item => item.kind === "local-http" && item.externalId === source);
+  if (endpoints.length !== 1 || endpoints[0]!.purpose !== resource.purpose || host(endpoints[0]!) !== undefined && host(endpoints[0]!) !== hostname
+    || named.some(item => item.kind === "local-http" && item.id !== endpoints[0]!.id)) throw new Error("Frozen legacy preview endpoint is ambiguous");
+  const endpoint = endpoints[0]!, publicTunnel = object(object(endpoint.metadata).publicTunnel);
+  const dns = named.filter(item => ["cloudflare-dns-record", "cloudflare-dns-route"].includes(item.kind));
+  if (dns.length > 1) throw new Error("Frozen legacy preview DNS association is ambiguous");
+  let dnsRecordId: string | null = null;
+  if (dns[0]) {
+    const value = object(dns[0].metadata), route = object(value.routeResult);
+    if (dns[0].externalId !== hostname || value.hostname !== hostname || value.tunnelId !== tunnelId || value.zone !== zoneId || value.account !== accountId
+      || value.type !== "CNAME tunnel route" || value.content !== `${tunnelId}.cfargotunnel.com` || route.name !== hostname || route.cname !== "new") throw new Error("Frozen legacy preview DNS identity changed");
+    dnsRecordId = Hex.parse(route.dnsTag);
+  }
+  const related = [...new Map([...named, endpoint].map(item => [item.id, item])).values()];
+  if (!related.some(item => item.id === resource.id)) throw new Error("Resource is outside the frozen legacy preview association");
+  const canonical = { hostname, tunnelId, zoneId, accountId, dnsRecordId };
+  for (const item of related) {
+    const value = object(item.metadata);
+    for (const [key, expected] of Object.entries(canonical)) if (value[key] !== undefined && value[key] !== expected) throw new Error("Frozen legacy preview canonical identity conflicts");
+    if (value.zone !== undefined && value.zone !== zoneId || value.account !== undefined && value.account !== accountId) throw new Error("Frozen legacy preview account or zone conflicts");
+  }
+  if (publicTunnel.id !== undefined && publicTunnel.id !== tunnelId || publicTunnel.hostname !== undefined && publicTunnel.hostname !== hostname
+    || publicTunnel.zoneId !== undefined && publicTunnel.zoneId !== zoneId || publicTunnel.accountId !== undefined && publicTunnel.accountId !== accountId) throw new Error("Frozen legacy preview endpoint association conflicts");
+  const shared = publicTunnel.shared === true || metadata.shared === true;
+  return { kind: "named" as const, hostname, tunnelId, zoneId, dnsRecordId, shared, related, legacyCanonical: canonical };
+}
+function previewScope(resource: Resource, resources: Resource[], allowLegacy = false) {
   const metadata = object(resource.metadata), hostname = host(resource);
   if (!hostname) throw new Error("Retirement preview requires a recorded hostname");
   if (hostname.endsWith(".trycloudflare.com")) {
@@ -19,6 +58,7 @@ function previewScope(resource: Resource, resources: Resource[]) {
     if (new Set(keys).size !== keys.length || keys.some(key => !resources.some(item => item.key === key && item.purpose === resource.purpose && ["launch-agent", "docker-container"].includes(item.kind)))) throw new Error("Retirement quick preview requires exact connector identities");
     return { kind: "quick" as const, hostname, keys };
   }
+  if (allowLegacy && ["tunnelId", "zoneId", "dnsRecordId"].some(key => metadata[key] === undefined)) return legacyNamedScope(resource, resources, hostname);
   const tunnelId = UUID.parse(metadata.tunnelId), zoneId = Hex.parse(metadata.zoneId), dnsRecordId = Hex.nullable().parse(metadata.dnsRecordId);
   if (metadata.hostname !== hostname || object(metadata.publicTunnel).id !== undefined && object(metadata.publicTunnel).id !== tunnelId) throw new Error("Retirement preview canonical identities conflict");
   const related = resources.filter(item => host(item) === hostname || !host(item) && kinds.includes(item.kind) && object(item.metadata).tunnelId === tunnelId);
@@ -27,7 +67,7 @@ function previewScope(resource: Resource, resources: Resource[]) {
   const shared = publicTunnel.shared === true || tunnelMeta.shared === true || !tunnel && publicTunnel.shared !== false;
   if (!shared) Hex.parse(metadata.accountId);
   if (related.some(item => activePreview(item) && (object(item.metadata).tunnelId !== tunnelId || object(item.metadata).zoneId !== zoneId || object(item.metadata).dnsRecordId !== dnsRecordId))) throw new Error("Retirement preview identities differ within one hostname");
-  return { kind: "named" as const, hostname, tunnelId, zoneId, dnsRecordId, shared, related };
+  return { kind: "named" as const, hostname, tunnelId, zoneId, dnsRecordId, shared, related, legacyCanonical: undefined };
 }
 
 /** Discovery and legacy receipt expansion must finish before owner authority
@@ -57,7 +97,13 @@ export function assertRetirementResourcePreflight(resources: Resource[]) {
 export function normalizeRetirementPreviewTransition(saved: Resource, current: Resource, savedResources: Resource[], currentResources: Resource[]) {
   const before = object(saved.metadata), after = { ...object(current.metadata) };
   if (!activePreview(saved)) return current.metadata;
-  const scope = previewScope(saved, savedResources);
+  const scope = previewScope(saved, savedResources, true);
+  if (scope.kind === "named" && scope.legacyCanonical) {
+    for (const [key, expected] of Object.entries(scope.legacyCanonical)) {
+      if (after[key] !== undefined && after[key] !== expected) throw new Error("Legacy preview discovery differs from its frozen identity");
+      if (before[key] === undefined) delete after[key];
+    }
+  }
   if (after.cleanupObserved !== before.cleanupObserved) {
     const allowed = saved.kind === "cloudflare-tunnel" && scope.kind === "named" ? scope.shared ? "task-hostname-removed-shared-tunnel-preserved" : "exact-tunnel-absent"
       : ["cloudflare-dns-record", "cloudflare-dns-route"].includes(saved.kind) ? "exact-dns-record-absent" : null;
