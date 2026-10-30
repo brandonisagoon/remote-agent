@@ -203,6 +203,10 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
 /** Confirmation observes cleanup; it neither deletes nor automatically repeats
  * anything after an interrupted adapter. The provider remains open for Done. */
 export async function confirmTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
+  return executeFullPreparation(input, () => confirmFinalization(input, dependencies));
+}
+
+async function confirmFinalization(input: FinalizationContext, dependencies: Dependencies) {
   const task = await owned(input);
   if (input.authorityOnly) throw new Error("Authority-only checks cannot confirm finalization");
   if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) return confirmExternalFinalization(input);

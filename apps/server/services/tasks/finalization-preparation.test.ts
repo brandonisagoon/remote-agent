@@ -11,7 +11,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
-import { prepareTaskFinalization } from "./finalization.ts";
+import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 import { preparationJournalWorker, requestFinalizationPreparation } from "./finalization-preparation.ts";
 import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
 import { taskRoutes } from "../../routes/tasks/index.ts";
@@ -307,4 +307,98 @@ test("queued verification refuses changed primitive resource metadata before rea
   let scans = 0;
   worker = preparationJournalWorker({ ...c.input, runtime: c.runtime }, async value => { scans++; return prepareTaskFinalization(value, f.dependencies); });
   worker.tick(); await worker.idle(); expect(scans).toBe(0); expect((await c.post(request)).status).toBe(409);
+});
+
+async function removedFixture() {
+  const f = await preparedFixture(), c = controls(f);
+  const prepared = await prepareTaskFinalization(c.input, f.dependencies);
+  await db.prisma.remoteTaskResource.update({ where: { id: "volume" }, data: { state: "released" } });
+  f.remove();
+  const post = (confirmation = attempt("confirmation")) => c.app.request(`/api/tasks/${f.task.id}/confirm-finalization`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: c.input.requestKey, cleanup: true, confirmation }) });
+  return { ...f, c, prepared, post };
+}
+
+test("confirmation acknowledgment joins one full observation and recovers its lost response with the exact revision", async () => {
+  const f = await removedFixture(), request = attempt("confirmation");
+  const accepted = await (await f.post(request)).json();
+  expect(accepted.confirmation.state).toBe("pending"); expect(accepted.receipt).toBeUndefined();
+  let scans = 0, release!: () => void, entered!: () => void;
+  const wait = new Promise<void>(resolve => release = resolve), started = new Promise<void>(resolve => entered = resolve);
+  worker = preparationJournalWorker(f.c.input, undefined, async input => { scans++; entered(); await wait; return confirmTaskFinalization(input, f.dependencies); });
+  worker.tick(); await started;
+  try {
+    const joined = await (await f.post()).json();
+    expect(joined.confirmation.acceptedRevision).toBe(accepted.confirmation.acceptedRevision);
+    await expect(confirmTaskFinalization(f.c.input, f.dependencies)).rejects.toThrow("already running");
+    expect((await f.c.post(request)).status).toBe(409); // A confirmation token cannot become a preparation token.
+  } finally { release(); }
+  await worker.idle();
+  // Treat the first terminal response as lost; a replay is only a local receipt read.
+  const ready = await (await f.post(request)).json(), replay = await (await f.post(request)).json();
+  expect(replay.receipt).toEqual(ready.receipt);
+  expect(replay.receipt.preparedRevision).toBe(f.prepared.preparedRevision);
+  expect(replay.receipt.cleanup).toEqual(f.prepared.cleanup);
+  expect(replay.receipt.confirmedRevision).toBeGreaterThan(0); expect(scans).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(1);
+  await worker.stop(); worker = preparationJournalWorker(f.c.input, undefined, async () => { throw new Error("completed confirmation must not rerun"); });
+  worker.tick(); await worker.idle();
+  expect((await (await f.post(request)).json()).receipt).toEqual(ready.receipt);
+});
+
+test.each(["pause", "revoke", "mismatch"])("confirmation %s cannot yield a ready receipt or closure authority", async mode => {
+  const f = await removedFixture(), request = attempt("confirmation");
+  await f.post(request);
+  worker = preparationJournalWorker(f.c.input, undefined, async input => {
+    const confirmed = await confirmTaskFinalization(input, f.dependencies);
+    if (mode === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    if (mode === "revoke") await f.revoke();
+    return mode === "mismatch" ? { ...confirmed, confirmedRevision: confirmed.confirmedRevision! + 1000 } : confirmed;
+  });
+  worker.tick(); await worker.idle();
+  const statuses = (await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" }, orderBy: { sequence: "asc" } })).map(row => JSON.parse(row.value!));
+  expect(statuses.at(-1).state).toBe("failed"); expect(statuses.some(row => row.state === "ready")).toBe(false);
+  const response = await f.post(request), result = await response.json();
+  expect(result.receipt).toBeUndefined(); expect(result.confirmation?.state).not.toBe("ready");
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).not.toBe("closed");
+});
+
+test("the existing worker completes confirmation beyond a control request deadline while requests stay responsive", async () => {
+  const f = await removedFixture(), request = attempt("confirmation");
+  f.c.app.get("/health", c => c.json({ ok: true }));
+  const socket = path.join(directory, "confirmation.sock"), server = Bun.serve({ unix: socket, fetch: f.c.app.fetch });
+  const post = () => fetch(`http://local/api/tasks/${f.task.id}/confirm-finalization`, { unix: socket, method: "POST", signal: AbortSignal.timeout(1000), headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.c.input.requestKey, cleanup: true, confirmation: request }) } as RequestInit & { unix: string });
+  let scans = 0;
+  const stop = startRuntimeEventProjection(f.c.input, async () => {}, { confirmFinalization: async input => { scans++; await Bun.sleep(31_000); return confirmTaskFinalization(input, f.dependencies); } });
+  try {
+    const first = await post(); expect(first.status).toBe(202); await first.body?.cancel();
+    const started = performance.now(); let result: any;
+    do { result = await (await post()).json(); if (result.confirmation.state === "ready") break; await Bun.sleep(200); } while (performance.now() - started < 36_000);
+    expect(result.confirmation.state).toBe("ready"); expect(result.receipt.confirmedRevision).toBeGreaterThan(0);
+    expect(performance.now() - started).toBeGreaterThan(30_000); expect(scans).toBe(1);
+    const health = await fetch("http://local/health", { unix: socket, signal: AbortSignal.timeout(1000) } as RequestInit & { unix: string }); expect(health.status).toBe(200); await health.body?.cancel();
+  } finally { await stop(); server.stop(true); }
+}, 40_000);
+
+test("an existing confirmed revision cannot conceal changed retained bytes at the next confirmation boundary", async () => {
+  const f = await fixture(), c = controls(f);
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root, pinnedToolingRoot: f.root } });
+  const root = path.join(directory, "retained"), data = Buffer.from("preserved owner data"), sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+  await mkdir(root, { mode: 0o700 }); await writeFile(path.join(root, "saved.bin"), data, { mode: 0o600 });
+  const manifest = JSON.stringify({ task: f.task.id, issue: f.task.issueIdentifier, mergedCommit: f.remote.pullRequest.mergeCommit.oid, count: 1,
+    entries: [{ archivePath: "saved.bin", sourcePath: "/historical/saved", sha256: sha(data), bytes: data.length }] });
+  await writeFile(path.join(root, "ARCHIVE-MANIFEST.json"), manifest, { mode: 0o600 });
+  await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "retained", kind: "evidence-archive", purpose: "development", externalId: root, state: "ready",
+    metadata: { archival: true, manifest: { path: "ARCHIVE-MANIFEST.json", sha256: sha(manifest), entries: 1 } } } });
+  await prepareTaskFinalization(c.input, f.dependencies); f.remove();
+  const { requestFinalizationConfirmation } = await import("./finalization-preparation.ts");
+  worker = preparationJournalWorker(c.input, undefined, input => confirmTaskFinalization(input, f.dependencies));
+  const first = attempt("confirmation"); await requestFinalizationConfirmation(c.input, first); worker.tick(); await worker.idle();
+  const confirmed = await requestFinalizationConfirmation(c.input, first); expect(confirmed.confirmation.state).toBe("ready");
+  await writeFile(path.join(root, "saved.bin"), "changed retained bytes");
+  const next = attempt("confirmation"); await requestFinalizationConfirmation(c.input, next); worker.tick(); await worker.idle();
+  const failed = await requestFinalizationConfirmation(c.input, next); expect(failed.confirmation.state).toBe("failed"); expect(failed.receipt).toBeUndefined();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
+  expect((await db.prisma.remoteTaskResource.findFirstOrThrow({ where: { key: "retained" } })).state).toBe("ready");
+  expect(await Bun.file(path.join(root, "saved.bin")).text()).toBe("changed retained bytes");
 });
