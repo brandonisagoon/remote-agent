@@ -65,10 +65,12 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
   const originalWork = request.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree,
     branch: current.identity.branch, approvedHead: cleanup.head, resources: current.resources, originalWork: request.originalWork }) : undefined;
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, current.resources) : [];
+  const { preparePreservationEvidence, assertPreservationSources } = await import("./cleanup-preservation.ts");
+  const preservation = await preparePreservationEvidence({ prisma: input.prisma, taskId: input.taskId, sessionId: current.session.id, resources: current.resources, plan: retainedArchives, selection: request.ownership.preservation });
   const adapterContext = current.resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources: current.resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot!, sourcePaths: [], deliveries,
-    ownership: request.ownership, originalWork: true, ...(adapterContext ? { adapterContext } : {}), retainedArchives });
+    ownership: request.ownership, originalWork: true, ...(adapterContext ? { adapterContext } : {}), retainedArchives, ...(preservation ? { preservation } : {}) });
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   await dependencies.assertResources({ taskId: input.taskId, resources: current.resources, plan, removed: false, originalWork: true });
@@ -82,6 +84,7 @@ export async function adoptLegacyDelivery(input: Context & { retirement: Deliver
     if (externalDigest(live.identity) !== externalDigest(current.identity) || live.task.phase !== current.task.phase || await externalOwnerHistory(tx, input.taskId, current.session.id) !== current.ownerHistoryRevision || ((await latestExternalBinding(tx, input.taskId, current.session.id))?.sequence ?? 0) !== request.expectedBindingRevision) throw new Error("Delivered retirement authority changed during adoption");
     if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: current.session.id, source: `finalizer:${input.taskId}`, action: "finalization-prepared" } })) throw new Error("Finalization was prepared concurrently");
     assertExternalResourceRecords(await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, false);
+    await assertPreservationSources(tx, input.taskId, current.session.id, plan);
     const event = await tx.runtimeMetadataEvent.create({ data: { ...where, key: request.requestKey, value: JSON.stringify(binding) } });
     await tx.remoteTask.update({ where: { id: input.taskId }, data: { phase: "complete" } });
     return { revision: event.sequence, binding };

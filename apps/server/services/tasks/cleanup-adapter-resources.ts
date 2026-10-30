@@ -61,7 +61,7 @@ export async function prepareCleanupAdapterResources(input: { context: CleanupAd
 
 /** Released is only a receipt state. A full confirm still independently proves
  * every prepared target absent, and a replay cannot absorb recreated targets. */
-export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean }, observe: Observe = runCleanupResourceObserver) {
+export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean; retainedTargets?: Map<string, string[]> }, observe: Observe = runCleanupResourceObserver) {
   if (!input.plan.length) return;
   const plans = input.plan.map(plan => CleanupAdapterPlan.parse(plan)), context = plans[0]!.observer;
   if (context.task.id !== input.taskId || plans.some(plan => !same(plan.observer, context))) throw new Error("Cleanup observer task or committed capability changed");
@@ -71,8 +71,12 @@ export async function assertCleanupAdapterResources(input: { taskId: string; res
     const current = result.observations.find(item => item.resourceId === plan.id)!;
     const record = input.resources.find(record => record.id === plan.id)!;
     if (current.adapter !== plan.adapter || !same([...current.dependencies].sort(), [...plan.dependencies].sort()) || !same([...current.stoppedConsumers].sort(), [...plan.stoppedConsumers].sort())) throw new Error("Cleanup observer adapter or dependency plan changed");
-    if (input.removed && record.state !== "released" || (input.removed || record.state === "released") && !current.absent) throw new Error("Prepared physical resource has no independently verified retirement");
-    if (record.state === "released") for (const id of plan.stoppedConsumers) {
+    const retained = input.retainedTargets?.get(plan.id);
+    if (retained) {
+      if (!retained.length || new Set(retained).size !== retained.length || record.state !== "ready" || retained.some(digest => !plan.targets.some(target => target.identityDigest === digest && target.presentAtPrepare) || !current.presentTargetDigests.includes(digest))
+        || input.removed && current.presentTargetDigests.some(digest => !retained.includes(digest))) throw new Error("Preserved adapter has a changed retained target or unfinished retired partition");
+    } else if (input.removed && record.state !== "released" || (input.removed || record.state === "released") && !current.absent) throw new Error("Prepared physical resource has no independently verified retirement");
+    if (record.state === "released" || retained && input.removed) for (const id of plan.stoppedConsumers) {
       const consumer = result.observations.find(item => item.resourceId === id);
       const families = consumer?.targets.filter(target => target.kind === "native-family") ?? [];
       if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Prepared store retirement still has an active or unverified native consumer");

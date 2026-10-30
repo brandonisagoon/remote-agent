@@ -31,10 +31,11 @@ function referencePaths(value: unknown, depth = 0): string[] {
 }
 export function captureAdapterDependencies(root: string, resources: FinalizationResourceRecord[], plan: FinalizationResourcePlan[]) {
   const dependencies = new Set<string>(), stoppedConsumers = new Set<string>();
-  for (const adapter of plan.flatMap(entry => entry.disposition === "retire-adapter" ? [entry] : entry.disposition === "retire-vault" ? [entry.vault] : [])) {
+  for (const { adapter, retained } of plan.flatMap(entry => entry.disposition === "retire-adapter" ? [{ adapter: entry, retained: false }] : entry.disposition === "retire-vault" ? [{ adapter: entry.vault, retained: false }] : entry.disposition === "retain-adapter" ? [{ adapter: entry.adapterPlan, retained: true }] : [])) {
     for (const target of adapter.targets) {
       const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file]
         : "credentials" in target.scope ? [target.scope.credentials.backupFile, target.scope.credentials.keyFile] : target.kind === "browser-auth-entry" ? [target.scope.keyFile] : [];
+      if (retained && "compose" in target.scope && target.scope.compose) required.push(target.scope.compose.file);
       if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
     }
     const record = resources.find(other => other.id === adapter.id)!;
