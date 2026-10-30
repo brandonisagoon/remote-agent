@@ -1,3 +1,4 @@
+import { preparationJournalWorker } from "../../tasks/finalization-preparation.ts";
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../../lib/config.ts";
 import {
@@ -218,12 +219,14 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
   await reconcileSourceMessages(input.config, input.prisma, input.runtime);
   await reconcileControlNotices(input.config, input.prisma);
   await projectTaskStalls(input);
-}): () => Promise<void> {
+}, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1] } = {}): () => Promise<void> {
+  const preparations = preparationJournalWorker(input, options.prepareFinalization);
   let running: Promise<void> | undefined;
   let requested = false;
   let stopped = false;
   const drain = () => {
     if (stopped) return;
+    preparations.tick();
     requested = true;
     if (running) return;
     running = (async () => {
@@ -245,5 +248,6 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
     clearInterval(timer);
     unsubscribe();
     await running;
+    await preparations.stop();
   };
 }

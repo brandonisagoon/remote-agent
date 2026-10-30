@@ -1,3 +1,5 @@
+import { executeFullPreparation } from "./finalization-preparation.ts";
+import { preparationStage } from "./preparation-diagnostics.ts";
 import { automaticCleanupTurn } from "./cleanup-inbox.ts";
 import { realpath } from "node:fs/promises";
 import { z } from "zod";
@@ -114,7 +116,16 @@ async function assertObservedPreparationAuthority(input: FinalizationContext, pr
 
 /** Verify delivery before deleting the only checkout that can prove it. This
  * creates no cleanup effects and never treats a model resource as authority. */
-export async function prepareTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
+export function prepareTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
+  const observed: Dependencies = { ...dependencies,
+    source: value => preparationStage("source", () => dependencies.source(value)),
+    completion: value => preparationStage("delivery", () => dependencies.completion(value)),
+    snapshot: value => preparationStage("fingerprint", () => dependencies.snapshot(value)),
+  };
+  return executeFullPreparation(input, () => prepareFinalization(input, observed));
+}
+
+async function prepareFinalization(input: FinalizationContext, dependencies: Dependencies) {
   const task = await owned(input);
   if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) return prepareExternalFinalization(input);
   const priorCleanup = await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey);
@@ -134,7 +145,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
     if (prepared.issueId !== source.issue.id || prepared.requestKey !== input.requestKey) throw new Error("Finalization requestKey belongs to a different source");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
     await assertFinalizationAuthority(input.prisma, input.config, prepared);
-    const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: prior.sequence });
+    const archiveRetention = await preparationStage("retained-archives", () => ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: prior.sequence }));
     await assertFinalizationAuthority(input.prisma, input.config, prepared, Boolean(confirmed));
     if (confirmed) {
       // A completed cleanup is replayed, never expanded to a newly created
@@ -173,7 +184,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
   const refreshedSource = await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
   if (refreshedSource.issue.id !== source.issue.id || refreshedSource.issue.identifier !== source.issue.identifier || refreshedSource.link.connectionId !== source.link.connectionId
     || refreshedSource.session.id !== source.session.id || refreshedSource.retirementAuthority?.revision !== source.retirementAuthority?.revision) throw new Error("Finalization source identity changed during initial verification");
-  const recorded = await input.prisma.$transaction(async (tx) => {
+  const recorded = await preparationStage("persistence", () => input.prisma.$transaction(async (tx) => {
     await assertFinalizationAuthority(tx, input.config, prepared, false, input.cleanup);
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where });
     if (duplicate) {
@@ -182,8 +193,8 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
     }
     const receipt = await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify(prepared) } });
     return result(prepared, receipt.sequence);
-  });
-  const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: recorded.preparedRevision });
+  }));
+  const archiveRetention = await preparationStage("retained-archives", () => ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: recorded.preparedRevision }));
   if (input.cleanup) return prepareCleanupFinalization(input, dependencies);
   await assertObservedPreparationAuthority(input, prepared, dependencies);
   return result(prepared, recorded.preparedRevision, undefined, archiveRetention);
@@ -248,7 +259,7 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   }
   const candidate = await inspectPreparedCleanupAuthority(input);
   if (candidate.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
-  const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: candidate.task.id, preparedRevision: candidate.preparation.sequence });
+  const archiveRetention = await preparationStage("retained-archives", () => ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: candidate.task.id, preparedRevision: candidate.preparation.sequence }));
   await bindPreparedCleanup(input, prepared => {
     if ("version" in prepared) throw new Error("External cleanup must use its v2 finalizer");
     return observePreparedFilesystem(input, prepared, dependencies);
