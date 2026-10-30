@@ -33,7 +33,6 @@ export {
   LinearIssueWebhookSchema as TrackerIssueWebhookSchema,
   LinearReactionWebhookSchema as TrackerReactionWebhookSchema,
   LinearWebhookEnvelopeSchema as TrackerWebhookEnvelopeSchema,
-  mentionsAgent,
   mergeAgentIssueLabelIds,
   parseAgentIssueRuntime,
   parseAgentIssueSourceIdentifier,

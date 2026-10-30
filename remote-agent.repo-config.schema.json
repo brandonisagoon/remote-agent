@@ -69,7 +69,9 @@
             "type": "string",
             "enum": [
               "issue.state-changed",
-              "issue.reaction"
+              "issue.reaction",
+              "comment.created",
+              "comment.reaction"
             ]
           },
           "when": {
@@ -92,11 +94,14 @@
             }
           },
           "skill": {
+            "default": {
+              "skillset": "",
+              "flags": []
+            },
             "type": "object",
             "properties": {
               "skillset": {
-                "type": "string",
-                "minLength": 1
+                "type": "string"
               },
               "flags": {
                 "default": [],
@@ -117,7 +122,9 @@
             "type": "string",
             "enum": [
               "start-session",
-              "message-session"
+              "message-session",
+              "queue-session",
+              "steer-session"
             ]
           },
           "providerId": {
@@ -156,6 +163,40 @@
         ],
         "additionalProperties": false
       }
+    },
+    "conversationReactions": {
+      "type": "object",
+      "properties": {
+        "queued": {
+          "type": "string",
+          "minLength": 1
+        },
+        "processing": {
+          "type": "string",
+          "minLength": 1
+        },
+        "replied": {
+          "type": "string",
+          "minLength": 1
+        },
+        "attention": {
+          "type": "string",
+          "minLength": 1
+        },
+        "failed": {
+          "type": "string",
+          "minLength": 1
+        },
+        "planUpdate": {
+          "type": "string",
+          "minLength": 1
+        },
+        "codeChange": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
     },
     "labels": {
       "default": {},

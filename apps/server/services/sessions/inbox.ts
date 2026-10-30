@@ -2,6 +2,9 @@ import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { isCurrentMergeApproval } from "../tasks/completion.ts";
+import { bindSourceTurn, sourceReplyInstructions } from "./source-messages.ts";
+import { deliverMessageControls } from "./message-controls.ts";
+import type { ServerConfig } from "../../../../lib/config.ts";
 
 const active = new WeakMap<AgentSessionRuntime, Set<string>>();
 const flushing = new WeakSet<AgentSessionRuntime>();
@@ -59,6 +62,12 @@ export async function resolveTaskInstruction(prisma: PrismaClient, runtime: Agen
       data: { state: { acknowledge: "acknowledged", cancel: "cancelled", retry: "queued" }[input.action], detail: input.reason },
     });
     if (!changed.count) throw new Error("Instruction changed during resolution; inspect and retry");
+    if (current.instruction.sourceMessageId) {
+      await tx.runtimeSourceMessage.update({ where: { id: current.instruction.sourceMessageId }, data: {
+        state: { retry: "queued", acknowledge: "handled", cancel: "attention" }[input.action], detail: input.reason, projectionPending: true,
+      } });
+      await tx.runtimeMessageControl.updateMany({ where: { sourceMessageId: current.instruction.sourceMessageId, state: "unknown" }, data: { state: "resolved", detail: input.reason } });
+    }
     await tx.runtimeMetadataEvent.create({ data: { ...auditWhere, runtimeSessionId: current.session.id, value } });
   });
   return { resolved: true as const };
@@ -90,16 +99,46 @@ async function instructionAuthorityAllows(prisma: Pick<PrismaClient, "runtimeMet
   return false;
 }
 
-export async function queueInstruction(prisma: Pick<PrismaClient, "runtimeInstruction">, input: { sessionId: string; text: string; requestId?: string }) {
+export async function queueInstruction(prisma: Pick<PrismaClient, "runtimeInstruction" | "runtimeSourceMessage">, input: { sessionId: string; text: string; requestId?: string; sourceMessageId?: string }) {
   const id = input.requestId ?? randomUUID();
-  const receipt = await prisma.runtimeInstruction.upsert({ where: { id }, update: {}, create: { id, sessionId: input.sessionId, text: input.text } });
+  const receipt = await prisma.runtimeInstruction.upsert({ where: { id }, update: {}, create: { id, sessionId: input.sessionId, text: input.text, sourceMessageId: input.sourceMessageId } });
   if (receipt.sessionId !== input.sessionId || receipt.text !== input.text) throw new Error("Instruction request ID already belongs to another instruction");
+  if (input.sourceMessageId && receipt.sourceMessageId && receipt.sourceMessageId !== input.sourceMessageId) throw new Error("Instruction already belongs to another source message");
+  if (input.sourceMessageId && !receipt.sourceMessageId) await prisma.runtimeInstruction.updateMany({ where: { id, sourceMessageId: null }, data: { sourceMessageId: input.sourceMessageId } });
+  if (input.sourceMessageId) {
+    const source = await prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: input.sourceMessageId } });
+    if (source.sessionId && source.sessionId !== input.sessionId) throw new Error("Source message already belongs to another primary");
+    if (!source.sessionId && source.state !== "routing") throw new Error("Source message already has a routing outcome; refusing a new instruction");
+    const state = { completed: "handled", failed: "failed", unknown: "unknown", dispatching: "unknown", cancelled: "attention", acknowledged: "handled", steered: "processing" }[receipt.state] ?? "queued";
+    await prisma.runtimeSourceMessage.updateMany({ where: { id: source.id, state: "routing" }, data: { sessionId: input.sessionId, state,
+      ...(receipt.state !== "queued" ? { requestId: receipt.executionRequestId ?? receipt.id } : {}), projectionPending: true } });
+  }
   return receipt;
+}
+
+async function sourceAuthorityAllows(prisma: PrismaClient, config: ServerConfig | undefined, receipt: { id: string; sourceMessageId: string | null }) {
+  if (!receipt.sourceMessageId) return true;
+  if (!config) return false;
+  try {
+    const { tracker } = await import("../../integrations/tracker/port.ts");
+    const source = await prisma.runtimeSourceMessage.findUniqueOrThrow({ where: { id: receipt.sourceMessageId } });
+    if (tracker.sourceMessages.provider !== source.provider) return false;
+    await tracker.sourceMessages.validateOwner(config, prisma, source);
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "source_ownership_revoked") {
+      await prisma.$transaction(async (tx) => {
+        const denied = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "failed", detail: "Source-message ownership is no longer valid" } });
+        if (denied.count) await tx.runtimeSourceMessage.update({ where: { id: receipt.sourceMessageId! }, data: { state: "failed", projectionPending: true } });
+      });
+    }
+    return false;
+  }
 }
 
 /** Called only by the daemon that owns the runtime. A claimed instruction
  * without a terminal journal entry after restart stays unknown, not replayed. */
-export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSessionRuntime) {
+export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSessionRuntime, config?: ServerConfig) {
   if (flushing.has(runtime)) return;
   flushing.add(runtime);
   const running = active.get(runtime) ?? new Set<string>();
@@ -111,9 +150,12 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
       const requestId = await instructionRequestId(prisma, receipt);
       const event = await prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: receipt.sessionId, requestId, phase: { in: ["completed", "cancelled", "failed"] } }, orderBy: { sequence: "desc" } });
       if (!event && receipt.state === "unknown") continue; // Keep its original uncertainty timestamp and evidence.
-      await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: receipt.state, updatedAt: receipt.updatedAt }, data: event
+      await prisma.$transaction(async (tx) => {
+      const settled = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: receipt.state, updatedAt: receipt.updatedAt }, data: event
         ? { state: event.phase, detail: event.error }
         : { state: "unknown", detail: "Delivery was interrupted. Inspect session history before resolving; automatic replay is disabled." } });
+      if (settled.count && receipt.sourceMessageId) await tx.runtimeSourceMessage.updateMany({ where: { id: receipt.sourceMessageId }, data: { state: event ? { completed: "handled", failed: "failed", cancelled: "attention" }[event.phase] : "unknown", projectionPending: true } });
+      });
     }
     // A busy/paused/uncertain session can have more than a page of queued
     // instructions. Do not let that backlog hide unrelated owners' work.
@@ -129,10 +171,18 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         if (visited.has(receipt.sessionId)) continue;
         visited.add(receipt.sessionId);
         if (running.has(receipt.id)) continue;
+        // Legacy callers may drain non-source instructions without config;
+        // comment-origin work always requires current integration authority.
+        if (receipt.sourceMessageId && !config) continue;
         if (await prisma.runtimeInstruction.count({ where: { sessionId: receipt.sessionId, state: { in: ["dispatching", "unknown", "preparing"] } } })) continue;
         const session = await runtime.getSession(receipt.sessionId);
         if (!session || session.status === "closed") {
-          await prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "failed", detail: "Session is unavailable or closed" } });
+          await prisma.$transaction(async (tx) => {
+            const failed = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "failed", detail: "Session is unavailable or closed" } });
+            if (failed.count && receipt.sourceMessageId) await tx.runtimeSourceMessage.update({ where: { id: receipt.sourceMessageId }, data: {
+              state: "failed", detail: "Session is unavailable or closed", projectionPending: true,
+            } });
+          });
           continue;
         }
         if (session.status === "active" || session.status === "provisioning") continue;
@@ -143,18 +193,24 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         running.add(receipt.id);
         void (async () => {
           try {
-            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: receipt.text, beforeStart: async () => prisma.$transaction(async (tx) => {
+            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: receipt.text + (receipt.sourceMessageId ? sourceReplyInstructions(receipt.sourceMessageId) : ""), beforeStart: async () => {
+              if (!(await sourceAuthorityAllows(prisma, config, receipt))) return false;
+              return prisma.$transaction(async (tx) => {
               const currentTask = await tx.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
               if (currentTask && (currentTask.ownerPaused || currentTask.phase === "closed")) return false;
               if (!(await instructionAuthorityAllows(tx, receipt))) return false;
-              const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null } });
+              const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null, executionRequestId: requestId } });
+              if (claim.count && receipt.sourceMessageId) await bindSourceTurn(tx, receipt.sourceMessageId, receipt.sessionId, requestId);
               return claim.count > 0;
-            }) });
+            });
+            } });
             for await (const _ of turn.events) { /* Persisted lifecycle journal is authoritative on restart. */ }
             const result = await turn.result;
-            await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });
+            const settled = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: result.status, detail: result.error ?? null } });
+            if (settled.count && receipt.sourceMessageId) await prisma.runtimeSourceMessage.update({ where: { id: receipt.sourceMessageId }, data: { state: { completed: "handled", failed: "failed", cancelled: "attention" }[result.status], projectionPending: true } });
           } catch {
-            await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
+            const uncertain = await prisma.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "dispatching" }, data: { state: "unknown", detail: "Delivery failed without a confirmed outcome. Inspect history before resolving." } }).catch(() => undefined);
+            if (uncertain?.count && receipt.sourceMessageId) await prisma.runtimeSourceMessage.update({ where: { id: receipt.sourceMessageId }, data: { state: "unknown", projectionPending: true } }).catch(() => undefined);
           } finally { running.delete(receipt.id); }
         })();
       }
@@ -162,8 +218,12 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
   } finally { flushing.delete(runtime); }
 }
 
-export function startInstructionDelivery(prisma: PrismaClient, runtime: AgentSessionRuntime) {
-  const tick = () => void deliverInstructions(prisma, runtime).catch(() => console.error("Instruction inbox reconciliation failed"));
+export function startInstructionDelivery(prisma: PrismaClient, runtime: AgentSessionRuntime, config: ServerConfig) {
+  const tick = () => void deliverMessageControls(prisma, runtime, async (message) => {
+    const { tracker } = await import("../../integrations/tracker/port.ts");
+    if (tracker.sourceMessages.provider !== message.provider) throw new Error("Source integration is unavailable");
+    return tracker.sourceMessages.validateOwner(config, prisma, message);
+  }).then(() => deliverInstructions(prisma, runtime, config)).catch(() => console.error("Instruction inbox reconciliation failed"));
   const timer = setInterval(tick, 1000);
   timer.unref();
   tick();

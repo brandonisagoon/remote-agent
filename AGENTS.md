@@ -43,6 +43,16 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   `read_source_issue` and `ask_question` use the session's linked issue and
   server-held credential. `RuntimeQuestion` persists a client-assigned comment
   UUID before delivery; retries reuse it and preserve an already-answered thread.
+- **Comment delivery** (`services/sessions/source-messages.ts`, `message-controls.ts`) —
+  ordinary comments use durable `RuntimeSourceMessage` origins and the existing
+  inbox; turn binding precedes tool execution. `read_reply_context` and
+  `reply_to_source` validate the prompt's source ID against the executing turn.
+  Reply UUIDs reconcile publication; explicit replies suppress automatic duplicates.
+  Repository `comment.created`/`comment.reaction` workflows select `queue-session`/
+  `steer-session` without skill composition; `conversationReactions` maps lifecycle
+  facts to integration presentation. No mention parser remains. Native steering is
+  capability-gated: acpx 0.13.2 reports unsupported and keeps the normal queue.
+  See `docs/comment-delivery.md`; source verification is separate from live rollout.
 - **Source attachments** (`apps/server/services/sessions/source-attachments.ts`) —
   `download_source_attachment` validates membership in the linked issue,
   comments or attachments and uses that connection's server-held credential.

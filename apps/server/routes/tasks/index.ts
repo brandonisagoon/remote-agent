@@ -16,10 +16,26 @@ import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } f
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 
+import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
+
 import { taskResponse } from "./response.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
+
+sessionTaskRoutes.post("/:sessionId/source-reply", async (c) => {
+  const parsed = SourceReplyInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "A stable requestKey and reply body are required" }, 400);
+  try { return c.json(await replyToSource({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId") })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+sessionTaskRoutes.post("/:sessionId/reply-context", async (c) => {
+  const parsed = z.object({ sourceMessageId: z.string().min(1) }).strict().safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid reply context" }, 400);
+  try { return c.json(await readReplyContext({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId") })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalization], ["confirm-finalization", confirmTaskFinalization]] as const) {
   sessionTaskRoutes.post(`/:sessionId/${action}`, async (c) => {

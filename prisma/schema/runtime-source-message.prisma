@@ -1,0 +1,55 @@
+/// Provider-neutral origin and reply outbox for one immutable inbound message.
+/// No foreign key to a session: an unroutable message still needs feedback.
+model RuntimeSourceMessage {
+  sequence           Int      @id @default(autoincrement())
+  id                 String   @unique
+  provider           String
+  connectionId       String
+  repositoryId       String
+  machineId          String
+  resourceId         String
+  resourceIdentifier String
+  commentId          String
+  threadRootId       String
+  authorId           String
+  body               String
+  presentation       Json
+  requestedActions   Json     @default("[]")
+  sessionId          String?
+  requestId          String?
+  targetRequestId    String?
+  state              String   @default("routing")
+  detail             String?
+  replyId            String   @unique @default(uuid())
+  replyBody          String?
+  replyRequestKey    String?
+  replyPosted        Boolean  @default(false)
+  projectionPending  Boolean  @default(true)
+  projectedReactions Json     @default("[]")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([provider, connectionId, commentId, sequence])
+  @@index([sessionId, requestId])
+}
+
+/// A control can arrive before its comment webhook; replay is idempotent.
+model RuntimeMessageControl {
+  id           String   @id
+  provider     String
+  connectionId String
+  repositoryId String
+  machineId    String
+  commentId    String
+  authorId     String
+  state        String   @default("pending")
+  detail       String?
+  sourceMessageId String?
+  noticeId     String   @unique @default(uuid())
+  noticeBody   String?
+  noticePosted Boolean @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([state, createdAt])
+}
