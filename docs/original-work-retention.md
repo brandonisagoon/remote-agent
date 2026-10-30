@@ -295,3 +295,29 @@ external-ID field. The shared pilot user and explicitly preserved identities do
 not become deletion targets. The actual DRA42 recorded preservation intent must
 be reconciled with its current owner-selected plan before live adoption; this
 adapter does not override it. Tests use disposable provider responses only.
+
+## Receipts backed by existing storage
+
+`retire-backed` represents a logical fixture, object or bucket receipt whose
+storage already has an independently observed adapter plan. It freezes the
+original receipt, one exact backing resource and storage-target digest, and its
+concrete chat IDs or bucket/object keys and recorded hashes. Task Redis fixtures
+must match the declared, observed task/purpose Compose volume; legacy MinIO
+objects must also match their recorded owner receipt ID and key. R2 objects must
+match the exact observed runtime bucket and recorded object prefix.
+
+This disposition grants no storage operation, object deletion, key deletion or
+export. The client retires only the logical receipt after observing that selected
+storage target absent. Other targets may remain present and the backing receipt
+may remain Ready. An unrelated DNS/provider failure cannot stand in for a
+selected-store check, and no generic Released flag substitutes for observation.
+Full task confirmation still independently verifies every existing plan target.
+
+Existing retained archives and preservation choices remain separate obligations.
+There is no established DRA8 Redis archive, and the old DRA98 MinIO probe has no
+established retained copy or digest; the latter stays `sha256: null`. The two
+DRA98 R2 fixture hashes independently match existing retained archive members.
+These facts are not upgraded into new copy claims by logical receipt retirement.
+The DRA8 shared pilot user is recorded as preserved context and receives no
+authentication operation. DRA42's intentionally retained user and objects volume
+require the separate retained-target plan, not this absence disposition.
