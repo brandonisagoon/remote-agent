@@ -406,6 +406,17 @@ Release additive migration `20261030120000_original_administration` with the
 matching Drafted capability. Existing pins, original preparation/binding bytes,
 retained archives and finalization request keys stay unchanged.
 
+DRA-208 preserves private executable archive members as immutable data. Ordinary
+retained archives accept task-owned regular payload files with exactly `0600` or
+`0700`, including historical scenario scripts. Directories remain `0700` and
+manifest documents remain `0600`. Every file retains its observed mode, inode,
+size and digest; manifests and complete inventory still have to match. Public or
+shared modes, special bits, another UID, hard links and redirected paths refuse.
+The observer does not execute scripts, chmod archives or rewrite old receipts.
+Existing private-backup mode support and individual legacy-evidence copy rules
+are unchanged. The client already validates frozen executable modes exactly;
+server/client fixtures verify acceptance and rejection after later mode drift.
+
 ## Installed dependencies in archived originals (DRA-205)
 
 New original-work proofs can retain exact ignored `node_modules` directories as
