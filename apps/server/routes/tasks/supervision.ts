@@ -1,3 +1,5 @@
+import { TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
+import { preparationStage } from "../../services/tasks/preparation-diagnostics.ts";
 import { CleanupOperation, assertPreparedCleanup, hasPreparedCleanup } from "../../services/tasks/cleanup-lifecycle.ts";
 import { automaticCleanupTurn } from "../../services/tasks/cleanup-inbox.ts";
 import { Hono } from "hono";
@@ -29,10 +31,10 @@ taskSupervisionRoutes.post("/:taskId/questions/:questionId/answer", async (c) =>
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
-taskSupervisionRoutes.get("/:taskId/activity", async (c) => {
-  const result = await readTaskActivity(c.get("prisma"), c.get("agentRuntime"), c.req.param("taskId"));
+taskSupervisionRoutes.get("/:taskId/activity", async (c) => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
+  const result = await preparationStage("activity", () => readTaskActivity(c.get("prisma"), c.get("agentRuntime"), c.req.param("taskId")));
   return result ? c.json(result) : c.json({ error: "Task not found" }, 404);
-});
+}));
 
 taskSupervisionRoutes.post("/:taskId/instructions", async (c) => {
   const parsed = z.object({ requestKey: z.string().min(1).max(200), text: z.string().min(1).max(100_000) }).strict().safeParse(await c.req.json());

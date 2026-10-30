@@ -1,3 +1,4 @@
+import { preparationStage } from "./preparation-diagnostics.ts";
 import type { PrismaClient, RemoteTask, RuntimeInstruction, RuntimeLifecycleEvent, RuntimeQuestion, RuntimeSession } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { z } from "zod";
@@ -122,8 +123,8 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
   const snapshot = async (row: RuntimeSession | null) => {
     const readErrors: string[] = [];
     const [session, history, questions, instructions, pending, latestTurn] = row ? await Promise.all([
-      runtime.getSession(row.id).catch(() => { readErrors.push("Runtime session lookup is unavailable"); return null; }),
-      runtime.history(row.id).catch(() => { readErrors.push("Session history is unavailable"); return []; }),
+      preparationStage("activity-session", () => runtime.getSession(row.id)).catch(() => { readErrors.push("Runtime session lookup is unavailable"); return null; }),
+      preparationStage("activity-history", () => runtime.history(row.id)).catch(() => { readErrors.push("Session history is unavailable"); return []; }),
       prisma.runtimeQuestion.findMany({ where: { runtimeSessionId: row.id }, orderBy: { createdAt: "asc" } }),
       prisma.runtimeInstruction.findMany({ where: { sessionId: row.id }, orderBy: { sequence: "desc" }, take: 100 }),
       prisma.runtimeInstruction.findMany({ where: { sessionId: row.id, state: { in: unsettledStates } }, orderBy: { sequence: "asc" }, select: { id: true, sequence: true, state: true, detail: true, createdAt: true, updatedAt: true } }),

@@ -1,3 +1,5 @@
+import { RequestLifetimeError } from "../../request-lifetime.ts";
+import { ADOPTION_DEADLINE_MS, TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
 import { Hono } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
@@ -23,19 +25,19 @@ taskCompletionRoutes.delete("/:taskId/completion/delivered-retirement", async c 
   try { return c.json(await revokeDeliveredRetirement({ prisma: c.get("prisma"), taskId: c.req.param("taskId"), revocation: parsed.data })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
-taskCompletionRoutes.get("/:taskId/completion/delivered-retirement", async c => {
+taskCompletionRoutes.get("/:taskId/completion/delivered-retirement", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
   try { return c.json(await (c.req.query("mode") === "legacy-delivery" ? inspectLegacyDelivery : inspectDoneRetirement)({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
-taskCompletionRoutes.put("/:taskId/completion/delivered-retirement", async c => {
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
+taskCompletionRoutes.put("/:taskId/completion/delivered-retirement", async c => taskRequest(c, ADOPTION_DEADLINE_MS, async () => {
   const parsed = z.discriminatedUnion("mode", [DoneRetirementInput, DeliveredRetirementInput]).safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Exact delivered-retirement evidence is required", details: parsed.error.issues }, 400);
   try {
     const context = { prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") };
     return c.json(parsed.data.mode === "existing-preparation" ? await adoptDoneRetirement({ ...context, retirement: parsed.data }) : await adoptLegacyDelivery({ ...context, retirement: parsed.data }));
   }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
 taskCompletionRoutes.get("/:taskId/completion/cleanup-resume", async (c) => {
   try { return c.json(await inspectCleanupResume({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
@@ -56,16 +58,16 @@ taskCompletionRoutes.put("/:taskId/completion/retirement", async (c) => {
   try { return c.json(await setRetirementAuthority({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), authorization: parsed.data })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
-taskCompletionRoutes.get("/:taskId/completion/external-deliveries", async (c) => {
+taskCompletionRoutes.get("/:taskId/completion/external-deliveries", async (c) => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
   try { return c.json(await inspectExternalDeliveries({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
-taskCompletionRoutes.put("/:taskId/completion/external-deliveries", async (c) => {
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
+taskCompletionRoutes.put("/:taskId/completion/external-deliveries", async (c) => taskRequest(c, ADOPTION_DEADLINE_MS, async () => {
   const parsed = ExternalDeliveryBindingInput.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Exact external deliveries, accepted evidence and expected revisions are required", details: parsed.error.issues }, 400);
   try { return c.json(await adoptExternalDeliveries({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), binding: parsed.data })); }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
 taskCompletionRoutes.get("/:taskId/completion", async (c) => {
   try { return c.json(await inspectTaskCompletion({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }

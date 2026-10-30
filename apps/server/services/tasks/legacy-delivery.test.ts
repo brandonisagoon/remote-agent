@@ -1,3 +1,7 @@
+import { createApp } from "../../app.ts";
+import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
+import { startControlSocket } from "../../control-socket.ts";
+import { withRequestLifetime } from "../../request-lifetime.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -54,7 +58,7 @@ test.each(["branch", "head", "dirty", "source", "pin", "resource"])("changed %s 
     if (changed === "source") f.issue.state = { id: "blocked", name: "Blocked", type: "started" };
     if (changed === "pin") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { toolingRevision: "f".repeat(40) } });
     if (changed === "resource") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "later", kind: "evidence", purpose: "development", externalId: "/foreign" } });
-    return f.dependencies.delivered(...args);
+    return f.dependencies.delivered(args[0]);
   } };
   await expect(adoptLegacyDelivery({ ...f.context, retirement: request }, dependencies)).rejects.toThrow();
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(0);
@@ -241,3 +245,84 @@ test("present-day adoption binds the actual adapter plan and requires independen
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toolingRevision).toBe("a".repeat(40));
   expect(f.issue.state.name).toBe("Done");
 });
+
+test("expired adoption cannot accept an observation finishing after its response; same request replays normally", async () => {
+  const f = await fixture(), request = await f.request();
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "waiting" } });
+  let release!: () => void, entered!: () => void, finished!: () => void, sources = 0;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const reached = new Promise<void>(resolve => { entered = resolve; });
+  const settled = new Promise<void>(resolve => { finished = resolve; });
+  const pending = withRequestLifetime({ timeoutMs: 1_000 }, async () => {
+    try { return await adoptLegacyDelivery({ ...f.context, retirement: request }, { ...f.dependencies,
+      source: async (...args) => { if (++sources === 2) { entered(); await gate; } return f.dependencies.source(); } }); }
+    finally { finished(); }
+  });
+  await reached;
+  await expect(pending).rejects.toThrow("deadline exceeded");
+  release(); await settled;
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(0);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).phase).toBe("waiting");
+  const adopted = await adoptLegacyDelivery({ ...f.context, retirement: request }, f.dependencies);
+  expect(await adoptLegacyDelivery({ ...f.context, retirement: request }, f.dependencies)).toEqual(adopted);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(1);
+});
+
+test("deadline inside adoption transaction rolls back even a completed event write", async () => {
+  const f = await fixture(), request = await f.request();
+  let release!: () => void, entered!: () => void, finished!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const reached = new Promise<void>(resolve => { entered = resolve; });
+  const settled = new Promise<void>(resolve => { finished = resolve; });
+  const prisma = new Proxy(db.prisma, { get(target, key) {
+    if (key !== "$transaction") return Reflect.get(target, key);
+    return (run: (tx: unknown) => Promise<unknown>) => target.$transaction(tx => run(new Proxy(tx, { get(transaction, model) {
+      if (model !== "runtimeMetadataEvent") return Reflect.get(transaction, model);
+      return new Proxy(tx.runtimeMetadataEvent, { get(events, method) {
+        if (method !== "create") return Reflect.get(events, method);
+        return async (args: Parameters<typeof events.create>[0]) => { const event = await events.create(args); entered(); await gate; return event; };
+      } });
+    } })));
+  } });
+  const pending = withRequestLifetime({ timeoutMs: 1_000 }, async () => {
+    try { return await adoptLegacyDelivery({ ...f.context, prisma, retirement: request }, f.dependencies); }
+    finally { finished(); }
+  });
+  await reached; await expect(pending).rejects.toThrow("deadline exceeded");
+  release(); await settled;
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(0);
+  const accepted = await adoptLegacyDelivery({ ...f.context, retirement: request }, f.dependencies);
+  expect(await adoptLegacyDelivery({ ...f.context, retirement: request }, f.dependencies)).toEqual(accepted);
+});
+
+test("real authenticated inspection and adoption keep JSON results beyond the default Unix/TCP idle cutoff", async () => {
+  const f = await fixture();
+  const original = { ...legacyDeliveryDependencies };
+  let slowRead = true;
+  Object.assign(legacyDeliveryDependencies, f.dependencies, { source: async () => { if (slowRead) await Bun.sleep(14_000); return f.dependencies.source(); } });
+  const app = createApp({ ...f.context, agentRuntime: createFakeAgentRuntime() });
+  const tcp = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: app.fetch });
+  const socketPath = path.join(directory, "transport.sock");
+  const unix = await startControlSocket({ path: socketPath, app });
+  const headers = { authorization: `Bearer ${f.context.config.apiKey}`, "content-type": "application/json" };
+  try {
+    const route = "/api/tasks/task/completion/delivered-retirement?mode=legacy-delivery";
+    const reads = await Promise.all([
+      fetch(`http://127.0.0.1:${tcp.port}${route}`, { headers, signal: AbortSignal.timeout(25_000) }),
+      fetch(`http://local${route}`, { headers, unix: socketPath, signal: AbortSignal.timeout(25_000) } as RequestInit),
+    ]);
+    const inspections = [];
+    for (const response of reads) { expect(response.status).toBe(200); expect(response.headers.get("server-timing")).toContain("source;dur="); inspections.push(await response.json()); }
+    expect(inspections[0]).toEqual(inspections[1]);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(0);
+    slowRead = false;
+    const request = await f.request();
+    legacyDeliveryDependencies.delivered = async (...args) => { await Bun.sleep(14_000); return f.dependencies.delivered(args[0]); };
+    const response = await fetch("http://local/api/tasks/task/completion/delivered-retirement", { method: "PUT", headers, body: JSON.stringify(request), unix: socketPath, signal: AbortSignal.timeout(25_000) } as RequestInit);
+    expect(response.status).toBe(200); const accepted = await response.json();
+    legacyDeliveryDependencies.delivered = f.dependencies.delivered;
+    const replay = await fetch("http://local/api/tasks/task/completion/delivered-retirement", { method: "PUT", headers, body: JSON.stringify(request), unix: socketPath, signal: AbortSignal.timeout(5_000) } as RequestInit);
+    expect(replay.status).toBe(200); expect(await replay.json()).toEqual(accepted);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "external-delivery-binding" } })).toBe(1);
+  } finally { Object.assign(legacyDeliveryDependencies, original); await unix.close(); await tcp.stop(true); }
+}, 40_000);

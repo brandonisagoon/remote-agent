@@ -29,7 +29,13 @@ export async function startControlSocket(input: {
     }
     unlinkSync(socketPath);
   }
-  const server = Bun.serve({ unix: socketPath, fetch: input.app.fetch });
+  // Bun 1.3.14 ignores server.timeout(request, ...) for Unix listeners. Keep
+  // the owner-only transport bounded above the authenticated adoption deadline
+  // (240s) plus its response margin; per-request deadlines remain in handlers.
+  const options = { unix: socketPath, idleTimeout: 255, fetch: input.app.fetch };
+  // bun-types exposes idleTimeout only on TCP options; the installed Unix
+  // implementation accepts it (covered by the real TCP/Unix route regression).
+  const server = Bun.serve(options as Omit<typeof options, "idleTimeout">);
   chmodSync(socketPath, 0o600);
   return {
     close: async () => {
