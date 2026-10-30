@@ -5,6 +5,8 @@ import path from "node:path";
 import { originalArchiveFixture, originalDigest, originalGit } from "../../../../test-support/original-work.ts";
 import { assertOriginalWork, originalWorkTar, prepareOriginalWork } from "./original-work.ts";
 import { finalizationDigest, type ResourceObservation } from "./finalization-resources.ts";
+import { withPreparationDiagnostics, type PreparationDiagnostic } from "./preparation-diagnostics.ts";
+import { preparationFailure } from "./preparation-errors.ts";
 
 let directory: string;
 const noProcesses: ResourceObservation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
@@ -21,6 +23,28 @@ async function fixture() {
   const input = { taskId: "task", worktree, branch: "codex/task", approvedHead: originalGit(worktree, ["rev-parse", "HEAD"]).toString().trim(), resources, originalWork: selection };
   return { input, worktree, archive, product, resources, selection };
 }
+test.each(["original-worktree", "git-administration"] as const)("original verification preserves the exact %s failure stage", async stage => {
+  const f = await fixture(), proof = await prepareOriginalWork(f.input, noProcesses), frozen = JSON.stringify(proof);
+  const events: PreparationDiagnostic[] = [], failure = new Error("Source root has open files or could not be inspected");
+  const observation = { ...noProcesses, rootIdle: async (root: string) => {
+    if (root === (stage === "original-worktree" ? f.worktree : proof.administration!.git.administrativeDirectory)) throw failure;
+  } };
+  await expect(withPreparationDiagnostics(async event => { events.push(event); }, () => assertOriginalWork({ taskId: "task", resources: f.resources, originalWork: proof, removed: false }, observation))).rejects.toBe(failure);
+  expect(events.at(-1)).toMatchObject({ outcome: "failed", failedStage: stage });
+  expect(JSON.stringify(proof)).toBe(frozen);
+});
+test.each(["named", "anonymous"] as const)("an actual original-work guard retains its safe %s Bun frame without private paths", async frame => {
+  const f = await fixture(), proof = await prepareOriginalWork(f.input, noProcesses);
+  try {
+    await assertOriginalWork({ taskId: frame === "named" ? "other-task" : "task", resources: f.resources, originalWork: proof, removed: frame === "anonymous" }, noProcesses);
+    throw new Error("Expected original identity refusal");
+  } catch (error) {
+    const diagnostic = preparationFailure(error);
+    expect(diagnostic.code).toBe("UNCLASSIFIED_FAILURE");
+    expect(diagnostic.reason).toMatch(/^Verification failed at original-work\.ts:[1-9]\d* without/);
+    expect(diagnostic.reason).not.toContain(directory);
+  }
+});
 test("independently restores staged, unstaged and binary untracked work without writing the original index", async () => {
   const f = await fixture(), index = originalGit(f.worktree, ["rev-parse", "--absolute-git-dir"]).toString().trim() + "/index";
   const before = await readFile(index), proof = await prepareOriginalWork(f.input, noProcesses);

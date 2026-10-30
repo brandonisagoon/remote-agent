@@ -22,6 +22,7 @@ import { recordCleanupProgress } from "./cleanup-progress.ts";
 import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { enqueueTaskCleanup, cleanupInstructionAllows } from "./cleanup-inbox.ts";
 import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
+import { preparationJournalWorker, requestFinalizationPreparation, requestFinalizationConfirmation } from "./finalization-preparation.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "external-cleanup-"))); });
@@ -38,6 +39,24 @@ async function adoptedFixture() {
   const adopted = await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, f.dependencies);
   return { ...f, adopted, input: { ...f.finalizer, cleanup: true as const } };
 }
+
+test.each(["prepare", "confirm"].flatMap(operation => ["delivery", "resource-verification"].map(stage => [operation, stage] as const)))("the v2 %s journal identifies %s without changing frozen authority", async (operation, stage) => {
+  const f = await adoptedFixture();
+  await prepareExternalFinalization(f.input, f.dependencies);
+  const original = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["external-delivery-binding", "finalization-prepared", CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } });
+  const runtime = createFakeAgentRuntime(), context = { ...f.input, runtime };
+  const dependencies = { ...f.dependencies, [stage === "delivery" ? "delivered" : "assertResources"]: async () => { throw new Error("private provider payload token=not-for-diagnostics"); } };
+  const attempt = { version: 1 as const, attemptId: crypto.randomUUID(), boundary: operation === "confirm" ? "confirmation" : "initial" };
+  const accepted = operation === "confirm" ? (await requestFinalizationConfirmation(context, attempt)).confirmation : (await requestFinalizationPreparation(context, attempt)).preparation;
+  const worker = preparationJournalWorker(context, input => prepareExternalFinalization(input, dependencies), input => confirmExternalFinalization(input, dependencies));
+  try { worker.tick(); await worker.idle(); } finally { await worker.stop(); }
+  const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-preparation-status", key: String(accepted.acceptedRevision) }, orderBy: { sequence: "desc" } });
+  const failed = JSON.parse(event.value!);
+  expect(failed).toMatchObject({ state: "failed", stage, diagnostic: { code: "UNCLASSIFIED_FAILURE" } });
+  expect(event.value).not.toContain("not-for-diagnostics");
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["external-delivery-binding", "finalization-prepared", CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } })).toEqual(original);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+});
 
 test("128 actual control-route renewals stay local, preserve retention, and enforce pause after restart", async () => {
   const f = await adoptedFixture(), bound = await prepareExternalFinalization(f.input, f.dependencies);

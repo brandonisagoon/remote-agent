@@ -495,3 +495,10 @@ continue to use their original capability. Unsupported tooling, changed capture
 bytes, recreated paths, changed provider targets or revoked authority fail closed;
 there is no credential fallback, new preparation, provider mutation or new cleanup
 operation in this compatibility path.
+
+
+## Attribute failed verification during an existing cleanup
+
+Existing v2 preparation and confirmation use the same safe observation stages as adoption. Resource verification, retained archives, the original worktree and Git administration remain distinct in the durable preparation journal. Known local guard failures have fixed classifications; an otherwise unclassified local observation may retain only an allowlisted server module and numeric source line, never a raw exception, filesystem path, provider body or stack. These diagnostics do not change accepted proofs, resource identities, refusal conditions or cleanup authority.
+
+Original DRA-98 attempt 1805 failed with only a broad verification error. The single subsequent resource assertion and one additional local original-work assertion both passed without changed proof/resource bytes, so the historical underlying cause remains unproven. This follow-up makes a future normal owner attempt attributable; it is not evidence that the earlier failure or final cleanup succeeded.

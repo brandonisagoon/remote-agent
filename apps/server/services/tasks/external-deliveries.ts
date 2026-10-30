@@ -35,7 +35,7 @@ export function requestExternalObservations(dependencies: ExternalDependencies):
     cleanupObserver: (...args) => preparationStage("resource-plan", () => dependencies.cleanupObserver(...args)),
     originalWork: (...args) => preparationStage("retained-archives", () => dependencies.originalWork(...args)),
     resources: (...args) => preparationStage("resource-plan", () => dependencies.resources(...args)),
-    assertResources: (...args) => preparationStage("verification", () => dependencies.assertResources(...args)),
+    assertResources: (...args) => preparationStage("resource-verification", () => dependencies.assertResources(...args)),
     assertOriginalWork: (...args) => preparationStage("retained-archives", () => dependencies.assertOriginalWork(...args)),
     observer: { ...dependencies.observer,
       source: (...args) => preparationStage("fingerprint", () => dependencies.observer.source(...args)),

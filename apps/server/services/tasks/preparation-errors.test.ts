@@ -3,6 +3,9 @@ import { z } from "zod";
 import { discoverCompletionPullRequest } from "./completion-observation.ts";
 import { preparationFailure } from "./preparation-errors.ts";
 
+// Bun's module-scope errors use bare frames, unlike named/anonymous callbacks.
+const moduleScopeError = new Error("private module-scope fixture");
+
 test("known guard and OS failures retain only the safe reason and code", () => {
   expect(preparationFailure(new Error("Worktree changed during finalization preparation"))).toMatchObject({ code: "WORKTREE_CHANGED" });
   const error = Object.assign(new Error("ENOENT /Users/private/secret?token=credential"), { code: "ENOENT", path: "/Users/private/secret" });
@@ -18,6 +21,41 @@ test("arbitrary payloads, URLs, credentials, codes, causes and transcripts never
   const invalid = z.literal("safe").safeParse(privateText);
   expect(preparationFailure(invalid.error)).toMatchObject({ code: "INVALID_OBSERVATION" });
   expect(JSON.stringify(preparationFailure(invalid.error))).not.toContain("private.invalid");
+});
+
+test("unclassified local guards retain only an allowlisted server source location", () => {
+  const error = new Error("private credential and provider body");
+  error.stack = `Error: private credential and provider body\n    at assertOriginalWork (${import.meta.dir}/original-work.ts:301:47)\n    at privateToken (/private/secret.ts:9:1)`;
+  const result = preparationFailure(error);
+  expect(result).toEqual({ code: "UNCLASSIFIED_FAILURE", reason: "Verification failed at original-work.ts:301 without a recognized safe diagnostic. Raw exception details were omitted." });
+  expect(JSON.stringify(result)).not.toMatch(/credential|provider body|secret|\/private|:47/);
+  for (const frame of ["/private/original-work.ts:301:47", `${import.meta.dir}/not-allowed.ts:301:47`, `${import.meta.dir}/original-work.ts:0:47`, `${import.meta.dir}/original-work.ts:10000000:47`, `${import.meta.dir}/original-work.ts:301:47?token=secret`]) {
+    for (const location of [`guard (${frame})`, frame]) {
+      error.stack = `Error: private\n    at ${location}`;
+      expect(preparationFailure(error).reason).not.toContain("original-work.ts:");
+    }
+  }
+});
+
+test("a real Bun module-scope frame is accepted only for the exact allowed local module", () => {
+  const frame = moduleScopeError.stack!.split("\n").find(line => line.startsWith(`    at ${import.meta.path}:`))!;
+  expect(frame).toMatch(/preparation-errors\.test\.ts:[1-9]\d*:[1-9]\d*$/);
+  expect(preparationFailure(moduleScopeError).reason).not.toContain("preparation-errors.test.ts");
+  // Reuse Bun's actual frame grammar, changing only the fixture module name.
+  const error = new Error("private module-scope fixture");
+  error.stack = `Error: private\n${frame.replace(import.meta.path, `${import.meta.dir}/original-work.ts`)}`;
+  expect(preparationFailure(error).reason).toMatch(/^Verification failed at original-work\.ts:[1-9]\d* without/);
+  expect(preparationFailure(error).reason).not.toContain(import.meta.dir);
+});
+
+test.each([
+  ["Source root has open files or could not be inspected", "FILESYSTEM_UNVERIFIED"],
+  ["A process still holds the linked worktree or its retained capture", "FILESYSTEM_BUSY"],
+  ["Original administration correspondence changed", "ORIGINAL_ADMINISTRATION_CHANGED"],
+  ["Retained archive changed since adoption", "ARCHIVE_CHANGED"],
+  ["Original staged, unstaged or untracked state changed since adoption", "WORKTREE_CHANGED"],
+] as const)("original verification guard has a safe fixed classification: %s", (message, code) => {
+  expect(preparationFailure(new Error(message)).code).toBe(code);
 });
 
 test.each([
