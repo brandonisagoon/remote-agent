@@ -20,6 +20,8 @@ import { preparationStage } from "./preparation-diagnostics.ts";
 import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { cleanupObserverFixture, existingCleanupObserverFixture } from "../../../../test-support/cleanup-observer.ts";
 import { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
+import { assertLinkedPathsIdle } from "./cleanup-open-handles.ts";
+import { FilesystemHandleDiagnosticError } from "./filesystem-handle-diagnostic.ts";
 let db: TestDatabase, directory: string;
 let worker: ReturnType<typeof preparationJournalWorker> | undefined;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); });
@@ -73,6 +75,59 @@ function controls(f: Awaited<ReturnType<typeof fixture>>) {
   const post = (preparation?: ReturnType<typeof attempt>) => app.request(`/api/tasks/${f.task.id}/prepare-finalization`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: input.requestKey, cleanup: true, ...(preparation ? { preparation } : {}) }) });
   return { input, runtime, app, post };
 }
+
+test("unidentified filesystem handle reaches the actual failed worker response and replays without authority", async () => {
+  const f = await preparedFixture(), c = controls(f), request = attempt("worktree-removal");
+  const originalResources = await db.prisma.remoteTaskResource.findMany();
+  const originalPreparation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } });
+  const calls: string[] = [];
+  expect((await c.post(request)).status).toBe(202);
+  worker = preparationJournalWorker(c.input, () => preparationStage("resource-verification", async () => {
+    await assertLinkedPathsIdle([f.worktree], args => {
+      calls.push(args[0]!);
+      return { exitCode: 0, stderr: Buffer.alloc(0), stdout: Buffer.from(args[0] === "ps" ? "123 unrelated\n" : "p123\0f167\0tREG\0nprivate-relative-secret\0\n") };
+    });
+    throw new Error("Unverified handles must never return authority");
+  }));
+  worker.tick(); await worker.idle();
+  const response = await (await c.post(request)).json();
+  expect(response.preparation).toMatchObject({ state: "failed", stage: "resource-verification" });
+  expect(response.preparation.error).toContain("[FILESYSTEM_UNVERIFIED]");
+  expect(response.preparation.error).toContain('process 123, descriptor "167", type "REG"');
+  expect(response.preparation.error).toContain("nonabsolute-path");
+  expect(response.receipt).toBeUndefined();
+  const rows = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" }, orderBy: { sequence: "asc" } });
+  expect(JSON.parse(rows.at(-1)!.value!).diagnostic).toMatchObject({ code: "FILESYSTEM_UNVERIFIED", filesystemHandle: { processId: 123, descriptor: "167", type: "REG", problem: "nonabsolute-path", name: "nonabsolute" } });
+  expect(JSON.stringify(rows)).not.toMatch(/private-relative-secret|\/private|cleanup-open-handles\.ts/);
+  expect(calls).toEqual(["ps", "lsof"]);
+  expect(await db.prisma.remoteTaskResource.findMany()).toEqual(originalResources);
+  expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: originalPreparation.sequence } })).toEqual(originalPreparation);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-confirmed", "finalization-cleanup-started"] } } })).toBe(0);
+  await worker.stop();
+  worker = preparationJournalWorker(c.input, async () => { throw new Error("Failed attempt must not repeat observation after restart"); });
+  worker.tick(); await worker.idle();
+  const { elapsedMs: _elapsed, ...originalResponse } = response.preparation;
+  expect((await (await c.post(request)).json()).preparation).toMatchObject(originalResponse);
+  expect(calls).toEqual(["ps", "lsof"]);
+});
+
+test("a malformed typed handle cannot enter the worker response or authorize cleanup", async () => {
+  const f = await fixture(), c = controls(f), request = attempt();
+  expect((await c.post(request)).status).toBe(202);
+  const error = new FilesystemHandleDiagnosticError({ processId: 123, descriptor: "7", type: "DIR", problem: "missing-name", name: "missing" });
+  Object.defineProperty(error, "handle", { value: { processId: 123, descriptor: "7", type: "DIR", problem: "missing-name", name: "missing", raw: "/private/credential?token=secret" } });
+  error.message = "private credential payload";
+  worker = preparationJournalWorker(c.input, () => preparationStage("resource-verification", async () => { throw error; }));
+  worker.tick(); await worker.idle();
+  const response = await (await c.post(request)).json();
+  expect(response.preparation).toMatchObject({ state: "failed", stage: "resource-verification" });
+  expect(response.preparation.error).toContain("[FILESYSTEM_UNVERIFIED]");
+  expect(response.receipt).toBeUndefined();
+  const failed = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-preparation-status" }, orderBy: { sequence: "desc" } });
+  expect(JSON.parse(failed.value!).diagnostic.filesystemHandle).toBeUndefined();
+  expect(JSON.stringify(response) + failed.value).not.toMatch(/credential|private|token|secret/);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-prepared", "finalization-confirmed", "finalization-cleanup-started"] } } })).toBe(0);
+});
 
 test("async preparation persists and replays the safe real-process observer failure without authority", async () => {
   const f = await fixture(), c = controls(f), attemptInput = attempt();

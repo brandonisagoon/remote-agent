@@ -1,10 +1,37 @@
 import { expect, test } from "bun:test";
 import { z } from "zod";
 import { discoverCompletionPullRequest } from "./completion-observation.ts";
-import { preparationFailure } from "./preparation-errors.ts";
+import { PreparationFailure, preparationFailure } from "./preparation-errors.ts";
+import { FilesystemHandleDiagnostic, FilesystemHandleDiagnosticError } from "./filesystem-handle-diagnostic.ts";
 
 // Bun's module-scope errors use bare frames, unlike named/anonymous callbacks.
 const moduleScopeError = new Error("private module-scope fixture");
+
+test("typed filesystem diagnostics reject unsupported fields and cannot smuggle raw exception text", () => {
+  const handle = { processId: 123, descriptor: "7", type: "REG", problem: "missing-name", name: "missing" } as const;
+  const error = new FilesystemHandleDiagnosticError(handle);
+  error.message = "Bearer secret at /private/input"; error.stack = "private stack";
+  const diagnostic = preparationFailure(error);
+  expect(diagnostic.filesystemHandle).toEqual(handle);
+  expect(JSON.stringify(diagnostic)).not.toMatch(/Bearer|secret|\/private|stack/);
+  for (const changed of [
+    { ...handle, processId: 0 }, { ...handle, processId: 2_147_483_648 }, { ...handle, processId: 1.5 },
+    { ...handle, descriptor: "12345678901" }, { ...handle, descriptor: "/private/secret" },
+    { ...handle, type: "private-type" }, { ...handle, problem: "ignore-and-continue" },
+    { ...handle, name: "/private/secret" }, { ...handle, raw: "secret lsof record" },
+    { ...handle, type: "missing" }, { ...handle, type: "PIPE" }, { ...handle, name: "absolute" },
+    { ...handle, problem: "nonabsolute-path" },
+  ]) {
+    expect(FilesystemHandleDiagnostic.safeParse(changed).success).toBeFalse();
+    expect(PreparationFailure.safeParse({ code: "FILESYSTEM_UNVERIFIED", reason: "safe", filesystemHandle: changed }).success).toBeFalse();
+    // Even an unsupported in-process typed shape remains a refusal with no
+    // details; neither its message nor a lookalike diagnostic is trusted.
+    Object.defineProperty(error, "handle", { value: changed, configurable: true });
+    expect(preparationFailure(error)).toEqual({ code: "FILESYSTEM_UNVERIFIED", reason: "The filesystem process or open-handle observation was incomplete or unavailable. No absence was established." });
+  }
+  expect(PreparationFailure.safeParse({ ...diagnostic, code: "PR_NOT_FOUND" }).success).toBeFalse();
+  expect(preparationFailure(Object.assign(new Error("private error"), { filesystemHandle: handle })).code).toBe("UNCLASSIFIED_FAILURE");
+});
 
 test("known guard and OS failures retain only the safe reason and code", () => {
   expect(preparationFailure(new Error("Worktree changed during finalization preparation"))).toMatchObject({ code: "WORKTREE_CHANGED" });
