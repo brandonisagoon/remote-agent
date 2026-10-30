@@ -22,6 +22,7 @@ import { prepareFinalizationResources, assertFinalizationResources, finalization
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { fixtureSocket } from "./unix-socket.test-support.ts";
 import { originalArchiveFixture } from "../../../../test-support/original-work.ts";
+import { recoveryArchiveFixture } from "../../../../test-support/recovery-work.ts";
 import { assertOriginalWork, prepareOriginalWork } from "./original-work.ts";
 
 let db: TestDatabase, directory: string;
@@ -101,14 +102,15 @@ async function fixture() {
   return { ...context, input, dependencies, finalize, task, session, comment, issue, states, copies, publisher, policy, report, worktree, product, sourceResource, manifest, capture, remove };
 }
 
-async function originalFixture() {
+async function originalFixture(recovery = false) {
   const f = await fixture();
   // This fixture deliberately has no source-copies receipt, like the historical
   // original. Its accepted delivery checkouts remain read-only evidence.
   await db.prisma.remoteTaskResource.delete({ where: { id: f.sourceResource.id } });
   const archive = path.join(directory, "retained-original");
-  const record = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "original-archive", kind: "source-archive", purpose: "review", externalId: archive, state: "ready" } });
-  const selection = await originalArchiveFixture(f.worktree, archive, record.id);
+  const record = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "original-archive", kind: recovery ? "recovery-archive" : "source-archive", purpose: recovery ? "tooling" : "review", externalId: archive, state: "ready" } });
+  const inventory = recovery ? await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "inventory", kind: "resource-inventory", purpose: "tooling", externalId: path.join(archive, "resource-inventory.json"), state: "ready" } }) : undefined;
+  const selection = recovery ? (await recoveryArchiveFixture(f.worktree, archive, { archiveResourceId: record.id, inventoryId: inventory!.id })).selection : await originalArchiveFixture(f.worktree, archive, record.id);
   const released = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "previously-retired", kind: "old-provider-object", purpose: "development", externalId: "historical-id", state: "released" } });
   const binding = ExternalDeliveryBindingInput.parse({ ...f.manifest, ownership: { ownedPaths: [] }, originalWork: selection, resourceIds: (await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } })).map((entry) => entry.id) });
   const dependencies = { ...f.dependencies,
@@ -123,13 +125,28 @@ async function originalFixture() {
   return { ...f, input: { ...f.input, binding }, dependencies, archive, archiveRecord: record, released, captureOriginal };
 }
 
+test("historical adoption preserves recovery archive purpose and exact archive-member retention after confirmation", async () => {
+  const f = await originalFixture(true);
+  const adopted = await adoptExternalDeliveries(f.input, f.dependencies);
+  expect(adopted.binding.originalWork?.restore).toHaveProperty("format", "base-work-tar/v1");
+  expect(adopted.binding.resources.filter(entry => entry.purpose === "tooling").map(entry => entry.disposition).sort()).toEqual(["retain-archive", "retain-archive-member"]);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  await f.captureOriginal(prepared.originalWork!); git(f.product, "worktree", "remove", f.worktree);
+  await confirmExternalFinalization(f.finalize, f.dependencies);
+  const projection = await externalFinalizationProjection(db.prisma, { id: f.task.id, primarySessionId: f.session.id });
+  expect(projection.finalizationRetention?.resources.filter(entry => entry.purpose === "tooling")).toHaveLength(2);
+  expect((await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id, purpose: "tooling" } })).every(record => record.state === "ready")).toBe(true);
+});
+
 test("dirty original finalization preserves restored archive, full capture and prior released records", async () => {
   const f = await originalFixture();
   const adopted = await adoptExternalDeliveries(f.input, f.dependencies);
   expect(adopted.binding.originalWork?.snapshot.clean).toBe(false);
   expect(adopted.binding.resources.find((entry) => entry.id === f.released.id)?.disposition).toBe("already-released");
   const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
-  expect(prepared.originalWork?.restore.workingTree).toBe(f.input.binding.originalWork!.expectedWorkingTree);
+  const selectedOriginal = f.input.binding.originalWork!;
+  if (!("expectedWorkingTree" in selectedOriginal)) throw new Error("Fixture requires its bundle selection");
+  expect(prepared.originalWork?.restore.workingTree).toBe(selectedOriginal.expectedWorkingTree);
   await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("not been preserved");
   await f.captureOriginal(prepared.originalWork!);
   // Lost acknowledgement after capture: replay is valid, but Git registration

@@ -22,12 +22,14 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
 export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Sha };
-export const RetainedArchivePlan = z.object({ ...Identity, disposition: z.literal("retain-archive"), archive: z.object({ root: Absolute, manifestPath: Absolute, manifestSha256: Sha, inventoryDigest: Sha }).strict() }).strict();
+export const RetainedArchivePlan = z.object({ ...Identity, purpose: z.enum(["development", "browser", "review", "tooling"]), disposition: z.literal("retain-archive"), archive: z.object({ root: Absolute, manifestPath: Absolute, manifestSha256: Sha, inventoryDigest: Sha }).strict() }).strict();
+export const RetainedArchiveMemberPlan = z.object({ ...Identity, kind: z.literal("resource-inventory"), purpose: z.literal("tooling"), disposition: z.literal("retain-archive-member"), archive: z.object({ resourceId: z.string().min(1), root: Absolute, inventoryDigest: Sha }).strict(), file: z.object({ path: Absolute, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedResultPlan = z.object({ ...Identity, disposition: z.literal("retain-result"), reference: z.object({ archiveResourceId: z.string(), provenancePath: Absolute, provenanceSha256: Sha }).strict() }).strict();
 export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
   z.object({ ...Identity, disposition: z.literal("retain-reference"), reference: z.object({ deliveryId: z.string(), type: z.enum(["pull-request", "ci-run"]), repository: z.string(), number: z.number().int().positive(), reviewedHead: z.string(), mergeCommit: z.string().optional() }).strict() }).strict(),
   z.object({ ...Identity, disposition: z.literal("already-released") }).strict(),
   RetainedArchivePlan,
+  RetainedArchiveMemberPlan,
   RetainedResultPlan,
   z.object({ ...Identity, disposition: z.literal("retire-owned"), dependencies: z.array(z.string()), target: z.discriminatedUnion("type", [
     z.object({ type: z.literal("file"), path: Absolute, root: Absolute, size: z.number().int().nonnegative(), sha256: Sha, ...NodeIdentity }).strict(),
@@ -37,6 +39,24 @@ export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
   ]) }).strict(),
 ]);
 export type FinalizationResourcePlan = z.infer<typeof FinalizationResourcePlan>;
+export type RetainedMaterialPlan = Extract<FinalizationResourcePlan, { disposition: "retain-archive" | "retain-result" | "retain-archive-member" }>;
+export function assertFinalizationPlanPurposes(resources: FinalizationResourceRecord[], plan: FinalizationResourcePlan[]) {
+  for (const resource of resources) {
+    if (["browser", "development", "review"].includes(resource.purpose)) continue;
+    const entry = plan.find(entry => entry.id === resource.id);
+    if (resource.purpose !== "tooling" || !entry || entry.purpose !== "tooling" || !(entry.disposition === "retain-archive" && resource.kind === "recovery-archive" && entry.kind === resource.kind && entry.externalId === entry.archive.root || entry.disposition === "retain-archive-member" && resource.kind === "resource-inventory" && entry.externalId === entry.file.path)) throw new Error("Unknown resource purpose cannot be adopted for cleanup");
+  }
+}
+export function assertRetainedMaterialPlan(entry: RetainedMaterialPlan, plan: FinalizationResourcePlan[]) {
+  if (entry.disposition === "retain-result") {
+    if (!["rubin-chat", "rubin-property-revision", "studio-site-snapshot"].includes(entry.kind)) throw new Error("Retained result identity mismatch");
+  } else if (entry.disposition === "retain-archive") {
+    if ((entry.purpose === "tooling" ? entry.kind !== "recovery-archive" : entry.kind !== "source-archive") || entry.externalId !== entry.archive.root || !inside(entry.archive.root, entry.archive.manifestPath)) throw new Error("Retained archive identity mismatch");
+  } else {
+    const archive = plan.find(parent => parent.id === entry.archive.resourceId);
+    if (!archive || archive.disposition !== "retain-archive" || archive.archive.root !== entry.archive.root || archive.archive.inventoryDigest !== entry.archive.inventoryDigest || entry.externalId !== entry.file.path || !inside(entry.archive.root, entry.file.path)) throw new Error("Retained archive member identity mismatch");
+  }
+}
 type Retirement = Extract<FinalizationResourcePlan, { disposition: "retire-owned" }>;
 type TreeTarget = Extract<Retirement["target"], { type: "tree" }>;
 export const FinalizationQuarantineJournal = z.object({
@@ -204,17 +224,17 @@ function referencePlan(resource: FinalizationResourceRecord, deliveries: Deliver
   return FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retain-reference", reference: { deliveryId: delivery.id, type: resource.kind === "ci-run" ? "ci-run" : "pull-request", repository: delivery.repository, number, reviewedHead: delivery.reviewedHead, ...(resource.kind !== "ci-run" ? { mergeCommit: delivery.mergeCommit } : {}) } });
 }
 
-export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: Array<Extract<FinalizationResourcePlan, { disposition: "retain-archive" | "retain-result" }>>; originalWork?: boolean }, observation = finalizationResourceObservation) {
+export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: RetainedMaterialPlan[]; originalWork?: boolean }, observation = finalizationResourceObservation) {
   const ownership = ExternalResourceOwnership.parse(input.ownership);
-  const resources = input.resources.filter((resource) => ["browser", "development", "review"].includes(resource.purpose));
-  if (resources.length !== input.resources.length) throw new Error("Unknown resource purpose cannot be adopted for cleanup");
+  const resources = input.resources;
+  assertFinalizationPlanPurposes(resources, input.retainedArchives ?? []);
   if (new Set(resources.map((r) => r.id)).size !== resources.length || new Set(resources.map((r) => r.key)).size !== resources.length) throw new Error("Resource inventory has duplicate identities");
   const retainedArchives = input.retainedArchives ?? [];
   const exceptional: FinalizationResourcePlan[] = [];
   const active = resources.filter((resource) => {
     if (resource.state === "released" && input.originalWork) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
     const archive = retainedArchives.find((entry) => entry.id === resource.id);
-    if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest || archive.disposition === "retain-archive" && (resource.kind !== "source-archive" || resource.externalId !== archive.archive.root) || archive.disposition === "retain-result" && !["rubin-chat", "rubin-property-revision", "studio-site-snapshot"].includes(resource.kind)) throw new Error("Retained archive identity mismatch"); exceptional.push(archive); return false; }
+    if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest) throw new Error("Retained archive identity mismatch"); assertRetainedMaterialPlan(archive, retainedArchives); exceptional.push(archive); return false; }
     return true;
   });
   if (!ownership.sourceCopyResourceId && input.originalWork) {
@@ -366,12 +386,14 @@ export async function inspectFinalizationQuarantine(input: { taskId: string; res
 
 export async function assertFinalizationResources(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; originalWork?: boolean }, observation = finalizationResourceObservation) {
   const plan = z.array(FinalizationResourcePlan).parse(input.plan);
-  const resources = input.resources.filter((r) => ["development", "review", "browser"].includes(r.purpose));
+  const resources = input.resources;
   if (new Set(plan.map((r) => r.id)).size !== plan.length || resources.length !== plan.length || resources.length !== input.resources.length) throw new Error("Finalization resource set changed");
+  assertFinalizationPlanPurposes(resources, plan);
   const trees = plan.filter((entry): entry is Retirement & { target: TreeTarget } => entry.disposition === "retire-owned" && entry.target.type === "tree");
   for (const entry of plan) {
     const record = resources.find((resource) => resource.id === entry.id);
     if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest) throw new Error("Finalization resource identity changed");
+    if (["retain-archive", "retain-result", "retain-archive-member"].includes(entry.disposition)) assertRetainedMaterialPlan(entry as RetainedMaterialPlan, plan);
     if (entry.disposition === "already-released" && record.state !== "released" || entry.disposition.startsWith("retain-") && record.state === "released") throw new Error("Retained history was falsely marked released or an already-released resource changed");
   }
   if (trees.length === 0 && input.originalWork && plan.every((entry) => entry.disposition !== "retire-owned")) return;
