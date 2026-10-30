@@ -159,11 +159,17 @@ export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, 
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
   scopes.push(...plan.filter(entry => entry.disposition === "retain-data").map(entry => entry.archive.root));
+  await assertRegisteredPathSharing(prisma, taskId, scopes, plan.filter(entry => entry.disposition === "retire-vault").map(entry => entry.externalId));
+}
+
+/** Shared by prepared plans and existing-operation legacy scopes; retain the
+ * exact ancestor/descendant query, including historical registered claims. */
+export async function assertRegisteredPathSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, scopes: string[], identities: string[] = []) {
   if (!scopes.length) return;
   const ancestors = new Set<string>();
   for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
   const shared = await prisma.remoteTaskResource.findFirst({ where: { taskId: { not: taskId }, OR: [
-    { externalId: { in: plan.filter(entry => entry.disposition === "retire-vault").map(entry => entry.externalId) } },
+    { externalId: { in: identities } },
     { externalId: { in: [...ancestors] } }, ...scopes.map(scope => ({ externalId: { startsWith: `${scope}${path.sep}` } })),
   ] } });
   if (shared) throw new Error("Registered capture overlaps another task's recorded resource");
