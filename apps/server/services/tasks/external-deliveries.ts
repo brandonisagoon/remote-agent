@@ -1,4 +1,6 @@
+import { prepareOriginalWork, assertOriginalWork } from "./original-work.ts";
 import { createHash } from "node:crypto";
+import path from "node:path";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
@@ -8,12 +10,12 @@ import { CompletionContractInput } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { EXTERNAL_BINDING, EXTERNAL_OBSERVATION, ExternalBinding, ExternalDeliveryBindingInput, ExternalTaskIdentity, externalDigest } from "./external-delivery-schema.ts";
 import { externalDeliveryObservation, observeExternalDeliveries } from "./external-delivery-observation.ts";
-import { assertFinalizationResources, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
+import { assertFinalizationResources, finalizationDigest, finalizationResourceIdentity, prepareFinalizationResources, RetainedArchivePlan, RetainedResultPlan, type FinalizationResourcePlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
 
 export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource" | "workerRun">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
-  handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources };
+  handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
 /** Transaction-time CAS uses only registry identity/state. Expensive filesystem
@@ -23,7 +25,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition === "retain-reference" && record.state === "released" || removed && entry.disposition === "retire-owned" && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition === "retire-owned" && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -107,19 +109,30 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const source = await dependencies.source({ ...input, sessionId: current.session.id });
   if (source.issue.id !== acceptance.issueId || source.link.connectionId !== current.identity.connectionId) throw new Error("Accepted source does not belong to the current task");
   const originalSnapshot = await dependencies.snapshot(current.identity.taskWorktree);
-  if (originalSnapshot.branch !== current.identity.branch || !originalSnapshot.clean || originalSnapshot.fingerprint !== lineage.approval.snapshot.fingerprint) throw new Error("Original cleanup worktree changed from the owner's accepted content");
+  if (originalSnapshot.branch !== current.identity.branch || (manifest.originalWork ? originalSnapshot.head !== lineage.approval.snapshot.head : !originalSnapshot.clean || originalSnapshot.fingerprint !== lineage.approval.snapshot.fingerprint)) throw new Error("Original cleanup worktree changed from the owner's accepted content");
   const deliveries = await observeExternalDeliveries(manifest.deliveries, manifest.mergeOrder, current.contract.reviewRequired === true, dependencies.observer);
   const resources = await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } });
   const resourceIds = resources.filter((resource) => ["development", "review", "browser"].includes(resource.purpose)).map((resource) => resource.id).sort();
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
-  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership });
-  const binding = ExternalBinding.parse({ version: 1, input: manifest, identity: current.identity, contractRevision: current.contractEvent.sequence, contractDigest: externalDigest(current.contract), verificationRevision: current.verification.sequence, manifestDigest: externalDigest(manifest), acceptance, deliveries, resources: plan, resourcePlanDigest: finalizationDigest(plan) });
+  const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
+  const retainedArchives = originalWork ? [originalWork.archive, ...originalWork.additionalArchives ?? []].map((archive) => RetainedArchivePlan.parse({ ...finalizationResourceIdentity(resources.find((entry) => entry.id === archive.resourceId)!), disposition: "retain-archive", archive: { root: archive.root, manifestPath: archive.manifestPath, manifestSha256: archive.manifestSha256, inventoryDigest: archive.inventoryDigest } })) : [];
+  const retainedResults = originalWork?.retainedResults?.map((result) => RetainedResultPlan.parse({ ...finalizationResourceIdentity(resources.find((entry) => entry.id === result.resourceId)!), disposition: "retain-result", reference: { archiveResourceId: originalWork.archive.resourceId, provenancePath: result.provenancePath, provenanceSha256: result.provenanceSha256 } })) ?? [];
+  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(originalWork ? { originalWork: true, retainedArchives: [...retainedArchives, ...retainedResults] } : {}) });
+  if (originalWork) {
+    const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
+    for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") {
+      const root = entry.target.path;
+      if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some((archive) => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Archive and original-work capture must stay outside every other cleanup root");
+    }
+  }
+  const binding = ExternalBinding.parse({ version: 1, input: manifest, identity: current.identity, contractRevision: current.contractEvent.sequence, contractDigest: externalDigest(current.contract), verificationRevision: current.verification.sequence, manifestDigest: externalDigest(manifest), acceptance, deliveries, resources: plan, resourcePlanDigest: finalizationDigest(plan), ...(originalWork ? { originalWork } : {}) });
   // Slow provider reads never turn a stale owner decision into new authority.
   const recheckedComment = await checkComment(input, current.session.id, manifest, dependencies);
   if (externalDigest(recheckedComment.acceptance) !== externalDigest(acceptance)) throw new Error("Owner acceptance changed during adoption");
   if (externalDigest(await dependencies.snapshot(current.identity.taskWorktree)) !== externalDigest(originalSnapshot)) throw new Error("Original cleanup worktree changed during adoption");
   for (const observed of deliveries) if (externalDigest(await dependencies.observer.source(manifest.deliveries.find((delivery) => delivery.id === observed.id)!)) !== externalDigest(observed.snapshot)) throw new Error("External source changed during adoption");
-  await dependencies.assertResources({ taskId: input.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, removed: false });
+  await dependencies.assertResources({ taskId: input.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), plan, removed: false, ...(originalWork ? { originalWork: true } : {}) });
+  if (originalWork) await dependencies.assertOriginalWork({ taskId: input.taskId, originalWork, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } }), removed: false });
   return input.prisma.$transaction(async (tx) => {
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, action: EXTERNAL_BINDING, source: `owner:${input.taskId}`, key: manifest.requestKey } });
     if (duplicate) {

@@ -21,6 +21,8 @@ import { prepareTaskFinalization } from "./finalization.ts";
 import { prepareFinalizationResources, assertFinalizationResources, finalizationDigest, inspectFinalizationQuarantine, type ResourceObservation } from "./finalization-resources.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { fixtureSocket } from "./unix-socket.test-support.ts";
+import { originalArchiveFixture } from "../../../../test-support/original-work.ts";
+import { assertOriginalWork, prepareOriginalWork } from "./original-work.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "external-delivery-"))); });
@@ -98,6 +100,125 @@ async function fixture() {
   const remove = async () => { await capture(); await db.prisma.remoteTaskResource.update({ where: { id: sourceResource.id }, data: { state: "released" } }); git(product, "worktree", "remove", worktree); };
   return { ...context, input, dependencies, finalize, task, session, comment, issue, states, copies, publisher, policy, report, worktree, product, sourceResource, manifest, capture, remove };
 }
+
+async function originalFixture() {
+  const f = await fixture();
+  // This fixture deliberately has no source-copies receipt, like the historical
+  // original. Its accepted delivery checkouts remain read-only evidence.
+  await db.prisma.remoteTaskResource.delete({ where: { id: f.sourceResource.id } });
+  const archive = path.join(directory, "retained-original");
+  const record = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "original-archive", kind: "source-archive", purpose: "review", externalId: archive, state: "ready" } });
+  const selection = await originalArchiveFixture(f.worktree, archive, record.id);
+  const released = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "previously-retired", kind: "old-provider-object", purpose: "development", externalId: "historical-id", state: "released" } });
+  const binding = ExternalDeliveryBindingInput.parse({ ...f.manifest, ownership: { ownedPaths: [] }, originalWork: selection, resourceIds: (await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } })).map((entry) => entry.id) });
+  const dependencies = { ...f.dependencies,
+    originalWork: (input: Parameters<typeof prepareOriginalWork>[0]) => prepareOriginalWork(input, noProcesses),
+    assertOriginalWork: (input: Parameters<typeof assertOriginalWork>[0]) => assertOriginalWork(input, noProcesses) };
+  const captureOriginal = async (proof: Awaited<ReturnType<typeof prepareOriginalWork>>) => {
+    const target = proof.target, root = target.inventory.find((entry) => entry.path === ".")!;
+    await mkdir(target.quarantine.directory, { mode: 0o700 }); const location = await lstat(target.quarantine.directory);
+    await writeFile(target.quarantine.journal, JSON.stringify({ version: 1, taskId: f.task.id, resourceId: proof.captureId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path, source: { dev: root.dev, ino: root.ino, mode: root.mode }, quarantine: { dev: location.dev, ino: location.ino } }), { mode: 0o600 });
+    await rename(target.path, target.quarantine.path);
+  };
+  return { ...f, input: { ...f.input, binding }, dependencies, archive, archiveRecord: record, released, captureOriginal };
+}
+
+test("dirty original finalization preserves restored archive, full capture and prior released records", async () => {
+  const f = await originalFixture();
+  const adopted = await adoptExternalDeliveries(f.input, f.dependencies);
+  expect(adopted.binding.originalWork?.snapshot.clean).toBe(false);
+  expect(adopted.binding.resources.find((entry) => entry.id === f.released.id)?.disposition).toBe("already-released");
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  expect(prepared.originalWork?.restore.workingTree).toBe(f.input.binding.originalWork!.expectedWorkingTree);
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("not been preserved");
+  await f.captureOriginal(prepared.originalWork!);
+  // Lost acknowledgement after capture: replay is valid, but Git registration
+  // must independently disappear before confirmation.
+  expect((await prepareExternalFinalization(f.finalize, f.dependencies)).preparedRevision).toBe(prepared.preparedRevision);
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("registered");
+  git(f.product, "worktree", "remove", f.worktree);
+  const confirmed = await confirmExternalFinalization(f.finalize, f.dependencies);
+  expect(confirmed.confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
+  expect((await confirmExternalFinalization(f.finalize, f.dependencies)).confirmedRevision).toBe(confirmed.confirmedRevision);
+  expect(await readFile(path.join(prepared.originalWork!.target.quarantine.path, "untracked.bin"))).toEqual(Buffer.from([0, 255, 1, 10]));
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.archiveRecord.id } })).state).toBe("ready");
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.released.id } })).state).toBe("released");
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
+  const projection = await externalFinalizationProjection(db.prisma, f.task);
+  expect(projection.finalizationRetention?.resources.find((entry) => entry.id === f.archiveRecord.id)?.disposition).toBe("retain-archive");
+});
+
+test("original-work selection never authorizes unknown open resources or changed work", async () => {
+  const f = await originalFixture();
+  const unknown = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "saved-provider-data", kind: "provider-object", purpose: "development", externalId: "do-not-delete", state: "ready" } });
+  f.input.binding.resourceIds.push(unknown.id);
+  await expect(adoptExternalDeliveries(f.input, f.dependencies)).rejects.toThrow("saved-provider-data (provider-object)");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: EXTERNAL_BINDING } })).toBe(0);
+  await db.prisma.remoteTaskResource.update({ where: { id: unknown.id }, data: { state: "released" } });
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  await writeFile(path.join(f.worktree, "new-work.txt"), "retain me");
+  await expect(prepareExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("New material");
+  expect(await readFile(path.join(f.worktree, "new-work.txt"), "utf8")).toBe("retain me");
+});
+
+test("legacy delivery aliases retain only the exact independently observed pull request", async () => {
+  const f = await fixture();
+  await db.prisma.remoteTaskResource.update({ where: { taskId_key: { taskId: f.task.id, key: "publisher-pr" } }, data: { kind: "delivery-receipt" } });
+  await db.prisma.remoteTaskResource.update({ where: { taskId_key: { taskId: f.task.id, key: "policy-pr" } }, data: { kind: "github-pull-request", externalId: "https://github.com/owner/policy/pull/999" } });
+  await expect(adoptExternalDeliveries(f.input, f.dependencies)).rejects.toThrow("independently verified");
+  await db.prisma.remoteTaskResource.update({ where: { taskId_key: { taskId: f.task.id, key: "policy-pr" } }, data: { externalId: "https://github.com/owner/policy/pull/7" } });
+  const adopted = await adoptExternalDeliveries(f.input, f.dependencies);
+  expect(adopted.binding.resources.filter((entry) => entry.disposition === "retain-reference")).toHaveLength(3);
+});
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted finalizer resumes archived dirty original capture and Done response loss", async () => {
+  const f = await originalFixture(), clientRoot = await realpath(process.env.DRAFTED_INTEGRATION_ROOT!);
+  const { finalizeTask } = await import(path.join(clientRoot, "src/finalize.ts"));
+  const { TaskRecord, FinalizationReceipt } = await import(path.join(clientRoot, "src/control.ts"));
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  const publication = publicationFixture(f, "state-response");
+  let failRemoval = true, removals = 0, closed = 0;
+  const registry = {
+    task: async () => {
+      const task = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id }, include: { resources: true } });
+      return TaskRecord.parse(JSON.parse(JSON.stringify({ ...task, ...await externalFinalizationProjection(db.prisma, task) })));
+    },
+    resource: async () => { throw new Error("Retained and previously released resources must not be rewritten"); },
+    prepareFinalization: async (request: { requestKey: string; finalizationVersion?: 2; authorityOnly?: true }) => FinalizationReceipt.parse(await prepareExternalFinalization({ ...f.finalize, ...request }, publication.dependencies)),
+    confirmFinalization: async (request: { requestKey: string; finalizationVersion?: 2 }) => FinalizationReceipt.parse(await confirmExternalFinalization({ ...f.finalize, ...request }, publication.dependencies)),
+    publishIssueUpdate: publication.publish,
+  };
+  const execute = () => finalizeTask({ registry, preparedCleanup: { observation: noProcesses }, runner: async (command: string[], cwd: string) => {
+    if (command[0] === "git" && command.includes("worktree") && command.includes("remove")) {
+      if (failRemoval) { failRemoval = false; throw new Error("injected interruption after original capture"); }
+      removals++;
+    }
+    const result = await bunCommandClient.run(command[0]!, command.slice(1), { cwd });
+    if (!result.ok) throw new Error("Fixture Git command failed");
+    return result.stdout.trim();
+  }, close: async () => {
+    expect(await db.prisma.runtimeIssueUpdate.count({ where: { runtimeSessionId: f.session.id, published: true } })).toBe(1);
+    await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } }); closed++;
+  } });
+  await expect(execute()).rejects.toThrow("interruption after original capture");
+  expect(closed).toBe(0); expect(removals).toBe(0);
+  const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-prepared" } });
+  const prepared = PreparedExternalFinalization.parse(JSON.parse(event.value!)), captured = prepared.originalWork!.target.quarantine.path;
+  const identity = await lstat(captured);
+  expect(await lstat(f.worktree).then(() => true, () => false)).toBe(false);
+  await expect(execute()).rejects.toThrow("injected");
+  expect(f.issue.state.name).toBe("Done"); expect(closed).toBe(0);
+  expect((await execute()).closed).toBe(true);
+  expect(closed).toBe(1); expect(removals).toBe(1);
+  expect((await lstat(captured)).ino).toBe(identity.ino);
+  expect(await readFile(path.join(captured, "staged.txt"), "utf8")).toBe("saved staged work\n");
+  expect(await readFile(path.join(captured, "README.md"), "utf8")).toBe("unfinished original change\n");
+  expect((await registry.task()).finalizationRetention.resources).toHaveLength(4);
+  expect(publication.counts()).toMatchObject({ createCount: 1, updateCount: 1 });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
+}, 30_000);
 
 function publicationFixture(f: Awaited<ReturnType<typeof fixture>>, failure?: "state-response" | "receipt-transaction") {
   const comments = new Map<string, { id: string; body: string; issue: { id: string } }>();

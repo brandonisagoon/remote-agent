@@ -20,13 +20,18 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
   z.object({ ...Entry, kind: z.literal("opaque"), dependencyResourceId: z.string().min(1) }).strict(),
 ]);
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
+export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Sha };
+export const RetainedArchivePlan = z.object({ ...Identity, disposition: z.literal("retain-archive"), archive: z.object({ root: Absolute, manifestPath: Absolute, manifestSha256: Sha, inventoryDigest: Sha }).strict() }).strict();
+export const RetainedResultPlan = z.object({ ...Identity, disposition: z.literal("retain-result"), reference: z.object({ archiveResourceId: z.string(), provenancePath: Absolute, provenanceSha256: Sha }).strict() }).strict();
 export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
   z.object({ ...Identity, disposition: z.literal("retain-reference"), reference: z.object({ deliveryId: z.string(), type: z.enum(["pull-request", "ci-run"]), repository: z.string(), number: z.number().int().positive(), reviewedHead: z.string(), mergeCommit: z.string().optional() }).strict() }).strict(),
+  z.object({ ...Identity, disposition: z.literal("already-released") }).strict(),
+  RetainedArchivePlan,
+  RetainedResultPlan,
   z.object({ ...Identity, disposition: z.literal("retire-owned"), dependencies: z.array(z.string()), target: z.discriminatedUnion("type", [
     z.object({ type: z.literal("file"), path: Absolute, root: Absolute, size: z.number().int().nonnegative(), sha256: Sha, ...NodeIdentity }).strict(),
-    z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1),
-      quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict(),
+    FinalizationTreeTarget,
     z.object({ type: z.literal("profile"), path: Absolute, ownerFile: Absolute, ownerSha256: Sha, session: z.string(), toolingRoot: Absolute, dev: z.number().int().nonnegative().optional(), ino: z.number().int().nonnegative().optional() }).strict(),
     z.object({ type: z.literal("endpoint"), url: z.string().url(), pid: z.number().int().positive(), script: Absolute }).strict(),
   ]) }).strict(),
@@ -42,7 +47,7 @@ export const FinalizationQuarantineJournal = z.object({
 export type FinalizationQuarantineJournal = z.infer<typeof FinalizationQuarantineJournal>;
 export type FinalizationResourceRecord = { id: string; key: string; kind: string; purpose: string; externalId: string; state: string; expiresAt?: string | Date | null; metadata?: unknown };
 type Delivery = { id: string; repository: string; pullRequest: number; url: string; reviewedHead: string; mergeCommit: string; ci: Array<{ runId: number; head: string }> };
-export const ExternalResourceOwnership = z.object({ sourceCopyResourceId: z.string().min(1), ownedPaths: z.array(Absolute).max(1000) }).strict();
+export const ExternalResourceOwnership = z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(Absolute).max(1000) }).strict();
 export type ExternalResourceOwnership = z.infer<typeof ExternalResourceOwnership>;
 
 function canonical(value: unknown): unknown {
@@ -147,7 +152,7 @@ async function observationCommand(command: string[], env?: Record<string, string
 
 /** Adoption has explicit owner-authenticated path scope. No task-name pattern or
  * resource metadata can broaden it. Browser cookies remain an opaque child. */
-async function inventory(root: string, allowed: string[], opaque: Map<string, string>, managedFiles: Map<string, string>) {
+export async function finalizationInventory(root: string, allowed: string[], opaque: Map<string, string>, managedFiles: Map<string, string>) {
   await assertFinalizationPath(root);
   const rootStat = await lstat(root);
   if (!rootStat.isDirectory() || await realpath(root) !== root) throw new Error("Source root is not an exact directory");
@@ -192,12 +197,33 @@ async function assertIgnoredOwnership(sourcePaths: string[], ownedPaths: string[
   }
 }
 
-export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership }, observation = finalizationResourceObservation) {
+function referencePlan(resource: FinalizationResourceRecord, deliveries: Delivery[]) {
+  const delivery = deliveries.find((item) => resource.kind !== "ci-run" ? resource.externalId === item.url : item.ci.some((run) => resource.externalId === `https://github.com/${item.repository}/actions/runs/${run.runId}` && run.head === item.reviewedHead));
+  if (!delivery) throw new Error("Reference is not part of an independently verified external delivery");
+  const number = resource.kind !== "ci-run" ? delivery.pullRequest : delivery.ci.find((run) => resource.externalId === `https://github.com/${delivery.repository}/actions/runs/${run.runId}`)!.runId;
+  return FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retain-reference", reference: { deliveryId: delivery.id, type: resource.kind === "ci-run" ? "ci-run" : "pull-request", repository: delivery.repository, number, reviewedHead: delivery.reviewedHead, ...(resource.kind !== "ci-run" ? { mergeCommit: delivery.mergeCommit } : {}) } });
+}
+
+export async function prepareFinalizationResources(input: { resources: FinalizationResourceRecord[]; taskId: string; sessionId: string; toolingRoot: string; sourcePaths: string[]; deliveries: Delivery[]; ownership: ExternalResourceOwnership; retainedArchives?: Array<Extract<FinalizationResourcePlan, { disposition: "retain-archive" | "retain-result" }>>; originalWork?: boolean }, observation = finalizationResourceObservation) {
   const ownership = ExternalResourceOwnership.parse(input.ownership);
   const resources = input.resources.filter((resource) => ["browser", "development", "review"].includes(resource.purpose));
   if (resources.length !== input.resources.length) throw new Error("Unknown resource purpose cannot be adopted for cleanup");
   if (new Set(resources.map((r) => r.id)).size !== resources.length || new Set(resources.map((r) => r.key)).size !== resources.length) throw new Error("Resource inventory has duplicate identities");
-  const source = resources.find((resource) => resource.id === ownership.sourceCopyResourceId);
+  const retainedArchives = input.retainedArchives ?? [];
+  const exceptional: FinalizationResourcePlan[] = [];
+  const active = resources.filter((resource) => {
+    if (resource.state === "released" && input.originalWork) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
+    const archive = retainedArchives.find((entry) => entry.id === resource.id);
+    if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest || archive.disposition === "retain-archive" && (resource.kind !== "source-archive" || resource.externalId !== archive.archive.root) || archive.disposition === "retain-result" && !["rubin-chat", "rubin-property-revision", "studio-site-snapshot"].includes(resource.kind)) throw new Error("Retained archive identity mismatch"); exceptional.push(archive); return false; }
+    return true;
+  });
+  if (!ownership.sourceCopyResourceId && input.originalWork) {
+    const unsupported = active.filter((resource) => !["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
+    if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
+    for (const resource of active) exceptional.push(referencePlan(resource, input.deliveries));
+    return exceptional;
+  }
+  const source = active.find((resource) => resource.id === ownership.sourceCopyResourceId);
   if (!source || source.kind !== "source-copies" || source.state === "released") throw new Error("Adoption requires the exact retained source-copy resource");
   const root = Absolute.parse(source.externalId);
   await assertFinalizationPath(root);
@@ -206,17 +232,14 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
   await observation.rootIdle(root);
   const opaque = new Map<string, string>(), managedFiles = new Map<string, string>();
   const allowed = [...input.sourcePaths, ...ownership.ownedPaths];
-  const plan: FinalizationResourcePlan[] = [];
-  for (const resource of resources) {
+  const plan: FinalizationResourcePlan[] = [...exceptional];
+  for (const resource of active) {
     if (resource.id === source.id) continue;
     if (resource.state === "released") throw new Error("Initial external adoption requires retained resource identities");
     const common = finalizationResourceIdentity(resource);
     const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
-    if (resource.kind === "pull-request" || resource.kind === "ci-run") {
-      const delivery = input.deliveries.find((item) => resource.kind === "pull-request" ? resource.externalId === item.url : item.ci.some((run) => resource.externalId === `https://github.com/${item.repository}/actions/runs/${run.runId}` && run.head === item.reviewedHead));
-      if (!delivery) throw new Error("Reference is not part of an independently verified external delivery");
-      const number = resource.kind === "pull-request" ? delivery.pullRequest : delivery.ci.find((run) => resource.externalId === `https://github.com/${delivery.repository}/actions/runs/${run.runId}`)!.runId;
-      plan.push(FinalizationResourcePlan.parse({ ...common, disposition: "retain-reference", reference: { deliveryId: delivery.id, type: resource.kind, repository: delivery.repository, number, reviewedHead: delivery.reviewedHead, ...(resource.kind === "pull-request" ? { mergeCommit: delivery.mergeCommit } : {}) } }));
+    if (["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind)) {
+      plan.push(referencePlan(resource, input.deliveries));
     } else if (resource.kind === "evidence") {
       if (!inside(root, resource.externalId)) throw new Error("Legacy evidence is outside the adopted source root");
       const identity = await fileIdentity(resource.externalId);
@@ -251,7 +274,7 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
       plan.push(FinalizationResourcePlan.parse({ ...common, disposition: "retire-owned", dependencies: [], target }));
     } else throw new Error("External finalization has an unsupported resource; preserve it");
   }
-  const entries = await inventory(root, allowed, opaque, managedFiles);
+  const entries = await finalizationInventory(root, allowed, opaque, managedFiles);
   // Allocate only a frozen name here. The prepared client creates this private
   // same-filesystem sibling immediately before its exclusive capture rename.
   const directory = path.join(path.dirname(root), `.drafted-finalization-${randomUUID()}`);
@@ -341,11 +364,17 @@ export async function inspectFinalizationQuarantine(input: { taskId: string; res
   return { captured: Boolean(captured), physicalPath: captured ? quarantine.path : target.path };
 }
 
-export async function assertFinalizationResources(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean }, observation = finalizationResourceObservation) {
+export async function assertFinalizationResources(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; originalWork?: boolean }, observation = finalizationResourceObservation) {
   const plan = z.array(FinalizationResourcePlan).parse(input.plan);
   const resources = input.resources.filter((r) => ["development", "review", "browser"].includes(r.purpose));
   if (new Set(plan.map((r) => r.id)).size !== plan.length || resources.length !== plan.length || resources.length !== input.resources.length) throw new Error("Finalization resource set changed");
   const trees = plan.filter((entry): entry is Retirement & { target: TreeTarget } => entry.disposition === "retire-owned" && entry.target.type === "tree");
+  for (const entry of plan) {
+    const record = resources.find((resource) => resource.id === entry.id);
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest) throw new Error("Finalization resource identity changed");
+    if (entry.disposition === "already-released" && record.state !== "released" || entry.disposition.startsWith("retain-") && record.state === "released") throw new Error("Retained history was falsely marked released or an already-released resource changed");
+  }
+  if (trees.length === 0 && input.originalWork && plan.every((entry) => entry.disposition !== "retire-owned")) return;
   if (trees.length !== 1) throw new Error("Finalization requires one exact retained source-root capture");
   const tree = trees[0]!, target = tree.target;
   const physical = plan.filter((entry): entry is Retirement => entry.disposition === "retire-owned");
@@ -360,7 +389,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   for (const entry of plan) {
     const resource = resources.find((r) => r.id === entry.id);
     if (!resource || finalizationResourceIdentity(resource).identityDigest !== entry.identityDigest) throw new Error("Finalization resource identity changed");
-    if (entry.disposition === "retain-reference") { if (resource.state === "released") throw new Error("Retained history was falsely marked released"); continue; }
+    if (entry.disposition !== "retire-owned") continue;
     const child = entry.target;
     if (child.type === "endpoint") await observation.endpointAbsent(child);
     else if (child.type !== "tree") {
