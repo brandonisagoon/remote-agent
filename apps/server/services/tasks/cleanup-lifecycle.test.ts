@@ -1396,3 +1396,86 @@ test.skipIf(!process.env.DRAFTED_NEON_INTEGRATION_ROOT)("actual Neon provider an
     expect(client.state.roles.map((value: { name: string }) => value.name)).toEqual(["drafted_runtime", "studio_spatial_owner"]);
   } finally { await server?.stop(true); await client.cleanup(); }
 }, 30_000);
+
+async function privateExportScopeFixture() {
+  const f = await fixture(), environment = path.join(directory, "environments", f.task.id), pinned = path.join(directory, "original-tooling");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { pinnedToolingRoot: pinned, toolingRoot: f.root } });
+  const values = [
+    { id: "private-export", key: "credentials-export-development", kind: "private-file", purpose: "development", externalId: path.join(environment, "provider.src.env"), metadata: {
+      source: "pinned tooling credentials/development.enc.json (createdAt 2026-10-26T22:34:30Z), authenticated", fields: ["OPENAI_API_KEY"],
+      derivedFiles: ["clerk.env", "provider.env", "web-provider.env", "terrain.src.env", "api.env", "web.env", "spatial.env", "test.env"],
+    } },
+    { id: "original-compose", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, metadata: { envDirectory: environment, composeFile: path.join(environment, "compose.yml") } },
+  ];
+  for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, state: "ready", taskId: f.task.id } });
+  await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const renew = () => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, resourceKeys: [values[0]!.key] }) });
+  const { legacyPrivateExportScope } = await import("./private-export-scope.ts");
+  const scope = legacyPrivateExportScope({ ...f.task, worktreePath: f.worktree, pinnedToolingRoot: pinned, resources: values.map(value => ({ ...value, state: "ready" })) }, values[0]!.key);
+  return { ...f, active, values, app, renew, scope };
+}
+
+test("private export selected scope uses only original v1 identity and preserves raw preparation/operation", async () => {
+  const f = await privateExportScopeFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const response = await f.renew(); expect(response.status).toBe(200);
+  const witness = await response.json(); expect(witness.resources).toEqual([{ id: f.values[0]!.id, key: f.values[0]!.key, identityDigest: finalizationResourceIdentity({ ...f.values[0]!, state: "ready" }).identityDigest }]);
+  expect(witness.cleanup).toEqual({ operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); expect((await f.renew()).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test.each(["source", "storage", "journal", "capture", "source-ancestor", "storage-worktree", "own-parent", "wrong-recipe", "missing-environment"])("private export scope refuses %s without any resource/proof mutation", async change => {
+  const f = await privateExportScopeFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  expect((await f.renew()).status).toBe(200);
+  if (change === "wrong-recipe") await db.prisma.remoteTaskResource.update({ where: { id: f.values[0]!.id }, data: { metadata: { ...f.values[0]!.metadata, source: "arbitrary credentials" } } });
+  else if (change === "missing-environment") await db.prisma.remoteTaskResource.update({ where: { id: f.values[1]!.id }, data: { externalId: "other-project" } });
+  else if (change === "own-parent") await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "parent", kind: "directory", purpose: "development", state: "ready", externalId: path.dirname(f.scope.environment) } });
+  else {
+    await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", branchName: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: f.task.toolingRevision, ...(change === "storage-worktree" ? { worktreePath: path.join(f.scope.storage, "source") } : {}) } });
+    if (change !== "storage-worktree") await db.prisma.remoteTaskResource.create({ data: { taskId: "foreign", key: "claim", kind: "private-file", purpose: "development", state: "ready",
+      externalId: change === "source" ? f.scope.source : change === "storage" ? f.scope.storage : change === "journal" ? f.scope.plan : change === "capture" ? f.scope.quarantine.path : f.scope.environment } });
+  }
+  expect((await f.renew()).status).toBe(409); expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, state: "released" } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test.skipIf(!process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT)("actual private export through Unix scoped authority refuses late claims then retains native inode across lost acknowledgment", async () => {
+  const f = await fixture(), root = process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT!;
+  const { privateExportFixture } = await import(path.join(root, "test/fixtures/private-export.ts"));
+  const localRoot = path.join(directory, "export-fixture"); await mkdir(localRoot, { mode: 0o700 });
+  const p = await privateExportFixture({ root: localRoot, taskId: f.task.id, seedComposeJournal: false });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { pinnedToolingRoot: p.task.pinnedToolingRoot, toolingRevision: p.task.toolingRevision, toolingRoot: f.root } });
+  for (const resource of p.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: f.task.id } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), original = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } });
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(process.platform === "darwin" ? "/private/tmp" : "/tmp", `private-export-${crypto.randomUUID().slice(0, 8)}.sock`), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {});
+  try {
+    const { finalizeTask } = await import(path.join(root, "src/finalize.ts"));
+    const { taskRegistry } = await import(path.join(root, "src/control.ts")), { manageResource } = await import(path.join(root, "src/resources.ts"));
+    const base = taskRegistry(socket, f.task.id, 3000); let loseWrite = true, writes = 0, captures = 0;
+    const registry = { ...base, resource: async (value: unknown) => { await base.resource(value); writes++; if (loseWrite) { loseWrite = false; throw Error("Lost applied Released acknowledgment"); } } };
+    const before = await lstat(p.file), bytes = await readFile(p.file), backup = await readFile(p.backupFile), key = await readFile(p.keyFile);
+    await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", branchName: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: f.task.toolingRevision } });
+    const run = (extra = {}) => manageResource({ registry, key: p.resource.key, action: "release", docker: p.docker, privateExport: { keyFile: p.keyFile, observation: p.input.observation, composeJournalRoot: p.input.composeJournalRoot,
+      captureHooks: { afterCapture: () => { captures++; } }, ...extra } });
+    await expect(run({ afterPlan: async () => { await db.prisma.remoteTaskResource.create({ data: { id: "late", taskId: "foreign", key: "claim", kind: "private-file", purpose: "development", state: "ready", externalId: p.scope.quarantine.path } }); } })).rejects.toThrow();
+    expect((await lstat(p.file)).ino).toBe(before.ino); expect(captures).toBe(0); expect(writes).toBe(0);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late" } });
+    const finalize = () => finalizeTask({ registry, cleanup: true, manage: (input: any) => manageResource({ ...input, docker: p.docker, compose: { journalRoot: p.input.composeJournalRoot },
+      privateExport: { keyFile: p.keyFile, observation: p.input.observation, composeJournalRoot: p.input.composeJournalRoot, captureHooks: { afterCapture: () => { captures++; } } } }), close: async () => { throw Error("Retained source must not close"); } });
+    await expect(finalize()).rejects.toThrow("Cleanup preserved task resources"); expect(captures).toBe(1);
+    const journal = await readFile(p.scope.plan), native = await readFile(p.scope.quarantine.journal); await run();
+    await expect(finalize()).rejects.toThrow("Cleanup preserved task resources");
+    expect(captures).toBe(1); expect(writes).toBe(1); expect((await lstat(p.scope.quarantine.path)).ino).toBe(before.ino); expect(await readFile(p.scope.quarantine.path)).toEqual(bytes);
+    expect(await readFile(p.scope.plan)).toEqual(journal); expect(await readFile(p.scope.quarantine.journal)).toEqual(native); expect(await readFile(p.backupFile)).toEqual(backup); expect(await readFile(p.keyFile)).toEqual(key);
+    expect(p.effects).toEqual([]);
+    const after = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } });
+    expect(after.map(value => finalizationResourceIdentity(value))).toEqual(original.map(value => finalizationResourceIdentity(value))); expect(after.filter(value => value.state === "released").map(value => value.id)).toEqual([p.resource.id]);
+    expect((await assertPreparedCleanup(f.input)).operationRevision).toBe(active.operationRevision); expect((await assertPreparedCleanup(f.input)).binding.preparedRevision).toBe(prepared.preparedRevision);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  } finally { await stopPreparation(); server.stop(true); }
+}, 20_000);
