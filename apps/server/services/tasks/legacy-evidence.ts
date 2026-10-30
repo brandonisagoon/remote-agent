@@ -93,6 +93,10 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   return { ...current, receipt: receipt(event.sequence, proof) };
 }
 
+// Local authority only: physical saved-copy/capture checks stay at adoption and
+// every evidence operation. The cleanup supplement reuses this exact binding.
+export const inspectLegacyEvidenceAuthority = loadProof;
+
 /** Only the owner's authenticated route can adopt old receipts. The old
  * preparation and metadata remain byte-for-byte untouched; missing hashes are
  * explicitly new observations, never retroactive historical evidence. */
@@ -104,6 +108,11 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
     const loaded = await loadProof(input.prisma, input.config, input.taskId, prior.sequence);
     if (finalizationDigest(loaded.receipt.proof.input) !== finalizationDigest(adoption)) throw new Error("Legacy evidence already has a different immutable retention proof");
     for (const entry of loaded.receipt.proof.entries) await inspectLegacyEvidenceCapture(loaded.receipt.proof, entry, false);
+    await input.prisma.$transaction(async tx => {
+      await loadProof(tx, input.config, input.taskId, prior.sequence);
+      const { supplementCleanupEvidence } = await import("./cleanup-lifecycle.ts");
+      await supplementCleanupEvidence({ prisma: tx, config: input.config, sessionId: current.session.id, requestKey: current.prepared.requestKey }, prior.sequence);
+    });
     return loaded.receipt;
   }
   const resources = await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId } });
@@ -165,6 +174,8 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
     const records = await tx.remoteTaskResource.findMany({ where: { taskId: input.taskId, kind: "evidence", state: { not: "released" } } });
     if (records.length !== entries.length || entries.some((entry) => !records.some((record) => record.id === entry.resourceId && legacyEvidenceResourceDigest(record) === entry.identityDigest))) throw new Error("Legacy evidence inventory changed during observation");
     const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.session.id, source: `owner:${input.taskId}`, action: LEGACY_EVIDENCE_RETAINED, key: adoption.requestKey, value: JSON.stringify(proof) } });
+    const { supplementCleanupEvidence } = await import("./cleanup-lifecycle.ts");
+    await supplementCleanupEvidence({ prisma: tx, config: input.config, sessionId: current.session.id, requestKey: current.prepared.requestKey }, event.sequence);
     return receipt(event.sequence, proof);
   });
 }

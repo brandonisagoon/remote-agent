@@ -138,3 +138,28 @@ Partial intent, completed capture and lost confirmation recover the same journal
 proof and preparation. A confirmed capture can still be inspected after its empty
 original parent is removed. Recreated source parents, replaced retained bytes or
 new overlapping ownership refuse continuation and preserve all material.
+
+## Evidence added after cleanup starts
+
+The existing authenticated retention adoption also supports an already-bound
+version 1 cleanup operation. In the same transaction as its retained-evidence
+proof, the server records a `finalization-cleanup-evidence-supplement` tied to
+the exact original operation, preparation and raw retained-proof event bytes.
+It does not rewrite those records or change the client operation witness.
+
+Only this validated evidence addition can extend the frozen authority epoch.
+The existing resource scope, task/pin identity, archives, owner revocation,
+pause and automatic-turn checks still apply. Saved copies are fully observed
+before adoption and independently checked by the normal evidence adapter
+before capture and confirmation. Cheap operation renewals validate the local
+binding without streaming the archives again. A retry reuses the same proof
+and supplement, including after capture or a lost confirmation response.
+Apply the additive `20261030190000_cleanup_evidence_supplement` migration through
+the normal stopped-service updater; its unique index prevents duplicate
+supplements. The existing endpoint and unchanged client protocol are reused.
+
+DRA-209's disposable regression binds cleanup before adoption, then uses the
+unchanged Drafted client to retire 20 files and one directory over the actual
+control socket. It verifies retained bytes, lost-response recovery and exact
+preservation of the preparation, operation and archive-proof events. No live
+DRA-80 adoption or cleanup is claimed by these tests.

@@ -12,6 +12,7 @@ import type { RemoteTaskResource } from "../../../../generated/prisma/client.ts"
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
+import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tree.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 import { adoptLegacyEvidence, assertLegacyEvidenceResourceUpdate, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
@@ -236,9 +237,100 @@ test("an original retained tooling parent is not a whole-tree cleanup operation"
 });
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
-test.each(["retained-copy", "pause", "pin", "revocation"])("bound evidence authority still refuses %s before capture", async change => {
-  const f = await fixture(), receipt = await f.adopt();
+test("saved evidence supplements an already bound cleanup without replacing its original records", async () => {
+  const f = await fixture({ privateBackup: true });
+  const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-archive-retention"] } } });
+  expect(frozen.length).toBe(3);
+  const receipt = await f.adopt();
+  const renewed = await prepareTaskFinalization({ ...f.finalInput, cleanup: true, authorityOnly: true }, f.dependencies);
+  expect(renewed.cleanup).toEqual(active.cleanup);
+  await f.manage(receipt, "capture-0", "authorize");
+  await capture(receipt);
+  const confirmed = await f.manage(receipt, "capture-0", "confirm");
+  expect(await f.manage(receipt, "capture-0", "confirm")).toEqual(confirmed);
+  expect(await f.adopt()).toEqual(receipt);
+  for (const event of frozen) expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: event.sequence } })).toEqual(event);
+  const supplement = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-cleanup-evidence-supplement" } });
+  const value = JSON.parse(supplement.value!);
+  expect(value.operationRevision).toBe(active.cleanup!.operationRevision);
+  expect(value.evidence.revision).toBe(receipt.proofRevision);
+  await expect(Promise.resolve(db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: supplement.runtimeSessionId, source: supplement.source, action: supplement.action, key: supplement.key, value: supplement.value } }))).rejects.toThrow();
+});
+
+test.each(["pause", "pin", "resource", "revocation"])("evidence supplementation refuses existing operation drift before adopting: %s", async change => {
+  const f = await fixture();
   await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "pin") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRevision: "b".repeat(40) } });
+  if (change === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.resources[1]!.id }, data: { metadata: { description: "changed ownership" } } });
+  if (change === "revocation") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "delivered-retirement-revoked", key: "withdrawn", value: JSON.stringify({ basis: "Owner revoked cleanup" }) } });
+  await expect(f.adopt()).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["legacy-evidence-retained", "finalization-cleanup-evidence-supplement"] } } })).toBe(0);
+  expect(await readFile(f.resources[0]!.externalId, "utf8")).toBe("saved capture\n");
+});
+
+test.each(["missing", "operation", "preparation", "proof", "proof-bytes"])("a missing or altered evidence supplement cannot change an operation: %s", async change => {
+  const f = await fixture(); await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies); const receipt = await f.adopt();
+  const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-cleanup-evidence-supplement" } });
+  const value = JSON.parse(event.value!);
+  if (change === "missing") await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: event.sequence } });
+  else if (change === "proof-bytes") {
+    const proof = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: receipt.proofRevision } });
+    await db.prisma.runtimeMetadataEvent.update({ where: { sequence: proof.sequence }, data: { value: proof.value + " " } });
+  } else {
+    if (change === "operation") value.operationRevision++;
+    if (change === "preparation") value.preparedDigest = "0".repeat(64);
+    if (change === "proof") value.evidence.digest = "0".repeat(64);
+    await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: JSON.stringify(value) } });
+  }
+  await expect(f.manage(receipt, "capture-0", "authorize")).rejects.toThrow();
+  expect(await readFile(f.resources[0]!.externalId, "utf8")).toBe("saved capture\n");
+});
+
+test("authenticated adoption retry repairs an old late proof without replacing proof or operation bytes", async () => {
+  const f = await fixture(); await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies); const receipt = await f.adopt();
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "legacy-evidence-retained"] } } });
+  // Reproduce the historical endpoint outcome before supplements existed.
+  await db.prisma.runtimeMetadataEvent.deleteMany({ where: { action: "finalization-cleanup-evidence-supplement" } });
+  await expect(f.manage(receipt, "capture-0", "authorize")).rejects.toThrow("authority");
+  const request = (authorized: boolean) => f.app.request(`/api/tasks/${f.task.id}/legacy-evidence`, { method: "POST", headers: { "content-type": "application/json", ...(authorized ? { authorization: `Bearer ${f.config.apiKey}` } : {}) }, body: JSON.stringify(f.adoption) });
+  expect((await request(false)).status).toBe(401);
+  const response = await request(true); expect(response.status).toBe(200); expect(await response.json()).toEqual(receipt);
+  await db.prisma.$disconnect();
+  await f.manage(receipt, "capture-0", "authorize");
+  expect(await f.adopt()).toEqual(receipt);
+  for (const event of frozen) expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: event.sequence } })).toEqual(event);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-cleanup-evidence-supplement" } })).toBe(1);
+});
+
+test("idle owner adoption does not waive the original automatic cleanup turn or pending work", async () => {
+  const f = await fixture();
+  const capability = async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
+    taskToolingRevision: f.task.toolingRevision, capabilityRevision: "b".repeat(40), checkout: "/fixture/immutable", instructions: "/fixture/immutable/cleanup.md", adapter: "/fixture/immutable/src/cli.ts" }, instructions: "Fixture cleanup adapter" });
+  const start = async (key: string) => {
+    const queued = await enqueueTaskCleanup({ ...f.context, requestKey: key }, { capability });
+    await db.prisma.runtimeInstruction.update({ where: { id: queued.instructionId }, data: { state: "dispatching", executionRequestId: key } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: key, runtimeSessionId: f.session.id, requestId: key, phase: "started", occurredAt: new Date() } });
+    return queued;
+  };
+  const first = await start("first");
+  const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  await db.prisma.runtimeInstruction.update({ where: { id: first.instructionId }, data: { state: "completed" } });
+  const receipt = await f.adopt();
+  await expect(f.manage(receipt, "capture-0", "authorize")).rejects.toThrow("exact executing");
+  await start("second");
+  await f.manage(receipt, "capture-0", "authorize");
+  expect((await prepareTaskFinalization({ ...f.finalInput, cleanup: true, authorityOnly: true }, f.dependencies)).cleanup).toEqual(active.cleanup);
+  await db.prisma.runtimeInstruction.create({ data: { id: "new-owner-work", sessionId: f.session.id, text: "Owner follow-up", state: "queued" } });
+  await expect(f.manage(receipt, "capture-0", "authorize")).rejects.toThrow("pending task instructions");
+  expect(await readFile(f.resources[0]!.externalId, "utf8")).toBe("saved capture\n");
+});
+
+test.each(["retained-copy", "pause", "pin", "revocation"])("bound evidence authority still refuses %s before capture", async change => {
+  const f = await fixture();
+  await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  const receipt = await f.adopt();
   if (change === "retained-copy") await writeFile(receipt.proof.entries[0]!.retained.path, "changed retained bytes\n");
   if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
   if (change === "pin") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRevision: "b".repeat(40) } });
@@ -248,6 +340,49 @@ test.each(["retained-copy", "pause", "pin", "revocation"])("bound evidence autho
   expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resources[0]!.id } })).state).toBe("ready");
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { source: `legacy-evidence:${f.task.id}`, action: "legacy-evidence-confirmed" } })).toBe(0);
 });
+
+test.skipIf(!draftedRoot)("actual client retires20 files and a directory with the same supplemented operation after lost acknowledgment", async () => {
+  const f = await fixture({ files: 20, directoryEvidence: true, privateBackup: true });
+  const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-archive-retention"] } } });
+  expect(frozen.length).toBe(3);
+  const response = await f.app.request(`/api/tasks/${f.task.id}/legacy-evidence`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${f.config.apiKey}` }, body: JSON.stringify(f.adoption) });
+  expect(response.status).toBe(200);
+  const receipt = await response.json() as LegacyEvidenceReceipt;
+  expect(receipt.proof.entries.length).toBe(21);
+  const originalPrepare = legacyEvidenceDependencies.prepare; legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const socket = path.join(directory, "supplement.sock"); let lost = false;
+  const server = Bun.serve({ unix: socket, fetch: async request => {
+    const operation = new URL(request.url).pathname.endsWith("/legacy-evidence") ? await request.clone().json() : null;
+    const result = await f.app.fetch(request);
+    if (operation?.resourceKey === "turns" && operation?.action === "confirm" && result.ok && !lost) { lost = true; return Response.json({ error: "Lost retained directory acknowledgment" }, { status: 500 }); }
+    return result;
+  } });
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageEvidenceResource } = await import(path.join(draftedRoot!, "src/evidence-resources.ts"));
+    const registry = taskRegistry(socket, f.task.id);
+    for (const entry of receipt.proof.entries) {
+      if (isEvidenceTree(entry)) {
+        await expect(manageEvidenceResource({ registry, key: entry.key, action: "release" })).rejects.toThrow("Lost retained directory acknowledgment");
+        await db.prisma.$disconnect();
+      }
+      expect((await manageEvidenceResource({ registry, key: entry.key, action: "release" })).state).toBe("released");
+      expect(await lstat(entry.target.path).catch(() => null)).toBeNull();
+      if (isEvidenceTree(entry)) expect(await readFile(path.join(entry.retained.path, "turn-28.ndjson"), "utf8")).toBe("saved turn 28\n");
+      else expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
+    }
+    expect(lost).toBeTrue();
+    expect(await f.adopt()).toEqual(receipt);
+    expect((await registry.task()).cleanupOperation.operationRevision).toBe(active.cleanup!.operationRevision);
+    for (const original of [...f.resources, f.treeResource!]) expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata).toEqual(original.metadata);
+    for (const event of frozen) expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: event.sequence } })).toEqual(event);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-cleanup-evidence-supplement" } })).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "legacy-evidence-confirmed" } })).toBe(21);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: "saved-backup" } } })).state).toBe("ready");
+    expect((await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies)).cleanup).toEqual(active.cleanup);
+  } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+}, 30_000);
 
 test.skipIf(!draftedRoot)("bound cleanup checks each evidence copy without repeating whole-task fingerprints", async () => {
   const f = await fixture({ files: 6, privateBackup: true }), receipt = await f.adopt();
