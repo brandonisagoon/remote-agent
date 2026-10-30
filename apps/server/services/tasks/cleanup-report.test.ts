@@ -1,3 +1,4 @@
+import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 import { cleanupInboxDependencies } from "./cleanup-inbox.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
@@ -177,6 +178,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
       catch (error) { return c.json({ error: (error as Error).message }, 409); }
     }).route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
   const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {}, { prepareFinalization: input => prepareTaskFinalization(input, f.dependencies) });
   try {
     const { taskRegistry, closeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
     const { finalizeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/finalize.ts"));
@@ -192,7 +194,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
     expect(await db.prisma.runtimeInstruction.count({ where: { state: "cancelled" } })).toBe(2);
     expect(f.issue.state.name).toBe("Blocked");
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.preparedRevision } })).value).toBe(preparation.value);
-  } finally { await server.stop(true); }
+  } finally { await stopPreparation(); await server.stop(true); }
 }, 30_000);
 
 
@@ -213,6 +215,7 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
     .post("/api/tasks/task/cleanup-report", c => c.json({ error: "Linear is offline" }, 503))
     .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
   const socket = path.join(directory, "cli.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {}, { prepareFinalization: input => prepareTaskFinalization(input, f.dependencies) });
   f.config.controlIpcPath = socket;
   const cli = async (args: string[] = ["task", "destroy", "--task", f.task.id]) => {
     const child = Bun.spawn([process.execPath, path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts"), ...args, "--socket", socket], { cwd: directory, stdout: "pipe", stderr: "pipe" });
@@ -267,5 +270,5 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
     const retry = await cli(["upkeep", "expired"]);
     expect(retry.code).toBe(0); expect(JSON.parse(retry.stdout)).toMatchObject({ alreadyClosed: true, reporting: { state: "pending" } });
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
-  } finally { Object.assign(finalizationDependencies, saved); Object.assign(cleanupInboxDependencies, savedInbox); await server.stop(true); }
+  } finally { Object.assign(finalizationDependencies, saved); Object.assign(cleanupInboxDependencies, savedInbox); await stopPreparation(); await server.stop(true); }
 }, 30_000);

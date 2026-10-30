@@ -1,3 +1,4 @@
+import { preparationStage } from "./preparation-diagnostics.ts";
 import { createHash } from "node:crypto";
 import { lstat, readlink } from "node:fs/promises";
 import path from "node:path";
@@ -17,7 +18,10 @@ async function run(client: CommandClient, cwd: string, command: string, args: st
 }
 
 /** Read-only facts. No fetch, commit, push, review or merge is performed. */
-export async function observeCompletionSnapshot(cwd: string, client: CommandClient = bunCommandClient): Promise<CompletionSnapshot> {
+export function observeCompletionSnapshot(cwd: string, client: CommandClient = bunCommandClient): Promise<CompletionSnapshot> {
+  return preparationStage("fingerprint", () => readCompletionSnapshot(cwd, client));
+}
+async function readCompletionSnapshot(cwd: string, client: CommandClient): Promise<CompletionSnapshot> {
   const git = (...args: string[]) => run(client, cwd, "git", args);
   const head = await git("rev-parse", "--verify", "HEAD");
   const branch = await git("symbolic-ref", "--short", "HEAD");
