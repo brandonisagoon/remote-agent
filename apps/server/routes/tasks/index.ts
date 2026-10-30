@@ -19,6 +19,7 @@ import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../s
 import { BrowserStopInput, resolveBrowserStopAuthority } from "../../services/tasks/browser-stop-authority.ts";
 import { LocalServiceStopInput, resolveLocalServiceStopAuthority } from "../../services/tasks/local-service-stop-authority.ts";
 import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
+import { renewCleanupAuthority } from "../../services/tasks/cleanup-authority.ts";
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
@@ -69,6 +70,16 @@ sessionTaskRoutes.post("/:sessionId/reply-context", async (c) => {
   if (!parsed.success) return c.json({ error: "Invalid reply context" }, 400);
   try { return c.json(await readReplyContext({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId") })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+taskRoutes.post("/:taskId/cleanup-authority", async (c) => {
+  const parsed = FinalizationInput.pick({ requestKey: true, finalizationVersion: true }).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "A stable cleanup requestKey is required" }, 400);
+  const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
+  if (!task?.primarySessionId) return c.json({ error: "Task has no original primary" }, 409);
+  try {
+    return c.json(await renewCleanupAuthority({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: task.primarySessionId }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
 for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalization], ["confirm-finalization", confirmTaskFinalization]] as const) {
