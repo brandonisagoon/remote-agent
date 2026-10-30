@@ -1,5 +1,5 @@
 import type { LinearCredential } from "../../../../lib/linear-auth.ts";
-import { linearGraphql } from "./client.ts";
+import { linearGraphql, LinearGraphqlResponseError } from "./client.ts";
 import { z } from "zod";
 
 /** Owner acceptance needs author, issue, organization and edit identity;
@@ -100,11 +100,29 @@ export async function createThreadedIssueComment(
   }
 }
 
-/** Reconcile a client-assigned comment ID after an uncertain create response. */
+// The exact HTTP-success GraphQL lookup failure observed for an uncreated
+// reserved UUID. A message alone, partial data or another error is not absence.
+const MissingComment = z.object({ data: z.null(), errors: z.tuple([z.object({
+  message: z.literal("Entity not found: Comment"), path: z.tuple([z.literal("comment")]),
+  locations: z.array(z.object({ line: z.number().int().positive(), column: z.number().int().positive() }).strict()).optional(),
+  extensions: z.object({ type: z.literal("invalid input"), code: z.literal("INPUT_ERROR"), statusCode: z.literal(400), userError: z.literal(true), userPresentableMessage: z.literal("Could not find referenced Comment.") }).strict(),
+}).strict()]) }).strict();
+const CommentIdentity = z.object({ id: z.string().min(1), body: z.string(), parentId: z.string().min(1).nullable().optional(),
+  issue: z.object({ id: z.string().min(1) }).nullable(), documentContent: z.object({ issue: z.object({ id: z.string().min(1) }).nullable() }).nullable().optional() });
+
+/** Reconcile a client-assigned comment ID before create or after an uncertain
+ * response. Only this read treats the exact missing-Comment error as null. */
 export async function fetchIssueCommentIdentity(apiKey: LinearCredential, commentId: string): Promise<{ id: string; body: string; parentId?: string | null; issue: { id: string } | null } | null> {
-  const data = await linearGraphql<{ comment: { id: string; body: string; parentId?: string | null; issue: { id: string } | null;
-    documentContent?: { issue: { id: string } | null } | null } | null }>(apiKey,
-    "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body parentId issue { id } documentContent { issue { id } } } }", { commentId });
+  let raw: unknown;
+  try {
+    raw = await linearGraphql<unknown>(apiKey,
+      "query QuestionComment($commentId: String!) { comment(id: $commentId) { id body parentId issue { id } documentContent { issue { id } } } }", { commentId });
+  } catch (error) {
+    if (error instanceof LinearGraphqlResponseError && MissingComment.safeParse(error.response).success) return null;
+    throw error;
+  }
+  const data = z.object({ comment: CommentIdentity.nullable() }).parse(raw);
+  if (data.comment && data.comment.id !== commentId) throw new Error("Linear returned a different comment identity");
   // Description-anchored threads are attached through documentContent. Use
   // the same issue identity for ingress, context and outbox reconciliation.
   return data.comment ? { ...data.comment, issue: data.comment.issue ?? data.comment.documentContent?.issue ?? null } : null;

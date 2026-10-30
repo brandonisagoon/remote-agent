@@ -272,3 +272,90 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
   } finally { Object.assign(finalizationDependencies, saved); Object.assign(cleanupInboxDependencies, savedInbox); await stopPreparation(); await server.stop(true); }
 }, 30_000);
+
+const originalGraphqlFetch = globalThis.fetch;
+const originalReportDelivery = { ...cleanupReportDelivery };
+afterEach(() => { globalThis.fetch = originalGraphqlFetch; Object.assign(cleanupReportDelivery, originalReportDelivery); });
+const missingGraphqlComment = () => ({ data: null, errors: [{ message: "Entity not found: Comment", path: ["comment"], locations: [{ line: 1, column: 46 }], extensions: { type: "invalid input", code: "INPUT_ERROR", statusCode: 400, userError: true, userPresentableMessage: "Could not find referenced Comment." } }] });
+
+async function graphqlReportingFixture() {
+  const f = await completedFixture(); await f.close();
+  const frozen = await db.prisma.runtimeIssueUpdate.findFirstOrThrow();
+  const originalTask = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  const originalSession = await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } });
+  const originalEvents = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const requests: { query: string; variables: any }[] = [];
+  const state: { comment: any; fault?: string; lostResponse?: boolean } = { comment: null };
+  globalThis.fetch = (async (_url, init) => {
+    const request = JSON.parse(String(init?.body)); requests.push(request);
+    if (request.query.includes("QuestionComment")) {
+      expect(request.variables).toEqual({ commentId: frozen.id });
+      if (state.fault === "network") throw new Error("Read network failed");
+      if (state.fault === "auth") return Response.json(missingGraphqlComment(), { status: 401 });
+      if (state.fault === "permission") { const payload = missingGraphqlComment(); payload.errors[0]!.extensions.code = "FORBIDDEN"; return Response.json(payload); }
+      if (state.fault === "partial") return Response.json({ ...missingGraphqlComment(), data: { comment: null } });
+      return Response.json(state.comment ? { data: { comment: state.comment } } : missingGraphqlComment());
+    }
+    if (request.query.includes("CreateThreadedIssueComment")) {
+      const data = request.variables.input;
+      expect(data).toEqual({ id: frozen.id, issueId: frozen.issueId, body: (frozen.input as { body: string }).body });
+      state.comment = { id: data.id, issue: { id: data.issueId }, parentId: null, body: data.body };
+      if (state.lostResponse) { state.lostResponse = false; state.fault = "network"; throw new Error("Create response lost"); }
+      return Response.json({ data: { commentCreate: { success: true, comment: { id: data.id } } } });
+    }
+    throw new Error("Unexpected GraphQL operation");
+  }) as typeof fetch;
+  cleanupReportDelivery.read = async () => f.issue;
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes);
+  const report = () => app.request(`/api/tasks/${f.task.id}/cleanup-report`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
+  const unchanged = async () => {
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(originalTask);
+    expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).toEqual(originalSession);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(originalEvents);
+    const current = await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: frozen.id } });
+    expect(current.input).toEqual(frozen.input); expect(current.runtimeSessionId).toBe(frozen.runtimeSessionId); expect(current.issueId).toBe(frozen.issueId);
+  };
+  return { ...f, frozen, state, requests, report, unchanged };
+}
+
+test("real GraphQL missing-comment lookup publishes the saved closed-task report once", async () => {
+  const f = await graphqlReportingFixture();
+  const response = await f.report(); expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ published: true, reportId: f.frozen.id });
+  await f.unchanged();
+  expect(f.requests.filter(request => request.query.includes("CreateThreadedIssueComment"))).toHaveLength(1);
+  const count = f.requests.length;
+  expect((await f.report()).status).toBe(200); expect(f.requests).toHaveLength(count);
+  expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: f.frozen.id } })).published).toBe(true);
+});
+
+test("real GraphQL lost create response reconciles the original report after restart without another create", async () => {
+  const f = await graphqlReportingFixture(); f.state.lostResponse = true;
+  expect((await f.report()).status).toBe(409);
+  expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: f.frozen.id } })).published).toBe(false);
+  await f.unchanged(); await db.prisma.$disconnect(); delete f.state.fault;
+  expect((await f.report()).status).toBe(200);
+  expect(f.requests.filter(request => request.query.includes("CreateThreadedIssueComment"))).toHaveLength(1);
+  await f.unchanged();
+});
+
+test("uncertain GraphQL and mismatched report identities preserve closure and never publish a replacement", async () => {
+  const f = await graphqlReportingFixture();
+  for (const fault of ["network", "auth", "permission", "partial"]) {
+    f.state.fault = fault;
+    expect((await f.report()).status).toBe(409);
+    await f.unchanged();
+  }
+  delete f.state.fault;
+  for (const change of ["issue", "body", "parent", "id"]) {
+    f.state.comment = { id: f.frozen.id, body: (f.frozen.input as { body: string }).body, parentId: null, issue: { id: f.frozen.issueId } };
+    if (change === "issue") f.state.comment.issue.id = "foreign-issue";
+    if (change === "body") f.state.comment.body = "different owner content";
+    if (change === "parent") f.state.comment.parentId = "foreign-thread";
+    if (change === "id") f.state.comment.id = "foreign-comment";
+    expect((await f.report()).status).toBe(409);
+    await f.unchanged();
+  }
+  expect(f.requests.filter(request => request.query.includes("CreateThreadedIssueComment"))).toHaveLength(0);
+  expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: f.frozen.id } })).published).toBe(false);
+});

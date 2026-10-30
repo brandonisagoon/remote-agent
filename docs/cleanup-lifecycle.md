@@ -44,6 +44,16 @@ preparation, comment UUID and body. They reconcile a lost response without
 repeating cleanup. Pending publication never becomes a claim that publication
 succeeded, and a pause/revocation still prevents a new reporting effect.
 
+Linear can return HTTP 200 with a structured `Entity not found: Comment` error
+when the saved report UUID has not been published. The shared identity lookup
+treats only that exact single-error, null-data response as absence. Authentication,
+permission, network, malformed and partial-data failures remain errors. Reporting
+then uses the original UUID and body; reconciliation requires the exact issue,
+body and top-level comment identity. It never reopens a closed task or repeats
+cleanup. Disposable GraphQL and control-route tests cover first publication,
+lost create responses, restart retry and mismatched identities. The original
+DRA-8 lookup was inspected read-only; this change does not claim live publication.
+
 The shared destroy CLI and dependency-aware adapter scheduling use this same
 operation. A merely Done task is not accepted delivery authority. Older external
 deliveries require their authenticated adoption and independently observed exact

@@ -14,6 +14,17 @@ interface LinearGraphqlResponse<T> {
 
 export class LinearApiError extends Error {}
 
+/** Keep structured failures for narrowly scoped read reconciliation. Private
+ * storage avoids adding provider payloads to ordinary Error logging/JSON. */
+export class LinearGraphqlResponseError extends LinearApiError {
+  #response: { errors: LinearGraphqlError[]; data: unknown };
+  constructor(errors: LinearGraphqlError[], data: unknown) {
+    super(errors.map(error => error.message).join("; "));
+    this.#response = { errors, data };
+  }
+  get response() { return this.#response; }
+}
+
 /** Personal keys use a raw Authorization header; apps use renewable bearer
  * tokens. Only an explicit HTTP 401 permits one retry, never an ambiguous
  * mutation failure or a network timeout. */
@@ -49,7 +60,7 @@ export async function linearGraphql<T>(
 
   const payload = (await response.json()) as LinearGraphqlResponse<T>;
   if (payload.errors?.length) {
-    throw new LinearApiError(payload.errors.map((e) => e.message).join("; "));
+    throw new LinearGraphqlResponseError(payload.errors, payload.data);
   }
   if (!payload.data) throw new LinearApiError("Linear returned no data");
 
