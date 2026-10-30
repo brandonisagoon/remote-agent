@@ -1,3 +1,5 @@
+import { realpath } from "node:fs/promises";
+
 const fetching = new Map<string, Promise<string>>();
 
 async function git(root: string, args: string[]): Promise<string> {
@@ -18,6 +20,11 @@ async function fetchRemoteBase(root: string, remote: string, branch: string): Pr
   await git(root, ["check-ref-format", source]);
   await git(root, ["fetch", "--no-tags", "--no-recurse-submodules", "--", remote, `+${source}:${target}`]);
   return git(root, ["rev-parse", "--verify", "--end-of-options", `${target}^{commit}`]);
+}
+
+/** Linked checkouts and path aliases share the same Git registration directory. */
+export async function resolveWorktreeCommonDirectory(root: string): Promise<string> {
+  return realpath(await git(root, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
 }
 
 /** Remote branch bases must be fetched before a new launch pins its commit.
