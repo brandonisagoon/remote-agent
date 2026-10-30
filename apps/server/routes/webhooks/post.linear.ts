@@ -3,6 +3,7 @@ import type { Context } from "hono";
 import { routeLinearDelivery } from "../../services/tasks/routing.ts";
 import { completeLinearRouting } from "../../integrations/linear/webhooks/routing.ts";
 import { readDeliveryComment } from "../../integrations/linear/comment-context.ts";
+import { nativeReportRoutingActor } from "../../integrations/linear/native-report-ingress.ts";
 
 import { MAX_REQUEST_BYTES } from "../../../../lib/config.ts";
 import {
@@ -93,6 +94,7 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
         : {};
     let repository;
     try {
+      const nativeActor = await nativeReportRoutingActor(prisma, config.machine, webhookConfig.connectionId, record);
       const attributes = await completeLinearRouting(config, webhookConfig, {
         "linear.organizationId": record.organizationId,
         "linear.teamId": data.teamId ?? issueRoutingData.teamId ?? team.id,
@@ -102,7 +104,7 @@ async function receiveLinear(c: Context<AppEnv>, forwarded: boolean) {
         // belong to their author, never the issue's assignee or creator.
         "linear.userId": record.type === "Issue"
           ? record.actor?.id
-          : data.userId ?? data.user?.id,
+          : nativeActor ?? data.userId ?? data.user?.id,
       }, record.type === "Issue" ? data.id : data.issueId ?? issueRoutingData.id,
       record.type === "Comment" ? data.id : data.commentId ?? data.comment?.id);
       repository = routeWebhookRepository(config, webhookId, attributes);
