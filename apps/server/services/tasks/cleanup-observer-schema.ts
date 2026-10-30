@@ -32,13 +32,15 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
   z.strictObject({ ...Common, kind: z.literal("local-ingress-route"), scope: z.strictObject({ ...Scope, configFile: Absolute, tunnelId: Nonempty }), hostname: Nonempty, sourceDigest: Hash, routeDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("native-family"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), proof: z.strictObject({ file: Absolute, sha256: Hash }), planDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-endpoint"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), url: z.url(), nativeProofDigest: Hash }),
+  z.strictObject({ ...Common, kind: z.literal("browser-session"), scope: z.strictObject({ ...Scope, namespace: z.literal("drafted") }),
+    profile: z.strictObject({ path: Absolute, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), ownerFile: Absolute, ownerSha256: Hash }) }),
 ]);
 export type CleanupTarget = z.infer<typeof CleanupTarget>;
 export function cleanupTargetDigest(target: Omit<CleanupTarget, "identityDigest"> | CleanupTarget) {
   const { identityDigest: _, ...identity } = target as CleanupTarget;
   return cleanupDigest(identity);
 }
-export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint"]);
+export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser"]);
 export const CleanupObserverResource = z.strictObject({ id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.string().min(1), externalId: z.string().min(1), state: z.string(), expiresAt: z.string().nullable(), metadata: z.json().nullable() });
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])) : value;
 export const cleanupDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
