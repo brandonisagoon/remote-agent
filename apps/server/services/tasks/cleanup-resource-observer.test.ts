@@ -55,17 +55,26 @@ test.each(["revision", "digest", "code", "manifest", "source", "permissions"])("
   if (changed === "manifest") { await writeFile(path.join(f.root, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { cleanup: { adapter: "other.ts" } } })); git(f.root, "add", "."); git(f.root, "commit", "--quiet", "-m", "Changed manifest"); f.capability.revision = git(f.root, "rev-parse", "HEAD"); }
   if (changed === "source") await writeFile(path.join(f.root, "cleanup.md"), "Changed tracked dependency");
   if (changed === "permissions") await chmod(f.adapter, 0o666);
-  await expect(runCleanupResourceObserver({ capability: f.capability, request: { pidFile } })).rejects.toThrow();
+  await expect(runCleanupResourceObserver({ capability: f.capability, request: { pidFile } })).rejects.toThrow("[OBSERVER_CAPABILITY]");
   expect(await Bun.file(pidFile).exists()).toBeFalse();
 });
 
-test.each(["stderr", "oversize", "invalid"])("observer %s fails without exposing provider output", async mode => {
+test.each([["stderr", "OBSERVER_EXIT"], ["oversize", "OBSERVER_OUTPUT_LIMIT"], ["invalid", "OBSERVER_JSON"]])("observer %s fails without exposing provider output", async (mode, code) => {
   const f = await fixture();
   try { await runCleanupResourceObserver({ capability: f.capability, request: { mode } }); throw new Error("Unexpected observer success"); }
   catch (error) {
     expect(String(error)).toContain("resource absence is unverified");
+    expect(String(error)).toContain(`[${code}]`);
     expect(String(error)).not.toContain("private-");
   }
+});
+
+test("invalid request size, serialization or deadline fails before any observer starts", async () => {
+  const f = await fixture(), circular: Record<string, unknown> = {}; circular.self = circular;
+  for (const input of [{ request: { private: "x".repeat(2 * 1024 * 1024) } }, { request: circular }, { request: undefined }, { request: {}, timeoutMs: 60_001 }, { request: {}, timeoutMs: 0 }]) {
+    await expect(runCleanupResourceObserver({ capability: f.capability, ...input })).rejects.toThrow("[OBSERVER_INPUT]");
+  }
+  expect(await verifyCleanupObserver(f.capability)).toEqual(f.capability);
 });
 
 test("a timed-out observer is killed and reaped, and the same committed observer remains usable", async () => {
@@ -90,4 +99,12 @@ test.each(["descendant-exits", "descendant-hangs"])("an observer %s cannot retai
   expect(() => process.kill(pid, 0)).toThrow();
   expect(() => process.kill(descendantPid, 0)).toThrow();
   expect(elapsed).toBeLessThan(1800);
+});
+
+test("observer timeout identifies the failed boundary while preserving process absence", async () => {
+  const f = await fixture(), outside = await realpath(await mkdtemp(path.join(tmpdir(), "observer-diagnostic-"))); roots.push(outside);
+  const pidFile = path.join(outside, "pid");
+  await expect(runCleanupResourceObserver({ capability: f.capability, request: { mode: "hang", pidFile }, timeoutMs: 250 })).rejects.toThrow("[OBSERVER_TIMEOUT]");
+  const pid = Number(await Bun.file(pidFile).text());
+  expect(() => process.kill(pid, 0)).toThrow();
 });

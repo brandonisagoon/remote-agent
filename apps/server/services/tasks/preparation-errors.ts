@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
 
 // These are diagnostic classifications, never authority or automatic repairs.
 // Only fixed reviewed text is retained: even a bounded arbitrary Error.message
 // may contain a credential, private URL, provider body or agent transcript.
 const reasons = {
+  ...cleanupObserverReasons,
   PR_NOT_FOUND: "No pull request was found for the configured repository and task branch or recorded PR number. Check that recorded delivery correspondence.",
   PR_LOOKUP_FAILED: "The GitHub pull request lookup failed. Check access and the configured repository, task branch or recorded PR number.",
   REPOSITORY_MISMATCH: "The configured delivery repository does not match the worktree Git remote.",
@@ -75,6 +77,7 @@ const messages = new Map<string, Code>([
 ]);
 
 export function preparationFailure(error: unknown): PreparationFailure {
+  if (error instanceof CleanupObserverError) return error.diagnostic;
   if (error instanceof PreparationDiagnosticError) return known(error.diagnosticCode);
   if (!(error instanceof Error)) return known("UNCLASSIFIED_FAILURE");
   const code = Object.getOwnPropertyDescriptor(error, "code")?.value;

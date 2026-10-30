@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { RemoteTask } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
+import { CleanupObserverError, observerFailureEnvelope, type CleanupObserverCode } from "./cleanup-observer-diagnostics.ts";
 
 const Absolute = z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && path.normalize(value) === value);
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
@@ -13,7 +14,7 @@ export const CleanupObserverCapability = z.object({ version: z.literal(1), sourc
 export type CleanupObserverCapability = z.infer<typeof CleanupObserverCapability>;
 const hash = (value: Uint8Array) => createHash("sha256").update(value).digest("hex");
 const inside = (root: string, file: string) => file !== root && file.startsWith(`${root}${path.sep}`);
-const failure = () => new Error("The pinned cleanup resource observer failed; resource absence is unverified");
+const failure = (code: CleanupObserverCode = "OBSERVER_CAPABILITY") => new CleanupObserverError(code);
 
 function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
   const reader = stream.getReader();
@@ -22,7 +23,7 @@ function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
     try {
       while (true) {
         const next = await reader.read(); if (next.done) break;
-        length += next.value.byteLength; if (length > limit) throw failure();
+        length += next.value.byteLength; if (length > limit) throw failure("OBSERVER_OUTPUT_LIMIT");
         chunks.push(next.value);
       }
       return Buffer.concat(chunks, length).toString("utf8");
@@ -37,15 +38,15 @@ async function waitForOwnedGroupExit(group: number) {
     // The helper has already killed its group. This is observation only:
     // never signal a numeric group after its leader could have been reaped.
     const current = Bun.spawnSync(["/bin/ps", "-axo", "pgid="], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 250, maxBuffer: 1024 * 1024 });
-    if (current.exitCode !== 0 || current.stderr.length || current.stdout.length > 1024 * 1024) throw failure();
+    if (current.exitCode !== 0 || current.stderr.length || current.stdout.length > 1024 * 1024) throw failure("OBSERVER_GROUP");
     if (!current.stdout.toString().split("\n").some(line => Number(line.trim()) === group)) return;
-    if (Date.now() >= deadline) throw failure();
+    if (Date.now() >= deadline) throw failure("OBSERVER_GROUP");
     await Bun.sleep(10);
   }
 }
 
-async function execute(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string> }) {
-  if (!["darwin", "linux"].includes(process.platform)) throw failure();
+async function execute(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string>; failureRequest?: unknown }) {
+  if (!["darwin", "linux"].includes(process.platform)) throw failure("OBSERVER_TRANSPORT");
   let complete: { code: number } | undefined;
   // A dedicated session leader outlives the command and its inherited pipes.
   // Only that helper signals its own group; no saved PID/group is rediscovered.
@@ -64,7 +65,7 @@ async function execute(args: string[], options: { cwd: string; input?: string; t
   };
   let rejectDeadline!: (reason: Error) => void;
   const deadline = new Promise<never>((_, reject) => { rejectDeadline = reject; });
-  const timer = setTimeout(() => { timedOut = true; cancel(); rejectDeadline(failure()); }, options.timeoutMs);
+  const timer = setTimeout(() => { timedOut = true; cancel(); rejectDeadline(failure("OBSERVER_TIMEOUT")); }, options.timeoutMs);
   // Start readers before writing stdin. Cancellation does not wait for EOF
   // from a provider child and never returns a successful partial response.
   const output = Promise.all([stdout.result, stderr.result, child.exited]);
@@ -75,17 +76,22 @@ async function execute(args: string[], options: { cwd: string; input?: string; t
       return await output;
     })();
     const [out, err] = await Promise.race([operation, deadline]);
-    if (timedOut || !complete || complete.code !== 0 || err.trim()) throw failure();
+    if (timedOut) throw failure("OBSERVER_TIMEOUT");
+    if (!complete) throw failure("OBSERVER_TRANSPORT");
+    if (complete.code !== 0) throw observerFailureEnvelope(err, options.failureRequest) ?? failure("OBSERVER_EXIT");
+    // Even a valid failure envelope on a successful exit is unexpected stderr,
+    // never a successful response or a resource-scoped diagnostic.
+    if (err.trim()) throw failure("OBSERVER_STDERR");
     return out;
-  } catch { throw failure(); }
+  } catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }
   finally {
     cancel();
     try {
       await child.exited.catch(() => {});
       await output.catch(() => {});
-      await waitForOwnedGroupExit(child.pid);
+      try { await waitForOwnedGroupExit(child.pid); } catch { throw failure("OBSERVER_GROUP"); }
     } finally { clearTimeout(timer); }
-    if (timedOut) throw failure();
+    if (timedOut) throw failure("OBSERVER_TIMEOUT");
   }
 }
 
@@ -115,15 +121,17 @@ export async function verifyCleanupObserver(capability: CleanupObserverCapabilit
 }
 
 export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig }, resolve = resolveToolingCompatibility) {
-  if (!input.task.worktreePath) throw failure();
-  const selected = await resolve({ task: input.task, repository: getRepositoryConfig(input.config, input.task.repositoryId), installRoot: input.config.installRoot,
-    capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}) });
-  const receipt = selected.receipt;
-  if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision) throw failure();
-  const value = CleanupObserverCapability.parse({ version: 1, source: receipt.source, checkout: receipt.checkout, revision: receipt.capabilityRevision,
-    adapter: receipt.adapter, adapterSha256: hash(await readFile(receipt.adapter)) });
-  if (value.checkout === input.task.worktreePath || inside(input.task.worktreePath, value.checkout)) throw failure();
-  return verifyCleanupObserver(value);
+  try {
+    if (!input.task.worktreePath) throw failure();
+    const selected = await resolve({ task: input.task, repository: getRepositoryConfig(input.config, input.task.repositoryId), installRoot: input.config.installRoot,
+      capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}) });
+    const receipt = selected.receipt;
+    if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision) throw failure();
+    const value = CleanupObserverCapability.parse({ version: 1, source: receipt.source, checkout: receipt.checkout, revision: receipt.capabilityRevision,
+      adapter: receipt.adapter, adapterSha256: hash(await readFile(receipt.adapter)) });
+    if (value.checkout === input.task.worktreePath || inside(input.task.worktreePath, value.checkout)) throw failure();
+    return await verifyCleanupObserver(value);
+  } catch { throw failure(); }
 }
 
 /** Private stdin and bounded JSON output only. The CLI action must use the
@@ -131,15 +139,21 @@ export async function resolveCleanupObserver(input: { task: RemoteTask; config: 
  * is inherited, and calling ordinary reconciliation is not this protocol. */
 export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number }) {
   const timeoutMs = input.timeoutMs ?? 60_000;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure();
-  const bytes = JSON.stringify(input.request);
-  if (Buffer.byteLength(bytes) > 2 * 1024 * 1024) throw failure();
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure("OBSERVER_INPUT");
+  let bytes: string, request: unknown;
+  try {
+    bytes = JSON.stringify(input.request);
+    if (Buffer.byteLength(bytes) > 2 * 1024 * 1024) throw failure("OBSERVER_INPUT");
+    request = JSON.parse(bytes);
+  } catch { throw failure("OBSERVER_INPUT"); }
   const capability = await verifyCleanupObserver(input.capability);
   const env: Record<string, string> = {};
   for (const name of ["PATH", "HOME", "TMPDIR", "USER", "CLOUDFLARE_API_TOKEN", "DRAFTED_CLOUDFLARE_CREDENTIALS"]) if (process.env[name] !== undefined) env[name] = process.env[name]!;
-  const output = await execute([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env });
+  let output: string;
+  try { output = await execute([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
+  catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }
   // Revalidate the code identity after the child finishes. An interrupted or
   // changed observer can never leave a successful physical-proof response.
   await verifyCleanupObserver(capability);
-  try { return JSON.parse(output) as unknown; } catch { throw failure(); }
+  try { return JSON.parse(output) as unknown; } catch { throw failure("OBSERVER_JSON"); }
 }

@@ -2,7 +2,7 @@ import { acquireRuntimeOwnership } from "../sessions/runtime-owner.ts";
 import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { Hono } from "hono";
@@ -18,6 +18,8 @@ import { taskRoutes } from "../../routes/tasks/index.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
 import { PreparationDiagnosticError } from "./preparation-errors.ts";
+import { cleanupObserverFixture, existingCleanupObserverFixture } from "../../../../test-support/cleanup-observer.ts";
+import { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 let db: TestDatabase, directory: string;
 let worker: ReturnType<typeof preparationJournalWorker> | undefined;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); });
@@ -71,6 +73,64 @@ function controls(f: Awaited<ReturnType<typeof fixture>>) {
   const post = (preparation?: ReturnType<typeof attempt>) => app.request(`/api/tasks/${f.task.id}/prepare-finalization`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: input.requestKey, cleanup: true, ...(preparation ? { preparation } : {}) }) });
   return { input, runtime, app, post };
 }
+
+test("async preparation persists and replays the safe real-process observer failure without authority", async () => {
+  const f = await fixture(), c = controls(f), attemptInput = attempt();
+  const resource = { id: "container", key: "saved-container", kind: "docker-container", purpose: "development", externalId: "c".repeat(64), state: "ready", expiresAt: null, metadata: { original: "private-record" } };
+  await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: f.task.id } });
+  const original = await db.prisma.remoteTaskResource.findMany();
+  const capability = await cleanupObserverFixture(directory, `const input=JSON.parse(await Bun.stdin.text()); const r=input.resource; console.error(JSON.stringify({version:1,type:"cleanup-observer-failure",stage:"resource",code:"provider-forbidden",resource:{id:r.id,key:r.key,kind:r.kind,adapter:"docker"}})); process.exit(1);`);
+  const request = { version: 1, task: { id: f.task.id, primarySessionId: f.session.id, worktreePath: f.worktree, toolingRevision: f.task.toolingRevision }, resources: [resource], resource, stage: "prepare" };
+  expect((await c.post(attemptInput)).status).toBe(202);
+  worker = preparationJournalWorker(c.input, () => preparationStage("resource-plan", async () => { await runCleanupResourceObserver({ capability, request }); throw new Error("Failed observer must never return"); }));
+  worker.tick(); await worker.idle();
+  const progress = await (await c.post(attemptInput)).json();
+  expect(progress.preparation).toMatchObject({ state: "failed", stage: "resource-plan" });
+  expect(progress.preparation.error).toContain("[OBSERVER_PROVIDER_FORBIDDEN]");
+  expect(progress.preparation.error).toContain("saved-container (docker-container/docker)");
+  expect(progress.receipt).toBeUndefined();
+  const events = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" }, orderBy: { sequence: "asc" } });
+  const failed = JSON.parse(events.at(-1)!.value!);
+  expect(failed.diagnostic.code).toBe("OBSERVER_PROVIDER_FORBIDDEN");
+  expect(failed.error).toBe(progress.preparation.error);
+  expect(JSON.stringify(events)).not.toMatch(/private-record|observer\/adapter/);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-prepared", "finalization-confirmed", "finalization-cleanup-started"] } } })).toBe(0);
+  expect(await db.prisma.remoteTaskResource.findMany()).toEqual(original);
+  await worker.stop();
+  worker = preparationJournalWorker(c.input, async () => { throw new Error("Failed attempt cannot rerun after restart"); });
+  worker.tick(); await worker.idle();
+  expect((await (await c.post(attemptInput)).json()).preparation).toMatchObject({ acceptedRevision: progress.preparation.acceptedRevision, state: "failed", stage: "resource-plan", error: progress.preparation.error });
+});
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual pinned Drafted third-resource failure crosses the subprocess and async journal without partial proof", async () => {
+  const f = await fixture(), c = controls(f), capability = await existingCleanupObserverFixture(process.env.DRAFTED_INTEGRATION_ROOT!);
+  const selected = ["first", "second", "development-tunnel"].map((key, index) => ({ id: `resource-${index}`, key, kind: index === 2 ? "cloudflare-tunnel" : "docker-container", purpose: "development", state: "ready", expiresAt: null,
+    externalId: index === 2 ? "original-tunnel" : String(index + 1).repeat(64), metadata: index === 2 ? { tunnelId: "11111111-2222-3333-4444-555555555555", configPath: "/private/not-read.yml" } : {} }));
+  for (const resource of selected) await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: f.task.id } });
+  const before = await db.prisma.remoteTaskResource.findMany();
+  const bin = path.join(directory, "bin"), log = path.join(directory, "docker-calls.jsonl"); await mkdir(bin);
+  // Real CLI/transport with a disposable command boundary. Nothing can invoke
+  // host Docker or a provider: only the two exact read-only list calls exist.
+  await writeFile(path.join(bin, "docker"), `#!${process.execPath}\nimport {appendFileSync} from "node:fs"; const args=process.argv.slice(2); appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+"\\n"); if(JSON.stringify(args)!==JSON.stringify(["container","ls","-aq","--no-trunc"])) process.exit(9);`, { mode: 0o700 });
+  const request = { version: 1, task: { id: f.task.id, primarySessionId: f.session.id, worktreePath: f.worktree, toolingRevision: f.task.toolingRevision }, resources: selected, stage: "prepare", observations: selected.map(resource => ({ resourceId: resource.id })) };
+  const oldPath = process.env.PATH; process.env.PATH = `${bin}:${oldPath ?? ""}`;
+  try {
+    await expect(runCleanupResourceObserver({ capability, request })).rejects.toThrow("[OBSERVER_PREVIEW_BINDING_MISSING]");
+    expect((await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line))).toEqual(Array(2).fill(["container", "ls", "-aq", "--no-trunc"]));
+    const pending = attempt(); expect((await c.post(pending)).status).toBe(202);
+    worker = preparationJournalWorker(c.input, () => preparationStage("resource-plan", async () => { await runCleanupResourceObserver({ capability, request }); throw new Error("No partial observer success allowed"); }));
+    worker.tick(); await worker.idle();
+    const result = await (await c.post(pending)).json();
+    expect(result.preparation).toMatchObject({ state: "failed", stage: "resource-plan" });
+    expect(result.preparation.error).toContain("[OBSERVER_PREVIEW_BINDING_MISSING]");
+    expect(result.preparation.error).toContain("development-tunnel (cloudflare-tunnel/preview)");
+    expect(result.preparation.error).not.toMatch(/private.invalid|not-read|11111111/);
+    expect(result.receipt).toBeUndefined();
+    expect((await readFile(log, "utf8")).trim().split("\n")).toHaveLength(4);
+    expect(await db.prisma.remoteTaskResource.findMany()).toEqual(before);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-prepared", "finalization-confirmed", "finalization-cleanup-started"] } } })).toBe(0);
+  } finally { if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath; }
+});
 
 test.each([false, true])("failed journal and progress preserve the exact safe nested diagnostic (nested=%s) without authority", async nested => {
   const f = await fixture(), c = controls(f), input = c.input, request = attempt();
