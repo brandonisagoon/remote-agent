@@ -89,7 +89,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual client retries captur
   const plans = originalWorkRetainedPlans(proof, f.resources);
   expect(() => assertResourcePlan({ resources: f.resources }, plans)).not.toThrow();
   const authority = () => assertOriginalWork({ taskId: "task", originalWork: proof, resources: f.resources, removed: false }, idle);
-  const input = { taskId: "task", worktree: f.worktree, revision: proof.snapshot.head, branch: proof.snapshot.branch, gitDirectory: proof.restore.gitDirectory, gitCwd: f.product, target: proof.target, assertAuthority: authority, observation: idle };
+  const input = { taskId: "task", worktree: f.worktree, revision: proof.snapshot.head, branch: proof.snapshot.branch, gitDirectory: proof.restore.gitDirectory, gitCwd: f.product, target: proof.target, administration: proof.administration, assertAuthority: authority, observation: idle };
   await expect(retireArchivedWorktree({ ...input, captureHooks: { afterCapture: async () => { throw new Error("response lost after capture"); } } })).rejects.toThrow("response lost");
   const captured = await lstat(proof.target.quarantine.path);
   await retireArchivedWorktree(input);
