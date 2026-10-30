@@ -252,13 +252,11 @@ recovery mode. Do not ask the human to repeat a standing authorization, manufact
 a receipt, or use generic cancellation/acknowledgment to bypass a held queue. Stop
 if the report has already started or its identity no longer matches.
 
-This compatibility path repairs an already-queued report. It does not yet close
-the race between an arbitrary connector posting a new comment and registering
-its origin after the provider response: a fast webhook may already start it.
-DRA-164's remaining proactive publisher work must persist trustworthy publication
-identity before ingress, using the existing durable publisher/outbox rather than
-another messaging system. DRA-164 is not complete until that path and live
-acceptance pass.
+This compatibility path repairs an already-queued report. Posting through an
+arbitrary connector and registering its origin after the response still has a
+race: a fast webhook may already start it. Use the native report publisher below
+for future informational reports. DRA-164 still requires deployment and live
+acceptance; local verification does not establish those results.
 
 Disposable verification covers the original blocked-cleanup ordering, unchanged
 original acceptance/marker bytes, unrelated-owner progress, real human edits,
@@ -291,3 +289,46 @@ A changed body under the same edit fact is refused. Historical resolutions that
 lack this observation retain their original exact update-timestamp contract and
 are not rewritten or silently upgraded. This change adds no wire request field,
 new approval, provider mutation or execution authority.
+
+## Publishing native reports before ingress
+
+An authorized native coordinator should use the existing server publisher for
+informational reports about an original task. It should perform these steps
+automatically as part of reporting, using the configured owner request transport;
+no additional human consent or manual provenance registration is required:
+
+1. Owner-authenticated `GET /api/tasks/:taskId/native-reports` returns the exact
+   current original owner digest and publication instructions.
+2. `POST` to the same path with `{ requestKey, body, ownershipDigest, owner:
+   { kind: "native-codex-chat", threadId, hostId, turnId } }`. Keep a stable key for
+   this report. The body is informational; the endpoint has no state, evidence
+   upload, source instruction, or task completion option.
+3. Save the returned comment ID with the native turn's receipt. On an uncertain
+   result, retry the exact request. Do not also call a separate comment connector
+   or create another request key for the same report.
+
+This reserves the existing `RuntimeIssueUpdate` UUID and an immutable native
+origin in one transaction, then calls the existing issue-update publisher. The
+same UUID is the provider comment ID. Current task, original primary, source,
+tooling pin, pause and request lifetime are checked around provider observations
+and immediately before publication. Session IPC alone cannot use this endpoint;
+it always requires the configured owner credential. Native thread/turn identifiers
+describe the caller's attested origin, not a fabricated ACP execution.
+The generic managed issue-update route cannot replay a reserved native outbox;
+the publisher requires the native wrapper's internal receipt-bound authority.
+
+An exact signed create webhook for that reserved UUID/body is informational even
+if it arrives before publication acknowledgment. A different comment with the
+same body has no such origin. Later edits require the signed subscribed actor,
+canonical provider content and exact creation/update timestamps; the creator can
+remain the app account while a human edits it. These edits receive distinct
+generation IDs, including A→B→A, and remain normal owner input. Out-of-order
+delivery of an edit before the initial create preserves the edit. Ordinary
+comment subscription routing remains unchanged. Linear documents the signed
+event actor separately from the entity's creator in its
+[webhook payload](https://linear.app/developers/webhooks).
+
+Disposable tests deliver the real publisher's webhook before its create call
+returns, simulate response loss/restart and simultaneous retries, exercise the
+actual authenticated HTTP and signed webhook routes, and check pin/pause/source,
+origin and cancellation refusal. No live report was posted by verification.

@@ -1,4 +1,5 @@
 import { nativeReportIngress } from "../../../../services/sessions/source-message-publication.ts";
+import { observeNativeReportWebhook, assertNativeReportWebhook, type NativeReportWebhook } from "../../native-report-ingress.ts";
 import type { PrismaClient } from "../../../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../../../types/runtime/index.ts";
@@ -72,13 +73,15 @@ async function queueOwnerComment(input: {
   prisma: PrismaClient; config: ServerConfig; agentRuntime: AgentSessionRuntime;
   deliveryId: string; webhook: LinearCommentWebhook; sessionId: string;
   parentIdentifier?: string; questionId?: string; discoveredChild?: boolean;
+  nativeReport?: NativeReportWebhook;
 }): Promise<CommentWebhookResult> {
   const { prisma, config, webhook, sessionId } = input;
   const data = webhook.data;
   // A Linear retry can carry a different delivery ID. An unchanged comment
   // still has one instruction, while a genuine edit is a new owner message.
   let sourceInput: SourceMessageInput = messageSource(config, webhook);
-  const report = await nativeReportIngress(prisma, config, sourceInput);
+  const report = input.nativeReport ? null : await nativeReportIngress(prisma, config, sourceInput);
+  if (input.nativeReport) sourceInput = { ...sourceInput, authorId: input.nativeReport.authorId, revision: input.nativeReport.revision };
   if (report && !report.informational) sourceInput = { ...sourceInput, revision: report.revision };
   const requestId = sourceMessageId(sourceInput);
   const queued = await prisma.$transaction(async (tx) => {
@@ -108,6 +111,7 @@ async function queueOwnerComment(input: {
       commentId: data.id, status: "accepted", detail: `instruction:${requestId}`,
     });
     if (!receipt) return false;
+    if (input.nativeReport) await assertNativeReportWebhook(tx, input.nativeReport);
     if (report) {
       const current = await tx.runtimeSourceMessageResolution.findUnique({ where: { id: report.receiptId } });
       if (current?.fingerprint !== report.fingerprint) throw new Error("Native report provenance changed during ingress");
@@ -169,6 +173,19 @@ export async function handleCommentWebhook(input: {
     input = { ...input, webhook };
   }
   const data = webhook.data;
+  const nativeReport = await observeNativeReportWebhook(prisma, config, webhook);
+  if (nativeReport?.informational) {
+    await prisma.$transaction(async tx => {
+      await assertNativeReportWebhook(tx, nativeReport);
+      await createWebhookReceipt(tx as PrismaClient, { webhookId: config.activeWebhookId, connectionId: config.activeConnectionId, repositoryId: config.activeRepositoryId, provider: "linear", deliveryId, eventType: "comment", trigger: "native-report", resourceId: nativeReport.origin.issueIdentifier, commentId: data.id, status: "ignored", detail: "native_report_publication" });
+    });
+    return { kind: "ignored", reason: "native_report_publication" };
+  }
+  if (nativeReport) {
+    const direct = await sourcePrimary(prisma, config, nativeReport.origin.issueIdentifier);
+    if (direct.primary?.id !== nativeReport.origin.sessionId) throw new Error("Native report edit no longer has its original source owner");
+    return queueOwnerComment({ ...input, nativeReport, sessionId: direct.primary.id });
+  }
   const authorId = data.userId ?? data.user?.id ?? null;
   const selfAuthored = authorId === config.agentUserId;
   const commentWorkflows = matchWorkflows({ config, on: "comment.created", fields: {
@@ -193,7 +210,7 @@ export async function handleCommentWebhook(input: {
   if (!selfAuthored && data.issue?.identifier && isSubscribedOwner(config, authorId)) {
     const direct = await sourcePrimary(prisma, config, data.issue.identifier);
     if (direct.primary && (!registration || registration.runtimeSessionId === direct.primary.id)) {
-      return queueOwnerComment({ ...input, sessionId: direct.primary.id, ...(registration ? { questionId: threadRootCommentId } : {}) });
+      return queueOwnerComment({ ...input, ...(nativeReport ? { nativeReport } : {}), sessionId: direct.primary.id, ...(registration ? { questionId: threadRootCommentId } : {}) });
     }
     ownerRoutingFailure = direct.primary && registration ? "source_thread_owner_mismatch" : direct.reason;
   }

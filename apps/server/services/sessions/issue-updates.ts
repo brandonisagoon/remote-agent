@@ -17,6 +17,7 @@ import { assertPreparedDoneHandoff } from "../tasks/finalization.ts";
 import { linkedSourceIssue } from "./questions.ts";
 import { registerThread } from "./threads.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
+import { readNativeReportOrigin } from "./native-report-origin.ts";
 
 export const IssueUpdateInput = z.object({
   requestKey: z.string().trim().min(1).max(200), body: z.string().trim().min(1).max(30_000),
@@ -24,6 +25,9 @@ export const IssueUpdateInput = z.object({
   evidence: z.array(z.object({ path: z.string().min(1).max(4096), title: z.string().trim().min(1).max(200) }).strict()).max(8).default([]),
 }).strict().refine((value) => Boolean(value.state) === Boolean(value.expectedState), "State changes require both state and expectedState from read_source_issue");
 type Input = z.infer<typeof IssueUpdateInput>;
+// Only the owner-authenticated native wrapper supplies this in-process guard.
+// It is not part of IssueUpdateInput or a session HTTP/MCP payload.
+type NativePublication = { receiptId: string; assertAuthority: () => Promise<void> };
 
 export const issueUpdateDelivery = {
   source: linkedSourceIssue, read: getSourceIssueForUpdate, update: updateSourceIssue,
@@ -40,16 +44,16 @@ export const issueUpdateDelivery = {
 // These writes run only in the HTTP server. Serializing per source prevents two
 // simultaneous retries from racing uploads or undoing a newer status update.
 const writes = new Map<string, Promise<unknown>>();
-export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, client = issueUpdateDelivery) {
+export async function publishSessionIssueUpdate(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, client = issueUpdateDelivery, native?: NativePublication) {
   const source = await client.source(input);
   const key = `${source.link.connectionId}:${source.issue.id}`;
   const previous = writes.get(key) ?? Promise.resolve();
-  const run = previous.catch(() => undefined).then(() => publish(input, source, client));
+  const run = previous.catch(() => undefined).then(() => publish(input, source, client, native));
   writes.set(key, run);
   try { return await run; } finally { if (writes.get(key) === run) writes.delete(key); }
 }
 
-async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof issueUpdateDelivery) {
+async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof issueUpdateDelivery, native?: NativePublication) {
   const { prisma, sessionId } = input;
   const { session, link, config, issue } = source;
   await assertTaskOpen(prisma, session.cwd);
@@ -61,6 +65,12 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   const ownedPaths = task?.resources.filter((resource) => resource.kind === "evidence" && resource.state !== "released").map((resource) => resource.externalId) ?? [];
   const context = { cwd: session.cwd, ownedPaths, cacheDirectory: evidenceCacheDirectory(config.acpxStateDir, sessionId, payload.requestKey) };
   let receipt = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: payload.requestKey } } });
+  const nativeOrigin = receipt && payload.requestKey.startsWith("native-report:") ? await readNativeReportOrigin(prisma, receipt.connectionId, receipt.id) : null;
+  if (nativeOrigin && (!native || native.receiptId !== receipt!.id)) throw new Error("Native reports must use their owner-authenticated publisher");
+  if (native) {
+    if (!nativeOrigin || native.receiptId !== receipt!.id) throw new Error("Native publication authority belongs to another receipt");
+    await native.assertAuthority();
+  }
   const target = payload.state ? issue.team.states.nodes.find((state) => state.name === payload.state) : undefined;
   if (!receipt?.published && payload.state && !target) throw new Error(`State '${payload.state}' is not in the linked issue's team; read_source_issue for current states`);
   if (!receipt) {
