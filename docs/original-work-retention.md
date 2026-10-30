@@ -180,6 +180,21 @@ and other registrations stay intact. Recreated checkout or administrative paths
 remain untouched and block completion. Both captured inventories and journals
 must verify; Released state alone is not a retirement proof.
 
+Standalone `evidence`, `private-file` and scenario entrypoint receipts can use
+`retire-file`. Each plan freezes its exact owned regular file, bytes, inode and
+private sibling quarantine. It uses the existing evidence capture protocol;
+interrupted capture, replaced files and recreated originals never authorize
+unlinking bytes. A scenario digest map binds only the named registered entrypoint;
+other wrapper, receipt and preserved files are not inferred as removal targets.
+Known recorded digests and sizes must match. One bounded process/handle snapshot
+covers all selected file paths, with bytes checked again afterward.
+
+A `source-checkpoint` uses a distinct `retire-tree` variant containing its frozen
+manifest identity. All listed members must match and the complete inventory also
+retains ancillary files. Its recorded root may be owner-writable 0755, while the
+quarantine remains private 0700. This does not widen ordinary private-directory
+capture or allow arbitrary ignored folders to become disposable.
+
 Process checks enumerate bounded NUL-delimited open-handle records rather than
 recursively traversing every installed dependency. Any handle or command naming
 the checkout/capture rejects inactivity; unknown filesystem names and observation

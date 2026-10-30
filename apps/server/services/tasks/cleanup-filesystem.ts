@@ -1,18 +1,21 @@
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { z } from "zod";
 import type { CleanupObserverBatchResult } from "./cleanup-observer-schema.ts";
-import { ContainedFilePlan, RegisteredTreePlan, assertFinalizationPath, assertFinalizationTree, finalizationInventory, finalizationResourceIdentity, inspectFinalizationQuarantine,
+import { ContainedFilePlan, RegisteredTreePlan, assertFinalizationPath, assertFinalizationTree, finalizationDigest, finalizationInventory, finalizationResourceIdentity, inspectFinalizationQuarantine,
   type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
+import { observeLegacyEvidenceFile } from "./legacy-evidence-files.ts";
+import { readArchiveBytes } from "./archive-observation.ts";
 
 type Tree = Extract<FinalizationResourcePlan, { disposition: "retire-tree" }>;
 type Child = Extract<FinalizationResourcePlan, { disposition: "retire-contained" }>;
 const within = (root: string, file: string) => root === file || file.startsWith(`${root}${path.sep}`);
 const overlaps = (a: string, b: string) => within(a, b) || within(b, a);
 const missing = (file: string) => lstat(file).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
-const directories = new Set(["directory", "private-directory"]);
+const directories = new Set(["directory", "private-directory", "source-checkpoint"]);
 const files = new Set(["private-file", "evidence"]);
 export function hasRegisteredCaptureResource(resource: FinalizationResourceRecord, resources: FinalizationResourceRecord[]) {
   return directories.has(resource.kind) || files.has(resource.kind) && path.isAbsolute(resource.externalId)
@@ -59,6 +62,34 @@ export async function privateRoot(root: string) {
   }
 }
 
+async function checkpointManifest(resource: FinalizationResourceRecord, physicalRoot = resource.externalId) {
+  await assertFinalizationPath(physicalRoot);
+  const stat = await lstat(physicalRoot), parent = await lstat(path.dirname(physicalRoot));
+  if (!stat.isDirectory() || stat.uid !== process.getuid?.() || stat.mode & 0o022 || !parent.isDirectory() || parent.uid !== process.getuid?.() || parent.mode & 0o022 || stat.dev !== parent.dev) throw new Error("Checkpoint root must be exact, owned and not shared writable");
+  const metadata = resource.metadata as Record<string, unknown> | null, manifest = metadata?.manifest;
+  if (typeof manifest !== "string" || typeof metadata?.manifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(metadata.manifestSha256)) throw new Error("Checkpoint requires its recorded manifest digest");
+  const original = path.isAbsolute(manifest) ? manifest : path.join(resource.externalId, manifest);
+  if (path.normalize(original) !== original || original === resource.externalId || !within(resource.externalId, original)) throw new Error("Checkpoint manifest leaves its exact root");
+  const file = path.join(physicalRoot, path.relative(resource.externalId, original)), observed = await observeLegacyEvidenceFile(file, false, 8 * 1024 * 1024);
+  if (observed.sha256 !== metadata.manifestSha256) throw new Error("Checkpoint manifest differs from its recorded digest");
+  const content = await readArchiveBytes(file, 8 * 1024 * 1024);
+  if (createHash("sha256").update(content).digest("hex") !== observed.sha256) throw new Error("Checkpoint manifest changed while reading");
+  const members = new Map<string, string>();
+  for (const line of content.toString().split("\n").filter(Boolean)) {
+    const match = /^([a-f0-9]{64}) [ *](.+)$/.exec(line), relative = match?.[2]?.replace(/^\.\//, "");
+    if (!match || !relative || path.isAbsolute(relative) || path.normalize(relative) !== relative || relative === "." || relative.split(path.sep).includes("..") || members.has(relative) || members.size >= 10000) throw new Error("Checkpoint manifest contains an invalid or duplicate member");
+    members.set(relative, match[1]!);
+  }
+  if (!members.size) throw new Error("Checkpoint manifest is empty");
+  return { manifest: { ...observed, path: original }, members };
+}
+function assertCheckpointMembers(inventory: Tree["target"]["inventory"], members: Map<string, string>) {
+  for (const [relative, sha256] of members) {
+    const entry = inventory.find(entry => entry.path === relative);
+    if (!entry || entry.kind !== "file" || entry.sha256 !== sha256) throw new Error("Checkpoint bytes differ from their recorded manifest");
+  }
+}
+
 /** The directory receipt, existing owner path selection and full frozen tree
  * identify the capture. A common path prefix never invents a parent receipt. */
 export async function prepareRegisteredCaptures(input: { resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; ownedPaths: string[]; protectedPaths: string[] }, observation: ResourceObservation) {
@@ -75,18 +106,24 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
     const edges = captureAdapterDependencies(root, input.resources, input.plan);
     const browsers = input.plan.filter(entry => entry.disposition === "retire-browser" && entry.capture.type === "registered" && entry.capture.parentResourceId === resource.id);
     edges.stoppedConsumers.push(...browsers.map(entry => entry.id));
-    await privateRoot(root);
+    const checkpoint = resource.kind === "source-checkpoint" ? await checkpointManifest(resource) : undefined;
+    if (!checkpoint) await privateRoot(root);
+    else for (let directory = root; ; directory = path.dirname(directory)) {
+      if (await missing(path.join(directory, ".git"))) throw new Error("Checkpoint cannot replace an explicit Git worktree plan");
+      if (directory === path.dirname(directory)) break;
+    }
     await observation.rootIdle(root);
     const children = input.resources.filter(other => other.id !== resource.id && path.isAbsolute(other.externalId) && within(root, other.externalId));
     if (children.some(child => child.externalId === root || !files.has(child.kind) && !browsers.some(browser => browser.id === child.id) || child.state === "released")) throw new Error("Registered root contains a resource without an exact contained-file plan");
     const inventory = await finalizationInventory(root, [root], new Map(browsers.map(browser => [browser.externalId, browser.id])), new Map(children.filter(child => files.has(child.kind)).map(child => [child.externalId, child.id])));
     if (inventory.some(entry => entry.path.split(path.sep).includes(".git"))) throw new Error("Registered directory contains Git metadata requiring a worktree plan");
+    if (checkpoint) assertCheckpointMembers(inventory, checkpoint.members);
     for (const entry of inventory) {
       const stat = await lstat(path.join(root, entry.path));
       if (stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 && entry.kind !== "symlink") throw new Error("Registered inventory contains unowned or shared writable material");
     }
     const directory = path.join(path.dirname(root), `.drafted-finalization-${randomUUID()}`);
-    const tree = RegisteredTreePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-tree", treeKind: "registered-directory",
+    const tree = RegisteredTreePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-tree", treeKind: checkpoint ? "source-checkpoint" : "registered-directory", ...(checkpoint ? { manifest: checkpoint.manifest } : {}),
       ...edges, target: { type: "tree", path: root, inventory, sourcePaths: [root],
         quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
     result.push(tree);
@@ -102,6 +139,11 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
     }
     await assertFinalizationTree(tree.target);
     await observation.rootIdle(root);
+    if (checkpoint) {
+      const fresh = await checkpointManifest(resource);
+      if (finalizationDigest(fresh.manifest) !== finalizationDigest(checkpoint.manifest)) throw new Error("Checkpoint changed during process observation");
+      await assertFinalizationTree(tree.target);
+    }
   }
   return result;
 }
@@ -109,7 +151,7 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
 /** This query is local authority, not a filesystem observer. It also runs on
  * renewals so another task cannot acquire a recorded path inside the capture. */
 export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
-  const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree");
+  const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file");
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
   if (!scopes.length) return;
@@ -132,6 +174,11 @@ export async function assertRegisteredCaptures(input: { taskId: string; resource
     const captured = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target: tree.target });
     if ((input.removed || record.state === "released") && !captured.captured) throw new Error("Registered directory has no verified retained capture");
     await assertFinalizationTree(tree.target, captured.physicalPath);
+    if (tree.treeKind === "source-checkpoint") {
+      const checkpoint = await checkpointManifest(record, captured.physicalPath);
+      if (finalizationDigest(checkpoint.manifest) !== finalizationDigest(tree.manifest)) throw new Error("Prepared checkpoint manifest identity changed");
+      assertCheckpointMembers(tree.target.inventory, checkpoint.members);
+    } else if (tree.kind === "source-checkpoint") throw new Error("Checkpoint lacks its exact manifest plan");
     if (captured.captured) assertCapturedDependencies(tree, input.resources, input.adapterObservation);
     for (const child of children.filter(child => child.parentResourceId === tree.id)) {
       const current = input.resources.find(record => record.id === child.id)!;

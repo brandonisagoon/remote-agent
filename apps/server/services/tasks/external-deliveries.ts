@@ -150,6 +150,10 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
     for (const entry of plan) {
+      if (entry.disposition === "retire-file") {
+        for (const file of [entry.target.path, entry.target.quarantine.directory]) if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(file, archive.root)) || overlaps(file, originalWork.target.path)) throw new Error("Standalone file capture must stay outside original-work archives and capture");
+        continue;
+      }
       if (entry.disposition === "retire-browser" && entry.capture.type === "standalone") {
         const root = entry.capture.target.path;
         if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some(archive => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Browser capture must stay outside original-work archives and capture");
