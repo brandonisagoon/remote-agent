@@ -30,7 +30,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || (entry.disposition === "retain-adapter" || entry.disposition === "retain-backed" || entry.disposition === "retain-data") && record.state !== "ready" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -86,6 +86,8 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
   const { assertPreservationSources } = await import("./cleanup-preservation.ts");
   await assertPreservationSources(prisma, binding.identity.taskId, binding.identity.sessionId, binding.resources);
+  const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
+  assertSavedDataCaptureSeparation(binding.resources, binding.originalWork ? [binding.originalWork.target.path, binding.originalWork.target.quarantine.directory, ...(binding.originalWork.administration ? [binding.originalWork.administration.administrationCapture.path, binding.originalWork.administration.administrationCapture.quarantine.directory] : [])] : []);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(prisma, binding.identity.taskId, binding.resources);
   // Historical approvals must also honor a later explicit revocation. The
@@ -149,6 +151,8 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(preservation ? { preservation } : {}), ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");
+  assertSavedDataCaptureSeparation(plan, originalWork ? [originalWork.target.path, originalWork.target.quarantine.directory, ...(originalWork.administration ? [originalWork.administration.administrationCapture.path, originalWork.administration.administrationCapture.quarantine.directory] : [])] : []);
   const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
   await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   if (originalWork) {

@@ -1,3 +1,4 @@
+import { SavedDataSelections } from "./cleanup-saved-data-schema.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
@@ -34,7 +35,7 @@ export const DeliveredRetirementInput = z.object({ version: z.literal(1), mode: 
   basis: z.string().trim().min(1).max(4000), cleanupSnapshot: CleanupSnapshot,
   deliveries: z.array(ProviderDeliveryInput).min(1).max(10), mergeOrder: z.array(z.string()).min(1).max(10),
   resourceIds: z.array(z.string().min(1)).max(1000), originalWork: OriginalWorkInput.optional(),
-  ownership: z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(AbsolutePath).max(1000), preservation: PreservationInput.optional() }).strict(),
+  ownership: z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(AbsolutePath).max(1000), preservation: PreservationInput.optional(), savedData: SavedDataSelections.optional() }).strict(),
 }).strict().superRefine((value, ctx) => {
   const ids = value.deliveries.map(d => d.id);
   if (new Set(ids).size !== ids.length || new Set(value.deliveries.map(d => `${d.repository}/${d.pullRequest}`)).size !== ids.length || new Set(value.resourceIds).size !== value.resourceIds.length || new Set(value.mergeOrder).size !== ids.length || value.mergeOrder.length !== ids.length || value.mergeOrder.some(id => !ids.includes(id))) ctx.addIssue({ code: "custom", message: "Delivered scopes, merge order and exact resources must be unique and complete" });
@@ -50,7 +51,7 @@ export const ExternalDeliveryBindingInput = z.object({
   deliveries: z.array(ExternalDeliveryInput).min(1).max(10), mergeOrder: z.array(z.string()).min(1).max(10),
   resourceIds: z.array(z.string().min(1)).min(1).max(1000),
   originalWork: OriginalWorkInput.optional(),
-  ownership: z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(AbsolutePath).max(1000), preservation: PreservationInput.optional() }).strict(),
+  ownership: z.object({ sourceCopyResourceId: z.string().min(1).optional(), ownedPaths: z.array(AbsolutePath).max(1000), preservation: PreservationInput.optional(), savedData: SavedDataSelections.optional() }).strict(),
 }).strict().superRefine((value, ctx) => {
   const unique = (values: string[]) => new Set(values).size === values.length;
   if (!unique(value.deliveries.map((entry) => entry.id)) || !unique(value.deliveries.map((entry) => `${entry.repository}/${entry.pullRequest}`)) || !unique(value.deliveries.map((entry) => entry.sourcePath)) || !unique(value.resourceIds) || !unique(value.ownership.ownedPaths) || !unique(value.mergeOrder) || value.mergeOrder.length !== value.deliveries.length || value.mergeOrder.some((id) => !value.deliveries.some((entry) => entry.id === id))) ctx.addIssue({ code: "custom", message: "Delivery, resource and merge-order identities must be unique and complete" });
