@@ -6,9 +6,12 @@ import type { PrismaClient, RemoteTaskResource } from "../../../../generated/pri
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { FINALIZATION_PREPARED, PreparedFinalization } from "./finalization-receipts.ts";
 import { prepareTaskFinalization } from "./finalization.ts";
-import { finalizationDigest } from "./finalization-resources.ts";
+import { lstat } from "node:fs/promises";
+import { finalizationDigest, assertFinalizationPath, finalizationResourceObservation } from "./finalization-resources.ts";
 import { inspectLegacyEvidenceCapture, observeLegacyArchive, observeLegacyEvidenceFile, within } from "./legacy-evidence-files.ts";
 import { LEGACY_EVIDENCE_CONFIRMED, LEGACY_EVIDENCE_RETAINED, LegacyEvidenceAdoptionInput, LegacyEvidenceOperationInput, LegacyEvidenceProof, LegacyEvidenceReceipt } from "./legacy-evidence-schema.ts";
+
+import { isEvidenceTree, matchLegacyEvidenceTrees, observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
@@ -56,6 +59,16 @@ function cleanupRoots(task: Awaited<ReturnType<typeof preparation>>["task"], pre
 }
 function receipt(sequence: number, proof: LegacyEvidenceProof): LegacyEvidenceReceipt { return { proofRevision: sequence, proofDigest: finalizationDigest(proof), proof }; }
 
+async function assertUnsharedDirectory(prisma: Database, taskId: string, resourceId: string, source: string) {
+  const ancestors: string[] = [];
+  for (let cursor = source; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
+  const shared = await prisma.remoteTaskResource.findFirst({ where: { id: { not: resourceId }, OR: [
+    { externalId: source }, { externalId: { startsWith: source + path.sep } },
+    { taskId: { not: taskId }, externalId: { in: ancestors } },
+  ] } });
+  if (shared) throw new Error("Directory evidence overlaps another task or resource");
+}
+
 async function loadProof(prisma: Database, config: ServerConfig, taskId: string, revision: number) {
   const event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
   if (!event || event.action !== LEGACY_EVIDENCE_RETAINED || event.source !== `owner:${taskId}`) throw new Error("Legacy evidence has no authenticated retention proof");
@@ -67,8 +80,9 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   const retainedIds = await retainedArchiveResourceIds(prisma, config, current.prepared);
   const roots = cleanupRoots(current.task, current.prepared, resources, true, retainedIds);
   const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false, retainedIds);
-  if (roots.some((root) => within(root, proof.archiveRoot) || within(proof.archiveRoot, root)) || proof.entries.some((entry) => wholeRoots.some((root) => within(root, entry.target.path) || within(root, entry.target.quarantine.directory)))) throw new Error("Retained evidence now overlaps a task cleanup root");
+  if (roots.some((root) => within(root, proof.archiveRoot) || within(proof.archiveRoot, root)) || proof.entries.some((entry) => wholeRoots.some((root) => (!isEvidenceTree(entry) && within(root, entry.target.path)) || within(root, entry.target.quarantine.directory)))) throw new Error("Retained evidence now overlaps a task cleanup root");
   for (const entry of proof.entries) {
+    if (isEvidenceTree(entry)) { await assertUnsharedDirectory(prisma, taskId, entry.resourceId, entry.target.path); await assertUnsharedDirectory(prisma, taskId, entry.resourceId, entry.target.quarantine.directory); }
     const record = resources.find((resource) => resource.id === entry.resourceId);
     if (!record || record.taskId !== taskId || legacyEvidenceResourceDigest(record) !== entry.identityDigest) throw new Error("Legacy evidence resource receipt changed");
     if (record.state === "released") {
@@ -105,18 +119,39 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
     const resource = evidence.find((record) => record.id === request.resourceId)!;
     if (!["browser", "development", "review"].includes(resource.purpose) || resource.createdAt > current.event.occurredAt || paths.has(resource.externalId)) throw new Error("Evidence lacks original prepared provenance or has an ambiguous source path");
     paths.add(resource.externalId);
-    const recorded = recordedProof(resource), source = await observeLegacyEvidenceFile(resource.externalId);
-    if (wholeRoots.some((root) => within(root, source.path))) throw new Error("Legacy evidence capture must survive outside whole-tree cleanup roots");
-    const retained = archive.members.get(request.retainedPath);
-    if (!retained || retained.path === source.path || retained.dev === source.dev && retained.ino === source.ino || retained.size !== request.size || retained.sha256 !== request.sha256 || source.size !== retained.size || source.sha256 !== retained.sha256 || recorded.sha256 !== undefined && recorded.sha256 !== source.sha256 || recorded.size !== undefined && recorded.size !== source.size) throw new Error("Original evidence, recorded proof and retained archive do not agree");
-    const directory = path.join(path.dirname(source.path), `.drafted-evidence-${randomUUID()}`);
-    entries.push({ resourceId: resource.id, key: resource.key, kind: "evidence", purpose: resource.purpose as "browser" | "development" | "review", externalId: resource.externalId,
-      createdAt: resource.createdAt.toISOString(), identityDigest: legacyEvidenceResourceDigest(resource), recorded, digestProvenance: recorded.sha256 ? "recorded-receipt" : "observed-at-adoption",
-      target: { ...source, type: "file", quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } }, retained });
+    const recorded = recordedProof(resource);
+    const common = { resourceId: resource.id, key: resource.key, kind: "evidence" as const, purpose: resource.purpose as "browser" | "development" | "review", externalId: resource.externalId, createdAt: resource.createdAt.toISOString(), identityDigest: legacyEvidenceResourceDigest(resource), recorded };
+    if ("type" in request && request.type === "tree") {
+      if (recorded.sha256 !== undefined || recorded.size !== undefined) throw new Error("Directory evidence cannot reinterpret a historical file hash or byte count");
+      const protectedRoots = [current.prepared.worktree, current.prepared.registeredWorktree, current.prepared.gitCwd, current.prepared.gitDirectory, current.task.toolingRoot, current.task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
+      if (protectedRoots.some(root => within(root, resource.externalId) || within(resource.externalId, root)) || evidence.some(other => other.id !== resource.id && (within(other.externalId, resource.externalId) || within(resource.externalId, other.externalId)))) throw new Error("Directory evidence overlaps protected or other evidence material");
+      await assertUnsharedDirectory(input.prisma, input.taskId, resource.id, resource.externalId);
+      const source = await observeLegacyEvidenceTree(resource.externalId), retained = await observeLegacyEvidenceTree(request.retainedPath, true);
+      if (source.inventoryDigest !== request.inventoryDigest || !within(archive.archiveRoot, retained.path) || retained.path === archive.archiveRoot) throw new Error("Directory evidence inventory or retained scope changed");
+      matchLegacyEvidenceTrees(source, retained, archive.members);
+      const parentPath = path.dirname(archive.archiveRoot); await assertFinalizationPath(parentPath);
+      const parent = await lstat(parentPath);
+      if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o7777) !== 0o700 || parent.dev !== source.inventory[0]!.dev) throw new Error("Directory quarantine needs an existing private parent on the same filesystem");
+      const sourceParentPath = path.dirname(source.path); await assertFinalizationPath(sourceParentPath);
+      const sourceParent = await lstat(sourceParentPath);
+      if (!sourceParent.isDirectory() || sourceParent.uid !== process.getuid?.() || (sourceParent.mode & 0o022) !== 0) throw new Error("Directory evidence source parent is not exclusively owned");
+      const directory = path.join(parentPath, `.drafted-finalization-${randomUUID()}`);
+      await assertUnsharedDirectory(input.prisma, input.taskId, resource.id, directory);
+      if (wholeRoots.some(root => within(root, directory) || within(directory, root))) throw new Error("Directory quarantine must survive outside every cleanup root");
+      entries.push({ ...common, digestProvenance: "observed-at-adoption", target: { type: "tree", path: source.path, sourcePaths: [source.path], inventory: source.inventory, sourceParent: { path: sourceParentPath, dev: sourceParent.dev, ino: sourceParent.ino, mode: sourceParent.mode }, quarantineParent: { path: parentPath, dev: parent.dev, ino: parent.ino, mode: parent.mode }, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } }, retained });
+    } else {
+      const fileRequest = request as Extract<LegacyEvidenceAdoptionInput["entries"][number], { sha256: string }>;
+      const source = await observeLegacyEvidenceFile(resource.externalId);
+      if (wholeRoots.some((root) => within(root, source.path))) throw new Error("Legacy evidence capture must survive outside whole-tree cleanup roots");
+      const retained = archive.members.get(fileRequest.retainedPath);
+      if (!retained || retained.path === source.path || retained.dev === source.dev && retained.ino === source.ino || retained.size !== fileRequest.size || retained.sha256 !== fileRequest.sha256 || source.size !== retained.size || source.sha256 !== retained.sha256 || recorded.sha256 !== undefined && recorded.sha256 !== source.sha256 || recorded.size !== undefined && recorded.size !== source.size) throw new Error("Original evidence, recorded proof and retained archive do not agree");
+      const directory = path.join(path.dirname(source.path), `.drafted-evidence-${randomUUID()}`);
+      entries.push({ ...common, digestProvenance: recorded.sha256 ? "recorded-receipt" : "observed-at-adoption", target: { ...source, type: "file", quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } }, retained });
+    }
   }
   const proof = LegacyEvidenceProof.parse({ version: 1, input: adoption, taskId: input.taskId, sessionId: current.session.id,
     preparedRevision: current.event.sequence, preparedDigest: finalizationDigest(JSON.parse(current.event.value!)), finalizationRequestKey: adoption.finalizationRequestKey,
-    identityDigest: current.identityDigest, contractRevision: current.prepared.contractRevision, archiveRoot: archive.archiveRoot, manifest: archive.manifest, entries });
+    identityDigest: current.identityDigest, contractRevision: current.prepared.contractRevision, archiveRoot: archive.archiveRoot, manifest: archive.manifest, ...(archive.manifests ? { manifests: archive.manifests } : {}), entries });
   for (const entry of entries) await inspectLegacyEvidenceCapture(proof, entry, false);
   return input.prisma.$transaction(async (tx) => {
     const changed = await preparation(tx, input.config, input.taskId, proof.preparedRevision, proof.finalizationRequestKey);
@@ -152,6 +187,11 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
   if (operation.action !== "inspect") {
     const prepared = await dependencies.prepare({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, requestKey: proof.finalizationRequestKey });
     if (prepared.preparedRevision !== proof.preparedRevision || "version" in prepared) throw new Error("Legacy evidence finalization authority changed");
+  }
+  if (isEvidenceTree(entry) && operation.action !== "inspect") {
+    const writers = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, purpose: entry.purpose, state: { not: "released" }, kind: { in: ["native-app", "launch-agent", "launch-agents", "docker-container", "docker-compose-project", "task-runtime", "local-http"] } } });
+    if (writers.length) throw new Error("Directory evidence writers must finish verified retirement before capture");
+    await finalizationResourceObservation.rootIdle(entry.target.path);
   }
   await inspectLegacyEvidenceCapture(proof, entry, operation.action === "confirm" || Boolean(prior));
   if (operation.action !== "inspect") {
@@ -190,6 +230,13 @@ export async function assertLegacyEvidenceResourceUpdate(prisma: Database, resou
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `owner:${task.id}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
   if (!event) return;
   const proof = LegacyEvidenceProof.parse(JSON.parse(event.value!));
+  if (next.state === "released" && path.isAbsolute(resource.externalId)) for (const tree of proof.entries.filter(isEvidenceTree)) {
+    if (tree.resourceId !== resource.id && within(resource.externalId, tree.target.path)) {
+      const captured = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `legacy-evidence:${task.id}`, action: LEGACY_EVIDENCE_CONFIRMED, key: tree.resourceId } });
+      const expected = { proofRevision: event.sequence, proofDigest: finalizationDigest(proof), preparedRevision: proof.preparedRevision, resourceId: tree.resourceId, identityDigest: tree.identityDigest };
+      if (captured?.value !== JSON.stringify(expected)) throw new Error("Parent cleanup requires confirmed directory evidence capture");
+    }
+  }
   const entry = proof.entries.find((candidate) => candidate.resourceId === resource.id);
   if (!entry) return;
   if (next.state !== resource.state && (next.state === "released" || resource.state === "released") || legacyEvidenceResourceDigest({ ...resource, ...next, metadata: (next.metadata ?? resource.metadata) as RemoteTaskResource["metadata"] }) !== entry.identityDigest) throw new Error("Authenticated legacy evidence must retain its original receipt; use independently verified evidence confirmation to release it");

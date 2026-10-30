@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmod, copyFile, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, link, lstat, mkdir, open, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
@@ -11,9 +11,10 @@ import type { RemoteTaskResource } from "../../../../generated/prisma/client.ts"
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
+import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tree.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
-import { adoptLegacyEvidence, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
-import type { LegacyEvidenceReceipt, LegacyEvidenceOperationInput } from "./legacy-evidence-schema.ts";
+import { adoptLegacyEvidence, assertLegacyEvidenceResourceUpdate, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
+import { LegacyEvidenceAdoptionInput, type LegacyEvidenceReceipt, type LegacyEvidenceOperationInput } from "./legacy-evidence-schema.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "legacy-evidence-"))); });
@@ -21,7 +22,7 @@ afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: tru
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 function git(cwd: string, ...args: string[]) { const command = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (command.exitCode) throw new Error(command.stderr.toString()); return command.stdout.toString().trim(); }
 
-async function fixture() {
+async function fixture(options: { directoryEvidence?: boolean; files?: number } = {}) {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, "DRA-99"), archive = path.join(directory, "retained");
   for (const dir of [root, historical, archive]) await mkdir(dir, { mode: 0o700 });
   git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
@@ -38,11 +39,23 @@ async function fixture() {
   const observer = { ...completionObservation, remote: async () => remote };
   const dependencies = { source: async () => ({ session, link: sourceLink, config, issue }), completion: (value: Parameters<typeof assertCompletionAllowed>[0]) => assertCompletionAllowed(value, observer), snapshot: completionObservation.snapshot };
   const resources: RemoteTaskResource[] = [], files: Array<{ path: string; sha256: string; bytes: number }> = [];
-  for (const [index, body] of ["saved capture\n", "sentinel without historical proof\n"].entries()) {
+  for (const [index, body] of Array.from({ length: options.files ?? 2 }, (_, index) => index === 0 ? "saved capture\n" : index === 1 ? "sentinel without historical proof\n" : `sentinel ${index}\n`).entries()) {
     const name = `evidence-${index}.txt`, original = path.join(historical, name), retained = path.join(archive, name);
     await writeFile(original, body, { mode: 0o600 }); await copyFile(original, retained); await chmod(retained, 0o600);
     resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: `capture-${index}`, kind: "evidence", purpose: index === 0 ? "development" : "browser", externalId: original, state: "ready", metadata: index === 0 ? { sha256: sha(body), bytes: Buffer.byteLength(body), description: "original receipt" } : { description: "legacy sentinel" } } }));
     files.push({ path: name, sha256: sha(body), bytes: Buffer.byteLength(body) });
+  }
+  let treeResource: RemoteTaskResource | undefined;
+  if (options.directoryEvidence) {
+    const original = path.join(directory, "environment", "logs", "turns"), retained = path.join(archive, "turns");
+    await mkdir(original, { recursive: true, mode: 0o700 }); await mkdir(retained, { mode: 0o700 });
+    for (let index = 0; index < 29; index++) {
+      const name = `turn-${index}.ndjson`, body = `saved turn ${index}\n`;
+      await writeFile(path.join(original, name), body, { mode: 0o600 }); await writeFile(path.join(retained, name), body, { mode: 0o600 });
+      files.push({ path: `turns/${name}`, sha256: sha(body), bytes: Buffer.byteLength(body) });
+    }
+    treeResource = await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "turns", kind: "evidence", purpose: "development", externalId: original, state: "ready", metadata: { description: "original directory receipt" } } });
+    await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "environment-parent", kind: "directory", purpose: "development", externalId: path.join(directory, "environment"), state: "allocated" } });
   }
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "old-browser", kind: "browser", purpose: "browser", externalId: "already-gone", state: "released", metadata: { preserved: true } } });
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "clerk", kind: "clerk", purpose: "development", externalId: "unclaimed.example.test", state: "unknown" } });
@@ -50,20 +63,22 @@ async function fixture() {
   const prepared = await prepareTaskFinalization(finalInput, dependencies);
   const manifestPath = path.join(archive, "RETENTION.json"), manifestBytes = JSON.stringify({ task: task.id, retainedArchive: archive, files, sourceUnchanged: true });
   await writeFile(manifestPath, manifestBytes, { mode: 0o600 });
-  const adoption = { requestKey: "retain-legacy", finalizationRequestKey: prepared.requestKey, expectedPreparedRevision: prepared.preparedRevision,
+  const adoption: LegacyEvidenceAdoptionInput = { requestKey: "retain-legacy", finalizationRequestKey: prepared.requestKey, expectedPreparedRevision: prepared.preparedRevision,
     manifest: { path: manifestPath, sha256: sha(manifestBytes) }, entries: resources.map((resource, index) => ({ resourceId: resource.id, retainedPath: path.join(archive, files[index]!.path), sha256: files[index]!.sha256, size: files[index]!.bytes })) };
+  if (treeResource) { const tree = await observeLegacyEvidenceTree(treeResource.externalId); adoption.entries.push({ type: "tree", resourceId: treeResource.id, retainedPath: path.join(archive, "turns"), inventoryDigest: tree.inventoryDigest }); }
   const manageDependencies = { prepare: (input: Parameters<typeof prepareTaskFinalization>[0]) => prepareTaskFinalization(input, dependencies) };
   const app = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
   const adopt = () => adoptLegacyEvidence({ ...context, adoption });
   const manage = (receipt: LegacyEvidenceReceipt, key: string, action: LegacyEvidenceOperationInput["action"]) => manageLegacyEvidence({ ...finalInput, operation: { resourceKey: key, action, proofRevision: receipt.proofRevision, proofDigest: receipt.proofDigest, preparedRevision: prepared.preparedRevision, finalizationRequestKey: prepared.requestKey } }, manageDependencies);
-  return { config, task, session, root, worktree, historical, archive, resources, files, prepared, context, finalInput, dependencies, manageDependencies, contract, issue, app, adoption, adopt, manage };
+  return { config, task, session, root, worktree, historical, archive, resources, treeResource, files, prepared, context, finalInput, dependencies, manageDependencies, contract, issue, app, adoption, adopt, manage };
 }
 
 async function capture(receipt: LegacyEvidenceReceipt, index = 0, intentOnly = false) {
   const entry = receipt.proof.entries[index]!, target = entry.target, q = target.quarantine;
+  const source = target.type === "file" ? target : target.inventory.find(entry => entry.path === ".")!;
   await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
   await writeFile(q.journal, JSON.stringify({ version: 1, taskId: receipt.proof.taskId, resourceId: entry.resourceId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: q.path,
-    source: { dev: target.dev, ino: target.ino, mode: target.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });
+    source: { dev: source.dev, ino: source.ino, mode: source.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });
   if (!intentOnly) await rename(target.path, q.path);
 }
 
@@ -241,6 +256,7 @@ test.skipIf(!draftedRoot)("actual Drafted adapter, control socket and server con
     expect((await registry.task()).legacyEvidenceRetention).toEqual(receipt);
     await expect(manageEvidenceResource({ registry, key: "capture-0", action: "release" })).rejects.toThrow("Lost acknowledgment");
     const entry = receipt.proof.entries[0]!;
+    if (entry.target.type !== "file") throw new Error("Expected file fixture");
     const captured = await lstat(entry.target.quarantine.path);
     expect(captured.ino).toBe(entry.target.ino);
     expect((await manageEvidenceResource({ registry, key: "capture-0", action: "release" })).observed).toBe("evidence-retired-archive-retained");
@@ -249,5 +265,102 @@ test.skipIf(!draftedRoot)("actual Drafted adapter, control socket and server con
     expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
     expect(await prepareTaskFinalization(f.finalInput, f.dependencies)).toEqual(f.prepared);
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: "task", key: "clerk" } } })).state).toBe("unknown");
+  } finally { server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+});
+
+test("complete26-file plus directory adoption retains the original v1 event and captures outside parent cleanup", async () => {
+  const f = await fixture({ files: 26, directoryEvidence: true });
+  const before = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } });
+  const receipt = await f.adopt(), entry = receipt.proof.entries.find(isEvidenceTree)!;
+  expect(receipt.proof.entries.length).toBe(27);
+  expect(entry.target.inventory.length).toBe(30);
+  expect(entry.recorded).toEqual({});
+  expect("sha256" in entry.target).toBeFalse();
+  expect(path.dirname(entry.target.quarantine.directory)).toBe(directory);
+  expect(entry.target.quarantine.directory.startsWith(path.join(directory, "environment") + path.sep)).toBeFalse();
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: before.sequence } })).value).toBe(before.value);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.treeResource!.id } })).toEqual(f.treeResource!);
+  const parent = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: "environment-parent" } } });
+  await expect(assertLegacyEvidenceResourceUpdate(db.prisma, parent, { state: "released", metadata: parent.metadata, expiresAt: parent.expiresAt })).rejects.toThrow("confirmed directory");
+  await f.manage(receipt, entry.key, "authorize");
+  await capture(receipt, receipt.proof.entries.indexOf(entry), true);
+  await expect(f.manage(receipt, entry.key, "confirm")).rejects.toThrow("still present");
+  await f.manage(receipt, entry.key, "authorize");
+  await rename(entry.target.path, entry.target.quarantine.path);
+  const confirmed = await f.manage(receipt, entry.key, "confirm");
+  expect(confirmed.confirmedRevision).toBeDefined();
+  await assertLegacyEvidenceResourceUpdate(db.prisma, parent, { state: "released", metadata: parent.metadata, expiresAt: parent.expiresAt });
+  await rm(parent.externalId, { recursive: true }); // only the now-empty disposable parent
+  await db.prisma.$disconnect();
+  expect(await f.manage(receipt, entry.key, "confirm")).toEqual(confirmed);
+  expect(await f.adopt()).toEqual(receipt);
+  expect(await readFile(path.join(entry.target.quarantine.path, "turn-0.ndjson"), "utf8")).toBe("saved turn 0\n");
+  expect(await readFile(path.join(entry.retained.path, "turn-0.ndjson"), "utf8")).toBe("saved turn 0\n");
+});
+
+test.each(["missing-copy", "changed-copy", "file-swap", "symlink", "hardlink", "shared-mode"])("directory adoption refuses %s without changing originals", async failure => {
+  const f = await fixture({ directoryEvidence: true }), source = f.treeResource!.externalId, retained = path.join(f.archive, "turns");
+  if (failure === "missing-copy") await rm(path.join(retained, "turn-0.ndjson"));
+  if (failure === "changed-copy") await writeFile(path.join(retained, "turn-0.ndjson"), "changed\n");
+  if (failure === "file-swap") { await rename(source, source + "-preserved"); await writeFile(source, "replacement file", { mode: 0o600 }); }
+  if (failure === "symlink") await symlink(path.join(source, "turn-0.ndjson"), path.join(source, "another"));
+  if (failure === "hardlink") await link(path.join(source, "turn-0.ndjson"), path.join(directory, "shared"));
+  if (failure === "shared-mode") await chmod(source, 0o777);
+  await expect(f.adopt()).rejects.toThrow();
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.treeResource!.id } })).state).toBe("ready");
+  expect(await lstat(source)).toBeDefined();
+});
+
+test("directory capture waits for writers and rejects later retained/source substitutions", async () => {
+  const f = await fixture({ directoryEvidence: true }), receipt = await f.adopt(), entry = receipt.proof.entries.find(isEvidenceTree)!;
+  const writer = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "writer", kind: "local-http", purpose: "development", externalId: "http://127.0.0.1:12345", state: "ready" } });
+  await expect(f.manage(receipt, entry.key, "authorize")).rejects.toThrow("writers");
+  await db.prisma.remoteTaskResource.update({ where: { id: writer.id }, data: { state: "released" } });
+  const handle = await open(path.join(entry.target.path, "turn-0.ndjson"), "a");
+  try { await expect(f.manage(receipt, entry.key, "authorize")).rejects.toThrow("open files"); } finally { await handle.close(); }
+  await f.manage(receipt, entry.key, "authorize");
+  await rename(path.join(entry.retained.path, "turn-0.ndjson"), path.join(entry.retained.path, "old"));
+  await writeFile(path.join(entry.retained.path, "turn-0.ndjson"), "saved turn 0\n", { mode: 0o600 });
+  await expect(f.manage(receipt, entry.key, "authorize")).rejects.toThrow();
+  expect(await lstat(entry.target.path)).toBeDefined();
+});
+
+test("directory evidence cannot be omitted or overlap another task", async () => {
+  const f = await fixture({ directoryEvidence: true });
+  const missing = { ...f.adoption, entries: f.adoption.entries.slice(0, -1) };
+  await expect(adoptLegacyEvidence({ ...f.context, adoption: missing })).rejects.toThrow("complete exact");
+  await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, connectionId: f.task.connectionId, issueIdentifier: "OTHER", worktreePath: path.join(directory, "other-work"), branchName: "other", toolingRoot: f.task.toolingRoot, toolingRevision: f.task.toolingRevision } });
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "other", key: "shared", kind: "directory", purpose: "development", externalId: f.treeResource!.externalId, state: "ready" } });
+  await expect(f.adopt()).rejects.toThrow("another task");
+});
+
+test.skipIf(!draftedRoot)("actual Drafted directory capture uses both pinned parents and resumes lost confirmation", async () => {
+  const f = await fixture({ files: 26, directoryEvidence: true }), receipt = await f.adopt(), entry = receipt.proof.entries.find(isEvidenceTree)!;
+  const originalPrepare = legacyEvidenceDependencies.prepare; legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const socket = path.join(directory, "directory.sock"); let lost = false, confirmations = 0;
+  const server = Bun.serve({ unix: socket, fetch: async request => {
+    const operation = new URL(request.url).pathname.endsWith("/legacy-evidence") ? await request.clone().json() : null;
+    const response = await f.app.fetch(request);
+    if (operation?.action === "confirm" && response.ok) { confirmations++; if (!lost) { lost = true; return Response.json({ error: "Lost directory acknowledgment" }, { status: 500 }); } }
+    return response;
+  } });
+  await chmod(socket, 0o600);
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageLegacyEvidence: clientManage, assertLegacyEvidenceParentRelease } = await import(path.join(draftedRoot!, "src/legacy-evidence.ts"));
+    const registry = taskRegistry(socket, f.task.id);
+    let task = await registry.task(); const parent = task.resources.find((resource: any) => resource.key === "environment-parent");
+    await expect(assertLegacyEvidenceParentRelease(registry, task, parent)).rejects.toThrow("confirmed directory");
+    await expect(clientManage({ registry, key: entry.key, action: "release", hooks: { afterJournal() { throw new Error("interrupted before capture"); } } })).rejects.toThrow("interrupted before capture");
+    expect((await lstat(entry.target.path)).ino).toBe(entry.target.inventory[0]!.ino);
+    await expect(clientManage({ registry, key: entry.key, action: "release" })).rejects.toThrow("Lost directory acknowledgment");
+    const captured = await lstat(entry.target.quarantine.path), journal = await readFile(entry.target.quarantine.journal);
+    expect((await clientManage({ registry, key: entry.key, action: "release" })).state).toBe("released");
+    expect(confirmations).toBe(1);
+    expect((await lstat(entry.target.quarantine.path)).ino).toBe(captured.ino);
+    expect(await readFile(entry.target.quarantine.journal)).toEqual(journal);
+    task = await registry.task(); await assertLegacyEvidenceParentRelease(registry, task, parent);
+    expect(task.resources.filter((resource: any) => resource.kind === "evidence" && resource.state === "ready").length).toBe(26);
+    expect(await readFile(path.join(entry.retained.path, "turn-28.ndjson"), "utf8")).toBe("saved turn 28\n");
   } finally { server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
 });

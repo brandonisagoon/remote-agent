@@ -357,12 +357,23 @@ async function readQuarantineJournal(file: string) {
 /** Observes a frozen capture; never creates, repairs, restores, or removes its
  * contents. A pending journal can precede rename, but missing source without a
  * matching capture is never proof of retirement. */
-export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget }) {
+export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget; quarantineParent?: { path: string; dev: number; ino: number; mode: number }; sourceParent?: { path: string; dev: number; ino: number; mode: number } }) {
   const { target } = input, { quarantine } = target;
-  if (path.dirname(quarantine.directory) !== path.dirname(target.path) || quarantine.directory === target.path || quarantine.path !== path.join(quarantine.directory, "contents") || quarantine.journal !== path.join(quarantine.directory, "pending.json") || !/^\.drafted-finalization-[0-9a-f-]{36}$/.test(path.basename(quarantine.directory))) throw new Error("Quarantine location does not match its frozen source root");
+  const destinationParent = input.quarantineParent;
+  if (destinationParent && !input.sourceParent) throw new Error("External quarantine requires both frozen parent identities");
+  if (destinationParent) {
+    await assertFinalizationPath(destinationParent.path);
+    const parent = await lstat(destinationParent.path);
+    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o7777) !== 0o700 || parent.dev !== destinationParent.dev || parent.ino !== destinationParent.ino || parent.mode !== destinationParent.mode || parent.dev !== target.inventory[0]?.dev) throw new Error("Quarantine destination parent identity changed");
+  }
+  if (path.dirname(quarantine.directory) !== (destinationParent?.path ?? path.dirname(target.path)) || quarantine.directory === target.path || quarantine.path !== path.join(quarantine.directory, "contents") || quarantine.journal !== path.join(quarantine.directory, "pending.json") || !/^\.drafted-finalization-[0-9a-f-]{36}$/.test(path.basename(quarantine.directory))) throw new Error("Quarantine location does not match its frozen source root");
   await assertFinalizationPath(target.path);
   await assertFinalizationPath(quarantine.directory);
   const source = await statOrMissing(target.path), directory = await statOrMissing(quarantine.directory);
+  if (input.sourceParent) {
+    const parent = await statOrMissing(input.sourceParent.path);
+    if (path.dirname(target.path) !== input.sourceParent.path || parent && (!parent.isDirectory() || parent.uid !== process.getuid?.() || parent.dev !== input.sourceParent.dev || parent.ino !== input.sourceParent.ino || parent.mode !== input.sourceParent.mode) || !parent && source) throw new Error("Evidence source parent identity changed");
+  }
   if (!directory) {
     if (!source) throw new Error("Source disappearance has no retained quarantine proof");
     return { captured: false as const, physicalPath: target.path };
