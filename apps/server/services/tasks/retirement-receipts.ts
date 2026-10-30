@@ -41,10 +41,10 @@ function stableMetadata(value: unknown) {
   return stable;
 }
 
-export async function retirementBinding(prisma: RetirementDatabase, config: ServerConfig, taskId: string, issueId: string, interrupted = false): Promise<RetirementBinding> {
+export async function retirementBinding(prisma: RetirementDatabase, config: ServerConfig, taskId: string, issueId: string, interrupted = false, cleanup = false): Promise<RetirementBinding> {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!session || session.role !== "primary" || session.status === "closed" || !(interrupted ? ["waiting", "blocked", "complete"].includes(task.phase) : task.phase === "complete") || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier
+  if (!session || session.role !== "primary" || session.status === "closed" || !(cleanup ? task.phase !== "closed" : interrupted ? ["waiting", "blocked", "complete"].includes(task.phase) : task.phase === "complete") || task.ownerPaused || !task.worktreePath || !task.connectionId || !task.issueIdentifier
     || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Retirement requires the open complete task's original primary");
   const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, externalId: task.issueIdentifier, resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
   if (!link) throw new Error("Retirement source ownership changed");
@@ -62,13 +62,13 @@ export async function retirementBinding(prisma: RetirementDatabase, config: Serv
       state: resource.state, expiresAt: resource.expiresAt?.toISOString() ?? null, metadata: stableMetadata(resource.metadata) })) });
 }
 
-export async function assertRetirementAuthority(prisma: RetirementDatabase, config: ServerConfig, taskId: string, sessionId: string, issueId: string, reference?: z.infer<typeof RetirementReference>) {
+export async function assertRetirementAuthority(prisma: RetirementDatabase, config: ServerConfig, taskId: string, sessionId: string, issueId: string, reference?: z.infer<typeof RetirementReference>, cleanup = false) {
   const event = await latestRetirement(prisma, taskId, sessionId);
   const grant = event && RetirementGrant.safeParse(JSON.parse(event.value ?? "null"));
   if (!event || !grant || !grant.success) throw new Error("Retirement owner authorization is missing or revoked");
   const digest = retirementDigest(grant.data);
   if (reference && (reference.revision !== event.sequence || reference.digest !== digest)) throw new Error("Retirement owner authorization was revoked or replaced");
-  const current = await retirementBinding(prisma, config, taskId, issueId);
+  const current = await retirementBinding(prisma, config, taskId, issueId, false, cleanup);
   const expected = grant.data.binding;
   if (current.sessionId !== sessionId || expected.sessionId !== sessionId) throw new Error("Retirement primary identity changed");
   assertRetirementBinding(current, expected);

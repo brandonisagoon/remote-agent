@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient, RemoteTaskResource } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
-import { FINALIZATION_PREPARED, PreparedFinalization } from "./finalization-receipts.ts";
+import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization } from "./finalization-receipts.ts";
 import { RetirementBinding, RetirementGrant, retirementDigest } from "./retirement-receipts.ts";
 import { normalizeRetirementPreviewTransition } from "./retirement-preview.ts";
 import { DoneRetirementGrant } from "./delivered-retirement.ts";
@@ -32,20 +32,25 @@ function stableMetadata(value: unknown) {
 /** No provider, source issue, Git subprocess or filesystem observation belongs
  * in this check. Native batches use it while retaining their own held-target
  * checks. A status edit is not an owner revocation. */
-async function current(input: Context) {
+async function current(input: Context, allowConfirmedClosed = false) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
   const session = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
-  if (!task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || task.phase === "closed" || session.status === "closed"
+  const closed = task.phase === "closed" || session.status === "closed";
+  if (!task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || closed && !allowConfirmedClosed
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Cleanup original ownership is changed, paused or closed");
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("Cleanup requires the existing stable finalization identity");
   const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId,
-    resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", endedAt: null } });
+    resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(closed && allowConfirmedClosed ? {} : { endedAt: null }) } });
   if (!link) throw new Error("Cleanup original source ownership changed");
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });
   if (!preparation?.value || preparation.key !== input.requestKey) throw new Error("Cleanup requires the exact existing preparation");
   const raw = JSON.parse(preparation.value);
   if (raw.version !== undefined) throw new Error("Prepared lifecycle currently requires version 1 preparation");
   const prepared = PreparedFinalization.parse(raw);
+  if (allowConfirmedClosed) {
+    const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
+    if (!confirmed || JSON.parse(confirmed.value ?? "null")?.preparedRevision !== preparation.sequence) throw new Error("Closed cleanup reporting requires its exact confirmed preparation");
+  }
   if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== input.requestKey || prepared.repositoryId !== task.repositoryId
     || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier
     || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName) throw new Error("Cleanup preparation belongs to another original task identity");
@@ -112,14 +117,36 @@ export function hasPreparedCleanup(prisma: Database, taskId: string, sessionId: 
   return prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(taskId, sessionId, requestKey) });
 }
 
-export async function assertPreparedCleanup(input: Context) {
-  const observed = await current(input);
+async function activeOperation(input: Context, allowConfirmedClosed = false) {
+  const observed = await current(input, allowConfirmedClosed);
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(observed.task.id, input.sessionId, input.requestKey) });
   if (!event?.value) throw new Error("Cleanup operation is not bound; perform full preparation first");
   const operation = CleanupOperation.parse(JSON.parse(event.value));
   if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
   assertBinding(observed.binding, operation.binding);
   return { ...observed, operation, operationRevision: event.sequence };
+}
+
+async function localSnapshot<T>(input: Context, read: (value: Context) => Promise<T>): Promise<T> {
+  const database = input.prisma as Database & Partial<Pick<PrismaClient, "$transaction">>;
+  // A batch observes one consistent local epoch. Callers already inside a
+  // mutation transaction reuse it rather than opening a nested transaction.
+  return database.$transaction ? database.$transaction(tx => read({ ...input, prisma: tx })) : read(input);
+}
+
+export const assertPreparedCleanup = (input: Context) => localSnapshot(input, value => activeOperation(value));
+
+/** Closed-session reporting is restricted to the existing confirmed fact. It
+ * confers no new resource effect, preparation or arbitrary publication scope. */
+export async function assertCompletedCleanup(input: Context) {
+  return localSnapshot(input, async scope => {
+    const active = await activeOperation(scope, true);
+    const confirmed = await scope.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: scope.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: scope.requestKey } });
+    const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
+    const retained = await retainedArchiveResourceIds(scope.prisma, scope.config, active.prepared);
+    if (active.binding.resources.some(resource => ["development", "browser", "review"].includes(resource.purpose) && resource.state !== "released" && !retained.has(resource.id))) throw new Error("Cleanup reporting has unresolved required resources");
+    return { ...active, confirmed };
+  });
 }
 
 /** Registry writes cannot expand an active operation or resurrect a released

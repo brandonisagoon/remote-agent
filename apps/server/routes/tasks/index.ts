@@ -17,6 +17,7 @@ import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } f
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
+import { CleanupReportRequest, publishCleanupReport, cleanupProjection } from "../../services/tasks/cleanup-report.ts";
 
 import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
 
@@ -24,6 +25,13 @@ import { taskResponse } from "./response.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
+
+taskRoutes.post("/:taskId/cleanup-report", async (c) => {
+  const request = CleanupReportRequest.safeParse(await c.req.json());
+  if (!request.success) return c.json({ error: "Use the existing finalization requestKey; cleanup report content is server-owned" }, 400);
+  try { return c.json(await publishCleanupReport({ ...request.data, prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 sessionTaskRoutes.post("/:sessionId/source-reply", async (c) => {
   const parsed = SourceReplyInput.safeParse(await c.req.json());
@@ -121,7 +129,7 @@ taskRoutes.get("/", async (c) => {
   // a stable ID order so activity cannot move tasks between cursor pages.
   if (c.req.query("pagination") !== "id") {
     const tasks = await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { updatedAt: "desc" }, take: 100 });
-    return c.json({ tasks: await Promise.all(tasks.map(async (task) => ({ ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task) }))) });
+    return c.json({ tasks: await Promise.all(tasks.map(async (task) => ({ ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), ...await cleanupProjection(prisma, c.get("config"), task) }))) });
   }
   const cursor = c.req.query("cursor");
   const rows = await prisma.remoteTask.findMany({ include: { resources: true }, orderBy: { id: "asc" }, take: 101, ...(cursor ? { where: { id: { gt: cursor } } } : {}) });
@@ -131,16 +139,16 @@ taskRoutes.get("/", async (c) => {
     action: "finalization-prepared", source: { in: complete.map((task) => `finalizer:${task.id}`) },
     runtimeSessionId: { in: complete.map((task) => task.primarySessionId!) },
   }, select: { source: true, runtimeSessionId: true } }) : [];
-  return c.json({ tasks: await Promise.all(tasks.map(async (task) => ({ ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) }))), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
+  return c.json({ tasks: await Promise.all(tasks.map(async (task) => ({ ...taskResponse(task), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), ...await cleanupProjection(prisma, c.get("config"), task), finalizationPending: prepared.some((receipt) => receipt.source === `finalizer:${task.id}` && receipt.runtimeSessionId === task.primarySessionId) }))), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
 });
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
-  return task ? c.json({ task: { ...taskResponse(task), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
+  return task ? c.json({ task: { ...taskResponse(task), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
 });
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {
   const task = await taskForSession(c.get("prisma"), c.req.param("sessionId"));
-  return task ? c.json({ task: { ...taskResponse(task), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
+  return task ? c.json({ task: { ...taskResponse(task), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
 });
 
 const Progress = z.object({

@@ -158,8 +158,10 @@ test("actual preparation and confirmation use the original receipt while Linear 
   const input = { ...f.input, cleanup: true as const };
   const unavailable = { ...f.dependencies, source: async () => { throw new Error("Linear unavailable"); }, completion: async () => { throw new Error("Provider observation must not repeat"); } };
   await expect(prepareTaskFinalization({ ...input, authorityOnly: true }, unavailable)).rejects.toThrow("not bound");
-  expect(await prepareTaskFinalization(input, unavailable)).toEqual(f.prepared);
-  expect(await prepareTaskFinalization({ ...input, authorityOnly: true }, unavailable)).toEqual(f.prepared);
+  const bound = await prepareTaskFinalization(input, unavailable);
+  expect(bound).toMatchObject(f.prepared);
+  expect("cleanup" in bound && bound.cleanup?.operationRevision).toBeGreaterThan(f.prepared.preparedRevision);
+  expect(await prepareTaskFinalization({ ...input, authorityOnly: true }, unavailable)).toEqual(bound);
   await expect(confirmTaskFinalization(input, unavailable)).rejects.toThrow("unreleased");
   await db.prisma.remoteTaskResource.update({ where: { id: "volume" }, data: { state: "released" } });
   f.remove();
@@ -169,6 +171,44 @@ test("actual preparation and confirmation use the original receipt while Linear 
   expect(await confirmTaskFinalization(input, unavailable)).toEqual(confirmed);
   expect(await prepareTaskFinalization({ ...input, authorityOnly: true }, unavailable)).toEqual(confirmed);
   expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } })).value).toBe(f.frozen.find(row => row.sequence === f.prepared.preparedRevision)!.value);
+});
+
+test("new cleanup prepares accepted delivery from a waiting/custom-status task without requiring current Merge", async () => {
+  const f = await fixture(); f.issue.state = { id: "custom", name: "Owner chose a custom state", type: "unstarted" };
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const bound = await prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  expect("cleanup" in bound && bound.cleanup?.operationRevision).toBeGreaterThan(bound.preparedRevision);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+  expect(f.issue.state.id).toBe("custom");
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("waiting");
+});
+
+test("new cleanup uses stored accepted owner source identity when Linear is unavailable and still observes exact delivery", async () => {
+  const f = await fixture();
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "completion-owner-approval", key: "owner",
+    value: JSON.stringify({ actorId: "configured-owner", contractRevision: f.contract.revision, requestKey: "owner", issueId: f.issue.id, issueIdentifier: f.issue.identifier, connectionId: f.task.connectionId }) } });
+  let delivered = 0;
+  const unavailable = { ...f.dependencies, source: async () => { throw new Error("Linear unavailable"); },
+    completion: async (input: Parameters<typeof assertCompletionAllowed>[0]) => { delivered++; return f.dependencies.completion(input); } };
+  const first = await prepareTaskFinalization({ ...f.input, cleanup: true }, unavailable);
+  expect(delivered).toBe(1);
+  expect(await prepareTaskFinalization({ ...f.input, cleanup: true, authorityOnly: true }, unavailable)).toEqual(first);
+  expect(delivered).toBe(1);
+  await f.revoke();
+  await expect(prepareTaskFinalization({ ...f.input, cleanup: true }, unavailable)).rejects.toThrow("revoked or replaced");
+});
+
+test("new cleanup cannot replace a differently keyed preparation or escape a prior explicit revocation", async () => {
+  const f = await fixture();
+  const existing = await prepareTaskFinalization({ ...f.input, requestKey: "original-key" }, f.dependencies);
+  await expect(prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow("cannot replace");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: existing.preparedRevision } })).not.toBeNull();
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: existing.preparedRevision } });
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "delivered-retirement-revoked", key: "owner-revoke", value: JSON.stringify({ basis: "Owner revoked retirement" }) } });
+  await expect(prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow("explicitly revoked");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(0);
 });
 
 test("actual resource routes reject new targets and resurrection while allowing paused stop observations", async () => {
@@ -210,12 +250,14 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual control client and se
     const { taskRegistry } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
     let registry = taskRegistry(socket, f.task.id, 1000);
     const request = { requestKey: f.input.requestKey, cleanup: true as const };
-    expect(await registry.prepareFinalization!(request)).toEqual(original);
+    const bound = await registry.prepareFinalization!(request);
+    expect(bound).toMatchObject(original);
+    expect(bound.cleanup.operationRevision).toBeGreaterThan(original.preparedRevision);
     const before = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
     const start = performance.now();
     for (let batch = 0; batch < 128; batch++) {
       if (batch === 64) { await db.prisma.$disconnect(); registry = taskRegistry(socket, f.task.id, 1000); }
-      expect(await registry.prepareFinalization!({ ...request, authorityOnly: true })).toEqual(original);
+      expect(await registry.prepareFinalization!({ ...request, authorityOnly: true })).toEqual(bound);
     }
     expect(performance.now() - start).toBeLessThan(10_000);
     expect(taskReads).toBe(0);

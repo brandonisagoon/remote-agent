@@ -6,8 +6,11 @@ preparation, completion contract, verification, retirement grant, retained
 evidence proof or tooling pin. A current Linear status is neither new cleanup
 permission nor a revocation of an already accepted delivery.
 
-`prepare-finalization` accepts `cleanup: true` for a genuine existing v1
-preparation. Full preparation verifies the current original worktree/Git
+`prepare-finalization` accepts `cleanup: true` for an existing v1 preparation,
+or creates the normal v1 preparation from an already accepted owner contract,
+matching verification and independently observed exact delivery. The latter
+binds source identity without requiring current Merge; it refuses a differently
+keyed old preparation or explicit revocation. Full preparation verifies the current original worktree/Git
 registration and saved archive bytes, establishes any legitimate saved-archive
 proof before freezing the operation, and compares the local authority again in
 the transaction. It never performs a destructive action.
@@ -21,6 +24,10 @@ Full resource boundaries and confirmation still inspect physical results and
 retained contents. A changed proof, target or pin cannot be bypassed by minting
 another request key or silently rebinding an existing operation.
 
+Explicit cleanup responses add `cleanup: {operationRevision, operationDigest}`.
+The client must freeze this server witness before accepting a non-complete
+phase. The original preparation and ordinary no-flag v1 responses stay intact.
+
 The task-bound prepare/confirm routes resolve the primary directly. Drafted's
 cleanup requests use these routes, avoiding a full task projection before every
 native removal batch. Existing session routes and old receipt shapes remain
@@ -28,10 +35,20 @@ available. Registry updates cannot add targets, change frozen identities or
 resurrect released resources; a paused task may still record a same-state stop
 observation without granting deletion authority.
 
-This first increment covers existing v1 preparations. The shared destroy CLI,
-dependency-aware adapter scheduling, durable reporting independent of closure,
-and external/older delivery correspondence are subsequent integration work.
-It does not authorize an unprepared or merely Done task, and it does not alter
+Confirmation atomically queues a fixed cleanup report in the existing
+issue-update store. The cleanup-aware finalizer closes after confirmation and
+attempts reporting independently. Existing preparations have no frozen source
+version, so their report is comment-only and never changes Linear status.
+Closed-task retries accept only that original task/issue/connection, confirmed
+preparation, comment UUID and body. They reconcile a lost response without
+repeating cleanup. Pending publication never becomes a claim that publication
+succeeded, and a pause/revocation still prevents a new reporting effect.
+
+These increments cover existing preparations and first-time preparation from
+existing accepted v1 delivery authority. The shared destroy CLI,
+dependency-aware adapter scheduling and external/older delivery correspondence
+are subsequent integration work.
+It does not treat a merely Done task as accepted delivery authority, and it does not alter
 live resources or declare DRA-194 complete.
 
 Validation includes real Git/SQLite fixtures and the actual Drafted control
