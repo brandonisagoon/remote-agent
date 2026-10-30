@@ -2,7 +2,9 @@ import { mkdirSync } from "node:fs";
 import path from "node:path";
 
 import type { RepositoryConfig } from "../../../../lib/config.ts";
-import { resolveWorktreeBase } from "./worktree-base.ts";
+import { resolveWorktreeBase, resolveWorktreeCommonDirectory } from "./worktree-base.ts";
+
+const registering = new Map<string, Promise<void>>();
 
 export interface ProvisionWorktreeInput {
   repository: RepositoryConfig;
@@ -46,21 +48,30 @@ async function createWorktree(
   worktreePath: string,
 ): Promise<void> {
   const baseCommit = await resolveWorktreeBase(input.repository.root, input.baseBranch ?? input.repository.baseBranch ?? "main");
-  mkdirSync(input.repository.worktreeRoot, { recursive: true });
-  await run(
-    [
-      "git",
-      "-C",
+  const commonDirectory = await resolveWorktreeCommonDirectory(input.repository.root);
+  // Git reads sibling registrations while adding one. A concurrent add can
+  // expose its directory before commondir is complete. Coordinate only these
+  // server-owned mutations; fetched commit pins and bootstraps stay independent.
+  const pending = (registering.get(commonDirectory) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    mkdirSync(input.repository.worktreeRoot, { recursive: true });
+    await run(
+      [
+        "git",
+        "-C",
+        input.repository.root,
+        "worktree",
+        "add",
+        "-b",
+        input.branchName,
+        worktreePath,
+        baseCommit,
+      ],
       input.repository.root,
-      "worktree",
-      "add",
-      "-b",
-      input.branchName,
-      worktreePath,
-      baseCommit,
-    ],
-    input.repository.root,
-  );
+    );
+  });
+  registering.set(commonDirectory, pending);
+  try { await pending; }
+  finally { if (registering.get(commonDirectory) === pending) registering.delete(commonDirectory); }
 }
 
 /** Repository-owned phase: the repo's own bootstrap command, run once in

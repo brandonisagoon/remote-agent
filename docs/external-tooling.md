@@ -16,6 +16,14 @@ actual task control and provider approval restrictions still apply.
 
 A remote branch base is fetched before each new launch resolves its commit. Fetch errors block creation, even when a cached tracking ref exists. Parallel launches can share an in-flight fetch, but no result is cached for later launches. The task persists the resulting `baseCommit` before creating its worktree; retries use that recorded commit without refetching or changing existing work. Local branch names and explicit commit revisions continue to use the caller-selected local state. The configured target clone is never pulled, checked out or reset as part of this process.
 
+The server coordinates its `git worktree add` commands by the canonical common
+Git directory, including linked checkouts and path aliases. Git reads neighboring
+registrations during creation, so concurrent additions can otherwise observe an
+unfinished `commondir` file. Only registration is queued: independent repositories
+and repository bootstrap remain concurrent, and each request keeps its resolved
+base commit. A failed addition still fails its caller and releases the queue for
+later requests; it does not remove or repair existing branches or worktrees.
+
 `RemoteTask` is created before setup and retains its request key, host, target branch/base, worktree, pinned tooling revision, primary session, environment status and resource receipts. Retrying the same request reuses that identity. Setup failures remain visible; both direct and workflow launches can start a repair agent in the already-created worktree. Unknown worktrees are not adopted. A resource key cannot be reassigned to a different external resource.
 
 The pinned acpx 0.13.2 dependency needs the committed Bun patch to preserve uppercase environment variable names in session records. Its persisted-key validator otherwise rejects `session_options.env`, preventing a real session from launching. The patch treats only that map as opaque; the rest of the validator stays active. A regression test saves and reloads the actual installed store. Remove the patch only after an upstream version passes that test.
