@@ -37,7 +37,7 @@ taskRoutes.post("/:taskId/cleanup-request", async (c) => {
   const request = CleanupEnqueueInput.safeParse(await c.req.json());
   if (!request.success) return c.json({ error: "A stable cleanup scheduling requestKey is required" }, 400);
   try {
-    const result = await enqueueTaskCleanup({ ...request.data, prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") });
+    const result = await enqueueTaskCleanup({ ...request.data, runtime: c.get("agentRuntime"), prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") });
     void deliverInstructions(c.get("prisma"), c.get("agentRuntime"), c.get("config")).catch(() => undefined);
     return c.json(result, 202);
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }

@@ -1,3 +1,4 @@
+import { ensureTaskCleanupTransports, releaseTaskCleanupTransports, returnTaskTransportToWork, inspectCleanupTransport } from "../../services/tasks/cleanup-transport.ts";
 import { RequestLifetimeError } from "../../request-lifetime.ts";
 import { ADOPTION_DEADLINE_MS, TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
 import { Hono } from "hono";
@@ -34,6 +35,7 @@ taskCompletionRoutes.put("/:taskId/completion/delivered-retirement", async c => 
   if (!parsed.success) return c.json({ error: "Exact delivered-retirement evidence is required", details: parsed.error.issues }, 400);
   try {
     const context = { prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") };
+    if (parsed.data.mode === "legacy-delivery") await ensureTaskCleanupTransports({ ...context, runtime: c.get("agentRuntime") });
     return c.json(parsed.data.mode === "existing-preparation" ? await adoptDoneRetirement({ ...context, retirement: parsed.data }) : await adoptLegacyDelivery({ ...context, retirement: parsed.data }));
   }
   catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
@@ -65,7 +67,9 @@ taskCompletionRoutes.get("/:taskId/completion/external-deliveries", async (c) =>
 taskCompletionRoutes.put("/:taskId/completion/external-deliveries", async (c) => taskRequest(c, ADOPTION_DEADLINE_MS, async () => {
   const parsed = ExternalDeliveryBindingInput.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Exact external deliveries, accepted evidence and expected revisions are required", details: parsed.error.issues }, 400);
-  try { return c.json(await adoptExternalDeliveries({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), binding: parsed.data })); }
+  try {
+    await ensureTaskCleanupTransports({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), taskId: c.req.param("taskId") });
+    return c.json(await adoptExternalDeliveries({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), binding: parsed.data })); }
   catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 }));
 taskCompletionRoutes.get("/:taskId/completion", async (c) => {
@@ -84,3 +88,18 @@ taskCompletionRoutes.post("/:taskId/completion/verification", async (c) => {
   try { return c.json(await recordCompletionVerification({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), verification: parsed.data })); }
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
+
+// Reuses owner authentication above; ordinary IPC cannot relocate providers.
+taskCompletionRoutes.post("/:taskId/completion/cleanup-transport", async c => taskRequest(c, ADOPTION_DEADLINE_MS, async () => {
+  const parsed = z.discriminatedUnion("mode", [z.object({ mode: z.literal("cleanup") }).strict(), z.object({ mode: z.literal("work"), revision: z.number().int().positive() }).strict()]).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Exact cleanup or return-to-work transport selection is required" }, 400);
+  try {
+    const input = { prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), taskId: c.req.param("taskId") };
+    return c.json(parsed.data.mode === "cleanup" ? await releaseTaskCleanupTransports(input) : await returnTaskTransportToWork({ ...input, revision: parsed.data.revision }));
+  } catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
+
+taskCompletionRoutes.get("/:taskId/completion/cleanup-transport", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
+  try { return c.json(await inspectCleanupTransport({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));

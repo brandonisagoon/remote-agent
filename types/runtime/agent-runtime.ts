@@ -121,6 +121,10 @@ export interface AgentSessionRuntime {
    * clearing stale active state. Never infers an instruction's outcome. */
   reconcileInterruptedSession?(sessionId: string): Promise<AgentRuntimeSession>;
   /** Process-local observation; absence of owned work never proves idle. */
+  /** Release only locally owned idle provider transports. The caller's exact
+   * task checks and durable transition run under the same runtime reservation. */
+  releaseIdleTransports?(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void>;
+  assertClosedProviderAbsent?(sessionId: string): Promise<void>;
   observeSessionActivity?(sessionId: string): { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
   listSessions(input?: {
     cwd?: string;
