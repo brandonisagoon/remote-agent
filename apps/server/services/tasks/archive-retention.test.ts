@@ -10,11 +10,13 @@ import { createApp } from "../../app.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { RetirementAuthorityInput, inspectRetirementAuthority, setRetirementAuthority } from "./retirement-authority.ts";
-import { prepareTaskFinalization, confirmTaskFinalization, finalizationDependencies } from "./finalization.ts";
+import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 import { ARCHIVE_RETENTION, ArchiveRetentionProof, type ArchiveRetentionReceipt } from "./archive-retention-schema.ts";
 import { archiveRetentionProjection, verifyArchiveRetention } from "./archive-retention.ts";
 import { observeSavedArchive } from "./archive-observation.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
+import { adoptLegacyEvidence, manageLegacyEvidence } from "./legacy-evidence.ts";
+import { finalizationDigest } from "./finalization-resources.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "saved-archives-"))); });
@@ -180,6 +182,60 @@ test("one immutable archive supplement is enforced independently of request retr
   const existing = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: saved.proofRevision } });
   await expect(Promise.resolve(db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: existing.runtimeSessionId, source: existing.source, action: existing.action, key: "replacement", value: existing.value } }))).rejects.toThrow();
   expect(await f.check(saved)).toEqual(saved);
+});
+
+test.each(["new", "replayed", "confirmed"])("%s preparation refreshes source authority after archive and Git observations", async mode => {
+  const f = await fixture({ prepare: mode !== "new" });
+  if (mode === "confirmed") { f.remove(); await confirmTaskFinalization(f.input, f.finalizationDependencies); }
+  let sourceReads = 0;
+  const dependencies = { ...f.finalizationDependencies,
+    source: async () => {
+      sourceReads++;
+      if (mode === "new" && await db.prisma.runtimeMetadataEvent.count({ where: { action: ARCHIVE_RETENTION } }) || mode === "confirmed" && sourceReads >= 3) f.issue.state = f.states[2]!;
+      return f.dependencies.source();
+    },
+    snapshot: async (worktree: string) => { const snapshot = await f.dependencies.snapshot(worktree); if (mode === "replayed") f.issue.state = f.states[2]!; return snapshot; },
+  };
+  await expect(prepareTaskFinalization(f.input, dependencies)).rejects.toThrow("current owner Merge");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-prepared" } })).toBe(1);
+  for (const resource of f.resources) expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).state).toBe("ready");
+  f.issue.state = f.states[1]!;
+  expect(retention(await f.prepare()).resources).toHaveLength(5);
+});
+
+test("Done retirement adopts and captures three original evidence files beneath their retained tooling parent without replacing grant or preparation", async () => {
+  const f = await baseFixture(), parent = path.join(directory, "original-evidence"), archive = path.join(directory, "retained-copies");
+  await mkdir(parent, { mode: 0o700 }); await mkdir(archive, { mode: 0o700 });
+  const retainedParent = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "task-evidence-archive", kind: "directory", purpose: "tooling", externalId: parent, state: "ready", metadata: { archive: true, retained: true, root: parent } } });
+  const files: Array<{ path: string; sha256: string; bytes: number }> = [], resources = [];
+  for (let index = 0; index < 3; index++) {
+    const name = `capture-${index}.txt`, body = `original saved evidence ${index}`;
+    await writeFile(path.join(parent, name), body, { mode: 0o600 }); await writeFile(path.join(archive, name), body, { mode: 0o600 });
+    files.push({ path: name, sha256: sha(body), bytes: Buffer.byteLength(body) });
+    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: name, kind: "evidence", purpose: "browser", externalId: path.join(parent, name), state: "ready", metadata: { bytes: Buffer.byteLength(body), sha256: sha(body) } } }));
+  }
+  const grant = await f.grant(), prepared = await prepareTaskFinalization(f.input, f.finalizationDependencies);
+  const before = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [grant.revision, prepared.preparedRevision] } }, orderBy: { sequence: "asc" } });
+  const manifest = JSON.stringify({ task: f.task.id, retainedArchive: archive, files }), manifestPath = path.join(archive, "RETENTION.json");
+  await writeFile(manifestPath, manifest, { mode: 0o600 });
+  const proof = await adoptLegacyEvidence({ ...f.context, adoption: { requestKey: "retain-three", finalizationRequestKey: prepared.requestKey, expectedPreparedRevision: prepared.preparedRevision,
+    manifest: { path: manifestPath, sha256: sha(manifest) }, entries: resources.map((resource, index) => ({ resourceId: resource.id, retainedPath: path.join(archive, files[index]!.path), sha256: files[index]!.sha256, size: files[index]!.bytes })) } });
+  const dependencies = { prepare: () => prepareTaskFinalization(f.input, f.finalizationDependencies) };
+  for (const entry of proof.proof.entries) {
+    const operation = { resourceKey: entry.key, proofRevision: proof.proofRevision, proofDigest: proof.proofDigest, preparedRevision: prepared.preparedRevision, finalizationRequestKey: prepared.requestKey };
+    await manageLegacyEvidence({ ...f.input, operation: { ...operation, action: "authorize" } }, dependencies);
+    const target = entry.target, q = target.quarantine; await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
+    await writeFile(q.journal, JSON.stringify({ version: 1, taskId: f.task.id, resourceId: entry.resourceId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: q.path,
+      source: { dev: target.dev, ino: target.ino, mode: target.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });
+    await rename(target.path, q.path);
+    await manageLegacyEvidence({ ...f.input, operation: { ...operation, action: "confirm" } }, dependencies);
+    expect(sha(await readFile(entry.retained.path))).toBe(target.sha256);
+    expect((await lstat(q.path)).ino).toBe(target.ino);
+  }
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: retainedParent.id } })).toEqual(retainedParent);
+  expect((await lstat(parent)).isDirectory()).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [grant.revision, prepared.preparedRevision] } }, orderBy: { sequence: "asc" } })).toEqual(before);
+  expect(await prepareTaskFinalization(f.input, f.finalizationDependencies)).toEqual(prepared);
 });
 
 test.skipIf(process.env.DRA_ARCHIVE_VOLUME_TEST !== "1")("disposable 459 MB archive is streamed with bounded memory", async () => {

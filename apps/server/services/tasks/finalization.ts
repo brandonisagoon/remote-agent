@@ -62,6 +62,15 @@ function result(prepared: PreparedFinalization, preparedRevision: number, confir
         body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, ${archiveRetention ? "resources requiring removal are released and verified saved archives remain intact" : "recorded development, browser and review resources are released"}, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
 }
 
+async function assertObservedPreparationAuthority(input: FinalizationContext, prepared: PreparedFinalization, dependencies: Dependencies, confirmed = false) {
+  // Content hashing and Git observations can outlast a source-state change.
+  // Refresh the actual owner/source after them, before returning adapter authority.
+  const source = await sourceAuthority(input, prepared.taskId, dependencies);
+  if (source.issue.id !== prepared.issueId || source.issue.identifier !== prepared.issueIdentifier || source.link.connectionId !== prepared.connectionId || source.session.id !== prepared.sessionId
+    || source.retirementAuthority?.revision !== prepared.retirementAuthority?.revision || source.retirementAuthority?.digest !== prepared.retirementAuthority?.digest) throw new Error("Finalization source authority changed during observation");
+  await assertFinalizationAuthority(input.prisma, input.config, prepared, confirmed);
+}
+
 /** Verify delivery before deleting the only checkout that can prove it. This
  * creates no cleanup effects and never treats a model resource as authority. */
 export async function prepareTaskFinalization(input: FinalizationContext, dependencies: Dependencies = finalizationDependencies) {
@@ -85,12 +94,14 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
       // A completed cleanup is replayed, never expanded to a newly created
       // worktree or newly retained resource after Done was published.
       await assertFinalizationRemoved(prepared);
+      await assertObservedPreparationAuthority(input, prepared, dependencies, true);
       return result(prepared, prior.sequence, confirmed.sequence, archiveRetention);
     }
     if (!(await worktreeIsMissing(prepared.worktree))) {
       const snapshot = await dependencies.snapshot(prepared.worktree);
       if (JSON.stringify(snapshot) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Worktree changed since finalization preparation; inspect before using a new requestKey");
     }
+    await assertObservedPreparationAuthority(input, prepared, dependencies);
     return result(prepared, prior.sequence, undefined, archiveRetention);
   }
   const delivery = await dependencies.completion(input);
@@ -125,7 +136,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
     return result(prepared, receipt.sequence);
   });
   const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: recorded.preparedRevision });
-  await assertFinalizationAuthority(input.prisma, input.config, prepared);
+  await assertObservedPreparationAuthority(input, prepared, dependencies);
   return result(prepared, recorded.preparedRevision, undefined, archiveRetention);
 }
 
