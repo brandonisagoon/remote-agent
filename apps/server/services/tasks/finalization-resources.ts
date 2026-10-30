@@ -1,4 +1,4 @@
-import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
+import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
 import type { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { observeInactiveUnixSocket } from "./unix-socket.ts";
@@ -263,7 +263,7 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
   const retainedArchives = input.retainedArchives ?? [];
   const exceptional: FinalizationResourcePlan[] = [];
   const active = resources.filter((resource) => {
-    if (resource.state === "released" && input.originalWork) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
+    if (resource.state === "released" && input.originalWork && !(!ownership.sourceCopyResourceId && hasHistoricalCleanupAdapter(resource))) { exceptional.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "already-released" })); return false; }
     const archive = retainedArchives.find((entry) => entry.id === resource.id);
     if (archive) { if (resource.state === "released" || archive.identityDigest !== finalizationResourceIdentity(resource).identityDigest) throw new Error("Retained archive identity mismatch"); assertRetainedMaterialPlan(archive, retainedArchives); exceptional.push(archive); return false; }
     return true;

@@ -1,4 +1,4 @@
-import { hasCleanupAdapter } from "./cleanup-adapter-resources.ts";
+import { hasCleanupAdapter, hasHistoricalCleanupAdapter } from "./cleanup-adapter-resources.ts";
 import { resolveCleanupObserver } from "./cleanup-resource-observer.ts";
 import { prepareOriginalWork, assertOriginalWork, originalWorkRetainedPlans } from "./original-work.ts";
 import { createHash } from "node:crypto";
@@ -140,7 +140,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
-  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state !== "released" && hasCleanupAdapter(resource.kind))
+  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
   if (originalWork) {
