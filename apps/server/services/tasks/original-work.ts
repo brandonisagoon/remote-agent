@@ -11,6 +11,7 @@ import { assertFinalizationPath, assertFinalizationTree, finalizationDigest, fin
 import { OriginalWork, OriginalWorkInput, type RecoveryWorkInput } from "./original-work-schema.ts";
 import { observeRecoveryArchive, assertRecoveryContents, recoveryTarMembers } from "./recovery-archive.ts";
 import { restoreRecoveryTar, type RecoveryTarMember } from "./recovery-tar.ts";
+import { assertMacArchiveMetadata } from "./apple-double.ts";
 
 const MAX_BYTES = 512 * 1024 * 1024;
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
@@ -27,7 +28,7 @@ export function originalWorkRetainedPlans(originalWork: OriginalWork, resources:
 /** Decode only regular files/directories. Never extract archive-supplied links,
  * devices, absolute names or traversal paths through a host tar command. */
 export function originalWorkTar(buffer: Buffer) {
-  const files = new Map<string, { bytes: Buffer; executable: boolean }>();
+  const files = new Map<string, { bytes: Buffer; executable: boolean; mode: number }>();
   let offset = 0, pendingPath: string | undefined, ended = false;
   const text = (value: Buffer) => value.toString("utf8").replace(/\0.*$/s, "");
   const number = (value: Buffer) => { const raw = text(value).trim(); if (!/^[0-7]*$/.test(raw)) throw new Error("Unsupported tar numeric encoding"); return raw ? parseInt(raw, 8) : 0; };
@@ -63,12 +64,25 @@ export function originalWorkTar(buffer: Buffer) {
     if (type === "5") { if (size !== 0) throw new Error("Invalid tar directory"); continue; }
     if (type !== "0") throw new Error("Only regular untracked files may be restored");
     if (files.size >= 10000) throw new Error("Too many untracked archive files");
-    files.set(name, { bytes: Buffer.from(content), executable: Boolean(mode & 0o111) });
+    files.set(name, { bytes: Buffer.from(content), executable: Boolean(mode & 0o111), mode });
   }
   if (!ended || pendingPath !== undefined) throw new Error("Incomplete tar archive");
   return files;
 }
 
+/** Classification needs the independently observed Git files, never a filename
+ * prefix alone. A genuine expected ._ file remains ordinary restore content. */
+export function originalWorkUntrackedTar(buffer: Buffer, expectedPaths: ReadonlySet<string>) {
+  const files = originalWorkTar(buffer), metadata: string[] = [];
+  for (const [name, entry] of files) {
+    if (expectedPaths.has(name)) continue;
+    const base = path.posix.basename(name), paired = path.posix.join(path.posix.dirname(name), base.slice(2));
+    if (!base.startsWith("._") || base.length === 2 || !expectedPaths.has(paired) || !files.has(paired) || entry.mode & 0o7111) throw new Error("Unlisted or ambiguous original tar member");
+    assertMacArchiveMetadata(entry.bytes);
+    metadata.push(name); files.delete(name);
+  }
+  return { files, metadata };
+}
 
 export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
   const selection = OriginalWorkInput.parse(input.originalWork);
@@ -109,7 +123,12 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
   for (const name of [selection.bundlePath, selection.indexPatchPath, selection.worktreePatchPath, selection.untrackedArchivePath]) if (!archive.entries.has(name)) throw new Error("Restore input is not covered by the retained manifest");
   const indexPatch = await bytes(member(root, selection.indexPatchPath)), worktreePatch = await bytes(member(root, selection.worktreePatchPath));
   if (sha(indexPatch) !== snapshot.indexPatchSha256 || sha(worktreePatch) !== snapshot.worktreePatchSha256) throw new Error("Archived staged or unstaged changes do not match the original");
-  const untracked = originalWorkTar(await bytes(member(root, selection.untrackedArchivePath)));
+  const { files: untracked, metadata } = originalWorkUntrackedTar(await bytes(member(root, selection.untrackedArchivePath)), new Set(snapshot.untracked.map(entry => entry.path)));
+  for (const name of metadata) {
+    try { await lstat(member(worktree, name)); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+    throw new Error("Archive metadata collides with an original source path");
+  }
   if (untracked.size !== snapshot.untracked.length || snapshot.untracked.some((entry) => { const archived = untracked.get(entry.path); return !archived || archived.bytes.length !== entry.size || sha(archived.bytes) !== entry.sha256 || archived.executable !== entry.executable; })) throw new Error("Archived untracked files do not match the original");
   const common = await realpath(await textGit(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
   const temporary = await realpath(await mkdtemp(path.join(os.tmpdir(), "drafted-original-restore-"))); await chmod(temporary, 0o700);

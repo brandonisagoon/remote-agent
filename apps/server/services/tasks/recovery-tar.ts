@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import { createGunzip } from "node:zlib";
 import { archiveMember } from "./archive-observation.ts";
 import { assertFinalizationPath } from "./finalization-resources.ts";
+import { assertAppleDoubleMetadata } from "./apple-double.ts";
 
 export type RecoveryTarMember = { kind: "file" | "symlink"; size: number; executable: boolean; sha256?: string; gitSha?: string };
 type TarInput = { path: string; size: number; sha256: string };
@@ -35,18 +36,6 @@ export function assertRecoveryLinkSet(links: Map<string, string>) {
     if (resolved === ".git" || resolved.startsWith(".git/")) throw new Error("Recovery symlink chain points into Git administration");
   }
 }
-function appleDouble(bytes: Buffer) {
-  if (bytes.length < 26 || bytes.readUInt32BE(0) !== 0x00051607 || bytes.readUInt32BE(4) !== 0x00020000) throw new Error("Unlisted recovery tar member is not AppleDouble metadata");
-  const count = bytes.readUInt16BE(24), end = 26 + count * 12, spans: Array<[number, number]> = [];
-  if (!count || end > bytes.length) throw new Error("Invalid AppleDouble metadata");
-  const ids = new Set<number>();
-  for (let n = 0; n < count; n++) {
-    const id = bytes.readUInt32BE(26 + n * 12), offset = bytes.readUInt32BE(30 + n * 12), length = bytes.readUInt32BE(34 + n * 12);
-    if (![2, 9].includes(id) || ids.has(id) || offset < end || offset + length > bytes.length || spans.some(([a, b]) => length && offset < b && offset + length > a)) throw new Error("Unsupported AppleDouble metadata");
-    ids.add(id); spans.push([offset, offset + length]);
-  }
-}
-
 /** Each gzip/tar stream is owned by one no-follow file descriptor. Member sizes
  * and hashes come from the selected receipt and independently observed Git tree.
  * No host tar extraction, whole-file buffers, links-as-directories or xattrs. */
@@ -143,7 +132,7 @@ export async function restoreRecoveryTar(input: TarInput, expected: Map<string, 
       if (!entry && options.appleDouble && path.posix.basename(name).startsWith("._")) {
         const paired = path.posix.join(path.posix.dirname(name), path.posix.basename(name).slice(2));
         if (!expected.has(paired) || metadata.has(paired) || type !== "0" || size > 64 * 1024) throw new Error("Unpaired recovery metadata");
-        appleDouble(await buffer(size)); metadata.add(paired); await take((512 - size % 512) % 512, () => {}); continue;
+        assertAppleDoubleMetadata(await buffer(size)); metadata.add(paired); await take((512 - size % 512) % 512, () => {}); continue;
       }
       if (!entry || seen.has(name) || Boolean(mode & 0o111) !== entry.executable || (mode & 0o7000)) throw new Error("Unlisted, duplicate or changed recovery tar member");
       if (type !== (entry.kind === "symlink" ? "2" : "0") || size !== (entry.kind === "symlink" ? 0 : entry.size)) throw new Error("Recovery tar member type or size changed");
