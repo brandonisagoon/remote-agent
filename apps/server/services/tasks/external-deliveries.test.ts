@@ -353,6 +353,48 @@ test("owner comment, actual worker lineage, exact report bytes and manifest revi
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: EXTERNAL_BINDING } })).toBe(0);
 });
 
+test("provider comment timestamp ordering preserves the exact original approval during adoption", async () => {
+  const f = await fixture();
+  f.comment.comment.createdAt = "2026-10-29T20:42:06.441Z";
+  f.comment.comment.updatedAt = "2026-10-29T20:42:06.402Z";
+  const approval = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.manifest.acceptance.approvalEventSequence } });
+  const accepted = await adoptExternalDeliveries(f.input, f.dependencies);
+  if (accepted.binding.version !== 1) throw new Error("Expected the original owner approval binding");
+  expect(accepted.binding.acceptance.createdAt).toBe(f.comment.comment.createdAt);
+  expect(accepted.binding.acceptance.updatedAt).toBe(f.comment.comment.updatedAt);
+  expect(accepted.binding.acceptance.approvalEventSequence).toBe(approval.sequence);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: approval.sequence } })).value).toBe(approval.value);
+  expect((await adoptExternalDeliveries(f.input, f.dependencies)).revision).toBe(accepted.revision);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: EXTERNAL_BINDING } })).toBe(1);
+});
+
+test("both provider comment timestamps must be valid and nonfuture before adoption", async () => {
+  const f = await fixture();
+  for (const field of ["createdAt", "updatedAt"] as const) {
+    const original = f.comment.comment[field];
+    for (const value of ["", "not-a-date", new Date(Date.now() + 60_000).toISOString()]) {
+      f.comment.comment[field] = value;
+      await expect(adoptExternalDeliveries(f.input, f.dependencies)).rejects.toThrow("timestamps do not match");
+      expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: EXTERNAL_BINDING } })).toBe(0);
+    }
+    f.comment.comment[field] = original;
+  }
+});
+
+test("provider timestamp ordering never permits changed approval metadata between adoption reads", async () => {
+  const f = await fixture();
+  f.comment.comment.createdAt = "2026-10-29T20:42:06.441Z";
+  f.comment.comment.updatedAt = "2026-10-29T20:42:06.402Z";
+  let reads = 0;
+  const dependencies = { ...f.dependencies, comment: async () => {
+    reads++;
+    return { ...f.comment, comment: { ...f.comment.comment, updatedAt: reads === 1 ? f.comment.comment.updatedAt : "2026-10-29T20:42:07.000Z" } };
+  } };
+  await expect(adoptExternalDeliveries(f.input, dependencies)).rejects.toThrow("Owner acceptance changed during adoption");
+  expect(reads).toBe(2);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: EXTERNAL_BINDING } })).toBe(0);
+});
+
 test("same-key adoption is immutable and existing v1 preparation cannot be silently converted", async () => {
   const f = await fixture(); await adoptExternalDeliveries(f.input, f.dependencies);
   await expect(adoptExternalDeliveries({ ...f.input, binding: { ...f.manifest, mergeOrder: ["policy", "publisher"] } }, f.dependencies)).rejects.toThrow("different adoption");
