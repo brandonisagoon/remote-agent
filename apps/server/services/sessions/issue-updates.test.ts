@@ -447,3 +447,33 @@ media("a legacy receipt with earlier uploads reports only that this failed prepa
   expect(f.steps).toEqual([]);
   expect((await evidenceOf(f))[0]).toMatchObject({ assetUrl: "https://uploads.linear.app/earlier", attachmentId: "earlier" });
 }, MEDIA_TIMEOUT);
+
+test("mapped implementation children finish through the real update flow while their shared PR and environment remain open", async () => {
+  const { recordWorkMap } = await import("./work-map.ts");
+  const { WorkMapInput } = await import("../tasks/work-map-state.ts");
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { connectionId: f.config.activeConnectionId, issueIdentifier: f.issue.identifier } });
+  const preview = await f.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "review-app", kind: "local-http", purpose: "review", externalId: "http://127.0.0.1:3000", state: "ready" } });
+  const children = ["implementation", "verification"].map(id => ({ ...f.issue, id, identifier: `DRA-${id}`, title: id, parent: { id: f.issue.id, identifier: f.issue.identifier }, completedAt: null, blockedBy: [], blocks: [], url: `https://linear.app/${id}` }));
+  const graph = { id: f.issue.id, identifier: f.issue.identifier, states: f.states, children };
+  const client = { ...f.client, graph: async (_: ServerConfig, query: { id: string }) => query.id === f.issue.id ? graph : { ...graph, id: query.id, children: [] },
+    read: async (_: ServerConfig, query: { id: string }) => children.find(c => c.id === query.id) ?? f.issue,
+    create: async (_: LinearCredential, input: { issueId: string; body: string; id?: string }) => { f.comments.set(input.id!, { id: input.id!, body: input.body, issue: { id: input.issueId } }); return { id: input.id! }; },
+    update: async (_: ServerConfig, query: { id: string }, input: { stateId?: string }) => { children.find(c => c.id === query.id)!.state = f.states.find(s => s.id === input.stateId)!; },
+  };
+  const map = WorkMapInput.parse({ version: 1, requestKey: "map", expectedRevision: 0, units: [
+    { issueId: f.issue.id, kind: "outcome", acceptance: "The product ships", deliveryIds: ["shared"] },
+    ...children.map(c => ({ issueId: c.id, kind: "work-item", acceptance: "Its functional check passed", deliveryIds: ["shared"] })),
+  ], deliveries: [{ id: "shared", scope: "Product PR", boundary: "merge", dependsOn: [], pullRequest: { repository: "owner/product", number: 1, head: "a".repeat(40) } }], remainingConsumers: [{ issueId: f.issue.id, reason: "Retained owner review" }] });
+  await recordWorkMap({ ...f.input, map }, client);
+  for (const child of children) {
+    const result = await publishChildIssueUpdate({ ...f.input, childIssueId: child.id, requestKey: `done-${child.id}`, state: "Done", expectedState: "On Course", evidence: [] }, client);
+    expect(result.published).toBeTrue();
+  }
+  expect(await f.prisma.remoteTaskResource.findUnique({ where: { id: preview.id } })).toEqual(preview);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  expect((await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).status).not.toBe("closed");
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+  await expect(publishSessionIssueUpdate({ ...f.input, requestKey: "parent-done", state: "Done", expectedState: "On Course", evidence: [] }, client)).rejects.toThrow("unobserved");
+  expect(f.comments.size).toBe(2);
+});

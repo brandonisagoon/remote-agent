@@ -1,3 +1,4 @@
+import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
 import { automaticCleanupTurn } from "./cleanup-inbox.ts";
@@ -34,6 +35,7 @@ async function owned(input: FinalizationContext) {
   const session = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
   const lifecycle = task && (input.cleanup || await hasPreparedCleanup(input.prisma, task.id, session.id, input.requestKey));
   if (!task || !task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || !lifecycle && task.phase !== "complete" || session.role !== "primary" || session.status === "closed" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.phase === "closed") throw new Error("Finalization requires the open complete task's original primary");
+  await assertNoRemainingConsumers(input.prisma, task);
   if (input.cleanup) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
   return task;
 }

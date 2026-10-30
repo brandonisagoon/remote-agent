@@ -759,3 +759,50 @@ test("historical administration supplement pins original preparation serializati
   await expect(prepareExternalFinalization({ ...f.finalize, authorityOnly: true }, f.dependencies)).rejects.toThrow("another preparation");
   expect(await lstat(f.worktree).then(() => true, () => false)).toBe(true);
 });
+
+test("DRA195 maps a three-PR outcome onto accepted v2 deliveries without inventing a task PR or rewriting proof", async () => {
+  const { recordWorkMap, workMapProjection, assertMappedIssueDelivery } = await import("../sessions/work-map.ts");
+  const { WorkMapInput } = await import("./work-map-state.ts");
+  const f = await fixture();
+  const thirdPath = path.join(f.copies, "third");
+  const thirdHead = await repository(thirdPath, "third");
+  const previous = f.manifest.deliveries[1]!;
+  f.manifest.deliveries.push({ ...previous, id: "third", repository: "owner/third", pullRequest: 3, sourcePath: thirdPath, reviewedHead: thirdHead,
+    verificationRefs: previous.verificationRefs.map(ref => ({ ...ref, head: thirdHead })) });
+  f.manifest.mergeOrder.push("third");
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  const bindingBefore = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: EXTERNAL_BINDING } });
+  const context = { prisma: db.prisma, config: f.config, sessionId: f.session.id };
+  const graph = { id: f.issue.id, identifier: f.issue.identifier, children: [], states: f.states };
+  const client = { source: f.dependencies.source, graph: async () => graph };
+  const map = WorkMapInput.parse({ version: 1, requestKey: "map-1", expectedRevision: 0,
+    units: [{ issueId: f.issue.id, kind: "outcome", acceptance: "All three accepted deliveries", deliveryIds: f.manifest.mergeOrder }],
+    deliveries: f.manifest.deliveries.map(d => ({ id: d.id, scope: d.id, boundary: "merge", dependsOn: [],
+      proposed: { repository: d.repository, branch: d.branch, baseBranch: d.baseBranch }, pullRequest: { repository: d.repository, number: d.pullRequest, head: d.id === "third" ? "0".repeat(40) : d.reviewedHead } })),
+    remainingConsumers: [],
+  });
+  const first = await recordWorkMap({ ...context, map }, client);
+  const partial = await workMapProjection(context, graph);
+  expect(partial.mapping!.deliveries.map(d => d.boundaryObserved)).toEqual([true, true, false]);
+  expect(partial.mapping!.deliveries.map(d => d.facts.deployed)).toEqual([null, null, null]);
+  await expect(assertMappedIssueDelivery(context, graph, f.issue.id)).rejects.toThrow("unobserved");
+  map.requestKey = "map-2"; map.expectedRevision = first.revision; map.deliveries[2]!.pullRequest!.head = thirdHead;
+  const mapped = await recordWorkMap({ ...context, map }, client);
+  await assertMappedIssueDelivery(context, graph, f.issue.id);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  expect(prepared.delivery.deliveries).toHaveLength(3);
+  const savedPreparation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  const held = await recordWorkMap({ ...context, map: { ...map, requestKey: "remaining-review", expectedRevision: mapped.revision, remainingConsumers: [{ issueId: f.issue.id, reason: "Combined review still uses the environment" }] } }, client);
+  await expect(prepareExternalFinalization({ ...f.finalize, authorityOnly: true }, f.dependencies)).rejects.toThrow("explicitly recorded work consumers");
+  await recordWorkMap({ ...context, map: { ...map, requestKey: "review-finished", expectedRevision: held.revision } }, client);
+  await f.remove();
+  await confirmExternalFinalization(f.finalize, f.dependencies);
+  await confirmExternalFinalization(f.finalize, f.dependencies);
+  expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: savedPreparation.sequence } })).toEqual(savedPreparation);
+  expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: bindingBefore.sequence } })).toEqual(bindingBefore);
+  expect(await db.prisma.remoteTask.findUnique({ where: { id: f.task.id } })).toEqual(f.task);
+  expect(await db.prisma.runtimeSession.count()).toBe(1);
+  // A later revoke invalidates current mapped shipping eligibility, not history.
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "delivered-retirement-revoked", key: "owner-revoked", value: "{}" } });
+  expect((await workMapProjection(context, graph)).mapping!.deliveries.every(d => !d.boundaryObserved)).toBeTrue();
+});

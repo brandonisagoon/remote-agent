@@ -1,3 +1,4 @@
+import { assertMappedIssueDelivery } from "./work-map.ts";
 import { rm } from "node:fs/promises";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
@@ -98,6 +99,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     if (target?.type === "completed" && target.name !== "Manual Review") await client.complete({ ...payload, prisma, config, sessionId });
     if (task && target && (target.type === "completed" || target.name === "Manual Review" || target.name === "Merge")) {
       const graph = await client.graph(config, { id: issue.id });
+      if (task.issueIdentifier === issue.identifier && target.type === "completed" && target.name !== "Manual Review") await assertMappedIssueDelivery(input, graph, issue.id);
       const unfinished = [];
       for (const child of graph.children) {
         if (child.state.type === "canceled" || (child.state.type === "completed" && child.state.name !== "Manual Review")) continue;
