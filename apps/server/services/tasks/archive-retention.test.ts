@@ -14,6 +14,7 @@ import { RetirementAuthorityInput, inspectRetirementAuthority, setRetirementAuth
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 import { ARCHIVE_RETENTION, ArchiveRetentionProof, type ArchiveRetentionReceipt } from "./archive-retention-schema.ts";
 import { archiveRetentionProjection, verifyArchiveRetention } from "./archive-retention.ts";
+import { observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { observeSavedArchive } from "./archive-observation.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { adoptLegacyEvidence, manageLegacyEvidence } from "./legacy-evidence.ts";
@@ -95,17 +96,25 @@ async function fixture(options: { prepare?: boolean } = {}) {
   return { ...f, archive, files, manifests, resources, identity, grant, prepared, prepare, app, check };
 }
 
-async function privateFixture(options: { prepare?: boolean } = {}) {
+async function privateFixture(options: { prepare?: boolean; directoryEvidence?: boolean } = {}) {
   const f = await baseFixture(), backups = [], resources = [];
   for (const extended of [false, true]) {
     const backup = await privateBackupFixture(path.join(directory, extended ? "current-backup" : "older-backup"), f.task.id, f.task.issueIdentifier!, extended);
     backups.push(backup);
     resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: extended ? "current-backup" : "older-backup", kind: "private-backup", purpose: "development", externalId: backup.root, state: "ready", metadata: backup.metadata } }));
   }
+  let treeResource;
+  if (options.directoryEvidence) {
+    const environment = path.join(directory, "environment"), original = path.join(environment, "evidence");
+    await mkdir(original, { recursive: true, mode: 0o700 });
+    for (const name of ["secret.env", "run.sh"]) await writeFile(path.join(original,name), await readFile(path.join(backups[1]!.root,"evidence/browser",name)), { mode:0o600 });
+    treeResource = await db.prisma.remoteTaskResource.create({data:{taskId:f.task.id,key:"original-evidence",kind:"evidence",purpose:"browser",externalId:original,state:"ready",metadata:{description:"exact original directory"}}});
+    await db.prisma.remoteTaskResource.create({data:{taskId:f.task.id,key:"environment",kind:"directory",purpose:"development",externalId:environment,state:"allocated"}});
+  }
   const grant = await f.grant(), prepare = () => prepareTaskFinalization(f.input, f.finalizationDependencies);
   const prepared = options.prepare === false ? undefined : await prepare();
   const app = createApp({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
-  return { ...f, archive: backups[0]!.root, files: backups[0]!.files, backups, resources, grant, prepared, prepare, app };
+  return { ...f, archive: backups[0]!.root, files: backups[0]!.files, backups, resources, grant, prepared, prepare, app, treeResource };
 }
 
 function retention(prepared: Awaited<ReturnType<typeof prepareTaskFinalization>>) {
@@ -155,6 +164,26 @@ test("two existing private backups preserve the original v1 preparation and immu
   await writeFile(path.join(f.backups[1]!.root,"README.md"),"changed ancillary bytes");
   await expect(f.prepare()).rejects.toThrow("contents or inode inventory changed");
   expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+});
+
+test("retained private backup proof allows exact directory evidence adoption without weakening its cleanup-root guard", async () => {
+  const f = await privateFixture({directoryEvidence:true}), backup=f.backups[1]!, original=await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({where:{sequence:f.prepared!.preparedRevision}});
+  const tree=await observeLegacyEvidenceTree(f.treeResource!.externalId);
+  const adoption={requestKey:"retain-backup-evidence",finalizationRequestKey:f.prepared!.requestKey,expectedPreparedRevision:f.prepared!.preparedRevision,
+    manifest:{path:path.join(backup.root,"MANIFEST.json"),sha256:backup.selection.manifests[0].sha256,format:"task-backup-evidence-v1" as const},
+    entries:[{type:"tree" as const,resourceId:f.treeResource!.id,retainedPath:path.join(backup.root,"evidence/browser"),inventoryDigest:tree.inventoryDigest}]};
+  await db.prisma.runtimeMetadataEvent.deleteMany({where:{action:ARCHIVE_RETENTION}});
+  await expect(adoptLegacyEvidence({...f.context,adoption})).rejects.toThrow("cleanup root");
+  const retained=retention(await f.prepare());
+  const evidence=await adoptLegacyEvidence({...f.context,adoption});
+  expect(evidence.proof.entries).toHaveLength(1);expect(evidence.proof.manifests).toHaveLength(4);
+  const entry=evidence.proof.entries[0]!;
+  await manageLegacyEvidence({...f.input,operation:{resourceKey:entry.key,action:"authorize",proofRevision:evidence.proofRevision,proofDigest:evidence.proofDigest,preparedRevision:original.sequence,finalizationRequestKey:f.prepared!.requestKey}},
+    {prepare:()=>f.prepare()});
+  expect(retention(await f.prepare())).toEqual(retained);
+  for(const record of f.resources)expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({where:{id:record.id}})).toEqual(record);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({where:{sequence:original.sequence}})).value).toBe(original.value);
+  expect(await lstat(entry.target.path)).toBeDefined();
 });
 
 test.each(["late", "unbound-manifest", "overlap"])("private backup %s cannot acquire a retention exception", async variant => {

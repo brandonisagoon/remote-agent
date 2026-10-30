@@ -11,8 +11,8 @@ export async function privateBackupFixture(root: string, taskId: string, issue: 
     await writeFile(path.join(root, name), body, { mode }); files.push(name);
     return { file: name, sha256: sha(body), bytes: Buffer.byteLength(body) };
   }
-  async function component(dir: string, manifest: string) {
-    const a = await file(`${dir}/secret.env`, "fake fixture configuration\n", 0o400), b = await file(`${dir}/run.sh`, "fixture bytes, never executed\n", 0o700);
+  async function component(dir: string, manifest: string, evidence = false) {
+    const a = await file(`${dir}/secret.env`, "fake fixture configuration\n", evidence ? 0o600 : 0o400), b = await file(`${dir}/run.sh`, "fixture bytes, never executed\n", evidence ? 0o600 : 0o700);
     const content = `${a.sha256}  ./secret.env\n${b.sha256}  ./run.sh\n`;
     const document = await file(manifest, content);
     return { dir, manifest, manifestSha256: document.sha256, files: 2 };
@@ -27,7 +27,7 @@ export async function privateBackupFixture(root: string, taskId: string, issue: 
     purposes[purpose] = { mysql, postgis, redis, objects: { count: 1, bytes: object.bytes, manifest: doc.file, manifestSha256: doc.sha256 }, runtimeConfig,
       ...(extended && purpose === "review" ? { receipt: await file("review/review-receipt.json", "{\"fixture\":true}\n") } : {}) };
   }
-  const evidence = extended ? { browserEvidence: await component("evidence/browser", "evidence-browser.sha256"), worktreeLocal: await component("evidence/local", "evidence-local.sha256") } : undefined;
+  const evidence = extended ? { browserEvidence: await component("evidence/browser", "evidence-browser.sha256", true), worktreeLocal: await component("evidence/local", "evidence-local.sha256", true) } : undefined;
   const bundle = extended ? await file("git/task.bundle", "retained git bytes; not a restore claim\n") : undefined;
   await file("README.md", "Ancillary material observed now, without historical provenance\n");
   const manifest = { version: 1, taskId, purposes, ...(extended ? { issue, evidence, git: { bundle: bundle!.file, sha256: bundle!.sha256, bytes: bundle!.bytes } } : {}) };
