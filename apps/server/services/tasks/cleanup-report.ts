@@ -65,7 +65,7 @@ export async function publishCleanupReport(input: Context, client = cleanupRepor
   const config = scopeConfig(input.config, { repositoryId: saved.active.prepared.repositoryId, connectionId: frozen.connectionId });
   const issue = await client.read(config, { id: frozen.issueId });
   if (!issue || issue.id !== frozen.issueId || issue.identifier !== frozen.issueIdentifier) throw new Error("Cleanup report source identity changed");
-  const matches = (comment: Awaited<ReturnType<typeof client.comment>>) => Boolean(comment && comment.id === frozen.reportId && comment.issue?.id === frozen.issueId && comment.body === frozen.payload.body);
+  const matches = (comment: Awaited<ReturnType<typeof client.comment>>) => Boolean(comment && comment.id === frozen.reportId && comment.issue?.id === frozen.issueId && !comment.parentId && comment.body === frozen.payload.body);
   let existing = await client.comment(config.linearApiKey, frozen.reportId);
   if (existing && !matches(existing)) throw new Error("Cleanup report comment identity or body changed");
   if (!existing) {
