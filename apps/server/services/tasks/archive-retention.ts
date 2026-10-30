@@ -5,7 +5,7 @@ import type { PrismaClient, RemoteTaskResource } from "../../../../generated/pri
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { PreparedFinalization } from "./finalization-receipts.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
-import { archiveMember, observeSavedArchive } from "./archive-observation.ts";
+import { archiveMember, observeSavedArchive, type SavedArchiveSelection } from "./archive-observation.ts";
 import { ARCHIVE_RETENTION, ArchiveRetentionProof, ArchiveRetentionReceipt, ArchiveRetentionCheck } from "./archive-retention-schema.ts";
 import { latestRetirement, RetirementGrant, retirementDigest } from "./retirement-receipts.ts";
 import { activeCleanupRoots } from "./cleanup-scope.ts";
@@ -14,7 +14,7 @@ type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "remoteTask
 type Context = { prisma: PrismaClient; config: ServerConfig; preparedRevision: number; taskId: string };
 const within = (root: string, file: string) => file === root || file.startsWith(`${root}${path.sep}`);
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
-const archiveResources = (resources: RemoteTaskResource[]) => resources.filter(resource => resource.kind === "evidence-archive" && ["development", "review", "browser"].includes(resource.purpose));
+const archiveResources = (resources: RemoteTaskResource[]) => resources.filter(resource => ["evidence-archive", "private-backup"].includes(resource.kind) && ["development", "review", "browser"].includes(resource.purpose));
 const where = (taskId: string, sessionId: string) => ({ runtimeSessionId: sessionId, source: `finalizer-archives:${taskId}`, action: ARCHIVE_RETENTION });
 
 /** Read-only identity checks also support closed-task upkeep. A confirmed close
@@ -96,14 +96,24 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
     await verifyFiles(loaded.proof); await load(input.prisma, input.config, task.id, prior.sequence);
     return loaded.receipt;
   }
-  const candidates = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, kind: "evidence-archive", purpose: { in: ["development", "review", "browser"] }, state: { not: "released" } } });
+  const candidates = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, kind: { in: ["evidence-archive", "private-backup"] }, purpose: { in: ["development", "review", "browser"] }, state: { not: "released" } } });
   if (!candidates.length) return undefined;
   const current = await context(input.prisma, input.config, task.id, input.preparedRevision);
   if (current.task.phase !== "complete" || current.session.status === "closed") throw new Error("New archive retention requires the open prepared primary");
   if (candidates.some(resource => resource.createdAt > current.event.occurredAt)) throw new Error("Saved archive was not registered before the existing preparation");
   const Manifest = z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/), entries: z.number().int().nonnegative().optional() }).passthrough();
   const Root = z.object({ archival: z.literal(true), manifest: Manifest, addenda: z.array(Manifest).max(20).optional(), finalCleanupReceipt: z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).optional() }).passthrough();
-  const roots = candidates.flatMap(resource => { const parsed = Root.safeParse(resource.metadata); return parsed.success ? [{ resource, metadata: parsed.data }] : []; });
+  type RootMetadata = Pick<z.infer<typeof Root>, "manifest" | "addenda" | "finalCleanupReceipt"> & { format?: "task-private-backup/v1" };
+  const roots = candidates.flatMap(resource => {
+    if (resource.kind === "private-backup") {
+      const metadata = z.object({ manifest: z.string() }).passthrough().parse(resource.metadata);
+      const match = /^(MANIFEST\.json) \(sha256 ([a-f0-9]{64})\)$/.exec(metadata.manifest);
+      if (!match) throw new Error("Private backup requires its exact recorded manifest digest");
+      return [{ resource, metadata: { manifest: { path: match[1]!, sha256: match[2]! }, format: "task-private-backup/v1" as const } as RootMetadata }];
+    }
+    const parsed = Root.safeParse(resource.metadata);
+    return parsed.success ? [{ resource, metadata: { manifest: parsed.data.manifest, addenda: parsed.data.addenda, finalCleanupReceipt: parsed.data.finalCleanupReceipt } as RootMetadata }] : [];
+  });
   if (!roots.length || roots.some((root, index) => roots.some((other, otherIndex) => index !== otherIndex && within(root.resource.externalId, other.resource.externalId)))) throw new Error("Saved archives require separate exact registered manifest roots");
   const archives: ArchiveRetentionProof["archives"] = [];
   for (const { resource, metadata } of roots) {
@@ -111,7 +121,9 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
     if (!path.isAbsolute(root) || path.normalize(root) !== root || [current.prepared.worktree, current.prepared.gitCwd, current.prepared.gitDirectory, current.task.toolingRoot, current.task.pinnedToolingRoot].filter((value): value is string => Boolean(value)).some(file => within(file, root) || within(root, file))) throw new Error("Saved archive overlaps a protected repository or cleanup root");
     if (activeCleanupRoots(current.resources, new Set(candidates.map(candidate => candidate.id))).some(other => within(root, other) || within(other, root))) throw new Error("Saved archive overlaps another active cleanup resource");
     const manifests = [metadata.manifest, ...(metadata.addenda ?? [])].map(({ path, sha256, entries }) => ({ path, sha256, ...(entries === undefined ? {} : { entries }) }));
-    const selection = { root, manifests, taskId: task.id, issueIdentifier: current.prepared.issueIdentifier, mergeCommit: current.prepared.delivery.receipts.merge.sha! };
+    const selection: SavedArchiveSelection = metadata.format === "task-private-backup/v1"
+      ? { format: metadata.format, root, manifests: [manifests[0]!], taskId: task.id, issueIdentifier: current.prepared.issueIdentifier }
+      : { root, manifests, taskId: task.id, issueIdentifier: current.prepared.issueIdentifier, mergeCommit: current.prepared.delivery.receipts.merge.sha! };
     const observed = await observeSavedArchive(selection);
     if (metadata.finalCleanupReceipt) {
       const absolute = archiveMember(root, metadata.finalCleanupReceipt.path), file = observed.inventory.find(entry => path.join(root, entry.path) === absolute);
@@ -123,10 +135,12 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
     const containing = archives.filter(archive => within(archive.selection.root, resource.externalId));
     if (containing.length !== 1) throw new Error("Saved archive receipt is outside its verified root");
     const archive = containing[0]!, relative = path.relative(archive.selection.root, resource.externalId) || ".";
-    const member = archive.inventory.find(entry => entry.path === relative), metadata = z.object({ archival: z.literal(true), sha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }).passthrough().parse(resource.metadata);
+    const member = archive.inventory.find(entry => entry.path === relative), metadata: { sha256?: string } = resource.kind === "private-backup"
+      ? {} : z.object({ archival: z.literal(true), sha256: z.string().regex(/^[a-f0-9]{64}$/).optional() }).passthrough().parse(resource.metadata);
+    if (resource.kind === "private-backup" && (archive.rootResourceId !== resource.id || relative !== "." || !("format" in archive.selection))) throw new Error("Private backup receipt must be its independently verified root");
     if (!member || !["file", "directory"].includes(member.kind) || metadata.sha256 && (member.kind !== "file" || member.sha256 !== metadata.sha256)) throw new Error("Saved archive receipt has no matching verified member");
     const first = archive.selection.manifests[0]!;
-    return { ...finalizationResourceIdentity(resource), kind: "evidence-archive" as const, disposition: "retain-archive" as const, state: resource.state,
+    return { ...finalizationResourceIdentity(resource), kind: resource.kind as "evidence-archive" | "private-backup", disposition: "retain-archive" as const, state: resource.state,
       archive: { root: archive.selection.root, manifestPath: archiveMember(archive.selection.root, first.path), manifestSha256: first.sha256, inventoryDigest: archive.inventoryDigest } };
   });
   const proof = ArchiveRetentionProof.parse({ version: 1, taskId: task.id, sessionId: current.session.id, requestKey: current.prepared.requestKey, preparedRevision: current.event.sequence, preparedDigest: current.preparedDigest,
