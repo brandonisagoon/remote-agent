@@ -161,6 +161,7 @@ test("an existing retained-evidence proof authorizes and independently confirms 
   const dependencies = { prepare: (input: Parameters<typeof prepareTaskFinalization>[0]) => prepareTaskFinalization(input, f.finalization) };
   await manageLegacyEvidence({ ...f.finalizer, operation: { ...operation, action: "authorize" } }, dependencies);
   const target = proof.proof.entries[0]!.target, q = target.quarantine;
+  if (target.type !== "file") throw new Error("Expected file fixture");
   await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
   await writeFile(q.journal, JSON.stringify({ version: 1, taskId: "task", resourceId: resource.id, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: q.path,
     source: { dev: target.dev, ino: target.ino, mode: target.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });

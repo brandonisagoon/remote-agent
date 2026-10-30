@@ -4,7 +4,7 @@ import { SavedArchiveSelection } from "./archive-observation.ts";
 
 export const ARCHIVE_RETENTION = "finalization-archive-retention";
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
-export const ArchiveRetentionResource = RetainedArchivePlan.extend({ kind: z.literal("evidence-archive"), state: z.string().refine(value => value !== "released") }).strict();
+export const ArchiveRetentionResource = RetainedArchivePlan.extend({ kind: z.enum(["evidence-archive", "private-backup"]), state: z.string().refine(value => value !== "released") }).strict();
 const Identity = {
   version: z.literal(1), taskId: z.string(), sessionId: z.string(), requestKey: z.string(),
   preparedRevision: z.number().int().positive(), preparedDigest: Digest, contractRevision: z.number().int().positive(),
