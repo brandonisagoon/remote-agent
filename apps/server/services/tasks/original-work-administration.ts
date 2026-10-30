@@ -108,7 +108,9 @@ export async function originalAdministrationAlreadyRetired(taskId: string, proof
   const pointer = await observeLegacyEvidenceFile(path.join(source.physicalPath, ".git"), false, 16384);
   const expected = proof.target.inventory.find(entry => entry.path === ".git");
   if (!expected || finalizationDigest({ ...pointer, path: ".git", kind: "file" }) !== finalizationDigest(expected)) throw new Error("Retired original pointer changed");
-  const match = /^gitdir: (\/[^\n\r\0]+)\n?$/.exec((await readArchiveBytes(pointer.path, 16384)).toString());
+  const bytes = await readArchiveBytes(pointer.path, 16384);
+  if (createHash("sha256").update(bytes).digest("hex") !== pointer.sha256) throw new Error("Retired original pointer changed during observation");
+  const match = /^gitdir: (\/[^\n\r\0]+)\n?$/.exec(bytes.toString());
   const admin = match?.[1];
   if (!admin || path.normalize(admin) !== admin || path.dirname(admin) !== path.join(proof.restore.gitDirectory, "worktrees")) throw new Error("Retired original pointer scope changed");
   return !(await selectedRegistration(proof)).selected.length && !await missing(admin);

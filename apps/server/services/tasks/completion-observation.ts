@@ -21,6 +21,13 @@ async function run(client: CommandClient, cwd: string, command: string, args: st
 export function observeCompletionSnapshot(cwd: string, client: CommandClient = bunCommandClient): Promise<CompletionSnapshot> {
   return preparationStage("fingerprint", () => readCompletionSnapshot(cwd, client));
 }
+/** Preserve existing Git configuration semantics while forbidding optional
+ * index refresh and filesystem-monitor hooks during a frozen capture proof. */
+export function observeReadonlyCompletionSnapshot(cwd: string): Promise<CompletionSnapshot> {
+  return observeCompletionSnapshot(cwd, { run(command, args, options) {
+    return bunCommandClient.run(command, command === "git" ? ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args] : args, options);
+  } });
+}
 async function readCompletionSnapshot(cwd: string, client: CommandClient): Promise<CompletionSnapshot> {
   const git = (...args: string[]) => run(client, cwd, "git", args);
   const head = await git("rev-parse", "--verify", "HEAD");

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { finalizationDigest, finalizationResourceObservation, type ResourceObservation } from "./finalization-resources.ts";
 import { FINALIZATION_PREPARED } from "./finalization-receipts.ts";
@@ -7,6 +8,7 @@ import { assertOriginalAdministration, prepareOriginalAdministration, originalAd
 
 export const ORIGINAL_ADMINISTRATION = "finalization-original-administration";
 type Database = Pick<PrismaClient, "runtimeMetadataEvent">;
+const bytesDigest = (value: string) => createHash("sha256").update(value).digest("hex");
 const scope = (prepared: PreparedExternalFinalization) => ({ runtimeSessionId: prepared.sessionId, source: `finalizer-original:${prepared.taskId}`, action: ORIGINAL_ADMINISTRATION, key: prepared.requestKey });
 async function preparation(db: Database, prepared: PreparedExternalFinalization, revision: number) {
   const event = await db.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
@@ -23,7 +25,7 @@ export async function originalAdministrationReceipt(db: Database, prepared: Prep
   if (!prepared.originalWork || prepared.originalWork.administration) throw new Error("Unexpected original administration supplement");
   const original = await preparation(db, prepared, preparedRevision), proof = OriginalAdministrationProof.parse(JSON.parse(event.value!));
   if (proof.taskId !== prepared.taskId || proof.sessionId !== prepared.sessionId || proof.requestKey !== prepared.requestKey || proof.preparedRevision !== preparedRevision
-    || proof.preparedDigest !== finalizationDigest(JSON.parse(original.value!)) || proof.originalWorkDigest !== finalizationDigest(prepared.originalWork)) throw new Error("Original administration supplement belongs to another preparation");
+    || proof.preparedDigest !== bytesDigest(original.value!) || proof.originalWorkDigest !== finalizationDigest(prepared.originalWork)) throw new Error("Original administration supplement belongs to another preparation");
   return OriginalAdministrationReceipt.parse({ revision: event.sequence, digest: finalizationDigest(proof), proof });
 }
 
@@ -49,13 +51,15 @@ export async function ensureOriginalAdministration(input: { prisma: PrismaClient
   const administration = alreadyRetired ? null : await prepareOriginalAdministration(prepared.taskId, original);
   if (administration) await assertOriginalAdministration({ taskId: prepared.taskId, originalWork: original, administration, removed: false }, observation);
   await input.assertAuthority(input.prisma);
+  const savedPreparation = await preparation(input.prisma, prepared, preparedRevision);
   const proof = OriginalAdministrationProof.parse({ version: 1, taskId: prepared.taskId, sessionId: prepared.sessionId, requestKey: prepared.requestKey,
-    preparedRevision, preparedDigest: finalizationDigest(prepared), originalWorkDigest: finalizationDigest(original), administration });
+    preparedRevision, preparedDigest: bytesDigest(savedPreparation.value!), originalWorkDigest: finalizationDigest(original), administration });
   // All expensive physical observations finished above. Only local authority and
   // immutable receipt CAS run in this transaction; unique index prevents forks.
   return input.prisma.$transaction(async tx => {
     await input.assertAuthority(tx as PrismaClient);
-    await preparation(tx, prepared, preparedRevision);
+    const unchanged = await preparation(tx, prepared, preparedRevision);
+    if (unchanged.value !== savedPreparation.value) throw new Error("Original preparation bytes changed during supplementation");
     const prior = await originalAdministrationReceipt(tx, prepared, preparedRevision);
     if (prior) throw new Error("Original administration was supplemented concurrently; retry the same preparation");
     const event = await tx.runtimeMetadataEvent.create({ data: { ...scope(prepared), value: JSON.stringify(proof) } });

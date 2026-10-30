@@ -707,3 +707,13 @@ test.skipIf(!process.env.DRAFTED_LEGACY_ROOT).each([false, true])("old strict cl
   expect(() => FinalizationReceipt.parse(prepared)).toThrow();
   expect(await lstat(f.worktree).then(() => true, () => false)).toBe(true);
 });
+
+test("historical administration supplement pins original preparation serialization bytes", async () => {
+  const f = await originalFixture(false, true); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  expect(prepared.originalWorkAdministration!.proof.preparedDigest).toBe(createHash("sha256").update(event.value!).digest("hex"));
+  await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: JSON.stringify(JSON.parse(event.value!), null, 2) } });
+  await expect(prepareExternalFinalization({ ...f.finalize, authorityOnly: true }, f.dependencies)).rejects.toThrow("another preparation");
+  expect(await lstat(f.worktree).then(() => true, () => false)).toBe(true);
+});
