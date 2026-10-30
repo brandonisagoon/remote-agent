@@ -16,6 +16,15 @@ const adapters: Record<string, z.infer<typeof CleanupAdapter>> = {
   "task-runtime": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
 };
 export const hasCleanupAdapter = (kind: string) => Object.hasOwn(adapters, kind);
+/** Old endpoint receipts may describe a superseded process using a port now
+ * owned by another receipt. Only independently addressable historical Docker
+ * identities enter the absence observer; history alone grants no effect. */
+export function hasHistoricalCleanupAdapter(resource: { kind: string; metadata?: unknown }) {
+  if (["docker-container", "docker-network", "docker-volume"].includes(resource.kind)) return true;
+  if (!["docker-compose", "docker-compose-project"].includes(resource.kind)) return false;
+  const metadata = resource.metadata;
+  return Boolean(metadata && typeof metadata === "object" && !Array.isArray(metadata) && "containers" in metadata && "configPath" in metadata);
+}
 const same = (left: unknown, right: unknown) => JSON.stringify(left) === JSON.stringify(right);
 
 function resultScope(input: z.infer<typeof CleanupObserverBatchInput>, value: unknown, identities: Map<string, string>) {
@@ -41,6 +50,8 @@ export async function prepareCleanupAdapterResources(input: { context: CleanupAd
   const result = resultScope(request, await observe({ capability: input.context.capability, request }), new Map(input.identities.map(identity => [identity.id, identity.identityDigest])));
   return input.identities.map(identity => {
     const observed = result.observations.find(item => item.resourceId === identity.id)!;
+    if (input.resources.find(resource => resource.id === identity.id)!.state === "released"
+      && (!observed.absent || observed.targets.some(target => target.presentAtPrepare))) throw new Error("Historical released adapter is still present or has no initial absence proof");
     return CleanupAdapterPlan.parse({ ...identity, disposition: "retire-adapter", dependencies: observed.dependencies, stoppedConsumers: observed.stoppedConsumers, adapter: observed.adapter, targets: observed.targets, observer: input.context });
   });
 }
@@ -64,4 +75,5 @@ export async function assertCleanupAdapterResources(input: { taskId: string; res
       if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Prepared store retirement still has an active or unverified native consumer");
     }
   }
+  return result;
 }

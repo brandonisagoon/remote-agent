@@ -107,6 +107,38 @@ test("the actual finalization planner binds adapters and rechecks their absence 
   expect(f.calls()).toBe(4);
 });
 
+test("historical Released adapter receipts require independent absence before adoption", async () => {
+  const { prepareFinalizationResources, assertFinalizationResources } = await import("./finalization-resources.ts");
+  const f = fixture(), resources = f.resources.slice(0, 5);
+  for (const resource of resources) resource.state = "released";
+  const observation = { adapters: f.observe, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
+  const input = { resources, taskId: f.task.id, sessionId: f.task.primarySessionId, toolingRoot: f.context.capability.checkout,
+    sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true, adapterContext: f.context };
+  await expect(prepareFinalizationResources(input, observation)).rejects.toThrow("Historical released adapter is still present");
+  expect(f.calls()).toBe(1);
+  const absentObserver = async (request: Parameters<typeof f.observe>[0]) => {
+    const result = await f.observe(request);
+    return { ...result, observations: result.observations.map(item => ({ ...item, absent: true, presentTargetDigests: [], targets: item.targets.map(target => {
+      const absent = CleanupTarget.parse({ ...target, presentAtPrepare: false, identity: null });
+      return { ...absent, identityDigest: cleanupTargetDigest(absent) };
+    }) })) };
+  };
+  const plan = await prepareFinalizationResources(input, { ...observation, adapters: absentObserver });
+  expect(plan.every(entry => entry.disposition === "retire-adapter" && entry.targets.every(target => !target.presentAtPrepare))).toBeTrue();
+  await assertFinalizationResources({ taskId: f.task.id, resources, plan, removed: true, originalWork: true }, { ...observation, adapters: absentObserver });
+  await expect(assertFinalizationResources({ taskId: f.task.id, resources, plan, removed: true, originalWork: true }, observation)).rejects.toThrow("invalid resource proof");
+  expect(resources.every(resource => resource.state === "released")).toBeTrue();
+});
+
+test("unsupported historical receipts remain explicitly recorded history without effect authority", async () => {
+  const { prepareFinalizationResources } = await import("./finalization-resources.ts");
+  const f = fixture(), historical = { ...f.resources[0]!, kind: "old-unsupported-logical-result", state: "released" };
+  const plan = await prepareFinalizationResources({ resources: [historical], taskId: f.task.id, sessionId: f.task.primarySessionId,
+    toolingRoot: f.context.capability.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true });
+  expect(plan).toEqual([{ ...finalizationResourceIdentity(historical), purpose: historical.purpose, disposition: "already-released" }]);
+  expect(f.calls()).toBe(0);
+});
+
 test("physical planning cannot infer a capability or silently drop unsupported resources", async () => {
   const { prepareFinalizationResources } = await import("./finalization-resources.ts");
   const f = fixture(), input = { resources: f.resources.slice(0, 5), taskId: f.task.id, sessionId: f.task.primarySessionId,
