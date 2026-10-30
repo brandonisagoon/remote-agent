@@ -7,6 +7,7 @@ import { assertFinalizationPath, finalizationDigest, type FinalizationInventoryE
 import { observeLegacyEvidenceFile } from "./legacy-evidence-files.ts";
 
 const MAX_BYTES = 512 * 1024 * 1024;
+const PRIVATE_ARCHIVE_FILE_MODES = [0o600, 0o700];
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const inside = (root: string, file: string) => file.startsWith(`${root}${path.sep}`);
 
@@ -21,7 +22,7 @@ export async function privateArchiveInventory(root: string, backup = false) {
   async function visit(file: string) {
     if (inventory.length >= 250_000) throw new Error("Archive inventory exceeds its entry bound");
     const before = await lstat(file), relative = path.relative(root, file) || ".";
-    if (before.dev !== rootStat.dev || before.uid !== process.getuid?.() || (before.isDirectory() ? (before.mode & 0o7777) !== 0o700 : !(backup ? [0o400, 0o600, 0o700] : [0o600]).includes(before.mode & 0o7777))) throw new Error("Retained archive must be private and task-owned");
+    if (before.dev !== rootStat.dev || before.uid !== process.getuid?.() || (before.isDirectory() ? (before.mode & 0o7777) !== 0o700 : !(backup ? [0o400, 0o600, 0o700] : PRIVATE_ARCHIVE_FILE_MODES).includes(before.mode & 0o7777))) throw new Error("Retained archive must be private and task-owned");
     if (before.isDirectory()) {
       inventory.push({ path: relative, kind: "directory", dev: before.dev, ino: before.ino, mode: before.mode });
       const children = (await readdir(file)).sort();
@@ -30,7 +31,9 @@ export async function privateArchiveInventory(root: string, backup = false) {
       if (before.dev !== after.dev || before.ino !== after.ino || before.mode !== after.mode || before.uid !== after.uid || JSON.stringify(children) !== JSON.stringify((await readdir(file)).sort())) throw new Error("Archive directory changed during observation");
     } else {
       if (!before.isFile() || before.size + total > byteLimit || ++files > 10_025) throw new Error("Archive contains unsupported or excessive material");
-      const observed = backup ? await observeBackupFile(file, byteLimit - total) : await observeLegacyEvidenceFile(file, true); total += observed.size;
+      // Mode is checked above and compared again below. Owner-only executable
+      // members are retained bytes, never executable inputs to this observer.
+      const observed = backup ? await observeBackupFile(file, byteLimit - total) : await observeLegacyEvidenceFile(file, false); total += observed.size;
       if (total > byteLimit || before.dev !== observed.dev || before.ino !== observed.ino || before.mode !== observed.mode) throw new Error("Archive file changed during observation");
       inventory.push({ kind: "file", path: relative, dev: observed.dev, ino: observed.ino, mode: observed.mode, size: observed.size, sha256: observed.sha256 });
     }
@@ -85,7 +88,8 @@ export async function observeArchive(root: string, manifestPath: string, manifes
   if (!entries.size) throw new Error("Archive manifest is empty");
   for (const entry of inventory) {
     if (entry.kind !== "directory" && entry.kind !== "file" || entry.kind === "file" && (path.join(root, entry.path) === manifestPath ? entry.sha256 !== manifestSha256 : entries.get(entry.path) !== entry.sha256)) throw new Error("Archive contains unmanifested or unsupported material");
-    if ((entry.mode & 0o7777) !== (entry.kind === "directory" ? 0o700 : 0o600)) throw new Error("Retained archive must be private");
+    const mode = entry.mode & 0o7777;
+    if (entry.kind === "directory" ? mode !== 0o700 : path.join(root, entry.path) === manifestPath ? mode !== 0o600 : !PRIVATE_ARCHIVE_FILE_MODES.includes(mode)) throw new Error("Retained archive must be private");
   }
   return { inventory, inventoryDigest: finalizationDigest(inventory), entries };
 }
@@ -125,7 +129,7 @@ export async function observeSavedArchive(value: SavedArchiveSelection) {
     const file = files.get(name);
     if (!file || file.sha256 !== expected.sha256 || expected.size !== undefined && file.size !== expected.size) throw new Error("Saved archive member differs from its manifest");
   }
-  for (const [name, expected] of documents) if (files.get(name)?.sha256 !== expected) throw new Error("Saved archive manifest changed during observation");
+  for (const [name, expected] of documents) if (files.get(name)?.sha256 !== expected || ((files.get(name)?.mode ?? 0) & 0o7777) !== 0o600) throw new Error("Saved archive manifest identity or private mode changed during observation");
   const ancillary = [...files.values()].filter(entry => !entries.has(entry.path) && !documents.has(entry.path)).map(({ path, size, sha256 }) => ({ path, size, sha256 }));
   return { inventory, inventoryDigest: finalizationDigest(inventory), ancillary, manifestEntries: entries.size };
 }
