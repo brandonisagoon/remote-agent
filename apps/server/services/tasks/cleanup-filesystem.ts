@@ -110,7 +110,7 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
  * renewals so another task cannot acquire a recorded path inside the capture. */
 export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
   const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree");
-  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.retainedAdministration.path] : [])]);
+  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
   if (!scopes.length) return;
   const ancestors = new Set<string>();

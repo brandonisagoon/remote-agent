@@ -36,7 +36,7 @@ export const LinkedWorktreePlan = z.object({ ...Identity, kind: z.literal("git-w
     repositoryIdentity: z.object(NodeIdentity).strict(), commonIdentity: z.object(NodeIdentity).strict(), administrativeIdentity: z.object(NodeIdentity).strict(),
     head: z.string().regex(/^[a-f0-9]{40}$/), branch: z.string().min(1).nullable(), pointer: FrozenFile, index: FrozenFile,
     administrativeInventory: z.array(FinalizationInventoryEntry).min(1).max(256) }).strict(),
-  retainedAdministration: z.object({ path: Absolute, inventoryDigest: Sha }).strict(),
+  administrationCapture: FinalizationTreeTarget.extend({ sourceParent: z.object({ path: Absolute, ...NodeIdentity }).strict(), quarantineParent: z.object({ path: Absolute, ...NodeIdentity }).strict() }).strict(),
   installedDependencies: z.array(z.object({ path: Absolute, ...NodeIdentity, packageFiles: z.array(FrozenFile).min(2).max(10) }).strict()).max(100),
 }).strict();
 export const RegisteredTreePlan = z.object({ ...Identity, disposition: z.literal("retire-tree"), treeKind: z.literal("registered-directory"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), target: FinalizationTreeTarget }).strict();
@@ -430,14 +430,14 @@ async function readQuarantineJournal(file: string) {
 /** Observes a frozen capture; never creates, repairs, restores, or removes its
  * contents. A pending journal can precede rename, but missing source without a
  * matching capture is never proof of retirement. */
-export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget; quarantineParent?: { path: string; dev: number; ino: number; mode: number }; sourceParent?: { path: string; dev: number; ino: number; mode: number } }) {
+export async function inspectFinalizationQuarantine(input: { taskId: string; resourceId: string; target: TreeTarget; quarantineParent?: { path: string; dev: number; ino: number; mode: number }; sourceParent?: { path: string; dev: number; ino: number; mode: number }; ownedQuarantineParent?: boolean }) {
   const { target } = input, { quarantine } = target;
   const destinationParent = input.quarantineParent;
   if (destinationParent && !input.sourceParent) throw new Error("External quarantine requires both frozen parent identities");
   if (destinationParent) {
     await assertFinalizationPath(destinationParent.path);
     const parent = await lstat(destinationParent.path);
-    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (parent.mode & 0o7777) !== 0o700 || parent.dev !== destinationParent.dev || parent.ino !== destinationParent.ino || parent.mode !== destinationParent.mode || parent.dev !== target.inventory[0]?.dev) throw new Error("Quarantine destination parent identity changed");
+    if (!parent.isDirectory() || parent.uid !== process.getuid?.() || (input.ownedQuarantineParent ? (parent.mode & 0o022) !== 0 : (parent.mode & 0o7777) !== 0o700) || parent.dev !== destinationParent.dev || parent.ino !== destinationParent.ino || parent.mode !== destinationParent.mode || parent.dev !== target.inventory[0]?.dev) throw new Error("Quarantine destination parent identity changed");
   }
   if (path.dirname(quarantine.directory) !== (destinationParent?.path ?? path.dirname(target.path)) || quarantine.directory === target.path || quarantine.path !== path.join(quarantine.directory, "contents") || quarantine.journal !== path.join(quarantine.directory, "pending.json") || !/^\.drafted-finalization-[0-9a-f-]{36}$/.test(path.basename(quarantine.directory))) throw new Error("Quarantine location does not match its frozen source root");
   await assertFinalizationPath(target.path);
