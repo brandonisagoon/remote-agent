@@ -2,7 +2,7 @@ import { startRuntimeEventProjection } from "../sessions/runtime-events/projecti
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { taskSupervisionRoutes } from "../../routes/tasks/supervision.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
@@ -20,6 +20,7 @@ import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
 import { taskRoutes, sessionTaskRoutes } from "../../routes/tasks/index.ts";
+import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -31,7 +32,7 @@ function git(cwd: string, ...args: string[]) {
   return result.stdout.toString().trim();
 }
 
-async function fixture() {
+async function fixture(taskId = "task") {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree");
   await mkdir(root); git(root, "init", "-b", "main");
   git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
@@ -39,7 +40,7 @@ async function fixture() {
   git(root, "worktree", "add", "-b", "codex/task", worktree);
   const config = testConfig({ repository: { ...testConfig().repository, root } });
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", cwd: worktree, repositoryId: config.repository.id, machineId: config.machine } });
-  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-75", primarySessionId: session.id, branchName: "codex/task", worktreePath: worktree, toolingRoot: directory, toolingRevision: "a".repeat(40), phase: "complete" } });
+  const task = await db.prisma.remoteTask.create({ data: { id: taskId, requestKey: taskId, repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-75", primarySessionId: session.id, branchName: "codex/task", worktreePath: worktree, toolingRoot: directory, toolingRevision: "a".repeat(40), phase: "complete" } });
   const link = await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-75", relationship: "handles" } });
   const states = [{ id: "merge", name: "Merge", type: "started" }, { id: "done", name: "Done", type: "completed" }, { id: "blocked", name: "Blocked", type: "started" }];
   const issue = { id: "issue", identifier: "DRA-75", branchName: "codex/task", title: "Task", description: "Request", state: states[0]!, team: { states: { nodes: states } }, labels: { nodes: [] }, relations: { nodes: [] }, inverseRelations: { nodes: [] } };
@@ -49,7 +50,7 @@ async function fixture() {
   const head = git(worktree, "rev-parse", "HEAD");
   const remote = { remote: "origin", repository: "owner/product", remoteHead: head, remoteBase: "b".repeat(40), pullRequest: { url: "https://github.com/owner/product/pull/12", headRefOid: head, headRefName: "codex/task", baseRefName: "main", state: "MERGED", isDraft: false, reviewDecision: null, mergeCommit: { oid: "c".repeat(40) } } };
   const observer = { ...completionObservation, remote: async () => remote };
-  const input = { prisma: db.prisma, config, sessionId: session.id, requestKey: "finalize:task" };
+  const input = { prisma: db.prisma, config, sessionId: session.id, requestKey: `finalize:${task.id}` };
   const dependencies = { source: async () => ({ session, link, config, issue }), completion: (value: Parameters<typeof assertCompletionAllowed>[0]) => assertCompletionAllowed(value, observer), snapshot: completionObservation.snapshot };
   const remove = () => git(root, "worktree", "remove", worktree);
   const revoke = () => setCompletionContract({ ...context, contract: CompletionContractInput.parse({ requestKey: "revoke", expectedRevision: contract.revision, boundary: "revoked", basis: "Owner withdrew delivery" }) });
@@ -64,6 +65,167 @@ async function preparedFixture() {
   const observe = async () => { expect(await completionObservation.snapshot(f.worktree)).toEqual(JSON.parse(frozen.find(row => row.sequence === prepared.preparedRevision)!.value!).delivery.receipts.snapshot); };
   return { ...f, prepared, frozen, observe };
 }
+
+async function resourceScopeFixture(kind: "environment" | "clerk" = "environment") {
+  const f = await fixture(kind === "clerk" ? "scopetask" : "task");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+  const root = path.join(directory, "environments", f.task.id);
+  const values = kind === "environment" ? [
+    { id: "env", key: "development-env-directory", kind: "directory", purpose: "development", externalId: root, metadata: { trackedGreenfieldEdits: false } },
+    { id: "credentials", key: "development-provider-credentials", kind: "private-env-files", purpose: "development", externalId: root, metadata: { files: { "test.env": "private" } } },
+  ] : [{ id: "user", key: "development-clerk-user", kind: "clerk-test-user", purpose: "development", externalId: "user_Exact", metadata: { createdByTask: true, email: "dra80.scopetas+clerk_test@example.com", instance: "Clerk TEST instance ins_Exact (sk_test/pk_test from development credential backup)" } }];
+  for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id, state: "ready" } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies);
+  const active = await bindPreparedCleanup(f.input, async () => {});
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient }))
+    .route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const keys = values.map(value => value.key);
+  const renew = (resourceKeys: string[] | null = keys) => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, ...(resourceKeys ? { resourceKeys } : {}) }) });
+  const put = (value: object) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
+  return { ...f, environment: root, values, prepared, active, app, keys, renew, put };
+}
+
+test("compact legacy scope binds all exact aliases and preserves old responses and raw preparation/operation on linked receipt retry", async () => {
+  const f = await resourceScopeFixture();
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const old = await (await f.renew(null)).json(); expect(old.resources).toBeUndefined();
+  const response = await f.renew([...f.keys].reverse()); expect(response.status).toBe(200);
+  const scoped = await response.json();
+  expect(scoped.resources).toEqual(f.values.map(value => ({ id: value.id, key: value.key, identityDigest: finalizationResourceIdentity({ ...value, state: "ready" }).identityDigest })).sort((a, b) => a.key.localeCompare(b.key)));
+  expect(scoped.cleanup).toEqual({ operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) });
+  expect((await f.renew([f.keys[0]!])).status).toBe(409);
+  expect((await f.renew([f.keys[0]!, f.keys[0]!])).status).toBe(400);
+  expect((await f.renew(["unknown"])).status).toBe(409);
+  // Existing route semantics record a client-verified effect without changing
+  // metadata. A lost acknowledgment can repeat either alias independently.
+  for (const value of f.values) {
+    const { id: _id, ...receipt } = value;
+    expect((await f.put({ ...receipt, state: "released" })).status).toBe(200);
+    expect(await (await f.renew()).json()).toEqual(scoped);
+    expect((await f.put({ ...receipt, state: "released" })).status).toBe(200);
+  }
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test("legacy scope refuses pause, changed task/receipt/operation and completed cleanup without minting another proof", async () => {
+  const f = await resourceScopeFixture();
+  expect((await f.renew()).status).toBe(200);
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  expect((await f.renew()).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false, pinnedToolingRoot: "/changed/pin" } });
+  expect((await f.renew()).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { pinnedToolingRoot: null } });
+  await db.prisma.remoteTaskResource.update({ where: { id: "credentials" }, data: { metadata: { changed: true } } });
+  expect((await f.renew()).status).toBe(409);
+  await db.prisma.remoteTaskResource.update({ where: { id: "credentials" }, data: { metadata: f.values[1]!.metadata } });
+  const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.active.operationRevision } });
+  await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: JSON.stringify({ ...JSON.parse(event.value!), requestKey: "changed" }) } });
+  expect((await f.renew()).status).toBe(409);
+  await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: event.value } });
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `finalizer:${f.task.id}`, action: FINALIZATION_CONFIRMED, key: f.input.requestKey, value: JSON.stringify({ preparedRevision: f.prepared.preparedRevision }) } });
+  expect((await f.renew()).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+});
+
+test.each(["ancestor", "descendant", "released-claim", "worktree", "quarantine", "journal"])("legacy scope sees a new cross-task %s claim on the next renewal", async position => {
+  const f = await resourceScopeFixture();
+  const first = await (await f.renew()).json();
+  await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40), ...(position === "worktree" ? { worktreePath: path.join(f.environment, "worktree") } : {}) } });
+  if (position !== "worktree") {
+    const token = finalizationDigest({ task: f.task.id, root: f.environment, resources: first.resources });
+    const externalId = position === "ancestor" ? path.dirname(f.environment) : position === "quarantine" ? path.join(path.dirname(f.environment), `.drafted-finalization-${token}`, "contents")
+      : position === "journal" ? path.join(path.dirname(f.environment), `.drafted-environment-${token}.json`) : path.join(f.environment, "foreign.bin");
+    await db.prisma.remoteTaskResource.create({ data: { id: "foreign", taskId: "other", key: "foreign", kind: "private-file", purpose: "development", externalId, state: position === "released-claim" ? "released" : "ready" } });
+  }
+  expect((await f.renew()).status).toBe(409);
+  expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, state: "released" } })).toBe(0);
+});
+
+test.each(["direct-user", "email-alias", "session"])("legacy user scope reuses the bounded global Clerk %s sharing check", async shape => {
+  const f = await resourceScopeFixture("clerk");
+  expect((await f.renew()).status).toBe(200);
+  await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "other", key: "shared", kind: shape === "session" ? "clerk-test-session" : "clerk-test-user", purpose: "development", state: "ready",
+    externalId: shape === "direct-user" ? "user_Exact" : shape === "email-alias" ? "other@example.com" : "sess_Exact", metadata: shape === "email-alias" ? { clerkUserId: "user_Exact" } : shape === "session" ? { userId: "user_Exact" } : {} } });
+  expect((await f.renew()).status).toBe(409);
+});
+
+test.skipIf(!process.env.DRAFTED_ENVIRONMENT_INTEGRATION_ROOT)("actual scoped control client captures one environment and recovers linked receipt loss without new preparation", async () => {
+  const f = await resourceScopeFixture();
+  await mkdir(f.environment, { recursive: true, mode: 0o700 });
+  await writeFile(path.join(f.environment, "test.env"), "PRIVATE_FIXTURE=value\n", { mode: 0o600 });
+  const sourceInode = (await lstat(f.environment)).ino;
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const socket = path.join(directory, "scope.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const root = process.env.DRAFTED_ENVIRONMENT_INTEGRATION_ROOT!;
+    const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { manageLegacyEnvironment } = await import(path.join(root, "src/legacy-environment-resources.ts"));
+    const registry = taskRegistry(socket, f.task.id, 3000), scoped = await registry.renewCleanupAuthority({ requestKey: f.input.requestKey, resourceKeys: f.keys });
+    const token = finalizationDigest({ task: f.task.id, root: f.environment, resources: scoped.resources });
+    const quarantine = path.join(path.dirname(f.environment), `.drafted-finalization-${token}`);
+    await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    // Idle-process behavior is covered by the native adapter's real lsof
+    // fixture. This pair isolates current server authority at capture time.
+    const run = (extra: object = {}) => manageLegacyEnvironment({ registry, key: f.keys[0], action: "release", observation: { pathsIdle: async () => {} }, ...extra });
+    await expect(run({ afterPlan: async () => {
+      await db.prisma.remoteTaskResource.create({ data: { id: "late-claim", taskId: "other", key: "late-claim", kind: "private-file", purpose: "development", externalId: path.join(quarantine, "contents", "foreign"), state: "ready" } });
+    } })).rejects.toThrow("another task");
+    expect((await lstat(f.environment)).ino).toBe(sourceInode);
+    expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, state: "released" } })).toBe(0);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-claim" } });
+    let lost = true;
+    const resource = registry.resource;
+    registry.resource = async (value: unknown) => { await resource(value); if (lost) { lost = false; throw new Error("lost linked acknowledgment"); } };
+    await expect(run()).rejects.toThrow("lost linked acknowledgment");
+    expect(await Bun.file(path.join(f.environment, "test.env")).exists()).toBeFalse();
+    expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, state: "released" } })).toBe(1);
+    const result = await run();
+    expect(result.quarantinePath).toBe(path.join(quarantine, "contents"));
+    expect((await lstat(result.quarantinePath)).ino).toBe(sourceInode);
+    expect(await readFile(path.join(result.quarantinePath, "test.env"), "utf8")).toBe("PRIVATE_FIXTURE=value\n");
+    expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, state: "released" } })).toBe(2);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect(await registry.renewCleanupAuthority({ requestKey: f.input.requestKey, resourceKeys: f.keys })).toEqual(scoped);
+  } finally { await server.stop(true); }
+}, 30_000);
+
+test.skipIf(!process.env.DRAFTED_CLERK_INTEGRATION_ROOT)("actual scoped control client refuses late shared Clerk ownership and recovers one lost DELETE response", async () => {
+  const f = await resourceScopeFixture("clerk");
+  const socket = path.join(directory, "clerk.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  try {
+    const root = process.env.DRAFTED_CLERK_INTEGRATION_ROOT!;
+    const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { cleanupClerkProvider } = await import(path.join(root, "src/cleanup-observer-clerk.ts"));
+    const { manageLegacyClerkResource } = await import(path.join(root, "src/legacy-clerk-resources.ts"));
+    const registry = taskRegistry(socket, f.task.id, 3000);
+    let present = true, reads = 0, effects = 0, inject = true, lose = true;
+    await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    const provider = cleanupClerkProvider(async (url: string | URL, options: RequestInit) => {
+      const route = new URL(String(url)).pathname;
+      if (route === "/v1/instance") return Response.json({ id: "ins_Exact", environment_type: "development" });
+      if (route !== "/v1/users/user_Exact") throw new Error("Unselected provider target");
+      if (options.method === "GET") {
+        if (++reads === 2 && inject) await db.prisma.remoteTaskResource.create({ data: { id: "shared-user", taskId: "other", key: "shared-user", kind: "clerk-test-user", purpose: "development", externalId: "user_Exact", state: "ready" } });
+        return present ? Response.json({ id: "user_Exact", created_at: 123, email_addresses: [{ email_address: "dra80.scopetas+clerk_test@example.com" }] }) : new Response(null, { status: 404 });
+      }
+      if (options.method !== "DELETE") throw new Error("Unsupported provider effect");
+      effects++; present = false;
+      if (lose) { lose = false; throw new Error("lost provider response"); }
+      return Response.json({ id: "user_Exact", deleted: true });
+    }, async () => ({ descriptor: { backupFile: path.join(directory, "fixed.enc.json"), backupSha256: "a".repeat(64), keyFile: path.join(directory, "fixed.key"), keyId: "b".repeat(64) }, secret: "sk_test_disposable" }));
+    const run = () => manageLegacyClerkResource({ registry, key: f.keys[0], action: "release", provider, journalRoot: path.join(directory, "clerk-retry") });
+    await expect(run()).rejects.toThrow("shared"); expect(effects).toBe(0);
+    inject = false; await db.prisma.remoteTaskResource.delete({ where: { id: "shared-user" } });
+    await expect(run()).rejects.toThrow("Clerk cleanup request failed"); expect(effects).toBe(1);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "user" } })).state).toBe("ready");
+    await run(); expect(effects).toBe(1);
+    const resource = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "user" } });
+    expect(resource.state).toBe("released"); expect(resource.metadata).toEqual(f.values[0]!.metadata);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+  } finally { await server.stop(true); }
+}, 30_000);
 
 test("existing preparation automatically binds once across lost responses without source status or provider reads", async () => {
   const f = await preparedFixture();
