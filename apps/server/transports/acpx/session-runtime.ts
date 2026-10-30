@@ -166,6 +166,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly store;
   private readonly runtimes = new Map<string, ReturnType<typeof createAcpRuntime>>();
   private readonly executionDirectories = new Map<string, { original: string; execution: string }>();
+  private shuttingDown = false;
   private readonly handles = new Map<string, AcpRuntimeHandle>();
   private readonly listeners = new Map<
     string,
@@ -290,6 +291,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   async ensureSession(
     input: EnsureAgentSessionInput,
   ): Promise<AgentRuntimeSession> {
+    if (this.shuttingDown) throw new CleanupTransportBlockedError("Session runtime is shutting down");
     const repository = input.repositoryId
       ? getRepositoryConfig(this.config, input.repositoryId)
       : resolveRepositoryForCwd(this.config, input.cwd);
@@ -308,7 +310,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
-      if (this.recoveringSessions.has(row.id)) throw new CleanupTransportBlockedError("Session transport transition is in progress");
+      if (this.shuttingDown || this.recoveringSessions.has(row.id)) throw new CleanupTransportBlockedError("Session transport transition is in progress");
       await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: row.id });
       const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
       const handle = await this.runtimeFor(row.id).ensureSession({
@@ -419,6 +421,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     beforeStart?: () => Promise<boolean>;
     onElicitation?: AgentElicitationHandler;
   }): AgentRuntimeTurn {
+    if (this.shuttingDown) throw new CleanupTransportBlockedError("Session runtime is shutting down");
     if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled; retry after recovery finishes");
     const requestId = input.requestId ?? randomUUID();
     const queue = new AsyncPushQueue<AgentRuntimeEvent>();
@@ -773,6 +776,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async shutdown(): Promise<void> {
+    this.shuttingDown = true;
     for (const controllers of this.waitingTurns.values()) for (const waiting of controllers) waiting.abort();
     this.capacity.stop();
     await Promise.allSettled(
@@ -780,6 +784,34 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         turn.cancel({ reason: "Remote Agent shutting down" }),
       ),
     );
+    // Logical sessions and persistent provider conversations survive a daemon
+    // restart. Only release handles this daemon owns and can prove are idle;
+    // unresolved active work is never relabeled or adopted as an idle transport.
+    const idle: string[] = [];
+    for (const id of this.handles.keys()) {
+      if (this.activeTurns.has(id) || this.turnChains.has(id) || this.waitingTurns.get(id)?.size || this.recoveringSessions.has(id)) continue;
+      const session = await this.prisma.runtimeSession.findUnique({ where: { id } });
+      if (session && ["idle", "closed"].includes(session.status)) idle.push(id);
+    }
+    if (idle.length) await this.releaseIdleTransports({ sessionIds: idle, check: async () => {}, commit: async () => {} });
+  }
+
+  /** Historical rows confer no transport ownership. This observer never opens,
+   * adopts or closes a provider, including a closed row with a live process. */
+  async assertClosedProviderAbsent(sessionId: string): Promise<void> {
+    const busy = () => this.handles.has(sessionId) || this.activeTurns.has(sessionId) || this.turnChains.has(sessionId)
+      || this.recoveringSessions.has(sessionId) || Boolean(this.waitingTurns.get(sessionId)?.size);
+    const session = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
+    if (session.status !== "closed" || busy()) throw new Error("Closed historical provider still has live or uncertain ownership");
+    const record = session.acpxRecordId ? await this.store.load(session.acpxRecordId) : undefined;
+    if (!record || record.acpxRecordId !== session.acpxRecordId || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId
+      || record.agentSessionId !== (session.agentSessionId ?? undefined)) throw new Error("Closed historical provider identity is unavailable");
+    assertProviderStopped(record);
+    const current = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
+    for (const key of ["status", "cwd", "acpxRecordId", "acpxSessionId", "agentSessionId"] as const) if (current[key] !== session[key]) throw new Error("Closed historical provider identity changed");
+    if (JSON.stringify(await this.store.load(session.acpxRecordId!)) !== JSON.stringify(record)) throw new Error("Closed historical provider record changed during absence observation");
+    if (busy()) throw new Error("Closed historical provider still has live or uncertain ownership");
+    assertProviderStopped(record);
   }
 
   async releaseIdleTransports(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void> {
@@ -833,6 +865,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   private async handleFor(session: AgentRuntimeSession, executionCwd?: string): Promise<AcpRuntimeHandle> {
+    if (this.shuttingDown) throw new CleanupTransportBlockedError("Session runtime is shutting down");
     if (!executionCwd) await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id });
     const selected = this.executionDirectories.get(session.id);
     if (selected && selected.execution !== executionCwd) throw new Error("Provider execution directory changed without release");

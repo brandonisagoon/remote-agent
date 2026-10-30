@@ -193,7 +193,7 @@ test("paused cleanup stays queued and an execution-directory replacement cannot 
   await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { ownerPaused: false } });
   await rename(saved.executionCwd, `${saved.executionCwd}-preserved`); await mkdir(saved.executionCwd, { mode: 0o700 });
   await deliverInstructions(f.prisma, f.runtime, f.config);
-  await until(async () => (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "cleanup-paused" } })).state === "failed");
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "cleanup-paused" } })).state).toBe("queued");
   const log = await readFile(path.join(f.root, "primary.jsonl"), "utf8"); expect(log.match(/"event":"spawn"/g)).toHaveLength(1);
 }, 30_000);
 
@@ -319,4 +319,173 @@ test("a deadline after the transport binding write rolls back before commit", as
   expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
   const accepted = await releaseTaskCleanupTransports(f);
   expect(await releaseTaskCleanupTransports(f)).toEqual(accepted);
+}, 30_000);
+
+
+async function unrelatedEditor(f: Awaited<ReturnType<typeof fixture>>) {
+  const editor = await f.runtime.ensureSession({ sessionKey: "editor", agent: "codex", cwd: f.source, repositoryId: f.session.repositoryId!, machineId: f.config.machine,
+    role: "primary", lifecycle: "persistent", agentEnv: { WARM_ACP_LOG: path.join(f.root, "editor.jsonl"), WARM_ACP_FINISH: path.join(f.root, "finish-capture") } });
+  f.ids.push(editor.id);
+  return editor;
+}
+
+test("separately closed absent editor history survives original provider release without adoption", async () => {
+  const f = await fixture(), editor = await unrelatedEditor(f);
+  await expect(releaseTaskCleanupTransports(f)).rejects.toThrow("owned provider family");
+  await f.runtime.close(editor.id, "Fixture owner closes unused editor");
+  const row = await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: editor.id } }), record = await f.store.load(editor.id);
+  const accepted = await releaseTaskCleanupTransports(f);
+  expect(await releaseTaskCleanupTransports(f)).toEqual(accepted);
+  expect(await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: editor.id } })).toEqual(row);
+  expect(await f.store.load(editor.id)).toEqual(record);
+  expect(await f.runtime.history(f.session.id)).toHaveLength(2);
+  expect(await f.prisma.runtimeInstruction.count({ where: { sessionId: editor.id } })).toBe(0);
+  expect(await f.prisma.runtimeSessionRelation.count({ where: { sourceSessionId: editor.id } })).toBe(0);
+}, 30_000);
+
+test("a closed but live foreign provider still blocks and is never adopted or stopped", async () => {
+  const f = await fixture(), editor = await unrelatedEditor(f), original = (await f.store.load(f.session.id))!, foreign = (await f.store.load(editor.id))!;
+  // A stale logical label is not independent provider absence.
+  await f.prisma.runtimeSession.update({ where: { id: editor.id }, data: { status: "closed" } });
+  await expect(releaseTaskCleanupTransports(f)).rejects.toThrow("Closed historical provider");
+  expect(alive(original.pid!)).toBe(true); expect(alive(foreign.pid!)).toBe(true);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  // A second daemon must inspect the record, never treat no local handle as absence.
+  const other = createAcpxSessionRuntime(f.prisma, f.config);
+  await expect(other.assertClosedProviderAbsent!(editor.id)).rejects.toThrow("still alive");
+  await other.shutdown();
+}, 30_000);
+
+
+test("daemon shutdown unloads owned idle transports and resumes the same original conversations after restart", async () => {
+  const f = await fixture(2), originalTask = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } });
+  const originalSessions = await f.prisma.runtimeSession.findMany({ orderBy: { id: "asc" } });
+  const records = await Promise.all(f.ids.map(id => f.store.load(id))), history = await f.runtime.history(f.session.id);
+  await f.runtime.shutdown();
+  expect(records.every(record => !alive(record!.pid!))).toBe(true);
+  await finalizationResourceObservation.rootIdle(f.source);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } })).toEqual(originalTask);
+  expect(await f.prisma.runtimeSession.findMany({ orderBy: { id: "asc" } })).toEqual(originalSessions);
+  expect(await f.runtime.history(f.session.id)).toEqual(history);
+  expect(() => f.runtime.startTurn({ sessionId: f.session.id, text: "Late writer" })).toThrow("shutting down");
+  await expect(f.runtime.ensureSession({ sessionKey: "late", agent: "codex", cwd: f.source })).rejects.toThrow("shutting down");
+  await expect(f.runtime.cancel(f.session.id, "Late control request")).rejects.toThrow("shutting down");
+  expect(await f.prisma.runtimeSession.count()).toBe(3);
+  const restarted = createAcpxSessionRuntime(f.prisma, f.config);
+  cleanups.push(async () => { await until(async () => restarted.observeSessionActivity!(f.session.id).state === "unknown"); await restarted.shutdown(); });
+  const accepted = await releaseTaskCleanupTransports({ ...f, runtime: restarted });
+  await f.schedule("cleanup-after-daemon-shutdown"); await deliverInstructions(f.prisma, restarted, f.config);
+  await until(async () => (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "cleanup-after-daemon-shutdown" } })).state === "completed");
+  const record = (await f.store.load(f.session.id))!;
+  expect(record.acpSessionId).toBe(records[0]!.acpSessionId); expect(record.cwd).toBe(f.source);
+  const log = (await readFile(path.join(f.root, "primary.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(log.filter(row => row.event === "session/new")).toHaveLength(1);
+  expect(log.find(row => row.event === "session/load")).toMatchObject({ cwd: accepted.executionCwd, sessionId: record.acpSessionId });
+}, 30_000);
+
+test("historical absence rejects a provider record changed during observation", async () => {
+  const f = await fixture(), editor = await unrelatedEditor(f);
+  await f.runtime.close(editor.id, "Fixture closes unused editor");
+  const original = (await f.store.load(editor.id))!, primary = (await f.store.load(f.session.id))!;
+  let reads = 0;
+  const prisma = new Proxy(f.prisma, { get(target, model) {
+    if (model !== "runtimeSession") return Reflect.get(target, model);
+    return new Proxy(target.runtimeSession, { get(sessions, method) {
+      if (method !== "findUniqueOrThrow") return Reflect.get(sessions, method);
+      return async (args: Parameters<typeof sessions.findUniqueOrThrow>[0]) => {
+        const row = await sessions.findUniqueOrThrow(args);
+        if (args.where.id === editor.id && ++reads === 2) await f.store.save({ ...original, pid: process.pid });
+        return row;
+      };
+    } });
+  } });
+  const observer = createAcpxSessionRuntime(prisma, f.config);
+  try {
+    await expect(observer.assertClosedProviderAbsent!(editor.id)).rejects.toThrow("record changed");
+    expect(alive(primary.pid!)).toBe(true);
+    expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  } finally { await f.store.save(original); await observer.shutdown(); }
+}, 30_000);
+
+test("an old queued cleanup survives pause and lost transport acknowledgment without a replacement instruction", async () => {
+  const f = await fixture(1), records = await Promise.all(f.ids.map(id => f.store.load(id)));
+  await f.schedule("old-release-queued-cleanup");
+  const original = await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-release-queued-cleanup" } });
+  const marker = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-cleanup-instruction", key: original.id } });
+  await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { ownerPaused: true } });
+  await deliverInstructions(f.prisma, f.runtime, f.config);
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: original.id } })).toEqual(original);
+  expect(records.every(record => alive(record!.pid!))).toBe(true);
+  await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { ownerPaused: false } });
+  const release = f.runtime.releaseIdleTransports!.bind(f.runtime);
+  f.runtime.releaseIdleTransports = input => release({ ...input, commit: async () => { await input.commit(); throw new Error("Lost transition acknowledgment"); } });
+  try { await deliverInstructions(f.prisma, f.runtime, f.config); }
+  finally { f.runtime.releaseIdleTransports = release; }
+  expect(records.every(record => !alive(record!.pid!))).toBe(true);
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: original.id } })).toEqual(original);
+  const binding = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "cleanup-provider-transport" } });
+  const restarted = createAcpxSessionRuntime(f.prisma, f.config);
+  cleanups.push(async () => { await until(async () => restarted.observeSessionActivity!(f.session.id).state === "unknown"); await restarted.shutdown(); });
+  await deliverInstructions(f.prisma, restarted, f.config);
+  await until(async () => (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: original.id } })).state === "completed");
+  const current = await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: original.id } });
+  expect(current).toMatchObject({ id: original.id, sequence: original.sequence, sessionId: original.sessionId, text: original.text, createdAt: original.createdAt });
+  expect(await f.prisma.runtimeInstruction.count()).toBe(1);
+  expect(await f.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: marker.sequence } })).toEqual(marker);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(1);
+  const log = (await readFile(path.join(f.root, "primary.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(log.filter(row => row.event === "session/new")).toHaveLength(1);
+  expect(log.find(row => row.event === "session/load")).toMatchObject({ cwd: JSON.parse(binding.value!).executionCwd, sessionId: records[0]!.acpSessionId });
+  await finalizationResourceObservation.rootIdle(f.source);
+}, 30_000);
+
+test("new work before an old queued cleanup transition preserves both instructions and the warm provider", async () => {
+  const f = await fixture(), record = (await f.store.load(f.session.id))!;
+  await f.schedule("old-release-queued-cleanup");
+  const release = f.runtime.releaseIdleTransports!.bind(f.runtime);
+  let checked = false;
+  f.runtime.releaseIdleTransports = input => release({ ...input, check: async () => {
+    await input.check();
+    if (!checked) { checked = true; await queueInstruction(f.prisma, { sessionId: f.session.id, requestId: "real-owner-followup", text: "Keep this genuine follow-up" }); }
+  } });
+  try { await deliverInstructions(f.prisma, f.runtime, f.config); }
+  finally { f.runtime.releaseIdleTransports = release; }
+  expect(alive(record.pid!)).toBe(true);
+  expect((await f.prisma.runtimeInstruction.findMany()).map(row => row.state)).toEqual(["queued", "queued"]);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  await deliverInstructions(f.prisma, f.runtime, f.config);
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-release-queued-cleanup" } })).state).toBe("cancelled");
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "real-owner-followup" } })).state).toBe("queued");
+  expect(alive(record.pid!)).toBe(true);
+}, 30_000);
+
+test("a claimed old cleanup cannot fall back to the source without its transport binding", async () => {
+  const f = await fixture(), record = (await f.store.load(f.session.id))!;
+  await f.schedule("old-release-queued-cleanup");
+  await f.prisma.runtimeInstruction.update({ where: { id: "old-release-queued-cleanup" }, data: { state: "dispatching", executionRequestId: "direct-claimed-cleanup" } });
+  const turn = f.runtime.startTurn({ sessionId: f.session.id, requestId: "direct-claimed-cleanup", text: "Do not execute in original source" });
+  for await (const _ of turn.events) {}
+  expect((await turn.result).status).toBe("failed");
+  expect(alive(record.pid!)).toBe(true);
+  const log = await readFile(path.join(f.root, "primary.jsonl"), "utf8");
+  expect(log.match(/"event":"session\/prompt"/g)).toHaveLength(1);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+}, 30_000);
+
+test("a blocked queued cleanup preserves its receipt while unrelated owners still dispatch", async () => {
+  const f = await fixture(), editor = await unrelatedEditor(f), original = (await f.store.load(f.session.id))!;
+  await f.prisma.runtimeSession.update({ where: { id: editor.id }, data: { status: "closed" } });
+  await f.schedule("old-release-queued-cleanup");
+  const queued = await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-release-queued-cleanup" } });
+  const otherCwd = path.join(f.root, "unrelated-source"); await mkdir(otherCwd);
+  const unrelated = await f.runtime.ensureSession({ sessionKey: "unrelated", agent: "codex", cwd: otherCwd, repositoryId: f.session.repositoryId!, machineId: f.config.machine,
+    role: "primary", lifecycle: "persistent", agentEnv: { WARM_ACP_LOG: path.join(f.root, "unrelated.jsonl"), WARM_ACP_FINISH: path.join(f.root, "finish-capture") } });
+  f.ids.push(unrelated.id);
+  await queueInstruction(f.prisma, { sessionId: unrelated.id, requestId: "unrelated-real-work", text: "Independent owner work" });
+  await deliverInstructions(f.prisma, f.runtime, f.config);
+  await until(async () => (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "unrelated-real-work" } })).state === "completed");
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: queued.id } })).toEqual(queued);
+  expect(alive(original.pid!)).toBe(true);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  expect(await f.runtime.history(unrelated.id)).toHaveLength(2);
 }, 30_000);

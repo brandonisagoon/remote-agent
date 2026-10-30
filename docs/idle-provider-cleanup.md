@@ -13,9 +13,23 @@ approval. Scheduling resolves its exact immutable cleanup capability before
 releasing any transport. Runtime reservations refuse active/queued local turns; database checks
 refuse active, provisioning, uncertain, foreign or unrelated sessions and pending
 open-family instructions. Delegate membership follows recorded `spawned-by`
-relations. Closed delegate history is preserved. A provider record without a
+relations. Closed delegate history is preserved. Separately closed unrelated
+sessions remain historical records only: a read-only runtime check must match
+their exact provider identity and independently prove its process absent. They
+are never added to the owned close loop. An open foreign session, a closed row
+with a live provider, or an unavailable historical identity still blocks the
+transition. A provider record without a
 locally held transport must independently prove its recorded process stopped;
 it is never adopted or signalled by PID.
+
+The existing inbox also performs this transition for a marked cleanup instruction
+queued before this feature was installed. It preserves the exact instruction and
+marker, excluding only that still-queued instruction from the pending-family
+check. Every transport effect and binding transaction rechecks its saved bytes,
+current acceptance and all other work. A lost transition response resumes the
+same queue item; an already claimed cleanup cannot fall back to source execution
+without the transport binding. Ordinary follow-ups remain visible and take
+precedence through the existing inbox rules.
 
 The runtime uses acpx's supported `close` with `discardPersistentState: false`
 to unload only its held transport, then observes process absence. Task/session
@@ -53,6 +67,14 @@ and recovery; ordinary adoption/scheduling calls it automatically.
 A confirmed finalizer can close its original logical session after restart
 without launching a new provider in the absent checkout. Existing logical close
 semantics remain separate from idle transport release.
+
+Daemon shutdown also releases its locally held idle transports through that
+same public lifecycle, after its existing active-turn cancellation handling.
+It observes the recorded provider exit, preserves logical rows/conversations,
+and refuses late starts while shutting down. Unsettled active or unheld providers
+are never converted to idle ownership. Deployment must still quiesce active
+work and independently verify the old provider families absent before activating
+a replacement; neither process exit nor launchd job removal alone is that proof.
 
 ## Verification
 

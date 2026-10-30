@@ -1,5 +1,5 @@
 import { cleanupTransportAllowsInstruction } from "../tasks/cleanup-transport.ts";
-import { cleanupInstructionAllows, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
+import { cleanupInstructionAllows, prepareQueuedCleanupTransport, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
 import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
@@ -193,6 +193,13 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
         if (task && (task.ownerPaused || task.phase === "closed")) continue;
         if (!(await instructionAuthorityAllows(prisma, receipt))) continue;
+        try {
+          if (!(await prepareQueuedCleanupTransport({ prisma, runtime, config, receipt }))) continue;
+        } catch {
+          // This exact queued item remains retryable. A blocked provider family
+          // must not prevent unrelated owners' instructions from dispatching.
+          continue;
+        }
         const requestId = await instructionRequestId(prisma, receipt);
         running.add(receipt.id);
         void (async () => {

@@ -19,7 +19,8 @@ const within = (root: string, file: string) => root === file || file.startsWith(
 const Binding = z.object({ version: z.literal(1), mode: z.enum(["cleanup", "work"]), identityDigest: z.string(), sessionId: z.string(),
   cwd: z.string(), sourceDev: z.number(), sourceIno: z.number(), executionCwd: z.string(), dev: z.number(), ino: z.number(), previousRevision: z.number().int().nonnegative(),
 }).strict();
-type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime; taskId: string };
+type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime; taskId: string;
+  queuedInstruction?: { id: string; check: (prisma: PrismaClient) => Promise<void> } };
 const latest = (prisma: PrismaClient, sessionId: string) => prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: "runtime", action: Action }, orderBy: { sequence: "desc" } });
 
 async function taskIdentity(input: Pick<Context, "prisma" | "config" | "taskId">) {
@@ -39,17 +40,21 @@ async function taskIdentity(input: Pick<Context, "prisma" | "config" | "taskId">
   return { task, primary, identityDigest: digest({ ...identity(task), linkId }) };
 }
 async function idleFamily(input: Context) {
+  await input.queuedInstruction?.check(input.prisma);
   const current = await taskIdentity(input);
-  const sessions = await input.prisma.runtimeSession.findMany({ where: { OR: [{ cwd: current.task.worktreePath! }, { cwd: { startsWith: `${current.task.worktreePath!}${path.sep}` } }] }, orderBy: { id: "asc" } });
-  if (sessions.some(session => session.cwd !== current.task.worktreePath || session.repositoryId !== current.task.repositoryId || session.machineId !== current.task.machineId
-    || session.id !== current.primary.id && session.role !== "delegate" || !["idle", "closed"].includes(session.status))) throw new Error("Cleanup transport refuses active, uncertain or foreign checkout sessions");
-  const relations = await input.prisma.runtimeSessionRelation.findMany({ where: { sourceSessionId: { in: sessions.filter(session => session.id !== current.primary.id).map(session => session.id) }, relationship: "spawned-by", endedAt: null }, orderBy: { id: "asc" } });
+  const all = await input.prisma.runtimeSession.findMany({ where: { OR: [{ cwd: current.task.worktreePath! }, { cwd: { startsWith: `${current.task.worktreePath!}${path.sep}` } }] }, orderBy: { id: "asc" } });
+  if (all.some(session => session.cwd !== current.task.worktreePath || session.repositoryId !== current.task.repositoryId || session.machineId !== current.task.machineId
+    || !["idle", "closed"].includes(session.status))) throw new Error("Cleanup transport refuses active, uncertain or foreign checkout sessions");
+  const relations = await input.prisma.runtimeSessionRelation.findMany({ where: { sourceSessionId: { in: all.filter(session => session.id !== current.primary.id).map(session => session.id) }, relationship: "spawned-by", endedAt: null }, orderBy: { id: "asc" } });
   const owned = new Set([current.primary.id]);
-  for (let depth = 0; depth < sessions.length; depth++) for (const relation of relations) if (owned.has(relation.targetSessionId)) owned.add(relation.sourceSessionId);
-  if (sessions.some(session => !owned.has(session.id))) throw new Error("Checkout session is not in the original primary's owned provider family");
-  const pending = await input.prisma.runtimeInstruction.count({ where: { sessionId: { in: sessions.filter(session => session.status !== "closed").map(session => session.id) }, state: { in: ["preparing", "queued", "dispatching", "unknown"] } } });
+  for (let depth = 0; depth < all.length; depth++) for (const relation of relations) if (owned.has(relation.targetSessionId)) owned.add(relation.sourceSessionId);
+  const historical = all.filter(session => !owned.has(session.id) && session.status === "closed");
+  const sessions = all.filter(session => owned.has(session.id));
+  if (sessions.length + historical.length !== all.length || sessions.some(session => session.id !== current.primary.id && session.role !== "delegate")) throw new Error("Checkout session is not in the original primary's owned provider family");
+  const pending = await input.prisma.runtimeInstruction.count({ where: { sessionId: { in: sessions.filter(session => session.status !== "closed").map(session => session.id) },
+    ...(input.queuedInstruction ? { id: { not: input.queuedInstruction.id } } : {}), state: { in: ["preparing", "queued", "dispatching", "unknown"] } } });
   if (pending) throw new Error("Cleanup transport preserves pending original-family instructions");
-  return { ...current, sessions, familyDigest: digest({ relations, sessions: sessions.map(session => ({ id: session.id, cwd: session.cwd, role: session.role, status: session.status,
+  return { ...current, sessions, historical, familyDigest: digest({ relations, sessions: all.map(session => ({ id: session.id, cwd: session.cwd, role: session.role, status: session.status,
     acpxRecordId: session.acpxRecordId, acpxSessionId: session.acpxSessionId, agentSessionId: session.agentSessionId })) }) };
 }
 async function checkDirectory(value: z.infer<typeof Binding>) {
@@ -64,6 +69,13 @@ export async function releaseTaskCleanupTransports(input: Context) {
   assertRequestActive();
   if (!input.runtime.releaseIdleTransports) throw new Error("Runtime does not support safe idle transport release");
   const before = await idleFamily(input), prior = await latest(input.prisma, before.primary.id);
+  const checkHistory = async (historical: typeof before.historical) => {
+    for (const session of historical) {
+      if (!input.runtime.assertClosedProviderAbsent) throw new Error("Historical checkout provider absence cannot be verified");
+      await input.runtime.assertClosedProviderAbsent(session.id);
+    }
+  };
+  await checkHistory(before.historical);
   const priorValue = prior && Binding.parse(JSON.parse(prior.value!));
   if (priorValue && priorValue.identityDigest !== before.identityDigest) throw new Error("Original cleanup transport identity changed");
   if (priorValue?.mode === "cleanup") { await checkDirectory(priorValue); }
@@ -73,6 +85,7 @@ export async function releaseTaskCleanupTransports(input: Context) {
       assertRequestActive();
       const after = await idleFamily(input);
       if (after.identityDigest !== before.identityDigest || after.familyDigest !== before.familyDigest || (await latest(input.prisma, before.primary.id))?.sequence !== prior?.sequence) throw new Error("Cleanup transport ownership changed during release");
+      await checkHistory(after.historical);
       assertRequestActive();
     },
     commit: async () => {
@@ -110,7 +123,15 @@ export async function cleanupExecutionDirectory(input: { prisma: PrismaClient; c
   const task = await input.prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
   if (!task?.primarySessionId) return undefined;
   const event = await latest(input.prisma, task.primarySessionId);
-  if (!event) return undefined;
+  if (!event) {
+    if (input.requestId) {
+      const instruction = await input.prisma.runtimeInstruction.findFirst({ where: { sessionId: input.sessionId, executionRequestId: input.requestId, state: "dispatching" } });
+      if (instruction && await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: "cleanup-inbox", action: "finalization-cleanup-instruction", key: instruction.id } })) {
+        throw new CleanupTransportBlockedError("Queued cleanup requires its original provider transport transition before execution");
+      }
+    }
+    return undefined;
+  }
   const value = Binding.parse(JSON.parse(event.value!));
   const current = await taskIdentity({ ...input, taskId: task.id });
   if (value.identityDigest !== current.identityDigest) throw new Error("Original cleanup transport identity changed");

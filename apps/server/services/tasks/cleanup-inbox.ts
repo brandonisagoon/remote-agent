@@ -49,6 +49,30 @@ async function family(store: CleanupInboxStore, task: RemoteTask) {
   return store.runtimeSession.findMany({ where: { cwd: task.worktreePath!, repositoryId: task.repositoryId, machineId: task.machineId } });
 }
 
+/** Upgrade an already queued cleanup instruction before opening its provider.
+ * The exact immutable marker and still-queued row are rechecked at every held
+ * transport effect and commit. No new scheduling request or instruction exists. */
+export async function prepareQueuedCleanupTransport(input: { prisma: PrismaClient; runtime: AgentSessionRuntime; config?: ServerConfig; receipt: { id: string; sessionId: string } }) {
+  if (!input.runtime.releaseIdleTransports) return true;
+  const where = { runtimeSessionId: input.receipt.sessionId, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key: input.receipt.id };
+  const event = await input.prisma.runtimeMetadataEvent.findFirst({ where });
+  if (!event) return true;
+  if (!input.config) return false;
+  const saved = Marker.parse(JSON.parse(event.value!)), instruction = await input.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: input.receipt.id } });
+  if (instruction.state !== "queued" || instruction.sessionId !== saved.sessionId || saved.sessionId !== input.receipt.sessionId) return false;
+  const frozenInstruction = JSON.stringify(instruction);
+  const check = async (prisma: PrismaClient) => {
+    const currentEvent = await prisma.runtimeMetadataEvent.findFirst({ where });
+    const currentInstruction = await prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: instruction.id } });
+    if (currentEvent?.sequence !== event.sequence || currentEvent.value !== event.value || JSON.stringify(currentInstruction) !== frozenInstruction) throw new Error("Queued cleanup identity changed before provider transition");
+    await currentMarker(prisma, saved);
+  };
+  await check(input.prisma);
+  await ensureTaskCleanupTransports({ ...input, config: input.config, taskId: saved.taskId, queuedInstruction: { id: instruction.id, check } });
+  await check(input.prisma);
+  return true;
+}
+
 // Closed delegates cannot receive more work. Keep their uncertain delivery
 // history intact; live runtime activity is still checked before cleanup effects.
 function pendingFamilyIds(task: RemoteTask, sessions: Array<{ id: string; status: string; role: string | null }>) {
