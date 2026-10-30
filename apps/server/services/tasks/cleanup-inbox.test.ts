@@ -4,13 +4,16 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { deliverInstructions, queueInstruction } from "../sessions/inbox.ts";
 import { recordSourceMessage } from "../sessions/source-messages.ts";
-import { automaticCleanupTurn, cleanupInstructionAllows, enqueueTaskCleanup, CLEANUP_INSTRUCTION } from "./cleanup-inbox.ts";
+import { automaticCleanupTurn, cleanupInstructionAllows, enqueueTaskCleanup, cleanupInboxDependencies, CLEANUP_INSTRUCTION } from "./cleanup-inbox.ts";
 
 let db: TestDatabase;
+const defaultCapability = cleanupInboxDependencies.capability;
 beforeEach(async () => { db = await createTestDatabase(); });
-afterEach(async () => { await db.cleanup(); });
+afterEach(async () => { cleanupInboxDependencies.capability = defaultCapability; await db.cleanup(); });
 async function fixture() {
   const config = testConfig();
+  config.repository.tooling = { root: "/configured", revision: "b".repeat(40) };
+  config.repositories = { ...config.repositories, [config.repository.id]: config.repository };
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", cwd: "/owned/task", repositoryId: config.repository.id, machineId: config.machine } });
   const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-194", primarySessionId: session.id, branchName: "codex/task", worktreePath: session.cwd, toolingRoot: "/old", toolingRevision: "a".repeat(40), pinnedToolingRoot: "/old/pin", phase: "waiting" } });
   await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier!, relationship: "handles" } });
@@ -18,6 +21,7 @@ async function fixture() {
   const runtime = createFakeAgentRuntime([{ id: session.id, cwd: session.cwd, repositoryId: session.repositoryId, machineId: session.machineId, status: "idle", role: "primary", agent: "codex" }]);
   let resolves = 0;
   const dependencies = { capability: async () => { resolves++; return { receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const, taskToolingRevision: task.toolingRevision, capabilityRevision: "b".repeat(40), checkout: "/immutable/new pin", instructions: "/immutable/new pin/cleanup.md", adapter: "/immutable/new pin/src/cli.ts" }, instructions: "Use the verified cleanup capability." }; } };
+  cleanupInboxDependencies.capability = dependencies.capability;
   const enqueue = (requestKey = "tick-1") => enqueueTaskCleanup({ prisma: db.prisma, config, taskId: task.id, requestKey }, dependencies);
   return { config, task, session, runtime, enqueue, resolves: () => resolves };
 }

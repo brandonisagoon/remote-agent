@@ -11,6 +11,7 @@ import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
 
 export const CLEANUP_INSTRUCTION = "finalization-cleanup-instruction";
 export const CLEANUP_REQUEST = "finalization-cleanup-request";
+export const CLEANUP_SUPERSEDED = "finalization-cleanup-superseded";
 export const CleanupEnqueueInput = z.object({ requestKey: z.string().trim().min(1).max(180) }).strict();
 export const AutomaticCleanup = z.object({ kind: z.literal("primary-inbox"), initialInstructionId: z.string() }).strict();
 export type CleanupInboxStore = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeInstruction" | "runtimeMetadataEvent" | "runtimeLifecycleEvent" | "runtimeSessionResourceLink" | "runtimeSourceMessage">;
@@ -49,15 +50,90 @@ async function family(store: CleanupInboxStore, task: RemoteTask) {
   return store.runtimeSession.findMany({ where: { cwd: task.worktreePath!, repositoryId: task.repositoryId, machineId: task.machineId } });
 }
 
+function cleanupCommand(saved: z.infer<typeof Marker>, resolved: Awaited<ReturnType<typeof resolveSessionToolingCapability>>, socket: string) {
+  if (!resolved.receipt.adapter) throw new Error("Cleanup capability has no adapter");
+  return [resolved.instructions, "", "Automatic cleanup continuation for this original primary.",
+    `Use the same finalization identity ${saved.requestKey}. This scheduling instruction is not acceptance or cleanup proof.`,
+    "First inspect current task activity. If another instruction or delegate needs work, stop this cleanup turn and allow the existing inbox to deliver it. Never cancel or acknowledge another instruction to make cleanup proceed.",
+    `Run the existing lifecycle command using only the resolved immutable cleanup adapter: bun --no-env-file ${quote(resolved.receipt.adapter)} task destroy --task ${quote(saved.taskId)} --socket ${quote(socket)}.`,
+    "The command validates accepted delivery, retention, ownership and pause locally. Do not hand-delete resources or replace the original pin. Report unresolved resources truthfully; interrupted cleanup resumes through the same command.",
+  ].join("\n");
+}
+
+/** Replace only an unstarted synthetic instruction. Old instructions, markers,
+ * request receipts and accepted cleanup authority remain immutable history. */
+export async function refreshQueuedCleanupInstruction(input: { prisma: PrismaClient; runtime: AgentSessionRuntime; config: ServerConfig; receipt: { id: string; sessionId: string } }, dependencies = cleanupInboxDependencies) {
+  const where = { runtimeSessionId: input.receipt.sessionId, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key: input.receipt.id };
+  const foundEvent = await input.prisma.runtimeMetadataEvent.findFirst({ where });
+  if (!foundEvent) return true;
+  const event = foundEvent;
+  const instruction = await input.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: input.receipt.id } });
+  if (instruction.state !== "queued" || instruction.sourceMessageId || instruction.executionRequestId) return false;
+  const saved = Marker.parse(JSON.parse(event.value!)), original = JSON.stringify(instruction);
+  if (saved.sessionId !== input.receipt.sessionId || instruction.sessionId !== saved.sessionId || saved.requestKey !== `finalize:${saved.taskId}`) throw new Error("Queued cleanup identity changed");
+  const configured = () => hash(JSON.stringify({ machine: input.config.machine, installRoot: input.config.installRoot, socket: input.config.controlIpcPath,
+    repository: input.config.repositories[saved.repositoryId] }));
+  const configurationDigest = configured();
+  async function eligible(store: CleanupInboxStore) {
+    const task = await currentMarker(store, saved), sessions = await family(store, task), ids = pendingFamilyIds(task, sessions);
+    const primary = sessions.find(session => session.id === saved.sessionId);
+    if (!primary || primary.status !== "idle" || primary.role !== "primary" || sessions.some(session => !["idle", "closed"].includes(session.status)
+      || input.runtime.observeSessionActivity && input.runtime.observeSessionActivity(session.id).state !== "unknown")) throw new Error("Queued cleanup waits for idle original work");
+    if (await store.runtimeInstruction.count({ where: { sessionId: { in: ids }, id: { not: instruction.id }, state: { in: Pending } } })) throw new Error("Queued cleanup preserves pending original work");
+    if (!(await cleanupCandidates(store as PrismaClient, input.config, [task])).has(task.id)) throw new Error("Queued cleanup acceptance changed");
+    return task;
+  }
+  await currentMarker(input.prisma, saved);
+  const resolved = structuredClone(await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: saved.sessionId, capability: "cleanup" }));
+  const capability = resolved.receipt;
+  if (!capability.adapter || capability.contract !== "remote-agent.tooling-capability/v1" || capability.capability !== "cleanup"
+    || capability.source !== "configured-host" || capability.taskToolingRevision !== saved.toolingRevision
+    || capability.capabilityRevision !== input.config.repositories[saved.repositoryId]?.tooling?.revision || configured() !== configurationDigest) throw new Error("Configured cleanup capability changed during resolution");
+  const capabilityDigest = hash(JSON.stringify(capability));
+  async function unchanged(store: CleanupInboxStore) {
+    const current = await store.runtimeInstruction.findUniqueOrThrow({ where: { id: instruction.id } });
+    const currentEvent = await store.runtimeMetadataEvent.findFirst({ where });
+    if (JSON.stringify(current) !== original || currentEvent?.sequence !== event.sequence || currentEvent.value !== event.value) throw new Error("Queued cleanup changed during capability resolution");
+    await eligible(store);
+    if (configured() !== configurationDigest) throw new Error("Configured cleanup capability changed during resolution");
+  }
+  // Resolution may await checkout preparation. Even an unchanged adapter must
+  // not return ready using a stale pause, instruction or acceptance snapshot.
+  if (hash(JSON.stringify(Object.entries(capability).sort())) === hash(JSON.stringify(Object.entries(saved.capability).sort()))) {
+    await unchanged(input.prisma); return true;
+  }
+  const next = Marker.parse({ ...saved, capability }), nextValue = JSON.stringify(next);
+  const successorId = `cleanup:${hash(JSON.stringify({ previous: instruction.id, instruction: hash(original), marker: event.sequence, markerDigest: hash(event.value!), capabilityDigest }))}`;
+  const text = cleanupCommand(next, resolved, input.config.controlIpcPath);
+  return input.prisma.$transaction(async tx => {
+    const current = await tx.runtimeInstruction.findUniqueOrThrow({ where: { id: instruction.id } });
+    if (current.state !== "queued") return false; // Lost acknowledgment/concurrent winner: never add another successor.
+    await unchanged(tx);
+    const receipt = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: saved.sessionId, source: `task:${saved.taskId}`, action: "tooling-capability", key: `${saved.taskId}:${capabilityDigest}` } });
+    if (configured() !== configurationDigest || receipt?.value !== JSON.stringify(capability)) throw new Error("Current cleanup capability receipt changed before refresh");
+    const cancelled = await tx.runtimeInstruction.updateMany({ where: { id: instruction.id, state: "queued", updatedAt: instruction.updatedAt },
+      data: { state: "cancelled", detail: `Superseded by cleanup instruction ${successorId} using reviewed tooling ${capability.capabilityRevision}; original command and authority are retained.` } });
+    if (cancelled.count !== 1) throw new Error("Queued cleanup changed before supersession");
+    await queueInstruction(tx, { sessionId: saved.sessionId, requestId: successorId, text });
+    await tx.runtimeMetadataEvent.create({ data: { ...where, key: successorId, value: nextValue } });
+    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: saved.sessionId, source: "cleanup-inbox", action: CLEANUP_SUPERSEDED, key: instruction.id,
+      value: JSON.stringify({ version: 1, taskId: saved.taskId, sessionId: saved.sessionId, requestKey: saved.requestKey,
+        previous: { instructionId: instruction.id, instructionSha256: hash(original), markerRevision: event.sequence, markerSha256: hash(event.value!) },
+        successor: { instructionId: successorId, textSha256: hash(text), markerSha256: hash(nextValue), capabilitySha256: capabilityDigest } }) } });
+    return false; // The next normal inbox pass selects the new item.
+  });
+}
+
 /** Upgrade an already queued cleanup instruction before opening its provider.
  * The exact immutable marker and still-queued row are rechecked at every held
  * transport effect and commit. No new scheduling request or instruction exists. */
 export async function prepareQueuedCleanupTransport(input: { prisma: PrismaClient; runtime: AgentSessionRuntime; config?: ServerConfig; receipt: { id: string; sessionId: string } }) {
-  if (!input.runtime.releaseIdleTransports) return true;
   const where = { runtimeSessionId: input.receipt.sessionId, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key: input.receipt.id };
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where });
   if (!event) return true;
   if (!input.config) return false;
+  if (!await refreshQueuedCleanupInstruction({ ...input, config: input.config })) return false;
+  if (!input.runtime.releaseIdleTransports) return true;
   const saved = Marker.parse(JSON.parse(event.value!)), instruction = await input.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: input.receipt.id } });
   if (instruction.state !== "queued" || instruction.sessionId !== saved.sessionId || saved.sessionId !== input.receipt.sessionId) return false;
   const frozenInstruction = JSON.stringify(instruction);
@@ -103,12 +179,7 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
   const saved = Marker.parse({ version: 1, taskId: task.id, sessionId: task.primarySessionId!, requestKey: `finalize:${task.id}`,
     worktree: task.worktreePath, repositoryId: task.repositoryId, machineId: task.machineId, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot,
     ...acceptance, capability: resolved.receipt });
-  const text = [resolved.instructions, "", "Automatic cleanup continuation for this original primary.",
-    `Use the same finalization identity ${saved.requestKey}. This scheduling instruction is not acceptance or cleanup proof.`,
-    "First inspect current task activity. If another instruction or delegate needs work, stop this cleanup turn and allow the existing inbox to deliver it. Never cancel or acknowledge another instruction to make cleanup proceed.",
-    `Run the existing lifecycle command using only the resolved immutable cleanup adapter: bun --no-env-file ${quote(resolved.receipt.adapter)} task destroy --task ${quote(task.id)} --socket ${quote(input.config.controlIpcPath)}.`,
-    "The command validates accepted delivery, retention, ownership and pause locally. Do not hand-delete resources or replace the original pin. Report unresolved resources truthfully; interrupted cleanup resumes through the same command.",
-  ].join("\n");
+  const text = cleanupCommand(saved, resolved, input.config.controlIpcPath);
   return input.prisma.$transaction(async tx => {
     await currentMarker(tx, saved);
     if (!(await cleanupCandidates(tx as PrismaClient, input.config, [await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } })])).has(task.id)) throw new Error("Cleanup scheduling authority changed during capability resolution");

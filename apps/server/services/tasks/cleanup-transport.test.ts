@@ -3,7 +3,7 @@ import { withRequestLifetime } from "../../request-lifetime.ts";
 import { pathToFileURL } from "node:url";
 import { originalArchiveFixture, originalGit } from "../../../../test-support/original-work.ts";
 import { prepareOriginalWork, assertOriginalWork } from "./original-work.ts";
-import { automaticCleanupTurn } from "./cleanup-inbox.ts";
+import { automaticCleanupTurn, cleanupInboxDependencies, CLEANUP_INSTRUCTION, CLEANUP_SUPERSEDED } from "./cleanup-inbox.ts";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -59,21 +59,35 @@ async function fixture(delegates = 0, linked = false) {
     await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: child.id, targetSessionId: session.id, relationship: "spawned-by" } });
   }
   await db.prisma.remoteTask.update({ where: { id: task.id }, data: { primarySessionId: session.id, worktreePath: source, pinnedToolingRoot: path.join(root, "original-pin"), phase: "waiting" } });
+  await db.prisma.remoteTask.update({ where: { id: task.id }, data: { connectionId: config.activeConnectionId, issueIdentifier: "DRA-fixture" } });
+  await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-fixture", relationship: "handles" } });
   const store = createRuntimeStore({ stateDir: config.acpxStateDir });
   const app = createApp({ config, prisma: db.prisma, agentRuntime: runtime, trustLocal: true });
   const context = { prisma: db.prisma, config, runtime, taskId: task.id };
   const request = (body: unknown, token = config.apiKey) => app.request(`/api/tasks/${task.id}/completion/cleanup-transport`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${token}` }, body: JSON.stringify(body) });
+  const previousCapability = cleanupInboxDependencies.capability;
+  const capability: typeof previousCapability = async () => {
+    const current = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+    const receipt = { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
+      taskToolingRevision: current.toolingRevision, capabilityRevision: repository.tooling.revision, checkout: root,
+      instructions: `${root}/cleanup.md`, adapter: `${root}/cli.ts` };
+    const key = `${task.id}:${hash(JSON.stringify(receipt))}`;
+    if (!await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "tooling-capability", key } })) await db.prisma.runtimeMetadataEvent.create({ data: {
+      runtimeSessionId: session.id, source: `task:${task.id}`, action: "tooling-capability", key, value: JSON.stringify(receipt) } });
+    return { receipt, instructions: "Fixture immutable cleanup capability" };
+  };
+  cleanupInboxDependencies.capability = capability; cleanups.push(async () => { cleanupInboxDependencies.capability = previousCapability; });
   async function schedule(requestId: string, text = "Continue exact original cleanup") {
     const current = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
-    const value = JSON.stringify({ boundary: "merge" });
+    const value = JSON.stringify({ boundary: "merge", verificationRequired: false });
     let contract = await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "completion-contract" } });
     contract ??= await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, source: `owner:${task.id}`, action: "completion-contract", key: "fixture-approval", value } });
     await queueInstruction(db.prisma, { sessionId: session.id, requestId, text });
     await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, source: "cleanup-inbox", action: "finalization-cleanup-instruction", key: requestId, value: JSON.stringify({ version: 1, taskId: task.id, sessionId: session.id, requestKey: `finalize:${task.id}`, worktree: source,
       repositoryId: current.repositoryId, machineId: current.machineId, toolingRevision: current.toolingRevision, pinnedToolingRoot: current.pinnedToolingRoot,
-      contractRevision: contract.sequence, contractDigest: hash(value), capability: { checkout: root, adapter: null, capabilityRevision: current.toolingRevision, taskToolingRevision: current.toolingRevision } }) } });
+      contractRevision: contract.sequence, contractDigest: hash(contract.value!), capability: (await capability({ prisma: db.prisma, config, sessionId: session.id, capability: "cleanup" })).receipt }) } });
   }
-  return { ...context, db, root, source, session, ids, store, request, schedule, app };
+  return { ...context, db, root, source, session, ids, store, request, schedule, app, capability };
 }
 
 test("real warm primary and delegates release; original cleanup resumes outside source with the same history and identity", async () => {
@@ -233,11 +247,9 @@ const clientRoot = process.env.DRAFTED_INTEGRATION_ROOT;
 test("existing automatic cleanup scheduling releases the warm family without another approval and retries the same instruction", async () => {
   const f = await fixture(1);
   await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { connectionId: f.config.activeConnectionId, issueIdentifier: "DRA-fixture" } });
-  await f.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: f.session.id, provider: "linear", connectionId: f.config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-fixture", relationship: "handles" } });
   await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.taskId}`, action: "completion-contract", key: "accepted", value: JSON.stringify({ boundary: "merge", verificationRequired: false }) } });
   const { enqueueTaskCleanup } = await import("./cleanup-inbox.ts");
-  const dependencies = { capability: async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
-    taskToolingRevision: "a".repeat(40), capabilityRevision: "b".repeat(40), checkout: f.root, instructions: `${f.root}/cleanup.md`, adapter: `${f.root}/cli.ts` }, instructions: "Fixture immutable cleanup capability" }) };
+  const dependencies = { capability: f.capability };
   const input = { ...f, requestKey: "automatic-pass" };
   const warm = (await f.store.load(f.session.id))!;
   await expect(enqueueTaskCleanup(input, { capability: async () => { throw new Error("Immutable cleanup capability unavailable"); } })).rejects.toThrow("capability unavailable");
@@ -488,4 +500,34 @@ test("a blocked queued cleanup preserves its receipt while unrelated owners stil
   expect(alive(original.pid!)).toBe(true);
   expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
   expect(await f.runtime.history(unrelated.id)).toHaveLength(2);
+}, 30_000);
+
+
+test("updated cleanup capability supersedes the old queue before the same real provider resumes outside source", async () => {
+  const f = await fixture(), originalRecord = (await f.store.load(f.session.id))!;
+  await f.prisma.remoteTask.update({ where: { id: f.taskId }, data: { connectionId: f.config.activeConnectionId, issueIdentifier: "DRA-fixture" } });
+  await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.taskId}`, action: "completion-contract", key: "accepted", value: JSON.stringify({ boundary: "merge", verificationRequired: false }) } });
+  await f.schedule("old-cleanup-command");
+  const original = await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "old-cleanup-command" } });
+  const marker = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: CLEANUP_INSTRUCTION, key: original.id } });
+  f.config.repositories[f.config.repository.id]!.tooling!.revision = "b".repeat(40);
+  await deliverInstructions(f.prisma, f.runtime, f.config);
+  expect(alive(originalRecord.pid!)).toBe(true);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  const successor = await f.prisma.runtimeInstruction.findFirstOrThrow({ where: { state: "queued" } });
+  expect(successor.id).not.toBe(original.id); expect(successor.text).toContain(`finalize:${f.taskId}`);
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: original.id } })).text).toBe(original.text);
+  expect(await f.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: marker.sequence } })).toEqual(marker);
+  await deliverInstructions(f.prisma, f.runtime, f.config);
+  await until(async () => (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: successor.id } })).state === "completed");
+  expect(alive(originalRecord.pid!)).toBe(false);
+  const record = (await f.store.load(f.session.id))!;
+  expect(record.acpSessionId).toBe(originalRecord.acpSessionId); expect(record.cwd).toBe(f.source);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(2);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_SUPERSEDED } })).toBe(1);
+  const log = (await readFile(path.join(f.root, "primary.jsonl"), "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  expect(log.filter(row => row.event === "session/new")).toHaveLength(1);
+  expect(log.find(row => row.event === "session/load")).toMatchObject({ sessionId: originalRecord.acpSessionId });
+  expect(log.find(row => row.event === "session/load")).not.toMatchObject({ cwd: f.source });
+  await finalizationResourceObservation.rootIdle(f.source);
 }, 30_000);
