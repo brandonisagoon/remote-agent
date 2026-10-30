@@ -8,13 +8,15 @@ export function withPreparationDiagnostics<T>(record: NonNullable<ReturnType<typ
   return observer.run(record, work);
 }
 export async function preparationStage<T>(stage: PreparationStage, work: () => Promise<T>): Promise<T> {
-  const leave = enterRequestStage(stage);
+  assertRequestActive();
+  // A dependency wrapper may call an already-instrumented implementation.
+  // Count that stage once, even without a persistent preparation observer.
+  if (currentStage.getStore() === stage) { const result = await work(); assertRequestActive(); return result; }
+  const leave = enterRequestStage(stage), record = observer.getStore();
+  const start = performance.now();
   try {
-    const record = observer.getStore();
-    if (!record || currentStage.getStore() === stage) { const result = await work(); assertRequestActive(); return result; }
-    const start = performance.now();
-    await record({ stage, event: "start" });
+    await record?.({ stage, event: "start" });
     try { const result = await currentStage.run(stage, work); assertRequestActive(); return result; }
-    finally { await record({ stage, event: "end", elapsedMs: Math.round(performance.now() - start) }); }
+    finally { await record?.({ stage, event: "end", elapsedMs: Math.round(performance.now() - start) }); }
   } finally { leave(); }
 }

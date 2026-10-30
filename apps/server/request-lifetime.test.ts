@@ -83,3 +83,13 @@ test("authenticated activity GET survives slow runtime history on TCP and Unix",
     expect(performance.now() - started).toBeGreaterThanOrEqual(14_000);
   } finally { await unix.close(); await tcp.stop(true); await db.cleanup(); await rm(directory, { recursive: true, force: true }); }
 }, 30_000);
+
+test("nested wrappers measure one stage once without a persistent diagnostic observer", async () => {
+  let timings = new Map<string, number>();
+  const started = performance.now();
+  await withRequestLifetime({ timeoutMs: 1_000, onTimings: value => { timings = value; } }, () =>
+    preparationStage("fingerprint", () => preparationStage("fingerprint", () => Bun.sleep(30))));
+  const elapsed = performance.now() - started;
+  expect(timings.get("fingerprint")).toBeGreaterThanOrEqual(25);
+  expect(timings.get("fingerprint")!).toBeLessThanOrEqual(elapsed + 1);
+});
