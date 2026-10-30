@@ -247,3 +247,64 @@ test("a stopped-consumer edge cannot stand in for a missing native ownership pro
   await expect(prepareFinalizationResources({ resources: f.resources.slice(0, 5), taskId: f.task.id, sessionId: f.task.primarySessionId,
     toolingRoot: f.context.capability.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true, adapterContext: f.context }, observation)).rejects.toThrow("no exact native-family proof");
 });
+
+test("standalone MySQL uses the existing exact provider target in the physical planner", async () => {
+  const { hasCleanupAdapter, hasHistoricalCleanupAdapter } = await import("./cleanup-adapter-resources.ts");
+  const { prepareFinalizationResources, assertFinalizationResources } = await import("./finalization-resources.ts");
+  const f = fixture(), resource = { ...f.resources[0]!, kind: "planetscale-branch", externalId: "task-branch-id" }, resources = [resource];
+  const raw = { kind: "planetscale-branch" as const, id: resource.externalId, name: "drafted-d-owned", presentAtPrepare: true,
+    scope: { taskId: f.task.id, purpose: resource.purpose, runtimeFile: "/private/task/mysql-target.json", credentialsFile: "/private/credentials.json", recipeHash: hash("a"), organization: "owner", database: "app", baseBranch: "main", baseBranchId: "production-base" } };
+  const target = CleanupTarget.parse({ ...raw, identityDigest: cleanupTargetDigest({ ...raw, identityDigest: hash("0") }) });
+  let present = true;
+  const observer = async ({ request }: { request: unknown }) => {
+    const input = CleanupObserverBatchInput.parse(request), targets = input.observations[0]!.expectedTargets ?? [{ ...target, presentAtPrepare: present }];
+    const frozen = targets.map(value => ({ ...value, identityDigest: cleanupTargetDigest(value) }));
+    return { version: 1, taskId: f.task.id, observations: [{ version: 1, taskId: f.task.id, resourceId: resource.id,
+      resourceIdentityDigest: finalizationResourceIdentity(resource).identityDigest, adapter: "runtime", dependencies: [], stoppedConsumers: [], targets: frozen, absent: !present, presentTargetDigests: present ? frozen.map(value => value.identityDigest) : [] }] };
+  };
+  const input = { resources, taskId: f.task.id, sessionId: f.task.primarySessionId, toolingRoot: f.context.capability.checkout,
+    sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true, adapterContext: f.context };
+  expect(hasCleanupAdapter(resource.kind)).toBeTrue(); expect(hasHistoricalCleanupAdapter(resource)).toBeTrue();
+  const plan = await prepareFinalizationResources(input, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} });
+  expect(plan[0]).toMatchObject({ disposition: "retire-adapter", adapter: "runtime", externalId: resource.externalId });
+  resource.state = "released";
+  await expect(assertFinalizationResources({ taskId: f.task.id, resources, plan, removed: true, originalWork: true }, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} })).rejects.toThrow("independently verified");
+  await expect(prepareFinalizationResources(input, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} })).rejects.toThrow("Historical released adapter is still present");
+  present = false;
+  await assertFinalizationResources({ taskId: f.task.id, resources, plan, removed: true, originalWork: true }, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} });
+  const absent = await prepareFinalizationResources(input, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} });
+  present = true;
+  await expect(assertFinalizationResources({ taskId: f.task.id, resources, plan: absent, removed: true, originalWork: true }, { adapters: observer, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} })).rejects.toThrow();
+  for (const root of ["/private/task", "/private"]) expect(() => captureAdapterDependencies(root, resources, plan.filter((value): value is import("./cleanup-adapter-resources.ts").CleanupAdapterPlan => value.disposition === "retire-adapter"))).toThrow("confirmation inputs");
+});
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted standalone observer pairs with server plan and confirmation after original source retirement", async () => {
+  const { mkdtemp, realpath, writeFile, rm } = await import("node:fs/promises"), { tmpdir } = await import("node:os"), path = await import("node:path"), { createHash } = await import("node:crypto");
+  const { observeCleanupBatch } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cleanup-observer.ts"));
+  const { taskResourceName } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/runtime-config.ts"));
+  const root = await mkdtemp(path.join(await realpath(tmpdir()), "standalone-mysql-pair-")), f = fixture();
+  const write = async (file: string, value: unknown) => { const bytes = JSON.stringify(value); await writeFile(file, bytes, { mode: 0o600 }); return createHash("sha256").update(bytes).digest("hex"); };
+  try {
+    const credentialsFile = path.join(root, "credentials.json"), credentialsSha256 = await write(credentialsFile, { STUDIO_PLANETSCALE_SERVICE_TOKEN_ID: "fixture", STUDIO_PLANETSCALE_SERVICE_TOKEN: "fixture" });
+    const configurationFile = path.join(root, "target.json"), name = taskResourceName(f.task.id, "development");
+    const configurationSha256 = await write(configurationFile, { version: 1, taskId: f.task.id, primarySessionId: f.task.primarySessionId, worktreePath: f.task.worktreePath, toolingRevision: f.task.toolingRevision,
+      key: "standalone", purpose: "development", credentialsFile, credentialsSha256, planetscale: { organization: "owner", database: "app", baseBranch: "main", baseBranchId: "production-base" },
+      sourceConfigurationFile: path.join(root, "retired-source.json"), sourceConfigurationSha256: hash("e"), sourceSnapshotFile: path.join(root, "retired-snapshot.json"), sourceSnapshotSha256: hash("f") });
+    const resource = { ...f.resources[0]!, key: "standalone", kind: "planetscale-branch", externalId: "branch-owned", metadata: { version: 1, configurationFile, configurationSha256,
+      receiptFile: path.join(root, "retired-progress.json"), sourceDigest: hash("c"), provider: { provider: "planetscale", id: "branch-owned", name } } }, resources = [resource];
+    let present = true, reads = 0;
+    const observer = async ({ request }: { request: unknown }) => observeCleanupBatch(request, { providers: () => ({ inspect: async (receipt: unknown) => { reads++; expect(receipt).toEqual(resource.metadata.provider); return present; } }) });
+    const plan = await prepareCleanupAdapterResources({ context: f.context, resources, identities: resources.map(value => ({ ...finalizationResourceIdentity(value), purpose: value.purpose })) }, observer);
+    expect(plan[0]).toMatchObject({ adapter: "runtime", kind: "planetscale-branch", dependencies: [] });
+    resource.state = "released";
+    await expect(assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, observer)).rejects.toThrow("independently verified");
+    present = false;
+    await assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, observer);
+    expect(reads).toBe(3);
+    // Neither the deleted original source nor its progress snapshot is needed;
+    // the frozen private configuration and provider identity remain mandatory.
+    await writeFile(configurationFile, "{}", { mode: 0o600 });
+    await expect(assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, observer)).rejects.toThrow();
+    expect(reads).toBe(3);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

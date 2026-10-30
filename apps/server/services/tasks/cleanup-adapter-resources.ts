@@ -13,17 +13,17 @@ type Identity = z.infer<z.ZodObject<typeof Identity>>;
 type Observe = typeof runCleanupResourceObserver;
 const adapters: Record<string, z.infer<typeof CleanupAdapter>> = {
   "docker-container": "docker", "docker-network": "docker", "docker-volume": "docker", "docker-compose": "compose", "docker-compose-project": "compose",
-  "task-runtime": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
+  "task-runtime": "runtime", "planetscale-branch": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
   "browser-profile": "browser",
   "clerk-test-user": "clerk", "clerk-test-session": "clerk",
   "browser-auth": "vault",
 };
 export const hasCleanupAdapter = (kind: string) => Object.hasOwn(adapters, kind);
 /** Old endpoint receipts may describe a superseded process using a port now
- * owned by another receipt. Only independently addressable historical Docker
+ * owned by another receipt. Only independently addressable historical Docker or standalone provider
  * identities enter the absence observer; history alone grants no effect. */
 export function hasHistoricalCleanupAdapter(resource: { kind: string; metadata?: unknown }) {
-  if (["docker-container", "docker-network", "docker-volume"].includes(resource.kind)) return true;
+  if (["docker-container", "docker-network", "docker-volume", "planetscale-branch"].includes(resource.kind)) return true;
   if (!["docker-compose", "docker-compose-project"].includes(resource.kind)) return false;
   const metadata = resource.metadata;
   return Boolean(metadata && typeof metadata === "object" && !Array.isArray(metadata) && "containers" in metadata && "configPath" in metadata);
