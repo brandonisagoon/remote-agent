@@ -2,7 +2,8 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertRegisteredCaptureSharing } from "./cleanup-filesystem.ts";
+import { assertRegisteredCaptureSharing, prepareRegisteredCaptures } from "./cleanup-filesystem.ts";
+import { CleanupAdapterPlan } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverBatchInput, CleanupTarget, cleanupTargetDigest } from "./cleanup-observer-schema.ts";
 import { assertFinalizationResources, finalizationDigest, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 
@@ -107,6 +108,21 @@ test("other tasks cannot claim a captured source or destination subtree", async 
   await assertRegisteredCaptureSharing(database as never, "task", plan);
   expect(JSON.stringify(query)).toContain(rootPlan(plan).target.quarantine.directory);
   foreign = true; await expect(assertRegisteredCaptureSharing(database as never, "task", plan)).rejects.toThrow("another task");
+});
+
+test.each(["runtimeFile", "credentialsFile"] as const)("registered capture preserves provider %s needed at final confirmation", async field => {
+  const f = await fixture();
+  const raw = { kind: "r2-bucket", id: "bucket", name: "bucket", createdAt: "now", presentAtPrepare: true,
+    scope: { taskId: "task", purpose: "development", accountId: "a".repeat(32), runtimeFile: path.join(f.directory, "runtime.json"), credentialsFile: path.join(f.directory, "credentials.json"), recipeHash: "b".repeat(64), [field]: f.secret } };
+  const target = CleanupTarget.parse({ ...raw, identityDigest: "0".repeat(64) });
+  target.identityDigest = cleanupTargetDigest(target);
+  const adapter = CleanupAdapterPlan.parse({ id: "runtime", key: "runtime-development", kind: "task-runtime", purpose: "development", externalId: "/private/runtime.json", expiresAt: null, identityDigest: "d".repeat(64),
+    disposition: "retire-adapter", adapter: "runtime", dependencies: [], stoppedConsumers: [], targets: [target], observer: {
+      task: { id: "task", primarySessionId: "primary", worktreePath: "/private/original-checkout", toolingRevision: "a".repeat(40) },
+      capability: { version: 1, source: "configured-host", checkout: "/private/tooling", revision: "b".repeat(40), adapter: "/private/tooling/cli.ts", adapterSha256: "c".repeat(64) },
+    } });
+  await expect(prepareRegisteredCaptures({ resources: f.resources, plan: [adapter], ownedPaths: [f.root], protectedPaths: [] }, quiet)).rejects.toThrow("confirmation inputs");
+  expect(await readFile(f.secret, "utf8")).toBe("PRIVATE_FIXTURE=preserved\n");
 });
 
 test.each(["native", "docker"] as const)("capture follows exact %s consumers without replacing their physical proof", async adapter => {

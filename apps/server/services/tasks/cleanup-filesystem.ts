@@ -51,8 +51,8 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
     for (const entry of input.plan) {
       if (entry.disposition === "retain-archive" && overlaps(root, entry.archive.root) || entry.disposition === "retain-archive-member" && within(root, entry.file.path)) throw new Error("Retained archive must survive outside registered cleanup roots");
       if (entry.disposition === "retire-adapter") for (const target of entry.targets) {
-        const required = "runtimeFile" in target.scope ? target.scope.runtimeFile : target.kind === "native-family" ? target.proof.file : undefined;
-        if (required && within(root, required)) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
+        const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file] : [];
+        if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
       }
     }
     await privateRoot(root);
