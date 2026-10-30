@@ -11,6 +11,7 @@ import { beginTask } from "./store.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
+import { recordDevelopmentIntent } from "./development-intent.ts";
 import { createApp } from "../../app.ts";
 import { deliverManagedMerge } from "../../workers/product/workflow/merge-delivery.ts";
 import { CompletionContractInput, setCompletionContract, type OwnerMergeApproval } from "./completion.ts";
@@ -159,6 +160,18 @@ for (const capability of ["runtime", "browser"] as const) {
     await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability })).rejects.toThrow("paused");
   });
 }
+
+test("paused runtime resolution requires the exact development intent and cannot resolve another capability or a superseded request", async () => {
+  const f = await fixture(true), context = { prisma: db.prisma, config: f.config, taskId: f.task.id };
+  const development = await recordDevelopmentIntent({ ...context, request: { action: "pause", development: true, requestKey: "desktop-pause" } });
+  const input = { prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "runtime" as const, development };
+  expect((await resolveSessionToolingCapability(input)).receipt.capability).toBe("runtime");
+  await expect(resolveSessionToolingCapability({ ...input, capability: "browser" } as any)).rejects.toThrow();
+  await expect(resolveSessionToolingCapability({ ...input, development: { ...development, intentDigest: "0".repeat(64) } })).rejects.toThrow("changed");
+  await recordDevelopmentIntent({ ...context, request: { action: "resume", development: true, requestKey: "new-owner-resume" } });
+  await expect(resolveSessionToolingCapability(input)).rejects.toThrow("changed");
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+});
 
 test("old pin resolves named cleanup without running effects, changing authority or repinning", async () => {
   const f = await fixture();

@@ -21,6 +21,7 @@ import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.t
 import { bunCommandClient } from "../../transports/command/index.ts";
 import { taskRoutes, sessionTaskRoutes } from "../../routes/tasks/index.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { completeDevelopmentIntent, recordDevelopmentIntent, renewDevelopmentAuthority } from "./development-intent.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -65,6 +66,151 @@ async function preparedFixture() {
   const observe = async () => { expect(await completionObservation.snapshot(f.worktree)).toEqual(JSON.parse(frozen.find(row => row.sequence === prepared.preparedRevision)!.value!).delivery.receipts.snapshot); };
   return { ...f, prepared, frozen, observe };
 }
+
+test("explicit paused compute stop records Allocated against the original cleanup binding without altering metadata, data or proofs", async () => {
+  const f = await fixture();
+  const compute = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-api", kind: "docker-container", purpose: "development", externalId: "c".repeat(64), state: "ready", metadata: { image: "original" } } });
+  const data = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-data", kind: "docker-volume", purpose: "development", externalId: "saved-volume", state: "ready" } });
+  await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [active.preparation.sequence, active.operationRevision] } }, orderBy: { sequence: "asc" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle" } });
+  await recordDevelopmentIntent({ ...f.context, request: { action: "pause", development: true, requestKey: "owner-paused-development" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/sessions", sessionTaskRoutes);
+  const receipt = { key: compute.key, kind: compute.kind, purpose: compute.purpose, externalId: compute.externalId, state: "allocated", metadata: { image: "original", observed: "stopped-data-retained" } };
+  const write = (value: unknown) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
+  expect((await write({ ...receipt, metadata: { image: "changed" } })).status).toBe(409);
+  expect((await write({ ...receipt, state: "released" })).status).toBe(409);
+  expect((await write(receipt)).status).toBe(200); expect((await write(receipt)).status).toBe(200);
+  expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: compute.id } })).toMatchObject({ state: "allocated", metadata: receipt.metadata });
+  expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: data.id } })).toEqual(data);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  await db.prisma.remoteTaskResource.update({ where: { id: compute.id }, data: { metadata: { image: "rebound" } } });
+  expect((await write({ ...receipt, metadata: { image: "rebound" } })).status).toBe(409);
+});
+
+test.each(["docker-container", "task-runtime"])("explicit %s resume after cleanup revocation acknowledges only the original saved compute", async kind => {
+  const f = await fixture();
+  const progress = { step: "health", detail: "Saved app is ready", state: "complete", updatedAt: "2026-10-30T00:00:00.000Z" };
+  const metadata = kind === "task-runtime" ? { recipeHash: "original", containerId: "c".repeat(64), providers: [{ provider: "storage", id: "saved" }], progress } : { image: "original" };
+  const compute = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-api", kind, purpose: "development", externalId: kind === "task-runtime" ? "/saved-runtime.json" : "c".repeat(64), state: "ready", metadata } });
+  const data = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-data", kind: "docker-volume", purpose: "development", externalId: "saved-volume", state: "ready" } });
+  await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [active.preparation.sequence, active.operationRevision] } }, orderBy: { sequence: "asc" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const runtime = createFakeAgentRuntime();
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
+  const change = (action: "pause" | "resume", requestKey: string) => app.request(`/api/tasks/${f.task.id}/automation`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, development: true, requestKey }) });
+  const receipt = { key: compute.key, kind, purpose: "development", externalId: compute.externalId, state: "allocated", metadata };
+  const write = (value: unknown) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
+  expect((await change("pause", "pause-saved")).status).toBe(200); expect((await write(receipt)).status).toBe(200);
+  expect((await change("resume", "active-cleanup")).status).toBe(409);
+  expect((await write({ ...receipt, state: "ready" })).status).toBe(409);
+  await f.revoke();
+  expect((await change("resume", "resume-saved")).status).toBe(200);
+  const resumed = kind === "task-runtime" ? { ...metadata, progress: { ...progress, step: "credentials", state: "running" } } : metadata;
+  if (kind === "task-runtime") {
+    expect((await write({ ...receipt, metadata: { ...resumed, progress: { ...resumed.progress, extra: "not progress" } } })).status).toBe(409);
+    expect((await write({ ...receipt, metadata: resumed })).status).toBe(200);
+    expect((await write({ ...receipt, metadata: { ...resumed, containerId: "d".repeat(64) } })).status).toBe(409);
+  }
+  expect((await write({ ...receipt, state: "ready", metadata: { ...resumed, unrelated: true } })).status).toBe(409);
+  expect((await write({ ...receipt, state: "ready", expiresAt: "2030-01-01T00:00:00.000Z", metadata: resumed })).status).toBe(409);
+  expect((await write({ ...receipt, state: "ready", metadata: resumed })).status).toBe(200);
+  expect((await write({ ...receipt, state: "ready", metadata: resumed })).status).toBe(200);
+  expect((await write({ ...receipt, state: "released", metadata: resumed })).status).toBe(409);
+  expect((await change("pause", "stop-again")).status).toBe(200);
+  expect((await write({ ...receipt, metadata: resumed })).status).toBe(200);
+  expect((await write({ ...receipt, state: "ready", metadata: resumed })).status).toBe(409);
+  expect((await change("resume", "resume-again")).status).toBe(200);
+  await db.prisma.remoteTaskResource.update({ where: { id: compute.id }, data: { state: "released" } });
+  expect((await write({ ...receipt, state: "ready", metadata: resumed })).status).toBe(409);
+  expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: data.id } })).toEqual(data);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test.each(["resume", "review-handoff"] as const)("a completed %s stays non-actionable when later cleanup changes the resource epoch", async reason => {
+  const f = await fixture();
+  const compute = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-api", kind: "docker-container", purpose: "development", externalId: "c".repeat(64), state: "ready" } });
+  const review = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "review-api", kind: "native-app", purpose: "review", externalId: "/separate-review", state: "ready", expiresAt: new Date(Date.now() + 600_000) } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const intent = await recordDevelopmentIntent({ ...f.context, request: reason === "resume" ? { action: "resume", development: true, requestKey: "completed-resume" }
+    : { action: "stop-development", requestKey: "completed-handoff", review: { key: review.key, identityDigest: finalizationResourceIdentity(review).identityDigest } } });
+  const authority = await renewDevelopmentAuthority({ ...f.context, ...intent, resourceKeys: [compute.key] });
+  await completeDevelopmentIntent({ ...f.context, ...intent, resourcesEpoch: authority.resourcesEpoch, resources: authority.resources });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes);
+  expect((await (await app.request(`/api/tasks/${f.task.id}`)).json()).task.developmentIntent.state).toBe("complete");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "complete" } });
+  await prepareTaskFinalization(f.input, f.dependencies); await bindPreparedCleanup(f.input, async () => {});
+  // Cleanup can continue in a non-complete phase, and a partial result changes
+  // the development epoch. This must not replay the old resume first.
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  await db.prisma.remoteTaskResource.update({ where: { id: compute.id }, data: { state: "released" } });
+  if (reason === "review-handoff") await db.prisma.remoteTaskResource.update({ where: { id: review.id }, data: { expiresAt: new Date(0) } });
+  const projection = (await (await app.request(`/api/tasks/${f.task.id}`)).json()).task;
+  expect(projection.developmentIntent).toBeUndefined(); expect(projection.developmentBlocked).toContain("cleanup");
+  expect(projection.cleanupRequired).toBeTrue();
+  await expect(renewDevelopmentAuthority({ ...f.context, ...intent, resourceKeys: [] })).rejects.toThrow(reason === "resume" ? "cleanup authority" : "review ownership");
+});
+
+const developmentClient = process.env.DRAFTED_DEVELOPMENT_INTEGRATION_ROOT;
+test.skipIf(!developmentClient)("actual saved-runtime client resumes and acknowledges original cleanup-bound compute after revocation", async () => {
+  const f = await fixture(); await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  const { taskRegistry } = await import(path.join(developmentClient!, "src/control.ts"));
+  const { continueDevelopmentIntent } = await import(path.join(developmentClient!, "src/development-intent.ts"));
+  const { manageRuntime, manageRuntimeResource } = await import(path.join(developmentClient!, "src/runtime.ts"));
+  const { savePrivate } = await import(path.join(developmentClient!, "src/runtime-config.ts"));
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient }))
+    .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(process.platform === "darwin" ? "/private/tmp" : "/tmp", `saved-runtime-${crypto.randomUUID().slice(0, 8)}.sock`);
+  const server = Bun.serve({ unix: socket, fetch: app.fetch });
+  try {
+    const registry = taskRegistry(socket, f.task.id), stateDirectory = path.join(directory, "runtime-state");
+    const approved = { CLERK_SECRET_KEY: "sk_test_approved_fixture", NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_approved_fixture" };
+    const credentialsFile = path.join(directory, "runtime-credentials.json"); await savePrivate(credentialsFile, approved);
+    const configFile = path.join(directory, "runtime-recipe.json");
+    await writeFile(configFile, JSON.stringify({ version: 1, profile: "platform", image: "fixture:1", credentialsFile, runtimeSecrets: Object.keys(approved),
+      planetscale: { organization: "fixture", database: "v2", baseBranch: "main", baseBranchId: "base-id" }, setup: [["bun", "install"]], fixtures: [["bun", "seed-task.ts"]],
+      services: { api: { command: ["bun", "api.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", json: { ready: true }, representative: true }], readyTimeoutSeconds: 1 }));
+    let container: any = null, creates = 0, starts = 0, stops = 0, schema = 0, exec = 0, remoteCreates = 0;
+    const docker = { preflight: async () => {}, create: async (state: any, root: string, environment: unknown) => {
+      creates++; await savePrivate(path.join(root, "app", "environment.json"), environment);
+      return container = { id: "a".repeat(64), image: "sha256:fixture", createdAt: "same-container", running: false, labels: { "dev.drafted.task": f.task.id, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } };
+    }, inspect: async () => container, start: async () => { starts++; container.running = true; }, stop: async () => { stops++; container.running = false; },
+      exec: async () => { exec++; }, remove: async () => { throw new Error("Development cannot remove its saved container"); }, releaseDependencies: async () => { throw new Error("Development cannot release saved dependencies"); } };
+    const remote = { provider: "planetscale", id: "saved-branch", name: "saved-name" };
+    const providers = { preflight: async () => {}, create: async (_provider: unknown, _name: unknown, record: (value: unknown) => Promise<void>) => {
+      remoteCreates++; await record(remote); return { DATABASE_URL: "mysql://fixture@task.psdb.cloud/v2" };
+    }, inspect: async () => true, schema: async (_receipt: unknown, operation: (environment: unknown) => Promise<void>) => { schema++; await operation({ DATABASE_URL: "mysql://fixture-admin@task.psdb.cloud/v2" }); },
+      release: async () => { throw new Error("No remote release"); } };
+    const dependencies = { docker, providers: () => providers, clerkCredentials: async () => approved, request: async () => Response.json({ ready: true }), stateDirectory };
+    await manageRuntime({ ...dependencies, registry, action: "up", configFile });
+    const original = await db.prisma.remoteTaskResource.findFirstOrThrow({ where: { taskId: f.task.id, kind: "task-runtime" } });
+    const initial = { creates, schema, exec, remoteCreates };
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "complete" } });
+    await prepareTaskFinalization(f.input, f.dependencies); const bound = await bindPreparedCleanup(f.input, async () => {});
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [bound.preparation.sequence, bound.operationRevision] } }, orderBy: { sequence: "asc" } });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+    const manage = (input: any) => manageRuntimeResource(input, (request: any) => manageRuntime({ ...request, ...dependencies }));
+    await recordDevelopmentIntent({ ...f.context, request: { action: "pause", development: true, requestKey: "stop-runtime" } });
+    expect((await continueDevelopmentIntent(registry, manage)).developmentIntent.state).toBe("complete");
+    expect(stops).toBe(1); expect(container.running).toBeFalse();
+    await expect(recordDevelopmentIntent({ ...f.context, request: { action: "resume", development: true, requestKey: "still-cleanup" } })).rejects.toThrow("cleanup authority");
+    expect(starts).toBe(1); await f.revoke();
+    await recordDevelopmentIntent({ ...f.context, request: { action: "resume", development: true, requestKey: "resume-saved-runtime" } });
+    const record = registry.resource; let lost = false;
+    registry.resource = async (receipt: any) => { await record(receipt); if (!lost && receipt.state === "ready") { lost = true; throw new Error("Lost Ready acknowledgment"); } };
+    await expect(continueDevelopmentIntent(registry, manage)).rejects.toThrow("Lost Ready acknowledgment");
+    expect((await continueDevelopmentIntent(registry, manage)).developmentIntent.state).toBe("complete");
+    expect(starts).toBe(2); expect(container.running).toBeTrue(); expect({ creates, schema, exec, remoteCreates }).toEqual(initial);
+    const current = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } });
+    expect(current.state).toBe("ready"); expect(current.externalId).toBe(original.externalId);
+    const { progress: _before, observed: _beforeObserved, ...oldIdentity } = original.metadata as any;
+    const { progress: _after, observed: _afterObserved, ...newIdentity } = current.metadata as any;
+    expect(newIdentity).toEqual(oldIdentity);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  } finally { server.stop(true); }
+}, 20_000);
 
 async function resourceScopeFixture(kind: "environment" | "clerk" = "environment") {
   const f = await fixture(kind === "clerk" ? "scopetask" : "task");

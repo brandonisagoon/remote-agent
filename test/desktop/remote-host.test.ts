@@ -105,22 +105,28 @@ test("supervision uses the private socket and previews reject the control API", 
   process.env.REMOTE_AGENT_CONFIG = file;
   const requests: Array<{ path: string; method: string; body: unknown }> = [];
   let externalId = "http://127.0.0.1:9010/review";
+  let unprovisioned = false;
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const part of req) body += part;
     requests.push({ path: req.url!, method: req.method!, body: body ? JSON.parse(body) : null });
     res.setHeader("content-type", "application/json");
-    res.end(JSON.stringify(req.method === "GET" ? { task: { resources: [{ id: "preview", kind: "local-http", state: "ready", externalId }] } } : { resolved: true }));
+    res.end(JSON.stringify(req.method === "GET" ? { task: { resources: unprovisioned ? [] : [{ id: "preview", kind: "local-http", state: "ready", externalId }] } } : { resolved: true }));
   });
   try {
     await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, resolve); });
     await desktopOperation(file, { method: "tasks:resolve", args: ["task", "instruction:one", "acknowledge", "Confirmed result in the transcript"] });
     expect(requests[0]).toEqual({ path: "/api/tasks/task/instructions/instruction%3Aone/resolve", method: "POST", body: { action: "acknowledge", reason: "Confirmed result in the transcript" } });
     expect(await desktopOperation(file, { method: "tasks:preview", args: ["task", "preview"] })).toBe(externalId);
+    await desktopOperation(file, { method: "tasks:control", args: ["task", "close"] });
+    expect(requests.find(request => request.path === "/api/tasks/task/automation")!.body).toEqual({ action: "close" });
     for (const url of ["http://127.0.0.1:9000/api/tasks", "https://public.example/review", "http://private:token@localhost:9010/review"]) {
       externalId = url;
       await expect(desktopOperation(file, { method: "tasks:preview", args: ["task", "preview"] })).rejects.toThrow("task-owned loopback");
     }
+    unprovisioned = true;
+    for (const action of ["pause", "resume"]) await desktopOperation(file, { method: "tasks:control", args: ["task", action] });
+    expect(requests.filter(request => request.path.endsWith("/automation")).slice(-2).map(request => request.body)).toEqual([{ action: "pause" }, { action: "resume" }]);
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     if (previous === undefined) delete process.env.REMOTE_AGENT_CONFIG; else process.env.REMOTE_AGENT_CONFIG = previous;
