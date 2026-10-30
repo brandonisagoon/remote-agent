@@ -445,3 +445,33 @@ lost capture acknowledgements through the actual client. A read-only DRA-42
 inspection recognizes six exact roots and both existing hardlink pairs. This
 inspection is not a live adoption, complete source inventory or writer-absence
 proof; original-primary cleanup after release remains the acceptance step.
+
+## Mac metadata in original bundle archives
+
+The original bundle format may contain paired AppleDouble records created by
+Mac tar. The raw tar reader still returns every regular member. Original-work
+verification uses the independently observed Git untracked paths to classify
+only extra `._name` records paired with an exact expected `name` member. An
+expected `._` file remains ordinary user content, including when its bytes happen
+to be valid AppleDouble. Any existing original path at a metadata name also
+refuses classification, including ignored files.
+
+Recognized metadata must have the bounded Apple copyfile two-entry layout:
+Finder information and an empty resource fork, with complete optional ATTR name
+and value records. Entry offsets, lengths, names, alignment, uniqueness and full
+byte coverage are checked. Unknown, executable, orphaned, overlapping or
+trailing data is refused. The layout follows Apple's
+[copyfile definitions](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.c)
+(`apple_double_header_t`, `attr_header_t`, and `attr_entry_t`). Metadata is never
+extracted or applied. The complete original tar remains covered by its existing
+manifest, hash and retained inventory. Exact real-file size, hash, executable
+mode, staged classification and independent restore checks remain required.
+
+DRA216's disposable fixture reproduced the original 14-versus-7 count failure
+before the fix. It now restores seven exact files plus seven synthetic 163-byte
+metadata records without changing source/index or archive bytes. Rejection
+fixtures cover malformed metadata, ordinary extra files, real `._` content and
+source-path collisions. A read-only comparison of DRA98's existing tar at
+2026-10-30 12:59:17 UTC classified all seven paired metadata records and matched
+all seven real files; archive and index identities and hashes stayed unchanged.
+This compatibility observation did not adopt a proof or perform cleanup.
