@@ -3,14 +3,15 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { fixtureSocket } from "./unix-socket.test-support.ts";
 import { assertFinalizationResources, assertFinalizationTree, finalizationDigest, finalizationResourceIdentity, finalizationResourceObservation, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const quiet: ResourceObservation = { endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
-async function fixture() {
-  const temp = await realpath(await mkdtemp(path.join(tmpdir(), "external-finalization-test-"))); roots.push(temp);
+async function fixture(prefix = "ef-") {
+  const temp = await realpath(await mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), prefix))); roots.push(temp);
   const root = path.join(temp, "legacy-task-source-copies"), sourcePath = path.join(root, "source"), toolingRoot = path.join(temp, "immutable-tooling");
   await mkdir(sourcePath, { recursive: true }); await mkdir(toolingRoot);
   if (Bun.spawnSync(["git", "init", "-q", sourcePath]).exitCode) throw new Error("Test repository initialization failed");
@@ -59,6 +60,71 @@ async function capture(plan: FinalizationResourcePlan[], renameRoot = true) {
 }
 
 describe("external-delivery resource ownership", () => {
+  test("explicitly scoped inactive sockets survive full capture, confirmation and replay at long paths", async () => {
+    const f = await fixture("ef-long-socket-capture-"), leak = path.join(f.root, "tmp", "leak");
+    await mkdir(leak, { recursive: true });
+    const socket = path.join(leak, "old.sock"); fixtureSocket(socket);
+    await expect(f.prepare()).rejects.toThrow("outside the adopted ownership scope");
+    f.input.ownership.ownedPaths.push(leak);
+    const plan = await f.prepare(), target = tree(plan), entry = target.inventory.find(item => item.path === "tmp/leak/old.sock")!;
+    expect(entry.kind).toBe("socket");
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
+    await capture(plan);
+    const captured = path.join(target.quarantine.path, entry.path), journal = await readFile(target.quarantine.journal);
+    expect(Buffer.byteLength(captured)).toBeGreaterThan(108);
+    for (const item of plan) if (item.disposition === "retire-owned") f.resources.find(resource => resource.id === item.id)!.state = "released";
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet);
+    await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet);
+    expect((await lstat(captured)).ino).toBe(entry.ino);
+    expect((await lstat(captured)).isSocket()).toBeTrue();
+    expect(await readFile(target.quarantine.journal)).toEqual(journal);
+    expect(await readFile(path.join(target.quarantine.path, "capture.webm"), "utf8")).toBe("capture");
+  });
+
+  for (const state of ["bound", "listening", "datagram"] as const) test(`inactive lsof observation cannot authorize a ${state} socket`, async () => {
+    const f = await fixture(), socket = path.join(f.root, "test.sock"), endpoint = fixtureSocket(socket, state);
+    f.input.ownership.ownedPaths.push(socket);
+    try { await expect(f.prepare(quiet)).rejects.toThrow("inactivity could not be verified"); }
+    finally { endpoint.close(); }
+    expect((await lstat(socket)).isSocket()).toBeTrue();
+    expect(f.resources.every(resource => resource.state === "ready")).toBeTrue();
+  });
+
+  test("FIFO entries remain unsupported even inside explicitly owned scope", async () => {
+    const f = await fixture(), fifo = path.join(f.root, "test.fifo");
+    expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+    f.input.ownership.ownedPaths.push(fifo);
+    await expect(f.prepare()).rejects.toThrow("unsupported filesystem entry");
+  });
+
+  test("FIFO replacements cannot block regular evidence or journal inspection before fstat", async () => {
+    const f = await fixture(), plan = await f.prepare(), target = tree(plan);
+    await capture(plan, false);
+    await rm(f.capture); expect(Bun.spawnSync(["mkfifo", f.capture]).exitCode).toBe(0);
+    await rm(target.quarantine.journal); expect(Bun.spawnSync(["mkfifo", target.quarantine.journal]).exitCode).toBe(0);
+    const program = `import { prepareFinalizationResources, inspectFinalizationQuarantine } from ${JSON.stringify(path.join(import.meta.dir, "finalization-resources.ts"))}; const input=JSON.parse(await Bun.stdin.text()); const quiet={rootIdle:async()=>{},endpointAbsent:async()=>{},browserAbsent:async()=>{}}; for(const operation of [()=>prepareFinalizationResources(input.prepare,quiet),()=>inspectFinalizationQuarantine(input.inspect)]) { try { await operation(); process.exitCode=2; } catch(error) { if(!/regular file/.test(error.message)) throw error; process.stdout.write("rejected\\n"); } }`;
+    const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", program], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const timer = setTimeout(() => child.kill(9), 2000);
+    try {
+      child.stdin.write(JSON.stringify({ prepare: f.input, inspect: { taskId: "original-task", resourceId: "source", target } })); child.stdin.end();
+      const [code, output, error] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      expect({ code, output, error }).toEqual({ code: 0, output: "rejected\nrejected\n", error: "" });
+    } finally { clearTimeout(timer); }
+    expect((await lstat(f.capture)).isFIFO()).toBeTrue(); expect((await lstat(target.quarantine.journal)).isFIFO()).toBeTrue();
+  });
+
+  test("socket substitutions after inventory and after capture preserve material and reject confirmation", async () => {
+    const f = await fixture(), socket = path.join(f.root, "test.sock"); fixtureSocket(socket);
+    f.input.ownership.ownedPaths.push(socket);
+    const plan = await f.prepare(), target = tree(plan), original = await lstat(socket), saved = path.join(f.temp, "saved.sock");
+    await rename(socket, saved); fixtureSocket(socket);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("identity changed");
+    expect((await lstat(saved)).ino).toBe(original.ino);
+    await capture(plan);
+    await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet)).rejects.toThrow("identity changed");
+    expect((await lstat(path.join(target.quarantine.path, "test.sock"))).isSocket()).toBeTrue();
+  });
+
   test("freezes all eight identities, retains only provider-verified references and never reads browser cookies", async () => {
     const f = await fixture(), plan = await f.prepare();
     expect(plan).toHaveLength(8);
