@@ -143,6 +143,7 @@ test("physical planning cannot infer a capability or silently drop unsupported r
   const { prepareFinalizationResources } = await import("./finalization-resources.ts");
   const f = fixture(), input = { resources: f.resources.slice(0, 5), taskId: f.task.id, sessionId: f.task.primarySessionId,
     toolingRoot: f.context.capability.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [] }, originalWork: true };
+  f.resources[5]!.kind = "unsupported-provider-resource";
   const observation = { adapters: f.observe, endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
   await expect(prepareFinalizationResources(input, observation)).rejects.toThrow("server-bound");
   await expect(prepareFinalizationResources({ ...input, resources: f.resources, adapterContext: f.context }, observation)).rejects.toThrow("exact resource plans");
