@@ -405,3 +405,32 @@ all copies. No live task was adopted or retired by the implementation tests.
 Release additive migration `20261030120000_original_administration` with the
 matching Drafted capability. Existing pins, original preparation/binding bytes,
 retained archives and finalization request keys stay unchanged.
+
+## Installed dependencies in archived originals (DRA-205)
+
+New original-work proofs can retain exact ignored `node_modules` directories as
+opaque children of the same atomic source capture. The existing linked-worktree
+detector requires a real owned directory, an untracked install path, its tracked
+package file and tracked root lock files. The proof binds each directory's
+device, inode and mode plus those files' exact identities and hashes. It does not
+claim individual dependency content hashes. Hardlinks inside an install remain
+links to the same retained bytes; nothing is unlinked or deduplicated.
+
+Explicit original ownership still covers every ignored path. All other ignored
+material remains fully inventoried. Source preparation, capture, retry and full
+confirmation recheck the dependency scope, directory identities and package pins.
+The existing bounded process/open-handle observer covers the entire source and
+capture, including opaque children; no writer receives an exception.
+
+`OriginalWork.installedDependencies` is optional and is emitted only when such
+roots are independently observed. Existing frozen preparations are never
+rewritten or converted: a proof without this field retains its complete old
+inventory and every dependency file hash. Use the matching new cleanup client
+for new proofs; the task's original policy/tooling pin remains unchanged.
+
+Disposable bundle and recovery-format fixtures cover two hardlink pairs, ignored
+owner files, changed directory/package/lock identities, active file handles and
+lost capture acknowledgements through the actual client. A read-only DRA-42
+inspection recognizes six exact roots and both existing hardlink pairs. This
+inspection is not a live adoption, complete source inventory or writer-absence
+proof; original-primary cleanup after release remains the acceptance step.
