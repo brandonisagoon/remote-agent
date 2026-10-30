@@ -3,21 +3,27 @@ import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
+import { DevelopmentReference, assertDevelopmentRequest } from "./development-intent.ts";
 
 // Merge is deliberately not exposed: its workflow has a separate owner
 // approval boundary. A caller may select a name, never a path or revision.
-export const ToolingCapabilityInput = z.object({ capability: z.enum(["development-credentials", "cleanup", "runtime", "browser"]) }).strict();
+export const ToolingCapabilityInput = z.union([
+  z.object({ capability: z.enum(["development-credentials", "cleanup", "runtime", "browser"]) }).strict(),
+  z.object({ capability: z.literal("runtime"), development: DevelopmentReference }).strict(),
+]);
 type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string };
 
 export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput>, resolve = resolveToolingCompatibility) {
-  const { capability } = ToolingCapabilityInput.parse({ capability: input.capability });
-  const assertOwnership = async (prisma: Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink">) => {
+  const parsed = ToolingCapabilityInput.parse({ capability: input.capability, ...("development" in input ? { development: input.development } : {}) });
+  const { capability } = parsed;
+  const assertOwnership = async (prisma: Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeInstruction" | "runtimeLifecycleEvent" | "runtimeMetadataEvent">) => {
     const task = await prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
     const session = await prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
     if (!task || !session || session.role !== "primary" || session.status === "closed" || !task.worktreePath
       || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId
       || task.machineId !== input.config.machine) throw new Error("Only the open owning task primary may resolve tooling capabilities");
-    if (task.ownerPaused || task.phase === "closed") throw new Error("Task capability resolution is paused or closed");
+    if ("development" in parsed) await assertDevelopmentRequest({ prisma, config: input.config, taskId: task.id, ...parsed.development });
+    if (task.ownerPaused && !("development" in parsed) || task.phase === "closed") throw new Error("Task capability resolution is paused or closed");
     const repository = input.config.repositories[task.repositoryId];
     if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
     if (task.issueIdentifier) {

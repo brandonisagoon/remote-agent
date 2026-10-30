@@ -14,6 +14,7 @@ import { listProviderModels } from "./provider-models.ts";
 import { tunnelInfo } from "./tunnel-info.ts";
 import { DesktopRepositoryReferenceSchema } from "../lib/desktop-sessions.ts";
 import { desktopRepositoryReference, desktopRepositorySessions } from "./desktop-sessions.ts";
+import { controlDevelopmentCompute } from "./development-control.ts";
 
 const text = z.string().min(1);
 const id = z.string().min(1).max(200);
@@ -98,7 +99,15 @@ export async function desktopOperation(file: string, raw: unknown, serviceLabel?
     case "sessions:list": return (await control<{ sessions: unknown[] }>(`/api/sessions?includeClosed=true${args[0] ? `&repositoryId=${encodeURIComponent(args[0] as string)}` : ""}`)).sessions;
     case "tasks:list": return (await control<{ tasks: DesktopTask[] }>("/api/tasks")).tasks;
     case "tasks:activity": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/activity`);
-    case "tasks:control": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/automation`, "POST", { action: args[1] });
+    case "tasks:control": {
+      const route = `/api/tasks/${encodeURIComponent(args[0] as string)}`;
+      if (args[1] === "close") return control(`${route}/automation`, "POST", { action: "close" });
+      const { task } = await control<{ task: { primarySessionId?: string | null; worktreePath?: string | null; resources: unknown[] } }>(route);
+      // A not-yet-provisioned task has no compute ownership to bind. Preserve
+      // its existing automation control while provisioned tasks use intent.
+      if ((!task.primarySessionId || !task.worktreePath) && task.resources.length === 0) return control(`${route}/automation`, "POST", { action: args[1] });
+      return controlDevelopmentCompute(config, args[0] as string, args[1] as "pause" | "resume");
+    }
     case "tasks:answer": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/questions/${encodeURIComponent(args[1] as string)}/answer`, "POST", { answer: args[2] });
     case "tasks:instruct": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/instructions`, "POST", { requestKey: args[1], text: args[2] });
     case "tasks:resolve": return control(`/api/tasks/${encodeURIComponent(args[0] as string)}/instructions/${encodeURIComponent(args[1] as string)}/resolve`, "POST", { action: args[2], reason: args[3] });

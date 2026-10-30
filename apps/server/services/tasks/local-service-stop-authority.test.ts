@@ -10,6 +10,7 @@ import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.t
 import { beginRuntimeSession } from "../sessions/runtime-registry.ts";
 import { beginTask } from "./store.ts";
 import { LocalServiceStopAuthority, resolveLocalServiceStopAuthority } from "./local-service-stop-authority.ts";
+import { recordDevelopmentIntent } from "./development-intent.ts";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -57,7 +58,7 @@ async function fixture() {
 test("real local service stop route resolves configured code without altering original receipts, pins or source state", async () => {
   const f = await fixture(), taskBefore = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
   const first = await f.request({ key: f.resource.key }); expect(first.status).toBe(200);
-  const authority = LocalServiceStopAuthority.parse(await first.json()); expect(authority.capability).toEqual(f.capability); expect(authority.turn.requestId).toBe("original-request");
+  const authority = LocalServiceStopAuthority.parse(await first.json()); expect(authority.capability).toEqual(f.capability); expect(authority.turn!.requestId).toBe("original-request");
   expect(authority.task.toolingRevision).toBe(f.task.toolingRevision); expect(authority.capability.revision).not.toBe(f.task.toolingRevision);
   expect(await (await f.request({ key: f.resource.key })).json()).toEqual(authority);
   expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(taskBefore);
@@ -99,9 +100,9 @@ test.each(["pause", "turn", "pin", "resource", "shared-parent"])("local service 
 
 test("local service stop distinguishes a later turn and a new started event with the same request ID", async () => {
   const f = await fixture(), first = await resolveLocalServiceStopAuthority(f.input, f.resolve); await f.event();
-  const replay = await resolveLocalServiceStopAuthority(f.input, f.resolve); expect(replay.turn.requestId).toBe(first.turn.requestId); expect(replay.turn.lifecycleRevision).toBeGreaterThan(first.turn.lifecycleRevision);
+  const replay = await resolveLocalServiceStopAuthority(f.input, f.resolve); expect(replay.turn!.requestId).toBe(first.turn!.requestId); expect(replay.turn!.lifecycleRevision).toBeGreaterThan(first.turn!.lifecycleRevision);
   f.setRequest("later-request"); await expect(resolveLocalServiceStopAuthority(f.input, f.resolve)).rejects.toThrow("executing"); await f.event();
-  const later = await resolveLocalServiceStopAuthority(f.input, f.resolve); expect(later.turn.requestId).toBe("later-request");
+  const later = await resolveLocalServiceStopAuthority(f.input, f.resolve); expect(later.turn!.requestId).toBe("later-request");
 });
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
@@ -140,3 +141,51 @@ test("local service witness binds the original private pin between otherwise ide
   expect(second.task).toEqual(first.task); expect(second.turn).toEqual(first.turn); expect(second.resource).toEqual(first.resource);
   expect(second.authorityDigest).not.toBe(first.authorityDigest);
 });
+
+test("saved owner-pause intent permits exact older service stop after cancellation settles without inventing a live turn", async () => {
+  const f = await fixture();
+  const development = await recordDevelopmentIntent({ prisma: f.prisma, config: f.config, taskId: f.task.id, request: { action: "pause", development: true, requestKey: "pause-development" } });
+  await expect(resolveLocalServiceStopAuthority({ ...f.input, development }, f.resolve)).rejects.toThrow("settle");
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle" } });
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  const before = await f.prisma.remoteTaskResource.findMany();
+  const receipt = await resolveLocalServiceStopAuthority({ ...f.input, development }, f.resolve);
+  expect(receipt.development).toEqual(development); expect(receipt.turn).toBeUndefined();
+  expect(receipt.resource.id).toBe(f.resource.id); expect(receipt.capability).toEqual(f.capability);
+  await expect(resolveLocalServiceStopAuthority(f.input, f.resolve)).rejects.toThrow();
+  await recordDevelopmentIntent({ prisma: f.prisma, config: f.config, taskId: f.task.id, request: { action: "resume", development: true, requestKey: "resume-development" } });
+  await expect(resolveLocalServiceStopAuthority({ ...f.input, development }, f.resolve)).rejects.toThrow("changed");
+  expect(await f.prisma.remoteTaskResource.findMany()).toEqual(before);
+});
+
+test.skipIf(!draftedRoot || process.platform !== "darwin")("actual paused development intent finishes an interrupted older process family and preserves its saved data", async () => {
+  const f = await fixture();
+  const { localServiceFixture } = await import(path.join(draftedRoot!, "test/fixtures/local-service-stop.ts"));
+  const { continueDevelopmentIntent } = await import(path.join(draftedRoot!, "src/development-intent.ts"));
+  const { manageResource } = await import(path.join(draftedRoot!, "src/resources.ts"));
+  const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+  const service = await localServiceFixture({ taskId: f.task.id }); cleanup.push(service.cleanup);
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { worktreePath: service.checkout } });
+  await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { cwd: service.checkout, status: "idle" } });
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  await f.prisma.remoteTaskResource.deleteMany({ where: { taskId: f.task.id } });
+  for (const resource of service.task.resources) await f.prisma.remoteTaskResource.create({ data: { ...resource, taskId: f.task.id } });
+  await recordDevelopmentIntent({ prisma: f.prisma, config: f.config, taskId: f.task.id, request: { action: "pause", development: true, requestKey: "pause-services" } });
+  const socket = `/private/tmp/development-${randomUUID().slice(0, 8)}.sock`, app = createApp({ config: f.config, prisma: f.prisma, agentRuntime: f.runtime, trustLocal: true });
+  const server = Bun.serve({ unix: socket, fetch: app.fetch }); await chmod(socket, 0o600); cleanup.push(async () => { await server.stop(true); });
+  const registry = taskRegistry(socket, f.task.id); let interrupted = false;
+  const manage = (input: any) => manageResource({ ...input, serviceStop: { ...service.observation,
+    assertCapability: async (value: unknown) => { expect(value).toEqual(f.capability); },
+    afterSignal: async () => { if (!interrupted) { interrupted = true; throw new Error("Interrupted after one exact process stop"); } },
+  } });
+  await expect(continueDevelopmentIntent(registry, manage)).rejects.toThrow("Interrupted after one exact process stop");
+  expect(service.effects).toHaveLength(1); expect((await registry.task()).ownerPaused).toBeTrue();
+  await continueDevelopmentIntent(registry, manage); await continueDevelopmentIntent(registry, manage);
+  expect(new Set(service.effects).size).toBe(3); expect(service.effects).toHaveLength(3);
+  expect((await registry.task()).developmentIntent.state).toBe("complete"); expect((await registry.task()).ownerPaused).toBeTrue();
+  expect(await service.readSaved()).toBe('{"saved":"unchanged"}');
+  expect(await f.prisma.remoteTaskResource.count({ where: { state: "released" } })).toBe(0);
+  await recordDevelopmentIntent({ prisma: f.prisma, config: f.config, taskId: f.task.id, request: { action: "resume", development: true, requestKey: "resume-services" } });
+  await expect(continueDevelopmentIntent(registry, manage)).rejects.toThrow("no verified saved resume adapter");
+  expect((await registry.task()).developmentIntent.state).toBe("pending"); expect(service.effects).toHaveLength(3);
+}, 30_000);
