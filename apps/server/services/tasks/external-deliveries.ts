@@ -1,3 +1,5 @@
+import { hasCleanupAdapter } from "./cleanup-adapter-resources.ts";
+import { resolveCleanupObserver } from "./cleanup-resource-observer.ts";
 import { prepareOriginalWork, assertOriginalWork, originalWorkRetainedPlans } from "./original-work.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -16,7 +18,7 @@ import { assertFinalizationResources, assertFinalizationPlanPurposes, finalizati
 export type ExternalDatabase = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
 export const externalBindingDependencies = { source: linkedSourceIssue, comment: fetchQualifiedIssueComment, observer: externalDeliveryObservation,
-  delivered: observeDeliveredScope,
+  delivered: observeDeliveredScope, cleanupObserver: resolveCleanupObserver,
   handoffComment: fetchIssueCommentIdentity, snapshot: completionObservation.snapshot, resources: prepareFinalizationResources, assertResources: assertFinalizationResources, originalWork: prepareOriginalWork, assertOriginalWork };
 export type ExternalDependencies = typeof externalBindingDependencies;
 
@@ -28,7 +30,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition === "retire-owned" && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && ["retire-owned", "retire-adapter"].includes(entry.disposition) && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -135,7 +137,9 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   if (JSON.stringify(resourceIds) !== JSON.stringify([...manifest.resourceIds].sort())) throw new Error("Adoption must name the complete exact task resource set");
   const originalWork = manifest.originalWork ? await dependencies.originalWork({ taskId: input.taskId, toolingRevision: current.identity.toolingRevision, worktree: current.identity.taskWorktree, branch: current.identity.branch, approvedHead: lineage.approval.snapshot.head, resources, originalWork: manifest.originalWork }) : undefined;
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
-  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state !== "released" && hasCleanupAdapter(resource.kind))
+    ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
+  const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
     for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") {
