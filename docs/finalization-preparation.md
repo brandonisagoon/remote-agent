@@ -64,6 +64,17 @@ authority, automatic retry or repair, and cannot reconstruct an earlier lost
 exception. In particular, DRA-42's unchanged existing retry succeeded after its
 initial failure; no persistent fingerprint defect is established by that history.
 
+An unidentified filesystem handle now retains `FILESYSTEM_UNVERIFIED` with its
+numeric process ID, bounded descriptor, allowlisted type and fixed missing-type,
+unknown-type, missing-name or nonabsolute-path classification. Unlisted types
+and descriptors become `other`; the observed name itself is never retained.
+The durable worker row keeps these validated fields and the existing client
+error string includes the same safe details. Malformed typed details produce the
+fixed unverified reason, not raw exception output. This does not change the
+handle refusal predicate or its existing narrow retry rule. It identifies a
+future refused observation; it cannot recover the omitted handle from original
+DRA-98 attempt 1808 or establish the cause of an earlier attempt.
+
 Drafted polls only this idempotent protocol. Each HTTP call keeps its ordinary
 finite deadline, reduced to the remaining overall ten-minute polling budget.
 Late ready responses do not extend that budget. Exhaustion reports the exact

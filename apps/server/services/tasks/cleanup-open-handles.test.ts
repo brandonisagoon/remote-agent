@@ -3,9 +3,28 @@ import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { assertLinkedPathsIdle, assertLinkedRootIdle, assertRootHandleInventory } from "./cleanup-open-handles.ts";
+import { preparationFailure } from "./preparation-errors.ts";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const record = (name: string, fd = "cwd", type = "DIR") => Buffer.from(`p123\0f${fd}\0t${type}\0n${name}\0\n`);
+test.each([
+  ["p123\0f167\0nvnode: Permission denied at /private/secret\0\n", "missing", "missing-type", "nonabsolute"],
+  ["p123\0f167\0tUNKN\0n/private/secret\0\n", "UNKN", "unknown-type", "absolute"],
+  ["p123\0f167\0tREG\0\n", "REG", "missing-name", "missing"],
+  ["p123\0f167\0tREG\0nrelative-secret\0\n", "REG", "nonabsolute-path", "nonabsolute"],
+] as const)("unidentified handle survives the preparation diagnostic boundary: %s", (raw, type, problem, name) => {
+  let error: unknown; try { assertRootHandleInventory("/private/task", Buffer.from(raw)); } catch (caught) { error = caught; }
+  const diagnostic = preparationFailure(error);
+  expect(diagnostic).toMatchObject({ code: "FILESYSTEM_UNVERIFIED", filesystemHandle: { processId: 123, descriptor: "167", type, problem, name } });
+  expect(diagnostic.reason).toContain(problem);
+  expect(JSON.stringify(diagnostic)).not.toMatch(/secret|Permission denied|\/private|vnode:/);
+});
+test("unsupported descriptor and type text are classified without retaining their contents", () => {
+  let error: unknown;
+  try { assertRootHandleInventory("/private/task", Buffer.from("p123\0fprivate-descriptor-token\0tprivate-type-token\0\n")); } catch (caught) { error = caught; }
+  expect(preparationFailure(error)).toMatchObject({ code: "FILESYSTEM_UNVERIFIED", filesystemHandle: { processId: 123, descriptor: "other", type: "other", problem: "missing-name", name: "missing" } });
+  expect(JSON.stringify(preparationFailure(error))).not.toMatch(/private|token/);
+});
 test.each(["/private/task", "/private/task/file with spaces", "/private/task/file\nwith newline", "/private/task (deleted)"])("exact open handle refuses %s without pathname tokenization", file => {
   expect(() => assertRootHandleInventory("/private/task", record(file))).toThrow("still holds");
 });

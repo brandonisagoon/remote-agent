@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
+import { FilesystemHandleDiagnostic, FilesystemHandleDiagnosticError, filesystemHandleReason } from "./filesystem-handle-diagnostic.ts";
 
 // These are diagnostic classifications, never authority or automatic repairs.
-// Only fixed reviewed text is retained: even a bounded arbitrary Error.message
-// may contain a credential, private URL, provider body or agent transcript.
+// Only fixed reviewed text and validated structured fields are retained: even a
+// bounded arbitrary Error.message may contain a credential, private URL,
+// provider body or agent transcript.
 const reasons = {
   ...cleanupObserverReasons,
   PR_NOT_FOUND: "No pull request was found for the configured repository and task branch or recorded PR number. Check that recorded delivery correspondence.",
@@ -34,7 +36,8 @@ const reasons = {
   UNCLASSIFIED_FAILURE: "Verification failed without a recognized safe diagnostic. Raw exception details were omitted; inspect the recorded inputs for this stage.",
 } as const;
 type Code = keyof typeof reasons;
-export const PreparationFailure = z.object({ code: z.enum(Object.keys(reasons) as [Code, ...Code[]]), reason: z.string().max(320) }).strict();
+export const PreparationFailure = z.object({ code: z.enum(Object.keys(reasons) as [Code, ...Code[]]), reason: z.string().max(320), filesystemHandle: FilesystemHandleDiagnostic.optional() }).strict()
+  .refine(value => !value.filesystemHandle || value.code === "FILESYSTEM_UNVERIFIED", "Filesystem handle detail requires its unverified diagnostic");
 export type PreparationFailure = z.infer<typeof PreparationFailure>;
 const known = (code: Code): PreparationFailure => ({ code, reason: reasons[code] });
 
@@ -116,6 +119,10 @@ function localFailure(error: Error): PreparationFailure {
 }
 
 export function preparationFailure(error: unknown): PreparationFailure {
+  if (error instanceof FilesystemHandleDiagnosticError) {
+    const handle = FilesystemHandleDiagnostic.safeParse(Object.getOwnPropertyDescriptor(error, "handle")?.value);
+    return handle.success ? { code: "FILESYSTEM_UNVERIFIED", reason: filesystemHandleReason(handle.data), filesystemHandle: handle.data } : known("FILESYSTEM_UNVERIFIED");
+  }
   if (error instanceof CleanupObserverError) return error.diagnostic;
   if (error instanceof PreparationDiagnosticError) return known(error.diagnosticCode);
   if (!(error instanceof Error)) return known("UNCLASSIFIED_FAILURE");
