@@ -176,7 +176,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const retainedArchives = originalWork ? originalWorkRetainedPlans(originalWork, resources) : [];
   const { preparePreservationEvidence, assertPreservationSources } = await import("./cleanup-preservation.ts");
   const preservation = await preparePreservationEvidence({ prisma: input.prisma, taskId: input.taskId, sessionId: current.session.id, resources, plan: retainedArchives, selection: manifest.ownership.preservation });
-  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
+  const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource, resources) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(preservation ? { preservation } : {}), ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
   const { assertSavedDataCaptureSeparation } = await import("./cleanup-saved-data.ts");

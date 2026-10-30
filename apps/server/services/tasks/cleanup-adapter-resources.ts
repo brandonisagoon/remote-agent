@@ -22,8 +22,23 @@ export const hasCleanupAdapter = (kind: string) => Object.hasOwn(adapters, kind)
 /** Old endpoint receipts may describe a superseded process using a port now
  * owned by another receipt. Only independently addressable historical Docker or standalone provider
  * identities enter the absence observer; history alone grants no effect. */
-export function hasHistoricalCleanupAdapter(resource: { kind: string; metadata?: unknown }) {
+export function hasHistoricalCleanupAdapter(resource: { kind: string; purpose?: string; metadata?: unknown }, resources: Array<{ kind: string; purpose?: string; state?: string; metadata?: unknown }> = []) {
   if (["docker-container", "docker-network", "docker-volume", "planetscale-branch"].includes(resource.kind)) return true;
+  if (resource.kind === "task-runtime") {
+    const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+    const metadata = object(resource.metadata);
+    if (typeof metadata.recipeHash !== "string" || !/^[a-f0-9]{64}$/.test(metadata.recipeHash) || !Array.isArray(metadata.providers)) return false;
+    // Observe a released runtime only when an unresolved logical object record
+    // still needs its exact bucket. Other historical runtimes stay historical.
+    // The actual runtime file and every provider target must independently
+    // prove absence before this can enter a plan; Released is not that proof.
+    const providers = metadata.providers.map(object);
+    return resources.some(candidate => {
+      if (candidate.kind !== "s3-object" || candidate.state === "released" || candidate.purpose !== resource.purpose) return false;
+      const stored = object(candidate.metadata), bucket = typeof stored.bucket === "string" ? /^(drafted-[a-z0-9-]+) \(task R2\)$/.exec(stored.bucket)?.[1] : undefined;
+      return Boolean(bucket && Array.isArray(stored.objects) && providers.filter(provider => provider.provider === "storage" && provider.id === bucket && provider.name === bucket).length === 1);
+    });
+  }
   if (!["docker-compose", "docker-compose-project"].includes(resource.kind)) return false;
   const metadata = resource.metadata;
   return Boolean(metadata && typeof metadata === "object" && !Array.isArray(metadata) && "containers" in metadata && "configPath" in metadata);
