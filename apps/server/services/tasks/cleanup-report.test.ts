@@ -1,3 +1,4 @@
+import { cleanupInboxDependencies } from "./cleanup-inbox.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -204,11 +205,15 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
   await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting", ownerPaused: true } });
   const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "idle", role: "primary" }]);
   const saved = { ...finalizationDependencies };
+  const savedInbox = { ...cleanupInboxDependencies };
   Object.assign(finalizationDependencies, f.dependencies);
+  cleanupInboxDependencies.capability = async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "cleanup", source: "configured-host", taskToolingRevision: f.task.toolingRevision,
+    capabilityRevision: "b".repeat(40), checkout: process.env.DRAFTED_INTEGRATION_ROOT!, instructions: path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "projects/greenfield/cleanup.md"), adapter: path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts") }, instructions: "Disposable configured immutable capability fixture" });
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
     .post("/api/tasks/task/cleanup-report", c => c.json({ error: "Linear is offline" }, 503))
     .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
   const socket = path.join(directory, "cli.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  f.config.controlIpcPath = socket;
   const cli = async (args: string[] = ["task", "destroy", "--task", f.task.id]) => {
     const child = Bun.spawn([process.execPath, path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts"), ...args, "--socket", socket], { cwd: directory, stdout: "pipe", stderr: "pipe" });
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
@@ -220,7 +225,30 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(0);
     expect(git(f.worktree, "rev-parse", "HEAD")).toBe(f.remote.remoteHead);
     await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
-    const result = await cli(automatic ? ["upkeep", "expired"] : undefined);
+    let automaticResult: Awaited<ReturnType<typeof cli>> | undefined;
+    if (automatic) {
+      runtime.startTurn = input => {
+        const result = (async () => {
+          if (!await input.beforeStart?.()) return { status: "cancelled" as const, stopReason: "deferred" };
+          runtime.sessions.get(f.session.id)!.status = "active";
+          runtime.observeSessionActivity = id => id === f.session.id ? { state: "executing", requestId: input.requestId, observedAt: Date.now() } : { state: "unknown", observedAt: Date.now() };
+          await db.prisma.runtimeLifecycleEvent.create({ data: { id: `${input.requestId}:started`, runtimeSessionId: f.session.id, requestId: input.requestId!, phase: "started", occurredAt: new Date() } });
+          expect(input.text).toContain(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts"));
+          expect(input.text).toContain(socket);
+          automaticResult = await cli();
+          return { status: automaticResult.code ? "failed" as const : "completed" as const, stopReason: "fixture-command-ended" };
+        })();
+        return { requestId: input.requestId!, result, events: { async *[Symbol.asyncIterator]() { await result; } }, cancel: async () => {} };
+      };
+    }
+    let result = await cli(automatic ? ["upkeep", "expired"] : undefined);
+    if (automatic) {
+      expect(result.code).toBe(0); expect(JSON.parse(result.stdout)).toMatchObject({ taskId: f.task.id, queued: true });
+      const deadline = Date.now() + 20_000;
+      while (!automaticResult && Date.now() < deadline) await Bun.sleep(10);
+      if (!automaticResult) throw new Error("Serialized original-primary cleanup did not finish");
+      result = automaticResult;
+    }
     if (result.code) throw new Error(JSON.stringify({ result, progress: await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "finalization-cleanup-progress" }, orderBy: { sequence: "desc" } }) }));
     expect(result.stderr).toBe(""); expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ taskId: f.task.id, closed: true, reporting: { state: "pending" } });
@@ -231,8 +259,13 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
     expect(runtime.closedSessionIds).toEqual([f.session.id]);
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "dependency" } })).state).toBe("released");
     expect(f.issue.state.name).toBe("Owner selected status");
+    if (automatic) {
+      await db.prisma.runtimeInstruction.updateMany({ where: { sessionId: f.session.id }, data: { state: "completed" } });
+      runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+      await db.prisma.$disconnect();
+    }
     const retry = await cli(["upkeep", "expired"]);
     expect(retry.code).toBe(0); expect(JSON.parse(retry.stdout)).toMatchObject({ alreadyClosed: true, reporting: { state: "pending" } });
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
-  } finally { Object.assign(finalizationDependencies, saved); await server.stop(true); }
+  } finally { Object.assign(finalizationDependencies, saved); Object.assign(cleanupInboxDependencies, savedInbox); await server.stop(true); }
 }, 30_000);

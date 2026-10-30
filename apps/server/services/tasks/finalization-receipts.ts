@@ -1,3 +1,4 @@
+import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { lstat, realpath } from "node:fs/promises";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
@@ -29,7 +30,7 @@ export const PreparedFinalization = z.object({
   retirementAuthority: RetirementReference.optional(),
 });
 export type PreparedFinalization = z.infer<typeof PreparedFinalization>;
-export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true; cleanup?: true };
+export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true; cleanup?: true; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
 
 export async function finalizationGit(cwd: string, args: string[]) {

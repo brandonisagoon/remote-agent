@@ -1,3 +1,5 @@
+import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
+import { taskSupervisionRoutes } from "../../routes/tasks/supervision.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -311,4 +313,47 @@ test("automatic cleanup candidates exclude pause, changed original ownership and
   await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { cwd: f.root } }); expect(await candidate()).toBeFalse();
   await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { cwd: f.worktree } }); expect(await candidate()).toBeTrue();
   await f.revoke(); expect(await candidate()).toBeFalse();
+});
+
+
+test("automatic operation keeps exact turn protection across omitted flags, deferred work, restart and a new serialized attempt", async () => {
+  const f = await preparedFixture();
+  const capability = async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
+    taskToolingRevision: f.task.toolingRevision, capabilityRevision: "b".repeat(40), checkout: "/fixture/immutable", instructions: "/fixture/immutable/cleanup.md", adapter: "/fixture/immutable/src/cli.ts" }, instructions: "Fixture immutable cleanup adapter" });
+  const start = async (key: string) => {
+    const queued = await enqueueTaskCleanup({ prisma: db.prisma, config: f.config, taskId: f.task.id, requestKey: key }, { capability });
+    await db.prisma.runtimeInstruction.update({ where: { id: queued.instructionId }, data: { state: "dispatching", executionRequestId: key } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: key, runtimeSessionId: f.session.id, requestId: key, phase: "started", occurredAt: new Date() } });
+    return queued;
+  };
+  const first = await start("first-cleanup-turn");
+  const bound = await bindPreparedCleanup(f.input, f.observe);
+  expect(bound.operation.automatic).toEqual({ kind: "primary-inbox", initialInstructionId: first.instructionId });
+  await db.prisma.runtimeInstruction.create({ data: { id: "followup", sessionId: f.session.id, text: "Owner follow-up", state: "queued" } });
+  await expect(assertPreparedCleanup(f.input)).rejects.toThrow("pending task instructions");
+  await expect(prepareTaskFinalization({ ...f.input, authorityOnly: true }, f.dependencies)).rejects.toThrow("pending task instructions");
+  await db.prisma.runtimeInstruction.update({ where: { id: first.instructionId }, data: { state: "completed" } });
+  await db.prisma.runtimeInstruction.update({ where: { id: "followup" }, data: { state: "completed" } });
+  await db.prisma.$disconnect();
+  await expect(assertPreparedCleanup(f.input)).rejects.toThrow("exact executing");
+  await start("later-cleanup-turn");
+  expect((await assertPreparedCleanup(f.input)).operation).toEqual(bound.operation);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } })).value).toBe(f.frozen.find(event => event.sequence === f.prepared.preparedRevision)!.value);
+  await db.prisma.remoteTaskResource.update({ where: { id: "volume" }, data: { state: "released" } });
+  f.remove();
+  await confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  // A follow-up can arrive after confirmed physical removal but before close.
+  // It must remain queued, with the original primary open to handle it.
+  await db.prisma.runtimeInstruction.create({ data: { id: "after-confirm", sessionId: f.session.id, text: "New request after removal", state: "queued" } });
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, role: "primary", status: "active" }]);
+  runtime.observeSessionActivity = () => ({ state: "executing", requestId: "later-cleanup-turn", observedAt: Date.now() });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient })).route("/api/tasks", taskSupervisionRoutes);
+  const response = await app.request("/api/tasks/task/automation", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close", cleanup: true }) });
+  expect(response.status).toBe(409);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "after-confirm" } })).state).toBe("queued");
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).not.toBe("closed");
+  expect(runtime.closedSessionIds).toEqual([]);
+  const explicitOwner = await app.request("/api/tasks/task/automation", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close" }) });
+  expect(explicitOwner.status).toBe(200);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "after-confirm" } })).state).toBe("cancelled");
 });

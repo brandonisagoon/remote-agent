@@ -1,3 +1,5 @@
+import { CleanupOperation, assertPreparedCleanup, hasPreparedCleanup } from "../../services/tasks/cleanup-lifecycle.ts";
+import { automaticCleanupTurn } from "../../services/tasks/cleanup-inbox.ts";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
@@ -60,7 +62,7 @@ taskSupervisionRoutes.post("/:taskId/instructions/:instructionId/resolve", async
 
 // Owner pause/resume is independent of browser viewing.
 taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
-  const parsed = z.object({ action: z.enum(["pause", "resume", "close"]) }).strict().safeParse(await c.req.json());
+  const parsed = z.object({ action: z.enum(["pause", "resume", "close"]), cleanup: z.literal(true).optional() }).strict().safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Choose pause, resume, or close" }, 400);
   const prisma = c.get("prisma"), runtime = c.get("agentRuntime");
   const task = await prisma.remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
@@ -98,7 +100,19 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
       return c.json({ task: taskResponse(await prisma.remoteTask.findUnique({ where: { id: task.id }, include: { resources: true } })) });
     }
     // Stop new deliveries before cancelling current work, including delegates.
-    await prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "closed", recoveryDetail: "Agent closed. Resource cleanup is a separate operation; inspect retained resources." } });
+    await prisma.$transaction(async tx => {
+      // Closing an automatic cleanup turn must not cancel a follow-up that
+      // arrived after confirmation. Claim closure against the same local inbox
+      // transaction; ordinary explicit owner close remains unchanged.
+      if (parsed.data.cleanup && task.primarySessionId && task.phase !== "closed") {
+        const operation = await hasPreparedCleanup(tx, task.id, task.primarySessionId, `finalize:${task.id}`);
+        const automatic = operation && CleanupOperation.parse(JSON.parse(operation.value!)).automatic;
+        const current = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
+        const executing = await automaticCleanupTurn(tx, current, Boolean(automatic), runtime);
+        if (executing) await assertPreparedCleanup({ prisma: tx, config: c.get("config"), sessionId: task.primarySessionId, requestKey: `finalize:${task.id}`, runtime });
+      }
+      await tx.remoteTask.update({ where: { id: task.id }, data: { phase: "closed", recoveryDetail: "Agent closed. Resource cleanup is a separate operation; inspect retained resources." } });
+    });
     if (task.worktreePath) {
       const sessions = await runtime.listSessions({ cwd: task.worktreePath });
       for (const session of sessions) {

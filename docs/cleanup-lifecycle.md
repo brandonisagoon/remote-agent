@@ -60,10 +60,27 @@ full-boundary rejection of changed retained bytes. Run with
 
 The current client exposes `drafted task destroy --task ID --socket PATH` as an
 entry point to the existing finalizer; `upkeep finalize` uses the same operation.
-Automatic expired upkeep also selects locally accepted merge contracts with
-matching verification, then lets ordinary first preparation verify delivery.
-Paused tasks, changed original session ownership and revoked decisions are not
-scheduled. Closed operations retry only their pending frozen report.
+Automatic expired upkeep selects locally accepted merge contracts with matching
+verification and queues the **original primary's existing durable inbox**. It
+never runs destructive cleanup alongside another turn. The server resolves the
+configured immutable cleanup compatibility capability, preserves the old task
+pin, and supplies the exact adapter/task/socket command. First preparation still
+independently verifies delivery; scheduling is not cleanup authority. Paused
+tasks, changed original ownership and revoked decisions are not scheduled.
+Closed operations retry only their pending frozen report.
+
+Each maintenance pass has an idempotent request receipt; concurrent passes reuse
+an outstanding synthetic cleanup instruction. A deferred/cancelled request
+replays unchanged, while a later pass can schedule a new attempt after genuine
+work finishes. Before dispatch, genuine queued work takes precedence without
+being cancelled or acknowledged. Automatic operations persist their inbox
+origin and require exact instruction/execution/lifecycle correlation on every
+renewal. Active delegates or another unsettled task instruction halt further
+effects. Automatic close repeats the inbox check in its transaction, preserving
+a follow-up that arrives after physical confirmation. The current cleanup turn
+returns and the existing runtime delivers the follow-up; there is no new lease
+or executor. These guards serialize agent turns, not arbitrary processes outside
+the registered task. Exact physical target checks remain required.
 
 Resource results are recorded against the same operation. The server validates
 keys and the operation epoch, caps/redacts diagnostic text, and derives terminal
@@ -85,6 +102,11 @@ A separate real 2,300-file native test resumes an old journal and asserts that
 batch checks cannot call full task projections, provider preparation or Git.
 The retained-backup/directory fixture verifies pause before capture, same-proof
 retry, unchanged original receipts, retained SQL bytes and an unresolved foreign
-provider resource. Stop-first dependency scheduling and legacy native source
-reconciliation are being integrated separately; external/v2 continuation is
-owned by the companion legacy-delivery change. No live teardown was performed.
+provider resource. The integrated stop-first dependency scheduler preserves
+independent progress after adapter failures. Before first operation binding,
+legacy native reconciliation observes supported source consumers and writes only
+private proof plus observation fields on their existing receipts. Unsupported
+sources remain unresolved. A real-process fixture confirms this hook precedes
+preparation without signals, new resources, pin changes or saved-data loss.
+External/v2 continuation remains the companion legacy-delivery change. No live
+teardown was performed.

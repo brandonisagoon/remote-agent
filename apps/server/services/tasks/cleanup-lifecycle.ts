@@ -1,3 +1,5 @@
+import { automaticCleanupTurn, AutomaticCleanup, type CleanupInboxStore } from "./cleanup-inbox.ts";
+import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient, RemoteTaskResource } from "../../../../generated/prisma/client.ts";
@@ -9,7 +11,11 @@ import { DoneRetirementGrant } from "./delivered-retirement.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeMetadataEvent">;
-type Context = { prisma: Database; config: ServerConfig; sessionId: string; requestKey: string };
+function inboxStore(prisma: Database): CleanupInboxStore {
+  for (const model of ["runtimeInstruction", "runtimeLifecycleEvent", "runtimeSourceMessage"]) if (!(model in prisma)) throw new Error("Cleanup requires the full local instruction store");
+  return prisma as unknown as CleanupInboxStore;
+}
+type Context = { prisma: Database; config: ServerConfig; sessionId: string; requestKey: string; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const EventReference = z.object({ revision: z.number().int().positive(), source: z.string(), action: z.string(), key: z.string().nullable(), digest: Digest }).strict();
 const Resource = RetirementBinding.shape.resources.element;
@@ -19,7 +25,7 @@ const CleanupBinding = z.object({
   preparedRevision: z.number().int().positive(), preparedDigest: Digest,
   authority: z.array(EventReference), resources: z.array(Resource).max(2000),
 }).strict();
-export const CleanupOperation = z.object({ version: z.literal(1), requestKey: z.string(), binding: CleanupBinding }).strict();
+export const CleanupOperation = z.object({ version: z.literal(1), requestKey: z.string(), automatic: AutomaticCleanup.optional(), binding: CleanupBinding }).strict();
 export type CleanupOperation = z.infer<typeof CleanupOperation>;
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 const ownerActions = ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "prepared-done-retirement", "delivered-retirement-revoked", "legacy-evidence-retained"];
@@ -124,6 +130,7 @@ async function activeOperation(input: Context, allowConfirmedClosed = false) {
   const operation = CleanupOperation.parse(JSON.parse(event.value));
   if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
   assertBinding(observed.binding, operation.binding);
+  if (!allowConfirmedClosed) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
   return { ...observed, operation, operationRevision: event.sequence };
 }
 
@@ -175,15 +182,18 @@ export async function assertCleanupResourceUpdate(input: { prisma: Database; con
  * their exact local epoch. It never replaces a prior operation to bypass drift. */
 export async function bindPreparedCleanup(input: Omit<Context, "prisma"> & { prisma: PrismaClient }, observe: (prepared: PreparedFinalization, revision: number) => Promise<void>) {
   const initial = await current(input);
+  const automatic = await automaticCleanupTurn(inboxStore(input.prisma), initial.task, false, input.runtime);
   const where = operationWhere(initial.task.id, input.sessionId, input.requestKey);
   if (await input.prisma.runtimeMetadataEvent.findFirst({ where })) return assertPreparedCleanup(input);
   await observe(initial.prepared, initial.preparation.sequence);
   await input.prisma.$transaction(async tx => {
     const latest = await current({ ...input, prisma: tx });
+    const currentAutomatic = await automaticCleanupTurn(tx, latest.task, Boolean(automatic), input.runtime);
+    if (retirementDigest(currentAutomatic ?? null) !== retirementDigest(automatic ?? null)) throw new Error("Automatic cleanup turn changed during initial observation");
     if (retirementDigest(latest.binding) !== retirementDigest(initial.binding)) throw new Error("Cleanup authority changed during initial observation");
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where });
     if (duplicate) { assertBinding(latest.binding, CleanupOperation.parse(JSON.parse(duplicate.value!)).binding); return; }
-    await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify(CleanupOperation.parse({ version: 1, requestKey: input.requestKey, binding: initial.binding })) } });
+    await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify(CleanupOperation.parse({ version: 1, requestKey: input.requestKey, ...(automatic ? { automatic } : {}), binding: initial.binding })) } });
   });
   return assertPreparedCleanup(input);
 }
