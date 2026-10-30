@@ -150,6 +150,7 @@ closes through the server route and retries offline reporting after restart.
 Live older tasks still require matching concrete resource
 adapters and exact ownership; this continuation layer does not exempt their
 unhandled records.
+## Read-only cleanup history
 
 Task, task-list and session-task GETs expose `cleanupHistory` independently of
 whether an automatic cleanup turn is executing. This read-only view validates
