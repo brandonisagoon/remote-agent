@@ -22,6 +22,7 @@ import { bunCommandClient } from "../../transports/command/index.ts";
 import { taskRoutes, sessionTaskRoutes } from "../../routes/tasks/index.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { completeDevelopmentIntent, recordDevelopmentIntent, renewDevelopmentAuthority } from "./development-intent.ts";
+import { assertRetirementResourcePreflight } from "./retirement-preview.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -230,6 +231,135 @@ async function resourceScopeFixture(kind: "environment" | "clerk" = "environment
   const put = (value: object) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
   return { ...f, environment: root, values, prepared, active, app, keys, renew, put };
 }
+
+async function legacyPreviewFixture(review = false, change?: (values: any[]) => void) {
+  const f = await fixture();
+  const purpose = review ? "review" : "development", hostname = `${purpose}.example.test`;
+  const tunnelId = "11111111-2222-3333-4444-555555555555", zone = "b".repeat(32), account = "a".repeat(32), dnsId = "c".repeat(32);
+  const source = "http://127.0.0.1:4173", environment = path.join(directory, purpose);
+  await mkdir(environment, { mode: 0o700 });
+  const config = path.join(environment, "cloudflared.yml"), credentials = path.join(environment, "connector.json");
+  await writeFile(credentials, JSON.stringify({ TunnelID: tunnelId, AccountTag: account }), { mode: 0o600 });
+  await writeFile(config, JSON.stringify({ tunnel: tunnelId, "credentials-file": credentials, ingress: [{ hostname, service: source }, { service: "http_status:404" }] }), { mode: 0o600 });
+  const values: any[] = [
+    { id: "endpoint", key: `${purpose}-preview-proxy`, kind: "local-http", purpose, externalId: source, state: review ? "released" : "allocated", metadata: { publicUrl: review ? null : `https://${hostname}` } },
+    { id: "tunnel", key: `${purpose}-cloudflare-tunnel`, kind: "cloudflare-tunnel", purpose, externalId: `saved-${purpose}-tunnel`, state: review ? "allocated" : "ready", metadata: {
+      hostname, tunnelId, zone, account, sourceAddress: source, configPath: review ? "<review env>/cloudflared.yml (saved ingress)" : config,
+      credentialsPath: review ? "<review env>/connector.json (0400)" : credentials,
+      ...(review ? { connector: "not started" } : { configIngress: `${hostname} -> ${source}; fallback http_status:404` }),
+    } },
+    { id: "environment", key: `${purpose}-env-directory`, kind: "directory", purpose, externalId: environment, state: "ready", metadata: {} },
+  ];
+  if (!review) values.push({ id: "dns", key: "development-dns", kind: "cloudflare-dns-record", purpose, externalId: hostname, state: "ready", metadata: {
+    hostname, tunnelId, zone, account, type: "CNAME tunnel route", content: `${tunnelId}.cfargotunnel.com`, routeResult: { cname: "new", name: hostname, dnsTag: dnsId },
+  } });
+  change?.(values);
+  for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const put = async (id: string, metadata: object, state?: string) => {
+    const value = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id } });
+    return app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: value.key, kind: value.kind, purpose: value.purpose, externalId: value.externalId, state: state ?? value.state, metadata }) });
+  };
+  return { ...f, app, put, values, prepared, active, frozen, purpose, hostname, tunnelId, zone, account, dnsId, source, environment, config,
+    canonical: { hostname, tunnelId, zoneId: zone, accountId: account, dnsRecordId: review ? null : dnsId } };
+}
+
+test.each([false, true])("frozen legacy preview PUT normalizes only recorded discovery and terminal annotations (review=%s)", async review => {
+  const f = await legacyPreviewFixture(review);
+  expect(() => assertRetirementResourcePreflight(f.active.operation.binding.resources)).toThrow("Reconcile exact public preview");
+  for (const value of f.values.filter(value => value.id !== "environment" && value.state !== "released")) {
+    const metadata = { ...value.metadata, ...f.canonical };
+    expect((await f.put(value.id, metadata)).status).toBe(200);
+    expect((await f.put(value.id, metadata)).status).toBe(200); // same operation, lost response
+    await assertPreparedCleanup(f.input);
+  }
+  if (!review) {
+    expect((await f.put("endpoint", { ...f.values[0].metadata, ...f.canonical, publicUrl: null, publicPreviewCleanup: { complete: true, hostname: f.hostname, tunnelId: f.tunnelId, sharedTunnelPreserved: false, observedAt: new Date().toISOString() } })).status).toBe(409);
+    const dns = f.values.find(value => value.id === "dns");
+    expect((await f.put("dns", { ...dns.metadata, ...f.canonical, cleanupObserved: "exact-dns-record-absent" }, "released")).status).toBe(200);
+  }
+  const tunnel = f.values.find(value => value.id === "tunnel");
+  expect((await f.put("tunnel", { ...tunnel.metadata, ...f.canonical, cleanupObserved: "exact-tunnel-absent" }, "released")).status).toBe(200);
+  if (!review) expect((await f.put("endpoint", { ...f.values[0].metadata, ...f.canonical, publicUrl: null, publicPreviewCleanup: { complete: true, hostname: f.hostname, tunnelId: f.tunnelId, sharedTunnelPreserved: false, observedAt: new Date().toISOString() } })).status).toBe(200);
+  expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+});
+
+test.each(["hostname", "tunnelId", "zoneId", "accountId", "dnsRecordId", "unrelated-metadata", "source", "shared"]) ("frozen legacy preview refuses changed %s on actual receipt PUT", async field => {
+  const f = await legacyPreviewFixture();
+  const value = f.values.find(value => value.id === "tunnel"), before = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: value.id } });
+  const metadata = { ...value.metadata, ...f.canonical, [field === "source" ? "sourceAddress" : field]: field === "shared" ? true : field === "hostname" ? "foreign.example.test" : field === "tunnelId" ? "99999999-2222-3333-4444-555555555555" : "e".repeat(32) };
+  expect((await f.put(value.id, metadata)).status).toBe(409);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: value.id } })).toEqual(before);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+});
+
+test("frozen preview without a recorded DNS ID cannot add a new deletion target", async () => {
+  const f = await legacyPreviewFixture(true), value = f.values.find(value => value.id === "tunnel");
+  expect((await f.put(value.id, { ...value.metadata, ...f.canonical, dnsRecordId: f.dnsId })).status).toBe(409);
+});
+
+test.each(["pause", "revocation", "other-session"])("legacy preview discovery cannot bypass %s after freezing", async guard => {
+  const f = await legacyPreviewFixture(), value = f.values.find(value => value.id === "tunnel");
+  const before = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: value.id } });
+  if (guard === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (guard === "revocation") await f.revoke();
+  let sessionId = f.session.id;
+  if (guard === "other-session") {
+    sessionId = "foreign";
+    await db.prisma.runtimeSession.create({ data: { id: sessionId, scopeKey: sessionId, agentCommand: "codex", status: "idle", role: "delegate", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  }
+  const response = await f.app.request(`/api/sessions/${sessionId}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: value.key, kind: value.kind, purpose: value.purpose, externalId: value.externalId, state: value.state, metadata: { ...value.metadata, ...f.canonical } }) });
+  expect(response.status).toBe(409);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: value.id } })).toEqual(before);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } })).toEqual(f.frozen.filter(row => [FINALIZATION_PREPARED, CLEANUP_OPERATION].includes(row.action)));
+});
+
+test.each(["purpose", "endpoint", "zone", "account", "dns-target", "duplicate-tunnel", "duplicate-endpoint"]) ("frozen legacy preview refuses conflicting original %s association", async field => {
+  const f = await legacyPreviewFixture(false, values => {
+    const endpoint = values.find(value => value.id === "endpoint"), dns = values.find(value => value.id === "dns"), tunnel = values.find(value => value.id === "tunnel");
+    if (field === "purpose") endpoint.purpose = "review";
+    else if (field === "endpoint") endpoint.externalId = "http://127.0.0.1:5173";
+    else if (field === "zone" || field === "account") dns.metadata[field] = "e".repeat(32);
+    else if (field === "dns-target") dns.metadata.content = "99999999-2222-3333-4444-555555555555.cfargotunnel.com";
+    else { const value = field === "duplicate-tunnel" ? tunnel : endpoint; values.push({ ...value, id: "duplicate", key: "duplicate" }); }
+  });
+  const value = f.values.find(value => value.id === "tunnel");
+  expect((await f.put(value.id, { ...value.metadata, ...f.canonical })).status).toBe(409);
+});
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each([false, true])("actual legacy preview adapter uses the original operation through discovery/deletion retry (review=%s)", async review => {
+  const f = await legacyPreviewFixture(review), root = process.env.DRAFTED_INTEGRATION_ROOT!;
+  const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+  const { releasePublicPreview, reconcilePublicPreview } = await import(path.join(root, "src/public-preview.ts"));
+  const socket = path.join(directory, "preview.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const registry = taskRegistry(socket, f.task.id, 3000), calls: string[] = [];
+    let dns = !review, tunnel = true, lostDelete = !review;
+    const provider = { request: async (method: string, route: string) => {
+      calls.push(`${method} ${route}`);
+      if (route.includes("dns_records")) {
+        if (method === "DELETE") { dns = false; if (lostDelete) { lostDelete = false; throw new Error("Lost exact DNS delete response"); } return null; }
+        const value = dns ? { id: f.dnsId, name: f.hostname, type: "CNAME", content: `${f.tunnelId}.cfargotunnel.com` } : null;
+        return route.includes("?") ? value ? [value] : [] : value;
+      }
+      if (route === `/accounts/${f.account}/cfd_tunnel/${f.tunnelId}`) { if (method === "DELETE") { tunnel = false; return null; } return tunnel ? { id: f.tunnelId } : null; }
+      throw new Error(`Unexpected disposable provider request ${method} ${route}`);
+    } };
+    const key = `${f.purpose}-cloudflare-tunnel`, input = { registry, key, provider, releaseConnector: async () => { throw new Error("No fixture connector is registered"); } };
+    await reconcilePublicPreview(input);
+    expect(calls.every(call => call.startsWith("GET"))).toBeTrue();
+    if (!review) await expect(releasePublicPreview(input)).rejects.toThrow("Lost exact DNS delete response");
+    await releasePublicPreview(input);
+    await releasePublicPreview(input);
+    expect(tunnel).toBeFalse(); expect(dns).toBeFalse();
+    expect(calls.filter(call => call.startsWith("DELETE"))).toHaveLength(review ? 1 : 2);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(f.frozen);
+  } finally { server.stop(true); }
+});
 
 test("compact legacy scope binds all exact aliases and preserves old responses and raw preparation/operation on linked receipt retry", async () => {
   const f = await resourceScopeFixture();

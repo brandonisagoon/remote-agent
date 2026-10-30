@@ -181,3 +181,28 @@ dependency removal. Full preparation, mutation, confirmation and reporting
 guards are unchanged. The DRA-199 acceptance fixture also covers active/idle
 transitions, restart, revocation, changed resource/primary identity and corrupted
 preparation links through the real GET routes.
+# Frozen older preview receipts
+
+An older v1 operation can contain a named preview whose account and zone are
+stored as `account`/`zone`, whose DNS ID is in the structured `routeResult`, and
+whose endpoint carries only `publicUrl`. The current preview adapter reads the
+provider, then records canonical fields before deletion. Previously that first
+receipt update failed because the operation validator required canonical fields
+in the original frozen record.
+
+The validator now derives those fields only from one exact saved association:
+the hostname, tunnel UUID, hex account/zone, loopback source and same-purpose
+endpoint, plus the structured CNAME record when present. It accepts only equal
+canonical additions and the existing terminal annotations. When the original
+association has no DNS ID, only null is accepted; discovering a new ID does not
+expand the frozen scope. Other metadata, shared ownership, resource identities,
+pause/revocation checks and original preparation/operation bytes stay bound.
+New retirement grants still require canonical discovery before authorization.
+
+The disposable HTTP tests cover development with a recorded DNS ID, review with
+no DNS record, conflicting associations, premature endpoint completion and
+retry. The real Drafted adapter also runs through the Unix control route with a
+mock provider, including one lost DNS deletion response. The read-only DRA-80
+check matches all four original records without submitting a receipt or provider
+mutation; live removal remains an original-primary acceptance step under
+DRA-127/DRA-227.
