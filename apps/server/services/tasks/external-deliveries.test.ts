@@ -573,3 +573,19 @@ test("pending Done reconciliation refuses mismatched payload, comment, source, m
   expect(publication.counts()).toMatchObject({ createCount: 1, updateCount: 1 });
   expect((await publication.publish(prepared.doneHandoff)).published).toBe(true);
 });
+
+test("an explicit retirement revocation blocks historical external binding and local cleanup authority", async () => {
+  const { revokeDeliveredRetirement } = await import("./delivered-retirement-revocation.ts");
+  const { inspectExternalCleanupAuthority } = await import("./external-cleanup-authority.ts");
+  const f = await fixture();
+  const adopted = await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  const before = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  await inspectExternalCleanupAuthority(f.finalize);
+  await revokeDeliveredRetirement({ prisma: db.prisma, taskId: f.task.id, revocation: { requestKey: "stop-historical-cleanup", expectedRevision: adopted.revision, basis: "Owner revoked cleanup" } });
+  await expect(inspectExternalCleanupAuthority(f.finalize)).rejects.toThrow("explicitly revoked");
+  await expect(prepareExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("explicitly revoked");
+  await expect(adoptExternalDeliveries(f.input, f.dependencies)).rejects.toThrow("explicitly revoked");
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } })).value).toBe(before.value);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "completion-retirement-authority" } })).toBe(0);
+});
