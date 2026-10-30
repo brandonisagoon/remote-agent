@@ -63,6 +63,7 @@ const GET_SOURCE_ISSUE_FOR_ROUTING = `
 const GET_SOURCE_ISSUE_FOR_WORKFLOW = `
   query SourceIssueForWorkflow($id: String!) {
     issue(id: $id) {
+      updatedAt
       id
       identifier
       branchName
@@ -167,6 +168,7 @@ export async function getSourceIssueForUpdate(
 }
 
 export type SourceIssueForUpdate = SourceIssueWithAgentIssues & {
+  updatedAt?: string;
   state: { id: string; name: string; type: string };
   team: { states: { nodes: Array<{ id: string; name: string; type: string }> } };
 };
