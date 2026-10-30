@@ -180,6 +180,21 @@ and other registrations stay intact. Recreated checkout or administrative paths
 remain untouched and block completion. Both captured inventories and journals
 must verify; Released state alone is not a retirement proof.
 
+Standalone `evidence`, `private-file` and scenario entrypoint receipts can use
+`retire-file`. Each plan freezes its exact owned regular file, bytes, inode and
+private sibling quarantine. It uses the existing evidence capture protocol;
+interrupted capture, replaced files and recreated originals never authorize
+unlinking bytes. A scenario digest map binds only the named registered entrypoint;
+other wrapper, receipt and preserved files are not inferred as removal targets.
+Known recorded digests and sizes must match. One bounded process/handle snapshot
+covers all selected file paths, with bytes checked again afterward.
+
+A `source-checkpoint` uses a distinct `retire-tree` variant containing its frozen
+manifest identity. All listed members must match and the complete inventory also
+retains ancillary files. Its recorded root may be owner-writable 0755, while the
+quarantine remains private 0700. This does not widen ordinary private-directory
+capture or allow arbitrary ignored folders to become disposable.
+
 Process checks enumerate bounded NUL-delimited open-handle records rather than
 recursively traversing every installed dependency. Any handle or command naming
 the checkout/capture rejects inactivity; unknown filesystem names and observation
@@ -220,8 +235,89 @@ Confirmation independently observes named-session absence through the configured
 capability even after the original paths have moved, and verifies the marker and
 profile identity at their captured paths. Released state alone is insufficient.
 Active browsers require verified stop-only handling before capture; owner pause
-is not overridden. The server fixtures cover both parent shapes, historical
+is not overridden. The existing resource `stop` operation obtains a read-only
+`browser-stop-authority` response from the original primary's session route. It
+binds the current executing request and started lifecycle sequence, exact task,
+profile receipt and configured cleanup capability. The client renews that full
+authority before closing only the named browser; profile, marker, cookies and
+receipt remain unchanged. A changed turn, paused/closed task, revoked source
+ownership or shared profile refuses stop. No completed phase, source issue state
+or full cleanup plan is required to stop the owned browser.
+
+The server fixtures cover both parent shapes, historical
 metadata-tooling mismatch, source recreation, shared profiles, marker/context
-substitution and capture replay. Live legacy adapter inspection and paired client
-execution are separate acceptance checks; these schema/observer tests do not
-claim a live browser has been stopped or retired.
+substitution and capture replay. Paired fixtures run the real client resource-stop
+and capture dispatcher against server authority and proof checks. The browser
+provider is replaced only in disposable fixtures; no live browser has been
+stopped or retired by those tests.
+
+## Exact browser vault entry retention
+
+The supported legacy auth vault is global even when browser sessions use the
+`drafted` namespace. The configured agent-browser 0.39.1 implementation selects
+`~/.agent-browser/auth/<entry>.json` independently of that namespace; its auth-show
+operation exposes identity metadata without the saved password. See the pinned
+[upstream implementation](https://github.com/vercel-labs/agent-browser/blob/v0.39.1/cli/src/native/auth.rs).
+
+A `retire-vault` plan binds the original task receipt, exact synthetic user and
+local origin, configured cleanup capability, encrypted entry bytes and retained
+encryption-key digest. The exact entry file is an adopted owned path; neither the
+shared auth directory nor the key becomes task-owned. Existing native file
+capture moves the encrypted entry into a private sibling quarantine, preserving
+its inode and every byte. No auth-delete or broad vault deletion is performed.
+
+Confirmation requires original-path absence plus the frozen journal and retained
+bytes. A recreated entry, changed key, substituted capture, shared claim or lost
+authority refuses completion while preserving available material. An initially
+absent legacy entry cannot invent a saved-file proof. Paired disposable tests use
+the actual server plan, client dispatcher and native capture, including lost
+acknowledgment and retry without rerunning auth-show on missing credentials.
+
+## Task test authentication
+
+The Clerk adapter accepts the supported exact legacy test-instance descriptors,
+task-prefixed synthetic email and registered user/session relationship. It reads
+only the configured encrypted development credential backup and fixed key, pins
+their identity, and verifies the provider's instance is the recorded development
+instance. User creation time and email identity, and session creation time and
+user relationship, stay frozen through retries. The shared prepared authority is
+renewed after credential/provider reads immediately before each mutation.
+
+An exact registered session is revoked before its user is removed. A revoked or
+otherwise terminal session can remain as a provider record; confirmation proves
+authentication authority is inactive rather than claiming the record vanished.
+Provider denial or failed observation never counts as absence. A lost deletion
+acknowledgment is reconciled with a fresh instance and user observation.
+
+Local binding renewals also reject another active task or purpose claiming the
+same provider user/session, including IDs held in legacy metadata instead of the
+external-ID field. The shared pilot user and explicitly preserved identities do
+not become deletion targets. The actual DRA42 recorded preservation intent must
+be reconciled with its current owner-selected plan before live adoption; this
+adapter does not override it. Tests use disposable provider responses only.
+
+## Receipts backed by existing storage
+
+`retire-backed` represents a logical fixture, object or bucket receipt whose
+storage already has an independently observed adapter plan. It freezes the
+original receipt, one exact backing resource and storage-target digest, and its
+concrete chat IDs or bucket/object keys and recorded hashes. Task Redis fixtures
+must match the declared, observed task/purpose Compose volume; legacy MinIO
+objects must also match their recorded owner receipt ID and key. R2 objects must
+match the exact observed runtime bucket and recorded object prefix.
+
+This disposition grants no storage operation, object deletion, key deletion or
+export. The client retires only the logical receipt after observing that selected
+storage target absent. Other targets may remain present and the backing receipt
+may remain Ready. An unrelated DNS/provider failure cannot stand in for a
+selected-store check, and no generic Released flag substitutes for observation.
+Full task confirmation still independently verifies every existing plan target.
+
+Existing retained archives and preservation choices remain separate obligations.
+There is no established DRA8 Redis archive, and the old DRA98 MinIO probe has no
+established retained copy or digest; the latter stays `sha256: null`. The two
+DRA98 R2 fixture hashes independently match existing retained archive members.
+These facts are not upgraded into new copy claims by logical receipt retirement.
+The DRA8 shared pilot user is recorded as preserved context and receives no
+authentication operation. DRA42's intentionally retained user and objects volume
+require the separate retained-target plan, not this absence disposition.

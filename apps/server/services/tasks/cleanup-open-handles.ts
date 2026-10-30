@@ -42,12 +42,18 @@ export function assertRootHandleInventory(root: string, output: Buffer) {
 }
 
 export async function assertLinkedRootIdle(root: string, run: HandleCommand = command) {
-  await assertFinalizationPath(root);
+  return assertLinkedPathsIdle([root], run);
+}
+
+/** One bounded process/handle snapshot covers a prepared set of exact files. */
+export async function assertLinkedPathsIdle(roots: string[], run: HandleCommand = command) {
+  if (!roots.length || roots.length > 2000 || new Set(roots).size !== roots.length) throw new Error("Filesystem observation scope is invalid");
+  for (const root of roots) await assertFinalizationPath(root);
   const processes = run(["ps", "-axo", "pid=,command="]);
   if (processes.exitCode !== 0 || processes.signalCode || processes.stderr.length || !processes.stdout.length || processes.stdout.length > MAX_BYTES) throw new Error("Linked worktree process inspection failed");
-  if (processes.stdout.toString().split("\n").some(line => line.includes(root))) throw new Error("A process command still references the linked worktree");
+  if (processes.stdout.toString().split("\n").some(line => roots.some(root => line.includes(root)))) throw new Error("A process command still references the linked worktree");
   const handles = run(["lsof", "-nP", "-F0pftn"]);
   if (handles.exitCode !== 0 || handles.signalCode || handles.stderr.length || handles.stdout.length > MAX_BYTES) throw new Error("Linked worktree open-handle inspection failed; absence is unverified");
-  assertRootHandleInventory(root, handles.stdout);
-  await assertFinalizationPath(root);
+  for (const root of roots) assertRootHandleInventory(root, handles.stdout);
+  for (const root of roots) await assertFinalizationPath(root);
 }
