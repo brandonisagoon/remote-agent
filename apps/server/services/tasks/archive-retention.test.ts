@@ -224,7 +224,7 @@ test("Done retirement adopts and captures three original evidence files beneath 
   for (const entry of proof.proof.entries) {
     const operation = { resourceKey: entry.key, proofRevision: proof.proofRevision, proofDigest: proof.proofDigest, preparedRevision: prepared.preparedRevision, finalizationRequestKey: prepared.requestKey };
     await manageLegacyEvidence({ ...f.input, operation: { ...operation, action: "authorize" } }, dependencies);
-    const target = entry.target, q = target.quarantine; await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
+    const target = entry.target, q = target.quarantine; if (target.type !== "file") throw new Error("Expected file fixture"); await mkdir(q.directory, { mode: 0o700 }); const stat = await lstat(q.directory);
     await writeFile(q.journal, JSON.stringify({ version: 1, taskId: f.task.id, resourceId: entry.resourceId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: q.path,
       source: { dev: target.dev, ino: target.ino, mode: target.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600 });
     await rename(target.path, q.path);
