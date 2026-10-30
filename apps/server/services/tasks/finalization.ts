@@ -8,6 +8,8 @@ import { latestExternalBinding } from "./external-deliveries.ts";
 import { prepareExternalFinalization, confirmExternalFinalization } from "./external-finalization.ts";
 import { observeRetirementDelivery } from "./retirement-authority.ts";
 import { assertRetirementAuthority, latestRetirement } from "./retirement-receipts.ts";
+import { ensureArchiveRetention, verifyPreparedArchives } from "./archive-retention.ts";
+import type { ArchiveRetentionReceipt } from "./archive-retention-schema.ts";
 import {
   FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization,
   assertFinalizationAuthority, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing,
@@ -50,13 +52,23 @@ async function sourceAuthority(input: FinalizationContext, taskId: string, depen
   throw new Error("Finalization requires current owner Merge authority");
 }
 
-function result(prepared: PreparedFinalization, preparedRevision: number, confirmedRevision?: number) {
+function result(prepared: PreparedFinalization, preparedRevision: number, confirmedRevision?: number, archiveRetention?: ArchiveRetentionReceipt) {
   return { requestKey: prepared.requestKey, taskId: prepared.taskId, sessionId: prepared.sessionId, preparedRevision,
     ...(confirmedRevision ? { confirmedRevision } : {}), worktree: prepared.worktree, revision: prepared.revision,
     branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
+    ...(archiveRetention ? { archiveRetention } : {}),
     ...(prepared.retirementAuthority ? { retirement: { authorityRevision: prepared.retirementAuthority.revision, authorityDigest: prepared.retirementAuthority.digest,
       doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
-        body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, recorded development, browser and review resources are released, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
+        body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, ${archiveRetention ? "resources requiring removal are released and verified saved archives remain intact" : "recorded development, browser and review resources are released"}, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
+}
+
+async function assertObservedPreparationAuthority(input: FinalizationContext, prepared: PreparedFinalization, dependencies: Dependencies, confirmed = false) {
+  // Content hashing and Git observations can outlast a source-state change.
+  // Refresh the actual owner/source after them, before returning adapter authority.
+  const source = await sourceAuthority(input, prepared.taskId, dependencies);
+  if (source.issue.id !== prepared.issueId || source.issue.identifier !== prepared.issueIdentifier || source.link.connectionId !== prepared.connectionId || source.session.id !== prepared.sessionId
+    || source.retirementAuthority?.revision !== prepared.retirementAuthority?.revision || source.retirementAuthority?.digest !== prepared.retirementAuthority?.digest) throw new Error("Finalization source authority changed during observation");
+  await assertFinalizationAuthority(input.prisma, input.config, prepared, confirmed);
 }
 
 /** Verify delivery before deleting the only checkout that can prove it. This
@@ -75,18 +87,22 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
     if (Boolean(prepared.retirementAuthority) !== Boolean(source.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
     if (prepared.issueId !== source.issue.id || prepared.requestKey !== input.requestKey) throw new Error("Finalization requestKey belongs to a different source");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
+    await assertFinalizationAuthority(input.prisma, input.config, prepared);
+    const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: prior.sequence });
     await assertFinalizationAuthority(input.prisma, input.config, prepared, Boolean(confirmed));
     if (confirmed) {
       // A completed cleanup is replayed, never expanded to a newly created
       // worktree or newly retained resource after Done was published.
       await assertFinalizationRemoved(prepared);
-      return result(prepared, prior.sequence, confirmed.sequence);
+      await assertObservedPreparationAuthority(input, prepared, dependencies, true);
+      return result(prepared, prior.sequence, confirmed.sequence, archiveRetention);
     }
     if (!(await worktreeIsMissing(prepared.worktree))) {
       const snapshot = await dependencies.snapshot(prepared.worktree);
       if (JSON.stringify(snapshot) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Worktree changed since finalization preparation; inspect before using a new requestKey");
     }
-    return result(prepared, prior.sequence);
+    await assertObservedPreparationAuthority(input, prepared, dependencies);
+    return result(prepared, prior.sequence, undefined, archiveRetention);
   }
   const delivery = await dependencies.completion(input);
   if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
@@ -109,7 +125,7 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
   const snapshot = await dependencies.snapshot(worktree);
   if (JSON.stringify(snapshot) !== JSON.stringify(delivery.receipts.snapshot)) throw new Error("Worktree changed during finalization preparation");
   await sourceAuthority(input, task.id, dependencies);
-  return input.prisma.$transaction(async (tx) => {
+  const recorded = await input.prisma.$transaction(async (tx) => {
     await assertFinalizationAuthority(tx, input.config, prepared);
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where });
     if (duplicate) {
@@ -119,6 +135,9 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
     const receipt = await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify(prepared) } });
     return result(prepared, receipt.sequence);
   });
+  const archiveRetention = await ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: recorded.preparedRevision });
+  await assertObservedPreparationAuthority(input, prepared, dependencies);
+  return result(prepared, recorded.preparedRevision, undefined, archiveRetention);
 }
 
 /** Confirmation observes cleanup; it neither deletes nor automatically repeats
@@ -136,13 +155,14 @@ export async function confirmTaskFinalization(input: FinalizationContext, depend
   if (Boolean(prepared.retirementAuthority) !== Boolean(source.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
   if (prepared.taskId !== task.id || prepared.sessionId !== input.sessionId || prepared.requestKey !== input.requestKey || prepared.issueId !== source.issue.id || prepared.connectionId !== source.link.connectionId) throw new Error("Finalization source identity changed");
   await assertFinalizationAuthority(input.prisma, input.config, prepared, true);
+  const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, prepared);
   await assertFinalizationRemoved(prepared);
   await sourceAuthority(input, task.id, dependencies);
   return input.prisma.$transaction(async (tx) => {
     await assertFinalizationAuthority(tx, input.config, prepared, true);
     const prior = await tx.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
-    if (prior) return result(prepared, preparation.sequence, prior.sequence);
+    if (prior) return result(prepared, preparation.sequence, prior.sequence, archiveRetention);
     const receipt = await tx.runtimeMetadataEvent.create({ data: { ...where, action: FINALIZATION_CONFIRMED, value: JSON.stringify({ preparedRevision: preparation.sequence }) } });
-    return result(prepared, preparation.sequence, receipt.sequence);
+    return result(prepared, preparation.sequence, receipt.sequence, archiveRetention);
   });
 }

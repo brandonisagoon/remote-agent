@@ -47,6 +47,8 @@ remain outside registered whole-tree cleanup roots. Historical archive input
 paths are never silently relocated: the submitted retained path must be an
 actual member of the pinned current manifest.
 
+Cleanup roots use actual unreleased browser/development/review dispositions. An existing tooling-purpose retained parent is not scheduled for whole-tree removal. Exact server-verified saved archives are likewise retained; arbitrary metadata cannot grant that exclusion. See [saved archive retention](saved-archive-retention.md).
+
 When an old hash exists it must match. When it does not, the separate proof
 records `digestProvenance: "observed-at-adoption"`; it never inserts a hash into
 the old receipt or claims that the observation happened earlier.

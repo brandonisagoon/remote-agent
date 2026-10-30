@@ -1,3 +1,5 @@
+import { activeCleanupRoots } from "./cleanup-scope.ts";
+import { retainedArchiveResourceIds } from "./archive-retention.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { PrismaClient, RemoteTaskResource } from "../../../../generated/prisma/client.ts";
@@ -48,21 +50,9 @@ function recordedProof(resource: RemoteTaskResource) {
   if (sizes.some((size) => typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) || sizes.some((size) => size !== sizes[0])) throw new Error("Recorded evidence sizes conflict or are invalid");
   return { ...(sha !== undefined ? { sha256: sha as string } : {}), ...(sizes.length ? { size: sizes[0] as number } : {}) };
 }
-function cleanupRoots(task: Awaited<ReturnType<typeof preparation>>["task"], prepared: PreparedFinalization, resources: RemoteTaskResource[], evidenceParents = true) {
-  const roots = [prepared.worktree, prepared.registeredWorktree, prepared.gitCwd, prepared.gitDirectory, task.toolingRoot, task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
-  for (const resource of resources) {
-    if (path.isAbsolute(resource.externalId) && (resource.kind !== "evidence" || evidenceParents)) roots.push(resource.kind === "evidence" ? path.dirname(resource.externalId) : resource.externalId);
-    const metadata = resource.metadata as Record<string, unknown> | null;
-    for (const key of ["root", "environmentRoot", "environmentDir", "runtimeRoot", "sourceRoot", "worktreePath", "profilePath", "stateDirectory"]) {
-      const value = metadata?.[key];
-      if (typeof value === "string" && path.isAbsolute(value)) roots.push(value);
-    }
-    for (const key of ["envFile", "environmentFile", "recipeFile"]) {
-      const value = metadata?.[key];
-      if (typeof value === "string" && path.isAbsolute(value)) roots.push(path.dirname(value));
-    }
-  }
-  return [...new Set(roots)];
+function cleanupRoots(task: Awaited<ReturnType<typeof preparation>>["task"], prepared: PreparedFinalization, resources: RemoteTaskResource[], evidenceParents = true, retainedResourceIds = new Set<string>()) {
+  const protectedRoots = [prepared.worktree, prepared.registeredWorktree, prepared.gitCwd, prepared.gitDirectory, task.toolingRoot, task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
+  return [...new Set([...protectedRoots, ...activeCleanupRoots(resources, retainedResourceIds, evidenceParents)])];
 }
 function receipt(sequence: number, proof: LegacyEvidenceProof): LegacyEvidenceReceipt { return { proofRevision: sequence, proofDigest: finalizationDigest(proof), proof }; }
 
@@ -74,8 +64,9 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, source: `owner:${taskId}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
   if (latest?.sequence !== event.sequence || event.runtimeSessionId !== current.session.id || event.key !== proof.input.requestKey || proof.taskId !== taskId || proof.sessionId !== current.session.id || proof.identityDigest !== current.identityDigest || proof.preparedDigest !== finalizationDigest(JSON.parse(current.event.value!)) || proof.contractRevision !== current.prepared.contractRevision) throw new Error("Legacy evidence proof or preparation authority changed");
   const resources = await prisma.remoteTaskResource.findMany({ where: { taskId } });
-  const roots = cleanupRoots(current.task, current.prepared, resources);
-  const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false);
+  const retainedIds = await retainedArchiveResourceIds(prisma, config, current.prepared);
+  const roots = cleanupRoots(current.task, current.prepared, resources, true, retainedIds);
+  const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false, retainedIds);
   if (roots.some((root) => within(root, proof.archiveRoot) || within(proof.archiveRoot, root)) || proof.entries.some((entry) => wholeRoots.some((root) => within(root, entry.target.path) || within(root, entry.target.quarantine.directory)))) throw new Error("Retained evidence now overlaps a task cleanup root");
   for (const entry of proof.entries) {
     const record = resources.find((resource) => resource.id === entry.resourceId);
@@ -105,9 +96,10 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
   const evidence = resources.filter((resource) => resource.kind === "evidence" && resource.state !== "released");
   const ids = adoption.entries.map((entry) => entry.resourceId);
   if (new Set(ids).size !== ids.length || finalizationDigest([...ids].sort()) !== finalizationDigest(evidence.map((resource) => resource.id).sort())) throw new Error("Adoption must name the complete exact unreleased evidence inventory");
-  const archive = await observeLegacyArchive(adoption.manifest, input.taskId, cleanupRoots(current.task, current.prepared, resources));
+  const retainedIds = await retainedArchiveResourceIds(input.prisma, input.config, current.prepared);
+  const archive = await observeLegacyArchive(adoption.manifest, input.taskId, cleanupRoots(current.task, current.prepared, resources, true, retainedIds));
   const entries: LegacyEvidenceProof["entries"] = [];
-  const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false);
+  const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false, retainedIds);
   const paths = new Set<string>();
   for (const request of adoption.entries) {
     const resource = evidence.find((record) => record.id === request.resourceId)!;

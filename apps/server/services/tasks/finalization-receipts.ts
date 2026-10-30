@@ -4,6 +4,7 @@ import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { bunCommandClient } from "../../transports/command/index.ts";
 import { assertRetirementAuthority, RetirementReference } from "./retirement-receipts.ts";
+import { retainedArchiveResourceIds, verifyPreparedArchives } from "./archive-retention.ts";
 
 export const FINALIZATION_PREPARED = "finalization-prepared";
 export const FINALIZATION_CONFIRMED = "finalization-confirmed";
@@ -76,7 +77,11 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
     const { grant } = await assertRetirementAuthority(prisma, config, task.id, session.id, prepared.issueId, prepared.retirementAuthority);
     if (grant.delivery.head !== prepared.revision || grant.delivery.mergeCommit !== prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.pullRequest.url?.toLowerCase() !== `https://github.com/${grant.delivery.repository}/pull/${grant.delivery.pullRequest}`) throw new Error("Finalization differs from the owner's exact retirement delivery");
   }
-  if (resourcesReleased && await prisma.remoteTaskResource.count({ where: { taskId: task.id, purpose: { in: ["browser", "development", "review"] }, state: { not: "released" } } })) throw new Error("Finalization has unreleased task resources");
+  if (resourcesReleased) {
+    const retained = await retainedArchiveResourceIds(prisma, config, prepared);
+    const remaining = await prisma.remoteTaskResource.findMany({ where: { taskId: task.id, purpose: { in: ["browser", "development", "review"] }, state: { not: "released" } } });
+    if (remaining.some(resource => !retained.has(resource.id))) throw new Error("Finalization has unreleased task resources");
+  }
   return task;
 }
 
@@ -89,6 +94,7 @@ export async function confirmedFinalizationDelivery(input: { prisma: PrismaClien
   const prepared = PreparedFinalization.parse(JSON.parse(preparation.value!));
   if (prepared.taskId !== input.taskId || prepared.sessionId !== input.sessionId || prepared.contractRevision !== input.contractRevision || prepared.requestKey !== confirmed.key) throw new Error("Finalization receipt is stale for this task");
   await assertFinalizationAuthority(input.prisma, input.config, prepared, true);
+  await verifyPreparedArchives(input.prisma, input.config, prepared);
   await assertFinalizationRemoved(prepared);
   // Recheck authority after filesystem observations, not just before them.
   await assertFinalizationAuthority(input.prisma, input.config, prepared, true);
