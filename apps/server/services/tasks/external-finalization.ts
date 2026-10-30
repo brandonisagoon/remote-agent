@@ -1,3 +1,4 @@
+import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { ensureOriginalAdministration, originalAdministrationReceipt } from "./original-work-supplement.ts";
 import { realpath } from "node:fs/promises";
 import { z } from "zod";
@@ -37,6 +38,7 @@ async function loadExternalBinding(input: Context) {
   const binding = ExternalBinding.parse(JSON.parse(event.value!));
   const authority = await assertExternalBindingAuthority(input.prisma, input.config, binding, event.sequence);
   if (!input.cleanup && !await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey) && authority.task.phase !== "complete") throw new Error("External finalization requires the complete task");
+  await assertNoRemainingConsumers(input.prisma, authority.task);
   return { task: authority.task, binding, revision: event.sequence };
 }
 

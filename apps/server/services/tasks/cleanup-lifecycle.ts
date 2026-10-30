@@ -1,3 +1,4 @@
+import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { automaticCleanupTurn, AutomaticCleanup, type CleanupInboxStore } from "./cleanup-inbox.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { createHash } from "node:crypto";
@@ -45,6 +46,7 @@ function stableMetadata(value: unknown) {
 async function current(input: Context, allowConfirmedClosed = false) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
   const session = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
+  await assertNoRemainingConsumers(input.prisma, task);
   const closed = task.phase === "closed" || session.status === "closed";
   if (!task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || closed && !allowConfirmedClosed
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Cleanup original ownership is changed, paused or closed");

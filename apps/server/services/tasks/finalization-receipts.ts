@@ -1,3 +1,4 @@
+import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { lstat, realpath } from "node:fs/promises";
 import { z } from "zod";
@@ -64,6 +65,7 @@ export async function assertFinalizationRemoved(prepared: Pick<PreparedFinalizat
 export async function assertFinalizationAuthority(prisma: Database, config: ServerConfig, prepared: PreparedFinalization, resourcesReleased = false, cleanup = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: prepared.taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
+  await assertNoRemainingConsumers(prisma, task);
   const { hasPreparedCleanup, assertPreparedCleanup, cleanupRetainedResourceIds } = await import("./cleanup-lifecycle.ts");
   const lifecycle = await hasPreparedCleanup(prisma, task.id, session.id, prepared.requestKey);
   const active = lifecycle ? await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey }) : undefined;

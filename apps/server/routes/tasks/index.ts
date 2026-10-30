@@ -15,6 +15,7 @@ import { isSafeBranchName } from "../../workers/product/workflow/branch.ts";
 import { askSessionQuestion, linkedSourceIssue, NoLinkedSourceIssueError } from "../../services/sessions/questions.ts";
 import { IssueUpdateInput, publishSessionIssueUpdate } from "../../services/sessions/issue-updates.ts";
 import { downloadSourceAttachment } from "../../services/sessions/source-attachments.ts";
+import { WorkMapInput, recordWorkMap } from "../../services/sessions/work-map.ts";
 import { ChildIssueUpdateInput, publishChildIssueUpdate, readSessionWorkGraph } from "../../services/sessions/child-issues.ts";
 import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../services/tasks/tooling-capabilities.ts";
 import { BrowserStopInput, resolveBrowserStopAuthority } from "../../services/tasks/browser-stop-authority.ts";
@@ -171,6 +172,14 @@ sessionTaskRoutes.get("/:sessionId/source-issue", async (c) => {
 sessionTaskRoutes.get("/:sessionId/work-graph", async (c) => {
   try {
     return c.json(await readSessionWorkGraph({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
+sessionTaskRoutes.put("/:sessionId/work-graph", async (c) => {
+  const parsed = WorkMapInput.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid work and delivery map", details: parsed.error.issues }, 400);
+  try {
+    return c.json(await recordWorkMap({ map: parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId") }));
   } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
