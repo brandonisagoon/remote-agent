@@ -804,6 +804,59 @@ test.skipIf(!process.env.DRAFTED_CLERK_INTEGRATION_ROOT)("actual scoped control 
   } finally { await server.stop(true); }
 }, 30_000);
 
+test.skipIf(!process.env.DRAFTED_COMPOSE_INTEGRATION_ROOT).each(["object", "name"])("actual aggregate Compose client retains original v1 preparation and operation through interrupted %s membership", async format => {
+  const f = await fixture("compose-task"), purpose = "review", project = `drafted-${f.task.id}-${purpose}`;
+  const environment = path.join(directory, "environments", `${f.task.id}-review`), file = path.join(environment, "compose.yml");
+  await mkdir(environment, { recursive: true, mode: 0o700 }); await writeFile(file, "name: disposable-owned-group\n", { mode: 0o600 });
+  const containerId = "a".repeat(64), networkId = "b".repeat(64), volume = `${project}-data`, networkName = `${project}-default`;
+  const metadata = { composeFile: file, containers: { mysql: containerId.slice(0, 12) }, volumes: [volume], network: format === "object" ? { id: networkId.slice(0, 12), name: networkName, subnet: "10.236.71.0/24" } : networkName };
+  const receipt = await db.prisma.remoteTaskResource.create({ data: { id: "original-group", taskId: f.task.id, key: "compose-review", kind: "docker-compose-project", purpose, externalId: project, state: "ready", metadata } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(directory, "compose.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  try {
+    const root = process.env.DRAFTED_COMPOSE_INTEGRATION_ROOT!;
+    const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { manageResource } = await import(path.join(root, "src/resources.ts"));
+    const registry = taskRegistry(socket, f.task.id, 3000), labels = { "dev.drafted.task": f.task.id, "dev.drafted.purpose": purpose, "com.docker.compose.project": project };
+    const objects = new Map<string, any>([
+      [`container:${containerId}`, { id: containerId, createdAt: "original-container", running: true, image: "sha256:original", networks: [networkId], volumes: [volume], labels: { ...labels, "com.docker.compose.service": "mysql", "com.docker.compose.project.config_files": file, "com.docker.compose.project.working_dir": environment } }],
+      [`network:${networkId}`, { id: networkId, name: networkName, createdAt: "original-network", subnets: ["10.236.71.0/24"], labels }],
+      [`volume:${volume}`, { id: volume, createdAt: "original-volume", labels }],
+    ]);
+    const effects: string[] = []; let pause = true, loseRemove = true, loseReceipt = true;
+    const docker = {
+      inspect: async (kind: string, id: string) => structuredClone(objects.get(`${kind}:${id}`) ?? null),
+      resolve: async (kind: string, id: string) => { const matches = [...objects].filter(([key]) => key.startsWith(`${kind}:${id}`)); if (matches.length > 1) throw new Error("ambiguous"); return structuredClone(matches[0]?.[1] ?? null); },
+      inventory: async (kind: string) => {
+        const values = structuredClone([...objects].filter(([key]) => key.startsWith(`${kind}:`)).map(([, value]) => value));
+        if (pause && kind === "volume") { pause = false; await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); }
+        return values;
+      },
+      stop: async (id: string) => { effects.push(`stop:${id}`); objects.get(`container:${id}`)!.running = false; },
+      remove: async (kind: string, id: string) => { effects.push(`remove:${kind}:${id}`); objects.delete(`${kind}:${id}`); if (loseRemove) { loseRemove = false; throw new Error("lost exact removal response"); } },
+    };
+    const run = () => manageResource({ registry, key: receipt.key, action: "release", allowEarlyRelease: true, docker, compose: { journalRoot: path.join(directory, "compose-journal") } });
+    await expect(run()).rejects.toThrow("Finalization requires the open complete task's original primary"); expect(effects).toEqual([]);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).ownerPaused).toBeTrue();
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    await expect(run()).rejects.toThrow("lost exact removal response");
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: receipt.id } })).state).toBe("ready");
+    const resource = registry.resource;
+    registry.resource = async (value: unknown) => { await resource(value); if (loseReceipt) { loseReceipt = false; throw new Error("lost aggregate receipt response"); } };
+    await expect(run()).rejects.toThrow("lost aggregate receipt response");
+    expect(await run()).toMatchObject({ state: "released" });
+    expect(effects).toEqual([`stop:${containerId}`, `remove:container:${containerId}`, `remove:network:${networkId}`, `remove:volume:${volume}`]);
+    const released = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(released.metadata).toEqual(metadata); expect(released.externalId).toBe(receipt.externalId);
+    expect(await db.prisma.remoteTaskResource.count({ where: { taskId: f.task.id } })).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(active.operation);
+    expect((await registry.task()).cleanupOperation.preparedRevision).toBe(prepared.preparedRevision);
+  } finally { await server.stop(true); }
+}, 30_000);
+
 test("existing preparation automatically binds once across lost responses without source status or provider reads", async () => {
   const f = await preparedFixture();
   f.issue.state = f.states[2]!;

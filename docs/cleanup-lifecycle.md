@@ -252,3 +252,16 @@ ambiguous aliases, unrelated resources, missing binding,
 identity changes, unmerged or malformed delivery, pause and revocation. Live
 acceptance remains with the original task owner; these tests create no provider
 resources or live cleanup effects.
+
+## Legacy Compose aggregate compatibility verification
+
+The optional `DRAFTED_COMPOSE_INTEGRATION_ROOT` fixture exercises the configured
+tooling client's existing resource release route against a genuine server v1
+preparation and operation. Object `{id,name,subnet}` and name-only network records
+remain in their original aggregate resource. The client resolves names only
+through exact recorded owned-container dependencies, records private member
+lifetimes before effects, and uses the unchanged compact authority route.
+The pair verifies a late pause, interrupted removal and lost aggregate receipt
+response with no new child records, metadata rewrite or preparation/operation
+event change. It uses disposable provider objects, not host Docker resources.
+No server runtime contract was added for this compatibility path.
