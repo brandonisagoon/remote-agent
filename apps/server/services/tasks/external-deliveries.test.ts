@@ -589,3 +589,20 @@ test("an explicit retirement revocation blocks historical external binding and l
   expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } })).value).toBe(before.value);
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "completion-retirement-authority" } })).toBe(0);
 });
+
+test("accepted cleanup reuses historical comment provenance while preserving provider checks and local revocation", async () => {
+  const { observeBoundExternalDelivery } = await import("./external-deliveries.ts");
+  const { revokeDeliveredRetirement } = await import("./delivered-retirement-revocation.ts");
+  const f = await fixture(), adopted = await adoptExternalDeliveries(f.input, f.dependencies);
+  await prepareExternalFinalization(f.finalize, f.dependencies);
+  let providerReads = 0;
+  const dependencies = { ...f.dependencies, comment: async () => { throw new Error("Linear comment is unavailable"); }, observer: { ...f.dependencies.observer,
+    remote: async (...args: Parameters<typeof f.dependencies.observer.remote>) => { providerReads++; return f.dependencies.observer.remote(...args); } } };
+  const input = { ...f.input, binding: adopted.binding, revision: adopted.revision, sources: false };
+  await expect(observeBoundExternalDelivery(input, dependencies)).rejects.toThrow("Linear comment is unavailable");
+  expect(await observeBoundExternalDelivery({ ...input, acceptedCleanup: true }, dependencies)).toHaveLength(2);
+  expect(providerReads).toBe(2);
+  await revokeDeliveredRetirement({ prisma: db.prisma, taskId: f.task.id, revocation: { requestKey: "revoke-accepted-continuation", expectedRevision: adopted.revision, basis: "Owner revoked cleanup" } });
+  await expect(observeBoundExternalDelivery({ ...input, acceptedCleanup: true }, dependencies)).rejects.toThrow("explicitly revoked");
+  expect(providerReads).toBe(2);
+});

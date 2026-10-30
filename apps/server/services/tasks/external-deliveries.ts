@@ -177,7 +177,7 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
 
 /** Revalidates owner comment and exact remote identity even after source roots
  * have been retired. Frozen reports are not reread from a removed directory. */
-export async function observeBoundExternalDelivery(input: Context & { revision: number; binding: ExternalBinding; sources: boolean }, dependencies = externalBindingDependencies) {
+export async function observeBoundExternalDelivery(input: Context & { revision: number; binding: ExternalBinding; sources: boolean; acceptedCleanup?: true }, dependencies = externalBindingDependencies) {
   const authority = await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
   if (input.binding.version === 2) {
     const observations = [];
@@ -190,8 +190,17 @@ export async function observeBoundExternalDelivery(input: Context & { revision: 
     await assertExternalBindingAuthority(input.prisma, input.config, input.binding, input.revision);
     return observations;
   }
-  const checked = await checkComment(input, input.binding.identity.sessionId, input.binding.input, dependencies);
-  if (externalDigest(checked.acceptance) !== externalDigest(input.binding.acceptance)) throw new Error("Accepted owner comment changed since external adoption");
+  if (input.acceptedCleanup) {
+    // The server's accepted cleanup path retains the frozen comment proof and
+    // revalidates its local owner/workflow lineage. Linear availability is not
+    // a recurring cleanup gate; explicit local revocation still applies above.
+    const lineage = await approvalLineage(input, input.binding.identity.sessionId, input.binding.acceptance.approvalEventSequence);
+    if (externalDigest(JSON.parse(lineage.event.value!)) !== input.binding.acceptance.approvalDigest || lineage.approval.actorId !== input.binding.acceptance.actorId
+      || lineage.approval.issueId !== input.binding.acceptance.issueId || lineage.approval.organizationId && lineage.approval.organizationId !== input.binding.acceptance.organizationId) throw new Error("Accepted external comment provenance changed");
+  } else {
+    const checked = await checkComment(input, input.binding.identity.sessionId, input.binding.input, dependencies);
+    if (externalDigest(checked.acceptance) !== externalDigest(input.binding.acceptance)) throw new Error("Accepted owner comment changed since external adoption");
+  }
   const observations = [];
   for (const frozen of input.binding.deliveries) {
     const delivery = input.binding.input.deliveries.find((entry) => entry.id === frozen.id)!;
