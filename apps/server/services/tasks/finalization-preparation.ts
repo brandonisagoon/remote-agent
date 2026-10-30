@@ -16,7 +16,7 @@ export type PreparationAttempt = z.infer<typeof PreparationAttempt>;
 const ACCEPTED = "finalization-preparation-accepted", STATUS = "finalization-preparation-status", ALIAS = "finalization-preparation-request";
 const source = (taskId: string) => `preparation:${taskId}`;
 const Input = z.object({ requestKey: z.string(), cleanup: z.literal(true), finalizationVersion: z.literal(2).optional() }).strict();
-const Accepted = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), input: Input, attempt: PreparationAttempt, epoch: z.string(), acceptedAt: z.string() }).strict();
+const Accepted = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), operation: z.literal("confirm").optional(), input: Input, attempt: PreparationAttempt, epoch: z.string(), acceptedAt: z.string() }).strict();
 const State = z.object({ state: z.enum(["pending", "running", "ready", "failed"]), stage: z.string(), event: z.enum(["start", "end"]).optional(), activeStage: z.string().nullable().optional(), outcome: z.enum(["succeeded", "failed"]).optional(), failedStage: z.string().optional(), diagnostic: PreparationFailure.optional(), worker: z.string().optional(), elapsedMs: z.number().optional(), result: z.unknown().optional(), error: z.string().optional(), retryable: z.boolean().optional() }).strict();
 type Context = FinalizationContext & { cleanup: true };
 type WorkerInput = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
@@ -69,6 +69,28 @@ async function append(input: WorkerInput, accepted: { sequence: number; runtimeS
 /** Same-attempt retries join durable work. A different boundary never replays a
  * completed observation; active scans are serialized by the existing worker. */
 export async function requestFinalizationPreparation(input: Context, attempt: PreparationAttempt, hooks: { afterAcceptanceGuard?: () => Promise<void> } = {}) {
+  return requestBoundary(input, attempt, "prepare", hooks);
+}
+
+export async function requestFinalizationConfirmation(input: Context, attempt: PreparationAttempt) {
+  if (attempt.boundary !== "confirmation") throw new Error("Confirmation requires its exact boundary");
+  await assertPreparedCleanup(input);
+  const { preparation, ...result } = await requestBoundary(input, attempt, "confirm");
+  return { confirmation: preparation, ...result };
+}
+
+async function assertConfirmedResult(input: Context, value: unknown) {
+  const active = await assertPreparedCleanup(input);
+  const result = z.object({ taskId: z.string(), sessionId: z.string(), requestKey: z.string(), preparedRevision: z.number().int().positive(), confirmedRevision: z.number().int().positive(),
+    cleanup: z.object({ operationRevision: z.number().int().positive(), operationDigest: z.string() }).strict() }).passthrough().parse(value);
+  const event = await input.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: result.confirmedRevision } });
+  if (result.taskId !== active.task.id || result.sessionId !== input.sessionId || result.requestKey !== input.requestKey || result.preparedRevision !== active.preparation.sequence
+    || result.cleanup.operationRevision !== active.operationRevision || result.cleanup.operationDigest !== retirementDigest(active.operation)
+    || !event || event.runtimeSessionId !== input.sessionId || event.source !== `finalizer:${active.task.id}` || event.key !== input.requestKey || event.action !== "finalization-confirmed"
+    || JSON.parse(event.value ?? "null")?.preparedRevision !== active.preparation.sequence) throw new Error("Confirmation result does not match the original prepared cleanup operation");
+}
+
+async function requestBoundary(input: Context, attempt: PreparationAttempt, operation: "prepare" | "confirm", hooks: { afterAcceptanceGuard?: () => Promise<void> } = {}) {
   const responseStarted = performance.now();
   let freshRequest = false;
   PreparationAttempt.parse(attempt);
@@ -89,19 +111,20 @@ export async function requestFinalizationPreparation(input: Context, attempt: Pr
     let joined: typeof all[number] | undefined;
     for (const candidate of all) {
       const saved = Accepted.parse(JSON.parse(candidate.value!));
-      if (saved.attempt.boundary !== attempt.boundary || saved.epoch !== observed.digest || retirementDigest(saved.input) !== retirementDigest({ requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) })) continue;
+      if ((saved.operation ?? "prepare") !== operation || saved.attempt.boundary !== attempt.boundary || saved.epoch !== observed.digest || retirementDigest(saved.input) !== retirementDigest({ requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) })) continue;
       const state = await latest(tx as PrismaClient, candidate);
       if (state.state === "pending" || state.state === "running") { joined = candidate; break; }
     }
     const record = joined ?? await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: input.sessionId, source: aliasWhere.source, action: ACCEPTED, key: attempt.attemptId,
-      value: JSON.stringify(Accepted.parse({ version: 1, taskId: observed.task.id, sessionId: input.sessionId, input: { requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) }, attempt, epoch: observed.digest, acceptedAt: new Date().toISOString() })) } });
+      value: JSON.stringify(Accepted.parse({ version: 1, taskId: observed.task.id, sessionId: input.sessionId, ...(operation === "confirm" ? { operation } : {}), input: { requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) }, attempt, epoch: observed.digest, acceptedAt: new Date().toISOString() })) } });
     await tx.runtimeMetadataEvent.create({ data: { ...aliasWhere, value: JSON.stringify({ attempt, acceptedRevision: record.sequence }) } });
     return record;
   });
   const saved = Accepted.parse(JSON.parse(accepted.value!));
-  if (saved.taskId !== observed.task.id || saved.sessionId !== input.sessionId || saved.epoch !== observed.digest || retirementDigest(saved.input) !== retirementDigest({ requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) })) throw new Error("Preparation attempt authority or turn changed; old observations cannot authorize a new boundary");
+  if ((saved.operation ?? "prepare") !== operation || saved.taskId !== observed.task.id || saved.sessionId !== input.sessionId || saved.epoch !== observed.digest || retirementDigest(saved.input) !== retirementDigest({ requestKey: input.requestKey, cleanup: true, ...(input.finalizationVersion ? { finalizationVersion: input.finalizationVersion } : {}) })) throw new Error("Preparation attempt authority, operation or turn changed; old observations cannot authorize a new boundary");
   const state = await latest(input.prisma, accepted);
   if (state.state === "ready") await assertPreparedCleanup(input);
+  if (state.state === "ready" && operation === "confirm") await assertConfirmedResult(input, state.result);
   if (freshRequest || state.state === "ready") await input.prisma.runtimeMetadataEvent.create({ data: {
     runtimeSessionId: input.sessionId, source: accepted.source, action: "finalization-preparation-response", key: attempt.attemptId,
     value: JSON.stringify({ acceptedRevision: accepted.sequence, stage: "response", event: "end", state: state.state, elapsedMs: Math.round(performance.now() - responseStarted) }),
@@ -136,7 +159,7 @@ export async function assertNoPendingPreparation(input: FinalizationContext) {
  * or provider executor. The process already holds exclusive runtime ownership.
  * Only one full preparation runs at a time; HTTP abandonment cannot cancel or
  * duplicate it. A new process resumes interrupted read-only verification. */
-export function preparationJournalWorker(input: WorkerInput, prepare?: (input: FinalizationContext) => Promise<unknown>) {
+export function preparationJournalWorker(input: WorkerInput, prepare?: (input: FinalizationContext) => Promise<unknown>, confirm?: (input: FinalizationContext) => Promise<unknown>) {
   if (activeWorkers.has(input.prisma)) throw new Error("Preparation journal already has a worker");
   const worker = randomUUID();
   let stopped = false, running: Promise<void> | undefined;
@@ -161,12 +184,13 @@ export function preparationJournalWorker(input: WorkerInput, prepare?: (input: F
         const start = performance.now();
         try {
           if ((await epoch(context)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed");
+          if (saved.operation === "confirm") await assertPreparedCleanup(context);
           await append(input, record, { state: "running", stage, worker });
           const result = await withPreparationDiagnostics(async diagnostic => {
             stage = diagnostic.failedStage ?? diagnostic.activeStage ?? diagnostic.stage;
             await append(input, record, { state: "running", ...diagnostic, worker });
           }, () => preparationStage("verification", async () => {
-            const actual = prepare ?? (await import("./finalization.ts")).prepareTaskFinalization;
+            const actual = saved.operation === "confirm" ? confirm ?? (await import("./finalization.ts")).confirmTaskFinalization : prepare ?? (await import("./finalization.ts")).prepareTaskFinalization;
             return execution.run({ sessionId: context.sessionId, requestKey: context.requestKey }, () => actual(context));
           }));
           stage = "response";
@@ -174,13 +198,15 @@ export function preparationJournalWorker(input: WorkerInput, prepare?: (input: F
             const local = { ...context, prisma: tx as PrismaClient };
             if ((await epoch(local)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed during verification");
             await assertPreparedCleanup(local);
+            if (saved.operation === "confirm") await assertConfirmedResult(local, result);
             await append({ ...input, prisma: tx as PrismaClient }, record, { state: "ready", stage, worker, elapsedMs: Math.round(performance.now() - start), result });
           });
         } catch (error) {
           const diagnostic = preparationFailure(error);
+          const label = saved.operation === "confirm" ? "Confirmation" : "Preparation";
           // Keep the released client's strict progress shape: its existing error
           // field carries exactly the same safe code/reason as the durable row.
-          await append(input, record, { state: "failed", stage, diagnostic, worker, elapsedMs: Math.round(performance.now() - start), error: `Preparation failed during ${stage}: [${diagnostic.code}] ${diagnostic.reason} Full verification did not grant cleanup authority.`, retryable: true });
+          await append(input, record, { state: "failed", stage, diagnostic, worker, elapsedMs: Math.round(performance.now() - start), error: `${label} failed during ${stage}: [${diagnostic.code}] ${diagnostic.reason} Full verification did not grant cleanup authority.`, retryable: true });
           console.error(`[preparation] ${record.sequence} failed at ${stage}: [${diagnostic.code}] ${diagnostic.reason}`);
         } finally { scans.delete(key); }
         return;

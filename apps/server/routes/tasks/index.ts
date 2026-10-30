@@ -1,4 +1,4 @@
-import { PreparationAttempt, requestFinalizationPreparation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
+import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
 import { CleanupEnqueueInput, enqueueTaskCleanup } from "../../services/tasks/cleanup-inbox.ts";
 import { deliverInstructions } from "../../services/sessions/inbox.ts";
 import { archiveRetentionProjection, assertArchiveResourceUpdate } from "../../services/tasks/archive-retention.ts";
@@ -86,12 +86,17 @@ for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalizati
   // Task-bound cleanup renewals resolve the original primary locally. They do
   // not fetch the full task/retention projection before every native batch.
   taskRoutes.post(`/:taskId/${action}`, async (c) => {
-    const parsed = FinalizationInput.extend({ preparation: PreparationAttempt.optional() }).safeParse(await c.req.json());
+    const parsed = FinalizationInput.extend({ preparation: PreparationAttempt.optional(), confirmation: PreparationAttempt.optional() }).safeParse(await c.req.json());
     if (!parsed.success) return c.json({ error: "A stable finalization requestKey is required" }, 400);
     const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
     if (!task?.primarySessionId) return c.json({ error: "Task has no original primary" }, 409);
     try {
       const input = { ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: task.primarySessionId };
+      if (parsed.data.confirmation) {
+        if (action !== "confirm-finalization" || parsed.data.preparation || !input.cleanup || input.authorityOnly) throw new Error("Asynchronous confirmation requires the existing full cleanup operation");
+        const value = await requestFinalizationConfirmation({ ...input, cleanup: true }, parsed.data.confirmation);
+        return c.json(value, value.confirmation.state === "pending" || value.confirmation.state === "running" ? 202 : 200);
+      }
       if (parsed.data.preparation) {
         if (action !== "prepare-finalization" || !input.cleanup || input.authorityOnly) throw new Error("Asynchronous preparation requires a full cleanup check");
         const value = await requestFinalizationPreparation({ ...input, cleanup: true }, parsed.data.preparation);
@@ -103,10 +108,15 @@ for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalizati
     catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
   });
   sessionTaskRoutes.post(`/:sessionId/${action}`, async (c) => {
-    const parsed = FinalizationInput.extend({ preparation: PreparationAttempt.optional() }).safeParse(await c.req.json());
+    const parsed = FinalizationInput.extend({ preparation: PreparationAttempt.optional(), confirmation: PreparationAttempt.optional() }).safeParse(await c.req.json());
     if (!parsed.success) return c.json({ error: "A stable finalization requestKey is required" }, 400);
     try {
       const input = { ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId") };
+      if (parsed.data.confirmation) {
+        if (action !== "confirm-finalization" || parsed.data.preparation || !input.cleanup || input.authorityOnly) throw new Error("Asynchronous confirmation requires the existing full cleanup operation");
+        const value = await requestFinalizationConfirmation({ ...input, cleanup: true }, parsed.data.confirmation);
+        return c.json(value, value.confirmation.state === "pending" || value.confirmation.state === "running" ? 202 : 200);
+      }
       if (parsed.data.preparation) {
         if (action !== "prepare-finalization" || !input.cleanup || input.authorityOnly) throw new Error("Asynchronous preparation requires a full cleanup check");
         const value = await requestFinalizationPreparation({ ...input, cleanup: true }, parsed.data.preparation);

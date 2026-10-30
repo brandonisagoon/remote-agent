@@ -1,4 +1,4 @@
-# Long cleanup preparation
+# Long cleanup preparation and confirmation
 
 A full cleanup check can spend longer than a control request's deadline hashing
 retained archives and the original worktree. New Drafted clients acknowledge
@@ -72,8 +72,34 @@ finish, and a later request joins any still-pending work. This does not turn
 resource writes or arbitrary control requests into automatically retried effects.
 
 This increment converts full cleanup preparation. Explicit archive-inspection
-and confirmation endpoints remain synchronous. It does not authorize deployment,
+endpoints remain synchronous. It does not authorize deployment,
 mutate live tasks, or change the meaning of verification or retained resources.
+
+Cleanup confirmation uses the same journal, worker, serialization reservation and
+bounded polling protocol. `confirm-finalization` accepts `confirmation` with the
+same version/attempt shape and the literal boundary `confirmation`; it requires
+the existing bound cleanup operation. The response uses a `confirmation`
+envelope. Accepted rows distinguish confirmation from preparation without
+rewriting old rows. A token cannot cross phases. Old synchronous confirmation
+remains supported, but cannot overlap a pending or running full boundary.
+
+The worker calls the existing full confirmation implementation, including
+physical absence, retained bytes, resource proofs and authority checks. It only
+returns ready after the durable confirmation belongs to the exact original
+preparation and operation. Lost HTTP responses join the same attempt; ready
+replays renew local authority and match the saved confirmation revision. A crash
+before journal completion repeats read-only verification and reconciles the
+existing confirmation/report rather than creating a replacement operation.
+Each new confirmation attempt rechecks physical content; cached ready progress
+is scoped to its accepted attempt and ownership/turn epoch.
+
+The ordinary Drafted lifecycle now polls confirmation under the same finite
+ten-minute total budget and ordinary per-request limit used for preparation.
+Pending, failed, mismatched or late responses never permit closure. A resumed
+finalizer whose initial full preparation already carries a confirmed revision
+skips resource and worktree retirement, obtains that exact current confirmation,
+then performs only the existing close/report steps. There is no custom wrapper,
+manual close, extended-deadline requirement, new approval or second executor.
 
 ## Verification
 

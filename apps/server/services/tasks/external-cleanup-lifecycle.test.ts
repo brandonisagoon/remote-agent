@@ -86,7 +86,7 @@ test("owner pause during full target observation prevents binding the initial lo
   expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.preparedRevision } })).action).toBe("finalization-prepared");
 });
 
-test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted v2 destroy preserves recorded branch, closes on confirmed cleanup and resumes its report", async () => {
+for (const loseConfirmationResponse of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)(`actual Drafted v2 destroy preserves recorded branch, closes on confirmed cleanup and resumes its report (lost confirmation=${loseConfirmationResponse})`, async () => {
   const f = await adoptedFixture();
   f.issue.state = { id: "custom", name: "Keep this owner status", type: "started" };
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "waiting" } });
@@ -99,19 +99,33 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted v2 destroy pr
   const runtime = createFakeAgentRuntime([{ id: "primary", cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
     .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes);
-  const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch }); await chmod(socket, 0o600);
+  let lostResponse = false;
+  const socket = path.join(directory, "control.sock"), server = Bun.serve({ unix: socket, fetch: async req => {
+    const response = await app.fetch(req);
+    if (loseConfirmationResponse && !lostResponse && new URL(req.url).pathname.endsWith("confirm-finalization") && response.ok) {
+      const value = await response.clone().json() as any;
+      if (value.confirmation?.state === "ready") { lostResponse = true; await Bun.sleep(1200); }
+    }
+    return response;
+  } }); await chmod(socket, 0o600);
   // HTTP acknowledges full checks; the existing projection lifecycle owns their
   // execution. Keep its real v1/v2 dispatcher and only fake external providers.
   const stopPreparation = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {});
   try {
     const { taskRegistry } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
     const { finalizeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/finalize.ts"));
-    let registry = taskRegistry(socket, "task", 20_000);
+    let registry = taskRegistry(socket, "task", loseConfirmationResponse ? 1000 : 20_000);
     const close = async () => {
       const response = await app.request("/api/tasks/task/automation", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close", cleanup: true }) });
       if (!response.ok) throw new Error(await response.text());
     };
-    const first = await finalizeTask({ registry, close, cleanup: true });
+    if (loseConfirmationResponse) {
+      // Confirmation committed and its HTTP reply was lost; interrupt before
+      // closure as a separate process continuation boundary.
+      await expect(finalizeTask({ registry, close: async () => { throw new Error("fixture interrupted before closure"); }, cleanup: true })).rejects.toThrow("fixture interrupted before closure");
+      expect(lostResponse).toBeTrue();
+    }
+    const first = await finalizeTask({ registry, close, cleanup: true, ...(loseConfirmationResponse ? { runner: async () => { throw new Error("Confirmed continuation must not re-enter removal"); } } : {}) });
     expect(first).toMatchObject({ closed: true, branch: "staging", reporting: { state: "pending" } });
     const attempts = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-accepted" } });
     const preparationStates = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status" } });

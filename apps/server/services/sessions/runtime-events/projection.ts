@@ -219,8 +219,8 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
   await reconcileSourceMessages(input.config, input.prisma, input.runtime);
   await reconcileControlNotices(input.config, input.prisma);
   await projectTaskStalls(input);
-}, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1] } = {}): () => Promise<void> {
-  const preparations = preparationJournalWorker(input, options.prepareFinalization);
+}, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1]; confirmFinalization?: Parameters<typeof preparationJournalWorker>[2] } = {}): () => Promise<void> {
+  const preparations = preparationJournalWorker(input, options.prepareFinalization, options.confirmFinalization);
   let running: Promise<void> | undefined;
   let requested = false;
   let stopped = false;
