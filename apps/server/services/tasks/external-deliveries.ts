@@ -84,6 +84,9 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 }
 
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
+  // Historical approvals must also honor a later explicit revocation. The
+  // present-day branch below binds the complete owner-history revision.
+  if (binding.version === 1 && await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: binding.identity.sessionId, source: `owner:${binding.identity.taskId}`, action: "delivered-retirement-revoked", sequence: { gt: revision } } })) throw new Error("External cleanup was explicitly revoked after this binding");
   if (binding.version === 2) {
     const current = await externalTaskOwnership(prisma, config, binding.identity.taskId, options);
     const event = await latestExternalBinding(prisma, current.task.id, current.session.id);
@@ -97,7 +100,7 @@ export async function assertExternalBindingAuthority(prisma: ExternalDatabase, c
   return current;
 }
 
-export async function externalOwnerHistory(prisma: ExternalDatabase, taskId: string, sessionId: string) {
+export async function externalOwnerHistory(prisma: Pick<PrismaClient, "runtimeMetadataEvent">, taskId: string, sessionId: string) {
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: sessionId, source: `owner:${taskId}`, action: { in: ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "delivered-retirement-revoked"] } }, orderBy: { sequence: "desc" } });
   return latest?.sequence ?? 0;
 }
