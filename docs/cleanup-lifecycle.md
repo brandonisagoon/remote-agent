@@ -199,6 +199,19 @@ expand the frozen scope. Other metadata, shared ownership, resource identities,
 pause/revocation checks and original preparation/operation bytes stay bound.
 New retirement grants still require canonical discovery before authorization.
 
+The UUID-external-ID format is also supported for an already-frozen operation:
+its tunnel records an absolute `config` and loopback `source`, its endpoint's
+structured `tunnel` repeats the UUID/hostname/config, and its one DNS receipt
+records account, zone, CNAME target and creation result/DNS ID. The validator
+requires the exact three same-purpose records with matching source/config and
+no duplicate physical aliases. It does not infer missing IDs from prose or
+provider discovery. The existing adapter still independently checks provider
+ownership and absence; this compatibility only validates its equal discovery
+annotations and ordered terminal receipts. Frozen preparation and operation
+bytes stay unchanged, and pause, revocation and original-primary checks still
+apply. This fixes the original DRA-71 first receipt-write refusal after its
+credential repair; the live cleanup result remains separate from source tests.
+
 The disposable HTTP tests cover development with a recorded DNS ID, review with
 no DNS record, conflicting associations, premature endpoint completion and
 retry. The real Drafted adapter also runs through the Unix control route with a

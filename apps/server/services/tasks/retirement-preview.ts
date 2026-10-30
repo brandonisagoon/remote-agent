@@ -1,4 +1,5 @@
 import { z } from "zod";
+import path from "node:path";
 import type { RetirementBinding } from "./retirement-receipts.ts";
 
 type Resource = RetirementBinding["resources"][number];
@@ -11,6 +12,46 @@ function host(resource: Resource) {
   try { return typeof value === "string" ? new URL(value.startsWith("http") ? value : `https://${value}`).hostname : undefined; } catch { return undefined; }
 }
 function activePreview(resource: Resource) { return resource.state !== "released" && (kinds.includes(resource.kind) || resource.kind === "local-http" && Boolean(object(resource.metadata).publicUrl)); }
+/** Some original receipts put the UUID in the tunnel externalId, config/source
+ * on that tunnel, account/zone/DNS ID on the route, and the same tuple on the
+ * endpoint's structured tunnel field. This is an exact frozen association,
+ * not a fallback to current provider discovery or descriptive ownership text. */
+function legacyUuidScope(resource: Resource, resources: Resource[], named: Resource[], tunnel: Resource, hostname: string) {
+  const metadata = object(tunnel.metadata), tunnelId = UUID.parse(tunnel.externalId);
+  const config = z.string().min(1).parse(metadata.config), sourceAddress = z.string().parse(metadata.source);
+  const source = new URL(`http://${sourceAddress}`);
+  if (!path.isAbsolute(config) || path.resolve(config) !== config || metadata.hostname !== hostname
+    || !["localhost", "127.0.0.1", "[::1]"].includes(source.hostname) || !source.port || source.port === "0" || sourceAddress !== source.host) throw new Error("Frozen UUID preview config or source is invalid");
+  const endpoints = resources.filter(item => item.kind === "local-http" && item.externalId === source.origin);
+  const dns = named.filter(item => ["cloudflare-dns-record", "cloudflare-dns-route"].includes(item.kind));
+  if (endpoints.length !== 1 || dns.length !== 1 || named.length !== 3
+    || endpoints[0]!.purpose !== resource.purpose || !named.some(item => item.id === endpoints[0]!.id)
+    || resources.filter(item => item.kind === "cloudflare-tunnel" && (item.externalId === tunnelId || object(item.metadata).tunnelId === tunnelId)).length !== 1) throw new Error("Frozen UUID preview association is ambiguous");
+  const endpoint = endpoints[0]!, endpointMeta = object(endpoint.metadata), endpointTunnel = object(endpointMeta.tunnel), route = object(dns[0]!.metadata);
+  const result = object(route.routeResult), accountId = Hex.parse(route.account), zoneId = Hex.parse(route.zone), dnsRecordId = Hex.parse(result.dnsTag);
+  if (endpointTunnel.id !== tunnelId || endpointTunnel.hostname !== hostname || endpointTunnel.config !== config
+    || endpointMeta.sourceAddress !== undefined && endpointMeta.sourceAddress !== sourceAddress
+    || dns[0]!.externalId !== hostname || route.tunnelId !== tunnelId || route.type !== "CNAME tunnel route"
+    || route.content !== `${tunnelId}.cfargotunnel.com` || result.name !== hostname || result.cname !== "new"
+    || resources.filter(item => ["cloudflare-dns-record", "cloudflare-dns-route"].includes(item.kind)
+      && (object(item.metadata).dnsRecordId === dnsRecordId || object(object(item.metadata).routeResult).dnsTag === dnsRecordId)).length !== 1) throw new Error("Frozen UUID preview endpoint or DNS identity changed");
+  if (metadata.configPath !== undefined && metadata.configPath !== config || metadata.sourceAddress !== undefined && metadata.sourceAddress !== source.origin
+    || metadata.configIngress !== undefined && metadata.configIngress !== `${hostname} -> ${source.origin}; fallback http_status:404`) throw new Error("Frozen UUID preview alternate config or source conflicts");
+  const canonical = { hostname, tunnelId, zoneId, accountId, dnsRecordId };
+  for (const item of named) {
+    const value = object(item.metadata);
+    for (const [key, expected] of Object.entries(canonical)) if (value[key] !== undefined && value[key] !== expected) throw new Error("Frozen UUID preview canonical identity conflicts");
+    if (value.zone !== undefined && value.zone !== zoneId || value.account !== undefined && value.account !== accountId) throw new Error("Frozen UUID preview account or zone conflicts");
+  }
+  const publicTunnel = object(endpointMeta.publicTunnel);
+  if (publicTunnel.id !== undefined && publicTunnel.id !== tunnelId || publicTunnel.hostname !== undefined && publicTunnel.hostname !== hostname
+    || publicTunnel.zoneId !== undefined && publicTunnel.zoneId !== zoneId || publicTunnel.accountId !== undefined && publicTunnel.accountId !== accountId
+    || publicTunnel.config !== undefined && publicTunnel.config !== config || publicTunnel.source !== undefined && publicTunnel.source !== source.origin) throw new Error("Frozen UUID preview endpoint association conflicts");
+  if (!named.some(item => item.id === resource.id)) throw new Error("Resource is outside the frozen UUID preview association");
+  const shared = publicTunnel.shared === true || metadata.shared === true;
+  return { kind: "named" as const, hostname, tunnelId, zoneId, dnsRecordId, shared, related: named, legacyCanonical: canonical };
+}
+
 /** Older accepted operations froze these aliases before canonical discovery.
  * Derive only identities already present in that exact recorded association;
  * a missing DNS ID permits null, never a newly discovered deletion target. */
@@ -19,6 +60,7 @@ function legacyNamedScope(resource: Resource, resources: Resource[], hostname: s
   const tunnels = named.filter(item => item.kind === "cloudflare-tunnel");
   if (tunnels.length !== 1 || named.some(item => item.purpose !== resource.purpose)) throw new Error("Frozen legacy preview association is ambiguous");
   const tunnel = tunnels[0]!, metadata = object(tunnel.metadata);
+  if (UUID.safeParse(tunnel.externalId).success && metadata.config !== undefined) return legacyUuidScope(resource, resources, named, tunnel, hostname);
   const tunnelId = UUID.parse(metadata.tunnelId), zoneId = Hex.parse(metadata.zone), accountId = Hex.parse(metadata.account);
   if (metadata.hostname !== hostname || typeof metadata.configPath !== "string" || !metadata.configPath) throw new Error("Frozen legacy preview tunnel identity is incomplete");
   const source = z.string().parse(metadata.sourceAddress), url = new URL(source);
