@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
 import { CleanupAdapter, CleanupObserverBatchInput, CleanupObserverBatchResult, CleanupObserverInput, CleanupObserverResource, CleanupTarget } from "./cleanup-observer-schema.ts";
 import { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 
@@ -76,12 +77,25 @@ export async function prepareCleanupAdapterResources(input: { context: CleanupAd
 
 /** Released is only a receipt state. A full confirm still independently proves
  * every prepared target absent, and a replay cannot absorb recreated targets. */
-export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean; retainedTargets?: Map<string, string[]> }, observe: Observe = runCleanupResourceObserver) {
+export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean; retainedTargets?: Map<string, string[]>; retainedPreviewInputs?: RetainedPreviewInput[]; previewObserver?: () => Promise<CleanupObserverCapability> }, observe: Observe = runCleanupResourceObserver) {
   if (!input.plan.length) return;
   const plans = input.plan.map(plan => CleanupAdapterPlan.parse(plan)), context = plans[0]!.observer;
   if (context.task.id !== input.taskId || plans.some(plan => !same(plan.observer, context))) throw new Error("Cleanup observer task or committed capability changed");
   const request = CleanupObserverBatchInput.parse({ version: 1, task: context.task, resources: input.resources, stage: "confirm", observations: plans.map(plan => ({ resourceId: plan.id, expectedTargets: plan.targets })) });
-  const result = resultScope(request, await observe({ capability: context.capability, request }), new Map(plans.map(plan => [plan.id, plan.identityDigest])));
+  const retained = input.retainedPreviewInputs ?? [];
+  const recovered = plans.filter(plan => plan.adapter === "preview" && retained.some(value => input.resources.find(resource => resource.id === value.resourceId)?.purpose === plan.purpose));
+  let value: unknown;
+  if (recovered.length) {
+    if (!input.previewObserver) throw new Error("Captured preview confirmation requires a compatible configured observer");
+    const current = await input.previewObserver();
+    const ordinary = request.observations.filter(item => !recovered.some(plan => plan.id === item.resourceId));
+    const observations = [];
+    if (ordinary.length) observations.push(...resultScope({ ...request, observations: ordinary }, await observe({ capability: context.capability, request: { ...request, observations: ordinary } }), new Map(plans.map(plan => [plan.id, plan.identityDigest]))).observations);
+    const recoveredRequest = CleanupObserverBatchInput.parse({ ...request, observations: request.observations.filter(item => recovered.some(plan => plan.id === item.resourceId)), retainedPreviewInputs: retained });
+    observations.push(...resultScope(recoveredRequest, await observe({ capability: context.capability, compatibleCapability: current, request: recoveredRequest }), new Map(plans.map(plan => [plan.id, plan.identityDigest]))).observations);
+    value = { version: 1, taskId: input.taskId, observations };
+  } else value = await observe({ capability: context.capability, request });
+  const result = resultScope(request, value, new Map(plans.map(plan => [plan.id, plan.identityDigest])));
   for (const plan of plans) {
     const current = result.observations.find(item => item.resourceId === plan.id)!;
     const record = input.resources.find(record => record.id === plan.id)!;

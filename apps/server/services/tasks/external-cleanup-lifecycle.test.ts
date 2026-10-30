@@ -355,3 +355,53 @@ test("queued external cleanup refresh preserves its accepted binding, preparatio
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_SUPERSEDED } })).toBe(1);
   expect(await prepareExternalFinalization({ ...f.input, authorityOnly: true }, f.dependencies)).toEqual(prepared);
 });
+
+test("captured preview confirmation uses current declared tooling without rewriting accepted binding or cleanup operation", async () => {
+  const { lstat, readFile, rename } = await import("node:fs/promises");
+  const { prepareFinalizationResources, assertFinalizationResources, finalizationResourceIdentity, finalizationDigest } = await import("./finalization-resources.ts");
+  const { CleanupObserverBatchInput, cleanupTargetDigest } = await import("./cleanup-observer-schema.ts");
+  const f = await fixture(), env = path.join(directory, "preview-environment"), configFile = path.join(env, "cloudflared.yml"), connector = path.join(env, "tunnel.json");
+  await mkdir(path.join(directory, "policy-tooling"), { mode: 0o700 });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { toolingRoot: path.join(directory, "policy-tooling"), pinnedToolingRoot: path.join(directory, "policy-tooling") } });
+  await mkdir(env, { mode: 0o700 }); await writeFile(configFile, "retained config", { mode: 0o600 }); await writeFile(connector, "retained connector", { mode: 0o400 });
+  const environment = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "development-env-directory", kind: "private-directory", purpose: "development", externalId: env, state: "ready", metadata: {} } });
+  const tunnel = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "development-tunnel", kind: "cloudflare-tunnel", purpose: "development", externalId: "original-tunnel", state: "ready", metadata: { configPath: "<development env>/cloudflared.yml (private retained configuration)", credentialsPath: "<development env>/tunnel.json (0400)" } } });
+  const old = { version: 1 as const, source: "configured-host" as const, checkout: path.join(directory, "old"), revision: "b".repeat(40), adapter: path.join(directory, "old/cleanup.ts"), adapterSha256: "d".repeat(64) };
+  const current = { ...old, checkout: path.join(directory, "current"), revision: "c".repeat(40), adapter: path.join(directory, "current/cleanup.ts") };
+  let selected = old, present = true, recovered = 0;
+  const observation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {}, adapters: async (input: Parameters<typeof import("./cleanup-resource-observer.ts").runCleanupResourceObserver>[0]) => {
+    const request = CleanupObserverBatchInput.parse(input.request);
+    expect(input.capability).toEqual(old);
+    if (input.compatibleCapability) { expect(input.compatibleCapability).toEqual(current); expect(request.retainedPreviewInputs?.[0]?.resourceId).toBe(environment.id); recovered++; }
+    const target = { kind: "local-ingress-route" as const, id: "preview.example.com", scope: { taskId: "task", purpose: "development" as const, configFile, tunnelId: "original-tunnel" }, hostname: "preview.example.com", sourceDigest: "a".repeat(64), routeDigest: "b".repeat(64), presentAtPrepare: true };
+    const targets = request.observations[0]!.expectedTargets ?? [{ ...target, identityDigest: cleanupTargetDigest(target) }];
+    return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: tunnel.id, resourceIdentityDigest: finalizationResourceIdentity(tunnel).identityDigest, adapter: "preview", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
+  } };
+  const dependencies = { ...f.dependencies, cleanupObserver: async () => selected,
+    resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, observation),
+    assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, observation) };
+  const retirement = await f.request(); retirement.ownership.ownedPaths = [env];
+  await adoptLegacyDelivery({ ...f.context, retirement }, dependencies);
+  const input = { ...f.finalizer, cleanup: true as const }, prepared = await prepareExternalFinalization(input, dependencies);
+  const tree = prepared.resources.find(entry => entry.id === environment.id); if (!tree || tree.disposition !== "retire-tree") throw new Error("Missing accepted tree");
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  expect(frozen.some(event => event.action === CLEANUP_OPERATION)).toBeTrue();
+  expect(frozen.some(event => event.action === "external-delivery-binding")).toBeTrue();
+  const client = process.env.DRAFTED_CLEANUP_CLIENT;
+  if (client) await (await import(path.join(client, "src/quarantine.ts"))).capturePreparedTree(tree.target, { taskId: "task", resourceId: tree.id, planDigest: finalizationDigest(tree.target) });
+  else {
+    await mkdir(tree.target.quarantine.directory, { mode: 0o700 }); const q = await lstat(tree.target.quarantine.directory), source = tree.target.inventory[0]!;
+    await writeFile(tree.target.quarantine.journal, JSON.stringify({ version: 1, taskId: "task", resourceId: tree.id, planDigest: finalizationDigest(tree.target), sourcePath: env, capturedPath: tree.target.quarantine.path, source: { dev: source.dev, ino: source.ino, mode: source.mode }, quarantine: { dev: q.dev, ino: q.ino } }), { mode: 0o600 });
+    await rename(env, tree.target.quarantine.path);
+  }
+  const journal = await readFile(tree.target.quarantine.journal); selected = current; present = false;
+  await db.prisma.remoteTaskResource.updateMany({ where: { taskId: "task" }, data: { state: "released" } });
+  git(f.root, "worktree", "remove", f.worktree);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  await expect(confirmExternalFinalization(input, dependencies)).rejects.toThrow(); expect(recovered).toBe(0);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: false } });
+  const confirmed = await confirmExternalFinalization(input, dependencies);
+  expect(confirmed.preparedRevision).toBe(prepared.preparedRevision); expect(await confirmExternalFinalization(input, dependencies)).toEqual(confirmed); expect(recovered).toBe(2);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(event => event.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await readFile(tree.target.quarantine.journal)).toEqual(journal);
+});

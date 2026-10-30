@@ -1,6 +1,7 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Nonempty = z.string().min(1);
@@ -53,11 +54,21 @@ export const CleanupObserverResource = z.strictObject({ id: z.string().min(1), k
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])) : value;
 export const cleanupDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 const uniqueTargets = (targets: CleanupTarget[]) => new Set(targets.map(target => JSON.stringify([target.kind, Object.entries(target.scope).sort(([a], [b]) => a.localeCompare(b)), target.id]))).size === targets.length;
+function retainedEnvironment(input: z.infer<typeof RetainedPreviewInput>, resources: z.infer<typeof CleanupObserverResource>[]) {
+  const resource = resources.find(resource => resource.id === input.resourceId);
+  if (!resource || resource.externalId !== input.sourcePath || !["directory", "private-directory"].includes(resource.kind) || !["development", "review"].includes(resource.purpose) || resource.key !== `${resource.purpose}-env-directory`) return false;
+  const parsed = z.record(z.string(), z.unknown()).safeParse(resource.metadata ?? {}); if (!parsed.success) return false;
+  const { observed: _, observedAt: __, ...metadata } = parsed.data;
+  const { id, key, kind, purpose, externalId, expiresAt } = resource;
+  return cleanupDigest({ id, key, kind, purpose, externalId, expiresAt, metadata }) === input.identityDigest;
+}
 export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task: z.strictObject({ id: z.string().min(1), primarySessionId: z.string().min(1), worktreePath: Absolute, toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) }),
-  resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional() }).superRefine((input, ctx) => {
+  resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional(), retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional() }).superRefine((input, ctx) => {
     if (input.stage === "prepare" ? input.expectedTargets !== undefined : input.expectedTargets === undefined) ctx.addIssue({ code: "custom", message: "Only confirm requires the exact prepared targets" });
     if (new Set(input.resources.map(resource => resource.id)).size !== input.resources.length || new Set(input.resources.map(resource => resource.key)).size !== input.resources.length || !input.resources.some(resource => resource.id === input.resource.id && cleanupDigest(resource) === cleanupDigest(input.resource))) ctx.addIssue({ code: "custom", message: "Observer resource must occur exactly once in its task inventory" });
     if (input.expectedTargets && (!uniqueTargets(input.expectedTargets) || input.expectedTargets.some(target => target.scope.taskId !== input.task.id || target.scope.purpose !== input.resource.purpose))) ctx.addIssue({ code: "custom", message: "Prepared target scope or uniqueness is invalid" });
+    if (input.retainedPreviewInputs && (input.stage !== "confirm" || new Set(input.retainedPreviewInputs.map(value => value.resourceId)).size !== input.retainedPreviewInputs.length
+      || input.retainedPreviewInputs.some(value => !retainedEnvironment(value, input.resources)))) ctx.addIssue({ code: "custom", message: "Retained preview inputs require exact confirmation resources" });
   });
 export type CleanupObserverInput = z.infer<typeof CleanupObserverInput>;
 export const CleanupObserverResult = z.strictObject({ version: z.literal(1), taskId: z.string(), resourceId: z.string(), resourceIdentityDigest: Hash,
@@ -76,12 +87,13 @@ export type CleanupObserverResult = z.infer<typeof CleanupObserverResult>;
 
 const ObserverTask = z.strictObject({ id: Nonempty, primarySessionId: Nonempty, worktreePath: Absolute, toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) });
 export const CleanupObserverBatchInput = z.strictObject({ version: z.literal(1), task: ObserverTask, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]),
+  retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional(),
   observations: z.array(z.strictObject({ resourceId: Nonempty, expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional() })).min(1).max(1000),
 }).superRefine((input, ctx) => {
   if (new Set(input.observations.map(value => value.resourceId)).size !== input.observations.length) ctx.addIssue({ code: "custom", message: "Batch resources must be unique" });
   for (const observation of input.observations) {
     const resource = input.resources.find(value => value.id === observation.resourceId);
-    if (!resource || !CleanupObserverInput.safeParse({ version: input.version, task: input.task, resources: input.resources, resource, stage: input.stage, expectedTargets: observation.expectedTargets }).success) ctx.addIssue({ code: "custom", message: "Batch observation does not bind an exact resource and stage" });
+    if (!resource || !CleanupObserverInput.safeParse({ version: input.version, task: input.task, resources: input.resources, resource, stage: input.stage, expectedTargets: observation.expectedTargets, retainedPreviewInputs: input.retainedPreviewInputs }).success) ctx.addIssue({ code: "custom", message: "Batch observation does not bind an exact resource and stage" });
   }
 });
 export type CleanupObserverBatchInput = z.infer<typeof CleanupObserverBatchInput>;

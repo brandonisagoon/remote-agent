@@ -4,7 +4,8 @@ import path from "node:path";
 import { z } from "zod";
 import type { RemoteTask } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
-import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
+import { CleanupObservationContracts, resolveToolingCompatibility } from "./tooling-compatibility.ts";
+import { CleanupObserverBatchInput } from "./cleanup-observer-schema.ts";
 import { CleanupObserverError, observerFailureEnvelope, type CleanupObserverCode } from "./cleanup-observer-diagnostics.ts";
 
 const Absolute = z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && path.normalize(value) === value);
@@ -97,7 +98,7 @@ async function execute(args: string[], options: { cwd: string; input?: string; t
 
 /** A server-configured committed capability is distinct from the task's old
  * policy pin. Resource metadata never selects an executable or Git revision. */
-async function checkedCapability(capability: CleanupObserverCapability) {
+async function checkedCapability(capability: CleanupObserverCapability, retainedPreview = false) {
   const value = CleanupObserverCapability.parse(capability);
   const root = await lstat(value.checkout), file = await lstat(value.adapter);
   if (!root.isDirectory() || root.isSymbolicLink() || !file.isFile() || file.isSymbolicLink() || file.size > 1024 * 1024
@@ -109,6 +110,10 @@ async function checkedCapability(capability: CleanupObserverCapability) {
   const relative = path.relative(value.checkout, value.adapter);
   const declared = z.object({ version: z.literal(1), capabilities: z.object({ cleanup: z.object({ adapter: z.string() }) }) }).parse(manifest);
   if (declared.capabilities.cleanup.adapter !== relative) throw failure();
+  if (retainedPreview) {
+    const contracts = CleanupObservationContracts.safeParse(manifest.capabilities?.cleanup?.observationContracts);
+    if (!contracts.success || !contracts.data.includes("retained-preview-inputs/v1")) throw failure("OBSERVER_COMPATIBILITY");
+  }
   const mode = (await git("ls-tree", value.revision, "--", relative)).trim();
   if (!/^100(?:644|755) blob /.test(mode)) throw failure();
   const committed = await git("show", `${value.revision}:${relative}`), actual = await readFile(value.adapter);
@@ -116,8 +121,8 @@ async function checkedCapability(capability: CleanupObserverCapability) {
   return value;
 }
 
-export async function verifyCleanupObserver(capability: CleanupObserverCapability) {
-  try { return await checkedCapability(capability); } catch { throw failure(); }
+export async function verifyCleanupObserver(capability: CleanupObserverCapability, retainedPreview = false) {
+  try { return await checkedCapability(capability, retainedPreview); } catch (error) { throw error instanceof CleanupObserverError ? error : failure(); }
 }
 
 export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig }, resolve = resolveToolingCompatibility) {
@@ -137,7 +142,7 @@ export async function resolveCleanupObserver(input: { task: RemoteTask; config: 
 /** Private stdin and bounded JSON output only. The CLI action must use the
  * tooling's read-only inspectors; no control socket or primary-session identity
  * is inherited, and calling ordinary reconciliation is not this protocol. */
-export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number }) {
+export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability }) {
   const timeoutMs = input.timeoutMs ?? 60_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure("OBSERVER_INPUT");
   let bytes: string, request: unknown;
@@ -146,7 +151,13 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
     if (Buffer.byteLength(bytes) > 2 * 1024 * 1024) throw failure("OBSERVER_INPUT");
     request = JSON.parse(bytes);
   } catch { throw failure("OBSERVER_INPUT"); }
-  const capability = await verifyCleanupObserver(input.capability);
+  const original = await verifyCleanupObserver(input.capability);
+  if (input.compatibleCapability) {
+    const parsed = CleanupObserverBatchInput.safeParse(request);
+    if (!parsed.success || parsed.data.stage !== "confirm" || !parsed.data.retainedPreviewInputs?.length
+      || parsed.data.observations.some(item => !item.expectedTargets?.every(target => ["cloudflare-dns-record", "cloudflare-tunnel", "cloudflare-ingress-route", "local-ingress-route"].includes(target.kind)))) throw failure("OBSERVER_INPUT");
+  }
+  const capability = input.compatibleCapability ? await verifyCleanupObserver(input.compatibleCapability, true) : original;
   const env: Record<string, string> = {};
   for (const name of ["PATH", "HOME", "TMPDIR", "USER", "CLOUDFLARE_API_TOKEN", "DRAFTED_CLOUDFLARE_CREDENTIALS"]) if (process.env[name] !== undefined) env[name] = process.env[name]!;
   let output: string;
@@ -154,6 +165,7 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
   catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }
   // Revalidate the code identity after the child finishes. An interrupted or
   // changed observer can never leave a successful physical-proof response.
-  await verifyCleanupObserver(capability);
+  await verifyCleanupObserver(capability, Boolean(input.compatibleCapability));
+  if (input.compatibleCapability) await verifyCleanupObserver(original);
   try { return JSON.parse(output) as unknown; } catch { throw failure("OBSERVER_JSON"); }
 }
