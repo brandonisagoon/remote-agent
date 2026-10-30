@@ -236,6 +236,49 @@ test("an original retained tooling parent is not a whole-tree cleanup operation"
 });
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+test.each(["retained-copy", "pause", "pin", "revocation"])("bound evidence authority still refuses %s before capture", async change => {
+  const f = await fixture(), receipt = await f.adopt();
+  await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  if (change === "retained-copy") await writeFile(receipt.proof.entries[0]!.retained.path, "changed retained bytes\n");
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "pin") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRevision: "b".repeat(40) } });
+  if (change === "revocation") await setCompletionContract({ ...f.context, contract: CompletionContractInput.parse({ requestKey: "revoked", expectedRevision: f.contract.revision, boundary: "revoked", basis: "Withdrawn" }) });
+  await expect(f.manage(receipt, "capture-0", "authorize")).rejects.toThrow();
+  expect(await readFile(f.resources[0]!.externalId, "utf8")).toBe("saved capture\n");
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resources[0]!.id } })).state).toBe("ready");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { source: `legacy-evidence:${f.task.id}`, action: "legacy-evidence-confirmed" } })).toBe(0);
+});
+
+test.skipIf(!draftedRoot)("bound cleanup checks each evidence copy without repeating whole-task fingerprints", async () => {
+  const f = await fixture({ files: 6, privateBackup: true }), receipt = await f.adopt();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+  await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  const before = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } });
+  const snapshot = f.dependencies.snapshot;
+  let fingerprints = 0;
+  f.dependencies.snapshot = async (...args) => { fingerprints++; return snapshot(...args); };
+  const originalPrepare = legacyEvidenceDependencies.prepare;
+  legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const socket = path.join(directory, "bounded-evidence.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageLegacyEvidence: manage } = await import(path.join(draftedRoot!, "src/legacy-evidence.ts"));
+    const registry = taskRegistry(socket, f.task.id);
+    for (const entry of receipt.proof.entries) {
+      expect((await manage({ registry, key: entry.key, action: "release" })).observed).toBe("evidence-retired-archive-retained");
+      expect(await lstat(entry.target.path).catch(() => null)).toBeNull();
+      expect(sha(await readFile(entry.retained.path))).toBe(entry.target.type === "file" ? entry.target.sha256 : "unexpected tree");
+    }
+    expect(fingerprints).toBe(0);
+    expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: before.sequence } })).value).toBe(before.value);
+    // The full finalizer boundary still observes the worktree and archives.
+    await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+    expect(fingerprints).toBeGreaterThan(0);
+    await writeFile(path.join(f.worktree, "README.md"), "later source edit\n");
+    await expect(prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies)).rejects.toThrow("worktree changed");
+  } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+}, 30_000);
+
 test.skipIf(!draftedRoot)("actual Drafted adapter, control socket and server confirm retain bytes across lost response", async () => {
   const f = await fixture(), receipt = await f.adopt();
   const originalPrepare = legacyEvidenceDependencies.prepare;

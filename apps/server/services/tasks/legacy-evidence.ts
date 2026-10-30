@@ -184,8 +184,18 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where: confirmWhere });
   const confirmation = { proofRevision: result.proofRevision, proofDigest: result.proofDigest, preparedRevision: proof.preparedRevision, resourceId: entry.resourceId, identityDigest: entry.identityDigest };
   if (prior && prior.value !== JSON.stringify(confirmation)) throw new Error("Legacy evidence confirmation linkage changed");
+  const prepareAuthority = async () => {
+    const { hasPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+    const bound = await hasPreparedCleanup(input.prisma, task.id, input.sessionId, proof.finalizationRequestKey);
+    // An established operation already pins the accepted task and retention
+    // epoch. Each file still gets independent copy/capture checks below; full
+    // worktree/archive observation remains at the outer finalizer boundaries.
+    // Legacy callers without an operation retain their original full checks.
+    return dependencies.prepare({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, requestKey: proof.finalizationRequestKey,
+      ...(bound ? { cleanup: true, authorityOnly: true } : {}) });
+  };
   if (operation.action !== "inspect") {
-    const prepared = await dependencies.prepare({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, requestKey: proof.finalizationRequestKey });
+    const prepared = await prepareAuthority();
     if (prepared.preparedRevision !== proof.preparedRevision || "version" in prepared) throw new Error("Legacy evidence finalization authority changed");
   }
   if (isEvidenceTree(entry) && operation.action !== "inspect") {
@@ -195,7 +205,7 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
   }
   await inspectLegacyEvidenceCapture(proof, entry, operation.action === "confirm" || Boolean(prior));
   if (operation.action !== "inspect") {
-    const fresh = await dependencies.prepare({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, requestKey: proof.finalizationRequestKey });
+    const fresh = await prepareAuthority();
     if (fresh.preparedRevision !== proof.preparedRevision || "version" in fresh) throw new Error("Legacy evidence finalization authority changed during observation");
     await loadProof(input.prisma, input.config, task.id, operation.proofRevision);
   }
