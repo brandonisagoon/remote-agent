@@ -162,16 +162,23 @@ remain in the capture, bound by directory identity and package/lock hashes; thei
 individual installed files are not content-hashed or deleted. All other ignored
 material remains fully hashed.
 
-Before capture and normal unregister, the client must publish a complete private
-copy of the small administrative directory, including `index`, `logs/HEAD`,
-`ORIG_HEAD` and any other observed regular files. The source inventory is bounded
-to 256 entries, 16 MiB per file and 64 MiB total. The frozen destination must
-contain exactly those bytes, with private directories/files; partial copies,
-extra material, links and changed source administration cannot be acknowledged.
-The shared common repository and its branches stay intact. Confirmation requires
-the retained checkout and administration, original-path absence and exact Git
-registration/administrative-path absence. A generic Released receipt proves none
-of these facts.
+After the complete checkout is captured, the same descriptor-bound mechanism
+captures its exact small administrative directory, including `index`,
+`logs/HEAD`, `ORIG_HEAD` and every other inventoried regular file. The inventory
+is bounded to 256 entries, 16 MiB per file and 64 MiB total. Source and destination
+parent identities and the filesystem are frozen; cross-device moves fail before
+source effects. The administration quarantine is private 0700 and outside Git's
+`worktrees` registration directory. Its parent must be user-owned and not writable
+by other users; existing evidence capture keeps its stricter private-parent rule.
+
+No Git removal command traverses the now-absent checkout path. A disposable test
+proved that ordinary `git worktree remove` could delete a clean-looking replacement
+with new ignored bytes created immediately before command dispatch. Exact native
+administration capture preserves all metadata without that traversal. Read-only
+Git commands verify registration absence afterward. The common repository, refs
+and other registrations stay intact. Recreated checkout or administrative paths
+remain untouched and block completion. Both captured inventories and journals
+must verify; Released state alone is not a retirement proof.
 
 Process checks enumerate bounded NUL-delimited open-handle records rather than
 recursively traversing every installed dependency. Any handle or command naming
@@ -183,7 +190,7 @@ and [lsof's Darwin pipe observer](https://github.com/apple-oss-distributions/lso
 There is no process-ID or read-only-directory-handle exemption.
 
 Disposable Darwin and Linux fixtures cover branch/detached registration, complete
-administration preservation, copy/source substitution, captured-root retries,
+administration preservation, captured/source substitution, captured-root retries,
 package/lock changes and an actual process retaining its working directory. A
 read-only DRA98 preflight covered all three linked checkouts, with six retained
 opaque dependency roots each, and fully hashed 1.26–2.04 GB of other bytes per

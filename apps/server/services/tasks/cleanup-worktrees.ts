@@ -27,6 +27,7 @@ async function directory(file: string) {
   if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 || await realpath(file) !== file) throw new Error("Linked worktree directory is shared, unowned or redirected");
   return stat;
 }
+const directoryIdentity = directory;
 const nodeIdentity = (stat: { dev: number; ino: number; mode: number }) => ({ dev: stat.dev, ino: stat.ino, mode: stat.mode });
 async function administrativeInventory(root: string, privateCopy = false) {
   const inventory: Worktree["git"]["administrativeInventory"] = [];
@@ -115,14 +116,20 @@ export async function prepareLinkedWorktreeCaptures(input: { resources: Finaliza
     await idle(root);
     const inventory = await finalizationInventory(root, [root], new Map(dependencies.map(dependency => [dependency.path, resource.id])), new Map());
     const name = randomUUID(), directory = path.join(path.dirname(root), `.drafted-finalization-${name}`);
+    const sourceParent = { path: path.dirname(state.administrativeDirectory), ...nodeIdentity(await directoryIdentity(path.dirname(state.administrativeDirectory))) };
+    const quarantineParent = { path: path.dirname(root), ...nodeIdentity(await directoryIdentity(path.dirname(root))) };
+    const adminDirectory = path.join(quarantineParent.path, `.drafted-finalization-${randomUUID()}`);
+    if (sourceParent.dev !== quarantineParent.dev || state.administrativeIdentity.dev !== quarantineParent.dev || inventory[0]!.dev !== quarantineParent.dev
+      || within(sourceParent.path, adminDirectory)) throw new Error("Linked administration requires a same-filesystem retained destination outside Git registrations");
     const plan = LinkedWorktreePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-worktree", ...edges, git: state,
       target: { type: "tree", path: root, sourcePaths: [root], inventory, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } },
-      retainedAdministration: { path: path.join(path.dirname(root), `.drafted-worktree-admin-${name}`), inventoryDigest: finalizationDigest(state.administrativeInventory) }, installedDependencies: dependencies });
-    const destinations = [directory, plan.retainedAdministration.path];
+      administrationCapture: { type: "tree", path: state.administrativeDirectory, sourcePaths: [state.administrativeDirectory], inventory: state.administrativeInventory, sourceParent, quarantineParent,
+        quarantine: { directory: adminDirectory, path: path.join(adminDirectory, "contents"), journal: path.join(adminDirectory, "pending.json") } }, installedDependencies: dependencies });
+    const destinations = [directory, plan.administrationCapture.quarantine.directory];
     if (destinations.some(destination => input.protectedPaths.some(file => overlaps(destination, file))
       || input.resources.some(other => path.isAbsolute(other.externalId) && overlaps(destination, other.externalId))
       || input.plan.some(entry => entry.disposition === "retain-archive" && overlaps(destination, entry.archive.root)))) throw new Error("Linked worktree retention destination overlaps protected or registered material");
-    if (await missing(plan.retainedAdministration.path)) throw new Error("Linked worktree administration destination already exists");
+    if (await missing(plan.administrationCapture.quarantine.directory)) throw new Error("Linked worktree administration destination already exists");
     if (finalizationDigest(await inspectGit(root)) !== finalizationDigest(state)) throw new Error("Linked worktree changed during capture preparation");
     await assertFinalizationTree(plan.target); await idle(root);
     result.push(plan);
@@ -130,20 +137,19 @@ export async function prepareLinkedWorktreeCaptures(input: { resources: Finaliza
   return result;
 }
 
-async function retainedAdministration(plan: Worktree, required: boolean) {
-  const file = plan.retainedAdministration.path, q = plan.target.quarantine.directory;
-  if (file !== path.join(path.dirname(plan.target.path), `.drafted-worktree-admin-${path.basename(q).replace(".drafted-finalization-", "")}`)
-    || plan.retainedAdministration.inventoryDigest !== finalizationDigest(plan.git.administrativeInventory)) throw new Error("Retained administration identity differs from its prepared source");
-  await assertFinalizationPath(file);
-  if (!(await missing(file))) { if (required) throw new Error("Captured worktree has no retained administration"); return; }
-  const saved = await administrativeInventory(file, true);
-  const content = (entry: Worktree["git"]["administrativeInventory"][number]) => {
-    if (entry.kind !== "file" && entry.kind !== "directory") throw new Error("Retained administration has unsupported material");
-    return entry.kind === "file" ? { path: entry.path, kind: entry.kind, size: entry.size, sha256: entry.sha256 } : { path: entry.path, kind: entry.kind };
-  };
-  if (finalizationDigest(saved.map(content)) !== finalizationDigest(plan.git.administrativeInventory.map(content))) throw new Error("Retained worktree administration bytes changed");
+async function inspectAdministration(taskId: string, plan: Worktree) {
+  const target = plan.administrationCapture;
+  if (target.path !== plan.git.administrativeDirectory || target.sourcePaths.length !== 1 || target.sourcePaths[0] !== target.path
+    || finalizationDigest(target.inventory) !== finalizationDigest(plan.git.administrativeInventory)
+    || target.sourceParent.path !== path.dirname(target.path) || target.quarantineParent.path !== path.dirname(plan.target.path)
+    || target.sourceParent.dev !== target.quarantineParent.dev || target.quarantineParent.dev !== plan.target.inventory[0]?.dev
+    || within(path.join(plan.git.commonDirectory, "worktrees"), target.quarantine.directory)
+    || overlaps(plan.target.quarantine.directory, target.quarantine.directory)) throw new Error("Linked administration capture scope changed");
+  const capture = await inspectFinalizationQuarantine({ taskId, resourceId: plan.id, target, sourceParent: target.sourceParent, quarantineParent: target.quarantineParent, ownedQuarantineParent: true });
+  await assertFinalizationTree(target, capture.physicalPath);
+  return capture;
 }
-async function assertRegistration(plan: Worktree, captured: boolean, removed: boolean) {
+async function assertRegistration(plan: Worktree, captured: boolean, administrationCaptured: boolean, removed: boolean) {
   const state = plan.git;
   if (finalizationDigest(nodeIdentity(await directory(state.repositoryRoot))) !== finalizationDigest(state.repositoryIdentity)
     || finalizationDigest(nodeIdentity(await directory(state.commonDirectory))) !== finalizationDigest(state.commonIdentity)) throw new Error("Linked worktree repository filesystem identity changed");
@@ -153,7 +159,8 @@ async function assertRegistration(plan: Worktree, captured: boolean, removed: bo
   if (!captured) {
     if (finalizationDigest(await inspectGit(plan.target.path)) !== finalizationDigest(state)) throw new Error("Prepared linked worktree Git state changed");
   } else {
-    if (removed && entries.length) throw new Error("Captured linked worktree registration is still present");
+    if ((removed || administrationCaptured) && entries.length) throw new Error("Captured linked worktree registration is still present");
+    if (!administrationCaptured && entries.length !== 1) throw new Error("Linked registration disappeared without its exact administration capture");
     const admin = await missing(state.administrativeDirectory);
     if (entries.length) { if (!admin || finalizationDigest(nodeIdentity(admin)) !== finalizationDigest(state.administrativeIdentity)) throw new Error("Linked worktree administrative state disappeared or changed before registration removal");
       if (finalizationDigest(await administrativeInventory(state.administrativeDirectory)) !== finalizationDigest(state.administrativeInventory)) throw new Error("Linked worktree administrative contents changed before registration removal"); }
@@ -169,8 +176,10 @@ export async function assertLinkedWorktreeCaptures(input: { taskId: string; reso
     const removed = input.removed || resource.state === "released";
     if (removed && !capture.captured) throw new Error("Linked worktree has no retained capture");
     await assertFinalizationTree(plan.target, capture.physicalPath);
-    await retainedAdministration(plan, capture.captured);
-    await assertRegistration(plan, capture.captured, removed);
+    const administration = await inspectAdministration(input.taskId, plan);
+    if (administration.captured && !capture.captured) throw new Error("Linked administration cannot retire before its source capture");
+    if (removed && !administration.captured) throw new Error("Linked worktree has no verified administration capture");
+    await assertRegistration(plan, capture.captured, administration.captured, removed);
     const opaque = plan.target.inventory.filter(entry => entry.kind === "opaque");
     if (opaque.length !== plan.installedDependencies.length || opaque.some(entry => entry.dependencyResourceId !== plan.id || !plan.installedDependencies.some(dependency => dependency.path === path.join(plan.target.path, entry.path) && dependency.dev === entry.dev && dependency.ino === entry.ino && dependency.mode === entry.mode))) throw new Error("Opaque dependency scope changed");
     for (const dependency of plan.installedDependencies) for (const file of dependency.packageFiles) {
@@ -180,6 +189,10 @@ export async function assertLinkedWorktreeCaptures(input: { taskId: string; reso
     if (capture.captured) assertCapturedDependencies(plan, input.resources, input.adapterObservation);
     await idle(plan.target.path);
     if (capture.captured) await idle(capture.physicalPath);
+    await idle(plan.administrationCapture.path);
+    if (administration.captured) await idle(administration.physicalPath);
+    const freshAdministration = await inspectAdministration(input.taskId, plan);
+    if (freshAdministration.captured !== administration.captured || freshAdministration.physicalPath !== administration.physicalPath) throw new Error("Linked administration capture changed during observation");
     const fresh = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: plan.id, target: plan.target });
     if (fresh.captured !== capture.captured || fresh.physicalPath !== capture.physicalPath) throw new Error("Linked worktree capture changed during observation");
     if (input.removed && resource.state !== "released") throw new Error("Linked worktree retirement has not been recorded");

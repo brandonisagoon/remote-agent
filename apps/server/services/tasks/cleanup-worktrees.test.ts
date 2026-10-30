@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { assertFinalizationResources, finalizationDigest, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
+import { assertFinalizationResources, inspectFinalizationQuarantine, finalizationDigest, prepareFinalizationResources, type FinalizationResourcePlan, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 import { assertRegisteredCaptureSharing } from "./cleanup-filesystem.ts";
 
 const roots: string[] = [];
@@ -33,17 +33,8 @@ function selected(plan: FinalizationResourcePlan[]) {
   const entry = plan.find(entry => entry.disposition === "retire-worktree");
   if (!entry || entry.disposition !== "retire-worktree") throw new Error("Missing linked plan"); return entry;
 }
-async function saveAdministration(entry: ReturnType<typeof selected>) {
-  for (const item of entry.git.administrativeInventory) {
-    const target = path.join(entry.retainedAdministration.path, item.path);
-    if (item.kind === "directory") await mkdir(target, { mode: 0o700 });
-    else if (item.kind === "file") await writeFile(target, await readFile(path.join(entry.git.administrativeDirectory, item.path)), { mode: 0o600, flag: "wx" });
-    else throw new Error("Unexpected fixture administration");
-  }
-}
-async function capture(plan: FinalizationResourcePlan[], saveAdmin = true) {
-  const entry = selected(plan), target = entry.target, source = target.inventory[0]!;
-  if (saveAdmin) await saveAdministration(entry);
+async function capture(plan: FinalizationResourcePlan[], administration = false) {
+  const entry = selected(plan), target = administration ? entry.administrationCapture : entry.target, source = target.inventory[0]!;
   await mkdir(target.quarantine.directory, { mode: 0o700 }); const stat = await lstat(target.quarantine.directory);
   await writeFile(target.quarantine.journal, JSON.stringify({ version: 1, taskId: "task", resourceId: entry.id, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path,
     source: { dev: source.dev, ino: source.ino, mode: source.mode }, quarantine: { dev: stat.dev, ino: stat.ino } }), { mode: 0o600, flag: "wx" });
@@ -58,11 +49,12 @@ test.each([false, true])("linked worktree keeps exact registration and retained 
   expect(entry.target.inventory.some(file => file.path === "node_modules/installed.js")).toBeFalse();
   expect(entry.target.inventory.find(file => file.path === "private-cache/never-disposable")?.kind).toBe("file");
   await f.verify(plan); await capture(plan); await f.verify(plan);
-  await expect(f.verify(plan, true)).rejects.toThrow("registration is still present");
-  git(f.repository, ["worktree", "remove", f.worktree]); f.resources[0]!.state = "released";
+  await expect(f.verify(plan, true)).rejects.toThrow("no verified administration capture");
+  await capture(plan, true); f.resources[0]!.state = "released";
+  expect(git(f.repository, ["worktree", "list", "--porcelain"])).not.toContain(f.worktree);
   await f.verify(plan, true); await f.verify(plan, true);
-  expect(await readFile(path.join(entry.retainedAdministration.path, "index"))).toEqual(index);
-  for (const item of entry.git.administrativeInventory.filter(item => item.kind === "file")) expect((await readFile(path.join(entry.retainedAdministration.path, item.path))).length).toBe(item.kind === "file" ? item.size : 0);
+  expect(await readFile(path.join(entry.administrationCapture.quarantine.path, "index"))).toEqual(index);
+  for (const item of entry.git.administrativeInventory.filter(item => item.kind === "file")) expect((await readFile(path.join(entry.administrationCapture.quarantine.path, item.path))).length).toBe(item.kind === "file" ? item.size : 0);
   expect(await readFile(path.join(entry.target.quarantine.path, "node_modules/installed.js"), "utf8")).toBe("installed bytes remain retained\n");
   expect(await readFile(path.join(entry.target.quarantine.path, "private-cache/never-disposable"), "utf8")).toBe("private ignored material\n");
   if (!detached) expect(git(f.repository, ["rev-parse", "codex/review"])).toBe(entry.git.head);
@@ -97,12 +89,13 @@ test.each(["dependency", "index", "ignored-file", "package"])("prepared linked w
   await expect(f.verify(plan)).rejects.toThrow();
 });
 
-test("complete retained administration is required before any captured worktree can be acknowledged", async () => {
-  const f = await fixture(), plan = await f.prepare(); await capture(plan, false);
-  await expect(f.verify(plan)).rejects.toThrow("no retained administration");
-  const entry = selected(plan); await saveAdministration(entry); await writeFile(path.join(entry.retainedAdministration.path, "index"), "wrong index", { mode: 0o600 });
-  await expect(f.verify(plan)).rejects.toThrow("administration bytes changed");
+test("complete native administration capture is required before retirement acknowledgment", async () => {
+  const f = await fixture(), plan = await f.prepare(); await capture(plan);
+  await f.verify(plan); await expect(f.verify(plan, true)).rejects.toThrow("no verified administration capture");
   expect(git(f.repository, ["worktree", "list", "--porcelain"])).toContain(f.worktree);
+  await capture(plan, true); const entry = selected(plan);
+  await writeFile(path.join(entry.administrationCapture.quarantine.path, "index"), "wrong index", { mode: 0o600 });
+  await expect(f.verify(plan)).rejects.toThrow();
 });
 
 test("active writers prevent linked capture preparation and confirmation", async () => {
@@ -114,23 +107,22 @@ test("active writers prevent linked capture preparation and confirmation", async
 });
 
 
-test.each(["reflog", "missing", "new", "symlink"])("retained Git administration refuses %s replacement without losing original metadata", async change => {
-  const f = await fixture(), plan = await f.prepare(), entry = selected(plan);
-  await saveAdministration(entry); const file = path.join(entry.retainedAdministration.path, "logs/HEAD");
-  const original = await readFile(path.join(entry.git.administrativeDirectory, "logs/HEAD"));
+test.each(["reflog", "missing", "new", "symlink"])("captured Git administration refuses %s substitution", async change => {
+  const f = await fixture(), plan = await f.prepare(), entry = selected(plan); await capture(plan); await capture(plan, true);
+  const file = path.join(entry.administrationCapture.quarantine.path, "logs/HEAD");
+  const index = await readFile(path.join(entry.administrationCapture.quarantine.path, "index"));
   if (change === "reflog") await writeFile(file, "different history");
   if (change === "missing") await rm(file);
-  if (change === "new") await writeFile(path.join(entry.retainedAdministration.path, "unrecorded"), "extra", { mode: 0o600 });
+  if (change === "new") await writeFile(path.join(entry.administrationCapture.quarantine.path, "unrecorded"), "extra", { mode: 0o600 });
   if (change === "symlink") { await rename(file, path.join(f.directory, "saved-reflog")); await symlink(path.join(f.directory, "saved-reflog"), file); }
   await expect(f.verify(plan)).rejects.toThrow();
-  expect(await readFile(path.join(entry.git.administrativeDirectory, "logs/HEAD"))).toEqual(original);
-  expect(git(f.repository, ["worktree", "list", "--porcelain"])).toContain(f.worktree);
+  expect(await readFile(path.join(entry.administrationCapture.quarantine.path, "index"))).toEqual(index);
 });
 
 test("changes to original Git administration after capture prevent unregister acknowledgment", async () => {
   const f = await fixture(), plan = await f.prepare(), entry = selected(plan); await capture(plan);
   await writeFile(path.join(entry.git.administrativeDirectory, "logs/HEAD"), "new history");
-  await expect(f.verify(plan)).rejects.toThrow("administrative contents changed");
+  await expect(f.verify(plan)).rejects.toThrow();
   expect(await readFile(path.join(entry.git.administrativeDirectory, "logs/HEAD"), "utf8")).toBe("new history");
 });
 
@@ -139,7 +131,82 @@ test("linked retention protects the whole saved administration from other task c
   const f = await fixture(), plan = await f.prepare(), entry = selected(plan); let query: unknown;
   const database = { remoteTaskResource: { findFirst: async (input: unknown) => { query = input; return null; } } };
   await assertRegisteredCaptureSharing(database as never, "task", plan);
-  expect(JSON.stringify(query)).toContain(entry.retainedAdministration.path);
+  expect(JSON.stringify(query)).toContain(entry.administrationCapture.quarantine.directory);
+  expect(JSON.stringify(query)).toContain(entry.administrationCapture.path);
   const foreign = { remoteTaskResource: { findFirst: async () => ({ id: "another-task-admin-claim" }) } };
   await expect(assertRegisteredCaptureSharing(foreign as never, "task", plan)).rejects.toThrow("another task");
 });
+
+
+test.each(["checkout", "administration"])("a recreated %s is preserved and blocks acknowledgment", async change => {
+  const f = await fixture(), plan = await f.prepare(), entry = selected(plan); await capture(plan); await capture(plan, true);
+  const root = change === "checkout" ? f.worktree : entry.git.administrativeDirectory;
+  await mkdir(root); await writeFile(path.join(root, "owner-save"), "new uncaptured material");
+  await expect(f.verify(plan)).rejects.toThrow("recreated");
+  expect(await readFile(path.join(root, "owner-save"), "utf8")).toBe("new uncaptured material");
+  expect(await readFile(path.join(entry.administrationCapture.quarantine.path, "index"))).not.toBeEmpty();
+});
+
+test("administration capture before source capture cannot become a valid retirement", async () => {
+  const f = await fixture(), plan = await f.prepare(); await capture(plan, true);
+  await expect(f.verify(plan)).rejects.toThrow("before its source capture");
+  expect(await readFile(path.join(f.worktree, "source.ts"), "utf8")).toBe("export const value = 1;\n");
+});
+
+test("changed destination parent identity blocks administration acknowledgment", async () => {
+  const f = await fixture(), plan = await f.prepare(), entry = selected(plan); await capture(plan);
+  const changed = structuredClone(plan), target = selected(changed).administrationCapture; target.quarantineParent.ino++;
+  await expect(f.verify(changed)).rejects.toThrow("parent identity changed");
+  expect(await readFile(entry.git.index.path)).not.toBeEmpty();
+});
+
+
+test("only linked administration permits a bound owned 0755 parent; legacy external capture stays private", async () => {
+  const f = await fixture(); await chmod(f.directory, 0o755); const plan = await f.prepare(), entry = selected(plan);
+  await f.verify(plan);
+  await expect(inspectFinalizationQuarantine({ taskId: "task", resourceId: entry.id, target: entry.administrationCapture, sourceParent: entry.administrationCapture.sourceParent, quarantineParent: entry.administrationCapture.quarantineParent })).rejects.toThrow("parent identity changed");
+  await capture(plan); await capture(plan, true); f.resources[0]!.state = "released"; await f.verify(plan, true);
+  expect((await lstat(entry.administrationCapture.quarantine.directory)).mode & 0o777).toBe(0o700);
+});
+
+test("cross-filesystem administration proof refuses before either source changes", async () => {
+  const f = await fixture(), plan = await f.prepare(), entry = selected(plan); entry.administrationCapture.quarantineParent.dev++;
+  await expect(f.verify(plan)).rejects.toThrow("capture scope changed");
+  expect(await readFile(path.join(f.worktree, "source.ts"), "utf8")).toBe("export const value = 1;\n");
+  expect(await readFile(entry.git.index.path)).not.toBeEmpty();
+});
+
+const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+test.skipIf(!draftedRoot).each(["capture", "administration"] as const)("actual prepared client retains linked source and administration across lost %s acknowledgment", async stage => {
+  const f = await fixture(stage === "administration"), plan = await f.prepare(), entry = selected(plan);
+  const frozen = JSON.stringify(plan), branchRefs = git(f.repository, ["show-ref"]);
+  const administration = new Map(await Promise.all(entry.git.administrativeInventory.filter(item => item.kind === "file").map(async item => [item.path, await readFile(path.join(entry.git.administrativeDirectory, item.path))] as const)));
+  const { releasePreparedResources } = await import(path.join(draftedRoot!, "src/finalization-resources.ts"));
+  const { assertResourcePlan, FinalizationResourcePlan: ClientPlan } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(f.directory, "original-worktree"), toolingRevision: "a".repeat(40), phase: "waiting", finalizationVersion: 2, resources: f.resources };
+  const prepared = adapterReceipt(task, plan.map(item => ClientPlan.parse(item))), writes: string[] = [];
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    writes.push(update.key); Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  let once = true;
+  const run = () => releasePreparedResources({ registry, prepared, observation: quiet, assertAuthority: () => f.verify(plan),
+    assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, linkedWorktreeHooks: { [stage]: { afterCapture: () => { if (once) { once = false; throw new Error("lost linked capture acknowledgment"); } } } } });
+  const partial = await run();
+  expect(partial.results).toEqual([{ key: "review-checkout", outcome: "failed", detail: "lost linked capture acknowledgment" }]);
+  expect(writes).toEqual([]); await f.verify(plan);
+  const captured = await lstat(entry.target.quarantine.path), journal = await readFile(entry.target.quarantine.journal);
+  const adminJournal = stage === "administration" ? await readFile(entry.administrationCapture.quarantine.journal) : null;
+  const retried = await run();
+  expect(retried.results).toEqual([{ key: "review-checkout", outcome: "retired-to-recoverable-quarantine" }]);
+  await f.verify(plan, true); await run(); await f.verify(plan, true);
+  expect(writes).toEqual(["review-checkout"]); expect(JSON.stringify(plan)).toBe(frozen);
+  expect((await lstat(entry.target.quarantine.path)).ino).toBe(captured.ino);
+  expect(await readFile(entry.target.quarantine.journal)).toEqual(journal);
+  if (adminJournal) expect(await readFile(entry.administrationCapture.quarantine.journal)).toEqual(adminJournal);
+  for (const [relative, bytes] of administration) expect(await readFile(path.join(entry.administrationCapture.quarantine.path, relative))).toEqual(bytes);
+  expect(await readFile(path.join(entry.target.quarantine.path, "node_modules/installed.js"), "utf8")).toBe("installed bytes remain retained\n");
+  expect(await readFile(path.join(entry.target.quarantine.path, "private-cache/never-disposable"), "utf8")).toBe("private ignored material\n");
+  expect(git(f.repository, ["worktree", "list", "--porcelain"])).not.toContain(f.worktree);
+  expect(git(f.repository, ["show-ref"])).toBe(branchRefs);
+}, 30000);
