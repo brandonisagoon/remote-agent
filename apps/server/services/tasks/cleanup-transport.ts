@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import { assertRequestActive } from "../../request-lifetime.ts";
 
 export class CleanupTransportBlockedError extends Error {}
 const Action = "cleanup-provider-transport";
@@ -60,6 +61,7 @@ async function checkDirectory(value: z.infer<typeof Binding>) {
 /** Owner adoption and existing cleanup scheduling use this transition, not a
  * second executor. Transport release grants no delivery or cleanup authority. */
 export async function releaseTaskCleanupTransports(input: Context) {
+  assertRequestActive();
   if (!input.runtime.releaseIdleTransports) throw new Error("Runtime does not support safe idle transport release");
   const before = await idleFamily(input), prior = await latest(input.prisma, before.primary.id);
   const priorValue = prior && Binding.parse(JSON.parse(prior.value!));
@@ -68,14 +70,18 @@ export async function releaseTaskCleanupTransports(input: Context) {
   let result: { revision: number; executionCwd: string } | undefined;
   await input.runtime.releaseIdleTransports({ sessionIds: before.sessions.map(session => session.id),
     check: async () => {
+      assertRequestActive();
       const after = await idleFamily(input);
       if (after.identityDigest !== before.identityDigest || after.familyDigest !== before.familyDigest || (await latest(input.prisma, before.primary.id))?.sequence !== prior?.sequence) throw new Error("Cleanup transport ownership changed during release");
+      assertRequestActive();
     },
     commit: async () => {
+      assertRequestActive();
       if (priorValue?.mode === "cleanup") { result = { revision: prior!.sequence, executionCwd: priorValue.executionCwd }; return; }
       const base = await realpath(input.config.acpxStateDir);
       const executionCwd = path.join(base, "cleanup-transports", createHash("sha256").update(before.task.id).digest("hex"));
       if (within(before.task.worktreePath!, executionCwd) || within(executionCwd, before.task.worktreePath!)) throw new Error("Cleanup execution directory overlaps original checkout");
+      assertRequestActive();
       await mkdir(path.dirname(executionCwd), { recursive: true, mode: 0o700 });
       await mkdir(executionCwd, { mode: 0o700 }).catch(error => { if (error.code !== "EEXIST") throw error; });
       const stat = await lstat(executionCwd), source = await lstat(before.task.worktreePath!);
@@ -86,7 +92,10 @@ export async function releaseTaskCleanupTransports(input: Context) {
       const saved = await input.prisma.$transaction(async tx => {
         const now = await idleFamily({ ...input, prisma: tx as PrismaClient });
         if (now.identityDigest !== before.identityDigest || now.familyDigest !== before.familyDigest || (await latest(tx as PrismaClient, before.primary.id))?.sequence !== prior?.sequence) throw new Error("Cleanup transport changed before binding");
-        return tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: before.primary.id, source: "runtime", action: Action, key: `${before.task.id}:${prior?.sequence ?? 0}`, value: JSON.stringify(value) } });
+        assertRequestActive();
+        const saved = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: before.primary.id, source: "runtime", action: Action, key: `${before.task.id}:${prior?.sequence ?? 0}`, value: JSON.stringify(value) } });
+        assertRequestActive();
+        return saved;
       });
       result = { revision: saved.sequence, executionCwd };
     },
@@ -117,6 +126,7 @@ export async function cleanupExecutionDirectory(input: { prisma: PrismaClient; c
 /** An explicit owner return restores ordinary execution only while the exact
  * original checkout still exists. No queued work is deleted or acknowledged. */
 export async function returnTaskTransportToWork(input: Context & { revision: number }) {
+  assertRequestActive();
   if (!input.runtime.releaseIdleTransports) throw new Error("Runtime cannot release idle transports");
   const before = await taskIdentity(input), prior = await latest(input.prisma, before.primary.id);
   if (!prior) throw new Error("Return-to-work requires the current transport revision");
@@ -126,15 +136,20 @@ export async function returnTaskTransportToWork(input: Context & { revision: num
   const original = await lstat(value.cwd);
   if (!original.isDirectory() || original.isSymbolicLink() || original.dev !== value.sourceDev || original.ino !== value.sourceIno || await realpath(value.cwd) !== value.cwd) throw new Error("Original checkout is no longer available for work");
   await input.runtime.releaseIdleTransports({ sessionIds: [before.primary.id], check: async () => {
+    assertRequestActive();
     const now = await taskIdentity(input);
     if (now.identityDigest !== before.identityDigest || (await latest(input.prisma, before.primary.id))?.sequence !== prior.sequence) throw new Error("Return-to-work authority changed");
+    assertRequestActive();
   }, commit: async () => {
+    assertRequestActive();
     if (value.mode === "work") return;
     await input.prisma.$transaction(async tx => {
       const now = await taskIdentity({ ...input, prisma: tx as PrismaClient });
       if (now.identityDigest !== before.identityDigest || (await latest(tx as PrismaClient, before.primary.id))?.sequence !== prior.sequence) throw new Error("Return-to-work changed before binding");
+      assertRequestActive();
       await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: before.primary.id, source: "runtime", action: Action,
         key: `${before.task.id}:${prior.sequence}`, value: JSON.stringify({ ...value, mode: "work", previousRevision: prior.sequence }) } });
+      assertRequestActive();
     });
   } });
   return { taskId: before.task.id, sessionId: before.primary.id, returned: true as const };
@@ -143,6 +158,7 @@ export async function returnTaskTransportToWork(input: Context & { revision: num
 /** Optional runtime capability: adapters without a warm process implementation
  * retain the old flow, whose independent root-idle checks still apply. */
 export async function ensureTaskCleanupTransports(input: Context) {
+  assertRequestActive();
   if (!input.runtime.releaseIdleTransports) return;
   const current = await taskIdentity(input), prior = await latest(input.prisma, current.primary.id);
   if (prior) {

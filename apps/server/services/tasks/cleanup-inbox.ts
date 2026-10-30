@@ -69,9 +69,9 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
   };
   if (prior) return result(input.prisma, JSON.parse(prior.value!).instructionId);
   if (!(await cleanupCandidates(input.prisma, input.config, [task])).has(task.id)) throw new Error("Task has no current accepted cleanup scheduling candidate");
-  if (input.runtime) await ensureTaskCleanupTransports({ ...input, runtime: input.runtime });
   const resolved = await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: task.primarySessionId!, capability: "cleanup" });
   if (!resolved.receipt.adapter || resolved.receipt.capability !== "cleanup" || resolved.receipt.taskToolingRevision !== task.toolingRevision) throw new Error("Configured cleanup capability has no exact adapter");
+  if (input.runtime) await ensureTaskCleanupTransports({ ...input, runtime: input.runtime });
   const external = await latestExternalBinding(input.prisma, task.id, task.primarySessionId!);
   const contract = external ? null : await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: task.primarySessionId!, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
   const acceptance = external ? { externalBinding: { revision: external.sequence, digest: hash(external.value ?? ""), ownerHistoryRevision: await externalOwnerHistory(input.prisma, task.id, task.primarySessionId!) } }

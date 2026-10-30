@@ -9,7 +9,8 @@ for cleanup.
 Owner-authenticated external-delivery adoption and the existing automatic
 cleanup request now release the exact idle original provider family before
 physical inspection. This is part of those existing operations, not another
-approval. Runtime reservations refuse active/queued local turns; database checks
+approval. Scheduling resolves its exact immutable cleanup capability before
+releasing any transport. Runtime reservations refuse active/queued local turns; database checks
 refuse active, provisioning, uncertain, foreign or unrelated sessions and pending
 open-family instructions. Delegate membership follows recorded `spawned-by`
 relations. Closed delegate history is preserved. A provider record without a
@@ -41,7 +42,11 @@ handled. An owner/supervisor can explicitly return to work through
 cleanup transport and requires the original directory's exact device/inode;
 removed or replaced source paths cannot be reopened. Read-only
 `GET .../cleanup-transport` returns the current revision and any identity/pause
-blocker. These routes require the owner API credential even over local IPC.
+blocker. These routes require the owner API credential even over local IPC. Reads have
+the existing 60-second application deadline and transitions the 240-second
+adoption deadline. Cancellation is checked before each transport close and
+inside the binding transaction before its write and return. A late binding
+rolls back; a retry after an acknowledged provider exit does not respawn it.
 `{"mode":"cleanup"}` provides the same idempotent transition for inspection
 and recovery; ordinary adoption/scheduling calls it automatically.
 

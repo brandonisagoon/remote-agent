@@ -1,4 +1,5 @@
 import { cleanupExecutionDirectory, CleanupTransportBlockedError } from "../../services/tasks/cleanup-transport.ts";
+import { assertRequestActive } from "../../request-lifetime.ts";
 import { randomUUID } from "node:crypto";
 import { assertTaskOpen } from "../../services/tasks/task-state.ts";
 import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
@@ -804,6 +805,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       }
       for (const entry of owned) {
         await input.check();
+        assertRequestActive();
         if (entry.runtime && entry.handle) await entry.runtime.close({ handle: entry.handle, reason: "Release idle transport for original-task cleanup", discardPersistentState: false });
         // close is a transport acknowledgment, not proof that a stale/foreign
         // provider exited. Observe the exact recorded process before proceeding.
@@ -815,6 +817,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         this.handles.delete(entry.id); this.runtimes.delete(entry.id); this.executionDirectories.delete(entry.id);
       }
       await input.check();
+      assertRequestActive();
       await input.commit();
     } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
   }

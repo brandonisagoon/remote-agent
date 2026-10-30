@@ -90,16 +90,16 @@ taskCompletionRoutes.post("/:taskId/completion/verification", async (c) => {
 });
 
 // Reuses owner authentication above; ordinary IPC cannot relocate providers.
-taskCompletionRoutes.post("/:taskId/completion/cleanup-transport", async c => {
+taskCompletionRoutes.post("/:taskId/completion/cleanup-transport", async c => taskRequest(c, ADOPTION_DEADLINE_MS, async () => {
   const parsed = z.discriminatedUnion("mode", [z.object({ mode: z.literal("cleanup") }).strict(), z.object({ mode: z.literal("work"), revision: z.number().int().positive() }).strict()]).safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Exact cleanup or return-to-work transport selection is required" }, 400);
   try {
     const input = { prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), taskId: c.req.param("taskId") };
     return c.json(parsed.data.mode === "cleanup" ? await releaseTaskCleanupTransports(input) : await returnTaskTransportToWork({ ...input, revision: parsed.data.revision }));
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
+  } catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));
 
-taskCompletionRoutes.get("/:taskId/completion/cleanup-transport", async c => {
+taskCompletionRoutes.get("/:taskId/completion/cleanup-transport", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
   try { return c.json(await inspectCleanupTransport({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId") })); }
-  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
-});
+  catch (error) { if (error instanceof RequestLifetimeError) throw error; return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+}));

@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { withRequestLifetime } from "../../request-lifetime.ts";
 import { pathToFileURL } from "node:url";
 import { originalArchiveFixture, originalGit } from "../../../../test-support/original-work.ts";
 import { prepareOriginalWork, assertOriginalWork } from "./original-work.ts";
@@ -234,6 +235,10 @@ test("existing automatic cleanup scheduling releases the warm family without ano
   const dependencies = { capability: async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
     taskToolingRevision: "a".repeat(40), capabilityRevision: "b".repeat(40), checkout: f.root, instructions: `${f.root}/cleanup.md`, adapter: `${f.root}/cli.ts` }, instructions: "Fixture immutable cleanup capability" }) };
   const input = { ...f, requestKey: "automatic-pass" };
+  const warm = (await f.store.load(f.session.id))!;
+  await expect(enqueueTaskCleanup(input, { capability: async () => { throw new Error("Immutable cleanup capability unavailable"); } })).rejects.toThrow("capability unavailable");
+  expect(alive(warm.pid!)).toBe(true);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
   const queued = await enqueueTaskCleanup(input, dependencies);
   expect(await enqueueTaskCleanup(input, dependencies)).toEqual(queued);
   const original = await f.store.load(f.session.id); expect(alive(original!.pid!)).toBe(false);
@@ -244,4 +249,70 @@ test("existing automatic cleanup scheduling releases the warm family without ano
   expect(log.find(row => row.event === "session/load")!.cwd).not.toBe(f.source);
   const inspection = await f.app.request(`/api/tasks/${f.taskId}/completion/cleanup-transport`, { headers: { authorization: `Bearer ${f.config.apiKey}` } });
   expect(await inspection.json()).toMatchObject({ readOnly: true, mode: "cleanup", sessionId: f.session.id, blocked: null });
+}, 30_000);
+
+
+test("cancelled owner request cannot unload the next real provider after its last authority check", async () => {
+  const f = await fixture(1), records = await Promise.all(f.ids.map(id => f.store.load(id)));
+  const controller = new AbortController(), release = f.runtime.releaseIdleTransports!.bind(f.runtime);
+  let checks = 0, finished!: () => void;
+  const settled = new Promise<void>(resolve => { finished = resolve; });
+  f.runtime.releaseIdleTransports = async input => {
+    try { return await release({ ...input, check: async () => { await input.check(); if (++checks === 2) controller.abort(); } }); }
+    finally { finished(); }
+  };
+  try {
+    const response = await f.app.request(`/api/tasks/${f.taskId}/completion/cleanup-transport`, { method: "POST", signal: controller.signal,
+      headers: { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify({ mode: "cleanup" }) });
+    expect(response.status).toBe(504); expect(await response.json()).toMatchObject({ code: "REQUEST_CANCELLED" });
+    await settled;
+    expect(records.every(record => alive(record!.pid!))).toBe(true);
+    expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  } finally { f.runtime.releaseIdleTransports = release; }
+}, 30_000);
+
+test("cancellation after transport exit preserves identity and retries without reopening the source", async () => {
+  const f = await fixture(), before = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } });
+  const record = (await f.store.load(f.session.id))!, controller = new AbortController(), release = f.runtime.releaseIdleTransports!.bind(f.runtime);
+  let finished!: () => void; const settled = new Promise<void>(resolve => { finished = resolve; });
+  f.runtime.releaseIdleTransports = async input => {
+    try { return await release({ ...input, commit: async () => { controller.abort(); await input.commit(); } }); }
+    finally { finished(); }
+  };
+  try {
+    await expect(withRequestLifetime({ timeoutMs: 10_000, signal: controller.signal }, () => releaseTaskCleanupTransports(f))).rejects.toThrow("disconnected");
+    await settled;
+    expect(alive(record.pid!)).toBe(false);
+    expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } })).toEqual(before);
+    expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  } finally { f.runtime.releaseIdleTransports = release; }
+  const accepted = await releaseTaskCleanupTransports(f);
+  expect(await releaseTaskCleanupTransports(f)).toEqual(accepted);
+  expect((await readFile(path.join(f.root, "primary.jsonl"), "utf8")).match(/"event":"spawn"/g)).toHaveLength(1);
+}, 30_000);
+
+test("a deadline after the transport binding write rolls back before commit", async () => {
+  const f = await fixture();
+  let unblock!: () => void, entered!: () => void, finished!: () => void;
+  const gate = new Promise<void>(resolve => { unblock = resolve; });
+  const reached = new Promise<void>(resolve => { entered = resolve; });
+  const settled = new Promise<void>(resolve => { finished = resolve; });
+  const prisma = new Proxy(f.prisma, { get(target, key) {
+    if (key !== "$transaction") return Reflect.get(target, key);
+    return (run: (tx: unknown) => Promise<unknown>) => target.$transaction(tx => run(new Proxy(tx, { get(transaction, model) {
+      if (model !== "runtimeMetadataEvent") return Reflect.get(transaction, model);
+      return new Proxy(tx.runtimeMetadataEvent, { get(events, method) {
+        if (method !== "create") return Reflect.get(events, method);
+        return async (args: Parameters<typeof events.create>[0]) => { const event = await events.create(args); entered(); await gate; return event; };
+      } });
+    } })));
+  } });
+  const pending = withRequestLifetime({ timeoutMs: 2_000 }, async () => {
+    try { return await releaseTaskCleanupTransports({ ...f, prisma }); } finally { finished(); }
+  });
+  await reached; await expect(pending).rejects.toThrow("deadline exceeded");
+  unblock(); await settled;
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-provider-transport" } })).toBe(0);
+  const accepted = await releaseTaskCleanupTransports(f);
+  expect(await releaseTaskCleanupTransports(f)).toEqual(accepted);
 }, 30_000);
