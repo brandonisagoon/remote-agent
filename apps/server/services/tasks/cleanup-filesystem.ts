@@ -33,7 +33,8 @@ export function captureAdapterDependencies(root: string, resources: Finalization
   const dependencies = new Set<string>(), stoppedConsumers = new Set<string>();
   for (const adapter of plan.filter(entry => entry.disposition === "retire-adapter")) {
     for (const target of adapter.targets) {
-      const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file] : [];
+      const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file]
+        : "credentials" in target.scope ? [target.scope.credentials.backupFile, target.scope.credentials.keyFile] : [];
       if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
     }
     const record = resources.find(other => other.id === adapter.id)!;

@@ -2,8 +2,43 @@ import { expect, test } from "bun:test";
 import { assertCleanupAdapterResources, prepareCleanupAdapterResources } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverBatchInput, CleanupTarget, cleanupTargetDigest } from "./cleanup-observer-schema.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
+import { captureAdapterDependencies } from "./cleanup-filesystem.ts";
 
 const hash = (digit: string) => digit.repeat(64);
+
+test("Clerk plans preserve exact instance, credential source, user and session creation proofs", async () => {
+  const f = fixture(), resources = [
+    { ...f.resources[0]!, kind: "clerk-test-user", externalId: "user_Owned", metadata: { email: "task+clerk_test@example.com" } as Record<string, string> },
+    { ...f.resources[1]!, kind: "clerk-test-session", externalId: "sess_Owned", metadata: { userId: "user_Owned" } as Record<string, string> },
+  ];
+  const scope = { taskId: f.task.id, purpose: "development", instanceId: "ins_Test", credentials: { backupFile: "/private/configured-tooling/credentials/development.enc.json", backupSha256: hash("a"), keyFile: "/private/keys/development.key", keyId: hash("b") } };
+  const raw = [
+    { kind: "clerk-user", id: "user_Owned", scope, presentAtPrepare: true, creation: { createdAt: 1000, emailDigest: hash("c") } },
+    { kind: "clerk-session", id: "sess_Owned", scope, presentAtPrepare: true, userId: "user_Owned", creation: { createdAt: 2000 } },
+  ];
+  const targets = raw.map(value => { const target = CleanupTarget.parse({ ...value, identityDigest: hash("0") }); return { ...target, identityDigest: cleanupTargetDigest(target) }; });
+  let absent = false;
+  const observer = async ({ request }: { request: unknown }) => {
+    const input = CleanupObserverBatchInput.parse(request);
+    return { version: 1, taskId: f.task.id, observations: input.observations.map(item => {
+      const resource = resources.find(resource => resource.id === item.resourceId)!, index = resources.indexOf(resource), frozen = item.expectedTargets ?? [targets[index]!];
+      return { version: 1, taskId: f.task.id, resourceId: resource.id, resourceIdentityDigest: finalizationResourceIdentity(resource).identityDigest, adapter: "clerk", targets: frozen,
+        dependencies: index === 0 ? [resources[1]!.id] : [], stoppedConsumers: [], absent, presentTargetDigests: absent ? [] : frozen.map(target => target.identityDigest) };
+    }) };
+  };
+  const plan = await prepareCleanupAdapterResources({ context: f.context, resources, identities: resources.map(resource => ({ ...finalizationResourceIdentity(resource), purpose: resource.purpose })) }, observer);
+  for (const resource of resources) resource.state = "released";
+  await expect(assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, observer)).rejects.toThrow("independently verified");
+  absent = true; await assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, observer);
+  for (const root of ["/private/keys", "/private/configured-tooling/credentials"]) expect(() => captureAdapterDependencies(root, resources, plan)).toThrow("confirmation inputs");
+  const changed = async (input: { request: unknown }) => {
+    const result = await observer(input); const changed = structuredClone(result.observations[0]!.targets[0]!);
+    if (changed.kind !== "clerk-user" || !changed.creation) throw new Error("Missing Clerk target");
+    changed.creation.createdAt++; changed.identityDigest = cleanupTargetDigest(changed); result.observations[0]!.targets = [changed]; return result;
+  };
+  await expect(assertCleanupAdapterResources({ taskId: f.task.id, resources, plan, removed: true }, changed)).rejects.toThrow("target identity changed");
+  for (const target of targets) expect(CleanupTarget.safeParse({ ...target, secretKey: "must-not-enter-proof" }).success).toBeFalse();
+});
 function fixture() {
   const task = { id: "original-task", primarySessionId: "original-primary", worktreePath: "/private/original-worktree", toolingRevision: "a".repeat(40) };
   const context = { task, capability: { version: 1 as const, source: "configured-host" as const, checkout: "/private/configured-tooling", revision: "b".repeat(40), adapter: "/private/configured-tooling/src/cli.ts", adapterSha256: hash("c") } };
