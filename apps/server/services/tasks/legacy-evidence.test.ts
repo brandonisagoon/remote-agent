@@ -8,7 +8,7 @@ import { privateBackupFixture } from "../../../../test-support/private-backup.ts
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { createApp } from "../../app.ts";
-import type { RemoteTaskResource } from "../../../../generated/prisma/client.ts";
+import type { RemoteTask, RemoteTaskResource } from "../../../../generated/prisma/client.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
@@ -17,6 +17,7 @@ import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tre
 import { finalizationDigest } from "./finalization-resources.ts";
 import { adoptLegacyEvidence, assertLegacyEvidenceResourceUpdate, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
 import { LegacyEvidenceAdoptionInput, type LegacyEvidenceReceipt, type LegacyEvidenceOperationInput } from "./legacy-evidence-schema.ts";
+import { evidenceWriterObservation } from "./legacy-evidence-writers.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "legacy-evidence-"))); });
@@ -24,14 +25,14 @@ afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: tru
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 function git(cwd: string, ...args: string[]) { const command = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (command.exitCode) throw new Error(command.stderr.toString()); return command.stdout.toString().trim(); }
 
-async function fixture(options: { directoryEvidence?: boolean; files?: number; privateBackup?: boolean } = {}) {
+async function fixture(options: { taskId?: string; directoryEvidence?: boolean; directoryPurpose?: "development" | "review"; files?: number; privateBackup?: boolean; beforePrepare?: (task: RemoteTask) => Promise<void> } = {}) {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, "DRA-99"), archive = path.join(directory, "retained");
   for (const dir of [root, historical, archive]) await mkdir(dir, { mode: 0o700 });
   git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
   await writeFile(path.join(root, "README.md"), "accepted\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture"); git(root, "worktree", "add", "-b", "codex/legacy", worktree);
   const config = testConfig({ repository: { ...testConfig().repository, root } });
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", cwd: worktree, repositoryId: config.repository.id, machineId: config.machine } });
-  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-99", primarySessionId: session.id, branchName: "codex/legacy", worktreePath: worktree, toolingRoot: root, toolingRevision: "a".repeat(40), phase: "complete" } });
+  const task = await db.prisma.remoteTask.create({ data: { id: options.taskId ?? "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-99", primarySessionId: session.id, branchName: "codex/legacy", worktreePath: worktree, toolingRoot: root, toolingRevision: "a".repeat(40), phase: "complete" } });
   const sourceLink = await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-99", relationship: "handles" } });
   const context = { prisma: db.prisma, config, taskId: task.id };
   const contract = await setCompletionContract({ ...context, contract: CompletionContractInput.parse({ requestKey: "owner", expectedRevision: 0, boundary: "merge", basis: "Owner accepted Merge", repository: "owner/product", pullRequest: 12, baseBranch: "main" }) });
@@ -56,14 +57,15 @@ async function fixture(options: { directoryEvidence?: boolean; files?: number; p
       await writeFile(path.join(original, name), body, { mode: 0o600 }); await writeFile(path.join(retained, name), body, { mode: 0o600 });
       files.push({ path: `turns/${name}`, sha256: sha(body), bytes: Buffer.byteLength(body) });
     }
-    treeResource = await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "turns", kind: "evidence", purpose: "development", externalId: original, state: "ready", metadata: { description: "original directory receipt" } } });
+    treeResource = await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "turns", kind: "evidence", purpose: options.directoryPurpose ?? "development", externalId: original, state: "ready", metadata: { description: "original directory receipt" } } });
     await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "environment-parent", kind: "directory", purpose: "development", externalId: path.join(directory, "environment"), state: "allocated" } });
   }
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "old-browser", kind: "browser", purpose: "browser", externalId: "already-gone", state: "released", metadata: { preserved: true } } });
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "clerk", kind: "clerk", purpose: "development", externalId: "unclaimed.example.test", state: "unknown" } });
   const backup = options.privateBackup ? await privateBackupFixture(path.join(directory, "private-backup"), task.id, task.issueIdentifier!) : undefined;
   if (backup) await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "saved-backup", kind: "private-backup", purpose: "development", externalId: backup.root, state: "ready", metadata: backup.metadata } });
-  const finalInput = { prisma: db.prisma, config, sessionId: session.id, requestKey: "finalize:task" };
+  await options.beforePrepare?.(task);
+  const finalInput = { prisma: db.prisma, config, sessionId: session.id, requestKey: `finalize:${task.id}` };
   const prepared = await prepareTaskFinalization(finalInput, dependencies);
   const manifestPath = path.join(archive, "RETENTION.json"), manifestBytes = JSON.stringify({ task: task.id, retainedArchive: archive, files, sourceUnchanged: true });
   await writeFile(manifestPath, manifestBytes, { mode: 0o600 });
@@ -506,6 +508,16 @@ test("directory capture waits for writers and rejects later retained/source subs
   expect(await lstat(entry.target.path)).toBeDefined();
 });
 
+test("an independently stopped writer does not require its failed DNS preview to be released", async () => {
+  const f = await fixture({ directoryEvidence: true }), receipt = await f.adopt(), entry = receipt.proof.entries.find(isEvidenceTree)!;
+  const preview = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-preview-proxy", kind: "local-http", purpose: "development", externalId: "http://127.0.0.1:12345", state: "allocated", metadata: { publicUrl: "https://fixture.example.test", observed: { error: "Cloudflare 403" } } } });
+  let observations = 0;
+  const dependencies = { ...f.manageDependencies, writers: async () => { observations++; return async () => {}; } };
+  await manageLegacyEvidence({ ...f.finalInput, operation: { resourceKey: entry.key, action: "authorize", proofRevision: receipt.proofRevision, proofDigest: receipt.proofDigest, preparedRevision: f.prepared.preparedRevision, finalizationRequestKey: receipt.proof.finalizationRequestKey } }, dependencies);
+  expect(observations).toBe(1);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: preview.id } })).toEqual(preview);
+});
+
 test("directory evidence cannot be omitted or overlap another task", async () => {
   const f = await fixture({ directoryEvidence: true });
   const missing = { ...f.adoption, entries: f.adoption.entries.slice(0, -1) };
@@ -579,4 +591,59 @@ test.skipIf(!draftedRoot)("waiting cleanup preserves its private backup and orig
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: "clerk" } } })).state).toBe("unknown");
     expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("waiting");
   } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+}, 30_000);
+
+test.skipIf(!draftedRoot || process.platform !== "darwin")("actual stopped native writer allows retained directory capture despite Allocated DNS failure and lost confirmation", async () => {
+  const { evidenceWriterFixture } = await import(path.join(draftedRoot!, "test/fixtures/evidence-writer.ts"));
+  const { observeEvidenceWriters } = await import(path.join(draftedRoot!, "src/cleanup-observer-writers.ts"));
+  const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+  const { manageLegacyEvidence: clientManage } = await import(path.join(draftedRoot!, "src/legacy-evidence.ts"));
+  let writer: Awaited<ReturnType<typeof evidenceWriterFixture>> | undefined;
+  const original = { ...evidenceWriterObservation }, oldPrepare = legacyEvidenceDependencies.prepare;
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    const f = await fixture({ taskId: `dra211-${crypto.randomUUID()}`, directoryEvidence: true, directoryPurpose: "review", privateBackup: true, beforePrepare: async task => {
+      writer = await evidenceWriterFixture({ id: task.id, primarySessionId: task.primarySessionId, worktreePath: task.worktreePath, toolingRevision: task.toolingRevision });
+      await writer.reconcile();
+      for (const resource of writer.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...resource, taskId: task.id } });
+    } });
+    const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies), receipt = await f.adopt();
+    const before = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-archive-retention"] } }, orderBy: { sequence: "asc" } });
+    expect(before.length).toBe(3);
+    const tree = receipt.proof.entries.find(isEvidenceTree)!;
+    legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+    evidenceWriterObservation.resolve = async () => ({ version: 1, source: "configured-host", checkout: draftedRoot!, revision: "a".repeat(40), adapter: path.join(draftedRoot!, "src/cli.ts"), adapterSha256: "a".repeat(64) });
+    evidenceWriterObservation.observe = async ({ request }) => observeEvidenceWriters(request);
+    const socket = path.join(directory, "stopped-writers.sock"); let lost = false;
+    server = Bun.serve({ unix: socket, fetch: async request => {
+      const op = new URL(request.url).pathname.endsWith("/legacy-evidence") ? await request.clone().json() : null;
+      const response = await f.app.fetch(request);
+      if (op?.action === "confirm" && response.ok && !lost) { lost = true; return Response.json({ error: "Lost capture response" }, { status: 500 }); }
+      return response;
+    } });
+    const registry = taskRegistry(socket, f.task.id);
+    await expect(clientManage({ registry, key: tree.key, action: "release" })).rejects.toThrow("running writer");
+    expect((await lstat(tree.target.path)).isDirectory()).toBeTrue();
+    await writer!.stop();
+    for (const resource of writer!.task.resources) await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { metadata: resource.metadata } });
+    const preview = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "writer-id" } });
+    const pidFile = writer!.pidFile, pidBytes = await readFile(pidFile);
+    await expect(clientManage({ registry, key: tree.key, action: "release", hooks: { beforeCapture: async () => {
+      await rename(pidFile, `${pidFile}.original`); await writeFile(pidFile, pidBytes, { mode: 0o600 });
+    } } })).rejects.toThrow("identity changed");
+    expect((await lstat(tree.target.path)).isDirectory()).toBeTrue();
+    await rename(pidFile, `${pidFile}.replacement`); await rename(`${pidFile}.original`, pidFile);
+    await expect(clientManage({ registry, key: tree.key, action: "release" })).rejects.toThrow("Lost capture response");
+    const captured = await lstat(tree.target.quarantine.path), journal = await readFile(tree.target.quarantine.journal);
+    expect((await clientManage({ registry, key: tree.key, action: "release" })).state).toBe("released");
+    expect((await lstat(tree.target.quarantine.path)).ino).toBe(captured.ino);
+    expect(await readFile(tree.target.quarantine.journal)).toEqual(journal);
+    expect(await readFile(path.join(tree.target.quarantine.path, "turn-28.ndjson"), "utf8")).toBe("saved turn 28\n");
+    expect(await readFile(path.join(tree.retained.path, "turn-28.ndjson"), "utf8")).toBe("saved turn 28\n");
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "writer-id" } })).toEqual(preview);
+    expect(preview.state).toBe("allocated");
+    expect(JSON.stringify(preview.metadata)).toContain("Cloudflare 403");
+    for (const event of before) expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: event.sequence } })).toEqual(event);
+    expect((await prepareTaskFinalization({ ...f.finalInput, cleanup: true, authorityOnly: true }, f.dependencies)).cleanup).toEqual(active.cleanup);
+  } finally { server?.stop(true); Object.assign(evidenceWriterObservation, original); legacyEvidenceDependencies.prepare = oldPrepare; await writer?.dispose(); }
 }, 30_000);
