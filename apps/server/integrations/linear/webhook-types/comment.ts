@@ -19,10 +19,13 @@ export const LinearCommentWebhookSchema = z.object({
   action: z.enum(["create", "update"]),
   webhookTimestamp: z.number().int(),
   organizationId: z.string().optional(),
+  actor: z.object({ id: z.string() }).nullish(),
   url: z.string().optional(),
   data: z.object({
     id: z.string(),
     body: z.string(),
+    createdAt: z.string().optional(),
+    updatedAt: z.string().optional(),
     issueId: z.string().optional(),
     parentId: z.string().nullish(),
     userId: z.string().nullish(),
