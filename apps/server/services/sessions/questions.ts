@@ -7,13 +7,21 @@ import { assertTaskOpen } from "../tasks/task-state.ts";
 import { findThreadSession, registerThread } from "./threads.ts";
 import { queueInstruction } from "./inbox.ts";
 
+export class NoLinkedSourceIssueError extends Error {
+  readonly code = "no_linked_issue";
+  constructor() {
+    super("This task has no active linked Linear issue. Use inspect_task for its existing task context where supported. Operations that require a linked issue remain unavailable.");
+    this.name = "NoLinkedSourceIssueError";
+  }
+}
+
 export async function linkedSourceIssue(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string }) {
   const session = await input.prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
   if (!session || session.status === "closed") throw new Error("Session is missing or closed");
   const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: {
     runtimeSessionId: session.id, provider: "linear", resourceType: "issue-identifier", relationship: "handles", endedAt: null,
   } });
-  if (!link) throw new Error("Session has no linked Linear issue");
+  if (!link) throw new NoLinkedSourceIssueError();
   const config = scopeConfig(input.config, { repositoryId: session.repositoryId, connectionId: link.connectionId });
   const issue = await getSourceIssueForUpdate(config, { id: link.externalId });
   if (!issue) throw new Error("Linked issue not found");
