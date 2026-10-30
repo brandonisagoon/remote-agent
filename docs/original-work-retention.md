@@ -83,3 +83,65 @@ A persistent primary/provider process using the worktree can block that check;
 phase `complete` is not a substitute for observing inactivity. No live DRA98
 archive validation, provider mutation, process stop, adoption or cleanup was run
 while implementing this change.
+
+## Existing base/work recovery archives
+
+`OriginalWorkInput` also accepts `format: "base-work-tar/v1"` for an exact
+`recovery-archive` resource with its existing `tooling` purpose. The selection
+pins `manifestPath`/`manifestSha256`, relative `receiptPath`/`receiptSha256`, and
+relative `checksumsPath`/`checksumsSha256`, plus explicit `ownedPaths`. It does not
+invent a bundle, rewrite the receipt or rebuild the backup. The original bundle
+input and DRA190 saved-archive formats keep their existing rules.
+
+The historical receipt must bind the current task, source path, archive path,
+base commit, branch and original tooling revision. Its checksum list and the
+selected checksum document must agree on `base.tar.gz`, `work.tar.gz`,
+`index.patch`, `tracked.patch`, `status.porcelain`, `base-tree.txt`,
+`changed-files.txt` and the selected manifest. Any recorded resource digest must
+also agree. The file-array manifest records each product path, file/link kind,
+size, SHA-256, executable mode and tracked/changed classification.
+
+Verification streams the compressed archives through held no-follow descriptors
+with declared byte and entry bounds. The base is compared with the original Git
+tree and restored into a private temporary repository. Exact staged and unstaged
+patches are applied there; the mixed work tar verifies all changed files and
+supplies untracked files. The entire restored manifest and Git snapshot must
+match the original, including staged/untracked classification. The source is
+re-read before returning. Original Git objects and index are not written.
+
+Only relative tracked symlinks staying inside the restore are supported; no tar
+member may traverse a file or link. Hard links, devices, duplicate/unlisted
+members, traversal and changed hashes are rejected. Paired AppleDouble records
+and the known libarchive provenance PAX attributes are bounded metadata covered
+by the compressed checksum; they are never extracted or applied. Gzip checksums
+and complete tar end markers are consumed before accepting the result.
+
+The original archive root must remain private 0700 and user-owned. Existing 0644
+files behind that root are preserved as recorded. The complete retained inventory
+also freezes interrupted archives and prior restore directories as newly observed
+ancillary material; those bytes never become authoritative restore inputs.
+`retainedArchiveMembers: [{resourceId}]` may select an exact `resource-inventory`
+tooling receipt whose task-bound regular file lies in that inventory. Its distinct
+`retain-archive-member` plan binds the parent archive, path, size, hash and current
+resource identity. Both records remain Ready, and all task records remain counted.
+Other tooling resources receive no exemption.
+
+Read-only DRA42 verification on 2026-10-30 at 05:28:06 UTC independently restored
+all 10,267 members and 14 dirty files from the unchanged 1,084,954,888-byte base
+archive in 67.2 seconds under concurrent test load. Manifest `f19388f3f2a001d38c387544e578bbdb0b22cba52ecda3e7613a4fd2ae31a077`
+remained unchanged. Evidence: `/private/tmp/dra192-dra42-readonly-restore.json`.
+No live adoption, preparation, resource write, process action or cleanup ran.
+
+Validation: the full server suite passed 796 tests with 3,694 assertions across
+107 files, including actual Drafted integration; one existing opt-in large
+archive test was skipped. Typecheck and desktop build passed. The client full
+suite passed 392 tests with five existing opt-in skips. The final link-chain
+guard was checked again with 33 affected native capture/restore/resource tests
+and 128 assertions, plus lint and build on the final tree. Logs: `/private/tmp/dra192-server-final.log`,
+`/private/tmp/dra192-affected-final.log`, `/private/tmp/dra192-build-final.log`.
+
+This format support does not supply missing delivery/owner authority or physical
+cleanup adapters. DRA42's current Done state still needs the separately supported
+retirement/adoption path and exact plans for its remaining physical resources.
+Deploy the server publisher before selecting the matching immutable Drafted
+client; an old strict client refuses the added format/disposition.

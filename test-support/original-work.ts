@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { OriginalWorkInput } from "../apps/server/services/tasks/original-work-schema.ts";
+import { BundleOriginalWorkInput } from "../apps/server/services/tasks/original-work-schema.ts";
+import type { z } from "zod";
 
 export const originalDigest = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 export function originalGit(cwd: string, args: string[], env?: Record<string, string>) {
@@ -10,7 +11,7 @@ export function originalGit(cwd: string, args: string[], env?: Record<string, st
   return result.stdout;
 }
 /** Fixture-only archive producer. Never called by production adoption. */
-export async function originalArchiveFixture(worktree: string, archive: string, archiveResourceId: string): Promise<OriginalWorkInput> {
+export async function originalArchiveFixture(worktree: string, archive: string, archiveResourceId: string): Promise<z.infer<typeof BundleOriginalWorkInput>> {
   await mkdir(archive, { mode: 0o700 });
   await writeFile(path.join(worktree, "staged.txt"), "saved staged work\n"); originalGit(worktree, ["add", "staged.txt"]);
   await writeFile(path.join(worktree, "README.md"), "unfinished original change\n");
