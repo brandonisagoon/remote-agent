@@ -5,12 +5,23 @@ import os from "node:os";
 import path from "node:path";
 import { z } from "zod";
 import { observeCompletionSnapshot } from "./completion-observation.ts";
-import { assertFinalizationPath, assertFinalizationTree, finalizationDigest, finalizationInventory, finalizationResourceIdentity, finalizationResourceObservation, inspectFinalizationQuarantine, type FinalizationResourceRecord } from "./finalization-resources.ts";
-import { OriginalWork, OriginalWorkInput, OriginalWorkSnapshot } from "./original-work-schema.ts";
+import { assertFinalizationPath, assertFinalizationTree, finalizationDigest, finalizationInventory, finalizationResourceIdentity, finalizationResourceObservation, inspectFinalizationQuarantine, RetainedArchivePlan, RetainedArchiveMemberPlan, RetainedResultPlan, type RetainedMaterialPlan, type FinalizationResourceRecord } from "./finalization-resources.ts";
+import { OriginalWork, OriginalWorkInput, OriginalWorkSnapshot, type RecoveryWorkInput } from "./original-work-schema.ts";
+import { observeRecoveryArchive, assertRecoveryContents, recoveryTarMembers } from "./recovery-archive.ts";
+import { restoreRecoveryTar, type RecoveryTarMember } from "./recovery-tar.ts";
 
 const MAX_BYTES = 512 * 1024 * 1024;
 const sha = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const inside = (root: string, file: string) => file.startsWith(`${root}${path.sep}`);
+export function originalWorkRetainedPlans(originalWork: OriginalWork, resources: FinalizationResourceRecord[]): RetainedMaterialPlan[] {
+  const proof = OriginalWork.parse(originalWork);
+  const identity = (id: string, digest: string) => { const resource = resources.find(entry => entry.id === id); if (!resource || resource.state === "released" || finalizationResourceIdentity(resource).identityDigest !== digest) throw new Error("Retained original resource identity changed"); return finalizationResourceIdentity(resource); };
+  return [
+    ...[proof.archive, ...proof.additionalArchives ?? []].map(archive => RetainedArchivePlan.parse({ ...identity(archive.resourceId, archive.identityDigest), disposition: "retain-archive", archive: { root: archive.root, manifestPath: archive.manifestPath, manifestSha256: archive.manifestSha256, inventoryDigest: archive.inventoryDigest } })),
+    ...(proof.retainedResults ?? []).map(result => RetainedResultPlan.parse({ ...identity(result.resourceId, result.identityDigest), disposition: "retain-result", reference: { archiveResourceId: proof.archive.resourceId, provenancePath: result.provenancePath, provenanceSha256: result.provenanceSha256 } })),
+    ...(proof.retainedArchiveMembers ?? []).map(member => RetainedArchiveMemberPlan.parse({ ...identity(member.resourceId, member.identityDigest), disposition: "retain-archive-member", archive: { resourceId: member.archiveResourceId, root: proof.archive.root, inventoryDigest: proof.archive.inventoryDigest }, file: { path: member.path, size: member.size, sha256: member.sha256 } })),
+  ];
+}
 async function git(cwd: string, args: string[]) {
   const child = Bun.spawn(["git", "--no-replace-objects", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
     cwd, env: { PATH: process.env.PATH ?? "", HOME: os.tmpdir(), GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stdout: "pipe", stderr: "pipe",
@@ -90,6 +101,7 @@ async function dirtySnapshot(worktree: string) {
 
 export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
   const selection = OriginalWorkInput.parse(input.originalWork);
+  if ("format" in selection) return prepareRecoveryOriginalWork({ ...input, originalWork: selection }, observation);
   const resource = input.resources.find((entry) => entry.id === selection.archiveResourceId);
   if (!resource || resource.kind !== "source-archive" || resource.state === "released") throw new Error("Original work requires its exact retained archive resource");
   const root = resource.externalId, worktree = input.worktree;
@@ -168,14 +180,100 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
   return proof;
 }
 
+type RecoveryOriginalInput = { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: RecoveryWorkInput };
+/** Read-only source/archive verification. Temporary restore writes never grant
+ * cleanup authority, register resources, or change the original checkout. */
+export async function verifyRecoveryOriginal(input: RecoveryOriginalInput) {
+  const selection = input.originalWork, resource = input.resources.find(entry => entry.id === selection.archiveResourceId), worktree = input.worktree;
+  if (!resource || resource.kind !== "recovery-archive" || resource.purpose !== "tooling" || resource.state === "released") throw new Error("Recovery work requires its exact retained archive resource");
+  const root = resource.externalId;
+  await assertFinalizationPath(worktree);
+  if (await realpath(worktree) !== worktree || root === worktree || inside(root, worktree) || inside(worktree, root) || selection.ownedPaths.some(file => !inside(worktree, file))) throw new Error("Recovery archive and owned paths overlap or escape the original worktree");
+  const original = await dirtySnapshot(worktree), archive = await observeRecoveryArchive(root, selection), receipt = archive.receipt;
+  if (original.head !== input.approvedHead || original.branch !== input.branch || receipt.task !== input.taskId || receipt.source !== worktree || receipt.base !== original.head || receipt.branch !== original.branch || !input.toolingRevision || receipt.toolingPin !== input.toolingRevision) throw new Error("Recovery archive belongs to another original task, source or tooling revision");
+  const recorded = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
+  for (const [key, observed] of Object.entries({ base: receipt.base, toolingPin: receipt.toolingPin, manifestSha256: selection.manifestSha256, baseArchiveSha256: archive.inputs.get("base.tar.gz")!.sha256, workArchiveSha256: archive.inputs.get("work.tar.gz")!.sha256 })) {
+    if (recorded[key] !== undefined && recorded[key] !== observed) throw new Error("Recovery archive conflicts with its recorded identity or digest");
+  }
+  const indexPatch = await bytes(member(root, "index.patch")), worktreePatch = await bytes(member(root, "tracked.patch"));
+  if (sha(indexPatch) !== original.indexPatchSha256 || sha(worktreePatch) !== original.worktreePatchSha256 || !(await git(worktree, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])).equals(await bytes(member(root, "status.porcelain")))) throw new Error("Recovery staged, unstaged or untracked status changed");
+  if (!(await git(worktree, ["ls-tree", "-r", "-l", "HEAD"])).equals(await bytes(member(root, "base-tree.txt")))) throw new Error("Recovery base tree differs from the original Git tree");
+  const tree = new Map<string, RecoveryTarMember>();
+  for (const line of (await git(worktree, ["ls-tree", "-r", "-l", "-z", "HEAD"])).toString().split("\0").filter(Boolean)) {
+    const match = /^(100644|100755|120000) blob ([a-f0-9]{40}) +([0-9]+)\t(.+)$/s.exec(line);
+    if (!match) throw new Error("Recovery base contains unsupported Git entries");
+    const name = match[4]!, size = Number(match[3]); member(worktree, name);
+    if (!Number.isSafeInteger(size) || tree.has(name)) throw new Error("Recovery base contains duplicate or oversized entries");
+    tree.set(name, { kind: match[1] === "120000" ? "symlink" : "file", executable: match[1] !== "100644", size, gitSha: match[2]! });
+  }
+  const tracked = new Set((await git(worktree, ["ls-files", "--cached", "-z"])).toString().split("\0").filter(Boolean));
+  const currentPaths = new Set([...tracked, ...original.untracked.map(entry => entry.path)]);
+  const deleted = new Set((await git(worktree, ["ls-files", "--deleted", "-z"])).toString().split("\0").filter(Boolean)); for (const file of deleted) currentPaths.delete(file);
+  if (currentPaths.size !== archive.members.size || [...currentPaths].some(name => !archive.members.has(name)) || archive.manifest.some(entry => entry.untracked !== original.untracked.some(file => file.path === entry.path))) throw new Error("Recovery manifest does not cover exact tracked and untracked source paths");
+  const changes = archive.manifest.filter(entry => entry.changed || entry.untracked);
+  const changedNames = (await bytes(member(root, "changed-files.txt"))).toString().trimEnd().split("\n").filter(Boolean);
+  if (new Set(changedNames).size !== changedNames.length || JSON.stringify([...changedNames].sort()) !== JSON.stringify(changes.map(entry => entry.path).sort())) throw new Error("Recovery changed-file list disagrees with its manifest");
+  const common = await realpath(await textGit(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
+  const temporary = await realpath(await mkdtemp(path.join(os.tmpdir(), "drafted-recovery-restore-"))); await chmod(temporary, 0o700);
+  let restore: OriginalWork["restore"];
+  try {
+    await git(temporary, ["init", "--quiet"]);
+    await writeFile(path.join(temporary, ".git/objects/info/alternates"), `${path.join(common, "objects")}\n`, { mode: 0o600 });
+    await git(temporary, ["update-ref", `refs/heads/${original.branch}`, original.head]);
+    await git(temporary, ["symbolic-ref", "HEAD", `refs/heads/${original.branch}`]);
+    await git(temporary, ["read-tree", "HEAD"]);
+    const base = archive.inputs.get("base.tar.gz")!, work = archive.inputs.get("work.tar.gz")!;
+    await restoreRecoveryTar({ path: member(root, base.file), size: base.size, sha256: base.sha256 }, tree, temporary);
+    if (indexPatch.length) await git(temporary, ["apply", "--binary", "--index", member(root, "index.patch")]);
+    const indexTree = await textGit(temporary, ["write-tree"]);
+    if (worktreePatch.length) await git(temporary, ["apply", "--binary", member(root, "tracked.patch")]);
+    await restoreRecoveryTar({ path: member(root, work.file), size: work.size, sha256: work.sha256 }, recoveryTarMembers(changes), temporary, { appleDouble: true, write: name => archive.members.get(name)!.untracked });
+    await assertRecoveryContents(temporary, archive.manifest, true);
+    const restored = await dirtySnapshot(temporary);
+    if (finalizationDigest(restored) !== finalizationDigest(original)) throw new Error("Independent recovery restore differs from original staged, unstaged or untracked content");
+    await git(temporary, ["add", "--all", "--force", "--", "."]);
+    restore = { format: "base-work-tar/v1", gitDirectory: common, head: original.head, indexTree, workingTree: await textGit(temporary, ["write-tree"]), fingerprint: restored.fingerprint, baseArchiveSha256: base.sha256, workArchiveSha256: work.sha256 };
+  } finally { await rm(temporary, { recursive: true, force: true }); }
+  const retainedArchiveMembers: NonNullable<OriginalWork["retainedArchiveMembers"]> = [], selectedIds = new Set<string>();
+  for (const selected of selection.retainedArchiveMembers ?? []) {
+    const record = input.resources.find(entry => entry.id === selected.resourceId);
+    const file = record && archive.inventory.find(entry => entry.kind === "file" && member(root, entry.path) === record.externalId);
+    if (!record || record.kind !== "resource-inventory" || record.purpose !== "tooling" || record.state === "released" || selectedIds.has(record.id) || !file || file.kind !== "file") throw new Error("Retained archive member requires an exact owned resource inventory file");
+    selectedIds.add(record.id);
+    const content = z.object({ task: z.literal(input.taskId) }).passthrough().parse(JSON.parse((await bytes(record.externalId, 8 * 1024 * 1024)).toString()));
+    void content;
+    retainedArchiveMembers.push({ resourceId: record.id, identityDigest: finalizationResourceIdentity(record).identityDigest, archiveResourceId: resource.id, path: record.externalId, size: file.size, sha256: file.sha256 });
+  }
+  if (finalizationDigest(await dirtySnapshot(worktree)) !== finalizationDigest(original)) throw new Error("Original source changed during recovery verification");
+  return { selection, resource, original, archive, restore, retainedArchiveMembers };
+}
+
+async function prepareRecoveryOriginalWork(input: RecoveryOriginalInput, observation: typeof finalizationResourceObservation) {
+  const { selection, resource, original, archive, restore, retainedArchiveMembers } = await verifyRecoveryOriginal(input), worktree = input.worktree, root = resource.externalId;
+  const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])).toString().split("\0").filter(Boolean);
+  for (const name of ignored) if (!selection.ownedPaths.some(owned => member(worktree, name) === owned || inside(owned, member(worktree, name)))) throw new Error("Ignored original material needs explicit owner-adopted paths");
+  if (finalizationDigest(await dirtySnapshot(worktree)) !== finalizationDigest(original)) throw new Error("Original source changed during recovery verification");
+  await observation.rootIdle(worktree);
+  const inventory = await finalizationInventory(worktree, [worktree], new Map(), new Map()), directory = path.join(path.dirname(worktree), `.drafted-finalization-${randomUUID()}`);
+  const proof = OriginalWork.parse({ version: 1, captureId: `original-worktree:${input.taskId}`, archive: { resourceId: resource.id, identityDigest: finalizationResourceIdentity(resource).identityDigest, root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, format: selection.format, recovery: selection, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, ...(retainedArchiveMembers.length ? { retainedArchiveMembers } : {}), snapshot: original, restore, target: { type: "tree", path: worktree, inventory, sourcePaths: [worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
+  await assertOriginalWork({ taskId: input.taskId, originalWork: proof, resources: input.resources, removed: false }, observation);
+  return proof;
+}
+
 export async function assertOriginalWork(input: { taskId: string; originalWork: OriginalWork; resources: FinalizationResourceRecord[]; removed: boolean }, observation = finalizationResourceObservation) {
   const proof = OriginalWork.parse(input.originalWork), resource = input.resources.find((entry) => entry.id === proof.archive.resourceId);
-  if (proof.captureId !== `original-worktree:${input.taskId}` || !resource || resource.kind !== "source-archive" || resource.externalId !== proof.archive.root || resource.state === "released" || finalizationResourceIdentity(resource).identityDigest !== proof.archive.identityDigest) throw new Error("Original archive resource identity changed");
+  const recovery = proof.archive.format === "base-work-tar/v1";
+  if (proof.captureId !== `original-worktree:${input.taskId}` || !resource || (recovery ? resource.kind !== "recovery-archive" || resource.purpose !== "tooling" : resource.kind !== "source-archive") || resource.externalId !== proof.archive.root || resource.state === "released" || finalizationResourceIdentity(resource).identityDigest !== proof.archive.identityDigest) throw new Error("Original archive resource identity changed");
   for (const expected of [proof.archive, ...proof.additionalArchives ?? []]) {
     const record = input.resources.find((entry) => entry.id === expected.resourceId);
-    if (!record || record.kind !== "source-archive" || record.state === "released" || record.externalId !== expected.root || finalizationResourceIdentity(record).identityDigest !== expected.identityDigest) throw new Error("Retained archive resource identity changed");
-    const archive = await archiveObservation(expected.root, expected.manifestPath, expected.manifestSha256, expected.format);
+    if (!record || (expected.format === "base-work-tar/v1" ? record.kind !== "recovery-archive" || record.purpose !== "tooling" : record.kind !== "source-archive") || record.state === "released" || record.externalId !== expected.root || finalizationResourceIdentity(record).identityDigest !== expected.identityDigest) throw new Error("Retained archive resource identity changed");
+    if (expected.format === "base-work-tar/v1" && (!expected.recovery || expected.recovery.archiveResourceId !== expected.resourceId || expected.recovery.manifestPath !== expected.manifestPath || expected.recovery.manifestSha256 !== expected.manifestSha256)) throw new Error("Recovery archive selection changed");
+    const archive = expected.format === "base-work-tar/v1" ? await observeRecoveryArchive(expected.root, expected.recovery!) : await archiveObservation(expected.root, expected.manifestPath, expected.manifestSha256, expected.format);
     if (archive.inventoryDigest !== expected.inventoryDigest || finalizationDigest(expected.inventory) !== archive.inventoryDigest) throw new Error("Retained archive changed since adoption");
+  }
+  for (const member of proof.retainedArchiveMembers ?? []) {
+    const record = input.resources.find(entry => entry.id === member.resourceId), entry = proof.archive.inventory.find(entry => entry.kind === "file" && path.join(proof.archive.root, entry.path) === member.path);
+    if (!record || record.kind !== "resource-inventory" || record.purpose !== "tooling" || record.state === "released" || record.externalId !== member.path || finalizationResourceIdentity(record).identityDigest !== member.identityDigest || member.archiveResourceId !== proof.archive.resourceId || !entry || entry.kind !== "file" || entry.sha256 !== member.sha256 || entry.size !== member.size) throw new Error("Retained archive member identity changed");
   }
   for (const result of proof.retainedResults ?? []) {
     const record = input.resources.find((entry) => entry.id === result.resourceId);
@@ -183,7 +281,7 @@ export async function assertOriginalWork(input: { taskId: string; originalWork: 
   }
   await assertFinalizationPath(proof.restore.gitDirectory);
   if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
-  for (const prerequisite of proof.restore.prerequisiteCommits) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
+  for (const prerequisite of "prerequisiteCommits" in proof.restore ? proof.restore.prerequisiteCommits : []) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
   const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
   await assertFinalizationTree(proof.target, capture.physicalPath);
   if (input.removed && !capture.captured) throw new Error("Original work has not been preserved in quarantine");
