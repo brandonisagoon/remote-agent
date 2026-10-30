@@ -10,8 +10,8 @@ const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const quiet: ResourceObservation = { endpointAbsent: async () => {}, rootIdle: async () => {}, browserAbsent: async () => {} };
-async function fixture() {
-  const temp = await realpath(await mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), "ef-"))); roots.push(temp);
+async function fixture(prefix = "ef-") {
+  const temp = await realpath(await mkdtemp(path.join(process.platform === "darwin" ? "/private/tmp" : tmpdir(), prefix))); roots.push(temp);
   const root = path.join(temp, "legacy-task-source-copies"), sourcePath = path.join(root, "source"), toolingRoot = path.join(temp, "immutable-tooling");
   await mkdir(sourcePath, { recursive: true }); await mkdir(toolingRoot);
   if (Bun.spawnSync(["git", "init", "-q", sourcePath]).exitCode) throw new Error("Test repository initialization failed");
@@ -61,7 +61,7 @@ async function capture(plan: FinalizationResourcePlan[], renameRoot = true) {
 
 describe("external-delivery resource ownership", () => {
   test("explicitly scoped inactive sockets survive full capture, confirmation and replay at long paths", async () => {
-    const f = await fixture(), leak = path.join(f.root, "tmp", "leak");
+    const f = await fixture("ef-long-socket-capture-"), leak = path.join(f.root, "tmp", "leak");
     await mkdir(leak, { recursive: true });
     const socket = path.join(leak, "old.sock"); fixtureSocket(socket);
     await expect(f.prepare()).rejects.toThrow("outside the adopted ownership scope");
@@ -71,7 +71,7 @@ describe("external-delivery resource ownership", () => {
     await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, quiet);
     await capture(plan);
     const captured = path.join(target.quarantine.path, entry.path), journal = await readFile(target.quarantine.journal);
-    expect(captured.length).toBeGreaterThan(104);
+    expect(Buffer.byteLength(captured)).toBeGreaterThan(108);
     for (const item of plan) if (item.disposition === "retire-owned") f.resources.find(resource => resource.id === item.id)!.state = "released";
     await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet);
     await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: true }, quiet);
