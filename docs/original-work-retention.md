@@ -21,9 +21,10 @@ extracted with archive-selected links or traversal paths.
 The restored staged tree, working tree and working-content fingerprint must
 match the original. The frozen receipt then includes the entire original
 directory inventory and a unique sibling quarantine target. The Drafted client
-captures that exact root with its existing descriptor-bound mechanism and
-removes only the now-absent Git worktree registration, without force. The branch,
-archive and complete captured directory remain available. A missing original
+captures that exact root with its existing descriptor-bound mechanism, then
+captures its exact per-worktree Git administration using the same mechanism.
+Git is read-only throughout retirement. The branch, archive, source capture and
+complete saved index/administration remain available. A missing original
 without a matching capture is not proof of retirement. Confirmation independently
 observes the archive, capture and Git-registration absence before the exact Done
 handoff can be published or the primary closed.
@@ -225,3 +226,39 @@ metadata-tooling mismatch, source recreation, shared profiles, marker/context
 substitution and capture replay. Live legacy adapter inspection and paired client
 execution are separate acceptance checks; these schema/observer tests do not
 claim a live browser has been stopped or retired.
+
+## Archived-original administration recovery (DRA-201)
+
+New original-work proofs bind the exact linked Git administration, its complete
+index/inventory, and both source and destination parent identities. The source
+is captured first; its administration moves to a second private same-filesystem
+quarantine. A recreated original path—including ignored files—is never traversed
+by a removal command and blocks completion. Shared Git refs and other worktrees
+remain untouched. Read-only snapshot commands disable optional index refresh.
+
+An older immutable preparation is never edited to add this target. Full
+preparation may append one `finalization-original-administration` event, bound to
+that preparation's revision/digest and the original-work digest. The additional
+wire receipt is strictly parsed; old clients reject it before their old cleanup
+path. Creating the supplement performs physical observations outside SQL, then
+rechecks existing local authority and immutable preparation in a short transaction.
+A unique index forbids alternate supplements for the same original finalization.
+Authority-only renewal reads the saved extension without rehashing files.
+
+If the source was already captured, a new extension must verify its exact saved
+`.git` pointer, original index, staged/unstaged/untracked snapshot, and linked
+registration. It cannot adopt whichever administration exists now. If historical
+source capture and exact registration/administration absence are independently
+verified, the extension records a null administration target: it does not claim
+an administration capture happened. Already-confirmed historical receipts remain
+valid without manufacturing that extension.
+
+Full confirmation observes both retained inventories (or the explicit historical
+absence), and links any extension revision/digest to the confirmation. Missing or
+changed extension rows invalidate confirmed replay. Recreated paths, changed
+parents/index/archive, active writers, owner pause and revoked authority preserve
+all copies. No live task was adopted or retired by the implementation tests.
+
+Release additive migration `20261030120000_original_administration` with the
+matching Drafted capability. Existing pins, original preparation/binding bytes,
+retained archives and finalization request keys stay unchanged.

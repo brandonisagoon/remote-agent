@@ -1,3 +1,4 @@
+import { ORIGINAL_ADMINISTRATION } from "./original-work-supplement.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
@@ -102,7 +103,7 @@ async function fixture() {
   return { ...context, input, dependencies, finalize, task, session, comment, issue, states, copies, publisher, policy, report, worktree, product, sourceResource, manifest, capture, remove };
 }
 
-async function originalFixture(recovery = false) {
+async function originalFixture(recovery = false, historical = false) {
   const f = await fixture();
   // This fixture deliberately has no source-copies receipt, like the historical
   // original. Its accepted delivery checkouts remain read-only evidence.
@@ -114,10 +115,10 @@ async function originalFixture(recovery = false) {
   const released = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "previously-retired", kind: "old-provider-object", purpose: "development", externalId: "historical-id", state: "released" } });
   const binding = ExternalDeliveryBindingInput.parse({ ...f.manifest, ownership: { ownedPaths: [] }, originalWork: selection, resourceIds: (await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } })).map((entry) => entry.id) });
   const dependencies = { ...f.dependencies,
-    originalWork: (input: Parameters<typeof prepareOriginalWork>[0]) => prepareOriginalWork(input, noProcesses),
+    originalWork: async (input: Parameters<typeof prepareOriginalWork>[0]) => { const proof = await prepareOriginalWork(input, noProcesses); if (historical) delete proof.administration; return proof; },
     assertOriginalWork: (input: Parameters<typeof assertOriginalWork>[0]) => assertOriginalWork(input, noProcesses) };
-  const captureOriginal = async (proof: Awaited<ReturnType<typeof prepareOriginalWork>>) => {
-    const target = proof.target, root = target.inventory.find((entry) => entry.path === ".")!;
+  const captureOriginal = async (proof: Awaited<ReturnType<typeof prepareOriginalWork>>, administration = false) => {
+    const target = administration ? proof.administration!.administrationCapture : proof.target, root = target.inventory.find((entry) => entry.path === ".")!;
     await mkdir(target.quarantine.directory, { mode: 0o700 }); const location = await lstat(target.quarantine.directory);
     await writeFile(target.quarantine.journal, JSON.stringify({ version: 1, taskId: f.task.id, resourceId: proof.captureId, planDigest: finalizationDigest(target), sourcePath: target.path, capturedPath: target.quarantine.path, source: { dev: root.dev, ino: root.ino, mode: root.mode }, quarantine: { dev: location.dev, ino: location.ino } }), { mode: 0o600 });
     await rename(target.path, target.quarantine.path);
@@ -151,7 +152,7 @@ test("historical adoption preserves recovery archive purpose and exact archive-m
   expect(adopted.binding.originalWork?.restore).toHaveProperty("format", "base-work-tar/v1");
   expect(adopted.binding.resources.filter(entry => entry.purpose === "tooling").map(entry => entry.disposition).sort()).toEqual(["retain-archive", "retain-archive-member"]);
   const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
-  await f.captureOriginal(prepared.originalWork!); git(f.product, "worktree", "remove", f.worktree);
+  await f.captureOriginal(prepared.originalWork!); await f.captureOriginal(prepared.originalWork!, true);
   await confirmExternalFinalization(f.finalize, f.dependencies);
   const projection = await externalFinalizationProjection(db.prisma, { id: f.task.id, primarySessionId: f.session.id });
   expect(projection.finalizationRetention?.resources.filter(entry => entry.purpose === "tooling")).toHaveLength(2);
@@ -172,8 +173,8 @@ test("dirty original finalization preserves restored archive, full capture and p
   // Lost acknowledgement after capture: replay is valid, but Git registration
   // must independently disappear before confirmation.
   expect((await prepareExternalFinalization(f.finalize, f.dependencies)).preparedRevision).toBe(prepared.preparedRevision);
-  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("registered");
-  git(f.product, "worktree", "remove", f.worktree);
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("exact administration");
+  await f.captureOriginal(prepared.originalWork!, true);
   const confirmed = await confirmExternalFinalization(f.finalize, f.dependencies);
   expect(confirmed.confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
   expect((await confirmExternalFinalization(f.finalize, f.dependencies)).confirmedRevision).toBe(confirmed.confirmedRevision);
@@ -208,8 +209,8 @@ test("legacy delivery aliases retain only the exact independently observed pull 
   expect(adopted.binding.resources.filter((entry) => entry.disposition === "retain-reference")).toHaveLength(3);
 });
 
-test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted finalizer resumes archived dirty original capture and Done response loss", async () => {
-  const f = await originalFixture(), clientRoot = await realpath(process.env.DRAFTED_INTEGRATION_ROOT!);
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each([false, true])("actual Drafted finalizer resumes archived dirty original capture and Done response loss (historical=%s)", async historical => {
+  const f = await originalFixture(false, historical), clientRoot = await realpath(process.env.DRAFTED_INTEGRATION_ROOT!);
   const { finalizeTask } = await import(path.join(clientRoot, "src/finalize.ts"));
   const { TaskRecord, FinalizationReceipt } = await import(path.join(clientRoot, "src/control.ts"));
   await adoptExternalDeliveries(f.input, f.dependencies);
@@ -225,9 +226,8 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted finalizer res
     confirmFinalization: async (request: { requestKey: string; finalizationVersion?: 2 }) => FinalizationReceipt.parse(await confirmExternalFinalization({ ...f.finalize, ...request }, publication.dependencies)),
     publishIssueUpdate: publication.publish,
   };
-  const execute = () => finalizeTask({ registry, preparedCleanup: { observation: noProcesses }, runner: async (command: string[], cwd: string) => {
+  const execute = () => finalizeTask({ registry, preparedCleanup: { observation: noProcesses, captureHooks: { afterCapture: () => { if (failRemoval) { failRemoval = false; throw new Error("injected interruption after original capture"); } } } }, runner: async (command: string[], cwd: string) => {
     if (command[0] === "git" && command.includes("worktree") && command.includes("remove")) {
-      if (failRemoval) { failRemoval = false; throw new Error("injected interruption after original capture"); }
       removals++;
     }
     const result = await bunCommandClient.run(command[0]!, command.slice(1), { cwd });
@@ -247,7 +247,7 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual Drafted finalizer res
   await expect(execute()).rejects.toThrow("injected");
   expect(f.issue.state.name).toBe("Done"); expect(closed).toBe(0);
   expect((await execute()).closed).toBe(true);
-  expect(closed).toBe(1); expect(removals).toBe(1);
+  expect(closed).toBe(1); expect(removals).toBe(0);
   expect((await lstat(captured)).ino).toBe(identity.ino);
   expect(await readFile(path.join(captured, "staged.txt"), "utf8")).toBe("saved staged work\n");
   expect(await readFile(path.join(captured, "README.md"), "utf8")).toBe("unfinished original change\n");
@@ -625,4 +625,85 @@ test("accepted cleanup reuses historical comment provenance while preserving pro
   await revokeDeliveredRetirement({ prisma: db.prisma, taskId: f.task.id, revocation: { requestKey: "revoke-accepted-continuation", expectedRevision: adopted.revision, basis: "Owner revoked cleanup" } });
   await expect(observeBoundExternalDelivery({ ...input, acceptedCleanup: true }, dependencies)).rejects.toThrow("explicitly revoked");
   expect(providerReads).toBe(2);
+});
+
+
+test("historical preparation supplement survives lost acknowledgment and never changes original receipt bytes", async () => {
+  const f = await originalFixture(false, true);
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  expect(prepared.originalWork?.administration).toBeUndefined();
+  expect(prepared.originalWorkAdministration?.proof.administration).toBeDefined();
+  const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
+  await db.prisma.$disconnect();
+  expect(await prepareExternalFinalization(f.finalize, f.dependencies)).toEqual(prepared);
+  expect(await prepareExternalFinalization({ ...f.finalize, authorityOnly: true }, f.dependencies)).toEqual(prepared);
+  expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: ORIGINAL_ADMINISTRATION } })).toBe(1);
+  const extension = prepared.originalWorkAdministration!;
+  await f.captureOriginal(prepared.originalWork!);
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow();
+  await f.captureOriginal({ ...prepared.originalWork!, administration: extension.proof.administration! }, true);
+  const confirmed = await confirmExternalFinalization(f.finalize, f.dependencies);
+  expect(confirmed.originalWorkAdministration).toEqual(extension);
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: extension.revision } });
+  await expect(confirmExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("proof is missing");
+});
+
+test("historical captured source is supplemented only against its saved staged snapshot and pointer", async () => {
+  const f = await originalFixture(false, true); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  // Simulate the exact pre-extension persisted state, not a live receipt rewrite.
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: prepared.originalWorkAdministration!.revision } });
+  await f.captureOriginal(prepared.originalWork!);
+  const replay = await prepareExternalFinalization(f.finalize, f.dependencies);
+  expect(replay.originalWorkAdministration!.proof.administration!.git.index.sha256).toBe(prepared.originalWorkAdministration!.proof.administration!.git.index.sha256);
+  expect(replay.preparedRevision).toBe(prepared.preparedRevision);
+  const admin = replay.originalWorkAdministration!.proof.administration!;
+  await writeFile(admin.git.index.path, "changed index");
+  await expect(prepareExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow();
+  expect(await readFile(path.join(prepared.originalWork!.target.quarantine.path, "staged.txt"), "utf8")).toBe("saved staged work\n");
+});
+
+test("a completed old registration removal is recorded truthfully without a fabricated admin capture", async () => {
+  const f = await originalFixture(false, true); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: prepared.originalWorkAdministration!.revision } });
+  await f.captureOriginal(prepared.originalWork!); git(f.product, "worktree", "remove", f.worktree);
+  const replay = await prepareExternalFinalization(f.finalize, f.dependencies);
+  expect(replay.originalWorkAdministration?.proof.administration).toBeNull();
+  expect((await confirmExternalFinalization(f.finalize, f.dependencies)).confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
+});
+
+test("changed staged administration before a historical supplement cannot be rebound", async () => {
+  const f = await originalFixture(false, true); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies), extension = prepared.originalWorkAdministration!;
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: extension.revision } });
+  git(f.worktree, "add", "README.md");
+  await f.captureOriginal(prepared.originalWork!);
+  await expect(prepareExternalFinalization(f.finalize, f.dependencies)).rejects.toThrow("snapshot differs");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: ORIGINAL_ADMINISTRATION } })).toBe(0);
+});
+
+test("pause during administration observation prevents supplementation and the unique receipt cannot fork", async () => {
+  const f = await originalFixture(false, true); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies), extension = prepared.originalWorkAdministration!;
+  const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: extension.revision } });
+  await expect(Promise.resolve(db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: event.runtimeSessionId, source: event.source, action: event.action, key: event.key, value: event.value } }))).rejects.toThrow();
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: extension.revision } });
+  const dependencies = { ...f.dependencies, assertOriginalWork: async (...args: Parameters<typeof f.dependencies.assertOriginalWork>) => {
+    await f.dependencies.assertOriginalWork(...args);
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  } };
+  await expect(prepareExternalFinalization(f.finalize, dependencies)).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: ORIGINAL_ADMINISTRATION } })).toBe(0);
+  expect(await lstat(f.worktree).then(() => true, () => false)).toBe(true);
+});
+
+test.skipIf(!process.env.DRAFTED_LEGACY_ROOT).each([false, true])("old strict client refuses new administration authority before effects (historical=%s)", async historical => {
+  const f = await originalFixture(false, historical); await adoptExternalDeliveries(f.input, f.dependencies);
+  const prepared = await prepareExternalFinalization(f.finalize, f.dependencies);
+  const { FinalizationReceipt } = await import(path.join(process.env.DRAFTED_LEGACY_ROOT!, "src/control.ts"));
+  expect(() => FinalizationReceipt.parse(prepared)).toThrow();
+  expect(await lstat(f.worktree).then(() => true, () => false)).toBe(true);
 });

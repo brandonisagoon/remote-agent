@@ -15,3 +15,7 @@ export const PreparedExternalFinalization = PreparedFinalization.omit({ delivery
   doneHandoff: z.object({ requestKey: z.string(), body: z.string(), expectedState: z.enum(["Merge", "Done"]), state: z.literal("Done") }).strict(),
 }).strict();
 export type PreparedExternalFinalization = z.infer<typeof PreparedExternalFinalization>;
+
+export const ExternalConfirmation = z.object({ version: z.literal(2), preparedRevision: z.number().int().positive(), resourceProofs: z.array(z.number().int().positive()),
+  originalWorkAdministration: z.object({ revision: z.number().int().positive(), digest: z.string().regex(/^[a-f0-9]{64}$/) }).strict().optional(),
+}).strict();

@@ -1,16 +1,18 @@
+import { originalAdministrationReceipt } from "./original-work-supplement.ts";
 import path from "node:path";
-import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { assertExternalBindingAuthority, assertExternalResourceRecords, latestExternalBinding, type ExternalDatabase } from "./external-deliveries.ts";
 import { EXTERNAL_OBSERVATION, ExternalBinding, externalDigest } from "./external-delivery-schema.ts";
-import { PreparedExternalFinalization } from "./external-finalization-schema.ts";
+import { ExternalConfirmation, PreparedExternalFinalization } from "./external-finalization-schema.ts";
 import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED } from "./finalization-receipts.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
 export async function assertExternalResourceProofs(prisma: Pick<PrismaClient, "runtimeMetadataEvent">, prepared: PreparedExternalFinalization, preparedRevision: number, value: string | null) {
-  const data = z.object({ version: z.literal(2), preparedRevision: z.number().int(), resourceProofs: z.array(z.number().int()) }).strict().parse(JSON.parse(value!));
+  const data = ExternalConfirmation.parse(JSON.parse(value!));
   if (data.preparedRevision !== preparedRevision || data.resourceProofs.length !== prepared.resources.length || new Set(data.resourceProofs).size !== data.resourceProofs.length) throw new Error("External finalization confirmation proof identity mismatch");
+  const administration = await originalAdministrationReceipt(prisma, prepared, preparedRevision);
+  if (finalizationDigest(data.originalWorkAdministration ?? null) !== finalizationDigest(administration ? { revision: administration.revision, digest: administration.digest } : null)) throw new Error("Original administration confirmation proof is missing or mismatched");
   const proofs = await prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: data.resourceProofs } } });
   if (proofs.length !== prepared.resources.length || prepared.resources.some((entry) => !proofs.some((proof) => {
     const value = JSON.parse(proof.value ?? "null");

@@ -29,7 +29,7 @@ async function directory(file: string) {
 }
 const directoryIdentity = directory;
 const nodeIdentity = (stat: { dev: number; ino: number; mode: number }) => ({ dev: stat.dev, ino: stat.ino, mode: stat.mode });
-async function administrativeInventory(root: string, privateCopy = false) {
+export async function administrativeInventory(root: string, privateCopy = false) {
   const inventory: Worktree["git"]["administrativeInventory"] = [];
   let bytes = 0;
   const rootStat = await directory(root);
