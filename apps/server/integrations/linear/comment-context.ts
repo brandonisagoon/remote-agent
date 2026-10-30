@@ -5,8 +5,8 @@ import { linearGraphql } from "./client.ts";
 export async function readDeliveryComment(credential: LinearCredential, id: string) {
   type Issue = { id: string; identifier: string; title?: string };
   const data = await linearGraphql<{ comment: { id: string; body: string; parentId: string | null;
-    user: { id: string } | null; issue: Issue | null; documentContent: { issue: Issue | null } | null } | null }>(credential,
-    "query DeliveryComment($id: String!) { comment(id: $id) { id body parentId user { id } issue { id identifier title } documentContent { issue { id identifier title } } } }", { id });
+    createdAt?: string; updatedAt?: string; user: { id: string } | null; issue: Issue | null; documentContent: { issue: Issue | null } | null } | null }>(credential,
+    "query DeliveryComment($id: String!) { comment(id: $id) { id body parentId createdAt updatedAt user { id } issue { id identifier title } documentContent { issue { id identifier title } } } }", { id });
   return data.comment ? { ...data.comment, issue: data.comment.issue ?? data.comment.documentContent?.issue ?? null } : null;
 }
 

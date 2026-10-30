@@ -206,3 +206,62 @@ For the deployment coordinator:
    capability and preserves the original queue. Keep native steering acceptance
    unresolved until it actually reaches the target turn through a supported
    capability; a queued follow-up is not that evidence.
+
+## Informational native reports already in the inbox
+
+A native coordinator can publish through the owner's connected Linear account.
+That account identity does not prove whether a comment is a human instruction or
+an agent report. The existing operator `external-disposition` endpoint now has a
+strict `queuedReport` mode for an owner-attested informational publication that
+has **never started**. It requires the owner's bearer credential even on the
+private control socket; session IPC alone cannot assert native authorship.
+
+Inspect `/api/source-messages/:sourceId`. Its `queuedReport.binding` gives the
+exact source sequence, original task/primary/pin digest and instruction
+generation/text digest. Add that binding to the existing external-disposition
+request with `version: 1`, the current `expectedUpdatedAt`, an `informational`
+outcome, and the native chat/host identity. Supply `publication` with the exact
+Linear connection, issue, comment, thread, author, body SHA-256 and provider
+creation/update timestamps. Supply `nativeReceipt` with the original
+`linear.save_comment` tool-call ID, native turn ID, saved receipt reference and
+SHA-256. This is an explicit authenticated owner attestation about that receipt;
+the server does not claim it ran or independently authenticated the native chat.
+No path in this request is executed or opened as code.
+
+The server independently rereads the current Linear publication, then rechecks
+the source, instruction and original unpaused owner inside the transaction.
+Preparing, dispatching, unknown, retried, steered or previously executed messages
+are ineligible. Changed content/version, ownership, tooling pin, source revisions
+or any existing execution/control evidence refuse the write. The original source
+body, instruction text, reply fields and all historical records remain. One
+`record-native-report` resolution records the attestation; only that never-started
+instruction becomes `acknowledged` and its source becomes `handled`, with explicit
+"External informational report; no managed execution" detail. No lifecycle event,
+execution request, reply or task completion is fabricated. The same request key
+and exact payload recover a lost response without another disposition.
+
+Unchanged ingress preserves that exact disposition. Later canonical provider
+versions remain human input, including an edit that returns to the original body;
+those versions receive distinct deterministic IDs without rewriting historical
+source IDs. Author identity, report-like prose and matching body text alone never
+suppress a new comment.
+
+For native coordinators: preserve the actual sent-message receipt as part of
+reporting, and attach its exact native origin automatically when using this
+recovery mode. Do not ask the human to repeat a standing authorization, manufacture
+a receipt, or use generic cancellation/acknowledgment to bypass a held queue. Stop
+if the report has already started or its identity no longer matches.
+
+This compatibility path repairs an already-queued report. It does not yet close
+the race between an arbitrary connector posting a new comment and registering
+its origin after the provider response: a fast webhook may already start it.
+DRA-164's remaining proactive publisher work must persist trustworthy publication
+identity before ingress, using the existing durable publisher/outbox rather than
+another messaging system. DRA-164 is not complete until that path and live
+acceptance pass.
+
+Disposable verification covers the original blocked-cleanup ordering, unchanged
+original acceptance/marker bytes, unrelated-owner progress, real human edits,
+concurrent/lost-response replay, pause/ownership/publication races and HTTP
+cancellation before a late provider observation. No original task was changed by
+these tests.
