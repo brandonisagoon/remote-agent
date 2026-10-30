@@ -50,13 +50,15 @@ jobs:
   gui-macos:
     needs: release
     runs-on: macos-latest
+    env:
+      HAS_MAC_CERT: ${{ secrets.MAC_CERT_P12 != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
       - run: bunx prisma generate
       - name: Import signing certificate
-        if: ${{ secrets.MAC_CERT_P12 != '' }}
+        if: ${{ env.HAS_MAC_CERT == 'true' }}
         env:
           MAC_CERT_P12: ${{ secrets.MAC_CERT_P12 }}
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
@@ -82,6 +84,8 @@ jobs:
   gui-windows:
     needs: release
     runs-on: windows-latest
+    env:
+      HAS_AZURE_SIGNING: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
@@ -90,7 +94,7 @@ jobs:
       - name: Build installer
         run: bun run desktop:dist
       - name: Sign installer (Azure Trusted Signing)
-        if: ${{ secrets.AZURE_CLIENT_ID != '' }}
+        if: ${{ env.HAS_AZURE_SIGNING == 'true' }}
         uses: azure/trusted-signing-action@v5
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
