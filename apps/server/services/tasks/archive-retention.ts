@@ -28,7 +28,11 @@ async function context(prisma: Database, config: ServerConfig, taskId: string, p
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
   const confirmed = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "finalization-confirmed", source: event.source, key: event.key } });
-  if (task.primarySessionId !== session.id || session.role !== "primary" || task.ownerPaused || !["complete", "closed"].includes(task.phase)
+  if (!["complete", "closed"].includes(task.phase)) {
+    const { inspectPreparedCleanupAuthority } = await import("./cleanup-lifecycle.ts");
+    await inspectPreparedCleanupAuthority({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
+  }
+  if (task.primarySessionId !== session.id || session.role !== "primary" || task.ownerPaused
     || (task.phase === "closed" || session.status === "closed") && (!confirmed || JSON.parse(confirmed.value!).preparedRevision !== event.sequence)
     || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath
     || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId
@@ -99,7 +103,7 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
   const candidates = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, kind: { in: ["evidence-archive", "private-backup"] }, purpose: { in: ["development", "review", "browser"] }, state: { not: "released" } } });
   if (!candidates.length) return undefined;
   const current = await context(input.prisma, input.config, task.id, input.preparedRevision);
-  if (current.task.phase !== "complete" || current.session.status === "closed") throw new Error("New archive retention requires the open prepared primary");
+  if (current.task.phase === "closed" || current.session.status === "closed") throw new Error("New archive retention requires the open prepared primary");
   if (candidates.some(resource => resource.createdAt > current.event.occurredAt)) throw new Error("Saved archive was not registered before the existing preparation");
   const Manifest = z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/), entries: z.number().int().nonnegative().optional() }).passthrough();
   const Root = z.object({ archival: z.literal(true), manifest: Manifest, addenda: z.array(Manifest).max(20).optional(), finalCleanupReceipt: z.object({ path: z.string(), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).optional() }).passthrough();

@@ -4,6 +4,7 @@ import { chmod, copyFile, link, lstat, mkdir, open, mkdtemp, readFile, realpath,
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import { privateBackupFixture } from "../../../../test-support/private-backup.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { createApp } from "../../app.ts";
@@ -22,7 +23,7 @@ afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: tru
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 function git(cwd: string, ...args: string[]) { const command = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (command.exitCode) throw new Error(command.stderr.toString()); return command.stdout.toString().trim(); }
 
-async function fixture(options: { directoryEvidence?: boolean; files?: number } = {}) {
+async function fixture(options: { directoryEvidence?: boolean; files?: number; privateBackup?: boolean } = {}) {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, "DRA-99"), archive = path.join(directory, "retained");
   for (const dir of [root, historical, archive]) await mkdir(dir, { mode: 0o700 });
   git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
@@ -59,6 +60,8 @@ async function fixture(options: { directoryEvidence?: boolean; files?: number } 
   }
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "old-browser", kind: "browser", purpose: "browser", externalId: "already-gone", state: "released", metadata: { preserved: true } } });
   await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "clerk", kind: "clerk", purpose: "development", externalId: "unclaimed.example.test", state: "unknown" } });
+  const backup = options.privateBackup ? await privateBackupFixture(path.join(directory, "private-backup"), task.id, task.issueIdentifier!) : undefined;
+  if (backup) await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: "saved-backup", kind: "private-backup", purpose: "development", externalId: backup.root, state: "ready", metadata: backup.metadata } });
   const finalInput = { prisma: db.prisma, config, sessionId: session.id, requestKey: "finalize:task" };
   const prepared = await prepareTaskFinalization(finalInput, dependencies);
   const manifestPath = path.join(archive, "RETENTION.json"), manifestBytes = JSON.stringify({ task: task.id, retainedArchive: archive, files, sourceUnchanged: true });
@@ -70,7 +73,7 @@ async function fixture(options: { directoryEvidence?: boolean; files?: number } 
   const app = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
   const adopt = () => adoptLegacyEvidence({ ...context, adoption });
   const manage = (receipt: LegacyEvidenceReceipt, key: string, action: LegacyEvidenceOperationInput["action"]) => manageLegacyEvidence({ ...finalInput, operation: { resourceKey: key, action, proofRevision: receipt.proofRevision, proofDigest: receipt.proofDigest, preparedRevision: prepared.preparedRevision, finalizationRequestKey: prepared.requestKey } }, manageDependencies);
-  return { config, task, session, root, worktree, historical, archive, resources, treeResource, files, prepared, context, finalInput, dependencies, manageDependencies, contract, issue, app, adoption, adopt, manage };
+  return { config, task, session, root, worktree, historical, archive, resources, treeResource, backup, files, prepared, context, finalInput, dependencies, manageDependencies, contract, issue, app, adoption, adopt, manage };
 }
 
 async function capture(receipt: LegacyEvidenceReceipt, index = 0, intentOnly = false) {
@@ -364,3 +367,38 @@ test.skipIf(!draftedRoot)("actual Drafted directory capture uses both pinned par
     expect(await readFile(path.join(entry.retained.path, "turn-28.ndjson"), "utf8")).toBe("saved turn 28\n");
   } finally { server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
 });
+
+
+test.skipIf(!draftedRoot)("waiting cleanup preserves its private backup and original evidence proofs through pause and directory capture", async () => {
+  const f = await fixture({ directoryEvidence: true, privateBackup: true }), receipt = await f.adopt();
+  const before = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.prepared.preparedRevision } });
+  const proofBefore = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: receipt.proofRevision } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } }); f.issue.state.name = "Owner selected custom status";
+  const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
+  expect("cleanup" in active && active.cleanup).toBeTruthy();
+  const originalPrepare = legacyEvidenceDependencies.prepare;
+  legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const socket = path.join(directory, "cleanup.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageLegacyEvidence: manage } = await import(path.join(draftedRoot!, "src/legacy-evidence.ts"));
+    const registry = taskRegistry(socket, f.task.id), tree = receipt.proof.entries.find(isEvidenceTree)!;
+    await expect(manage({ registry, key: tree.key, action: "release", hooks: { beforeCapture: async () => {
+      await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    } } })).rejects.toThrow("Saved archive proof is unavailable");
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).ownerPaused).toBeTrue();
+    expect((await lstat(tree.target.path)).isDirectory()).toBeTrue();
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    const result = await manage({ registry, key: tree.key, action: "release" });
+    expect(result.observed).toBe("evidence-retired-archive-retained");
+    expect((await lstat(tree.target.quarantine.path)).isDirectory()).toBeTrue();
+    expect((await manage({ registry, key: tree.key, action: "release" })).observed).toBe(result.observed);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: tree.resourceId } })).metadata).toEqual(f.treeResource!.metadata);
+    expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: before.sequence } })).value).toBe(before.value);
+    expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: proofBefore.sequence } })).value).toBe(proofBefore.value);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: "saved-backup" } } })).state).toBe("ready");
+    expect(await readFile(path.join(f.backup!.root, "development/mysql.sql"), "utf8")).toBe("retained SQL\n");
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: f.task.id, key: "clerk" } } })).state).toBe("unknown");
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("waiting");
+  } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+}, 30_000);
