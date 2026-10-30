@@ -16,6 +16,7 @@ import { ToolingCapabilityInput, resolveSessionToolingCapability } from "../../s
 import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
+import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
 
 import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
 
@@ -39,6 +40,16 @@ sessionTaskRoutes.post("/:sessionId/reply-context", async (c) => {
 });
 
 for (const [action, finalize] of [["prepare-finalization", prepareTaskFinalization], ["confirm-finalization", confirmTaskFinalization]] as const) {
+  // Task-bound cleanup renewals resolve the original primary locally. They do
+  // not fetch the full task/retention projection before every native batch.
+  taskRoutes.post(`/:taskId/${action}`, async (c) => {
+    const parsed = FinalizationInput.safeParse(await c.req.json());
+    if (!parsed.success) return c.json({ error: "A stable finalization requestKey is required" }, 400);
+    const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
+    if (!task?.primarySessionId) return c.json({ error: "Task has no original primary" }, 409);
+    try { return c.json(await finalize({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), sessionId: task.primarySessionId })); }
+    catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+  });
   sessionTaskRoutes.post(`/:sessionId/${action}`, async (c) => {
     const parsed = FinalizationInput.safeParse(await c.req.json());
     if (!parsed.success) return c.json({ error: "A stable finalization requestKey is required" }, 400);
@@ -172,6 +183,7 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
       if (existing.externalId !== data.externalId || existing.kind !== data.kind || existing.purpose !== data.purpose) throw new Error("Resource key already belongs to another resource; record a new key");
       await assertLegacyEvidenceResourceUpdate(tx, existing, values);
       await assertArchiveResourceUpdate(tx, existing, values);
+      await assertCleanupResourceUpdate({ prisma: tx, config: c.get("config"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values);
       return tx.remoteTaskResource.update({ where: { id: existing.id }, data: { state: values.state, metadata: values.metadata, expiresAt: values.expiresAt } });
     });
     return c.json({ resource });

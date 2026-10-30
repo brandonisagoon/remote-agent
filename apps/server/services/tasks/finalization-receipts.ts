@@ -29,7 +29,7 @@ export const PreparedFinalization = z.object({
   retirementAuthority: RetirementReference.optional(),
 });
 export type PreparedFinalization = z.infer<typeof PreparedFinalization>;
-export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true };
+export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true; cleanup?: true };
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeMetadataEvent" | "runtimeSessionResourceLink" | "remoteTaskResource">;
 
 export async function finalizationGit(cwd: string, args: string[]) {
@@ -63,7 +63,10 @@ export async function assertFinalizationRemoved(prepared: Pick<PreparedFinalizat
 export async function assertFinalizationAuthority(prisma: Database, config: ServerConfig, prepared: PreparedFinalization, resourcesReleased = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: prepared.taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
-  if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
+  const { hasPreparedCleanup, assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+  const lifecycle = await hasPreparedCleanup(prisma, task.id, session.id, prepared.requestKey);
+  if (lifecycle) await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
+  if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.ownerPaused || !lifecycle && task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
   if (task.repositoryId !== prepared.repositoryId || task.machineId !== prepared.machineId || task.machineId !== config.machine || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.cwd !== task.worktreePath || task.branchName !== prepared.branch || task.connectionId !== prepared.connectionId || task.issueIdentifier !== prepared.issueIdentifier) throw new Error("Finalization task identity changed");
   // Compare configured path identity without requiring the removed checkout.
   if (task.worktreePath !== prepared.taskWorktree) throw new Error("Finalization worktree ownership changed");
@@ -73,7 +76,7 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
   const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${task.id}` }, orderBy: { sequence: "desc" } });
   if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Finalization completion authority was revoked or replaced");
   if (prepared.delivery.boundary !== "merge" || prepared.delivery.receipts.contractRevision !== prepared.contractRevision || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha || !prepared.delivery.receipts.snapshot.clean || prepared.delivery.receipts.snapshot.head !== prepared.revision || prepared.delivery.receipts.snapshot.branch !== prepared.branch) throw new Error("Finalization has no successful merge-delivery receipt");
-  if (prepared.retirementAuthority) {
+  if (prepared.retirementAuthority && !lifecycle) {
     const { grant } = await assertRetirementAuthority(prisma, config, task.id, session.id, prepared.issueId, prepared.retirementAuthority);
     if (grant.delivery.head !== prepared.revision || grant.delivery.mergeCommit !== prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.pullRequest.url?.toLowerCase() !== `https://github.com/${grant.delivery.repository}/pull/${grant.delivery.pullRequest}`) throw new Error("Finalization differs from the owner's exact retirement delivery");
   }
