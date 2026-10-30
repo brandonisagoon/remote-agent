@@ -1,3 +1,4 @@
+import { cleanupExecutionDirectory, CleanupTransportBlockedError } from "../../services/tasks/cleanup-transport.ts";
 import { randomUUID } from "node:crypto";
 import { assertTaskOpen } from "../../services/tasks/task-state.ts";
 import { queueInstruction, deliverInstructions } from "../../services/sessions/inbox.ts";
@@ -163,6 +164,7 @@ function assertProviderStopped(record: AcpSessionRecord, activeSince?: Date): vo
 export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly store;
   private readonly runtimes = new Map<string, ReturnType<typeof createAcpRuntime>>();
+  private readonly executionDirectories = new Map<string, { original: string; execution: string }>();
   private readonly handles = new Map<string, AcpRuntimeHandle>();
   private readonly listeners = new Map<
     string,
@@ -175,6 +177,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   private readonly activeTurns = new Map<string, AcpRuntimeTurn>();
   private readonly waitingTurns = new Map<string, Set<AbortController>>();
   private readonly recoveringSessions = new Set<string>();
+  private readonly releasingSessions = new Set<string>();
   private readonly capacity: TurnCapacity;
 
   constructor(
@@ -197,7 +200,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     if (existing) return existing;
     const runtime = createAcpRuntime({
       cwd: this.config.installRoot,
-      sessionStore: this.store,
+      // Logical/provider records retain the original cwd and complete history.
+      // Only this connection's supported session/load request sees cleanup cwd.
+      sessionStore: {
+        load: async id => {
+          const record = await this.store.load(id), context = this.executionDirectories.get(sessionId);
+          if (!record || !context) return record;
+          if (record.cwd !== context.original) throw new Error("Provider original cwd changed");
+          return { ...record, cwd: context.execution };
+        },
+        save: async record => {
+          const context = this.executionDirectories.get(sessionId);
+          if (context && record.cwd !== context.execution) throw new Error("Provider cleanup cwd changed");
+          await this.store.save(context ? { ...record, cwd: context.original } : record);
+        },
+      },
       agentRegistry: createAgentRegistry({
         overrides: this.config.acpxAgentCommands,
       }),
@@ -290,6 +307,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       labels: resolveInitialSessionLabels(repository, input.labels),
     });
     try {
+      if (this.recoveringSessions.has(row.id)) throw new Error("Session transport transition is in progress");
+      await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: row.id });
       const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
       const handle = await this.runtimeFor(row.id).ensureSession({
         sessionKey: row.id,
@@ -314,7 +333,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         configOptions: configOptionsFromStatus(runtimeStatus),
       });
     } catch (error) {
-      await updateRuntimeSessionState(this.prisma, row.id, {
+      if (!(error instanceof CleanupTransportBlockedError)) await updateRuntimeSessionState(this.prisma, row.id, {
         status: "error",
         recoveryDetail: error instanceof Error ? error.message : String(error),
       });
@@ -430,7 +449,6 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
         await this.requireSession(input.sessionId);
         await assertTaskOpen(this.prisma, session.cwd);
-        const handle = await this.handleFor(session);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
         await assertTaskOpen(this.prisma, session.cwd);
         if (input.beforeStart && !(await input.beforeStart())) {
@@ -438,6 +456,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           queue.close();
           return;
         }
+        const executionCwd = await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id, requestId });
+        const handle = await this.handleFor(session, executionCwd);
+        if (signal.aborted) throw new Error("Waiting turn cancelled");
         await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
@@ -562,7 +583,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       const message = error instanceof Error ? error.message : String(error);
       completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
       queue.close();
-      if (!signal.aborted) await this.prisma.runtimeSession.updateMany({
+      if (!signal.aborted && !(error instanceof CleanupTransportBlockedError)) await this.prisma.runtimeSession.updateMany({
         where: { id: input.sessionId, status: { not: "closed" } },
         data: { status: "error", recoveryDetail: message },
       }).catch(() => undefined);
@@ -703,8 +724,15 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   async close(sessionId: string, reason: string): Promise<void> {
     for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const session = await this.requireSession(sessionId);
-    const handle = await this.handleFor(session);
-    await this.runtimeFor(sessionId).close({ handle, reason });
+    const handle = this.handles.get(sessionId);
+    if (handle) await this.runtimeFor(sessionId).close({ handle, reason });
+    else {
+      // A confirmed cleanup can close its original logical session after a
+      // restart without spawning a provider inside the now-retired checkout.
+      const record = await this.loadRecord(session);
+      if (!record || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId) throw new Error("Provider close identity is unavailable");
+      assertProviderStopped(record);
+    }
     await updateRuntimeSessionState(this.prisma, session.id, {
       status: "closed",
       closedAt: new Date(),
@@ -753,7 +781,46 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     );
   }
 
+  async releaseIdleTransports(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void> {
+    const ids = [...new Set(input.sessionIds)].sort();
+    const busy = (id: string) => this.recoveringSessions.has(id) || this.turnChains.has(id) || this.activeTurns.has(id) || Boolean(this.waitingTurns.get(id)?.size);
+    if (!ids.length || ids.some(busy)) throw new Error("Provider still has local work in flight");
+    for (const id of ids) { this.recoveringSessions.add(id); this.releasingSessions.add(id); }
+    try {
+      await input.check();
+      // Validate the entire family before stopping the first owned transport.
+      const owned = [];
+      for (const id of ids) {
+        const session = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id } });
+        if (!["idle", "closed"].includes(session.status)) throw new Error("Provider session is not idle");
+        const record = session.acpxRecordId ? await this.store.load(session.acpxRecordId) : undefined;
+        if (!record) throw new Error("Provider transport identity is unavailable");
+        if (record.acpxRecordId !== session.acpxRecordId || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId
+          || record.agentSessionId !== (session.agentSessionId ?? undefined)) throw new Error("Provider transport identity changed");
+        const runtime = this.runtimes.get(id), handle = this.handles.get(id);
+        if (!runtime || !handle) assertProviderStopped(record);
+        else if (handle.acpxRecordId !== record.acpxRecordId || handle.backendSessionId !== record.acpSessionId) throw new Error("Owned provider handle changed");
+        owned.push({ id, record, runtime, handle });
+      }
+      for (const entry of owned) {
+        await input.check();
+        if (entry.runtime && entry.handle) await entry.runtime.close({ handle: entry.handle, reason: "Release idle transport for original-task cleanup", discardPersistentState: false });
+        // close is a transport acknowledgment, not proof that a stale/foreign
+        // provider exited. Observe the exact recorded process before proceeding.
+        const deadline = Date.now() + 5_000;
+        while (true) {
+          try { assertProviderStopped(entry.record); break; }
+          catch (error) { if (Date.now() >= deadline) throw error; await new Promise(resolve => setTimeout(resolve, 20)); }
+        }
+        this.handles.delete(entry.id); this.runtimes.delete(entry.id); this.executionDirectories.delete(entry.id);
+      }
+      await input.check();
+      await input.commit();
+    } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
+  }
+
   private async requireSession(sessionId: string): Promise<AgentRuntimeSession> {
+    if (this.releasingSessions.has(sessionId)) throw new Error("Session transport transition is in progress");
     const session = await findRuntimeSession(this.prisma, sessionId);
     if (!session) throw new Error(`runtime session not found: ${sessionId}`);
     if (session.status === "closed") {
@@ -762,14 +829,21 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     return session;
   }
 
-  private async handleFor(session: AgentRuntimeSession): Promise<AcpRuntimeHandle> {
+  private async handleFor(session: AgentRuntimeSession, executionCwd?: string): Promise<AcpRuntimeHandle> {
+    if (!executionCwd) await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id });
+    const selected = this.executionDirectories.get(session.id);
+    if (selected && selected.execution !== executionCwd) throw new Error("Provider execution directory changed without release");
+    if (executionCwd && !selected) {
+      if (this.handles.has(session.id) || this.runtimes.has(session.id)) throw new Error("Original provider must be released before cleanup resume");
+      this.executionDirectories.set(session.id, { original: session.cwd, execution: executionCwd });
+    }
     const existing = this.handles.get(session.id);
     if (existing) return existing;
     const handle = await this.runtimeFor(session.id).ensureSession({
       sessionKey: session.id,
       agent: session.agent,
       mode: "persistent",
-      cwd: session.cwd,
+      cwd: executionCwd ?? session.cwd,
     });
     this.handles.set(session.id, handle);
     await attachRuntimeSession(this.prisma, {

@@ -1,3 +1,4 @@
+import { cleanupTransportAllowsInstruction } from "../tasks/cleanup-transport.ts";
 import { cleanupInstructionAllows, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
 import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
@@ -85,6 +86,7 @@ async function instructionRequestId(prisma: PrismaClient, receipt: { id: string;
 }
 
 async function instructionAuthorityAllows(prisma: CleanupInboxStore, receipt: { id: string; sessionId: string }) {
+  if (!(await cleanupTransportAllowsInstruction(prisma, receipt))) return false;
   if (!(await cleanupInstructionAllows(prisma, receipt))) return false;
   const dispatch = await prisma.runtimeMetadataEvent.findFirst({ where: {
     runtimeSessionId: receipt.sessionId, action: "workflow-dispatch", key: receipt.id,

@@ -1,3 +1,4 @@
+import { ensureTaskCleanupTransports } from "./cleanup-transport.ts";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
@@ -56,7 +57,7 @@ function pendingFamilyIds(task: RemoteTask, sessions: Array<{ id: string; status
 
 /** An automatic request is a durable inbox instruction, never effect authority.
  * Its immutable capability is resolved outside the enqueue transaction. */
-export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; requestKey: string }, dependencies = cleanupInboxDependencies) {
+export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; requestKey: string; runtime?: AgentSessionRuntime }, dependencies = cleanupInboxDependencies) {
   CleanupEnqueueInput.parse({ requestKey: input.requestKey });
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
   const requestWhere = { runtimeSessionId: task.primarySessionId!, source: `finalizer:${task.id}`, action: CLEANUP_REQUEST, key: input.requestKey };
@@ -68,6 +69,7 @@ export async function enqueueTaskCleanup(input: { prisma: PrismaClient; config: 
   };
   if (prior) return result(input.prisma, JSON.parse(prior.value!).instructionId);
   if (!(await cleanupCandidates(input.prisma, input.config, [task])).has(task.id)) throw new Error("Task has no current accepted cleanup scheduling candidate");
+  if (input.runtime) await ensureTaskCleanupTransports({ ...input, runtime: input.runtime });
   const resolved = await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: task.primarySessionId!, capability: "cleanup" });
   if (!resolved.receipt.adapter || resolved.receipt.capability !== "cleanup" || resolved.receipt.taskToolingRevision !== task.toolingRevision) throw new Error("Configured cleanup capability has no exact adapter");
   const external = await latestExternalBinding(input.prisma, task.id, task.primarySessionId!);
