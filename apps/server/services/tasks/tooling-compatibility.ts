@@ -9,7 +9,8 @@ import { prepareTooling } from "./tooling.ts";
 
 const RelativePath = z.string().min(1).refine((value) => !path.isAbsolute(value) && !value.split(/[\\/]/).includes(".."), "Capability paths must stay inside their committed checkout");
 const Capability = z.object({ instructions: RelativePath, adapter: RelativePath }).strict();
-const Manifest = z.object({ version: z.literal(1), capabilities: z.object({ prepare: Capability.optional(), merge: Capability.optional(), cleanup: Capability.optional(), runtime: Capability.optional(), browser: Capability.optional(), "development-credentials": Capability.optional() }).strict() }).strict();
+export const CleanupObservationContracts = z.array(z.string().regex(/^[a-z][a-z0-9-]{0,63}\/v[1-9][0-9]{0,2}$/)).min(1).max(16).refine(values => new Set(values).size === values.length);
+const Manifest = z.object({ version: z.literal(1), capabilities: z.object({ prepare: Capability.optional(), merge: Capability.optional(), cleanup: Capability.extend({ observationContracts: CleanupObservationContracts.optional() }).strict().optional(), runtime: Capability.optional(), browser: Capability.optional(), "development-credentials": Capability.optional() }).strict() }).strict();
 export type ToolingCapability = "prepare" | "merge" | "cleanup" | "runtime" | "browser" | "development-credentials";
 export interface CompatibilityReceipt {
   contract: "remote-agent.tooling-capability/v1";

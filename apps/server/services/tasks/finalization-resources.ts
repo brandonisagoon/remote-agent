@@ -2,7 +2,7 @@ import { SavedDataSelections, SavedScratchBinding } from "./cleanup-saved-data-s
 import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
 import { PreservationInput, PreservationProof } from "./cleanup-preservation-schema.ts";
-import type { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
+import type { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { observeInactiveUnixSocket } from "./unix-socket.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -520,7 +520,7 @@ export async function inspectFinalizationQuarantine(input: { taskId: string; res
   return { captured: Boolean(captured), physicalPath: captured ? quarantine.path : target.path };
 }
 
-export async function assertFinalizationResources(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; originalWork?: boolean }, observation = finalizationResourceObservation) {
+export async function assertFinalizationResources(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; originalWork?: boolean; previewObserver?: () => Promise<CleanupObserverCapability> }, observation = finalizationResourceObservation) {
   const plan = z.array(FinalizationResourcePlan).parse(input.plan);
   const resources = input.resources;
   if (new Set(plan.map((r) => r.id)).size !== plan.length || resources.length !== plan.length || resources.length !== input.resources.length) throw new Error("Finalization resource set changed");
@@ -537,7 +537,9 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   assertPlanDependencies(plan);
   const adapters = plan.flatMap(entry => entry.disposition === "retire-adapter" ? [entry] : entry.disposition === "retire-browser" ? [entry.session] : entry.disposition === "retire-vault" ? [entry.vault] : entry.disposition === "retain-adapter" ? [entry.adapterPlan] : []);
   const retainedTargets = new Map(plan.filter(entry => entry.disposition === "retain-adapter").map(entry => [entry.id, entry.retainedTargetDigests]));
-  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed, retainedTargets }, observation.adapters) : undefined;
+  const { capturedPreviewInputs } = await import("./cleanup-preview-retained.ts");
+  const retainedPreviewInputs = adapters.some(entry => entry.adapter === "preview") ? await capturedPreviewInputs({ ...input, plan }) : [];
+  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed, retainedTargets, retainedPreviewInputs, previewObserver: input.previewObserver }, observation.adapters) : undefined;
   if (retainedTargets.size) {
     const { assertPreservedAdapters } = await import("./cleanup-preservation.ts");
     await assertPreservedAdapters({ ...input, plan });

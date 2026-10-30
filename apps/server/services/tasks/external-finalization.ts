@@ -88,7 +88,12 @@ async function preparedAuthority(input: Context, prepared: PreparedExternalFinal
 }
 
 async function resources(input: Context, prepared: PreparedExternalFinalization, removed: boolean, dependencies: ExternalDependencies) {
-  await dependencies.assertResources({ taskId: prepared.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed, ...(prepared.originalWork || prepared.deliveredRetirement ? { originalWork: true } : {}) });
+  await dependencies.assertResources({ taskId: prepared.taskId, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), plan: prepared.resources, removed,
+    previewObserver: async () => {
+      const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: prepared.taskId } });
+      if (task.primarySessionId !== prepared.sessionId || task.worktreePath !== prepared.taskWorktree || task.toolingRevision !== prepared.toolingRevision || task.pinnedToolingRoot !== prepared.pinnedToolingRoot) throw new Error("Captured preview observer task identity changed");
+      return dependencies.cleanupObserver({ task, config: input.config });
+    }, ...(prepared.originalWork || prepared.deliveredRetirement ? { originalWork: true } : {}) });
   if (prepared.originalWork) await dependencies.assertOriginalWork({ taskId: prepared.taskId, originalWork: prepared.originalWork, resources: await input.prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), removed });
   if (prepared.originalWork && !prepared.originalWork.administration) {
     const event = await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { ...whereFor(input, prepared.taskId), action: FINALIZATION_PREPARED } });

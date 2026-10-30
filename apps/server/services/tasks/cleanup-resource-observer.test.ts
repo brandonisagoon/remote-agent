@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { cleanupDigest, cleanupTargetDigest } from "./cleanup-observer-schema.ts";
 import { runCleanupResourceObserver, verifyCleanupObserver } from "./cleanup-resource-observer.ts";
 
 const roots: string[] = [];
@@ -13,7 +14,7 @@ function git(cwd: string, ...args: string[]) {
   if (result.exitCode) throw new Error("Fixture Git command failed");
   return result.stdout.toString().trim();
 }
-async function fixture() {
+async function fixture(supportsRetained = false, contracts: unknown = ["retained-preview-inputs/v1"]) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "cleanup-observer-"))); roots.push(root);
   const adapter = path.join(root, "adapter.ts");
   const source = `const input = JSON.parse(await Bun.stdin.text());
@@ -31,7 +32,7 @@ else if (input.mode === "oversize") console.log("x".repeat(9 * 1024 * 1024));
 else if (input.mode === "invalid") console.log("private-invalid-output");
 else console.log(JSON.stringify({ taskId: input.taskId, resourceId: input.resourceId, args: process.argv.slice(2), hasControl: Boolean(process.env.REMOTE_AGENT_SOCKET || process.env.REMOTE_AGENT_SESSION_ID) }));\n`;
   await writeFile(adapter, source, { mode: 0o600 });
-  await writeFile(path.join(root, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { cleanup: { instructions: "cleanup.md", adapter: "adapter.ts" } } }), { mode: 0o600 });
+  await writeFile(path.join(root, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { cleanup: { instructions: "cleanup.md", adapter: "adapter.ts", ...(supportsRetained ? { observationContracts: contracts } : {}) } } }), { mode: 0o600 });
   await writeFile(path.join(root, "cleanup.md"), "Read-only fixture", { mode: 0o600 });
   git(root, "init", "--quiet"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.invalid");
   git(root, "add", "."); git(root, "commit", "--quiet", "-m", "Pinned observer");
@@ -107,4 +108,46 @@ test("observer timeout identifies the failed boundary while preserving process a
   await expect(runCleanupResourceObserver({ capability: f.capability, request: { mode: "hang", pidFile }, timeoutMs: 250 })).rejects.toThrow("[OBSERVER_TIMEOUT]");
   const pid = Number(await Bun.file(pidFile).text());
   expect(() => process.kill(pid, 0)).toThrow();
+});
+
+function retainedRequest() {
+  const environment = { id: "environment", key: "development-env-directory", kind: "private-directory", purpose: "development", externalId: "/private/original-env", state: "released", expiresAt: null, metadata: {} };
+  const preview = { ...environment, id: "preview", key: "development-tunnel", kind: "cloudflare-tunnel", externalId: "tunnel" };
+  const { state: _, ...identity } = environment;
+  const file = { dev: 1, ino: 2, mode: 33152, size: 12, sha256: "b".repeat(64) };
+  const target = { kind: "local-ingress-route", id: "preview.example.com", scope: { taskId: "task", purpose: "development", configFile: "/private/original-env/cloudflared.yml", tunnelId: "tunnel" }, hostname: "preview.example.com", sourceDigest: "a".repeat(64), routeDigest: "c".repeat(64), presentAtPrepare: true } as const;
+  return { version: 1, task: { id: "task", primarySessionId: "primary", worktreePath: "/private/original", toolingRevision: "a".repeat(40) }, resources: [environment, preview], stage: "confirm",
+    observations: [{ resourceId: preview.id, expectedTargets: [{ ...target, identityDigest: cleanupTargetDigest(target) }] }],
+    retainedPreviewInputs: [{ resourceId: environment.id, identityDigest: cleanupDigest(identity), planDigest: "e".repeat(64), sourcePath: environment.externalId,
+      quarantine: { directory: "/private/capture", path: "/private/capture/contents", journal: "/private/capture/pending.json" }, root: { dev: 1, ino: 3, mode: 16832 },
+      config: { ...file, path: "/private/original-env/cloudflared.yml" }, connector: { ...file, path: "/private/original-env/credentials.json" } }] };
+}
+
+test("retained preview compatibility requires a committed declared contract and verifies the original capability too", async () => {
+  const original = await fixture(), unsupported = await fixture(), current = await fixture(true), request = retainedRequest();
+  await expect(runCleanupResourceObserver({ capability: original.capability, compatibleCapability: unsupported.capability, request })).rejects.toThrow("OBSERVER_COMPATIBILITY");
+  expect(await runCleanupResourceObserver({ capability: original.capability, compatibleCapability: current.capability, request })).toMatchObject({ hasControl: false, args: ["cleanup", "observe-resource"] });
+  await writeFile(original.adapter, original.source + "\n// original changed");
+  await expect(runCleanupResourceObserver({ capability: original.capability, compatibleCapability: current.capability, request })).rejects.toThrow("OBSERVER_CAPABILITY");
+});
+
+test.each(["prepare", "missing-input", "duplicate-input", "environment", "target-kind", "current-code"])("compatible observer rejects %s without falling back", async changed => {
+  const original = await fixture(), current = await fixture(true), request: any = retainedRequest();
+  if (changed === "prepare") request.stage = "prepare";
+  if (changed === "missing-input") delete request.retainedPreviewInputs;
+  if (changed === "duplicate-input") request.retainedPreviewInputs.push(request.retainedPreviewInputs[0]);
+  if (changed === "environment") request.resources[0].metadata = { replacement: true };
+  if (changed === "target-kind") request.observations[0].expectedTargets = [{ kind: "docker-volume", id: "volume", scope: { taskId: "task", purpose: "development" }, identity: null, presentAtPrepare: false, identityDigest: "a".repeat(64) }];
+  if (changed === "current-code") await writeFile(current.adapter, current.source + "\n// changed");
+  await expect(runCleanupResourceObserver({ capability: original.capability, compatibleCapability: current.capability, request })).rejects.toThrow();
+});
+
+
+test("a compatible manifest may advertise other bounded contracts without changing the selected contract", async () => {
+  const original = await fixture(), current = await fixture(true, ["future-observation/v2", "retained-preview-inputs/v1"]);
+  expect(await runCleanupResourceObserver({ capability: original.capability, compatibleCapability: current.capability, request: retainedRequest() })).toMatchObject({ hasControl: false });
+});
+test.each([[], ["future-observation/v2"], ["retained-preview-inputs/v1", "malformed arbitrary value"], ["retained-preview-inputs/v1", "retained-preview-inputs/v1"]].map(contracts => [contracts]))("unsupported or malformed advertised contracts %j refuse compatibility", async contracts => {
+  const original = await fixture(), current = await fixture(true, contracts);
+  await expect(runCleanupResourceObserver({ capability: original.capability, compatibleCapability: current.capability, request: retainedRequest() })).rejects.toThrow("OBSERVER_COMPATIBILITY");
 });

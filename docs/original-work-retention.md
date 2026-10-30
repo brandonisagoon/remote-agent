@@ -475,3 +475,23 @@ source-path collisions. A read-only comparison of DRA98's existing tar at
 2026-10-30 12:59:17 UTC classified all seven paired metadata records and matched
 all seven real files; archive and index identities and hashes stayed unchanged.
 This compatibility observation did not adopt a proof or perform cleanup.
+
+### Captured preview credentials during confirmation
+
+An accepted registered environment capture may contain a recognized legacy preview's original
+configuration and connector credential. Full external confirmation derives
+references to those exact inventoried files, verifies the native capture journal
+and complete retained inventory, and passes them only to read-only preview
+observation. The original source must remain absent. The observer checks the
+selected files again before every provider GET and keeps the original live
+configuration path as the target whose absence is being proved.
+
+The original observer capability and every prepared target remain frozen.
+Only affected preview observations use the current configured immutable cleanup
+capability, whose committed manifest must explicitly declare
+`cleanup.observationContracts: ["retained-preview-inputs/v1"]`. Both the old and
+current code identities are verified before and after that call. Other adapters
+continue to use their original capability. Unsupported tooling, changed capture
+bytes, recreated paths, changed provider targets or revoked authority fail closed;
+there is no credential fallback, new preparation, provider mutation or new cleanup
+operation in this compatibility path.

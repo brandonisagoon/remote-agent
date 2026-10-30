@@ -25,6 +25,7 @@ type Resource = NonNullable<Failure["resource"]>;
 
 /** Fixed reasons only. These are diagnostics, never physical proof or authority. */
 export const cleanupObserverReasons = {
+  OBSERVER_COMPATIBILITY: "The configured observer does not declare retained-preview-inputs/v1 compatibility.",
   OBSERVER_CAPABILITY: "The committed observer capability could not be verified.",
   OBSERVER_TIMEOUT: "The read-only observer exceeded its deadline.",
   OBSERVER_EXIT: "The read-only observer exited unsuccessfully.",
