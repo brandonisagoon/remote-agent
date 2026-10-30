@@ -10,6 +10,7 @@ import { observeRetirementDelivery } from "./retirement-authority.ts";
 import { assertRetirementAuthority, latestRetirement } from "./retirement-receipts.ts";
 import { ensureArchiveRetention, verifyPreparedArchives } from "./archive-retention.ts";
 import type { ArchiveRetentionReceipt } from "./archive-retention-schema.ts";
+import { assertDoneRetirement, latestDoneRetirement, observeDoneRetirement } from "./delivered-retirement.ts";
 import {
   FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, PreparedFinalization,
   assertFinalizationAuthority, assertFinalizationRemoved, finalizationGit, finalizationWorktrees, worktreeIsMissing,
@@ -28,8 +29,12 @@ async function owned(input: FinalizationContext) {
   return task;
 }
 
-async function sourceAuthority(input: FinalizationContext, taskId: string, dependencies: Dependencies): Promise<Awaited<ReturnType<typeof linkedSourceIssue>> & { retirementAuthority?: PreparedFinalization["retirementAuthority"] }> {
+async function sourceAuthority(input: FinalizationContext, taskId: string, dependencies: Dependencies): Promise<Awaited<ReturnType<typeof linkedSourceIssue>> & { retirementAuthority?: PreparedFinalization["retirementAuthority"]; retirementSupplement?: PreparedFinalization["retirementAuthority"] }> {
   const source = await dependencies.source(input);
+  if (await latestDoneRetirement(input.prisma, taskId, input.sessionId)) {
+    const retirementSupplement = await observeDoneRetirement({ ...input, taskId }, source, { source: dependencies.source, snapshot: dependencies.snapshot, remote: dependencies.retirementRemote ?? observeRetirementDelivery });
+    return { ...source, retirementSupplement };
+  }
   if (source.issue.state.name === "Merge") return source;
   // A lost close response after successful publication may be retried, but a
   // bare Done state is not authority to clean up somebody else's delivery.
@@ -52,22 +57,24 @@ async function sourceAuthority(input: FinalizationContext, taskId: string, depen
   throw new Error("Finalization requires current owner Merge authority");
 }
 
-function result(prepared: PreparedFinalization, preparedRevision: number, confirmedRevision?: number, archiveRetention?: ArchiveRetentionReceipt) {
+function result(prepared: PreparedFinalization, preparedRevision: number, confirmedRevision?: number, archiveRetention?: ArchiveRetentionReceipt, supplement?: PreparedFinalization["retirementAuthority"]) {
+  const authority = supplement ?? prepared.retirementAuthority;
   return { requestKey: prepared.requestKey, taskId: prepared.taskId, sessionId: prepared.sessionId, preparedRevision,
     ...(confirmedRevision ? { confirmedRevision } : {}), worktree: prepared.worktree, revision: prepared.revision,
     branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
     ...(archiveRetention ? { archiveRetention } : {}),
-    ...(prepared.retirementAuthority ? { retirement: { authorityRevision: prepared.retirementAuthority.revision, authorityDigest: prepared.retirementAuthority.digest,
+    ...(authority ? { retirement: { authorityRevision: authority.revision, authorityDigest: authority.digest,
       doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
         body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, ${archiveRetention ? "resources requiring removal are released and verified saved archives remain intact" : "recorded development, browser and review resources are released"}, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
 }
 
-async function assertObservedPreparationAuthority(input: FinalizationContext, prepared: PreparedFinalization, dependencies: Dependencies, confirmed = false) {
+async function assertObservedPreparationAuthority(input: FinalizationContext, prepared: PreparedFinalization, dependencies: Dependencies, confirmed = false, supplement?: PreparedFinalization["retirementAuthority"]) {
   // Content hashing and Git observations can outlast a source-state change.
   // Refresh the actual owner/source after them, before returning adapter authority.
   const source = await sourceAuthority(input, prepared.taskId, dependencies);
   if (source.issue.id !== prepared.issueId || source.issue.identifier !== prepared.issueIdentifier || source.link.connectionId !== prepared.connectionId || source.session.id !== prepared.sessionId
-    || source.retirementAuthority?.revision !== prepared.retirementAuthority?.revision || source.retirementAuthority?.digest !== prepared.retirementAuthority?.digest) throw new Error("Finalization source authority changed during observation");
+    || source.retirementAuthority?.revision !== prepared.retirementAuthority?.revision || source.retirementAuthority?.digest !== prepared.retirementAuthority?.digest
+    || source.retirementSupplement?.revision !== supplement?.revision || source.retirementSupplement?.digest !== supplement?.digest) throw new Error("Finalization source authority changed during observation");
   await assertFinalizationAuthority(input.prisma, input.config, prepared, confirmed);
 }
 
@@ -94,15 +101,15 @@ export async function prepareTaskFinalization(input: FinalizationContext, depend
       // A completed cleanup is replayed, never expanded to a newly created
       // worktree or newly retained resource after Done was published.
       await assertFinalizationRemoved(prepared);
-      await assertObservedPreparationAuthority(input, prepared, dependencies, true);
-      return result(prepared, prior.sequence, confirmed.sequence, archiveRetention);
+      await assertObservedPreparationAuthority(input, prepared, dependencies, true, source.retirementSupplement);
+      return result(prepared, prior.sequence, confirmed.sequence, archiveRetention, source.retirementSupplement);
     }
     if (!(await worktreeIsMissing(prepared.worktree))) {
       const snapshot = await dependencies.snapshot(prepared.worktree);
       if (JSON.stringify(snapshot) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Worktree changed since finalization preparation; inspect before using a new requestKey");
     }
-    await assertObservedPreparationAuthority(input, prepared, dependencies);
-    return result(prepared, prior.sequence, undefined, archiveRetention);
+    await assertObservedPreparationAuthority(input, prepared, dependencies, false, source.retirementSupplement);
+    return result(prepared, prior.sequence, undefined, archiveRetention, source.retirementSupplement);
   }
   const delivery = await dependencies.completion(input);
   if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
@@ -157,12 +164,27 @@ export async function confirmTaskFinalization(input: FinalizationContext, depend
   await assertFinalizationAuthority(input.prisma, input.config, prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, prepared);
   await assertFinalizationRemoved(prepared);
-  await sourceAuthority(input, task.id, dependencies);
+  await assertObservedPreparationAuthority(input, prepared, dependencies, true, source.retirementSupplement);
   return input.prisma.$transaction(async (tx) => {
     await assertFinalizationAuthority(tx, input.config, prepared, true);
+    if (source.retirementSupplement) await assertDoneRetirement(tx, input.config, task.id, input.sessionId, source.issue.id, source.retirementSupplement);
     const prior = await tx.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
-    if (prior) return result(prepared, preparation.sequence, prior.sequence, archiveRetention);
+    if (prior) return result(prepared, preparation.sequence, prior.sequence, archiveRetention, source.retirementSupplement);
     const receipt = await tx.runtimeMetadataEvent.create({ data: { ...where, action: FINALIZATION_CONFIRMED, value: JSON.stringify({ preparedRevision: preparation.sequence }) } });
-    return result(prepared, preparation.sequence, receipt.sequence, archiveRetention);
+    return result(prepared, preparation.sequence, receipt.sequence, archiveRetention, source.retirementSupplement);
   });
+}
+
+export async function assertPreparedDoneHandoff(input: FinalizationContext & { body?: string; state?: string; expectedState?: string }, dependencies: Dependencies = finalizationDependencies) {
+  const task = await owned(input);
+  const supplement = await latestDoneRetirement(input.prisma, task.id, input.sessionId);
+  if (!supplement) throw new Error("Prepared Done retirement supplement is missing");
+  const grant = JSON.parse(supplement.value!);
+  const preparation = await input.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: grant.preparedRevision } });
+  const prepared = PreparedFinalization.parse(JSON.parse(preparation.value!));
+  const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${task.id}`, action: FINALIZATION_CONFIRMED, key: prepared.requestKey } });
+  if (!confirmed || JSON.parse(confirmed.value!).preparedRevision !== preparation.sequence) throw new Error("Prepared Done handoff requires confirmed cleanup");
+  const replay = await confirmTaskFinalization({ ...input, requestKey: prepared.requestKey }, dependencies);
+  const handoff = "retirement" in replay ? replay.retirement?.doneHandoff : undefined;
+  if (!handoff || input.requestKey !== handoff.requestKey || input.body !== handoff.body || input.state !== handoff.state || input.expectedState !== handoff.expectedState) throw new Error("Prepared Done retirement requires the exact immutable handoff");
 }
