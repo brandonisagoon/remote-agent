@@ -4,6 +4,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { finalizationDigest, finalizationResourceIdentity, type FinalizationResourceRecord } from "./finalization-resources.ts";
 import { CompletionContractInput } from "./completion.ts";
+import { readDevelopmentJson, retainedDevelopmentIds } from "./development-selection.ts";
 
 import { AutomationInput, DevelopmentAuthority, DevelopmentAuthorityInput, DevelopmentCompleteInput, DevelopmentProjection, DevelopmentReference } from "../../../../lib/development-intent.ts";
 export { AutomationInput, DevelopmentAuthority, DevelopmentAuthorityInput, DevelopmentCompleteInput, DevelopmentProjection, DevelopmentReference } from "../../../../lib/development-intent.ts";
@@ -32,9 +33,10 @@ export function developmentCompute(resource: Pick<RemoteTaskResource, "purpose" 
 const identities = (resources: RemoteTaskResource[]) => resources.map(resource => {
   const value = finalizationResourceIdentity(resource); return { id: value.id, key: value.key, identityDigest: value.identityDigest };
 }).sort((a, b) => a.key.localeCompare(b.key));
-const epoch = (resources: RemoteTaskResource[]) => finalizationDigest(resources.filter(resource => resource.purpose === "development").map(resource => ({
+const resourceSnapshot = (resources: RemoteTaskResource[]) => finalizationDigest(resources.map(resource => ({
   ...finalizationResourceIdentity(resource), state: resource.state,
 })).sort((a, b) => a.key.localeCompare(b.key)));
+const epoch = (resources: RemoteTaskResource[]) => resourceSnapshot(resources.filter(resource => resource.purpose === "development"));
 
 async function assertDevelopmentWork(input: Context, task: RemoteTask) {
   const where = { runtimeSessionId: task.primarySessionId! };
@@ -150,22 +152,34 @@ export async function assertDevelopmentIntent(input: Context & z.infer<typeof De
   }
   return active;
 }
-export async function renewDevelopmentAuthority(input: Context & { prisma: PrismaClient } & z.infer<typeof DevelopmentAuthorityInput>) {
+async function selection(input: Context & z.infer<typeof DevelopmentReference>, read = readDevelopmentJson) {
+  const active = await assertDevelopmentIntent(input);
+  const records = await input.prisma.remoteTaskResource.findMany({ where: { taskId: active.task.id } });
+  // Held local proof reads finish before a write transaction. The transaction
+  // then rechecks the original identity, intent and complete resource epoch.
+  const retained = await retainedDevelopmentIds(active.task, records, read);
+  return { identityDigest: active.identityDigest, snapshot: resourceSnapshot(records), retained };
+}
+export async function renewDevelopmentAuthority(input: Context & { prisma: PrismaClient } & z.infer<typeof DevelopmentAuthorityInput>, read = readDevelopmentJson) {
   DevelopmentAuthorityInput.parse({ intentRevision: input.intentRevision, intentDigest: input.intentDigest, resourceKeys: input.resourceKeys });
+  const observed = await selection(input, read);
   return input.prisma.$transaction(async tx => {
     const active = await assertDevelopmentIntent({ ...input, prisma: tx });
     const records = await tx.remoteTaskResource.findMany({ where: { taskId: active.task.id } });
+    if (active.identityDigest !== observed.identityDigest || resourceSnapshot(records) !== observed.snapshot) throw new Error("Development selection changed during proof inspection");
     const selected = records.filter(resource => input.resourceKeys.includes(resource.key));
-    if (selected.length !== input.resourceKeys.length || selected.some(resource => !developmentCompute(resource))) throw new Error("Development authority requires exact current development compute");
+    if (selected.length !== input.resourceKeys.length || selected.some(resource => !developmentCompute(resource) || observed.retained.has(resource.id))) throw new Error("Development authority requires exact current development compute");
     return DevelopmentAuthority.parse({ version: 1, task: { id: active.task.id, primarySessionId: active.primary.id, worktreePath: active.task.worktreePath, toolingRevision: active.task.toolingRevision },
       intent: active.intent, resourcesEpoch: epoch(records), resources: identities(selected) });
   });
 }
-export async function completeDevelopmentIntent(input: Context & { prisma: PrismaClient } & z.infer<typeof DevelopmentCompleteInput>) {
+export async function completeDevelopmentIntent(input: Context & { prisma: PrismaClient } & z.infer<typeof DevelopmentCompleteInput>, read = readDevelopmentJson) {
+  const observed = await selection(input, read);
   return input.prisma.$transaction(async tx => {
     const active = await assertDevelopmentIntent({ ...input, prisma: tx });
     const records = await tx.remoteTaskResource.findMany({ where: { taskId: active.task.id } });
-    const expected = identities(records.filter(developmentCompute));
+    if (active.identityDigest !== observed.identityDigest || resourceSnapshot(records) !== observed.snapshot) throw new Error("Development selection changed during proof inspection");
+    const expected = identities(records.filter(resource => developmentCompute(resource) && !observed.retained.has(resource.id)));
     if (epoch(records) !== input.resourcesEpoch || finalizationDigest(expected) !== finalizationDigest(input.resources)) throw new Error("Development completion resource membership or identity changed");
     const value = JSON.stringify({ version: 1, intentRevision: active.intent.revision, intentDigest: active.intent.digest, resourcesEpoch: input.resourcesEpoch, resources: expected });
     const where = { runtimeSessionId: active.primary.id, source: source(active.task.id), action: CompleteAction, key: active.value.requestKey };
@@ -188,8 +202,11 @@ export async function developmentProjection(input: Context) {
     } catch { return { developmentBlocked: "The saved development resume or review handoff is unavailable during cleanup or until work is restored" }; }
   }
   const records = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id } });
+  let retained: Set<string>;
+  try { retained = await retainedDevelopmentIds(active.task, records); }
+  catch { return { developmentIntent: DevelopmentProjection.parse({ version: 1, ...active.intent, state: "pending", blocked: "The saved retained development bindings could not be verified" }) }; }
   const complete = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: source(task.id), action: CompleteAction, key: active.value.requestKey }, orderBy: { sequence: "desc" } });
-  const expected = JSON.stringify({ version: 1, intentRevision: active.intent.revision, intentDigest: active.intent.digest, resourcesEpoch: epoch(records), resources: identities(records.filter(developmentCompute)) });
+  const expected = JSON.stringify({ version: 1, intentRevision: active.intent.revision, intentDigest: active.intent.digest, resourcesEpoch: epoch(records), resources: identities(records.filter(resource => developmentCompute(resource) && !retained.has(resource.id))) });
   return { developmentIntent: DevelopmentProjection.parse({ version: 1, ...active.intent, state: complete?.value === expected ? "complete" : "pending" }) };
 }
 
