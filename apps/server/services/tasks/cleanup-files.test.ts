@@ -158,7 +158,8 @@ test.skipIf(!draftedRoot).each(["files", "checkpoint"])("actual prepared dispatc
   const target = plan[0]!; if (target.disposition !== "retire-file" && target.disposition !== "retire-tree") throw new Error("Missing capture plan");
   const journal = await readFile(target.target.quarantine.journal), captured = await lstat(target.target.quarantine.path);
   if (kind === "files") expect(batches).toHaveLength(2);
-  const retried = await run(); expect(retried.results.every((entry: { outcome: string }) => entry.outcome === "retired-to-recoverable-quarantine")).toBeTrue(); await f.verify(plan, true);
+  const retried = await run(); expect(retried.results.filter((entry: { outcome: string }) => entry.outcome === "failed")).toEqual([]);
+  expect(retried.results.every((entry: { outcome: string }) => entry.outcome === "retired-to-recoverable-quarantine")).toBeTrue(); await f.verify(plan, true);
   await run(); await f.verify(plan, true); expect(writes).toEqual(kind === "files" ? ["scenario", "capture"] : ["capture"]);
   expect(await readFile(target.target.quarantine.journal)).toEqual(journal); expect((await lstat(target.target.quarantine.path)).ino).toBe(captured.ino);
   if (kind === "checkpoint") expect(await readFile(path.join(target.target.quarantine.path, "README.md"), "utf8")).toBe("ancillary notes stay retained\n");
