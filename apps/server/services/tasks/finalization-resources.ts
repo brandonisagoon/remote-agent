@@ -25,11 +25,15 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
 export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Sha };
+export const RegisteredTreePlan = z.object({ ...Identity, disposition: z.literal("retire-tree"), treeKind: z.literal("registered-directory"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), target: FinalizationTreeTarget }).strict();
+export const ContainedFilePlan = z.object({ ...Identity, disposition: z.literal("retire-contained"), parentResourceId: z.string().min(1), dependencies: z.array(z.string().min(1)).length(1), target: z.object({ type: z.literal("file"), path: Absolute, ...NodeIdentity, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedArchivePlan = z.object({ ...Identity, purpose: z.enum(["development", "browser", "review", "tooling"]), disposition: z.literal("retain-archive"), archive: z.object({ root: Absolute, manifestPath: Absolute, manifestSha256: Sha, inventoryDigest: Sha }).strict() }).strict();
 export const RetainedArchiveMemberPlan = z.object({ ...Identity, kind: z.literal("resource-inventory"), purpose: z.literal("tooling"), disposition: z.literal("retain-archive-member"), archive: z.object({ resourceId: z.string().min(1), root: Absolute, inventoryDigest: Sha }).strict(), file: z.object({ path: Absolute, size: z.number().int().nonnegative(), sha256: Sha }).strict() }).strict();
 export const RetainedResultPlan = z.object({ ...Identity, disposition: z.literal("retain-result"), reference: z.object({ archiveResourceId: z.string(), provenancePath: Absolute, provenanceSha256: Sha }).strict() }).strict();
 export const FinalizationResourcePlan = z.discriminatedUnion("disposition", [
   CleanupAdapterPlan,
+  RegisteredTreePlan,
+  ContainedFilePlan,
   z.object({ ...Identity, disposition: z.literal("retain-reference"), reference: z.object({ deliveryId: z.string(), type: z.enum(["pull-request", "ci-run"]), repository: z.string(), number: z.number().int().positive(), reviewedHead: z.string(), mergeCommit: z.string().optional() }).strict() }).strict(),
   z.object({ ...Identity, disposition: z.literal("already-released") }).strict(),
   RetainedArchivePlan,
@@ -243,7 +247,7 @@ function assertPlanDependencies(plan: FinalizationResourcePlan[]) {
       if (new Set(entry.dependencies).size !== entry.dependencies.length || entry.dependencies.includes(id)) throw new Error("Prepared cleanup dependency identity changed");
       for (const dependency of entry.dependencies) visit(dependency);
     }
-    if (entry.disposition === "retire-adapter") {
+    if ("stoppedConsumers" in entry) {
       if (new Set(entry.stoppedConsumers).size !== entry.stoppedConsumers.length || entry.stoppedConsumers.includes(id) || entry.stoppedConsumers.some(id => entry.dependencies.includes(id))) throw new Error("Prepared stopped-consumer identity changed");
       for (const id of entry.stoppedConsumers) {
         const consumer = entries.get(id);
@@ -269,16 +273,21 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
     return true;
   });
   if (!ownership.sourceCopyResourceId && input.originalWork) {
+    const { prepareRegisteredCaptures, hasRegisteredCaptureResource } = await import("./cleanup-filesystem.ts");
     const adapters = active.filter(resource => hasCleanupAdapter(resource.kind));
     const references = active.filter(resource => ["pull-request", "ci-run", "github-pull-request", "delivery-receipt"].includes(resource.kind));
-    const unsupported = active.filter(resource => !adapters.includes(resource) && !references.includes(resource));
-    if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
+    const unsupportedKinds = active.filter(resource => !adapters.includes(resource) && !references.includes(resource) && !hasRegisteredCaptureResource(resource, active));
+    if (unsupportedKinds.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupportedKinds.map(resource => `${resource.key} (${resource.kind})`).join(", ")}`);
     for (const resource of references) exceptional.push(referencePlan(resource, input.deliveries));
     if (adapters.length) {
       const context = input.adapterContext;
       if (!context || context.task.id !== input.taskId || context.task.primarySessionId !== input.sessionId) throw new Error("Physical adapter preparation requires the server-bound original task and committed cleanup capability");
       exceptional.push(...await prepareCleanupAdapterResources({ context, resources: observerResources(resources), identities: adapters.map(resource => ({ ...finalizationResourceIdentity(resource), purpose: z.enum(["development", "browser", "review"]).parse(resource.purpose) })) }, observation.adapters));
     }
+    exceptional.push(...await prepareRegisteredCaptures({ resources: active, plan: exceptional, ownedPaths: ownership.ownedPaths,
+      protectedPaths: [input.toolingRoot, ...(input.adapterContext ? [input.adapterContext.task.worktreePath, input.adapterContext.capability.checkout] : [])] }, observation));
+    const unsupported = active.filter(resource => !exceptional.some(entry => entry.id === resource.id));
+    if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
     assertPlanDependencies(exceptional);
     return exceptional;
   }
@@ -448,7 +457,11 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   }
   assertPlanDependencies(plan);
   const adapters = plan.filter((entry): entry is CleanupAdapterPlan => entry.disposition === "retire-adapter");
-  if (adapters.length) await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed }, observation.adapters);
+  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed }, observation.adapters) : undefined;
+  if (plan.some(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-contained")) {
+    const { assertRegisteredCaptures } = await import("./cleanup-filesystem.ts");
+    await assertRegisteredCaptures({ ...input, plan, adapterObservation }, observation);
+  }
   if (trees.length === 0 && input.originalWork && plan.every((entry) => entry.disposition !== "retire-owned")) return;
   if (trees.length !== 1) throw new Error("Finalization requires one exact retained source-root capture");
   const tree = trees[0]!, target = tree.target;

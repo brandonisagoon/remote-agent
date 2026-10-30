@@ -30,7 +30,7 @@ export function assertExternalResourceRecords(records: FinalizationResourceRecor
   if (resources.length !== records.length || resources.length !== plan.length) throw new Error("External finalization resource set changed");
   for (const entry of plan) {
     const record = resources.find((item) => item.id === entry.id);
-    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && ["retire-owned", "retire-adapter"].includes(entry.disposition) && record.state !== "released") throw new Error("External finalization resource identity or state changed");
+    if (!record || finalizationResourceIdentity(record).identityDigest !== entry.identityDigest || entry.disposition.startsWith("retain-") && record.state === "released" || entry.disposition === "already-released" && record.state !== "released" || removed && entry.disposition.startsWith("retire-") && record.state !== "released") throw new Error("External finalization resource identity or state changed");
   }
 }
 
@@ -84,6 +84,8 @@ async function approvalLineage(input: Context, sessionId: string, sequence: numb
 }
 
 export async function assertExternalBindingAuthority(prisma: ExternalDatabase, config: ServerConfig, binding: ExternalBinding, revision: number, options: { allowConfirmedClosed?: boolean } = {}) {
+  const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
+  await assertRegisteredCaptureSharing(prisma, binding.identity.taskId, binding.resources);
   // Historical approvals must also honor a later explicit revocation. The
   // present-day branch below binds the complete owner-history revision.
   if (binding.version === 1 && await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: binding.identity.sessionId, source: `owner:${binding.identity.taskId}`, action: "delivered-retirement-revoked", sequence: { gt: revision } } })) throw new Error("External cleanup was explicitly revoked after this binding");
@@ -143,9 +145,12 @@ export async function adoptExternalDeliveries(input: Context & { binding: Extern
   const adapterContext = !manifest.ownership.sourceCopyResourceId && originalWork && resources.some(resource => resource.state === "released" ? hasHistoricalCleanupAdapter(resource) : hasCleanupAdapter(resource.kind))
     ? { capability: await dependencies.cleanupObserver({ task: current.task, config: input.config }), task: { id: current.task.id, primarySessionId: current.session.id, worktreePath: current.identity.taskWorktree, toolingRevision: current.identity.toolingRevision } } : undefined;
   const plan = await dependencies.resources({ resources, taskId: input.taskId, sessionId: current.session.id, toolingRoot: current.task.pinnedToolingRoot, sourcePaths: manifest.deliveries.map((delivery) => delivery.sourcePath), deliveries, ownership: manifest.ownership, ...(adapterContext ? { adapterContext } : {}), ...(originalWork ? { originalWork: true, retainedArchives } : {}) });
+  const { assertRegisteredCaptureSharing } = await import("./cleanup-filesystem.ts");
+  await assertRegisteredCaptureSharing(input.prisma, input.taskId, plan);
   if (originalWork) {
     const overlaps = (left: string, right: string) => left === right || left.startsWith(`${right}${path.sep}`) || right.startsWith(`${left}${path.sep}`);
-    for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") {
+    for (const entry of plan) {
+      if (entry.disposition !== "retire-tree" && entry.disposition !== "retire-owned" || entry.target.type !== "tree") continue;
       const root = entry.target.path;
       if ([originalWork.archive, ...originalWork.additionalArchives ?? []].some((archive) => overlaps(root, archive.root)) || overlaps(root, originalWork.target.path)) throw new Error("Archive and original-work capture must stay outside every other cleanup root");
     }

@@ -75,4 +75,5 @@ export async function assertCleanupAdapterResources(input: { taskId: string; res
       if (!consumer || !families.length || families.some(target => consumer.presentTargetDigests.includes(target.identityDigest))) throw new Error("Prepared store retirement still has an active or unverified native consumer");
     }
   }
+  return result;
 }
