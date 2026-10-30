@@ -1,3 +1,7 @@
+import { publishChildIssueUpdate } from "../sessions/child-issues.ts";
+import { handleIssueWebhook } from "../../integrations/linear/webhooks/issue/handler.ts";
+import { cleanupStatusPayload, publishCleanupStatus } from "./cleanup-status.ts";
+import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 import { cleanupInboxDependencies } from "./cleanup-inbox.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -166,14 +170,15 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual finalizer closes afte
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
     .use("/api/tasks/task/automation", async (c, next) => {
       expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
-      expect(await db.prisma.runtimeIssueUpdate.count({ where: { published: false } })).toBe(1);
+      expect(await db.prisma.runtimeIssueUpdate.count({ where: { published: false, requestKey: "finalize:task:cleanup-report" } })).toBe(1);
       await next();
       expect(c.res.status).toBe(200);
       closures++;
       if (lostClose) { lostClose = false; c.res = Response.json({ error: "Close acknowledgement lost" }, { status: 503 }); }
-    }).post("/api/tasks/task/cleanup-report", async c => {
+    }).post("/api/tasks/task/cleanup-status", async c => c.json(await publishCleanupStatus({ ...f.context, requestKey: f.input.requestKey }, { ...issueUpdateDelivery, source: f.dependencies.source })))
+    .post("/api/tasks/task/cleanup-report", async c => {
       expect(await c.req.json<unknown>()).toEqual({ requestKey: f.input.requestKey });
-      expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
+      expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(1);
       try { return c.json(await publishCleanupReport({ ...f.context, requestKey: f.input.requestKey }, client)); }
       catch (error) { return c.json({ error: (error as Error).message }, 409); }
     }).route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
@@ -208,10 +213,13 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
   const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "idle", role: "primary" }]);
   const saved = { ...finalizationDependencies };
   const savedInbox = { ...cleanupInboxDependencies };
+  const repository = { ...f.config.repository, tooling: { root: process.env.DRAFTED_INTEGRATION_ROOT!, revision: "b".repeat(40) } };
+  f.config.repository = repository; f.config.repositories = { [repository.id]: repository };
   Object.assign(finalizationDependencies, f.dependencies);
   cleanupInboxDependencies.capability = async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "cleanup", source: "configured-host", taskToolingRevision: f.task.toolingRevision,
     capabilityRevision: "b".repeat(40), checkout: process.env.DRAFTED_INTEGRATION_ROOT!, instructions: path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "projects/greenfield/cleanup.md"), adapter: path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/cli.ts") }, instructions: "Disposable configured immutable capability fixture" });
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .post("/api/tasks/task/cleanup-status", async c => c.json(await publishCleanupStatus({ ...f.context, requestKey: f.input.requestKey }, { ...issueUpdateDelivery, source: f.dependencies.source })))
     .post("/api/tasks/task/cleanup-report", c => c.json({ error: "Linear is offline" }, 503))
     .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
   const socket = path.join(directory, "cli.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
@@ -253,7 +261,10 @@ for (const automatic of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRAT
       result = automaticResult;
     }
     if (result.code) throw new Error(JSON.stringify({ result, progress: await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "finalization-cleanup-progress" }, orderBy: { sequence: "desc" } }) }));
-    expect(result.stderr).toBe(""); expect(result.code).toBe(0);
+    const progress = result.stderr.trim().split("\n").filter(Boolean).map(line => JSON.parse(line));
+    expect(progress.length).toBeGreaterThan(0);
+    expect(progress.every(event => event.event === "cleanup-progress" && event.version === 1 && Number.isInteger(event.sequence))).toBe(true);
+    expect(result.stderr).not.toContain(f.worktree); expect(result.code).toBe(0);
     expect(JSON.parse(result.stdout)).toMatchObject({ taskId: f.task.id, closed: true, reporting: { state: "pending" } });
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
@@ -358,4 +369,238 @@ test("uncertain GraphQL and mismatched report identities preserve closure and ne
   }
   expect(f.requests.filter(request => request.query.includes("CreateThreadedIssueComment"))).toHaveLength(0);
   expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: f.frozen.id } })).published).toBe(false);
+});
+
+
+async function visibleFixture() {
+  const f = await fixture();
+  f.states.push({ id: "cleanup", name: "Cleanup", type: "completed" });
+  const comments = new Map<string, { id: string; issue: { id: string }; body: string }>();
+  const writes: string[] = [];
+  const client = { ...issueUpdateDelivery, source: f.dependencies.source, read: async () => f.issue,
+    graph: async () => ({ id: f.issue.id, identifier: f.issue.identifier, states: f.states, children: [] }),
+    update: async (_config: unknown, _query: unknown, value: { stateId?: string }) => { f.issue.state = f.states.find(state => state.id === value.stateId)!; writes.push(f.issue.state.name); },
+    comment: async (_credential: unknown, id: string) => comments.get(id) ?? null,
+    create: async (_credential: unknown, value: { id?: string; issueId: string; body: string }) => {
+      if (!value.id) throw new Error("Missing durable comment ID");
+      comments.set(value.id, { id: value.id, issue: { id: value.issueId }, body: value.body }); return { id: value.id };
+    } };
+  const context = { ...f.context, requestKey: f.input.requestKey };
+  const prepare = () => prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  const confirm = () => confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  return { ...f, context, client, comments, writes, prepare, confirm };
+}
+
+test("visible cleanup uses the real API, preserves original proof, and reports Done only after confirmation", async () => {
+  const f = await visibleFixture();
+  const saved = { ...issueUpdateDelivery }, savedReport = { ...cleanupReportDelivery };
+  Object.assign(issueUpdateDelivery, f.client); Object.assign(cleanupReportDelivery, f.client);
+  const runtime = createFakeAgentRuntime([{ ...f.session, status: "idle" }]);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient })).route("/api/tasks", taskRoutes);
+  const post = (endpoint: string) => app.request(`/api/tasks/task/${endpoint}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
+  try {
+    expect((await post("cleanup-status")).status).toBe(409); expect(f.writes).toEqual([]);
+    await f.prepare();
+    const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } } });
+    expect((await post("cleanup-status")).status).toBe(200); expect(f.issue.state.name).toBe("Cleanup");
+    expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).status).toBe("idle");
+    expect(runtime.closedSessionIds).toEqual([]);
+    expect(await handleIssueWebhook({ prisma: db.prisma, config: f.config, agentRuntime: runtime, deliveryId: "cleanup-status-webhook", webhook: {
+      type: "Issue", action: "update", webhookTimestamp: Date.now(), actor: { id: f.config.agentUserId },
+      data: { id: f.issue.id, identifier: f.issue.identifier, state: f.issue.state }, updatedFrom: { stateId: "merge" },
+    } })).toEqual({ kind: "ignored" });
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0); expect(await db.prisma.runtimeSession.count()).toBe(1);
+    const start = await db.prisma.runtimeIssueUpdate.findFirstOrThrow();
+    expect((await post("cleanup-status")).status).toBe(200); expect(f.comments.size).toBe(1);
+    await expect(publishSessionIssueUpdate({ ...f.input, requestKey: "premature", state: "Done", expectedState: "Cleanup", body: "Not confirmed", evidence: [] }, f.client)).rejects.toThrow();
+    expect(f.issue.state.name).toBe("Cleanup");
+    // The state is visibility, not a new effect guard or a changed proof.
+    expect((await assertPreparedCleanup(f.input)).prepared.taskId).toBe(f.task.id);
+    f.remove(); await f.confirm();
+    expect((await post("cleanup-report")).status).toBe(200); expect(f.writes).toEqual(["Cleanup", "Done"]);
+    expect((await post("cleanup-status")).status).toBe(200); expect(await (await post("cleanup-status")).json()).toEqual({ state: "superseded" });
+    expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(proof => proof.sequence) } } })).toEqual(proofs);
+  } finally { Object.assign(issueUpdateDelivery, saved); Object.assign(cleanupReportDelivery, savedReport); }
+});
+
+test.each(["missing", "Done", "Blocked"])("%s status never grants authority, rewinds an owner state, or blocks cleanup", async shape => {
+  const f = await visibleFixture(); await f.prepare();
+  if (shape === "missing") f.states.pop(); else f.issue.state = f.states.find(state => state.name === shape)!;
+  expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: shape === "missing" ? "unavailable" : "superseded" });
+  expect(f.comments.size).toBe(0); f.remove(); await f.confirm();
+  expect((await publishCleanupReport(f.context, f.client)).published).toBe(true);
+  expect(f.writes).toEqual(shape === "missing" ? ["Done"] : []);
+  expect((await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: "finalize:task:cleanup-report" } })).input).not.toHaveProperty("state");
+});
+
+test("lost Cleanup status response becomes a saved Done report; old pending start cannot replay after closure", async () => {
+  const f = await visibleFixture(); await f.prepare();
+  await expect(publishCleanupStatus(f.context, { ...f.client, update: async (...args) => { await f.client.update(...args); throw new Error("lost status response"); } })).rejects.toThrow("lost status response");
+  const start = await db.prisma.runtimeIssueUpdate.findFirstOrThrow();
+  expect(start).toMatchObject({ commentPosted: true, published: false }); expect(f.issue.state.name).toBe("Cleanup");
+  f.remove(); await f.confirm();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed" } });
+  await expect(publishCleanupReport(f.context, { ...f.client, update: async (...args) => { await f.client.update(...args); throw new Error("lost Done response"); } })).rejects.toThrow("lost Done response");
+  expect(f.issue.state.name).toBe("Done");
+  expect((await publishCleanupReport(f.context, f.client)).published).toBe(true);
+  expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "superseded" });
+  expect(f.writes).toEqual(["Cleanup", "Done"]);
+  expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
+});
+
+test("owner change supersedes a pending Cleanup handoff without pretending it published", async () => {
+  const f = await visibleFixture(); await f.prepare();
+  await expect(publishCleanupStatus(f.context, { ...f.client, update: async () => { throw new Error("offline"); } })).rejects.toThrow("offline");
+  const start = await db.prisma.runtimeIssueUpdate.findFirstOrThrow(); f.issue.state = f.states.find(state => state.name === "Blocked")!;
+  expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "superseded" });
+  f.remove(); await f.confirm(); await publishCleanupReport(f.context, f.client);
+  expect(f.issue.state.name).toBe("Blocked"); expect(f.writes).toEqual([]);
+  expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
+});
+
+test.each(["pause", "revocation"])("Cleanup publication rechecks %s before its state effect", async change => {
+  const f = await visibleFixture(); await f.prepare();
+  const client = { ...f.client, create: async (...args: Parameters<typeof f.client.create>) => {
+    const result = await f.client.create(...args);
+    if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); else await f.revoke();
+    return result;
+  } };
+  await expect(publishCleanupStatus(f.context, client)).rejects.toThrow();
+  expect(f.writes).toEqual([]); expect(f.issue.state.name).toBe("Merge");
+  expect((await db.prisma.runtimeIssueUpdate.findFirstOrThrow()).published).toBe(false);
+});
+
+test("manual Cleanup and arbitrary publication payload cannot substitute for an operation", async () => {
+  const f = await visibleFixture(); f.issue.state = f.states.find(state => state.name === "Cleanup")!;
+  await expect(publishSessionIssueUpdate({ ...f.input, requestKey: "manual", state: "Cleanup", expectedState: "Cleanup", body: "fake", evidence: [] }, f.client)).rejects.toThrow();
+  expect(f.comments.size).toBe(0);
+  f.issue.state = f.states[0]!; await f.prepare();
+  const active = await assertPreparedCleanup(f.input);
+  await expect(publishSessionIssueUpdate({ ...f.input, ...cleanupStatusPayload(active), body: "different" }, f.client)).rejects.toThrow("prepared handoff");
+  expect(f.writes).toEqual([]);
+});
+
+
+test.each(["read", "state"])("normal final status recovers a %s outage without requiring Cleanup publication", async point => {
+  const f = await visibleFixture(); await f.prepare();
+  await expect(publishCleanupStatus(f.context, { ...f.client,
+    ...(point === "read" ? { source: async () => { throw new Error("source offline"); } } : { update: async () => { throw new Error("state offline"); } }),
+  })).rejects.toThrow("offline");
+  const start = await db.prisma.runtimeIssueUpdate.findFirstOrThrow();
+  expect(start).toMatchObject({ published: false, commentPosted: point === "state" });
+  expect(f.issue.state.name).toBe("Merge"); f.remove(); await f.confirm();
+  const report = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: CLEANUP_REPORT } });
+  expect(JSON.parse(report.value!)).toMatchObject({ statusHandoff: { startReportId: start.id, expectedStates: ["Merge", "Cleanup"], state: "Done" } });
+  await publishCleanupReport(f.context, f.client); expect(f.issue.state.name).toBe("Done");
+  expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "superseded" });
+  expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
+  expect(f.writes).toEqual(["Done"]);
+});
+
+test("in-flight Cleanup and confirmed Done share source publication ordering", async () => {
+  const f = await visibleFixture(); await f.prepare();
+  const reached = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const start = publishCleanupStatus(f.context, { ...f.client, update: async (...args) => {
+    reached.resolve(); await release.promise; return f.client.update(...args);
+  } });
+  try {
+    await reached.promise; f.remove(); await f.confirm();
+    const done = publishCleanupReport(f.context, f.client);
+    await Promise.resolve(); expect(f.writes).toEqual([]);
+    release.resolve(); expect(await start).toEqual({ state: "superseded" });
+    expect((await done).published).toBe(true); expect(f.writes).toEqual(["Cleanup", "Done"]);
+    const pending = await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: "finalize:task:cleanup" } });
+    expect(pending.published).toBe(false);
+    expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "superseded" });
+    expect(f.writes).toEqual(["Cleanup", "Done"]);
+  } finally { release.resolve(); await start; }
+});
+
+for (const offline of [false, true]) test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)(`actual Drafted finalizer reports visible stages through Unix API (initial reporting offline=${offline})`, async () => {
+  const f = await visibleFixture();
+  const original = await f.prepare();
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } });
+  const saved = { ...issueUpdateDelivery }, savedReport = { ...cleanupReportDelivery }, savedFinalization = { ...finalizationDependencies };
+  Object.assign(issueUpdateDelivery, f.client, offline ? { source: async () => { throw new Error("source reporting offline"); } } : {});
+  Object.assign(cleanupReportDelivery, f.client); Object.assign(finalizationDependencies, f.dependencies);
+  const runtime = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "idle", role: "primary" }]);
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .use("/api/tasks/task/automation", async (c, next) => {
+      expect(f.issue.state.name).toBe("Done");
+      expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { runtimeSessionId_requestKey: { runtimeSessionId: f.session.id, requestKey: "finalize:task:cleanup-report" } } })).published).toBe(true);
+      await next();
+    }).route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(directory, "visible.sock"), server = Bun.serve({ unix: socket, fetch: app.fetch });
+  const stop = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {}, { prepareFinalization: value => prepareTaskFinalization(value, f.dependencies) });
+  try {
+    const { taskRegistry, closeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/control.ts"));
+    const { finalizeTask } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/finalize.ts"));
+    const registry = taskRegistry(socket, f.task.id), close = () => closeTask(socket, f.task.id);
+    expect(await finalizeTask({ registry, close, cleanup: true })).toMatchObject({ closed: true, reporting: { state: "published" } });
+    expect(f.writes).toEqual(offline ? ["Done"] : ["Cleanup", "Done"]);
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    expect(await finalizeTask({ registry, close, cleanup: true, runner: async () => { throw new Error("must not repeat effects"); } })).toMatchObject({ closed: true, alreadyClosed: true });
+    expect(runtime.closedSessionIds).toEqual([f.session.id]);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+    expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.preparedRevision } })).value).toBe(frozen[0]!.value);
+  } finally { await stop(); await server.stop(true); Object.assign(issueUpdateDelivery, saved); Object.assign(cleanupReportDelivery, savedReport); Object.assign(finalizationDependencies, savedFinalization); }
+}, 30_000);
+
+
+test("wrong-category Cleanup is unavailable while confirmed normal delivery still reports Done", async () => {
+  const f = await visibleFixture(); f.states.find(state => state.name === "Cleanup")!.type = "started";
+  await f.prepare(); expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "unavailable" });
+  expect(f.comments.size).toBe(0); f.remove(); await f.confirm();
+  await publishCleanupReport(f.context, f.client); expect(f.writes).toEqual(["Done"]);
+});
+
+test("published Cleanup followed by owner return to Merge is preserved by final reporting", async () => {
+  const f = await visibleFixture(); await f.prepare(); await publishCleanupStatus(f.context, f.client);
+  const start = await db.prisma.runtimeIssueUpdate.findFirstOrThrow(); expect(start.published).toBe(true);
+  f.issue.state = f.states[0]!;
+  expect(await publishCleanupStatus(f.context, f.client)).toEqual({ state: "superseded" });
+  f.remove(); await f.confirm(); await publishCleanupReport(f.context, f.client);
+  expect(f.issue.state.name).toBe("Merge"); expect(f.writes).toEqual(["Cleanup"]);
+  expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
+});
+
+
+async function childStatusFixture() {
+  const f = await visibleFixture(); await f.prepare();
+  const child = { ...f.issue, id: "child", identifier: "DRA-CHILD" };
+  const client = { ...f.client, read: async (_config: unknown, query: { id: string }) => query.id === child.id ? child : f.issue,
+    graph: async (_config: unknown, query: { id: string }) => ({ id: query.id, identifier: query.id === child.id ? child.identifier : f.issue.identifier, states: f.states,
+      children: query.id === child.id ? [] : [{ id: child.id, identifier: child.identifier, title: "Child", url: "https://linear.app/child", state: child.state, completedAt: null,
+        parent: { id: f.issue.id, identifier: f.issue.identifier }, blockedBy: [], blocks: [] }] }),
+    update: async (_config: unknown, _query: unknown, value: { stateId?: string }) => { child.state = f.states.find(state => state.id === value.stateId)!; f.writes.push(child.state.name); },
+  };
+  return { ...f, child, client, parentClient: f.client };
+}
+
+test("actual child publisher cannot borrow the parent's prepared Cleanup handoff", async () => {
+  const f = await childStatusFixture(), payload = cleanupStatusPayload(await assertPreparedCleanup(f.input));
+  await expect(publishChildIssueUpdate({ ...f.input, ...payload, childIssueId: f.child.id }, f.client)).rejects.toThrow("original prepared source");
+  expect(f.writes).toEqual([]); expect(f.comments.size).toBe(0);
+  expect(await db.prisma.runtimeIssueUpdate.count()).toBe(0);
+  expect(f.child.state.name).toBe("Merge");
+  expect(await publishCleanupStatus(f.context, f.parentClient)).toMatchObject({ state: "published" });
+  f.remove(); await f.confirm(); await publishCleanupReport(f.context, f.parentClient);
+  expect(f.issue.state.name).toBe("Done");
+});
+
+test("ordinary child completion from owner Cleanup does not require parent environment teardown", async () => {
+  const f = await childStatusFixture(); f.child.state = f.states.find(state => state.name === "Cleanup")!;
+  const before = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } } });
+  expect(await publishChildIssueUpdate({ ...f.input, childIssueId: f.child.id, requestKey: "child-done", body: "Child work meets its accepted boundary; parent environment remains in use.", state: "Done", expectedState: "Cleanup", evidence: [] }, f.client)).toMatchObject({ published: true, state: "Done" });
+  expect(f.child.state.name).toBe("Done"); expect(f.issue.state.name).toBe("Merge");
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(before);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(row => row.sequence) } } })).toEqual(proofs);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+  expect(git(f.worktree, "rev-parse", "HEAD")).toBe(f.remote.remoteHead);
 });
