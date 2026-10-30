@@ -12,7 +12,7 @@ const DockerScope = z.strictObject({ ...Scope, project: Nonempty.optional(), ope
   compose: z.strictObject({ file: Absolute, sha256: Hash, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), member: Nonempty }).optional(),
 });
 const DockerIdentity = z.strictObject({ createdAt: z.string().min(1), labelsDigest: Hash });
-const ProviderScope = { ...Scope, runtimeFile: Absolute, recipeHash: Hash };
+const ProviderScope = { ...Scope, runtimeFile: Absolute, credentialsFile: Absolute, recipeHash: Hash };
 
 /** Only known provider/host identity fields cross the observer boundary.
  * Credentials, environment values, scripts and arbitrary commands do not. */
