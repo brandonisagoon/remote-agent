@@ -26,6 +26,9 @@ import { assertRetirementResourcePreflight } from "./retirement-preview.ts";
 import { retainedDevelopmentFixture } from "../../../../test-support/retained-development-fixture.ts";
 import { cleanupProjection, cleanupReportDelivery } from "./cleanup-report.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
+import { clerkCreationRecord } from "../../../../test-support/clerk-creation-fixture.ts";
+import { legacyClerkUserScript, legacyClerkJwksScript } from "./clerk-creation-recipe.ts";
+import { prepareClerkCreation, commitClerkCreation } from "./clerk-creation-evidence.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -420,6 +423,114 @@ async function resourceScopeFixture(kind: "environment" | "clerk" = "environment
   const put = (value: object) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
   return { ...f, environment: root, values, prepared, active, app, keys, renew, put };
 }
+
+async function originalCreatedClerkFixture() {
+  const f = await fixture("scopetask");
+  f.config.acpxStateDir = path.join(directory, "acpx");
+  const environment = path.join(directory, "environments", f.task.id), email = "dra75.scopetas+clerk_test@example.com", instanceId = "ins_Original";
+  await mkdir(path.join(environment, "scripts"), { recursive: true, mode: 0o700 });
+  await mkdir(path.join(f.config.acpxStateDir, "sessions"), { recursive: true });
+  await writeFile(path.join(environment, "scripts/clerk-user.ts"), legacyClerkUserScript("DRA-75", email), { mode: 0o644 });
+  await writeFile(path.join(environment, "scripts/clerk-jwks.ts"), legacyClerkJwksScript, { mode: 0o644 });
+  await writeFile(path.join(environment, "clerk-user.json"), JSON.stringify({ userId: "user_Original", email, password: "private-fixture-value" }), { mode: 0o600 });
+  await db.prisma.remoteTaskResource.create({ data: { id: "environment", taskId: f.task.id, key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, state: "ready", metadata: { envDirectory: environment, composeFile: path.join(environment, "compose.yml") } } });
+  await db.prisma.remoteTaskResource.create({ data: { id: "export", taskId: f.task.id, key: "credentials-export-development", kind: "private-file", purpose: "development", externalId: path.join(environment, "provider.src.env"), state: "ready", metadata: {} } });
+  const resource = await db.prisma.remoteTaskResource.create({ data: { id: "created-user", taskId: f.task.id, key: "clerk-test-user-development", kind: "clerk-test-user", purpose: "development", externalId: "user_Original", state: "ready",
+    metadata: { instance: `Clerk test instance (sk_test/pk_test guarded), kid ${instanceId}`, email, credentialsFile: "<envDirectory>/clerk-user.json (0600)" } } });
+  const actor = await db.prisma.runtimeSession.create({ data: { id: "environment-delegate", scopeKey: "environment-delegate", acpxRecordId: "environment-delegate", acpxSessionId: "original-provider-session", role: "delegate", agentCommand: "claude", status: "closed", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  const relation = await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: actor.id, targetSessionId: f.session.id, relationship: "spawned-by", endedAt: new Date() } });
+  const record = clerkCreationRecord({ actor: { ...actor, acpxRecordId: actor.acpxRecordId!, acpxSessionId: actor.acpxSessionId! }, taskId: f.task.id, environment, instanceId, email, resource, resourceCreatedAt: resource.createdAt.toISOString() });
+  const recordPath = path.join(f.config.acpxStateDir, "sessions", `${actor.acpxRecordId}.json`);
+  await writeFile(recordPath, JSON.stringify(record), { mode: 0o644 });
+  await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+  const original = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const renew = () => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, resourceKeys: [resource.key] }) });
+  return { ...f, environment, resource, actor, relation, record, recordPath, active, original, app, renew };
+}
+
+test("original structured Clerk creation is frozen once outside the unchanged v1 preparation and operation", async () => {
+  const f = await originalCreatedClerkFixture(), response = await f.renew();
+  expect(response.status).toBe(200); const first: any = await response.json();
+  expect(first.clerkCreation).toMatchObject({ taskId: f.task.id, sessionId: f.session.id, resourceId: f.resource.id, userId: f.resource.externalId,
+    instanceId: "ins_Original", preparedRevision: f.active.preparation.sequence, operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) });
+  const fact = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: first.clerkCreation.evidenceRevision } });
+  expect(fact.action).toBe("cleanup-clerk-original-creation"); expect(first.clerkCreation.evidenceDigest).toBe(finalizationDigest(JSON.parse(fact.value!)));
+  expect(fact.value).not.toContain("private-fixture-value"); expect(fact.value).not.toContain("CLERK_SECRET_KEY");
+  await rm(f.recordPath); await rm(f.environment, { recursive: true });
+  expect(await (await f.renew()).json()).toEqual(first);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: f.original.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(f.original);
+  expect((await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "cleanup-clerk-original-creation" } })).length).toBe(1);
+});
+
+test.each(["missing", "reused", "script", "local-user", "foreign-claim", "pause", "relation"])("original Clerk scoped renewal refuses %s without recording provenance or authority", async change => {
+  const f = await originalCreatedClerkFixture();
+  if (change === "missing") await rm(f.recordPath);
+  if (change === "reused") {
+    const result = f.record.messages[0]!.Agent.tool_results["create-exact-user"]! as any;
+    result.output = result.output.replace('"created":true', '"created":false'); result.content.Text = result.output;
+    await writeFile(f.recordPath, JSON.stringify(f.record));
+  }
+  if (change === "script") await writeFile(path.join(f.environment, "scripts/clerk-user.ts"), "console.log('created:true')");
+  if (change === "local-user") await writeFile(path.join(f.environment, "clerk-user.json"), JSON.stringify({ userId: "user_Other", email: "wrong@example.com", password: "private-fixture-value" }));
+  if (change === "foreign-claim") await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "other-purpose-claim", kind: "clerk-test-session", purpose: "review", externalId: "sess_Shared", state: "ready", metadata: { userId: f.resource.externalId } } });
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "relation") await db.prisma.runtimeSessionRelation.update({ where: { id: f.relation.id }, data: { relationship: "notifies-parent" } });
+  const result = await f.renew(); expect(result.status).toBe(409); const body = await result.text(); expect(body).not.toContain("private-fixture-value");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-clerk-original-creation" } })).toBe(0);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
+});
+
+test("original Clerk creator relationship is compared again after bounded file observation", async () => {
+  const f = await originalCreatedClerkFixture(), prepared = await prepareClerkCreation(db.prisma, f.config, f.active, [f.resource.key]);
+  await db.prisma.runtimeSession.update({ where: { id: f.actor.id }, data: { acpxSessionId: "replaced-provider-session" } });
+  await expect(db.prisma.$transaction(async tx => commitClerkCreation(tx, await assertPreparedCleanup({ ...f.input, prisma: tx }), prepared!))).rejects.toThrow("relationship changed");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-clerk-original-creation" } })).toBe(0);
+});
+
+test.skipIf(!process.env.DRAFTED_CLERK_INTEGRATION_ROOT)("actual original creation witness survives lost renewal/delete/receipt replies and rejects final-read claims", async () => {
+  const f = await originalCreatedClerkFixture(), socket = path.join(directory, "original-clerk.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const root = process.env.DRAFTED_CLERK_INTEGRATION_ROOT!, { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { cleanupClerkProvider } = await import(path.join(root, "src/cleanup-observer-clerk.ts"));
+    const { manageResource } = await import(path.join(root, "src/resources.ts"));
+    const registry = taskRegistry(socket, f.task.id, 3000), journalRoot = path.join(directory, "clerk-retry");
+    let present = true, reads = 0, effects = 0, loseRenew = true, loseDelete = true, loseReceipt = true, lateClaim = true, pause = false;
+    await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    const renew = registry.renewCleanupAuthority;
+    registry.renewCleanupAuthority = async (input: unknown) => { const value = await renew(input); if (loseRenew) { loseRenew = false; throw new Error("lost original creation witness reply"); } return value; };
+    const task = registry.task;
+    registry.task = async () => { const value = await task(); if (lateClaim && reads >= 2) { lateClaim = false; await db.prisma.remoteTaskResource.create({ data: { id: "late-shared", taskId: "other", key: "shared", kind: "clerk-test-session", purpose: "review", externalId: "sess_Shared", state: "ready", metadata: { userId: f.resource.externalId } } }); } return value; };
+    const provider = cleanupClerkProvider(async (url: string | URL, options: RequestInit) => {
+      const route = new URL(String(url)).pathname;
+      if (route === "/v1/instance") return Response.json({ id: "ins_Original", environment_type: "development" });
+      if (route !== `/v1/users/${f.resource.externalId}`) throw new Error("Unselected provider target");
+      if (options.method === "GET") { reads++; if (pause) { pause = false; await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); }
+        return present ? Response.json({ id: f.resource.externalId, created_at: 1793223854938, email_addresses: [{ email_address: "dra75.scopetas+clerk_test@example.com" }] }) : new Response(null, { status: 404 }); }
+      if (options.method !== "DELETE") throw new Error("Unsupported provider effect");
+      effects++; present = false; if (loseDelete) { loseDelete = false; throw new Error("lost exact DELETE reply"); }
+      return Response.json({ id: f.resource.externalId, deleted: true });
+    }, async () => ({ descriptor: { backupFile: path.join(directory, "fixed.enc.json"), backupSha256: "a".repeat(64), keyFile: path.join(directory, "fixed.key"), keyId: "b".repeat(64) }, secret: "sk_test_disposable" }));
+    const run = () => manageResource({ registry, key: f.resource.key, action: "release", clerk: { provider, journalRoot } });
+    await expect(run()).rejects.toThrow("lost original creation witness reply"); expect(reads).toBe(0); expect(effects).toBe(0);
+    const fact = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "cleanup-clerk-original-creation" } });
+    await rm(f.recordPath); await rm(f.environment, { recursive: true });
+    await expect(run()).rejects.toThrow("shared"); expect(effects).toBe(0);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-shared" } });
+    pause = true; await expect(run()).rejects.toThrow(); expect(effects).toBe(0);
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    await expect(run()).rejects.toThrow("Clerk cleanup request failed"); expect(effects).toBe(1);
+    const write = registry.resource;
+    registry.resource = async (value: unknown) => { await write(value); if (loseReceipt) { loseReceipt = false; throw new Error("lost original Released reply"); } };
+    await expect(run()).rejects.toThrow("lost original Released reply");
+    expect(await run()).toMatchObject({ state: "released" }); expect(effects).toBe(1);
+    const released = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }); expect(released.metadata).toEqual(f.resource.metadata);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: f.original.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(f.original);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "cleanup-clerk-original-creation" } })).toEqual([fact]);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+  } finally { await server.stop(true); }
+}, 30_000);
 
 async function legacyPreviewFixture(review = false, change?: (values: any[]) => void, uuidFormat = false) {
   const f = await fixture();
@@ -1489,3 +1600,87 @@ test.skipIf(!process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT)("actual privat
     expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
   } finally { await stopPreparation(); server.stop(true); }
 }, 20_000);
+
+async function nativeAppScopeFixture() {
+  const f = await fixture("native-task"), env = path.join(directory, "environments", f.task.id), project = `drafted-${f.task.id}-development`;
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+  const processes = { api: { pid: 101, listen: "127.0.0.1:19711" }, parcelWorker: { pid: 102, health: "http://127.0.0.1:19714/health" }, web: { pid: 103, listenerPid: 104, listen: "[::1]:19710" }, flagsFixture: { pid: 105, listen: "https://127.0.0.1:19712" }, proxy: { pid: 106, listen: "127.0.0.1:19713" } };
+  const values = [
+    { id: "apps-r2", key: "local-http-development-r2", kind: "local-http", purpose: "development", state: "released", externalId: "http://localhost:19713", metadata: { supersedes: "local-http-development (released)", launcher: "<envDirectory>/run.sh <api|web|posthog|proxy|worker>", pidFiles: "<envDirectory>/*.pid", processes } },
+    { id: "apps-r3", key: "local-http-development-r3", kind: "local-http", purpose: "development", state: "released", externalId: "http://localhost:19713", metadata: { supersedes: "local-http-development-r2", processes: { api: { ...processes.api, pid: 107, spatial: "Neon task_spatial" }, parcelWorker: { ...processes.parcelWorker, pid: 108, spatial: "Neon task_spatial" }, web: { listen: processes.web.listen }, flagsFixture: { listen: processes.flagsFixture.listen }, proxy: { listen: processes.proxy.listen } } } },
+    { id: "apps-compose", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", state: "ready", externalId: project, metadata: { composeFile: path.join(env, "compose.yml"), envDirectory: env } },
+    { id: "apps-neon", key: "spatial-neon-development", kind: "neon-branch-database", purpose: "development", state: "ready", externalId: "br-original/task_spatial", metadata: { runtimeDatabase: "task_spatial", supersedes: "local PostGIS in compose-development-r2 (stopped by owner cutover; volume retained; not restarted)", cutoverReceipt: path.join(directory, "cutovers", project, "receipt.private.json") } },
+  ];
+  for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const keys = values.map(value => value.key).sort(), pids = [103, 104, 105, 107, 108, 109];
+  const renew = (nativePids: number[] | undefined = pids, resourceKeys: string[] | undefined = keys) => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, resourceKeys, nativePids }) });
+  return { ...f, values, keys, pids, env, prepared, active, app, renew };
+}
+
+test("native app scope binds original Released aliases and exact PID exclusions without changing the original operation", async () => {
+  const f = await nativeAppScopeFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const before = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  const response = await f.renew([...f.pids].reverse()); expect(response.status).toBe(200);
+  const value = await response.json();
+  expect(value).toMatchObject({ preparedRevision: f.prepared.preparedRevision, cleanup: { operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) }, nativeApps: { version: 1, pids: f.pids } });
+  expect(value.nativeApps.recordedBefore).toBe(frozen.find(row => row.sequence === f.prepared.preparedRevision)!.occurredAt.toISOString());
+  expect(value.resources).toEqual(before.map(resource => ({ id: resource.id, key: resource.key, identityDigest: finalizationResourceIdentity(resource).identityDigest })).sort((a, b) => a.key.localeCompare(b.key)));
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(before);
+});
+
+test.each(["root", "released-descendant", "same-task-alias", "environment", "worktree", "pause", "revoke", "changed-resource", "missing-root", "partial-scope", "wrong-scope", "duplicate", "oversized"])("native app scope refuses %s before any effect authority", async change => {
+  const f = await nativeAppScopeFixture();
+  expect((await f.renew()).status).toBe(200);
+  const foreign = ["root", "released-descendant", "environment", "worktree"].includes(change);
+  if (foreign) await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "foreign", toolingRoot: f.root, toolingRevision: "b".repeat(40), ...(change === "worktree" ? { worktreePath: path.join(f.worktree, "nested") } : {}) } });
+  if (["root", "released-descendant", "same-task-alias", "environment"].includes(change)) await db.prisma.remoteTaskResource.create({ data: { taskId: change === "same-task-alias" ? f.task.id : "foreign", key: "new-claim", kind: change === "environment" ? "directory" : "local-http", purpose: "development", state: change === "released-descendant" ? "released" : "ready", externalId: change === "environment" ? path.join(f.env, "child") : "http://localhost:1", metadata: { pid: change === "root" ? 107 : 109 } } });
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "revoke") await f.revoke();
+  if (change === "changed-resource") await db.prisma.remoteTaskResource.update({ where: { id: "apps-r3" }, data: { metadata: { changed: true } } });
+  const pids = change === "missing-root" ? [109] : change === "duplicate" ? [...f.pids, 109] : change === "oversized" ? Array.from({ length: 257 }, (_, index) => index + 1) : f.pids;
+  const keys = change === "partial-scope" ? [f.keys[0]!] : change === "wrong-scope" ? ["spatial-neon-development"] : f.keys;
+  const response = await f.renew(pids, keys); expect(response.status).toBe(["duplicate", "oversized"].includes(change) ? 400 : 409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+});
+
+test.skipIf(!process.env.DRAFTED_NATIVE_APPS_INTEGRATION_ROOT || process.platform !== "darwin")("actual native apps and Unix authority stop only the frozen family, reject late claims and recover the same proof", async () => {
+  const f = await fixture("original71"), root = process.env.DRAFTED_NATIVE_APPS_INTEGRATION_ROOT!;
+  const { nativeAppFixture } = await import(path.join(root, "test/fixtures/native-apps.ts"));
+  const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+  const { stopRecordedTaskApps } = await import(path.join(root, "src/legacy-native.ts"));
+  const { inspectHostProcess } = await import(path.join(root, "src/runtime-transfer-host.ts"));
+  const { terminateHostProcess } = await import(path.join(root, "src/runtime-transfer-signal.ts"));
+  const p = await nativeAppFixture({ root: directory, taskId: f.task.id, checkout: f.worktree });
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+    for (const value of p.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
+    git(f.worktree, "add", "apps", "node_modules"); git(f.worktree, "commit", "-m", "Disposable native app fixture");
+    f.remote.remoteHead = git(f.worktree, "rev-parse", "HEAD"); f.remote.pullRequest.headRefOid = f.remote.remoteHead;
+    await recordCompletionVerification({ ...f.context, verification: { requestKey: "native-verified", passed: true, evidence: ["Disposable native fixtures verified"] } });
+    await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), resources = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } });
+    await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "foreign", toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+    const socket = path.join("/private/tmp", `native-apps-${crypto.randomUUID().slice(0, 8)}.sock`); server = Bun.serve({ unix: socket, fetch: app.fetch });
+    const registry = taskRegistry(socket, f.task.id, 3000); let lateClaim = true, loseReply = true;
+    p.provider.terminate = async (process: any, beforeSignal: () => Promise<void>) => {
+      await terminateHostProcess(process, async (pid: number) => { const current = await inspectHostProcess(pid);
+        if (lateClaim) { lateClaim = false; await db.prisma.remoteTaskResource.create({ data: { id: "late-claim", taskId: "foreign", key: "claimed-child", kind: "local-http", purpose: "review", state: "released", externalId: "http://localhost:1", metadata: { pid } } }); }
+        return current;
+      }, beforeSignal); p.signalled.push(process.pid);
+    };
+    const run = () => stopRecordedTaskApps({ registry, provider: p.provider, proofDirectory: p.proofs, afterSignal: async () => { if (loseReply) { loseReply = false; throw Error("lost signal reply"); } } });
+    await expect(run()).rejects.toThrow("another resource owner"); expect(p.signalled).toEqual([]);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-claim" } });
+    await expect(run()).rejects.toThrow("lost signal reply"); expect(p.signalled).toHaveLength(1);
+    await run(); await run(); expect(p.signalled.sort()).toEqual(p.children.map((child: any) => child.pid).sort()); expect(p.signalled).not.toContain(process.pid);
+    expect(await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } })).toEqual(resources);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(active.operation);
+  } finally { await p.cleanup(); server?.stop(true); }
+}, 30_000);

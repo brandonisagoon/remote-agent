@@ -23,7 +23,7 @@ import { BrowserStopInput, resolveBrowserStopAuthority } from "../../services/ta
 import { LocalServiceStopInput, resolveLocalServiceStopAuthority } from "../../services/tasks/local-service-stop-authority.ts";
 import { FinalizationInput, prepareTaskFinalization, confirmTaskFinalization } from "../../services/tasks/finalization.ts";
 import { renewCleanupAuthority } from "../../services/tasks/cleanup-authority.ts";
-import { CleanupResourceKeys } from "../../services/tasks/cleanup-resource-scope.ts";
+import { CleanupResourceKeys, CleanupNativePids } from "../../services/tasks/cleanup-resource-scope.ts";
 import { externalFinalizationProjection } from "../../services/tasks/external-finalization.ts";
 import { assertLegacyEvidenceResourceUpdate, legacyEvidenceProjection } from "../../services/tasks/legacy-evidence.ts";
 import { assertCleanupResourceUpdate } from "../../services/tasks/cleanup-lifecycle.ts";
@@ -88,7 +88,7 @@ sessionTaskRoutes.post("/:sessionId/reply-context", async (c) => {
 });
 
 taskRoutes.post("/:taskId/cleanup-authority", async (c) => {
-  const parsed = FinalizationInput.pick({ requestKey: true, finalizationVersion: true }).extend({ resourceKeys: CleanupResourceKeys.optional() }).safeParse(await c.req.json());
+  const parsed = FinalizationInput.pick({ requestKey: true, finalizationVersion: true }).extend({ resourceKeys: CleanupResourceKeys.optional(), nativePids: CleanupNativePids.optional() }).safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "A stable cleanup requestKey is required" }, 400);
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
   if (!task?.primarySessionId) return c.json({ error: "Task has no original primary" }, 409);

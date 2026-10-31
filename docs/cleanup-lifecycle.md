@@ -298,3 +298,21 @@ preflight confirms current legacy shape only, not live retirement.
 The selected-key v1 authority route recognizes only the exact recorded `credentials-export-development` private export recipe and its original same-task environment/Compose association. It checks the source, deterministic private journal and external capture storage against source/tooling, retained archives, other tasks' resource paths and registered worktrees. This is a local scope witness for an already-accepted operation, not new preparation or physical absence proof. The client separately authenticates the original committed encrypted backup/key, verifies exact export bytes and stopped consumers, and preserves the source inode through native capture before writing Released with unchanged metadata.
 
 The disposable Unix route/whole-finalizer regression covers a late foreign capture-path claim, an initially absent Compose journal, native capture, a lost applied registry acknowledgment, exact retained-source preservation and unchanged original preparation/operation events. No live original71 private-export action is claimed by these tests.
+
+For the exact historical r2/r3 task-app group, selected cleanup renewal returns
+`nativeApps: { version: 1, recordedBefore }`, where the timestamp is the original
+preparation event. An optional `nativePids` request is a bounded unique set of
+positive process IDs. It is valid only with that complete original resource
+scope, must include its recorded roots/listener, and is echoed sorted as
+`nativeApps.pids`. It only extends global ownership exclusions; the client must
+independently prove every process lifetime and hold the kernel identity while
+renewing immediately before an individual signal. The saved full set is reused
+through partial-stop retries, even after members exit. No new preparation,
+resource metadata link or cleanup operation is written.
+### Original Clerk creation evidence
+
+For the exact older development test-user recipe with no `createdByTask` flag, selected-key renewal may derive a creation witness from the original delegate's configured Acpx record. Initial derivation runs outside the SQL transaction with bounded, held local reads. The frozen Compose environment and private-export location must agree; exact known script bytes, private user result, successful paired create output and subsequent matching resource registration must all correspond. Text-only history, reused users, unrelated delegates, altered registration and ambiguous evidence refuse.
+
+Inside the existing authority transaction, current preparation/operation, selected resource, global sharing checks and original delegate relation are rechecked before saving one redacted `cleanup-clerk-original-creation` fact. This fact is outside the finalizer owner-action set and changes neither original proof bytes nor resource metadata. The compact response binds its revision/digest to the original primary and operation. Cached renewals verify the same immutable fact and relationships without requiring retired local inputs to reappear. It grants no independent cleanup authority; the client still verifies the exact provider instance/user lifetime and current scope before deletion and fresh absence before acknowledgment.
+
+The actual Unix fixture covers durable witness response loss, cached recovery after local evidence retirement, late foreign ownership and owner pause, provider response loss and registry acknowledgment loss, with one effect and unchanged original preparation/operation. Live original-task acceptance remains separate.

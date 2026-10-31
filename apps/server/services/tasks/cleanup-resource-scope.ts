@@ -1,4 +1,5 @@
 import path from "node:path";
+import { legacyNativeAppScope } from "./legacy-native-app-scope.ts";
 import { legacyNeonReviewScope } from "./legacy-neon-scope.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { z } from "zod";
@@ -8,6 +9,9 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { ArchiveRetentionProof } from "./archive-retention-schema.ts";
 import { assertPreparedCleanup, cleanupRetainedResourceIds } from "./cleanup-lifecycle.ts";
 import { assertPrivateExportScope } from "./cleanup-private-export-scope.ts";
+import { matchesClerkCreation, type prepareClerkCreation } from "./clerk-creation-evidence.ts";
+
+export const CleanupNativePids = z.array(z.number().int().positive().max(0x7fffffff)).min(1).max(256).refine(values => new Set(values).size === values.length);
 
 export const CleanupResourceKeys = z.array(z.string().min(1).max(100)).min(1).max(100)
   .refine(keys => new Set(keys).size === keys.length, "Cleanup resource keys must be unique");
@@ -20,7 +24,8 @@ const directoryKinds = new Set(["directory", "private-env-files"]);
 /** This is a local ownership recheck of an already frozen v1 operation, not a
  * new plan or proof of physical absence. Client adapters still verify held
  * filesystem/provider identities and their durable retry journals. */
-export async function cleanupResourceScope(prisma: Database, config: Parameters<typeof cleanupRetainedResourceIds>[1], active: Active, keys: string[]) {
+export async function cleanupResourceScope(prisma: Database, config: Parameters<typeof cleanupRetainedResourceIds>[1], active: Active, keys: string[], options: { nativePids?: number[]; creation?: NonNullable<Awaited<ReturnType<typeof prepareClerkCreation>>> } = {}) {
+  const { nativePids, creation } = options;
   CleanupResourceKeys.parse(keys);
   if (active.kind !== "v1") throw new Error("Legacy resource scope requires the existing version 1 cleanup");
   const selected = keys.map(key => active.binding.resources.find(resource => resource.key === key));
@@ -30,7 +35,11 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     .sort((a, b) => a.key.localeCompare(b.key));
   const retained = await cleanupRetainedResourceIds(prisma, config, active);
   if (resources.some(resource => retained.has(resource.id))) throw new Error("Retained resources cannot receive legacy cleanup authority");
-  if (resources.every(resource => directoryKinds.has(resource.kind))) {
+  if (resources.some(resource => resource.kind === "local-http")) {
+    await assertNativeAppScope(prisma, active, keys, nativePids);
+  } else if (nativePids) {
+    throw new Error("Native PID exclusions require the exact app scope");
+  } else if (resources.every(resource => directoryKinds.has(resource.kind))) {
     const first = resources[0]!, root = first.externalId;
     if (!path.isAbsolute(root) || path.normalize(root) !== root || root.includes("\0") || !["development", "review"].includes(first.purpose)
       || resources.some(resource => resource.externalId !== root || resource.purpose !== first.purpose)) throw new Error("Legacy environment scope requires one exact same-purpose root");
@@ -83,9 +92,32 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     const resource = resources[0]!;
     const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
     if (resources.length !== 1 || resource.kind !== "clerk-test-user" || resource.purpose !== "development"
-      || !/^user_[A-Za-z0-9]+$/.test(resource.externalId) || metadata.createdByTask !== true) throw new Error("Legacy resource scope is not a supported task-created test user");
+      || !/^user_[A-Za-z0-9]+$/.test(resource.externalId) || metadata.createdByTask !== true && !matchesClerkCreation(active, resource, creation)) throw new Error("Legacy resource scope is not a supported task-created test user");
     await assertClerkResourceSharing(prisma, active.task.id, [{ resourceId: resource.id, purpose: resource.purpose,
       identityDigest: finalizationResourceIdentity(resource).identityDigest, kind: "clerk-user", id: resource.externalId }]);
   }
   return identities;
+}
+
+export async function assertNativeAppScope(prisma: Database, active: Active, keys: string[], nativePids?: number[]) {
+  const scope = legacyNativeAppScope({ id: active.task.id, worktreePath: active.binding.worktree, resources: active.binding.resources });
+  if (keys.length !== scope.keys.length || scope.keys.some(key => !keys.includes(key))) throw new Error("Recorded app scope needs its exact original receipt group");
+  await assertRegisteredPathSharing(prisma, active.task.id, [active.binding.worktree, scope.environment]);
+  const roots = scope.sources.flatMap(source => [source.pid, ...(source.listenerPid ? [source.listenerPid] : [])]);
+  const pids = new Set(nativePids ? CleanupNativePids.parse(nativePids) : roots);
+  if (roots.some(pid => !pids.has(pid))) throw new Error("Native scope cannot omit its recorded roots");
+  const directories = [active.binding.worktree, scope.environment], ancestors = new Set<string>();
+  for (const directory of directories) for (let current = directory; ; current = path.dirname(current)) { ancestors.add(current); if (current === path.dirname(current)) break; }
+  if (await prisma.remoteTask.findFirst({ where: { id: { not: active.task.id }, OR: [{ worktreePath: { in: [...ancestors] } }, ...directories.map(directory => ({ worktreePath: { startsWith: `${directory}${path.sep}` } }))] } })) throw new Error("Native app path has another task owner");
+  const claims = await prisma.remoteTaskResource.findMany({ where: { kind: { in: ["local-http", "local-process", "native-app", "launch-agent", "launch-agents"] } }, take: 10001 });
+  if (claims.length > 10000) throw new Error("Native process ownership inventory exceeds its bound");
+  for (const claim of claims) {
+    if (claim.taskId === active.task.id && scope.keys.includes(claim.key)) continue;
+    const meta = z.record(z.string(), z.unknown()).parse(claim.metadata ?? {}), values: unknown[] = [meta.pid, meta.listenerPid];
+    if (meta.pids && typeof meta.pids === "object" && !Array.isArray(meta.pids)) values.push(...Object.values(meta.pids));
+    if (meta.processes && typeof meta.processes === "object" && !Array.isArray(meta.processes)) for (const item of Object.values(meta.processes)) {
+      if (item && typeof item === "object" && !Array.isArray(item)) values.push((item as { pid?: unknown }).pid, (item as { listenerPid?: unknown }).listenerPid);
+    }
+    if (values.some(value => typeof value === "number" && pids.has(value))) throw new Error("Recorded native process has another resource owner");
+  }
 }
