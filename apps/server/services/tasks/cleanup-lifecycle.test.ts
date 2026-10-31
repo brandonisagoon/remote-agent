@@ -26,6 +26,8 @@ import { assertRetirementResourcePreflight } from "./retirement-preview.ts";
 import { retainedDevelopmentFixture } from "../../../../test-support/retained-development-fixture.ts";
 import { cleanupProjection, cleanupReportDelivery } from "./cleanup-report.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
+import { clerkCreationRecord } from "../../../../test-support/clerk-creation-fixture.ts";
+import { legacyClerkUserScript, legacyClerkJwksScript } from "./clerk-creation-recipe.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -420,6 +422,63 @@ async function resourceScopeFixture(kind: "environment" | "clerk" = "environment
   const put = (value: object) => app.request(`/api/sessions/${f.session.id}/task/resources`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(value) });
   return { ...f, environment: root, values, prepared, active, app, keys, renew, put };
 }
+
+async function originalCreatedClerkFixture() {
+  const f = await fixture("scopetask");
+  f.config.acpxStateDir = path.join(directory, "acpx");
+  const environment = path.join(directory, "environments", f.task.id), email = "dra75.scopetas+clerk_test@example.com", instanceId = "ins_Original";
+  await mkdir(path.join(environment, "scripts"), { recursive: true, mode: 0o700 });
+  await mkdir(path.join(f.config.acpxStateDir, "sessions"), { recursive: true });
+  await writeFile(path.join(environment, "scripts/clerk-user.ts"), legacyClerkUserScript("DRA-75", email), { mode: 0o644 });
+  await writeFile(path.join(environment, "scripts/clerk-jwks.ts"), legacyClerkJwksScript, { mode: 0o644 });
+  await writeFile(path.join(environment, "clerk-user.json"), JSON.stringify({ userId: "user_Original", email, password: "private-fixture-value" }), { mode: 0o600 });
+  await db.prisma.remoteTaskResource.create({ data: { id: "environment", taskId: f.task.id, key: "development-env-directory", kind: "directory", purpose: "development", externalId: environment, state: "ready", metadata: { trackedGreenfieldEdits: false } } });
+  const resource = await db.prisma.remoteTaskResource.create({ data: { id: "created-user", taskId: f.task.id, key: "clerk-test-user-development", kind: "clerk-test-user", purpose: "development", externalId: "user_Original", state: "ready",
+    metadata: { instance: `Clerk test instance (sk_test/pk_test guarded), kid ${instanceId}`, email, credentialsFile: "<envDirectory>/clerk-user.json (0600)" } } });
+  const actor = await db.prisma.runtimeSession.create({ data: { id: "environment-delegate", scopeKey: "environment-delegate", acpxRecordId: "environment-delegate", acpxSessionId: "original-provider-session", role: "delegate", agentCommand: "claude", status: "closed", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  const relation = await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: actor.id, targetSessionId: f.session.id, relationship: "spawned-by", endedAt: new Date() } });
+  const record = clerkCreationRecord({ actor: { ...actor, acpxRecordId: actor.acpxRecordId!, acpxSessionId: actor.acpxSessionId! }, taskId: f.task.id, environment, instanceId, email, resource, resourceCreatedAt: resource.createdAt.toISOString() });
+  const recordPath = path.join(f.config.acpxStateDir, "sessions", `${actor.acpxRecordId}.json`);
+  await writeFile(recordPath, JSON.stringify(record), { mode: 0o644 });
+  await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+  const original = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const renew = () => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, resourceKeys: [resource.key] }) });
+  return { ...f, environment, resource, actor, relation, record, recordPath, active, original, app, renew };
+}
+
+test("original structured Clerk creation is frozen once outside the unchanged v1 preparation and operation", async () => {
+  const f = await originalCreatedClerkFixture(), response = await f.renew();
+  expect(response.status).toBe(200); const first: any = await response.json();
+  expect(first.clerkCreation).toMatchObject({ taskId: f.task.id, sessionId: f.session.id, resourceId: f.resource.id, userId: f.resource.externalId,
+    instanceId: "ins_Original", preparedRevision: f.active.preparation.sequence, operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) });
+  const fact = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: first.clerkCreation.evidenceRevision } });
+  expect(fact.action).toBe("cleanup-clerk-original-creation"); expect(first.clerkCreation.evidenceDigest).toBe(finalizationDigest(JSON.parse(fact.value!)));
+  expect(fact.value).not.toContain("private-fixture-value"); expect(fact.value).not.toContain("CLERK_SECRET_KEY");
+  await rm(f.recordPath); await rm(f.environment, { recursive: true });
+  expect(await (await f.renew()).json()).toEqual(first);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: f.original.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(f.original);
+  expect((await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "cleanup-clerk-original-creation" } })).length).toBe(1);
+});
+
+test.each(["missing", "reused", "script", "local-user", "foreign-claim", "pause", "relation"])("original Clerk scoped renewal refuses %s without recording provenance or authority", async change => {
+  const f = await originalCreatedClerkFixture();
+  if (change === "missing") await rm(f.recordPath);
+  if (change === "reused") {
+    const result = f.record.messages[0]!.Agent.tool_results["create-exact-user"]! as any;
+    result.output = result.output.replace('"created":true', '"created":false'); result.content.Text = result.output;
+    await writeFile(f.recordPath, JSON.stringify(f.record));
+  }
+  if (change === "script") await writeFile(path.join(f.environment, "scripts/clerk-user.ts"), "console.log('created:true')");
+  if (change === "local-user") await writeFile(path.join(f.environment, "clerk-user.json"), JSON.stringify({ userId: "user_Other", email: "wrong@example.com", password: "private-fixture-value" }));
+  if (change === "foreign-claim") await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "other-purpose-claim", kind: "clerk-test-session", purpose: "review", externalId: "sess_Shared", state: "ready", metadata: { userId: f.resource.externalId } } });
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "relation") await db.prisma.runtimeSessionRelation.update({ where: { id: f.relation.id }, data: { relationship: "notifies-parent" } });
+  const result = await f.renew(); expect(result.status).toBe(409); const body = await result.text(); expect(body).not.toContain("private-fixture-value");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-clerk-original-creation" } })).toBe(0);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
+});
 
 async function legacyPreviewFixture(review = false, change?: (values: any[]) => void, uuidFormat = false) {
   const f = await fixture();
