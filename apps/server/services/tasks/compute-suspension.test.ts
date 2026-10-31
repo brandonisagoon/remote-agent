@@ -293,3 +293,36 @@ test("the production collector tick reaches the same intent renewal and stopped 
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
   expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).state).toBe("allocated");
 });
+
+async function partialStudio() {
+  const f = await fixture("docker-compose-project");
+  await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { configuration: { configurationFile: "/fixture/coverage.json", configurationSha256: f.observation.configurationDigest } } });
+  Object.assign(f.observation, { application: { containerId: "1".repeat(64), image: `sha256:${"2".repeat(64)}`, createdAt: "2030-01-01T00:00:00Z", startedAt: "2030-01-01T00:01:00Z", stopped: false } });
+  await f.refresh();
+  const decision = await considerComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify });
+  expect(decision.outcome).toBe("suspension-recorded");
+  Object.assign(f.observation.application!, { stopped: true }); f.observation.coverage = "incomplete";
+  await f.setTraffic({ ...f.traffic(), coverage: "incomplete", reason: "stopped-legacy-studio", lastReceivedAt: Date.now() - 60_000 });
+  const refresh = async () => { f.observation.observedAt = Date.now(); return recordComputeObservation({ ...f.input, observation: f.observation }); };
+  await refresh();
+  return { ...f, decision, context: { ...f.context, refreshCompute: refresh }, refresh };
+}
+test("an existing suspension can finish exact aggregate members after its app stops, without new idle authority", async () => {
+  const f = await partialStudio();
+  expect((await collectComputeEvidence(f.input)).eligible).toBe(false);
+  const authority = await renewDevelopmentAuthority({ ...f.context, ...f.decision.intent!, resourceKeys: [f.resource.key] });
+  await expect(completeDevelopmentIntent({ ...f.context, ...f.decision.intent!, resourcesEpoch: authority.resourcesEpoch, resources: authority.resources })).rejects.toThrow("physically stopped");
+  f.observation.state = "stopped"; await f.refresh();
+  const renewed = await renewDevelopmentAuthority({ ...f.context, ...f.decision.intent!, resourceKeys: [f.resource.key] });
+  expect((await completeDevelopmentIntent({ ...f.context, ...f.decision.intent!, resourcesEpoch: renewed.resourcesEpoch, resources: renewed.resources })).state).toBe("complete");
+});
+test.each(["restart", "source", "gap", "operation", "pause", "resource"])("partial stop cannot normalize %s drift", async changed => {
+  const f = await partialStudio();
+  if (changed === "restart") f.observation.application!.startedAt = "2030-01-01T00:02:00Z";
+  if (changed === "source") f.observation.sourceRevision = "9".repeat(40);
+  if (changed === "gap") await f.setTraffic({ ...f.traffic(), reason: "sequence-gap" });
+  if (changed === "operation") f.observation.operations.generation = "0".repeat(64);
+  if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  if (changed === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { metadata: { replaced: true } } });
+  await expect(renewDevelopmentAuthority({ ...f.context, ...f.decision.intent!, resourceKeys: [f.resource.key] })).rejects.toThrow();
+});
