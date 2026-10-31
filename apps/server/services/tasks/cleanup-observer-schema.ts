@@ -10,9 +10,12 @@ const Absolute = z.string().max(4096).refine(value => path.isAbsolute(value) && 
 const Purpose = z.enum(["development", "review", "browser"]);
 const Scope = { taskId: z.string().min(1), purpose: Purpose };
 const Common = { id: z.string().min(1), presentAtPrepare: z.boolean(), identityDigest: Hash };
+const StudioReference = z.strictObject({ file: Absolute, sha256: Hash });
 const DockerScope = z.strictObject({ ...Scope, purpose: z.enum(["development", "review", "browser", "tooling"]), project: Nonempty.optional(), operation: Nonempty.optional(), name: Nonempty.optional(),
   compose: z.strictObject({ file: Absolute, sha256: Hash, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), member: Nonempty }).optional(),
-});
+  studio: StudioReference.optional(),
+}).refine(scope => !scope.studio || scope.purpose === "development" && Boolean(scope.project) && !scope.compose && !scope.operation && !scope.name,
+  "Stock Studio and generic Docker/Compose scopes cannot be mixed");
 const DockerIdentity = z.strictObject({ createdAt: z.string().min(1), labelsDigest: Hash });
 const ProviderScope = { ...Scope, runtimeFile: Absolute, credentialsFile: Absolute, recipeHash: Hash };
 const ClerkCredentials = z.strictObject({ backupFile: Absolute, backupSha256: Hash, keyFile: Absolute, keyId: Hash });
@@ -26,6 +29,9 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
   z.strictObject({ ...Common, kind: z.literal("docker-network"), id: Nonempty, scope: DockerScope,
     identity: DockerIdentity.extend({ name: z.string().min(1) }).strict().nullable() }),
   z.strictObject({ ...Common, kind: z.literal("docker-volume"), scope: DockerScope, identity: DockerIdentity.nullable() }),
+  z.strictObject({ ...Common, kind: z.literal("studio-proxy-route"), scope: z.strictObject({ taskId: Nonempty, purpose: z.literal("development"), project: Nonempty,
+    studio: StudioReference, proxyId: Hash, configuration: z.strictObject({ file: Absolute, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative() }) }),
+    containerId: Hash, hostname: z.string().regex(/^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+localhost$/), listenPort: z.union([z.literal(3200), z.literal(8100)]), routeDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("planetscale-branch"), scope: z.strictObject({ ...ProviderScope, organization: Nonempty, database: Nonempty, baseBranch: Nonempty, baseBranchId: Nonempty }), name: Nonempty }),
   z.strictObject({ ...Common, kind: z.literal("neon-branch"), scope: z.strictObject({ ...ProviderScope, projectId: Nonempty, baselineBranchId: Nonempty }), name: Nonempty }),
   z.strictObject({ ...Common, kind: z.literal("upstash-database"), scope: z.strictObject(ProviderScope), name: z.string().min(1), createdAt: z.string().min(1) }),
