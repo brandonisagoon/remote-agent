@@ -16,6 +16,7 @@ export const BundleOriginalWorkInput = z.object({
   expectedWorkingTree: Sha, retainedResults: z.array(z.object({ resourceId: z.string().min(1), provenancePath: Relative }).strict()).max(1000).optional(),
   additionalArchives: z.array(ArchiveInput).max(20).optional(), ownedPaths: z.array(Absolute).max(1000),
 }).strict();
+export type BundleOriginalWorkSelection = z.infer<typeof BundleOriginalWorkInput>;
 export const RecoveryWorkInput = z.object({
   format: z.literal("base-work-tar/v1"), archiveResourceId: z.string().min(1),
   manifestPath: Absolute, manifestSha256: Digest,
@@ -52,6 +53,7 @@ export const OriginalWork = z.object({ version: z.literal(1), captureId: z.strin
   installedDependencies: LinkedWorktreePlan.shape.installedDependencies.optional(),
 }).strict();
 export type OriginalWork = z.infer<typeof OriginalWork>;
+export type OriginalWorkCapture = Pick<OriginalWork, "captureId" | "snapshot" | "restore" | "target" | "administration" | "installedDependencies">;
 
 export const OriginalAdministrationProof = z.object({
   version: z.literal(1), taskId: z.string().min(1), sessionId: z.string().min(1), requestKey: z.string().min(1),

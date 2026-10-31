@@ -6,7 +6,7 @@ import { administrativeInventory } from "./cleanup-worktrees.ts";
 import { observeLegacyEvidenceFile } from "./legacy-evidence-files.ts";
 import { assertFinalizationPath, assertFinalizationTree, finalizationDigest, inspectFinalizationQuarantine, type ResourceObservation } from "./finalization-resources.ts";
 import { finalizationWorktrees } from "./finalization-receipts.ts";
-import { OriginalWorkAdministration, type OriginalWork } from "./original-work-schema.ts";
+import { OriginalWorkAdministration, type OriginalWorkCapture } from "./original-work-schema.ts";
 import { originalWorkDirtySnapshot, originalWorkTextGit as git } from "./original-work-git.ts";
 
 const within = (root: string, file: string) => root === file || file.startsWith(`${root}${path.sep}`);
@@ -19,7 +19,7 @@ async function directory(file: string) {
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || stat.mode & 0o022 || await realpath(file) !== file) throw new Error("Original administration directory ownership changed");
   return identity(stat);
 }
-async function selectedRegistration(proof: OriginalWork) {
+async function selectedRegistration(proof: OriginalWorkCapture) {
   const entries = finalizationWorktrees(await git(proof.restore.gitDirectory, ["--git-dir", proof.restore.gitDirectory, "worktree", "list", "--porcelain", "-z"]));
   const selected = entries.filter(entry => entry.worktree === proof.target.path);
   if (selected.length > 1 || selected.some(entry => entry.HEAD !== proof.snapshot.head || entry.branch !== `refs/heads/${proof.snapshot.branch}` || "locked" in entry)) throw new Error("Original worktree registration changed");
@@ -29,7 +29,7 @@ async function selectedRegistration(proof: OriginalWork) {
 /** The current admin must correspond to the saved source, including its index.
  * A captured source is inspected with its explicit work-tree path; no index
  * refresh, checkout, reset or Git administrative write is permitted. */
-async function observeAdministration(proof: OriginalWork, physicalSource: string) {
+async function observeAdministration(proof: OriginalWorkCapture, physicalSource: string) {
   const pointer = await observeLegacyEvidenceFile(path.join(physicalSource, ".git"), false, 16384);
   const expectedPointer = proof.target.inventory.find(entry => entry.path === ".git");
   if (!expectedPointer || expectedPointer.kind !== "file" || finalizationDigest({ ...pointer, path: ".git", kind: "file" }) !== finalizationDigest(expectedPointer)) throw new Error("Captured original Git pointer differs from its saved inventory");
@@ -60,7 +60,7 @@ async function observeAdministration(proof: OriginalWork, physicalSource: string
     pointer: { ...pointer, path: path.join(proof.target.path, ".git") }, index, administrativeInventory: inventory };
 }
 
-export async function prepareOriginalAdministration(taskId: string, proof: OriginalWork) {
+export async function prepareOriginalAdministration(taskId: string, proof: OriginalWorkCapture) {
   const source = await inspectFinalizationQuarantine({ taskId, resourceId: proof.captureId, target: proof.target });
   await assertFinalizationTree(proof.target, source.physicalPath);
   const state = await observeAdministration(proof, source.physicalPath);
@@ -73,7 +73,7 @@ export async function prepareOriginalAdministration(taskId: string, proof: Origi
     sourceParent, quarantineParent, quarantine: { directory: destination, path: path.join(destination, "contents"), journal: path.join(destination, "pending.json") } } });
 }
 
-export async function assertOriginalAdministration(input: { taskId: string; originalWork: OriginalWork; administration: OriginalWorkAdministration; removed: boolean }, observation: ResourceObservation) {
+export async function assertOriginalAdministration(input: { taskId: string; originalWork: OriginalWorkCapture; administration: OriginalWorkAdministration; removed: boolean }, observation: ResourceObservation) {
   const proof = input.originalWork, administration = OriginalWorkAdministration.parse(input.administration), target = administration.administrationCapture, state = administration.git;
   const source = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
   if (state.commonDirectory !== proof.restore.gitDirectory || state.head !== proof.snapshot.head || state.branch !== proof.snapshot.branch
@@ -102,7 +102,7 @@ export async function assertOriginalAdministration(input: { taskId: string; orig
 
 /** Historical retirement has no administration capture to invent. Require the
  * saved source pointer and its exact linked entry both independently absent. */
-export async function originalAdministrationAlreadyRetired(taskId: string, proof: OriginalWork) {
+export async function originalAdministrationAlreadyRetired(taskId: string, proof: OriginalWorkCapture) {
   const source = await inspectFinalizationQuarantine({ taskId, resourceId: proof.captureId, target: proof.target });
   if (!source.captured) return false;
   const pointer = await observeLegacyEvidenceFile(path.join(source.physicalPath, ".git"), false, 16384);
