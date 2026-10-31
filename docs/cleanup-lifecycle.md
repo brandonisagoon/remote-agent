@@ -371,3 +371,31 @@ progress, saved reporting and closure. Full original archive/source/admin checks
 precede the final retained Docker observation and transaction. A completed
 confirmation is immutable across receipt refresh; closed-report retries reuse
 the same UUID and body without repeating source or resource effects.
+
+
+### Continuing an operation after primary closure (DRA-172)
+
+The existing cleanup operation remains the only pending cleanup intent. If its
+original primary closes after preparation, ordinary closed-task upkeep may
+continue that same operation once the task is durably closed and the entire
+original family has no executing, queued or uncertain work. Historical spawned
+descendants are traversed with cycle, depth and size bounds even when their
+working directories differ. The operation must
+predate the recorded closure. An idle provider status with a finite `closedAt`
+is compatible with closure; an active or reopened primary is not.
+
+The original task, primary, tooling pin, preparation, owner authority and exact
+resource bindings are checked on every renewal and before confirmation. Ended
+source links retain their original identity. Existing retained archive and
+legacy evidence proofs remain readable; closure cannot create a cleanup
+operation or adopt new owner evidence. Paused tasks, changed resources, revoked
+authority and unresolved delegates preserve their resources. Plain close without
+a bound operation keeps its existing resource policy.
+
+Disposable tests exercise v1 and v2 continuation, retained-proof checks,
+automatic-inbox provenance, moved delegates, physical capture and lost receipt
+recovery. The actual Unix/CLI test loses a successful close response, then runs
+paginated `upkeep closed` and explicit `upkeep expired --task` through the same
+preparation and Git retirement. It creates no session or instruction and keeps
+original proof rows and retained PR history unchanged. These are source tests;
+no historical task was replayed for this change.

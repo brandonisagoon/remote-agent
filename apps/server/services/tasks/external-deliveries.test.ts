@@ -126,6 +126,28 @@ async function originalFixture(recovery = false, historical = false) {
   return { ...f, input: { ...f.input, binding }, dependencies, archive, archiveRecord: record, released, captureOriginal };
 }
 
+test("closed v2 operation resumes the frozen external inventory without new adoption or primary", async () => {
+  const f = await fixture();
+  await adoptExternalDeliveries(f.input, f.dependencies);
+  const input = { ...f.finalize, cleanup: true as const };
+  const prepared = await prepareExternalFinalization(input, f.dependencies);
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const closedAt = new Date();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle", closedAt } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: closedAt } });
+  expect(await prepareExternalFinalization(input, f.dependencies)).toEqual(prepared);
+  await f.capture(false);
+  await expect(confirmExternalFinalization(input, f.dependencies)).rejects.toThrow("filesystem resources");
+  await f.remove();
+  const confirmed = await confirmExternalFinalization(input, f.dependencies);
+  expect(confirmed.confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
+  expect(await confirmExternalFinalization(input, f.dependencies)).toEqual(confirmed);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.runtimeSession.count()).toBe(1);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+});
+
 test("bound historical v2 cleanup retains approval lineage while Linear comment reads are unavailable", async () => {
   const f = await fixture();
   await adoptExternalDeliveries(f.input, f.dependencies);

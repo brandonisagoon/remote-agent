@@ -36,7 +36,9 @@ async function loadExternalBinding(input: Context) {
   const event = await latestExternalBinding(input.prisma, task.id, input.sessionId);
   if (!event) throw new Error("External finalization requires an adopted delivery binding");
   const binding = ExternalBinding.parse(JSON.parse(event.value!));
-  const authority = await assertExternalBindingAuthority(input.prisma, input.config, binding, event.sequence);
+  const closed = task.phase === "closed";
+  if (closed) await assertPreparedCleanup(input);
+  const authority = await assertExternalBindingAuthority(input.prisma, input.config, binding, event.sequence, { allowClosedCleanup: closed });
   if (!input.cleanup && !await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey) && authority.task.phase !== "complete") throw new Error("External finalization requires the complete task");
   await assertNoRemainingConsumers(input.prisma, authority.task);
   return { task: authority.task, binding, revision: event.sequence };
@@ -101,10 +103,10 @@ async function resources(input: Context, prepared: PreparedExternalFinalization,
     const event = await input.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { ...whereFor(input, prepared.taskId), action: FINALIZATION_PREPARED } });
     await ensureOriginalAdministration({ prisma: input.prisma, prepared, preparedRevision: event.sequence, removed, create: !removed, assertAuthority: async prisma => {
       const scope = { ...input, prisma };
-      if (await hasPreparedCleanup(prisma, prepared.taskId, prepared.sessionId, prepared.requestKey)) await assertPreparedCleanup(scope);
+      const active = await hasPreparedCleanup(prisma, prepared.taskId, prepared.sessionId, prepared.requestKey) ? await assertPreparedCleanup(scope) : null;
       const adopted = await latestExternalBinding(prisma, prepared.taskId, prepared.sessionId);
       if (!adopted || adopted.sequence !== prepared.bindingRevision) throw new Error("Original administration binding changed");
-      await assertExternalBindingAuthority(prisma, input.config, ExternalBinding.parse(JSON.parse(adopted.value!)), adopted.sequence);
+      await assertExternalBindingAuthority(prisma, input.config, ExternalBinding.parse(JSON.parse(adopted.value!)), adopted.sequence, { allowClosedCleanup: active?.closedContinuation });
       assertExternalResourceRecords(await prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId } }), prepared.resources, removed);
     } });
   }
@@ -115,7 +117,7 @@ export async function prepareExternalFinalization(input: Context, dependencies =
   dependencies = requestExternalObservations(dependencies);
   if (input.finalizationVersion !== 2) throw new Error("External delivery requires finalizationVersion 2; v1 cannot authorize cleanup");
   const { task, binding, revision } = await loadExternalBinding(input);
-  if (input.cleanup) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
+  if (input.cleanup && task.phase !== "closed") await automaticCleanupTurn(input.prisma, task, false, input.runtime);
   const lifecycle = input.cleanup || await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey);
   const existing = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...whereFor(input, task.id), action: FINALIZATION_PREPARED } });
   if (lifecycle && existing) return prepareExternalCleanup(input, dependencies);

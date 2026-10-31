@@ -74,6 +74,140 @@ async function preparedFixture() {
   return { ...f, prepared, frozen, observe };
 }
 
+async function closePreparedFixture(f: Awaited<ReturnType<typeof referenceFixture>>, status = "closed") {
+  const closedAt = new Date();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status, closedAt } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: closedAt } });
+}
+
+test.each(["closed", "idle"])("closed %s primary retains the same v1 operation through confirmation and reporting projection", async status => {
+  const f = await referenceFixture();
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  await closePreparedFixture(f, status);
+  expect(await assertPreparedCleanup(f.input)).toMatchObject({ closedContinuation: true, operationRevision: f.active!.operationRevision });
+  expect(await prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).toMatchObject({ preparedRevision: f.active!.preparation.sequence });
+  f.remove();
+  const confirmed = await confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies);
+  expect(await confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).toEqual(confirmed);
+  expect(await cleanupProjection(db.prisma, f.config, f.task)).toHaveProperty("cleanupOperation.confirmedRevision", confirmed.confirmedRevision);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.reference.id } })).toEqual(f.reference);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(event => event.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.runtimeSession.count()).toBe(1);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+test.each(["unbound", "missing-closure", "operation-after-closure", "reopened", "active-primary", "active-delegate", "moved-delegate", "pending-primary", "pending-delegate", "paused", "revoked", "changed-resource"])("closed cleanup refuses %s before preparation or effects", async condition => {
+  const f = await referenceFixture({ bound: condition !== "unbound" });
+  await closePreparedFixture(f);
+  if (condition === "missing-closure") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { closedAt: null } });
+  if (condition === "operation-after-closure") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { closedAt: new Date(0) } });
+  if (condition === "reopened") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
+  if (condition === "active-primary") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "active" } });
+  if (condition.includes("delegate")) {
+    await db.prisma.runtimeSession.create({ data: { id: "delegate", scopeKey: "delegate", agentCommand: "codex", status: ["active-delegate", "moved-delegate"].includes(condition) ? "active" : "idle", role: "delegate", cwd: condition === "moved-delegate" ? path.join(directory, "moved") : f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  }
+  if (condition === "moved-delegate") await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "delegate", targetSessionId: f.session.id, relationship: "spawned-by", endedAt: new Date() } });
+  if (condition.startsWith("pending")) await db.prisma.runtimeInstruction.create({ data: { id: "pending", sessionId: condition === "pending-primary" ? f.session.id : "delegate", state: "unknown", text: "Uncertain original work" } });
+  if (condition === "paused") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (condition === "revoked") await f.revoke();
+  if (condition === "changed-resource") await db.prisma.remoteTaskResource.update({ where: { id: f.reference.id }, data: { externalId: "https://github.com/owner/product/pull/99" } });
+  await expect(prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow();
+  expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+});
+
+test.each(["active", "pending", "cycle", "settled"])("closed cleanup checks a moved recursive delegate family (%s)", async condition => {
+  const f = await referenceFixture(); await closePreparedFixture(f);
+  for (const id of ["child", "grandchild"]) await db.prisma.runtimeSession.create({ data: { id, scopeKey: id, agentCommand: "codex", status: id === "grandchild" && condition === "active" ? "active" : "closed", closedAt: new Date(), role: "delegate", cwd: path.join(directory, id), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  for (const [sourceSessionId, targetSessionId] of [["child", f.session.id], ["grandchild", "child"], ...(condition === "cycle" ? [[f.session.id, "grandchild"]] : [])]) await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: sourceSessionId!, targetSessionId: targetSessionId!, relationship: "spawned-by", endedAt: new Date() } });
+  await db.prisma.runtimeSession.create({ data: { id: "unrelated", scopeKey: "unrelated", agentCommand: "codex", status: "active", cwd: path.join(directory, "unrelated"), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  if (condition === "pending") await db.prisma.runtimeInstruction.create({ data: { id: "grandchild-pending", sessionId: "grandchild", state: "unknown", text: "Unresolved descendant work" } });
+  if (condition === "settled") expect(await assertPreparedCleanup(f.input)).toHaveProperty("closedContinuation", true);
+  else await expect(assertPreparedCleanup(f.input)).rejects.toThrow();
+  expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+});
+
+test.skipIf(!process.env.DRAFTED_CLOSED_CLEANUP_ROOT).each(["direct", "closed", "expired"])("actual closed-task upkeep %s continues after a lost close response without reopening or removing twice", async mode => {
+  const f = await referenceFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const fake = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
+  const runtime = { ...fake, close: async (id: string, reason: string) => {
+    await fake.close(id, reason);
+    await db.prisma.runtimeSession.update({ where: { id }, data: { status: "closed", closedAt: new Date() } });
+  } };
+  const savedReport = { ...cleanupReportDelivery };
+  Object.assign(cleanupReportDelivery, { read: async () => { throw new Error("Fixture report offline"); } });
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: runtime, commandClient: bunCommandClient }))
+    .route("/api/tasks", taskRoutes).route("/api/tasks", taskSupervisionRoutes).route("/api/sessions", sessionTaskRoutes);
+  let releaseClose!: () => void, lostClose = false;
+  const closeGate = new Promise<void>(resolve => { releaseClose = resolve; });
+  const socket = path.join(directory, "closed.sock"), server = Bun.serve({ unix: socket, fetch: async request => {
+    const response = await app.fetch(request);
+    if (new URL(request.url).pathname.endsWith("/automation") && response.ok && !lostClose) { lostClose = true; await closeGate; }
+    return response;
+  } }); await chmod(socket, 0o600);
+  const stop = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime }, async () => {});
+  try {
+    const root = process.env.DRAFTED_CLOSED_CLEANUP_ROOT!;
+    const { taskRegistry, listUpkeepTasks, closeTask } = await import(path.join(root, "src/control.ts"));
+    const { finalizeTask } = await import(path.join(root, "src/finalize.ts"));
+    // The actual route commits closure, then its response is lost. No finalizer ran.
+    await expect(closeTask(socket, f.task.id, 250)).rejects.toThrow("may have taken effect");
+    releaseClose(); expect(lostClose).toBeTrue();
+    const closed = await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } });
+    expect(closed.closedAt).not.toBeNull();
+    expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeTrue();
+    expect((await listUpkeepTasks(socket)).find((task: { id: string }) => task.id === f.task.id)).toMatchObject({ phase: "closed", finalizationPending: true });
+    const registry = taskRegistry(socket, f.task.id);
+    let removals = 0;
+    const runner = async (command: string[], cwd: string) => {
+      if (command.includes("remove")) removals++;
+      return git(cwd, ...command.slice(1));
+    };
+    const continueClosed = async () => {
+      if (mode === "direct") return finalizeTask({ registry, cleanup: true, runner, close: () => closeTask(socket, f.task.id) });
+      const child = Bun.spawn([process.execPath, path.join(root, "src/cli.ts"), "upkeep", mode, "--socket", socket, ...(mode === "expired" ? ["--task", f.task.id] : [])], { cwd: directory, stdout: "pipe", stderr: "pipe" });
+      const [stdout, stderr, code] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+      if (code !== 0) throw new Error(`Disposable upkeep failed: ${stdout} ${stderr}`);
+      return JSON.parse(stdout.trim());
+    };
+    expect(await continueClosed()).toMatchObject({ closed: true, reporting: { state: "pending" } });
+    expect(await continueClosed()).toMatchObject({ closed: true, alreadyClosed: true });
+    expect(removals).toBe(mode === "direct" ? 1 : 0);
+    expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeFalse();
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    expect(fake.closedSessionIds).toEqual([f.session.id]);
+    expect(await db.prisma.runtimeSession.count()).toBe(1);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).closedAt).toEqual(closed.closedAt);
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.reference.id } })).toEqual(f.reference);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    for (const action of [FINALIZATION_PREPARED, CLEANUP_OPERATION, FINALIZATION_CONFIRMED]) expect(await db.prisma.runtimeMetadataEvent.count({ where: { action } })).toBe(1);
+  } finally { releaseClose(); await stop(); await server.stop(true); Object.assign(cleanupReportDelivery, savedReport); }
+}, 30_000);
+
+test("closed automatic operation keeps its original inbox provenance without requiring a new coding turn", async () => {
+  const f = await preparedFixture();
+  const capability = async () => ({ receipt: { contract: "remote-agent.tooling-capability/v1" as const, capability: "cleanup" as const, source: "configured-host" as const,
+    taskToolingRevision: f.task.toolingRevision, capabilityRevision: "b".repeat(40), checkout: "/fixture/immutable", instructions: "/fixture/immutable/cleanup.md", adapter: "/fixture/immutable/src/cli.ts" }, instructions: "Fixture cleanup" });
+  const queued = await enqueueTaskCleanup({ prisma: db.prisma, config: f.config, taskId: f.task.id, requestKey: "original" }, { capability });
+  await db.prisma.runtimeInstruction.update({ where: { id: queued.instructionId }, data: { state: "dispatching", executionRequestId: "original-turn" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "original-turn", runtimeSessionId: f.session.id, requestId: "original-turn", phase: "started", occurredAt: new Date() } });
+  const active = await bindPreparedCleanup(f.input, f.observe);
+  expect(active.operation.automatic?.initialInstructionId).toBe(queued.instructionId);
+  await db.prisma.runtimeInstruction.update({ where: { id: queued.instructionId }, data: { state: "cancelled" } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed", closedAt: new Date() } });
+  await db.prisma.$disconnect();
+  expect((await assertPreparedCleanup(f.input)).operation).toEqual(active.operation);
+  const runtime = createFakeAgentRuntime();
+  runtime.observeSessionActivity = () => ({ state: "executing", observedAt: Date.now(), requestId: "unsettled-provider" });
+  await expect(assertPreparedCleanup({ ...f.input, runtime })).rejects.toThrow("stop executing");
+  expect(await db.prisma.runtimeInstruction.count()).toBe(1);
+  await expect(enqueueTaskCleanup({ prisma: db.prisma, config: f.config, taskId: f.task.id, requestKey: "new-turn" }, { capability })).rejects.toThrow();
+});
+
 test("frozen v1 accepted PR history remains Ready through preparation, confirmation retry and closure", async () => {
   const f = await fixture();
   const reference = await db.prisma.remoteTaskResource.create({ data: { id: "accepted-pr", taskId: f.task.id, key: "development-pull-request", kind: "github-pull-request", purpose: "development", externalId: f.remote.pullRequest.url, state: "ready",
