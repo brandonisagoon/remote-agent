@@ -1,3 +1,4 @@
+import { startComputeCollection } from "./services/tasks/compute-worker.ts";
 import { createApp } from "./app.ts";
 import { readConfig } from "../../lib/config.ts";
 import { applyPragmas, createPrismaClient } from "./prisma.ts";
@@ -33,6 +34,7 @@ const stopProjection = startRuntimeEventProjection({
 
 const app = createApp({ config, agentRuntime, prisma });
 const localApp = createApp({ config, agentRuntime, prisma, trustLocal: true });
+const stopComputeCollection = startComputeCollection({ prisma, config, runtime: agentRuntime });
 const stopPlacementDelivery = startPlacementDelivery(prisma, routingRequest(config, (request) => localApp.fetch(request)));
 
 const server = Bun.serve({
@@ -55,6 +57,7 @@ async function shutdown(signal: string): Promise<void> {
   console.log(`Received ${signal}, shutting down`);
   stopInstructionDelivery();
   stopPlacementDelivery();
+  await stopComputeCollection();
   await stopProjection();
   await controlSocket.close();
   await acpIpcServer.close();

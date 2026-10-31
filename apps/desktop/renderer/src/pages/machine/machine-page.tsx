@@ -1,3 +1,4 @@
+import { ComputePolicy } from "../../../../../../lib/compute-policy.ts";
 import { useHost } from "@renderer/lib/host-context.tsx";
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -254,6 +255,24 @@ export function MachinePage({ value, mutate }: { value: ServiceFile; mutate: Mut
           <Field label="Database URL" value={machine.server.databaseUrl ?? ""} onChange={(next) => mutate((file) => { file.machine.server.databaseUrl = next; })} />
           <Field label="Session State Directory" description="Where acpx persists each session's conversation state." value={machine.acpx.stateDir ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.stateDir = next; })} />
           <Field label="Concurrent agent turns" type="number" description="Additional instructions wait in order. Blank leaves this machine unlimited. Requires a server restart." value={machine.acpx.maxConcurrentTurns ?? ""} onChange={(next) => mutate((file) => { file.machine.acpx.maxConcurrentTurns = next === "" ? undefined : Number(next); })} />
+        </SettingsCard>
+      </SettingsSection>
+
+      <SettingsSection value="compute" title="Application compute" description="Limit running application environments on this host. Fully observed idle development apps can stop while keeping saved data. Changes require a server restart.">
+        <SettingsCard>
+          <Label>Admission and inactivity suspension</Label>
+          <Select value={machine.compute?.enabled ? "enabled" : "disabled"} onValueChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, enabled: next === "enabled" }; })}>
+            <SelectTrigger><SelectValue /></SelectTrigger><SelectContent><SelectItem value="disabled">Disabled</SelectItem><SelectItem value="enabled">Enabled</SelectItem></SelectContent>
+          </Select>
+          <Field label="Application environment slots" type="number" description="A separate host budget from concurrent agent turns. Unknown existing compute still occupies capacity." value={machine.compute?.slots ?? 0} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, slots: Number(next) }; })} />
+          <Field label="Quiet period (seconds)" type="number" value={machine.compute?.quietPeriodSeconds ?? 1800} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, quietPeriodSeconds: Number(next) }; })} />
+          <Field label="Decisions API key" type="password" value={machine.compute?.decisionApiKey ?? ""} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, decisionApiKey: next || undefined }; })} />
+          <p className="text-muted-foreground text-xs">Uses gpt-6-luna. Missing or uncertain evidence keeps the application running. Compute offers last one minute after delivery to an executing turn.</p>
+          <div className="grid gap-4 sm:grid-cols-3">
+            <Field label="Collector freshness (seconds)" type="number" value={machine.compute?.collectorFreshnessSeconds ?? 15} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, collectorFreshnessSeconds: Number(next) }; })} />
+            <Field label="Offer delivery wait (seconds)" type="number" value={machine.compute?.deliveryTimeoutSeconds ?? 30} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, deliveryTimeoutSeconds: Number(next) }; })} />
+            <Field label="Startup reconciliation (seconds)" type="number" value={machine.compute?.startupTimeoutSeconds ?? 600} onChange={next => mutate(file => { file.machine.compute = { ...ComputePolicy.parse({}), ...file.machine.compute, startupTimeoutSeconds: Number(next) }; })} />
+          </div>
         </SettingsCard>
       </SettingsSection>
 

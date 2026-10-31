@@ -16,6 +16,7 @@ import { taskRoutingRoutes } from "./tasks/routing.ts";
 import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
 import { sourceMessageRoutes } from "./source-messages.ts";
 import { nativeReportRoutes } from "./tasks/native-reports.ts";
+import { computeRoutes } from "./tasks/compute.ts";
 
 export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/health", healthRoutes);
@@ -28,6 +29,7 @@ export function mountRoutes(app: Hono<AppEnv>): void {
   app.route("/api/tasks", taskSupervisionRoutes);
   app.route("/api/tasks", taskCompletionRoutes);
   app.route("/api/tasks", nativeReportRoutes);
+  app.route("/api/tasks", computeRoutes);
   app.route("/api", legacyEvidenceRoutes);
   app.route("/api", archiveRetentionRoutes);
   app.route("/api/routing", taskRoutingRoutes);

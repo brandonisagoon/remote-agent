@@ -4,6 +4,7 @@ import path from "node:path";
 import { scopedConfigFile } from "./config-scope.ts";
 
 import { z } from "zod";
+import { ComputePolicy } from "./compute-policy.ts";
 import { LinearCredentialSchema, type LinearCredential } from "./linear-auth.ts";
 import { readToolingSource } from "./tooling-source.ts";
 import { RoutingConfigSchema, type RoutingConfig } from "./routing-config.ts";
@@ -278,6 +279,7 @@ export const ServiceFileSchema = z.object({
   machine: z.object({
     id: MachineSchema,
     name: z.string().min(1),
+    compute: ComputePolicy.optional(),
     server: z.object({
       publicUrl: z.string().min(1),
       apiKey: z.string().min(1),
@@ -436,6 +438,7 @@ export interface WebhookConfig {
 }
 
 export interface ServerConfig {
+  compute?: import("./compute-policy.ts").ComputePolicy;
   routing?: RoutingConfig;
   serviceName: string;
   configFile: string;
@@ -669,6 +672,7 @@ export function readConfig(filePath: string = configFilePath()): ServerConfig {
 
   return {
     ...(file.routing ? { routing: file.routing } : {}),
+    ...(file.machine.compute ? { compute: file.machine.compute } : {}),
     serviceName: file.serviceName,
     configFile,
     installRoot,

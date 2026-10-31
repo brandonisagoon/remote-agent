@@ -1016,6 +1016,14 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       event = { ...event, output: output.length > 8000 ? `…${output.slice(-8000)}` : output };
     }
     const saved = await appendRuntimeLifecycleEvent(this.prisma, event);
+    if (event.phase === "started" && this.config.compute?.enabled) {
+      // appendRuntimeLifecycleEvent follows promptStarted, not queueing or
+      // provider process creation. Recovery uses this exact persisted time.
+      await (await import("../../services/tasks/compute-admission.ts")).confirmComputeDelivery({
+        prisma: this.prisma, machineId: this.config.machine, policy: this.config.compute,
+        sessionId: event.sessionId, requestId: event.requestId,
+      }).catch(() => console.error("Compute offer delivery requires reconciliation"));
+    }
     await recordSourceLifecycle(this.prisma, saved);
     await this.emit(saved);
   }

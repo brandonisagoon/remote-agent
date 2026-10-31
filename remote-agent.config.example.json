@@ -29,6 +29,15 @@
     },
     "updates": {
       "channel": "stable"
+    },
+    "compute": {
+      "enabled": false,
+      "slots": 2,
+      "quietPeriodSeconds": 1800,
+      "collectorFreshnessSeconds": 15,
+      "deliveryTimeoutSeconds": 30,
+      "startupTimeoutSeconds": 600,
+      "decisionModel": "gpt-6-luna"
     }
   },
   "routing": {

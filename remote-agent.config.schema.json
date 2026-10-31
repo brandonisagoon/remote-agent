@@ -26,6 +26,64 @@
           "type": "string",
           "minLength": 1
         },
+        "compute": {
+          "type": "object",
+          "properties": {
+            "enabled": {
+              "default": false,
+              "type": "boolean"
+            },
+            "slots": {
+              "default": 0,
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 1000
+            },
+            "quietPeriodSeconds": {
+              "default": 1800,
+              "type": "integer",
+              "minimum": 30,
+              "maximum": 604800
+            },
+            "collectorFreshnessSeconds": {
+              "default": 15,
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 300
+            },
+            "deliveryTimeoutSeconds": {
+              "default": 30,
+              "type": "integer",
+              "minimum": 5,
+              "maximum": 300
+            },
+            "startupTimeoutSeconds": {
+              "default": 600,
+              "type": "integer",
+              "minimum": 30,
+              "maximum": 3600
+            },
+            "decisionApiKey": {
+              "type": "string",
+              "minLength": 1
+            },
+            "decisionModel": {
+              "default": "gpt-6-luna",
+              "type": "string",
+              "const": "gpt-6-luna"
+            }
+          },
+          "required": [
+            "enabled",
+            "slots",
+            "quietPeriodSeconds",
+            "collectorFreshnessSeconds",
+            "deliveryTimeoutSeconds",
+            "startupTimeoutSeconds",
+            "decisionModel"
+          ],
+          "additionalProperties": false
+        },
         "server": {
           "type": "object",
           "properties": {
