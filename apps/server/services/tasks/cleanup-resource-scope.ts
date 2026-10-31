@@ -8,6 +8,7 @@ import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { ArchiveRetentionProof } from "./archive-retention-schema.ts";
 import { assertPreparedCleanup, cleanupRetainedResourceIds } from "./cleanup-lifecycle.ts";
+import { assertLegacyStudioScope } from "./cleanup-studio-sharing.ts";
 import { assertPrivateExportScope } from "./cleanup-private-export-scope.ts";
 import { matchesClerkCreation, type prepareClerkCreation } from "./clerk-creation-evidence.ts";
 
@@ -15,7 +16,7 @@ export const CleanupNativePids = z.array(z.number().int().positive().max(0x7ffff
 
 export const CleanupResourceKeys = z.array(z.string().min(1).max(100)).min(1).max(100)
   .refine(keys => new Set(keys).size === keys.length, "Cleanup resource keys must be unique");
-type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeMetadataEvent">;
+type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeMetadataEvent" | "computeEnvironment">;
 type Active = Awaited<ReturnType<typeof assertPreparedCleanup>>;
 const within = (root: string, file: string) => root === file || file.startsWith(`${root}${path.sep}`);
 const overlaps = (a: string, b: string) => within(a, b) || within(b, a);
@@ -73,6 +74,8 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     const ancestors = new Set<string>();
     for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
     if (await prisma.remoteTask.findFirst({ where: { OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: `${scope}${path.sep}` } }))] } })) throw new Error("Legacy environment overlaps a registered task worktree");
+  } else if (resources.length === 1 && resources[0]!.kind === "docker-compose-project") {
+    await assertLegacyStudioScope(prisma, active.task.id, active.binding.worktree, resources[0]!);
   } else if (resources.length === 1 && resources[0]!.kind === "neon-branch-database") {
     const resource = resources[0]!, scope = legacyNeonScope({ id: active.task.id, resources: active.binding.resources }, resource);
     if (scope.currentBackup) {

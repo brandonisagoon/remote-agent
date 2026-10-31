@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
 import { CleanupAdapter, CleanupObserverBatchInput, CleanupObserverBatchResult, CleanupObserverInput, CleanupObserverResource, CleanupTarget } from "./cleanup-observer-schema.ts";
 import { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
+import { assertStudioCleanupTargets } from "./cleanup-studio-targets.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review", "tooling"]), savedDataResourceId: z.string().min(1).optional(), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Hash };
@@ -58,6 +59,7 @@ function resultScope(input: z.infer<typeof CleanupObserverBatchInput>, value: un
       || item.targets.some(target => target.scope.taskId !== input.task.id || target.scope.purpose !== record.purpose)
       || [...item.dependencies, ...item.stoppedConsumers].some(id => !input.resources.some(record => record.id === id))) throw new Error("Cleanup observer resource ownership or dependencies changed");
     if (input.stage === "confirm" && !same(item.targets, selected.expectedTargets)) throw new Error("Cleanup observer target identity changed since preparation");
+    assertStudioCleanupTargets(item, record, input.task);
   }
   return result;
 }

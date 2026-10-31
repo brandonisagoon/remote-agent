@@ -36,6 +36,8 @@ export function captureAdapterDependencies(root: string, resources: Finalization
       const required = "runtimeFile" in target.scope ? [target.scope.runtimeFile, target.scope.credentialsFile] : target.kind === "native-family" ? [target.proof.file]
         : "credentials" in target.scope ? [target.scope.credentials.backupFile, target.scope.credentials.keyFile] : target.kind === "browser-auth-entry" ? [target.scope.keyFile] : [];
       if (retained && "compose" in target.scope && target.scope.compose) required.push(target.scope.compose.file);
+      if ("studio" in target.scope && target.scope.studio) required.push(target.scope.studio.file);
+      if (target.kind === "studio-proxy-route") required.push(target.scope.configuration.file);
       if (required.some(file => within(root, file))) throw new Error("Independent final confirmation inputs must survive outside filesystem capture");
     }
     const record = resources.find(other => other.id === adapter.id)!;
@@ -152,9 +154,11 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
 
 /** This query is local authority, not a filesystem observer. It also runs on
  * renewals so another task cannot acquire a recorded path inside the capture. */
-export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
+export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource" | "remoteTask">, taskId: string, plan: FinalizationResourcePlan[]) {
   const { assertClerkCleanupSharing } = await import("./cleanup-clerk.ts");
   await assertClerkCleanupSharing(prisma, taskId, plan);
+  const { assertStudioCleanupSharing } = await import("./cleanup-studio-sharing.ts");
+  await assertStudioCleanupSharing(prisma, taskId, plan);
   const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file" || entry.disposition === "retire-vault");
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
