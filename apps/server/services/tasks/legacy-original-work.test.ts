@@ -126,7 +126,8 @@ test("compact renewal protects another task's file-only retained proof without a
   // closed. No TaskResource exists for this retained archive by design.
   const proof = { ...receipt.proof, taskId: foreignTask.id, sessionId: foreignSession.id, requestKey: `finalize:${foreignTask.id}` };
   await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: foreignSession.id, source: `owner:${foreignTask.id}`, action: LEGACY_ORIGINAL_WORK, key: proof.requestKey, value: JSON.stringify(proof) } });
-  await expect(assertLegacyOriginalWorkAuthority(db.prisma, await inspectCleanupSupplementAuthority(f.input), receipt)).rejects.toThrow("another task's retained proof");
+  await expect(inspectCleanupSupplementAuthority(f.input)).rejects.toThrow("another task's retained proof");
+  await expect(assertLegacyOriginalWorkAuthority(db.prisma, f.active, receipt)).rejects.toThrow("another task's retained proof");
   expect((await lstat(f.worktree)).isDirectory()).toBe(true); expect(await db.prisma.remoteTaskResource.count()).toBe(56); await f.unchanged();
 });
 
@@ -221,6 +222,14 @@ actual("actual v1 finalizer retains stopped Docker data and recovers source/admi
     const { archive: _archive, ...binding } = f.adoption;
     f.adoption.archive = await prepareLegacyOriginalArchive({ taskId: f.task.id, sessionId: f.session.id, toolingRevision: f.task.toolingRevision, worktree: f.worktree,
       revision: f.prepared.revision, branch: f.prepared.branch, archiveRoot: path.join(ownerRoot, "source"), ownedPaths: [path.join(f.worktree, "cache")], binding }, { assertAuthority: async () => { await inspectCleanupSupplementAuthority(f.input); } });
+    // The exact retained group cannot unlock plain Git removal before the
+    // existing owner route adopts recoverable source, even after upkeep has
+    // already frozen its valid external Compose journal.
+    const unadopted = taskRegistry(socket, f.task.id, 20_000); unadopted.publishCleanupStatus = undefined; let plainRemovals = 0;
+    await expect(finalizeTask({ registry: unadopted, cleanup: true, close: async () => { throw Error("Unadopted source cannot close"); }, preparedCleanup: { observation: idle },
+      manage: (input: any) => manageResource({ ...input, docker, compose: { journalRoot } }), runner: async (command: string[], cwd: string) => { if (command.includes("worktree") && command.includes("remove")) plainRemovals++; return run(command, cwd); } })).rejects.toThrow("Cleanup preserved task resources");
+    expect(plainRemovals).toBe(0); expect((await lstat(f.worktree)).isDirectory()).toBe(true); expect(effects).toBe(0);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-retained-compose" } })).toBe(0);
     const adopted = await f.request(); expect(adopted.status).toBe(200); const proof = LegacyOriginalWorkReceipt.parse(await adopted.json()).proof.originalWork;
     const originalInode = (await lstat(f.worktree)).ino, adminInode = (await lstat(proof.administration.administrationCapture.path)).ino;
     const rawEvents = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), rows = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });

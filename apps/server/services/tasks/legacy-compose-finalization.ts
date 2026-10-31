@@ -71,6 +71,8 @@ async function sharing(db: Database, active: Active, proof: z.infer<typeof Proof
 async function saved(db: Database, active: Active) {
   const event = await db.runtimeMetadataEvent.findFirst({ where: where(active) });
   if (!event) return;
+  const { legacyOriginalWorkReceipt } = await import("./legacy-original-work.ts");
+  if (active.kind !== "v1" || !await legacyOriginalWorkReceipt(db, active.prepared, active.preparation.sequence)) throw new Error("Retained Compose requires its adopted original source archive and capture proof");
   let proof: z.infer<typeof Proof>;
   try { proof = Proof.parse(JSON.parse(event.value!)); } catch { throw new Error("Retained Compose proof is invalid"); }
   validate(active, proof); await sharing(db, active, proof);
@@ -90,6 +92,10 @@ export async function ensureLegacyComposeRetention(input: FinalizationContext, a
   if (active.kind !== "v1") return;
   const prior = await saved(input.prisma, active), selected = candidates(active);
   if (!selected.length) { if (prior) throw new Error("Retained Compose source disappeared from its original inventory"); return; }
+  const { legacyOriginalWorkReceipt } = await import("./legacy-original-work.ts");
+  // This new Ready-resource disposition must never unlock plain Git removal
+  // before the existing owner has adopted recoverable original source.
+  if (!await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence)) return;
   if (!prior && !create) throw new Error("Retained Compose requires its original observed disposition");
   if (!prior) for (const resource of selected) {
     const file = path.join(dependencies.journalRoot(), `${finalizationDigest({ taskId: active.task.id, resourceId: resource.id })}.json`);

@@ -1776,7 +1776,23 @@ async function retainedComposeFixture() {
   const { CleanupTarget, cleanupTargetDigest } = await import("./cleanup-observer-schema.ts");
   const f = await fixture(), group = await db.prisma.remoteTaskResource.create({ data: { id: "retained-compose", taskId: f.task.id, key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, state: "ready", metadata: { composeFile: path.join(directory, "environment", "compose.yml") } } });
   const source = await db.prisma.remoteTaskResource.create({ data: { id: "migrated-source", taskId: f.task.id, key: "spatial-neon-development", kind: "neon-branch-database", purpose: "development", externalId: "br-original/task_spatial", state: "released", metadata: { supersedes: `local PostGIS in ${group.key} (stopped by owner cutover; volume retained; not restarted)` } } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
   const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const { adoptLegacyOriginalWork, legacyOriginalWorkDependencies } = await import("./legacy-original-work.ts");
+  const archiveRoot = path.join(directory, "retained-source"); await mkdir(archiveRoot, { mode: 0o700 });
+  git(f.worktree, "bundle", "create", path.join(archiveRoot, "source.bundle"), "refs/heads/codex/task"); await chmod(path.join(archiveRoot, "source.bundle"), 0o600);
+  for (const file of ["index.diff", "worktree.diff"]) await writeFile(path.join(archiveRoot, file), "", { mode: 0o600 });
+  await writeFile(path.join(archiveRoot, "untracked.tar"), Buffer.alloc(1024), { mode: 0o600 });
+  const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex"), lines: string[] = [];
+  for (const file of (await readdir(archiveRoot)).sort()) lines.push(`${sha(await readFile(path.join(archiveRoot, file)))}  ${file}`);
+  const manifest = lines.join("\n") + "\n", manifestPath = path.join(archiveRoot, "MANIFEST.sha256"); await writeFile(manifestPath, manifest, { mode: 0o600 });
+  const operation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: active.operationRevision } });
+  const observationBefore = legacyOriginalWorkDependencies.observation;
+  legacyOriginalWorkDependencies.observation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
+  try { await adoptLegacyOriginalWork({ ...f.context, adoption: { kind: "original-work", requestKey: "source", finalizationRequestKey: f.input.requestKey, expectedPreparedRevision: prepared.preparedRevision,
+    expectedPreparedRawDigest: sha(active.preparation.value!), expectedOperationRevision: active.operationRevision, expectedOperationDigest: finalizationDigest(active.operation), expectedOperationRawDigest: sha(operation.value!),
+    archive: { archiveRoot, manifestPath, manifestSha256: sha(manifest), bundlePath: "source.bundle", bundleRef: "refs/heads/codex/task", indexPatchPath: "index.diff", worktreePatchPath: "worktree.diff", untrackedArchivePath: "untracked.tar", expectedWorkingTree: git(f.worktree, "rev-parse", "HEAD^{tree}"), ownedPaths: [] } } }); }
+  finally { legacyOriginalWorkDependencies.observation = observationBefore; }
   const journalRoot = path.join(directory, "compose-journal"); await mkdir(journalRoot, { mode: 0o700 });
   const journal = path.join(journalRoot, `${finalizationDigest({ taskId: f.task.id, resourceId: group.id })}.json`); await writeFile(journal, "fixture journal", { mode: 0o600 });
   const descriptor = (file: string) => ({ file, dev: 1, ino: 2, mode: 0o100600, sha256: "a".repeat(64) });
@@ -1798,7 +1814,7 @@ async function retainedComposeFixture() {
   return { ...f, group, source, prepared, active, journal, observation, dependencies, requests, restore: () => Object.assign(dependencies, original) };
 }
 
-test("v1 retained Compose proof confirms and reports its unchanged Ready data under the original operation", async () => {
+test("v1 retained Compose proof preserves unchanged Ready data under the original archived operation", async () => {
   const f = await retainedComposeFixture();
   const { ensureLegacyComposeRetention } = await import("./legacy-compose-finalization.ts");
   try {
@@ -1810,13 +1826,8 @@ test("v1 retained Compose proof confirms and reports its unchanged Ready data un
     expect(await prepareTaskFinalization({ ...f.input, cleanup: true, authorityOnly: true })).toMatchObject({ retainedCompose: retained, preparedRevision: f.prepared.preparedRevision });
     const progress = await recordCleanupProgress({ ...f.context, progress: { requestKey: f.input.requestKey, operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation), outcomes: [] } });
     expect(progress.resources.find(resource => resource.id === f.group.id)).toMatchObject({ state: "ready", outcome: "retained" });
-    f.remove();
-    const confirmed = await confirmTaskFinalization({ ...f.input, cleanup: true });
-    expect(confirmed).toMatchObject({ retainedCompose: retained, preparedRevision: f.prepared.preparedRevision });
-    expect(await confirmTaskFinalization({ ...f.input, cleanup: true })).toEqual(confirmed);
-    const report = await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: `${f.input.requestKey}:cleanup-report` } });
-    expect(JSON.stringify(report.input)).toContain("verified stopped migration data");
-    expect(await cleanupProjection(db.prisma, f.config, f.task)).toMatchObject({ retainedCompose: retained, cleanupOperation: { confirmedRevision: confirmed.confirmedRevision } });
+    expect(await ensureLegacyComposeRetention({ ...f.input, cleanup: true }, await assertPreparedCleanup(f.input), false)).toEqual(retained);
+    expect(await cleanupProjection(db.prisma, f.config, f.task)).toMatchObject({ retainedCompose: retained });
     expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(rows);
     for (const event of frozen) expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: event.sequence } })).toEqual(event);
     expect(f.requests.at(-1)).toMatchObject({ stage: "confirm", retainedCompose: { preparedRevision: f.prepared.preparedRevision, cleanup: { operationRevision: f.active.operationRevision } } });
@@ -1840,8 +1851,7 @@ for (const change of ["pause", "operation", "foreign-short-id", "foreign-worktre
     if (change === "cutover") f.observation.retainedCompose.cutover.sha256 = "f".repeat(64);
     if (change === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.group.id }, data: { metadata: { changed: true } } });
     if (change === "physical-error") f.dependencies.observe = async () => { throw new Error("Retained Compose partition is missing or running"); };
-    f.remove();
-    await expect(confirmTaskFinalization({ ...f.input, cleanup: true })).rejects.toThrow();
+    await expect(ensureLegacyComposeRetention({ ...f.input, cleanup: true }, f.active, false)).rejects.toThrow();
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
     expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: frozen.sequence } })).toEqual(frozen);
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.group.id } })).state).toBe("ready");

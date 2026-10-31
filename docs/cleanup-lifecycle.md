@@ -357,7 +357,9 @@ observer result for the exact original Ready development group and its migrated
 Neon correspondence. Preparation and confirmation independently verify the
 external retirement journal, config and cutover plus the retained container,
 volume and network lifetimes. A running/recreated member or additional consumer
-refuses confirmation. The original Ready record remains Ready; all unrelated
+refuses confirmation. This new exception is unavailable until the owner has
+adopted the original source/archive/admin proof, so a pre-adoption automatic
+attempt cannot fall through to plain Git removal. The original Ready record remains Ready; all unrelated
 Ready resources continue to block finalization.
 
 The version 1 receipt exposes optional `legacyOriginalWork` and `retainedCompose`
