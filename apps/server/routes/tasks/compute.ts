@@ -21,7 +21,7 @@ computeRoutes.post("/:taskId/compute-request", async c => {
   if (!config.compute?.enabled) return c.json({ enabled: false });
   try {
     const input = { prisma: c.get("prisma"), machineId: config.machine, policy: config.compute };
-    const environment = await requestCompute({ ...input, taskId: c.req.param("taskId"), request: parsed.data });
+    const environment = await requestCompute({ ...input, config, taskId: c.req.param("taskId"), request: parsed.data });
     await offerNextCompute(input);
     const allocation = await input.prisma.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: ["claimed", "running", "unknown"] } }, orderBy: { createdAt: "desc" } });
     return c.json({ enabled: true, environment, ...(allocation ? { allocationId: allocation.id } : {}) }, 202);

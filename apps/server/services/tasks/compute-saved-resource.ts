@@ -18,7 +18,7 @@ export function isSavedComputeEnvironment(environment: ComputeEnvironment) {
 export async function assertSavedComputeResource(store: Pick<Prisma.TransactionClient, "remoteTaskResource">,
   input: { taskId: string; key: string; purpose: string; recipeDigest: string; saved: Binding }) {
   const resource = await store.remoteTaskResource.findUnique({ where: { id: input.saved.resourceId } });
-  if (!resource || resource.taskId !== input.taskId || resource.key !== input.key || resource.purpose !== input.purpose || resource.state === "released"
+  if (input.purpose !== "development" || !resource || resource.taskId !== input.taskId || resource.key !== input.key || resource.purpose !== input.purpose || resource.state === "released"
     || !kinds.has(resource.kind) || finalizationResourceIdentity(resource).identityDigest !== input.saved.resourceIdentity
     || savedComputeDigest(input.saved) !== input.recipeDigest) throw new SavedComputeIdentityChanged("Saved compute resource identity changed");
   return resource;
@@ -30,14 +30,16 @@ export function assertSavedComputeRequest(environment: ComputeEnvironment, saved
   }
 }
 /** Physical-only enrollment cannot claim complete traffic or job coverage. */
-export function assertSavedComputeObservation(environment: ComputeEnvironment, observation: ComputeObservation) {
+export function assertSavedComputeObservation(environment: ComputeEnvironment, observation: ComputeObservation, allowActualRevision = false) {
   if (observation.resourceId !== environment.resourceId || observation.resourceIdentity !== environment.resourceIdentity
     || observation.environmentId !== environment.id || observation.taskId !== environment.taskId || observation.primarySessionId !== environment.primarySessionId
-    || observation.recipeDigest !== environment.recipeDigest || observation.revision !== environment.revision || observation.purpose !== environment.purpose
+    || observation.recipeDigest !== environment.recipeDigest || !allowActualRevision && observation.revision !== environment.revision || observation.purpose !== environment.purpose
     || observation.configurationDigest !== environment.recipeDigest || observation.routes.length || observation.coverage !== "incomplete"
     || observation.operations.coverage !== "incomplete") throw new Error("Saved compute requires its exact physical-only observation");
 }
 export function assertSavedComputeStopped(environment: ComputeEnvironment, observed: ComputeObservation, now: Date, freshnessSeconds: number) {
+  // A physical read can reconcile an older allocation after a product commit,
+  // but starting always claims exactly the environment's current generation.
   assertSavedComputeObservation(environment, observed);
   const age = now.getTime() - observed.observedAt;
   if (observed.state !== "stopped" || age < 0 || age > freshnessSeconds * 1000) throw new Error("Saved compute requires a fresh stopped observation before claiming");

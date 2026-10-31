@@ -29,12 +29,13 @@ const stamp = (input: Context) => input.now?.getTime() ?? Date.now();
 export async function recordComputeObservation(input: Context & { observation: ComputeObservation }) {
   const value = ComputeObservation.parse(input.observation);
   const env = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
-  if (isSavedComputeEnvironment(env)) assertSavedComputeObservation(env, value);
+  const saved = isSavedComputeEnvironment(env);
+  if (saved) assertSavedComputeObservation(env, value, true);
   await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(input.prisma, env);
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: env.taskId } });
   const resource = await input.prisma.remoteTaskResource.findUnique({ where: { id: value.resourceId } });
   if (!resource || resource.taskId !== env.taskId || resource.purpose !== env.purpose || resource.state === "released" || task.primarySessionId !== env.primarySessionId
-    || value.environmentId !== env.id || value.taskId !== env.taskId || value.primarySessionId !== env.primarySessionId || value.purpose !== env.purpose || value.revision !== env.revision
+    || value.environmentId !== env.id || value.taskId !== env.taskId || value.primarySessionId !== env.primarySessionId || value.purpose !== env.purpose || !saved && value.revision !== env.revision
     || value.recipeDigest !== env.recipeDigest || finalizationResourceIdentity(resource).identityDigest !== value.resourceIdentity
     || value.observedAt > stamp(input) + 1000 || stamp(input) - value.observedAt > 10_000) throw new Error("Compute observation ownership or freshness changed");
   if (value.routes.some(route => route.environmentId !== env.id || route.taskId !== env.taskId || route.primarySessionId !== env.primarySessionId || route.purpose !== env.purpose

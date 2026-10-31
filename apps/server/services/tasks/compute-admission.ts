@@ -5,8 +5,9 @@ import type { Prisma, PrismaClient, ComputeEnvironment } from "../../../../gener
 import { COMPUTE_CLAIM_MS, ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { ComputeObservation } from "./compute-observation.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import type { ServerConfig } from "../../../../lib/config.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
-import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeRequest, assertSavedComputeResource, assertSavedComputeStopped, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
+import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObservation, assertSavedComputeRequest, assertSavedComputeResource, assertSavedComputeStopped, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date };
@@ -102,15 +103,59 @@ async function withdraw(store: Store, offerId: string, reason: "expired" | "decl
   return true;
 }
 
-export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest> }) {
+async function savedRevisionAllocations(store: Pick<Store, "computeOffer" | "computeSlot">, environmentId: string) {
+  const offers = await store.computeOffer.findMany({ where: { environmentId }, orderBy: { id: "asc" }, take: 1001 });
+  if (offers.length > 1000) throw new Error("Saved compute revision history exceeds its bound");
+  if (offers.some(value => ["claimed", "running", "unknown"].includes(value.state))) throw new Error("Saved compute revision still has an active or uncertain allocation");
+  const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(value => value.id) } }, orderBy: { id: "asc" }, take: 1001 });
+  if (slots.length > 1000 || slots.some(slot => !offers.some(offer => offer.id === slot.allocationId && offer.state === "offered" && offer.claimedAt === null))) throw new Error("Saved compute revision has an unexplained slot");
+  return { offers, slots };
+}
+
+export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation) {
   policy(input); const request = ComputeRequest.parse(input.request);
+  const prior = await input.prisma.computeEnvironment.findUnique({ where: { taskId_key: { taskId: input.taskId, key: request.key } } });
+  // A saved app can survive normal product commits. Observe the actual new
+  // HEAD before changing its generation; never relabel an old observation.
+  const transition = await (async () => {
+    if (!prior || prior.revision === request.revision) return;
+    if (!request.saved || !input.config || input.config.machine !== input.machineId) throw new Error("Compute request identity changed");
+    const owned = await assertComputeEnvironmentOwner(input.prisma, prior);
+    assertSavedComputeRequest(prior, request.saved);
+    if (prior.taskIdentity !== owned.identity || prior.purpose !== request.purpose || prior.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
+    const resource = await assertSavedComputeResource(input.prisma, { taskId: input.taskId, ...request, saved: request.saved });
+    const allocations = await savedRevisionAllocations(input.prisma, prior.id);
+    const candidate = { ...prior, revision: request.revision, observation: null };
+    const read = readRevision ?? (await import("./compute-observer.ts")).readConfiguredComputeObservation;
+    const output = await read({ prisma: input.prisma, config: input.config }, owned.task, candidate, resource, []);
+    const observation = ComputeObservation.parse(output.observation);
+    assertSavedComputeStopped(candidate, observation, at(input), input.policy.collectorFreshnessSeconds);
+    if (output.traffic.length) throw new Error("Saved revision cannot inherit traffic coverage");
+    return { resource, allocations, observation };
+  })();
   return input.prisma.$transaction(async store => {
     const owned = await computeTaskOwner(store, input.taskId, input.machineId);
     if (request.saved) await assertSavedComputeResource(store, { taskId: input.taskId, ...request, saved: request.saved });
     const old = await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: input.taskId, key: request.key } } });
     if (old) {
-      if (old.taskIdentity !== owned.identity || old.purpose !== request.purpose || old.revision !== request.revision || old.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
+      if (old.taskIdentity !== owned.identity || old.purpose !== request.purpose || old.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
       assertSavedComputeRequest(old, request.saved);
+      if (transition) {
+        const current = await store.remoteTaskResource.findUniqueOrThrow({ where: { id: transition.resource.id } });
+        const allocations = await savedRevisionAllocations(store, old.id);
+        if (finalizationDigest(old) !== finalizationDigest(prior) || finalizationDigest(current) !== finalizationDigest(transition.resource)
+          || finalizationDigest(allocations) !== finalizationDigest(transition.allocations)) throw new Error("Saved compute revision changed during observation");
+        assertSavedComputeStopped({ ...old, revision: request.revision }, transition.observation, at(input), input.policy.collectorFreshnessSeconds);
+        // Keep original offer IDs/results. Even an already dispatched old
+        // instruction cannot claim its now-withdrawn offer at the new HEAD.
+        for (const offer of allocations.offers) if (["queued", "offered"].includes(offer.state)) await withdraw(store, offer.id, "ineligible", at(input));
+        await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: old.primarySessionId, source: `compute:${old.taskId}`, action: "compute-saved-revision", key: finalizationDigest({ environmentId: old.id, from: old.revision, to: request.revision, previous: finalizationDigest(old) }), value: JSON.stringify({ version: 1, environmentId: old.id,
+          taskIdentity: old.taskIdentity, resourceId: old.resourceId, resourceIdentity: old.resourceIdentity, fromRevision: old.revision, toRevision: request.revision,
+          previousObservation: old.observation, observation: transition.observation, offers: allocations.offers.map(value => ({ id: value.id, state: value.state, instructionId: value.instructionId })) }) } });
+        const updated = await store.computeEnvironment.update({ where: { id: old.id }, data: { revision: request.revision, observation: transition.observation, state: "waiting" } });
+        await rotate(store, updated, at(input)); return updated;
+      }
+      if (old.revision !== request.revision) throw new Error("Compute request identity changed");
       if (old.state === "suspended" && !(await store.computeWait.findUnique({ where: { environmentId: old.id } }))) await rotate(store, old, at(input));
       return old;
     }
@@ -291,6 +336,7 @@ export async function reconcileObservedCompute(input: Context & { environmentId:
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);
     const observation = ComputeObservation.parse(environment.observation);
+    if (isSavedComputeEnvironment(environment)) assertSavedComputeObservation(environment, observation, true);
     const resource = environment.resourceId && await store.remoteTaskResource.findUnique({ where: { id: environment.resourceId } });
     if (!resource || observation.environmentId !== environment.id || observation.taskId !== environment.taskId || observation.primarySessionId !== environment.primarySessionId
       || observation.resourceId !== resource.id || observation.resourceIdentity !== finalizationResourceIdentity(resource).identityDigest

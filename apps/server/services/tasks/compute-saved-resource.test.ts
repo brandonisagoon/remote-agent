@@ -31,6 +31,13 @@ test("a saved resume binds the original resource without rewriting or duplicatin
   expect(await db.prisma.remoteTaskResource.count()).toBe(1);
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
 });
+test("saved review receipts retain their separate lifecycle and cannot reserve a development resume", async () => {
+  const f = await fixture();
+  const resource = await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { purpose: "review" } });
+  const saved = { resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest };
+  await expect(requestCompute({ ...context(), taskId: "task", request: { ...f.request, purpose: "review", saved, recipeDigest: finalizationDigest({ version: 1, adapter: "saved-compute", ...saved }) } })).rejects.toThrow("identity changed");
+  expect(await db.prisma.computeEnvironment.count()).toBe(0); expect(await db.prisma.computeOffer.count()).toBe(0);
+});
 async function registered() {
   const f = await fixture(), environment = await requestCompute({ ...context(), taskId: "task", request: f.request });
   const observation = { version: 1 as const, environmentId: environment.id, taskId: "task", primarySessionId: "primary", purpose: f.request.purpose,
@@ -72,6 +79,14 @@ test("saved physical observation cannot become full activity coverage", async ()
     await expect(f.record(observation)).rejects.toThrow("physical-only");
   }
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).observation).toBeNull();
+});
+
+test("actual physical HEAD can differ for reconciliation but never for first claim", async () => {
+  const f = await registered(), offer = await delivered(f);
+  await f.record({ ...f.observation, revision: "b".repeat(40) });
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).revision).toBe(f.request.revision);
+  await expect(claimCompute({ ...context(), taskId: "task", offerId: offer.id, request: f.request })).rejects.toThrow("physical-only observation");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe("offered");
 });
 test.each(["identity", "released", "pause"])("saved claim renewal refuses later %s without freeing its allocation", async changed => {
   const f = await registered(), offer = await delivered(f);
@@ -120,4 +135,79 @@ test("saved resume cannot override an explicit stop left pending across maintena
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: false } });
   await expect(claim()).rejects.toThrow("superseded by a development stop");
   expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+});
+
+async function nextRevision() {
+  const f = await registered(); await f.record();
+  const request = { ...f.request, revision: "b".repeat(40) };
+  const config = testConfig({ machine: "host", compute: policy });
+  const observation = { ...f.observation, revision: request.revision };
+  const read: NonNullable<Parameters<typeof requestCompute>[1]> = async (_input, _task, candidate, _resource, traffic) => {
+    expect(candidate.revision).toBe(request.revision); expect(candidate.observation).toBeNull(); expect(traffic).toEqual([]);
+    return { observation, traffic: [] };
+  };
+  const transition = (reader = read) => requestCompute({ ...context(), config, taskId: "task", request }, reader);
+  return { ...f, request, observation, read, transition, config };
+}
+
+test("stopped saved revision requeues fairly, preserves history and replays a lost transition reply", async () => {
+  const f = await nextRevision(), oldOffer = (await offerNextCompute(context()))!;
+  await db.prisma.runtimeInstruction.update({ where: { id: oldOffer.instructionId }, data: { state: "dispatching" } });
+  const previousSequence = (await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: f.environment.id } })).sequence;
+  const oldObservation = (await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).observation;
+  const updated = await f.transition();
+  expect(updated).toMatchObject({ id: f.environment.id, key: f.environment.key, revision: f.request.revision, state: "waiting" });
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: oldOffer.id } })).state).toBe("ineligible");
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: oldOffer.instructionId } })).state).toBe("dispatching");
+  await expect(claimCompute({ ...context(), taskId: "task", offerId: oldOffer.id, request: f.request })).rejects.toThrow("expired or superseded");
+  expect((await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: updated.id } })).sequence).toBeGreaterThan(previousSequence);
+  // The caller lost its reply after the transaction committed. Same request
+  // replays without reading another physical generation or appending a fact.
+  expect(await f.transition(async () => { throw new Error("must not reobserve committed transition"); })).toEqual(updated);
+  const events = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-saved-revision" } });
+  expect(events).toHaveLength(1);
+  expect(JSON.parse(events[0]!.value!)).toMatchObject({ fromRevision: f.environment.revision, toRevision: f.request.revision, previousObservation: oldObservation, observation: f.observation, offers: [{ id: oldOffer.id, state: "queued" }] });
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
+});
+
+test.each(["claimed", "running", "unknown", "unexplained-slot"])("saved revision refuses %s without changing its allocation", async state => {
+  const f = await nextRevision(), offer = (await offerNextCompute(context()))!;
+  await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: state === "unexplained-slot" ? "stopped" : state } });
+  await db.prisma.computeSlot.upsert({ where: { id: "host:0" }, create: { id: "host:0", machineId: "host", ordinal: 0, allocationId: offer.id }, update: { allocationId: offer.id } });
+  await expect(f.transition(async () => { throw new Error("must refuse before observation"); })).rejects.toThrow(state === "unexplained-slot" ? "unexplained slot" : "active or uncertain allocation");
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).revision).toBe(f.environment.revision);
+  expect((await db.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(offer.id);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-saved-revision" } })).toBe(0);
+});
+
+test.each(["running", "stale", "wrong-revision", "coverage"])("saved revision refuses %s candidate observation", async change => {
+  const f = await nextRevision();
+  await expect(f.transition(async () => ({ traffic: [], observation: { ...f.observation,
+    ...(change === "running" ? { state: "running" as const } : change === "stale" ? { observedAt: now.getTime() - 10_001 } : change === "coverage" ? { coverage: "complete" as const } : { revision: f.environment.revision }) } }))).rejects.toThrow();
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).revision).toBe(f.environment.revision);
+});
+
+test.each(["pause", "owner", "resource", "revision", "observation", "claim"])("saved revision CAS refuses late %s", async change => {
+  const f = await nextRevision(), offer = (await offerNextCompute(context()))!;
+  await expect(f.transition(async (...args) => {
+    const output = await f.read(...args);
+    if (change === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    if (change === "owner") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { branchName: "codex/replaced" } });
+    if (change === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { metadata: { original: "changed" } } });
+    if (change === "revision") await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { revision: "c".repeat(40) } });
+    if (change === "observation") await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { observation: { ...f.observation, observedAt: now.getTime() - 1 } } });
+    if (change === "claim") await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: now } });
+    return output;
+  })).rejects.toThrow();
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe(change === "claim" ? "claimed" : "queued");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-saved-revision" } })).toBe(0);
+});
+
+test("two saved revision contenders cannot both advance the same prior generation", async () => {
+  const f = await nextRevision(); let ready = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const read: typeof f.read = async (...args) => { const output = await f.read(...args); if (++ready === 2) release(); await gate; return output; };
+  const results = await Promise.allSettled([f.transition(read), f.transition(read)]);
+  expect(results.filter(value => value.status === "fulfilled")).toHaveLength(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-saved-revision" } })).toBe(1);
 });

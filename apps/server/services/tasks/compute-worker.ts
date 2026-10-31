@@ -7,6 +7,7 @@ import { considerComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
 import { verifiedComputeRuntime } from "./compute-observer.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
+import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }) {
   const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
@@ -34,6 +35,13 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       const environment = environments[index++]; if (!environment) return;
       try {
         await deps.refresh({ ...input, environmentId: environment.id });
+        if (isSavedComputeEnvironment(environment)) {
+          // Physical-only legacy recipes never supply inactivity authority.
+          // Their actual HEAD may have moved while the allocated app ran;
+          // exact stopped/settled reconciliation preserves the old generation.
+          await reconcileObservedCompute({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute!, environmentId: environment.id, runtime: input.runtime });
+          observed++; continue;
+        }
         const context = { ...input, taskId: environment.taskId, environmentId: environment.id };
         const projection = await developmentProjection(context);
         const intent = projection.developmentIntent;
