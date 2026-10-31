@@ -13,6 +13,7 @@ import { LEGACY_EVIDENCE_CONFIRMED, LEGACY_EVIDENCE_RETAINED, LegacyEvidenceAdop
 
 import { isEvidenceTree, matchLegacyEvidenceTrees, observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { assertLegacyEvidenceWriters } from "./legacy-evidence-writers.ts";
+import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { assertLocalCompletion } from "./local-completion.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
@@ -96,7 +97,7 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   for (const entry of proof.entries) {
     if (isEvidenceTree(entry)) { await assertUnsharedDirectory(prisma, taskId, entry.resourceId, entry.target.path); await assertUnsharedDirectory(prisma, taskId, entry.resourceId, entry.target.quarantine.directory); }
     const record = resources.find((resource) => resource.id === entry.resourceId);
-    if (!record || record.taskId !== taskId || legacyEvidenceResourceDigest(record) !== entry.identityDigest) throw new Error("Legacy evidence resource receipt changed");
+    if (!record || record.taskId !== taskId || entry.purpose === "tooling" && (!current.prepared.localCompletion || record.state !== "ready") || legacyEvidenceResourceDigest(record) !== entry.identityDigest) throw new Error("Legacy evidence resource receipt changed");
     if (record.state === "released") {
       const confirmed = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: proof.sessionId, source: `legacy-evidence:${taskId}`, action: LEGACY_EVIDENCE_CONFIRMED, key: entry.resourceId } });
       if (confirmed?.value !== JSON.stringify({ proofRevision: event.sequence, proofDigest: finalizationDigest(proof), preparedRevision: proof.preparedRevision, resourceId: entry.resourceId, identityDigest: entry.identityDigest })) throw new Error("Evidence was marked released without independent retirement confirmation");
@@ -138,10 +139,11 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
   const paths = new Set<string>();
   for (const request of adoption.entries) {
     const resource = evidence.find((record) => record.id === request.resourceId)!;
-    if (!["browser", "development", "review"].includes(resource.purpose) || resource.createdAt > current.event.occurredAt || paths.has(resource.externalId)) throw new Error("Evidence lacks original prepared provenance or has an ambiguous source path");
+    if (!["browser", "development", "review", "tooling"].includes(resource.purpose) || resource.createdAt > current.event.occurredAt || paths.has(resource.externalId)) throw new Error("Evidence lacks original prepared provenance or has an ambiguous source path");
     paths.add(resource.externalId);
     const recorded = recordedProof(resource);
-    const common = { resourceId: resource.id, key: resource.key, kind: "evidence" as const, purpose: resource.purpose as "browser" | "development" | "review", externalId: resource.externalId, createdAt: resource.createdAt.toISOString(), identityDigest: legacyEvidenceResourceDigest(resource), recorded };
+    if (resource.purpose === "tooling" && (!current.prepared.localCompletion || resource.state !== "ready" || "type" in request || within(path.dirname(resource.externalId), archive.archiveRoot) || within(archive.archiveRoot, path.dirname(resource.externalId)))) throw new Error("Retained tooling evidence requires an original Ready file and a disjoint copied-proof root");
+    const common = { resourceId: resource.id, key: resource.key, kind: "evidence" as const, purpose: resource.purpose as "browser" | "development" | "review" | "tooling", externalId: resource.externalId, createdAt: resource.createdAt.toISOString(), identityDigest: legacyEvidenceResourceDigest(resource), recorded };
     if ("type" in request && request.type === "tree") {
       if (recorded.sha256 !== undefined || recorded.size !== undefined) throw new Error("Directory evidence cannot reinterpret a historical file hash or byte count");
       const protectedRoots = [current.prepared.worktree, current.prepared.registeredWorktree, current.prepared.gitCwd, current.prepared.gitDirectory, current.task.toolingRoot, current.task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
@@ -159,7 +161,7 @@ export async function adoptLegacyEvidence(input: Context & { adoption: LegacyEvi
       const directory = path.join(parentPath, `.drafted-finalization-${randomUUID()}`);
       await assertUnsharedDirectory(input.prisma, input.taskId, resource.id, directory);
       if (wholeRoots.some(root => within(root, directory) || within(directory, root))) throw new Error("Directory quarantine must survive outside every cleanup root");
-      entries.push({ ...common, digestProvenance: "observed-at-adoption", target: { type: "tree", path: source.path, sourcePaths: [source.path], inventory: source.inventory, sourceParent: { path: sourceParentPath, dev: sourceParent.dev, ino: sourceParent.ino, mode: sourceParent.mode }, quarantineParent: { path: parentPath, dev: parent.dev, ino: parent.ino, mode: parent.mode }, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } }, retained });
+      entries.push({ ...common, purpose: resource.purpose as "browser" | "development" | "review", digestProvenance: "observed-at-adoption", target: { type: "tree", path: source.path, sourcePaths: [source.path], inventory: source.inventory, sourceParent: { path: sourceParentPath, dev: sourceParent.dev, ino: sourceParent.ino, mode: sourceParent.mode }, quarantineParent: { path: parentPath, dev: parent.dev, ino: parent.ino, mode: parent.mode }, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } }, retained });
     } else {
       const fileRequest = request as Extract<LegacyEvidenceAdoptionInput["entries"][number], { sha256: string }>;
       const source = await observeLegacyEvidenceFile(resource.externalId);
@@ -203,6 +205,7 @@ export async function manageLegacyEvidence(input: { prisma: PrismaClient; config
   if (operation.proofDigest !== result.proofDigest || operation.preparedRevision !== proof.preparedRevision || operation.finalizationRequestKey !== proof.finalizationRequestKey) throw new Error("Legacy evidence operation does not match its immutable proof");
   const entry = proof.entries.find((candidate) => candidate.key === operation.resourceKey);
   if (!entry) throw new Error("Resource is outside the authenticated evidence inventory");
+  if (entry.purpose === "tooling" && operation.action !== "inspect") throw new Error("Retained tooling evidence is verified in place and cannot be captured or released");
   const confirmWhere = { runtimeSessionId: input.sessionId, source: `legacy-evidence:${task.id}`, action: LEGACY_EVIDENCE_CONFIRMED, key: entry.resourceId };
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where: confirmWhere });
   const confirmation = { proofRevision: result.proofRevision, proofDigest: result.proofDigest, preparedRevision: proof.preparedRevision, resourceId: entry.resourceId, identityDigest: entry.identityDigest };
@@ -281,5 +284,23 @@ export async function assertLegacyEvidenceResourceUpdate(prisma: Database, resou
   }
   const entry = proof.entries.find((candidate) => candidate.resourceId === resource.id);
   if (!entry) return;
+  if (entry.purpose === "tooling" && next.state !== "ready") throw new Error("Retained tooling evidence must keep its original Ready state");
   if (next.state !== resource.state && (next.state === "released" || resource.state === "released") || legacyEvidenceResourceDigest({ ...resource, ...next, metadata: (next.metadata ?? resource.metadata) as RemoteTaskResource["metadata"] }) !== entry.identityDigest) throw new Error("Authenticated legacy evidence must retain its original receipt; use independently verified evidence confirmation to release it");
+}
+
+
+/** Tooling evidence remains Ready in place. Full boundaries verify both that
+ * original file and its disjoint retained copy; this grants no deletion scope. */
+export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config: ServerConfig, prepared: PreparedFinalization) {
+  if (!prepared.localCompletion) return;
+  const resources = await prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId, kind: "evidence", purpose: "tooling", state: { not: "released" } } });
+  if (!resources.length) return;
+  const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: prepared.sessionId, source: `owner:${prepared.taskId}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
+  if (!event) throw new PreparationDiagnosticError("LOCAL_EVIDENCE_RETENTION_REQUIRED");
+  const loaded = await loadProof(prisma, config, prepared.taskId, event.sequence);
+  if (loaded.prepared.requestKey !== prepared.requestKey || loaded.receipt.proof.preparedDigest !== finalizationDigest(prepared)) throw new Error("Retained tooling evidence belongs to another preparation");
+  const entries = loaded.receipt.proof.entries.filter(entry => entry.purpose === "tooling");
+  if (entries.length !== resources.length || resources.some(resource => !entries.some(entry => entry.resourceId === resource.id))) throw new Error("Retained tooling evidence inventory changed");
+  for (const entry of entries) if (await inspectLegacyEvidenceCapture(loaded.receipt.proof, entry, false) !== "intact") throw new Error("Retained tooling evidence must remain at its unchanged original path");
+  await loadProof(prisma, config, prepared.taskId, event.sequence);
 }

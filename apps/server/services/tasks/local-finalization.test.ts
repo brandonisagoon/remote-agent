@@ -117,10 +117,11 @@ test("missing direct completion emits a fixed safe diagnostic and schedules no c
 });
 
 const actual = process.env.DRAFTED_LOCAL_FINALIZATION_ROOT ? test : test.skip;
-actual.each(["none", "changed-ignored", "new-ignored", "pause"])("actual client preserves unlinked source and evidence through capture/retry (late change=%s)", async change => {
+actual.each(["none", "changed-ignored", "new-ignored", "pause", "changed-manifest", "changed-manifest-copy", "tooling-directory", "tooling-kind", "shared-copy-root"])("actual client preserves unlinked source and evidence through capture/retry (late change=%s)", async change => {
   const f = await fixture(), root = process.env.DRAFTED_LOCAL_FINALIZATION_ROOT!;
   const client = (file: string) => import(pathToFileURL(path.join(root, `src/${file}.ts`)).href);
   const { finalizeTask } = await client("finalize"), { taskRegistry, closeTask } = await client("control"), { manageResource } = await client("resources");
+  const { prepareLegacyEvidence } = await client("legacy-evidence");
   const { prepareLegacyOriginalArchive } = await client("legacy-original-archive"), { run } = await client("process");
   const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
   const idle = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
@@ -132,22 +133,60 @@ actual.each(["none", "changed-ignored", "new-ignored", "pause"])("actual client 
     const sourceEvidence = path.join(directory, "original-evidence", "evidence.txt"), retainedRoot = path.join(directory, "retained-evidence"), retainedFile = path.join(retainedRoot, "evidence.txt");
     await mkdir(path.dirname(sourceEvidence), { mode: 0o700 }); await mkdir(retainedRoot, { mode: 0o700 }); await writeFile(sourceEvidence, "published evidence", { mode: 0o600 }); await writeFile(retainedFile, "published evidence", { mode: 0o600 });
     const evidence = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "evidence", kind: "evidence", purpose: "development", externalId: sourceEvidence, state: "ready", metadata: { sha256: sha("published evidence"), bytes: 18 } } });
+    // Exact actual task shape: six development evidence files and two tooling
+    // manifest FILES inside a prior archive. All copies live in a disjoint root.
+    const copied = [{ resource: evidence, path: "evidence.txt", bytes: "published evidence" }];
+    for (let index = 1; index < 8; index++) {
+      const tooling = index >= 6, name = `evidence-${index}.txt`, bytes = `original retained material ${index}`;
+      const source = tooling ? path.join(directory, "original-retained", index === 6 ? "RETENTION.json" : "lifecycle/RETENTION.json") : path.join(path.dirname(sourceEvidence), name);
+      await mkdir(path.dirname(source), { recursive: true, mode: 0o700 }); await writeFile(source, bytes, { mode: 0o600 }); await writeFile(path.join(retainedRoot, name), bytes, { mode: 0o600 });
+      const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: name, kind: "evidence", purpose: tooling ? "tooling" : "development", externalId: source, state: "ready", metadata: { sha256: sha(bytes), bytes: Buffer.byteLength(bytes) } } });
+      copied.push({ resource, path: name, bytes });
+    }
+    const retainedRecords = copied.filter(item => item.resource.purpose === "tooling").map(item => structuredClone(item.resource));
     const registry = taskRegistry(f.socket, f.task.id, 20_000); let removals = 0, closed = 0;
     const close = async () => { await closeTask(f.socket, f.task.id); closed++; };
     const manage = (input: any) => manageResource(input);
     const args = { registry, cleanup: true, close, manage, preparedCleanup: { observation: idle } };
-    await expect(finalizeTask({ ...args, runner: async (command: string[], cwd: string) => { if (command.includes("remove")) removals++; return run(command, cwd); } })).rejects.toThrow("ignored material");
+    await expect(finalizeTask({ ...args, runner: async (command: string[], cwd: string) => { if (command.includes("remove")) removals++; return run(command, cwd); } })).rejects.toThrow("LOCAL_EVIDENCE_RETENTION_REQUIRED");
     expect(removals).toBe(0); expect(closed).toBe(0); expect(await readFile(cache, "utf8")).toBe("original ignored material");
-    const prepared = await f.request("prepare-finalization", f.input); expect(prepared.status).toBe(200);
+    const prepared = await f.request("prepare-finalization", { ...f.input, authorityOnly: true }); expect(prepared.status).toBe(200);
     expect(prepared.data.localCompletion.sourceCaptureRequired).toBe(true);
     const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.data.preparedRevision } });
     const operation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.data.cleanup.operationRevision } });
-    const manifestPath = path.join(retainedRoot, "RETENTION.json"), manifest = JSON.stringify({ task: f.task.id, retainedArchive: retainedRoot, sourceUnchanged: true, files: [{ path: "evidence.txt", sha256: sha("published evidence"), bytes: 18 }] });
+    const manifestPath = path.join(retainedRoot, "RETENTION.json"), manifest = JSON.stringify({ task: f.task.id, retainedArchive: retainedRoot, sourceUnchanged: true, files: copied.map(item => ({ path: item.path, sha256: sha(item.bytes), bytes: Buffer.byteLength(item.bytes) })) });
     await writeFile(manifestPath, manifest, { mode: 0o600 });
     const evidenceInput = { requestKey: "evidence-retention", finalizationRequestKey: f.input.requestKey, expectedPreparedRevision: original.sequence,
-      manifest: { path: manifestPath, sha256: sha(manifest) }, entries: [{ resourceId: evidence.id, retainedPath: retainedFile, sha256: sha("published evidence"), size: 18 }] };
+      manifest: { path: manifestPath, sha256: sha(manifest) }, entries: copied.map(item => ({ resourceId: item.resource.id, retainedPath: path.join(retainedRoot, item.path), sha256: sha(item.bytes), size: Buffer.byteLength(item.bytes) })) };
+    if (["tooling-directory", "tooling-kind", "shared-copy-root"].includes(change)) {
+      let input: any = structuredClone(evidenceInput);
+      if (change === "tooling-directory") input.entries[6] = { type: "tree", resourceId: copied[6]!.resource.id, retainedPath: path.join(retainedRoot, copied[6]!.path), inventoryDigest: "a".repeat(64) };
+      if (change === "tooling-kind") await db.prisma.remoteTaskResource.update({ where: { id: copied[6]!.resource.id }, data: { kind: "private-file" } });
+      if (change === "shared-copy-root") {
+        const shared = path.join(path.dirname(retainedRecords[0]!.externalId), "copies"); await mkdir(shared, { mode: 0o700 });
+        for (const item of copied) await writeFile(path.join(shared, item.path), item.bytes, { mode: 0o600 });
+        const bytes = JSON.stringify({ task: f.task.id, retainedArchive: shared, sourceUnchanged: true, files: copied.map(item => ({ path: item.path, sha256: sha(item.bytes), bytes: Buffer.byteLength(item.bytes) })) });
+        const file = path.join(shared, "RETENTION.json"); await writeFile(file, bytes, { mode: 0o600 });
+        input = { ...input, manifest: { path: file, sha256: sha(bytes) }, entries: copied.map(item => ({ resourceId: item.resource.id, retainedPath: path.join(shared, item.path), sha256: sha(item.bytes), size: Buffer.byteLength(item.bytes) })) };
+      }
+      expect((await f.request("legacy-evidence", input, true)).status).toBe(409);
+      expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "legacy-evidence-retained" } })).toBe(0);
+      expect(removals).toBe(0); expect(closed).toBe(0); expect(await readFile(retainedRecords[0]!.externalId, "utf8")).toBe(copied[6]!.bytes);
+      return;
+    }
+    expect(await prepareLegacyEvidence({ registry, configuration: { requestKey: evidenceInput.requestKey, finalizationRequestKey: evidenceInput.finalizationRequestKey,
+      expectedPreparedRevision: evidenceInput.expectedPreparedRevision, manifest: evidenceInput.manifest,
+      copies: copied.map(item => ({ resourceKey: item.resource.key, retainedPath: path.join(retainedRoot, item.path) })) } })).toEqual(evidenceInput);
     expect((await f.request("legacy-evidence", evidenceInput)).status).toBe(401);
     const evidenceAdoption = await f.request("legacy-evidence", evidenceInput, true); expect(evidenceAdoption).toMatchObject({ status: 200 });
+    expect(evidenceAdoption.data.proof.entries).toHaveLength(8);
+    const retainedEntry = evidenceAdoption.data.proof.entries.find((entry: any) => entry.purpose === "tooling");
+    const retainedOperation = { resourceKey: retainedEntry.key, action: "authorize", proofRevision: evidenceAdoption.data.proofRevision, proofDigest: evidenceAdoption.data.proofDigest, preparedRevision: original.sequence, finalizationRequestKey: f.input.requestKey };
+    const forbidden = await fetch(`http://localhost/api/sessions/${f.session.id}/legacy-evidence`, { unix: f.socket, method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(retainedOperation) });
+    expect(forbidden.status).toBe(409);
+    const retainedResource = retainedRecords[0]!;
+    await expect(registry.resource({ key: retainedResource.key, kind: retainedResource.kind, purpose: "tooling", externalId: retainedResource.externalId, state: "allocated", metadata: retainedResource.metadata })).rejects.toThrow();
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: retainedResource.id } })).toEqual(retainedResource);
     const binding = { kind: "original-work", requestKey: "source-retention", finalizationRequestKey: f.input.requestKey, expectedPreparedRevision: original.sequence, expectedPreparedRawDigest: sha(original.value!),
       expectedOperationRevision: operation.sequence, expectedOperationRawDigest: sha(operation.value!), expectedOperationDigest: finalizationDigest(JSON.parse(operation.value!)) };
     const parent = path.join(directory, "source-archive"); await mkdir(parent, { mode: 0o700 });
@@ -158,6 +197,8 @@ actual.each(["none", "changed-ignored", "new-ignored", "pause"])("actual client 
     if (change !== "none") {
       if (change === "changed-ignored") await writeFile(cache, "new owner material after adoption");
       if (change === "new-ignored") await writeFile(path.join(f.worktree, "cache", "late.bin"), "later ignored material");
+      if (change === "changed-manifest") await writeFile(retainedRecords[0]!.externalId, "changed original manifest");
+      if (change === "changed-manifest-copy") await writeFile(path.join(retainedRoot, copied[6]!.path), "changed copied manifest");
       if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
       let effects = 0;
       await expect(finalizeTask({ ...args, manage: async () => { effects++; throw Error("must refuse before effects"); } })).rejects.toThrow();
@@ -179,6 +220,11 @@ actual.each(["none", "changed-ignored", "new-ignored", "pause"])("actual client 
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: evidence.id } })).state).toBe("released");
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: operation.sequence } })).value).toBe(operation.value);
+    for (const record of retainedRecords) {
+      expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: record.id } })).toEqual(record);
+      expect(await readFile(record.externalId, "utf8")).toBe(copied.find(item => item.resource.id === record.id)!.bytes);
+    }
+    expect(await db.prisma.remoteTaskResource.count()).toBe(8);
     expect(await db.prisma.runtimeIssueUpdate.count()).toBe(0); expect(await db.prisma.runtimeSession.count()).toBe(1);
     expect(await finalizeTask(args)).toMatchObject({ alreadyClosed: true, reporting: { state: "recorded" } });
   } finally { await stop(); legacyOriginalWorkDependencies.observation = priorObservation; await f.server.stop(true); }

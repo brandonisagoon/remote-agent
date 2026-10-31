@@ -447,3 +447,17 @@ cases cover missing/changed verification and authority, source drift, paused or
 closed tasks, active/moved descendants, pending work, dirty work and changed
 ignored contents. Unsupported local completion produces fixed safe diagnostic
 codes rather than a generic failure or a fabricated remote delivery.
+
+Direct-task manifests registered as `kind: evidence, purpose: tooling` use a
+narrow copied-file retention variant. Adoption includes the complete evidence
+inventory while preserving those original Ready rows, purposes, metadata and
+paths. Only regular files with exact recorded/observed bytes and an independent
+copy in a disjoint proof root are accepted; tooling directories and other kinds
+are refused. A manifest already inside its retained archive cannot be its own
+copy: prepare a separate private copy-proof root containing that manifest and
+all selected evidence. Original archives are neither rewritten nor moved.
+Full preparation and confirmation verify the original tooling files and copied
+bytes; missing adoption prevents source retirement. These entries cannot obtain
+capture/release authority, and generic tooling-resource selection is unchanged.
+The actual Unix fixture includes six development evidence files and two retained
+tooling manifests, with original/copy mutation and overlapping-copy refusals.

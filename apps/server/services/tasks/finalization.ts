@@ -1,3 +1,4 @@
+import { verifyRetainedToolingEvidence } from "./legacy-evidence.ts";
 import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority, legacyOriginalWorkDependencies } from "./legacy-original-work.ts";
 import { assertLegacyOriginalWorkFiles } from "./legacy-original-work-files.ts";
 import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
@@ -309,6 +310,7 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
     await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: Boolean(confirmed) }, legacyOriginalWorkDependencies.observation);
     await assertLegacyOriginalWorkAuthority(input.prisma, await assertPreparedCleanup(input), legacyOriginalWork);
   } else await observePreparedFilesystem(input, candidate.prepared, dependencies);
+  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
   if (confirmed) await assertFinalizationRemoved(active.prepared);
   await assertPreparedCleanup(input);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, !confirmed);
@@ -328,6 +330,7 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   if (active.prepared.localCompletion?.sourceCaptureRequired && !legacyOriginalWork) throw new PreparationDiagnosticError("LOCAL_SOURCE_CAPTURE_REQUIRED");
   if (legacyOriginalWork) await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: true }, legacyOriginalWorkDependencies.observation);
   await assertFinalizationRemoved(active.prepared);
+  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
   return input.prisma.$transaction(async tx => {
     const latest = await assertPreparedCleanup({ ...input, prisma: tx });

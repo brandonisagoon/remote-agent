@@ -10,6 +10,7 @@ const reasons = {
   LOCAL_COMPLETION_REQUIRED: "A task without a source issue requires its existing owner-authenticated research or local-only completion contract and bound verification; no issue or merge will be invented.",
   LOCAL_COMPLETION_IDENTITY: "Local cleanup requires the unchanged original primary and null source identity, with no linked issue ownership.",
   LOCAL_COMPLETION_UNSAFE: "Local cleanup requires verified clean work and no claimed remote delivery. Preserve changed work and saved data through the existing retention flow before retirement.",
+  LOCAL_EVIDENCE_RETENTION_REQUIRED: "Retained tooling evidence needs the existing exact copied-evidence adoption before source retirement. Preserve original files and records; no tooling deletion is authorized.",
   LOCAL_RETENTION_UNSUPPORTED: "This saved archive format requires linked delivery evidence. Preserve its bytes; local cleanup supports exact copied-evidence and original-source adoption without inventing a source issue or merge.",
   LOCAL_SOURCE_CAPTURE_REQUIRED: "The local task has ignored original material. Preserve it through the existing same-operation original-source archive and capture proof before source retirement; do not discard it or replace the preparation.",
   ...cleanupObserverReasons,
