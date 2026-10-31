@@ -227,3 +227,32 @@ test.skipIf(!clientRoot)("actual Unix suspension refuses a newer owner pause aft
   expect(await f.prisma.remoteTaskResource.count({ where: { state: "released" } })).toBe(0);
   expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-complete" } })).toBe(0);
 }, 90_000);
+
+test.skipIf(!clientRoot)("setup, migrations and fixtures retain their claimed slot before application activity becomes available", async () => {
+  const f = await fixture();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
+  const offer = await f.deliver(), steps: string[] = [], execute = f.input.docker.exec;
+  f.input.docker.exec = async () => {
+    const task = await f.registry.task(), resource = task.resources.find((value: any) => value.key === "runtime-development");
+    const step = resource.metadata.progress.step;
+    steps.push(step);
+    expect(await Bun.file(path.join(path.dirname(resource.externalId), "app", "start.json")).exists()).toBe(false);
+    expect(resource.metadata.compute).toBeUndefined();
+    // Even the fixture's deliberately idle physical observation cannot override
+    // the actual active setup turn. Real traffic coverage is not published yet.
+    const result = await considerComputeSuspension({ ...f, environmentId: offer.environmentId, requestKey: `setup:${step}` }, {
+      classify: async () => { throw new Error("Startup must never reach Decisions"); },
+    });
+    expect(result.outcome).toBe("not-eligible");
+    expect(result.evidence.activity.ownedSessionsSettled).toBe(false);
+    expect(await f.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+    expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
+    expect(f.effects).not.toContain("stop");
+    await execute();
+  };
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
+  expect(steps).toEqual(["setup", "schema", "fixtures"]);
+  await f.settled(offer);
+  expect((await f.consider({ ...f, environmentId: offer.environmentId, requestKey: "ready-and-quiet" })).outcome).toBe("suspension-recorded");
+  expect(f.effects).not.toContain("stop");
+}, 90_000);
