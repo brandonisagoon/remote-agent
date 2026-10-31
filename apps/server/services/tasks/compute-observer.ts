@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { PrismaClient, RemoteTask, RemoteTaskResource, ComputeEnvironment, ComputeTraffic } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
+import type { CompatibilityReceipt } from "./tooling-compatibility.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
 import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
@@ -13,12 +14,16 @@ const Output = z.object({ observation: ComputeObservation, traffic: z.array(Traf
 
 export async function verifiedComputeRuntime(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; development?: { intentRevision: number; intentDigest: string } }, dependencies = { resolve: resolveSessionToolingCapability, execute: executeOwnedObserver }) {
   const { receipt } = await dependencies.resolve({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, capability: "runtime", ...(input.development ? { development: input.development } : {}) });
+  return verifyComputeRuntimeReceipt(receipt, dependencies.execute);
+}
+
+async function verifyComputeRuntimeReceipt(receipt: CompatibilityReceipt, execute = executeOwnedObserver) {
   const adapterPath = receipt.adapter;
   if (!adapterPath) throw new Error("Configured runtime has no compute observer adapter");
   const checked = async () => {
     const root = await realpath(receipt.checkout), adapter = await realpath(adapterPath), stat = await lstat(adapter);
     if (root !== receipt.checkout || adapter !== adapterPath || !adapter.startsWith(`${root}${path.sep}`) || !stat.isFile() || stat.isSymbolicLink() || stat.mode & 0o022 || stat.size > 1024 * 1024) throw new Error("Compute observer capability identity changed");
-    const git = (...args: string[]) => dependencies.execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", ...args], { cwd: root, timeoutMs: 10_000 });
+    const git = (...args: string[]) => execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", ...args], { cwd: root, timeoutMs: 10_000 });
     if ((await git("rev-parse", "HEAD")).trim() !== receipt.capabilityRevision || (await git("status", "--porcelain=v1", "--untracked-files=normal")).trim()) throw new Error("Compute observer checkout changed");
     const manifest = JSON.parse(await git("show", `${receipt.capabilityRevision}:.remote-agent-capabilities.json`));
     if (manifest.capabilities?.runtime?.adapter !== path.relative(root, adapter) || !manifest.capabilities?.runtime?.observationContracts?.includes("compute-traffic/v1")) throw new Error("Configured runtime cannot observe compute traffic");
@@ -70,4 +75,24 @@ export async function refreshComputeObservation(input: { prisma: PrismaClient; c
     }
     return output.observation;
   });
+}
+
+/** Read-only collector recovery never installs tooling, records capability
+ * grants, resumes an owner or requires the archived product path to exist. */
+export async function readInstalledComputeReclamation(input: { config: ServerConfig }, task: RemoteTask, request: unknown, execute = executeOwnedObserver) {
+  const repository = input.config.repositories[task.repositoryId];
+  if (!repository?.tooling) throw new Error("No configured compute reclamation runtime");
+  const revision = repository.tooling.revision;
+  const checkout = path.join(input.config.installRoot, "tooling", repository.id, revision);
+  const manifest = JSON.parse(await execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "show", `${revision}:.remote-agent-capabilities.json`], { cwd: checkout, timeoutMs: 10_000 }));
+  const relative = z.string().min(1).parse(manifest.capabilities?.runtime?.adapter);
+  if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes("..")) throw new Error("Compute reclamation adapter path changed");
+  const verified = await verifyComputeRuntimeReceipt({ contract: "remote-agent.tooling-capability/v1", capability: "runtime", source: "configured-host", taskToolingRevision: task.toolingRevision,
+    capabilityRevision: revision, checkout, instructions: "", adapter: path.join(checkout, relative) }, execute);
+  const payload = JSON.stringify(request);
+  if (Buffer.byteLength(payload) > 2*1024*1024) throw new Error("Compute reclamation input exceeds its bound");
+  const env = Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
+  const result = JSON.parse(await execute([process.execPath, "--no-env-file", verified.adapterPath, "compute", "reclaim-observe"], { cwd: checkout, env, timeoutMs: 10_000, input: payload }));
+  if (verified.before !== await verified.checked()) throw new Error("Compute reclamation observer changed during observation");
+  return result;
 }

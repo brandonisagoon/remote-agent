@@ -7,6 +7,7 @@ import { considerComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
 import { verifiedComputeRuntime } from "./compute-observer.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
+import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }) {
@@ -19,7 +20,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
-const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerComputeSuspension, continue: continueSuspension };
+const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute };
 
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
@@ -34,6 +35,12 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
     for (;;) {
       const environment = environments[index++]; if (!environment) return;
       try {
+        const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
+        const resource = await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: environment.resourceId! } });
+        if (task.ownerPaused || task.phase === "closed" || resource.state === "released") {
+          await deps.reclaim({ ...input, environmentId: environment.id });
+          observed++; continue;
+        }
         await deps.refresh({ ...input, environmentId: environment.id });
         if (isSavedComputeEnvironment(environment)) {
           // Physical-only legacy recipes never supply inactivity authority.

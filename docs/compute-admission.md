@@ -21,8 +21,28 @@ slot. Paused owner enrollment remains stopped; ordinary start guards still refus
 owner pause. The Drafted producer owns exact route preparation and bounded
 installation before a subsequent ordinary primary claim.
 
-Focused source checkpoint: 59 observation, admission, enrollment and suspension
-tests / 241 assertions plus types pass. Independent reviews cleared the classifier,
-sanitizer, allocation, suspension and actual-source evidence seams. The complete
-real legacy Docker/Unix pair, final scoped PR reviews and broad checks remain;
-no live host configuration or original task was changed by these source tests.
+The actual legacy Docker/Unix pair passed 2 tests / 43 assertions at client
+`7671b10` and server `ab559b5` (test committed separately as `3c2ab98`). It covers
+missing measurement retaining the same allocation, extra app-owned resolver-address
+listener refusal, busy-to-quiet progress despite heartbeats, complete workspace-first
+suspension, capacity release, and same-container/data resume. Docker identities,
+processes, relay, NGINX and activity sockets are actual. The fixture uses isolated
+network-name/host-port translations, synthetic measured app callbacks, a seeded
+confirmed delivery event and an injected Decisions answer. Actual Greenfield
+framework and queue hooks have separate tests; this is not pilot acceptance.
+
+After an ordinary owner pause or task closure, the collector can still observe
+physical capacity through the already-installed configured runtime. It cannot
+install tooling, recreate source, start compute or reopen a task. A distinct
+reclamation result binds the original environment/allocation, exact Docker members
+or saved native stop proof, current resource and historical task ownership. The
+full recursive original session family, same-directory writers and relation graph
+must remain settled through the final transaction. Unknown starts, changed members,
+missing native proofs and observation errors retain capacity. Only fresh stopped
+or absent evidence releases the slot; the result cannot authorize a claim or an
+inactivity decision. Original task/resource metadata and owner pauses are unchanged.
+
+Final affected reclamation checks passed 127 tests / 471 assertions on the server
+and 63 / 195 on Drafted, with both typechecks. Independent review and final broad
+checks remain before the root-owned deployment and disposable rollout acceptance.
+No live host configuration or original task was changed by these source tests.

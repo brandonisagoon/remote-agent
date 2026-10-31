@@ -9,6 +9,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObservation, assertSavedComputeRequest, assertSavedComputeResource, assertSavedComputeStopped, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
+import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
@@ -36,9 +37,12 @@ export async function computeTaskOwner(store: OwnerStore, taskId: string, machin
     const link = await store.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", endedAt: null } });
     if (!link) throw new ComputeOwnerUnavailable("Compute source ownership was revoked"); sourceLinkId = link.id;
   }
-  const identity = finalizationDigest({ taskId: task.id, primarySessionId: session.id, machineId, repositoryId: task.repositoryId, worktreePath: task.worktreePath,
-    connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, sourceLinkId, baseCommit: task.baseCommit, branchName: task.branchName, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
+  const identity = computeTaskIdentity(task, session.id, machineId, sourceLinkId);
   return { task, session, identity };
+}
+export function computeTaskIdentity(task: import("../../../../generated/prisma/client.ts").RemoteTask, primarySessionId: string, machineId: string, sourceLinkId: string | null) {
+  return finalizationDigest({ taskId: task.id, primarySessionId: primarySessionId, machineId, repositoryId: task.repositoryId, worktreePath: task.worktreePath,
+    connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, sourceLinkId, baseCommit: task.baseCommit, branchName: task.branchName, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
 }
 export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Store, "remoteTaskResource">, environment: ComputeEnvironment, options: { allowPaused?: boolean } = {}) {
   const owned = await computeTaskOwner(store, environment.taskId, environment.machineId, options);
@@ -65,6 +69,12 @@ async function unaccounted(store: Store, input: Context) {
     if (occupied.has(environment.id)) return true;
     const observation = ComputeObservation.safeParse(environment.observation);
     const resource = resources.find(value => value.id === environment.resourceId);
+    const reclaimed = ComputeReclamation.safeParse(environment.observation);
+    if (resource && reclaimed.success && environment.state === "suspended" && ["stopped", "absent"].includes(reclaimed.data.state)
+      && reclaimed.data.environmentId === environment.id && reclaimed.data.taskId === environment.taskId && reclaimed.data.primarySessionId === environment.primarySessionId
+      && reclaimed.data.resourceId === resource.id && reclaimed.data.resourceIdentity === finalizationResourceIdentity(resource).identityDigest
+      && reclaimed.data.allocationResourceIdentity === environment.resourceIdentity && at(input).getTime() >= reclaimed.data.observedAt
+      && at(input).getTime() - reclaimed.data.observedAt <= input.policy.collectorFreshnessSeconds * 1000) return true;
     return observation.success && resource && observation.data.state === "stopped"
       && observation.data.resourceId === resource.id && observation.data.resourceIdentity === finalizationResourceIdentity(resource).identityDigest
       && observation.data.environmentId === environment.id && observation.data.taskId === environment.taskId
