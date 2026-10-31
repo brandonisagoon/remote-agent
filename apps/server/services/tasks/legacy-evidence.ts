@@ -13,6 +13,7 @@ import { LEGACY_EVIDENCE_CONFIRMED, LEGACY_EVIDENCE_RETAINED, LegacyEvidenceAdop
 
 import { isEvidenceTree, matchLegacyEvidenceTrees, observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { assertLegacyEvidenceWriters } from "./legacy-evidence-writers.ts";
+import { assertLocalCompletion } from "./local-completion.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
 type Context = { prisma: PrismaClient; config: ServerConfig; taskId: string };
@@ -40,11 +41,15 @@ async function preparation(prisma: Database, config: ServerConfig, taskId: strin
   const raw = JSON.parse(event.value!);
   if (raw.version !== undefined) throw new Error("Legacy evidence retention only supplements version 1 preparation");
   const prepared = PreparedFinalization.parse(raw);
-  if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== requestKey || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier || prepared.delivery.boundary !== "merge" || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.contractRevision !== prepared.contractRevision) throw new Error("Legacy evidence preparation identity or verified merge changed");
-  const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${taskId}` }, orderBy: { sequence: "desc" } });
-  if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Legacy evidence completion authority was revoked or replaced");
-  const linked = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
-  if (!linked) throw new Error("Legacy evidence source ownership changed");
+  if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== requestKey || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier || prepared.delivery.receipts.contractRevision !== prepared.contractRevision) throw new Error("Legacy evidence preparation identity or verified delivery changed");
+  if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else {
+    if (prepared.delivery.boundary !== "merge" || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha) throw new Error("Legacy evidence preparation identity or verified merge changed");
+    const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${taskId}` }, orderBy: { sequence: "desc" } });
+    if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Legacy evidence completion authority was revoked or replaced");
+    const linked = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
+    if (!linked) throw new Error("Legacy evidence source ownership changed");
+  }
   const identityDigest = finalizationDigest({ taskId, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier,
     worktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot,
     repositoryRoot: getRepositoryConfig(config, task.repositoryId).root });

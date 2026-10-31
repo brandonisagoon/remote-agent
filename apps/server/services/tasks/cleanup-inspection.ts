@@ -10,7 +10,7 @@ import { normalizeRetirementPreviewTransition } from "./retirement-preview.ts";
 // validates the complete versioned preparation and its current authority.
 const SavedPreparation = z.object({
   taskId: z.string(), sessionId: z.string(), requestKey: z.string(), repositoryId: z.string(), machineId: z.string(),
-  connectionId: z.string(), issueIdentifier: z.string(), taskWorktree: z.string(), branch: z.string(), version: z.literal(2).optional(),
+  connectionId: z.string().nullable(), issueIdentifier: z.string().nullable(), taskWorktree: z.string(), branch: z.string(), version: z.literal(2).optional(),
   deliveredRetirement: z.object({ kind: z.literal("present-day-owner"), recordedBranch: z.string() }).optional(),
 });
 type Store = Pick<PrismaClient, "runtimeMetadataEvent" | "remoteTaskResource">;

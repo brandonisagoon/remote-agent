@@ -13,6 +13,7 @@ import { DoneRetirementGrant } from "./delivered-retirement.ts";
 import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts";
 import type { PreparedExternalFinalization } from "./external-finalization-schema.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
+import { assertLocalCompletion, assertLocalCleanupFamily } from "./local-completion.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
 export const CLEANUP_EVIDENCE_SUPPLEMENT = "finalization-cleanup-evidence-supplement";
@@ -26,7 +27,7 @@ const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const EventReference = z.object({ revision: z.number().int().positive(), source: z.string(), action: z.string(), key: z.string().nullable(), digest: Digest }).strict();
 const Resource = RetirementBinding.shape.resources.element;
 const CleanupBinding = z.object({
-  taskId: z.string(), sessionId: z.string(), repositoryId: z.string(), machineId: z.string(), connectionId: z.string(), issueIdentifier: z.string(),
+  taskId: z.string(), sessionId: z.string(), repositoryId: z.string(), machineId: z.string(), connectionId: z.string().nullable(), issueIdentifier: z.string().nullable(),
   worktree: z.string(), branch: z.string(), baseCommit: z.string().nullable(), toolingRoot: z.string(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable(), repositoryRoot: z.string(),
   preparedRevision: z.number().int().positive(), preparedDigest: Digest,
   authority: z.array(EventReference), resources: z.array(Resource).max(2000),
@@ -52,12 +53,14 @@ async function current(input: Context, allowConfirmedClosed = false) {
   const closedContinuation = closed && !allowConfirmedClosed;
   if (closedContinuation) await assertClosedCleanupFamily(inboxStore(input.prisma), task, session,
     await input.prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(task.id, session.id, input.requestKey) }), input.runtime);
-  if (!task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused
+  if (!task.worktreePath || task.ownerPaused || (task.connectionId === null) !== (task.issueIdentifier === null)
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Cleanup original ownership is changed, paused or closed");
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("Cleanup requires the existing stable finalization identity");
-  const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId,
-    resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
-  if (!link) throw new Error("Cleanup original source ownership changed");
+  if (task.connectionId !== null && task.issueIdentifier !== null) {
+    const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId,
+      resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
+    if (!link) throw new Error("Cleanup original source ownership changed");
+  }
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });
   if (!preparation?.value || preparation.key !== input.requestKey) throw new Error("Cleanup requires the exact existing preparation");
   const raw = JSON.parse(preparation.value);
@@ -90,9 +93,13 @@ async function current(input: Context, allowConfirmedClosed = false) {
   ] }, orderBy: { sequence: "desc" } });
   const latest = records.filter((event, index) => records.findIndex(candidate => candidate.action === event.action && candidate.source === event.source) === index);
   const contract = latest.find(event => event.action === "completion-contract"), policy = JSON.parse(contract?.value ?? "null");
-  if (!contract || contract.sequence !== prepared.contractRevision || policy?.boundary !== "merge") throw new Error("Cleanup accepted completion authority was revoked or replaced");
+  if (!contract || contract.sequence !== prepared.contractRevision || policy?.boundary !== (prepared.localCompletion?.boundary ?? "merge")) throw new Error("Cleanup accepted completion authority was revoked or replaced");
   const receipt = prepared.delivery.receipts;
-  if (prepared.delivery.boundary !== "merge" || receipt.contractRevision !== contract.sequence || !receipt.snapshot.clean || receipt.snapshot.head !== prepared.revision
+  if (prepared.localCompletion) {
+    await assertLocalCompletion(input.prisma, prepared);
+    if (!allowConfirmedClosed && !closedContinuation) await assertLocalCleanupFamily(inboxStore(input.prisma), task, input.runtime);
+  }
+  else if (prepared.delivery.boundary !== "merge" || receipt.contractRevision !== contract.sequence || !receipt.snapshot.clean || receipt.snapshot.head !== prepared.revision
     || receipt.snapshot.branch !== prepared.branch || !receipt.commit.observed || receipt.commit.sha !== prepared.revision || !receipt.commit.clean
     || !receipt.pullRequest.observed || !receipt.pullRequest.matchesHead || !receipt.merge.observed || !receipt.merge.merged || !receipt.merge.sha) throw new Error("Cleanup has no accepted server-observed delivery");
   const verification = latest.find(event => event.action === "completion-verification"), verified = JSON.parse(verification?.value ?? "null");

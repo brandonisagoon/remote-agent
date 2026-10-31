@@ -14,6 +14,7 @@ import { inspectSavedCleanup } from "./cleanup-inspection.ts";
 import { cleanupProgressProjection } from "./cleanup-progress.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
+import { readLocalCleanupReport, recordLocalCleanupReport } from "./local-cleanup-report.ts";
 
 export const CLEANUP_REPORT = "finalization-cleanup-report";
 export const CleanupReportRequest = z.object({ requestKey: z.string().min(1).max(180) }).strict();
@@ -29,7 +30,9 @@ const where = (taskId: string, sessionId: string, requestKey: string) => ({ runt
 /** Runs in the confirmation transaction. This records the already verified
  * cleanup fact before closure; it neither reads nor changes Linear. */
 export async function queueCleanupReport(prisma: Database, active: Active, confirmedRevision: number) {
+  if (active.kind === "v1" && active.prepared.localCompletion) return recordLocalCleanupReport(prisma, active, confirmedRevision);
   const prepared = active.prepared;
+  if (!prepared.connectionId || !prepared.issueId || !prepared.issueIdentifier) throw new Error("Linked cleanup reporting requires its original source");
   const original = active.kind === "v1" && await legacyOriginalWorkReceipt(prisma, active.prepared, active.preparation.sequence);
   const accepted = active.kind === "v2"
     ? `Accepted external deliveries are preserved: ${active.prepared.delivery.deliveries.map(delivery => `${delivery.url} (reviewed ${delivery.reviewedHead}, merged ${delivery.mergeCommit})`).join("; ")}.${active.prepared.originalWork ? " Unfinished original work remains preserved in its verified archive and exact quarantine; it is not claimed as delivered." : ""}`
@@ -70,6 +73,11 @@ export const cleanupReportDelivery = { read: getSourceIssueForUpdate, comment: f
 /** A lost response retries one UUID/body after closure. Existing preparations
  * lack a Cleanup publication and retain their original comment-only behavior. */
 export async function publishCleanupReport(input: Context, client = cleanupReportDelivery) {
+  const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
+  if (task.connectionId === null && task.issueIdentifier === null) {
+    if (!task.primarySessionId) throw new Error("Local cleanup report requires its original primary");
+    return readLocalCleanupReport(input.prisma, await assertCompletedCleanup({ ...input, sessionId: task.primarySessionId }));
+  }
   const { frozen } = await load(input);
   return serializeIssuePublication(`${frozen.connectionId}:${frozen.issueId}`, () => publish(input, client));
 }
@@ -132,10 +140,12 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
     const input = { prisma, config, sessionId, requestKey };
     const active = saved.history.recordedConfirmationRevision ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
     if (active.operationRevision !== saved.history.operationRevision || retirementDigest(active.operation) !== saved.history.operationDigest) throw new Error("Cleanup operation changed during inspection");
-    const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
+    const report = active.kind === "v1" && active.prepared.localCompletion && saved.history.recordedConfirmationRevision
+      ? await readLocalCleanupReport(prisma, await assertCompletedCleanup(input))
+      : await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
     const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined);
     const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
     return { ...history, ...(retainedCompose ? { retainedCompose } : {}), ...(finalizationRetention ? { finalizationRetention } : {}), cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
-      preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !report?.published) } };
+      preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !(report?.published || report && "recorded" in report && report.recorded)) } };
   } catch (error) { return { ...history, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
 }

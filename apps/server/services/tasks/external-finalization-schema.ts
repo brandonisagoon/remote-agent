@@ -1,11 +1,11 @@
 import { z } from "zod";
-import { PreparedFinalization } from "./finalization-receipts.ts";
+import { PreparedLinkedFinalization } from "./finalization-receipts.ts";
 import { ExternalDeliveryObservation } from "./external-delivery-schema.ts";
 import { FinalizationResourcePlan } from "./finalization-resources.ts";
 import { OriginalWork } from "./original-work-schema.ts";
 
 export const CleanupSnapshot = z.object({ head: z.string(), branch: z.string(), clean: z.boolean(), fingerprint: z.string() }).strict();
-export const PreparedExternalFinalization = PreparedFinalization.omit({ delivery: true }).extend({
+export const PreparedExternalFinalization = PreparedLinkedFinalization.omit({ delivery: true, localCompletion: true }).extend({
   contractRevision: z.number().int().nullable(),
   version: z.literal(2), bindingRevision: z.number().int().positive(), bindingDigest: z.string(), resourcePlanDigest: z.string(),
   baseCommit: z.string().nullable(), toolingRevision: z.string(), pinnedToolingRoot: z.string().nullable(), cleanupSnapshot: CleanupSnapshot,

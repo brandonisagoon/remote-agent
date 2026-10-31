@@ -4,6 +4,8 @@ import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./l
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
+import { readLocalCompletion, assertLocalCompletion, assertLocalDelivery, assertLocalCleanupFamily } from "./local-completion.ts";
+import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { automaticCleanupTurn } from "./cleanup-inbox.ts";
 import { realpath } from "node:fs/promises";
 import { z } from "zod";
@@ -42,7 +44,8 @@ async function owned(input: FinalizationContext) {
     // ordinary completion still require an open original primary.
     return (await assertPreparedCleanup(input)).task;
   }
-  if (!task || !task.worktreePath || !task.connectionId || !task.issueIdentifier || task.ownerPaused || !lifecycle && task.phase !== "complete" || session.role !== "primary" || session.status === "closed" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.phase === "closed") throw new Error("Finalization requires the open complete task's original primary");
+  if (!task || !task.worktreePath || task.ownerPaused || !lifecycle && task.phase !== "complete" || session.role !== "primary" || session.status === "closed" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.phase === "closed") throw new Error("Finalization requires the open complete task's original primary");
+  if ((task.connectionId === null) !== (task.issueIdentifier === null)) throw new PreparationDiagnosticError("LOCAL_COMPLETION_IDENTITY");
   await assertNoRemainingConsumers(input.prisma, task);
   if (input.cleanup) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
   return task;
@@ -109,12 +112,14 @@ function result(prepared: PreparedFinalization, preparedRevision: number, confir
     branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
     ...(archiveRetention ? { archiveRetention } : {}),
     ...(cleanup ? { cleanup } : {}),
+    ...(prepared.localCompletion ? { localCompletion: prepared.localCompletion } : {}),
     ...(authority ? { retirement: { authorityRevision: authority.revision, authorityDigest: authority.digest,
       doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
         body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, ${archiveRetention ? "resources requiring removal are released and verified saved archives remain intact" : "recorded development, browser and review resources are released"}, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
 }
 
 async function assertObservedPreparationAuthority(input: FinalizationContext, prepared: PreparedFinalization, dependencies: Dependencies, confirmed = false, supplement?: PreparedFinalization["retirementAuthority"]) {
+  if (prepared.localCompletion) { await assertFinalizationAuthority(input.prisma, input.config, prepared, confirmed); return; }
   // Content hashing and Git observations can outlast a source-state change.
   // Refresh the actual owner/source after them, before returning adapter authority.
   const source = await sourceAuthority(input, prepared.taskId, dependencies);
@@ -137,7 +142,13 @@ export function prepareTaskFinalization(input: FinalizationContext, dependencies
 
 async function prepareFinalization(input: FinalizationContext, dependencies: Dependencies) {
   const task = await owned(input);
-  if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) return prepareExternalFinalization(input);
+  const direct = task.connectionId === null && task.issueIdentifier === null;
+  if (direct && task.phase !== "closed") await assertLocalCleanupFamily(input.prisma, task, input.runtime);
+  if (direct && !input.cleanup) throw new PreparationDiagnosticError("LOCAL_COMPLETION_REQUIRED");
+  if (await latestExternalBinding(input.prisma, task.id, input.sessionId)) {
+    if (direct) throw new PreparationDiagnosticError("LOCAL_COMPLETION_IDENTITY");
+    return prepareExternalFinalization(input);
+  }
   const priorCleanup = await hasPreparedCleanup(input.prisma, task.id, input.sessionId, input.requestKey);
   const preparedBefore = input.cleanup && await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, action: FINALIZATION_PREPARED, source: `finalizer:${task.id}`, key: input.requestKey } });
   if (priorCleanup || preparedBefore) return prepareCleanupFinalization(input, dependencies);
@@ -145,14 +156,15 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
   if (input.cleanup && await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, action: FINALIZATION_PREPARED, source: `finalizer:${task.id}` } })) throw new Error("Cleanup cannot replace an existing preparation under another identity");
   if (input.authorityOnly) throw new Error("Authority-only checks require external finalization version 2");
   if (input.finalizationVersion === 2) throw new Error("Finalization version 2 requires an adopted external delivery binding");
-  const source = await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
-  if (source.link.connectionId !== task.connectionId || source.issue.identifier !== task.issueIdentifier || source.session.id !== input.sessionId) throw new Error("Finalization source does not belong to this task");
+  const local = direct ? await readLocalCompletion(input.prisma, task.id, input.sessionId) : undefined;
+  const source = direct ? undefined : await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
+  if (source && (source.link.connectionId !== task.connectionId || source.issue.identifier !== task.issueIdentifier || source.session.id !== input.sessionId)) throw new Error("Finalization source does not belong to this task");
   const where = { runtimeSessionId: input.sessionId, action: FINALIZATION_PREPARED, source: `finalizer:${task.id}`, key: input.requestKey };
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where });
   if (prior) {
     const prepared = PreparedFinalization.parse(JSON.parse(prior.value!));
-    if (Boolean(prepared.retirementAuthority) !== Boolean(source.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
-    if (prepared.issueId !== source.issue.id || prepared.requestKey !== input.requestKey) throw new Error("Finalization requestKey belongs to a different source");
+    if (Boolean(prepared.retirementAuthority) !== Boolean(source?.retirementAuthority)) throw new Error("Finalization source retirement authority changed");
+    if (prepared.issueId !== (source?.issue.id ?? null) || prepared.requestKey !== input.requestKey) throw new Error("Finalization requestKey belongs to a different source");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
     await assertFinalizationAuthority(input.prisma, input.config, prepared);
     const archiveRetention = await preparationStage("retained-archives", () => ensureArchiveRetention({ prisma: input.prisma, config: input.config, taskId: task.id, preparedRevision: prior.sequence }));
@@ -161,19 +173,21 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
       // A completed cleanup is replayed, never expanded to a newly created
       // worktree or newly retained resource after Done was published.
       await assertFinalizationRemoved(prepared);
-      await assertObservedPreparationAuthority(input, prepared, dependencies, true, source.retirementSupplement);
-      return result(prepared, prior.sequence, confirmed.sequence, archiveRetention, source.retirementSupplement);
+      await assertObservedPreparationAuthority(input, prepared, dependencies, true, source?.retirementSupplement);
+      return result(prepared, prior.sequence, confirmed.sequence, archiveRetention, source?.retirementSupplement);
     }
     if (!(await worktreeIsMissing(prepared.worktree))) {
       const snapshot = await dependencies.snapshot(prepared.worktree);
       if (JSON.stringify(snapshot) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Worktree changed since finalization preparation; inspect before using a new requestKey");
     }
-    await assertObservedPreparationAuthority(input, prepared, dependencies, false, source.retirementSupplement);
-    return result(prepared, prior.sequence, undefined, archiveRetention, source.retirementSupplement);
+    await assertObservedPreparationAuthority(input, prepared, dependencies, false, source?.retirementSupplement);
+    return result(prepared, prior.sequence, undefined, archiveRetention, source?.retirementSupplement);
   }
   const delivery = await dependencies.completion(input);
-  if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
+  if (local) assertLocalDelivery(delivery, local.reference, local.contract.sequence);
+  else if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
   const worktree = await realpath(task.worktreePath!);
+  if (local) local.reference.sourceCaptureRequired = Boolean(await finalizationGit(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]));
   const gitCwd = await realpath(getRepositoryConfig(input.config, task.repositoryId).root);
   if (worktree === gitCwd) throw new Error("Finalization may not remove the configured repository root");
   const gitDirectory = await realpath(await finalizationGit(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
@@ -184,16 +198,19 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
   for (const entry of entries) if (entry.worktree && await realpath(entry.worktree).catch(() => "") === worktree) matching.push(entry);
   const entry = matching[0];
   if (matching.length !== 1 || entry?.HEAD !== delivery.receipts.snapshot.head || entry?.branch !== `refs/heads/${task.branchName}`) throw new Error("Finalization Git registration does not match verified delivery");
-  const prepared: PreparedFinalization = { taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey,
-    repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId!, issueIdentifier: task.issueIdentifier!, issueId: source.issue.id,
+  const prepared = PreparedFinalization.parse({ taskId: task.id, sessionId: input.sessionId, requestKey: input.requestKey,
+    repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, issueId: source?.issue.id ?? null,
     contractRevision: delivery.receipts.contractRevision,
     worktree, taskWorktree: task.worktreePath!, registeredWorktree: entry!.worktree!, revision: delivery.receipts.snapshot.head, branch: task.branchName, gitDirectory, gitCwd, delivery,
-    ...(source.retirementAuthority ? { retirementAuthority: source.retirementAuthority } : {}) };
+    ...(local ? { localCompletion: local.reference } : {}), ...(source?.retirementAuthority ? { retirementAuthority: source.retirementAuthority } : {}) });
   const snapshot = await dependencies.snapshot(worktree);
   if (JSON.stringify(snapshot) !== JSON.stringify(delivery.receipts.snapshot)) throw new Error("Worktree changed during finalization preparation");
+  if (prepared.localCompletion) await assertLocalCompletion(input.prisma, prepared);
+  else if (source) {
   const refreshedSource = await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
   if (refreshedSource.issue.id !== source.issue.id || refreshedSource.issue.identifier !== source.issue.identifier || refreshedSource.link.connectionId !== source.link.connectionId
     || refreshedSource.session.id !== source.session.id || refreshedSource.retirementAuthority?.revision !== source.retirementAuthority?.revision) throw new Error("Finalization source identity changed during initial verification");
+  }
   const recorded = await preparationStage("persistence", () => input.prisma.$transaction(async (tx) => {
     await assertFinalizationAuthority(tx, input.config, prepared, false, input.cleanup);
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where });
@@ -256,6 +273,8 @@ async function observePreparedFilesystem(input: FinalizationContext, prepared: P
   if (await worktreeIsMissing(prepared.worktree)) return assertFinalizationRemoved(prepared);
   if (await realpath(prepared.taskWorktree) !== prepared.worktree
     || JSON.stringify(await dependencies.snapshot(prepared.worktree)) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Cleanup prepared worktree changed");
+  if (prepared.localCompletion && !prepared.localCompletion.sourceCaptureRequired
+    && await finalizationGit(prepared.worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])) throw new PreparationDiagnosticError("LOCAL_SOURCE_CAPTURE_REQUIRED");
   const entries = finalizationWorktrees(await finalizationGit(prepared.gitCwd, ["--git-dir", prepared.gitDirectory, "worktree", "list", "--porcelain", "-z"])).filter(entry => entry.worktree === prepared.registeredWorktree);
   if (entries.length !== 1 || entries[0]!.HEAD !== prepared.revision || entries[0]!.branch !== `refs/heads/${prepared.branch}`) throw new Error("Cleanup original worktree registration changed");
 }
@@ -306,6 +325,7 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   await assertFinalizationAuthority(input.prisma, input.config, active.prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
   const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+  if (active.prepared.localCompletion?.sourceCaptureRequired && !legacyOriginalWork) throw new PreparationDiagnosticError("LOCAL_SOURCE_CAPTURE_REQUIRED");
   if (legacyOriginalWork) await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: true }, legacyOriginalWorkDependencies.observation);
   await assertFinalizationRemoved(active.prepared);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, false);

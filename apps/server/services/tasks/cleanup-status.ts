@@ -13,6 +13,7 @@ export function cleanupStatusPayload(active: Active) {
 
 /** This is an ordinary publication receipt, never a new cleanup grant. */
 export async function cleanupStatusReceipt(prisma: Pick<PrismaClient, "runtimeIssueUpdate">, active: Active) {
+  if (active.kind === "v1" && active.prepared.localCompletion) return null;
   const payload = cleanupStatusPayload(active);
   const receipt = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: active.prepared.sessionId, requestKey: payload.requestKey } } });
   if (!receipt) return null;
@@ -43,11 +44,13 @@ export async function publishCleanupStatus(input: Context, client = issueUpdateD
     return { state: "superseded" as const };
   }
   const active = await assertPreparedCleanup(context);
+  if (active.kind === "v1" && active.prepared.localCompletion) return { state: "unavailable" as const };
   // Save reporting intent before any network read, independently of whether
   // Cleanup exists or its comment/state response arrives. Confirmation uses
   // this same row; it never guesses state application from commentPosted.
   const seeded = await input.prisma.$transaction(async prisma => {
     const current = await assertPreparedCleanup({ ...context, prisma });
+    if (!current.prepared.connectionId || !current.prepared.issueId) throw new Error("Cleanup status requires its original source issue");
     if (current.operationRevision !== active.operationRevision || retirementDigest(current.operation) !== retirementDigest(active.operation)) throw new Error("Cleanup status operation changed");
     if (await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId!, source: `finalizer:${task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } })) return false;
     const payload = cleanupStatusPayload(current);
