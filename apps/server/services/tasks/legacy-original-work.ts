@@ -58,8 +58,9 @@ async function assertStorage(prisma: Database, active: Active, proof: LegacyOrig
   if (storage.some((file, index) => roots.some(root => overlaps(root, file)) || storage.some((other, j) => j !== index && overlaps(file, other)))) throw new Error("Original archive or capture storage overlaps protected material or cleanup roots");
   const scopes = [original.target.path, original.administration.administrationCapture.path, ...storage];
   await assertRegisteredPathSharing(prisma, active.task.id, scopes);
-  const otherTasks = await prisma.remoteTask.findMany({ where: { id: { not: active.task.id }, worktreePath: { not: null } }, select: { worktreePath: true } });
-  if (otherTasks.some(task => task.worktreePath && scopes.some(scope => overlaps(scope, task.worktreePath!)))) throw new Error("Original source capture overlaps another registered worktree");
+  const ancestors = new Set<string>();
+  for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
+  if (await prisma.remoteTask.findFirst({ where: { id: { not: active.task.id }, OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: scope + path.sep } }))] } })) throw new Error("Original source capture overlaps another registered worktree");
 }
 
 /** Shared by the owner adoption CAS and the normal finalizer's compact renewal.
