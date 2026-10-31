@@ -1992,3 +1992,69 @@ for (const change of ["pause", "operation", "foreign-short-id", "foreign-worktre
     expect(receipt?.preparedRevision).toBe(f.prepared.preparedRevision);
   } finally { f.restore(); }
 });
+
+const runtimeCleanupClient = process.env.DRAFTED_RUNTIME_CLEANUP_ROOT;
+test.skipIf(!runtimeCleanupClient)("actual v1 runtime cleanup preserves frozen provider metadata through progress and lost acknowledgments", async () => {
+  const f = await fixture("runtime-cleanup-progress");
+  const { taskRegistry } = await import(path.join(runtimeCleanupClient!, "src/control.ts"));
+  const { manageRuntime } = await import(path.join(runtimeCleanupClient!, "src/runtime.ts"));
+  const { guardedRetirementRegistry } = await import(path.join(runtimeCleanupClient!, "src/finalize.ts"));
+  const { RuntimeConfig, digest, savePrivate } = await import(path.join(runtimeCleanupClient!, "src/runtime-config.ts"));
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient }))
+    .route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const socket = path.join(process.platform === "darwin" ? "/private/tmp" : "/tmp", `runtime-cleanup-${crypto.randomUUID().slice(0, 8)}.sock`);
+  const server = Bun.serve({ unix: socket, fetch: app.fetch });
+  try {
+    const registry = taskRegistry(socket, f.task.id), stateDirectory = path.join(directory, "runtime-state"), credentialsFile = path.join(directory, "credentials.json");
+    await savePrivate(credentialsFile, { FIXTURE: "private" });
+    const recipe = RuntimeConfig.parse({ version: 1, profile: "platform", image: "fixture:1", credentialsFile,
+      planetscale: { organization: "fixture", database: "v2", baseBranch: "main", baseBranchId: "base-id" },
+      neon: { projectId: "project", baselineBranchId: "br-base", baselineName: "base", role: "owner" }, redis: { region: "us-east-1", budget: 20 }, storage: { accountId: "b".repeat(32) },
+      services: { api: { command: ["bun", "api.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true }], readyTimeoutSeconds: 1 });
+    const providers = ["planetscale", "neon", "redis", "storage"].map(provider => ({ provider, id: `${provider}-id`, name: "exact-original-task", createdAt: "original-lifetime" }));
+    const state: any = { version: 1, taskId: f.task.id, worktree: f.worktree, revision: git(f.worktree, "rev-parse", "HEAD"), purpose: "development", recipeHash: digest(recipe), recipe,
+      phase: "stopped", resources: providers, expiresAt: "2030-01-01T00:00:00.000Z", schemaApplied: true, setupComplete: true, fixturesComplete: true, fingerprints: {}, urls: {}, ports: {},
+      container: { id: "a".repeat(64), image: "sha256:fixture", createdAt: "original-container" }, network: { id: "b".repeat(64), createdAt: "original-network" }, dependencyVolume: { name: "original-volume", createdAt: "original-volume" },
+      progress: { step: "health", detail: "Accepted health checks", state: "complete", updatedAt: new Date().toISOString() } };
+    const file = path.join(stateDirectory, "runtimes", f.task.id, "development", "runtime.json"); await savePrivate(file, state);
+    await registry.resource({ key: "runtime-development", kind: "task-runtime", purpose: "development", externalId: file, state: "allocated", expiresAt: state.expiresAt, metadata: {
+      recipeHash: state.recipeHash, revision: state.revision, providers, containerId: state.container.id, network: state.network, dependencyVolume: state.dependencyVolume,
+      progress: state.progress, observed: "stopped" } });
+    await prepareTaskFinalization(f.input, f.dependencies); const bound = await bindPreparedCleanup(f.input, async () => {});
+    const original = await db.prisma.remoteTaskResource.findFirstOrThrow({ where: { taskId: f.task.id } });
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: [bound.preparation.sequence, bound.operationRevision] } }, orderBy: { sequence: "asc" } });
+    const renew = async () => { const current = await registry.renewCleanupAuthority!({ requestKey: f.input.requestKey }); expect(current.cleanup.operationRevision).toBe(bound.operationRevision); };
+    let lostProgress = false, lostReleased = false, loseDelete = true;
+    const acknowledged = { ...registry, resource: async (value: any) => {
+      await registry.resource(value);
+      if (!lostProgress && value.metadata?.observed?.runtimeCleanup?.providers?.some((r: any) => r.released)) { lostProgress = true; throw Error("Lost progress acknowledgment"); }
+      if (value.state === "released" && !lostReleased) { lostReleased = true; throw Error("Lost Released acknowledgment"); }
+    } };
+    const guarded = guardedRetirementRegistry(acknowledged, renew), physical = new Set(providers.map(r => r.id)), deletions: string[] = [];
+    let container: any = { ...state.container, running: false, labels: { "dev.drafted.task": f.task.id, "dev.drafted.purpose": "development", "dev.drafted.runtime": "1" } };
+    const docker = { inspect: async () => container, stop: async () => { container.running = false; }, remove: async () => { container = null; }, releaseDependencies: async () => {},
+      preflight: async () => { throw Error("No startup"); }, create: async () => { throw Error("No creation"); }, start: async () => { throw Error("No start"); }, exec: async () => { throw Error("No command"); } };
+    const remote = { release: async (receipt: any) => { expect(providers.some(r => r.id === receipt.id && r.provider === receipt.provider && r.name === receipt.name)).toBeTrue();
+      if (physical.delete(receipt.id)) { deletions.push(receipt.id); if (receipt.provider === "redis" && loseDelete) { loseDelete = false; throw Error("Lost provider response"); } } } };
+    const release = () => manageRuntime({ registry: guarded, stateDirectory, action: "release", docker, providers: () => remote });
+    await expect(release().catch((error: unknown) => { expect(deletions).toEqual(["storage-id"]); throw error; })).rejects.toThrow("Lost progress acknowledgment");
+    expect(deletions).toEqual(["storage-id"]);
+    const partial = JSON.parse(await readFile(file, "utf8")); expect(partial.resources.find((r: any) => r.provider === "storage").released).toBeTrue();
+    const stable = (metadata: any) => { const { observed, observedAt, ...value } = metadata; return value; };
+    expect(stable((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata)).toEqual(stable(original.metadata));
+    for (const mutate of [(s: any) => { s.resources[0].id = "foreign-id"; }, (s: any) => { s.resources.reverse(); }, (s: any) => { s.network.createdAt = "replacement"; }]) {
+      const changed = structuredClone(partial); mutate(changed); await savePrivate(file, changed);
+      await expect(release()).rejects.toThrow("Runtime cleanup ownership changed"); expect(deletions).toEqual(["storage-id"]); await savePrivate(file, partial);
+    }
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    await expect(release()).rejects.toThrow(); expect(deletions).toEqual(["storage-id"]);
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    await expect(release()).rejects.toThrow("Lost provider response"); expect(deletions).toEqual(["storage-id", "redis-id"]);
+    await expect(release()).rejects.toThrow("Lost Released acknowledgment");
+    expect((await release()).phase).toBe("released"); expect(deletions).toEqual(["storage-id", "redis-id", "neon-id", "planetscale-id"]); expect(physical.size).toBe(0);
+    const current = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } }); expect(current.state).toBe("released"); expect(current.id).toBe(original.id);
+    expect(stable(current.metadata)).toEqual(stable(original.metadata)); expect((current.metadata as any).observed.runtimeCleanup.providers.every((r: any) => r.released)).toBeTrue();
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect((await registry.task()).cleanupOperation!.operationRevision).toBe(bound.operationRevision);
+  } finally { server.stop(true); }
+}, 30_000);
