@@ -35,11 +35,15 @@ export type TrafficEnvelope = z.infer<typeof TrafficEnvelope>;
 type Active = { classification: z.infer<typeof TrafficClass>; startedAt: number; stream: boolean };
 type Completed = { endedAt: number; status: number; access: boolean };
 type Bucket = { minute: number; requests: number; meaningful: number; unknown: number; failed: number; cancelled: number };
+export const NginxCheckpoint = z.object({ dev: z.string().regex(/^\d+$/), ino: z.string().regex(/^\d+$/), offset: Time.max(1024 * 1024), sha256: Digest }).strict();
+export const NginxCursor = z.object({ current: NginxCheckpoint, previous: NginxCheckpoint.extend({ sealed: z.boolean() }).optional() }).strict();
+export type NginxCursor = z.infer<typeof NginxCursor>;
 export type TrafficState = {
   version: 1; route: ComputeRoute; epoch: string; sequence: number; lastReceivedAt: number;
   lastObservedAt: number; coverage: "complete" | "incomplete"; coverageSince: number;
   reason: string | null; lastMeaningfulAt: number | null; lastUnknownAt: number | null;
   active: Record<string, Active>; completed: Record<string, Completed>; buckets: Bucket[];
+  nginx?: NginxCursor;
 };
 const MAX_REQUESTS = 4096, MAX_BUCKETS = 60;
 const own = (value: object, key: string) => Object.hasOwn(value, key);
@@ -142,4 +146,5 @@ export const TrafficStateSchema = z.object({
   reason: z.string().max(100).nullable(), lastMeaningfulAt: Time.nullable(), lastUnknownAt: Time.nullable(),
   active: boundedMap(ActiveSchema), completed: boundedMap(CompletedSchema),
   buckets: z.array(z.object({ minute: Time, requests: Time, meaningful: Time, unknown: Time, failed: Time, cancelled: Time }).strict()).max(MAX_BUCKETS),
+  nginx: NginxCursor.optional(),
 }).strict();
