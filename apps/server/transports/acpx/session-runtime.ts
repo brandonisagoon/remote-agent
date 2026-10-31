@@ -1,3 +1,4 @@
+import { readClosedSessionMessages } from "./closed-history.ts";
 import { cleanupExecutionDirectory, CleanupTransportBlockedError } from "../../services/tasks/cleanup-transport.ts";
 import { assertRequestActive } from "../../request-lifetime.ts";
 import { randomUUID } from "node:crypto";
@@ -399,11 +400,12 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async history(sessionId: string): Promise<AgentRuntimeMessage[]> {
-    const session = await this.requireSession(sessionId);
-    const record = await this.loadRecord(session);
-    if (!record) return [];
+    const session = await this.requireSession(sessionId, true);
+    const saved = session.status === "closed" || session.closedAt
+      ? await readClosedSessionMessages(this.config.acpxStateDir, session)
+      : (await this.loadRecord(session))?.messages ?? [];
     const messages: AgentRuntimeMessage[] = [];
-    for (const message of record.messages) {
+    for (const message of saved) {
       const user = textFromUserMessage(message);
       if (user) messages.push({ role: "user", text: user });
       const agent = textFromAgentMessage(message);
@@ -854,11 +856,11 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
   }
 
-  private async requireSession(sessionId: string): Promise<AgentRuntimeSession> {
+  private async requireSession(sessionId: string, allowClosedHistory = false): Promise<AgentRuntimeSession> {
     if (this.releasingSessions.has(sessionId)) throw new Error("Session transport transition is in progress");
     const session = await findRuntimeSession(this.prisma, sessionId);
     if (!session) throw new Error(`runtime session not found: ${sessionId}`);
-    if (session.status === "closed") {
+    if (session.status === "closed" && !allowClosedHistory) {
       throw new Error(`runtime session is closed: ${sessionId}`);
     }
     return session;
