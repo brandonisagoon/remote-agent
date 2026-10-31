@@ -14,13 +14,26 @@ export async function assertClosedCleanupFamily(prisma: Store, task: RemoteTask,
     || operation.occurredAt.getTime() > closedAt! || primary.id !== task.primarySessionId || !["closed", "idle"].includes(primary.status)) {
     throw new Error("Closed cleanup requires the original operation recorded before settled primary closure");
   }
-  // Include direct delegates even if their cwd or relation later changed; an
-  // active writer cannot disappear from this guard through metadata movement.
+  // Keep same-worktree writers and every original spawned descendant, even
+  // after cwd movement or relation closure. Traverse only this primary's graph;
+  // cycles/ambiguous ancestry and excessive depth or size refuse conservatively.
   const family = await prisma.runtimeSession.findMany({ where: { OR: [
     { id: primary.id },
     { cwd: task.worktreePath!, repositoryId: task.repositoryId, machineId: task.machineId },
-    { outgoingRelations: { some: { targetSessionId: primary.id, relationship: "spawned-by" } } },
   ] }, take: 2001 });
+  const members = new Set(family.map(session => session.id)), descendants = new Set([primary.id]);
+  let frontier = [primary.id], depth = 0;
+  while (frontier.length) {
+    if (++depth > 64 || members.size > 2000) throw new Error("Closed cleanup family exceeds its observation bound");
+    const children = await prisma.runtimeSession.findMany({ where: { outgoingRelations: { some: { targetSessionId: { in: frontier }, relationship: "spawned-by" } } }, take: 2001 });
+    frontier = [];
+    for (const child of children) {
+      if (descendants.has(child.id)) throw new Error("Closed cleanup descendant ancestry is cyclic or ambiguous");
+      descendants.add(child.id); frontier.push(child.id);
+      if (!members.has(child.id)) { members.add(child.id); family.push(child); }
+      if (members.size > 2000) throw new Error("Closed cleanup family exceeds its observation bound");
+    }
+  }
   if (family.length > 2000 || family.some(session => !["idle", "closed"].includes(session.status)
     || runtime?.observeSessionActivity && runtime.observeSessionActivity(session.id).state !== "unknown")) {
     throw new Error("Closed cleanup waits for the original task family to stop executing");

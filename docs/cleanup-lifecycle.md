@@ -378,7 +378,9 @@ the same UUID and body without repeating source or resource effects.
 The existing cleanup operation remains the only pending cleanup intent. If its
 original primary closes after preparation, ordinary closed-task upkeep may
 continue that same operation once the task is durably closed and the entire
-original family has no executing, queued or uncertain work. The operation must
+original family has no executing, queued or uncertain work. Historical spawned
+descendants are traversed with cycle, depth and size bounds even when their
+working directories differ. The operation must
 predate the recorded closure. An idle provider status with a finite `closedAt`
 is compatible with closure; an active or reopened primary is not.
 

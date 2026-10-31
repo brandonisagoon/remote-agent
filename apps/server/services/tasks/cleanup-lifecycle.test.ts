@@ -117,6 +117,18 @@ test.each(["unbound", "missing-closure", "operation-after-closure", "reopened", 
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
 });
 
+test.each(["active", "pending", "cycle", "settled"])("closed cleanup checks a moved recursive delegate family (%s)", async condition => {
+  const f = await referenceFixture(); await closePreparedFixture(f);
+  for (const id of ["child", "grandchild"]) await db.prisma.runtimeSession.create({ data: { id, scopeKey: id, agentCommand: "codex", status: id === "grandchild" && condition === "active" ? "active" : "closed", closedAt: new Date(), role: "delegate", cwd: path.join(directory, id), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  for (const [sourceSessionId, targetSessionId] of [["child", f.session.id], ["grandchild", "child"], ...(condition === "cycle" ? [[f.session.id, "grandchild"]] : [])]) await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: sourceSessionId!, targetSessionId: targetSessionId!, relationship: "spawned-by", endedAt: new Date() } });
+  await db.prisma.runtimeSession.create({ data: { id: "unrelated", scopeKey: "unrelated", agentCommand: "codex", status: "active", cwd: path.join(directory, "unrelated"), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  if (condition === "pending") await db.prisma.runtimeInstruction.create({ data: { id: "grandchild-pending", sessionId: "grandchild", state: "unknown", text: "Unresolved descendant work" } });
+  if (condition === "settled") expect(await assertPreparedCleanup(f.input)).toHaveProperty("closedContinuation", true);
+  else await expect(assertPreparedCleanup(f.input)).rejects.toThrow();
+  expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+});
+
 test.skipIf(!process.env.DRAFTED_CLOSED_CLEANUP_ROOT).each(["direct", "closed", "expired"])("actual closed-task upkeep %s continues after a lost close response without reopening or removing twice", async mode => {
   const f = await referenceFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
   const fake = createFakeAgentRuntime([{ id: f.session.id, cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine, role: "primary", status: "idle" }]);
