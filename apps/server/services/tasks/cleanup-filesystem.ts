@@ -154,9 +154,11 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
 
 /** This query is local authority, not a filesystem observer. It also runs on
  * renewals so another task cannot acquire a recorded path inside the capture. */
-export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
+export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, "remoteTaskResource" | "remoteTask">, taskId: string, plan: FinalizationResourcePlan[]) {
   const { assertClerkCleanupSharing } = await import("./cleanup-clerk.ts");
   await assertClerkCleanupSharing(prisma, taskId, plan);
+  const { assertStudioCleanupSharing } = await import("./cleanup-studio-sharing.ts");
+  await assertStudioCleanupSharing(prisma, taskId, plan);
   const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file" || entry.disposition === "retire-vault");
   const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);

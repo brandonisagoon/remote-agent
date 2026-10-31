@@ -17,7 +17,12 @@ network objects are preservation facts, never removal targets.
 The configured observer verifies the external ownership bytes and physical
 lifetimes. The server freezes that result through its existing preparation and
 confirmation contract; it does not read provider state inside SQL or introduce
-another authority endpoint. Final confirmation requires every prepared target
+another authority endpoint. The original v1 finalizer requests the existing
+selected-resource witness for its exact Compose key. That renewal rechecks
+registered project/member ownership, the original source and private enrollment
+proof directory after physical observations and before each effect. The v2
+prepared-plan boundary shares the same bounded negative ownership checks.
+Unrelated shared proxy/network users do not become retiring claims. Final confirmation requires every prepared target
 absent, including routes. The enrolled proof and shared configuration must remain
 outside source/evidence capture roots. Their exact descriptors remain available
 after the original source has been captured. Shared configuration content can
@@ -26,6 +31,10 @@ route digests remain bound.
 
 Retained migration resources continue to use their existing preservation path.
 Stock cleanup cannot adopt a different member, omit a route, replace a shared
-configuration inode or relabel a changed provider object. Client effect and
-lost-response recovery tests, full composition, protected delivery and disposable
-live acceptance remain separate from this server schema checkpoint.
+configuration inode or relabel a changed provider object. The composed test uses actual Unix control/SQLite authority, the real client
+observer and local-only original v1 finalizer, source/archive adoption and Git
+capture. A late registered foreign member refuses before effects; partial
+removal and lost Released/source-capture/confirmation replies recover through the
+same operation. Docker operations, the proxy owner writer and filesystem-handle
+observations are injected in that pair. Actual physical acceptance remains
+separate from source validation and protected delivery.
