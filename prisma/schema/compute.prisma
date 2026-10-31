@@ -1,4 +1,20 @@
 /// Host application compute is independent of provider turn capacity.
+/// Bounded accounting for original resource groups with no environment.
+/// This observation never grants start authority or changes resource state.
+model ComputeBaseline {
+  id           String   @id
+  machineId    String
+  taskId       String
+  purpose      String
+  resourceIds  Json
+  refreshToken String
+  proof        Json?
+  updatedAt    DateTime @updatedAt
+
+  @@unique([machineId, taskId, purpose])
+  @@index([machineId])
+}
+
 model ComputeEnvironment {
   id               String   @id
   taskId           String

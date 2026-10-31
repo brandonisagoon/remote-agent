@@ -50,3 +50,31 @@ Final affected reclamation checks passed 133 tests / 495 assertions on the serve
 and 63 / 195 on Drafted, with both typechecks. Independent review and final broad
 checks remain before the root-owned deployment and disposable rollout acceptance.
 No live host configuration or original task was changed by these source tests.
+
+DRA-242 adds separate initial accounting for original development/review groups
+that have counted resources but no compute environment. `ComputeBaseline` is one
+bounded row per machine/task/purpose, not an environment, offer, enrollment or
+resource disposition. Every refresh clears earlier credit before inventory or
+adapter reads. The installed immutable `compute baseline-observe` contract reads
+the complete original member set; every member must be freshly stopped or absent.
+Unsupported, running, changed or unreadable members keep the group reserved.
+Previously recorded members remain in that set after registry release.
+
+The final token CAS binds the resource set, original task/primary/source links,
+historical recursive family, same-directory writers, pending work, relevant
+allocations and global physical ownership claims. Admission recomputes those
+facts inside its existing transaction. A slower old refresh cannot overwrite a
+newer invalidation. Ordinary offer selection, confirmed delivery and first claim
+refresh outside SQL through the same read-only observer; overlapping host callers
+share that refresh. Unrelated offers do not invalidate an original group's proof.
+The refresh function can also run while policy is disabled, without offering or
+enabling anything. Missing observer support leaves all original reservations.
+
+Real disposable SQLite tests cover whole-group accounting with no original
+enrollment, preserved closed/paused task and resource rows, Released-row failure,
+moved/active descendants, overlapping ownership, stale and concurrent reads. An
+actual immutable Git adapter subprocess exercises offer, delivery and first-claim
+refresh, including a restart or changed capability between these boundaries. Its
+physical answers are controlled fixture inputs; actual client physical observers
+have separate contract tests. Production activation and live acceptance remain
+root-owned and are not established by this source checkpoint.

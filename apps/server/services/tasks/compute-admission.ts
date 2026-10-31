@@ -11,7 +11,7 @@ import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObs
 
 import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 type Store = Prisma.TransactionClient;
-type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date };
+type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date; config?: ServerConfig; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 export const ComputeRequest = z.object({ key: Key, purpose: z.enum(["development", "review"]), revision: z.string().regex(/^[a-f0-9]{40}$/), recipeDigest: Digest, saved: SavedComputeBinding.optional() }).strict();
@@ -84,8 +84,24 @@ async function unaccounted(store: Store, input: Context) {
   // Unallocated running/unknown environments remain host usage until a fresh
   // physical reclamation succeeds, even after ordinary resource cleanup.
   const uncertain = environments.filter(environment => !occupied.has(environment.id) && ["running", "unknown", "starting"].includes(environment.state));
+  const baselines = await (await import("./compute-baseline.ts")).computeBaselineCredits(store, input);
+  for (const baseline of baselines) if (baseline.credited) for (const id of baseline.resourceIds) recorded.add(id);
+  const originalClaims = baselines.filter(baseline => !baseline.credited && baseline.resourceIds.some(id => !recorded.has(id)));
   return new Set([...resources.filter(resource => !recorded.has(resource.id)).map(resource => `${resource.taskId}:${resource.purpose}`),
+    ...originalClaims.map(group => `${group.taskId}:${group.purpose}`),
     ...uncertain.map(environment => `${environment.taskId}:${environment.purpose}`)]).size;
+}
+const baselineRefreshes = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
+async function refreshBaseline(input: Context) {
+  if (!input.config || !input.runtime) return; // Internal callers without a live observer cannot create baseline credit.
+  if (input.config.machine !== input.machineId) throw new Error("Compute accounting belongs to another host");
+  let pending = baselineRefreshes.get(input.prisma);
+  if (!pending) { pending = new Map(); baselineRefreshes.set(input.prisma, pending); }
+  const active = pending.get(input.machineId);
+  if (active) return active;
+  const work = import("./compute-baseline.ts").then(module => module.refreshComputeBaselines({ prisma: input.prisma, config: input.config!, runtime: input.runtime!, now: input.now }));
+  pending.set(input.machineId, work);
+  try { return await work; } finally { if (pending.get(input.machineId) === work) pending.delete(input.machineId); }
 }
 async function freeSlot(store: Store, input: Context) {
   const settings = policy(input), unavailable = await unaccounted(store, input);
@@ -235,6 +251,8 @@ export async function reconcileComputeOffers(input: Context) {
  * an exact persisted prompt-start event confirms delivery to the executing turn. */
 export async function offerNextCompute(input: Context) {
   const settings = policy(input); await reconcileComputeOffers(input);
+  if (!await input.prisma.computeWait.findFirst({ where: { machineId: input.machineId, eligibleAt: { lte: at(input) } } })) return null;
+  await refreshBaseline(input);
   return input.prisma.$transaction(async store => {
     if (!(await freeSlot(store, input))) return null;
     // One pending delivery per host avoids a burst of messages for one slot.
@@ -260,6 +278,8 @@ export async function offerNextCompute(input: Context) {
 
 export async function confirmComputeDelivery(input: Context & { sessionId: string; requestId: string }) {
   policy(input);
+  const candidate = await input.prisma.runtimeInstruction.findFirst({ where: { sessionId: input.sessionId, executionRequestId: input.requestId }, select: { id: true } });
+  if (candidate && await input.prisma.computeOffer.findFirst({ where: { instructionId: candidate.id, state: "queued" } })) await refreshBaseline(input);
   return input.prisma.$transaction(async store => {
     const instruction = await store.runtimeInstruction.findFirst({ where: { sessionId: input.sessionId, executionRequestId: input.requestId } });
     if (!instruction) return null;
@@ -284,6 +304,7 @@ export async function confirmComputeDelivery(input: Context & { sessionId: strin
 
 export async function claimCompute(input: Context & { taskId: string; offerId: string; request: z.infer<typeof ComputeRequest> }) {
   policy(input); const request = ComputeRequest.parse(input.request);
+  if (await input.prisma.computeOffer.findFirst({ where: { id: input.offerId, state: "offered" } })) await refreshBaseline(input);
   return input.prisma.$transaction(async store => {
     const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
