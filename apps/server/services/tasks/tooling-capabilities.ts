@@ -16,7 +16,7 @@ type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string }
 export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput>, resolve = resolveToolingCompatibility) {
   const parsed = ToolingCapabilityInput.parse({ capability: input.capability, ...("development" in input ? { development: input.development } : {}) });
   const { capability } = parsed;
-  const assertOwnership = async (prisma: Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeInstruction" | "runtimeLifecycleEvent" | "runtimeMetadataEvent">) => {
+  const assertOwnership = async (prisma: Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource" | "runtimeInstruction" | "runtimeLifecycleEvent" | "runtimeMetadataEvent" | "computeEnvironment" | "computeTraffic" | "computeOffer" | "computeSlot">) => {
     const task = await prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
     const session = await prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
     if (!task || !session || session.role !== "primary" || session.status === "closed" || !task.worktreePath

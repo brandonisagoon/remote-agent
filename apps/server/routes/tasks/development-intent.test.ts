@@ -6,6 +6,8 @@ import { createApp } from "../../app.ts";
 import { finalizationResourceIdentity } from "../../services/tasks/finalization-resources.ts";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 
 let db: TestDatabase;
 beforeEach(async () => { db = await createTestDatabase(); });
@@ -184,6 +186,55 @@ test.each(["pause", "resume"] as const)("an older %s route cannot overwrite the 
 });
 
 const draftedRoot = process.env.DRAFTED_DEVELOPMENT_INTEGRATION_ROOT;
+
+test.skipIf(!draftedRoot)("actual Unix owner pause/resume stops only saved Compose compute and preserves retained spatial data", async () => {
+  const f = await fixture(), root = await realpath(await mkdtemp(path.join(tmpdir(), "development-compose-")));
+  const socket = path.join(root, "control.sock"), directory = path.join(root, "environment"), configFile = path.join(directory, "compose.yml"), journalRoot = path.join(root, "compute-journal");
+  await mkdir(directory, { mode: 0o700 }); await writeFile(configFile, "name: original-compose\n", { mode: 0o600 });
+  const project = "drafted-task-development", appId = "a".repeat(64), spatialId = "b".repeat(64), networkId = "c".repeat(64), appVolume = `${project}-app`, spatialVolume = `${project}-spatial`;
+  const labels = { "dev.drafted.task": "task", "dev.drafted.purpose": "development", "com.docker.compose.project": project };
+  const containers = [
+    { id: appId, labels: { ...labels, "com.docker.compose.service": "app", "com.docker.compose.project.config_files": configFile, "com.docker.compose.project.working_dir": directory }, createdAt: "original-app", image: "sha256:app", networks: [networkId], volumes: [appVolume], running: true },
+    { id: spatialId, labels: { ...labels, "com.docker.compose.service": "spatial", "com.docker.compose.project.config_files": configFile, "com.docker.compose.project.working_dir": directory }, createdAt: "original-spatial", image: "sha256:spatial", networks: [networkId], volumes: [spatialVolume], running: false },
+  ];
+  const objects = new Map<string, any>(containers.map(value => [`container:${value.id}`, value]));
+  objects.set(`network:${networkId}`, { id: networkId, name: `${project}-default`, labels: { ...labels, "com.docker.compose.network": "default" }, createdAt: "original-network" });
+  for (const id of [appVolume, spatialVolume]) objects.set(`volume:${id}`, { id, labels, createdAt: "original-volume" });
+  await db.prisma.remoteTaskResource.delete({ where: { id: f.compute.id } });
+  const group = await db.prisma.remoteTaskResource.create({ data: { id: "group", taskId: "task", key: "development-compose", kind: "docker-compose-project", purpose: "development", externalId: project, state: "ready",
+    metadata: { composeFile: configFile, containers: { app: appId, spatial: spatialId }, network: `${networkId} (${project}-default)`, volumes: [appVolume, spatialVolume] } } });
+  const cutoverDirectory = path.join(root, "cutovers", project), cutoverFile = path.join(cutoverDirectory, "receipt.private.json");
+  await mkdir(cutoverDirectory, { recursive: true, mode: 0o700 });
+  await writeFile(cutoverFile, JSON.stringify({ project, branchId: "br-original", state: "migrated", startedAt: "2030-01-01T00:00:00Z", completedAt: "2030-01-01T00:01:00Z", files: [configFile, path.join(directory, "spatial.env")].map((file, index) => ({ file, backup: path.join(cutoverDirectory, `file-${index}.backup`) })) }), { mode: 0o600 });
+  const retained = await db.prisma.remoteTaskResource.create({ data: { id: "retained-source", taskId: "task", key: "spatial-neon-development", kind: "neon-branch-database", purpose: "development", state: "released", externalId: "br-original/task_spatial",
+    metadata: { cutoverReceipt: cutoverFile, runtimeDatabase: "task_spatial", supersedes: `local PostGIS in ${group.key} (stopped by owner cutover; volume retained; not restarted)` } } });
+  const before = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+  const { continueDevelopmentIntent } = await import(path.join(draftedRoot!, "src/development-intent.ts"));
+  const { manageResource } = await import(path.join(draftedRoot!, "src/resources.ts"));
+  const { finalizationDigest } = await import(path.join(draftedRoot!, "src/finalization-plan.ts"));
+  const server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  const effects: string[] = [], originalSpatial = JSON.stringify(containers[1]);
+  const docker = { inspect: async (kind: string, id: string) => structuredClone(objects.get(`${kind}:${id}`) ?? null),
+    resolve: async (kind: string, id: string) => structuredClone(objects.get(`${kind}:${id}`) ?? null),
+    inventory: async (kind: string) => structuredClone([...objects].filter(([key]) => key.startsWith(`${kind}:`)).map(([, value]) => value)),
+    stop: async (id: string) => { effects.push(`stop:${id}`); objects.get(`container:${id}`).running = false; },
+    start: async (id: string) => { effects.push(`start:${id}`); objects.get(`container:${id}`).running = true; },
+    remove: async () => { throw new Error("No data or compute removal belongs to pause/resume"); } };
+  const registry = taskRegistry(socket, "task"), manage = (input: any) => manageResource({ ...input, docker, compose: { computeJournalRoot: journalRoot } });
+  try {
+    expect((await f.intent("pause")).response.status).toBe(200);
+    expect((await continueDevelopmentIntent(registry, manage, docker)).developmentIntent.state).toBe("complete");
+    const file = path.join(journalRoot, `${finalizationDigest({ taskId: "task", resourceId: group.id })}.json`), journal = await readFile(file);
+    expect((await f.get()).ownerPaused).toBeTrue(); expect(containers[0]!.running).toBeFalse();
+    expect((await f.intent("resume")).response.status).toBe(200);
+    expect((await continueDevelopmentIntent(registry, manage, docker)).developmentIntent.state).toBe("complete");
+    expect((await f.get()).ownerPaused).toBeFalse(); expect(effects).toEqual([`stop:${appId}`, `start:${appId}`]);
+    expect(JSON.stringify(containers[1])).toBe(originalSpatial); expect(objects.size).toBe(5); expect(await readFile(file)).toEqual(journal);
+    expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(before);
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: retained.id } })).toEqual(retained);
+  } finally { await server.stop(true); await rm(root, { recursive: true, force: true }); }
+}, 20_000);
 test.skipIf(!draftedRoot)("actual client retries only the saved pending cancellation through the real automation route", async () => {
   const f = await fixture();
   await db.prisma.remoteTaskResource.update({ where: { id: f.compute.id }, data: { state: "released" } });

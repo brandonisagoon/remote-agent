@@ -1,7 +1,7 @@
 import { cleanupTransportAllowsInstruction } from "../tasks/cleanup-transport.ts";
 import { cleanupInstructionAllows, prepareQueuedCleanupTransport, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
 import { randomUUID } from "node:crypto";
-import type { PrismaClient } from "../../../../generated/prisma/client.ts";
+import type { Prisma, PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { isCurrentMergeApproval } from "../tasks/completion.ts";
 import { bindSourceTurn, sourceReplyInstructions } from "./source-messages.ts";
@@ -85,7 +85,8 @@ async function instructionRequestId(prisma: PrismaClient, receipt: { id: string;
   return retry ? `${receipt.id}:retry:${retry.sequence}` : receipt.id;
 }
 
-async function instructionAuthorityAllows(prisma: CleanupInboxStore, receipt: { id: string; sessionId: string }) {
+async function instructionAuthorityAllows(prisma: Prisma.TransactionClient, receipt: { id: string; sessionId: string }) {
+  if (!(await (await import("../tasks/compute-admission.ts")).computeInstructionAllows(prisma, receipt))) return false;
   if (!(await cleanupTransportAllowsInstruction(prisma, receipt))) return false;
   if (!(await cleanupInstructionAllows(prisma, receipt))) return false;
   const dispatch = await prisma.runtimeMetadataEvent.findFirst({ where: {
@@ -230,11 +231,14 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
 }
 
 export function startInstructionDelivery(prisma: PrismaClient, runtime: AgentSessionRuntime, config: ServerConfig) {
-  const tick = () => void deliverMessageControls(prisma, runtime, async (message) => {
+  const tick = () => void Promise.resolve().then(async () => {
+    if (config.compute?.enabled) await (await import("../tasks/compute-admission.ts")).offerNextCompute({ prisma, machineId: config.machine, policy: config.compute })
+      .catch(() => console.error("Compute admission requires reconciliation"));
+  }).then(() => deliverMessageControls(prisma, runtime, async (message) => {
     const { tracker } = await import("../../integrations/tracker/port.ts");
     if (tracker.sourceMessages.provider !== message.provider) throw new Error("Source integration is unavailable");
     return tracker.sourceMessages.validateOwner(config, prisma, message);
-  }).then(() => deliverInstructions(prisma, runtime, config)).catch(() => console.error("Instruction inbox reconciliation failed"));
+  })).then(() => deliverInstructions(prisma, runtime, config)).catch(() => console.error("Instruction inbox reconciliation failed"));
   const timer = setInterval(tick, 1000);
   timer.unref();
   tick();

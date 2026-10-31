@@ -46,7 +46,7 @@ async function waitForOwnedGroupExit(group: number) {
   }
 }
 
-async function execute(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string>; failureRequest?: unknown }) {
+export async function executeOwnedObserver(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string>; failureRequest?: unknown }) {
   if (!["darwin", "linux"].includes(process.platform)) throw failure("OBSERVER_TRANSPORT");
   let complete: { code: number } | undefined;
   // A dedicated session leader outlives the command and its inherited pipes.
@@ -104,7 +104,7 @@ async function checkedCapability(capability: CleanupObserverCapability, retained
   if (!root.isDirectory() || root.isSymbolicLink() || !file.isFile() || file.isSymbolicLink() || file.size > 1024 * 1024
     || root.uid !== process.getuid?.() || file.uid !== process.getuid?.() || root.mode & 0o022 || file.mode & 0o022
     || await realpath(value.checkout) !== value.checkout || await realpath(value.adapter) !== value.adapter || !inside(value.checkout, value.adapter)) throw failure();
-  const git = (...args: string[]) => execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", ...args], { cwd: value.checkout, timeoutMs: 10_000 });
+  const git = (...args: string[]) => executeOwnedObserver(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", ...args], { cwd: value.checkout, timeoutMs: 10_000 });
   if ((await git("rev-parse", "HEAD")).trim() !== value.revision || (await git("status", "--porcelain=v1", "--untracked-files=normal")).trim()) throw failure();
   const manifest = JSON.parse(await git("show", `${value.revision}:.remote-agent-capabilities.json`));
   const relative = path.relative(value.checkout, value.adapter);
@@ -161,7 +161,7 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
   const env: Record<string, string> = {};
   for (const name of ["PATH", "HOME", "TMPDIR", "USER", "CLOUDFLARE_API_TOKEN", "DRAFTED_CLOUDFLARE_CREDENTIALS"]) if (process.env[name] !== undefined) env[name] = process.env[name]!;
   let output: string;
-  try { output = await execute([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
+  try { output = await executeOwnedObserver([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
   catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }
   // Revalidate the code identity after the child finishes. An interrupted or
   // changed observer can never leave a successful physical-proof response.

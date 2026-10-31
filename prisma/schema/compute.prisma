@@ -1,0 +1,77 @@
+/// Host application compute is independent of provider turn capacity.
+model ComputeEnvironment {
+  id               String   @id
+  taskId           String
+  primarySessionId String
+  machineId        String
+  key              String
+  purpose          String
+  revision         String
+  recipeDigest     String
+  taskIdentity     String
+  state            String   @default("waiting")
+  resourceId       String?
+  resourceIdentity String?
+  configuration    Json?
+  observation      Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@unique([taskId, key])
+  @@index([machineId, state])
+}
+
+/// An expired/declined eligible entry is moved to the tail by a new sequence.
+model ComputeWait {
+  sequence      Int      @id @default(autoincrement())
+  environmentId String   @unique
+  machineId     String
+  eligibleAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+
+  @@index([machineId, sequence])
+}
+
+/// Stable inbox ID is separate from capacity. Queued offers hold no slot.
+model ComputeOffer {
+  id                 String   @id
+  environmentId      String
+  machineId          String
+  instructionId      String   @unique
+  executionRequestId String?
+  state              String   @default("queued")
+  dispatchDeadline   DateTime
+  deliveredAt        DateTime?
+  expiresAt          DateTime?
+  claimedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([environmentId, state])
+  @@index([machineId, state])
+}
+
+/// Compare-and-swap on an explicit slot prevents concurrent double allocation.
+/// Claimed/uncertain startup retains its slot until verified stopped/absent.
+model ComputeSlot {
+  id           String @id
+  machineId    String
+  ordinal      Int
+  allocationId String? @unique
+
+  @@unique([machineId, ordinal])
+}
+
+/// Collector state is bounded and carries exact route ownership, not raw logs.
+model ComputeTraffic {
+  routeId       String   @id
+  environmentId String
+  taskId        String
+  epoch         String
+  sequence      Int      @default(0)
+  state         Json
+  updatedAt     DateTime @updatedAt
+
+  @@index([environmentId])
+}
