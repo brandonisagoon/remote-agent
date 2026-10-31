@@ -47,6 +47,7 @@ export function legacyNeonScope(task: { id: string; resources: Resource[] }, res
   if (!path.isAbsolute(environment) || path.normalize(environment) !== environment || path.basename(environment) !== task.id || path.basename(path.dirname(environment)) !== "environments"
     || groupMeta.composeFile !== path.join(environment, "compose.yml") || task.resources.some(value => value.id !== resource.id && value.externalId === resource.externalId)) throw new Error("Development database environment or aliases changed");
   if (task.resources.some(value => value.purpose === "development" && neonReviewWriterKinds.has(value.kind) && value.id !== group.id && value.state !== "released")) throw new Error("Registered development database consumers are not retired");
+  if (task.resources.some(value => value.id !== resource.id && value.kind === "neon-branch-database" && value.externalId.startsWith(match[1] + "/") && value.purpose === "review" && value.state !== "released")) throw new Error("Original review database retirement must finish before its development verification sibling retires");
   const token = finalizationDigest({ taskId: task.id, resource: finalizationResourceIdentity({ ...resource, id: resource.id }) });
   return { branchId: match[1]!, database: "task_spatial", role: "drafted_runtime", env: path.join(environment, "spatial.env"), source: resource, project, cutover,
     mapping: path.join(path.dirname(path.dirname(path.dirname(cutover))), "branches.private.json"), currentBackup: true as const, group, environment,

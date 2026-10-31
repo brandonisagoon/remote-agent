@@ -1430,6 +1430,7 @@ async function neonScopeFixture(development = false) {
     { id: "review-service", key: "review-service", kind: "local-http", purpose: "review", externalId: "http://127.0.0.1:8080", state: "released", metadata: {} },
   ];
   if (development) {
+    values[1]!.state = "released";
     Object.assign(values[0]!.metadata, { supersedes: "local PostGIS in compose-development-r2 (stopped by owner cutover; volume retained; not restarted)" });
     const environment = path.join(directory, "environments", f.task.id);
     await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, id: "original-compose", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", state: "ready", externalId: `drafted-${f.task.id}-development`,
