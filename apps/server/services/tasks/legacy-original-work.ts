@@ -4,6 +4,8 @@ import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { inspectCleanupSupplementAuthority, CLEANUP_OPERATION } from "./cleanup-lifecycle.ts";
 import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
+import { LegacyEvidenceProof } from "./legacy-evidence-schema.ts";
+import { ArchiveRetentionProof } from "./archive-retention-schema.ts";
 import { activeCleanupRoots } from "./cleanup-scope.ts";
 import { FINALIZATION_PREPARED, FINALIZATION_CONFIRMED, type PreparedFinalization } from "./finalization-receipts.ts";
 import { finalizationDigest, finalizationResourceObservation, type ResourceObservation } from "./finalization-resources.ts";
@@ -58,6 +60,26 @@ async function assertStorage(prisma: Database, active: Active, proof: LegacyOrig
   if (storage.some((file, index) => roots.some(root => overlaps(root, file)) || storage.some((other, j) => j !== index && overlaps(file, other)))) throw new Error("Original archive or capture storage overlaps protected material or cleanup roots");
   const scopes = [original.target.path, original.administration.administrationCapture.path, ...storage];
   await assertRegisteredPathSharing(prisma, active.task.id, scopes);
+  // File-only retention proofs intentionally have no TaskResource. Preserve
+  // those claims too, including captures kept after the other task closed.
+  const retained = await prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [LEGACY_ORIGINAL_WORK, "legacy-evidence-retained", "finalization-archive-retention"] },
+    NOT: { source: { in: [`owner:${active.task.id}`, `finalizer-archives:${active.task.id}`] } } }, take: 10_001 });
+  if (retained.length > 10_000) throw new Error("Original retained path claims exceed the local verification bound");
+  for (const event of retained) {
+    const value = JSON.parse(event.value ?? "null"); let taskId: string, expectedSource: string, protectedPaths: string[];
+    if (event.action === LEGACY_ORIGINAL_WORK) {
+      const saved = LegacyOriginalWorkProof.parse(value); taskId = saved.taskId; expectedSource = `owner:${taskId}`;
+      protectedPaths = [saved.originalWork.archive.root, saved.originalWork.target.quarantine.directory, saved.originalWork.administration.administrationCapture.quarantine.directory];
+    } else if (event.action === "legacy-evidence-retained") {
+      const saved = LegacyEvidenceProof.parse(value); taskId = saved.taskId; expectedSource = `owner:${taskId}`;
+      protectedPaths = [saved.archiveRoot, ...saved.entries.map(entry => entry.target.quarantine.directory)];
+    } else {
+      const saved = ArchiveRetentionProof.parse(value); taskId = saved.taskId; expectedSource = `finalizer-archives:${taskId}`;
+      protectedPaths = saved.resources.map(resource => resource.archive.root);
+    }
+    if (event.source !== expectedSource || taskId === active.task.id || protectedPaths.some(root => scopes.some(scope => overlaps(root, scope)))) throw new Error("Original source capture overlaps or cannot verify another task's retained proof");
+  }
+
   const ancestors = new Set<string>();
   for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
   if (await prisma.remoteTask.findFirst({ where: { id: { not: active.task.id }, OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: scope + path.sep } }))] } })) throw new Error("Original source capture overlaps another registered worktree");
