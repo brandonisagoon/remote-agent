@@ -115,9 +115,10 @@ test("Task closure and source-state changes invalidate preparation without repla
   await expect(prepareTaskFinalization(f.input, f.dependencies)).rejects.toThrow("current owner Merge");
   f.issue.state = f.states[0]!;
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
-  await expect(prepareTaskFinalization(f.input, f.dependencies)).rejects.toThrow("open complete task");
+  await expect(prepareTaskFinalization(f.input, f.dependencies)).rejects.toThrow("original operation recorded before settled primary closure");
   f.remove();
-  await expect(confirmTaskFinalization(f.input, f.dependencies)).rejects.toThrow("open complete task");
+  await expect(confirmTaskFinalization(f.input, f.dependencies)).rejects.toThrow("original operation recorded before settled primary closure");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-cleanup-started", FINALIZATION_CONFIRMED] } } })).toBe(0);
 });
 
 test("prepare retries never refresh accepted bytes and arbitrary Done is not cleanup authority", async () => {

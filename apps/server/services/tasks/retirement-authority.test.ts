@@ -202,7 +202,8 @@ test("source state and explicit revocation during remote observation deny cleanu
 test("a closed original primary and revoked completion contract cannot consume retirement authority", async () => {
   const f = await fixture(); await f.grant();
   await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed" } });
-  await expect(prepareTaskFinalization(f.input, f.finalizationDependencies)).rejects.toThrow("open complete task");
+  await expect(prepareTaskFinalization(f.input, f.finalizationDependencies)).rejects.toThrow("original operation recorded before settled primary closure");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: [FINALIZATION_PREPARED, "finalization-cleanup-started", FINALIZATION_CONFIRMED] } } })).toBe(0);
   await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "idle" } });
   await f.revoke();
   await expect(prepareTaskFinalization(f.input, f.finalizationDependencies)).rejects.toThrow("existing merge authority");
