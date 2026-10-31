@@ -20,7 +20,7 @@ function fixture() {
     { kind: "docker-network", id: hash(4), presentAtPrepare: true, scope, identity: { createdAt: "network-created", labelsDigest: hash(11), name: "original-default" } },
     ...resource.metadata.volumes.map(id => ({ kind: "docker-volume", id, presentAtPrepare: true, scope, identity: { createdAt: "volume-created", labelsDigest: hash(11) } })),
     ...[3200, 8100].map(port => ({ kind: "studio-proxy-route", id: `original-${port}`, presentAtPrepare: true,
-      scope: { ...scope, proxyId: hash(6), configuration }, containerId: hash(1), hostname: `original-${port}.localhost`, listenPort: port, routeDigest: hash(port) })),
+      scope: { ...scope, proxyId: hash(6), configuration }, containerId: hash(1), hostname: "original.localhost", listenPort: port, routeDigest: hash(port) })),
   ];
   let absent = false;
   const targets = () => raw.map(target => ({ ...target, identityDigest: cleanupTargetDigest(target) }));
@@ -36,13 +36,14 @@ function fixture() {
 test("the original stock member and route set is prepared once and independently confirmed absent", async () => {
   const f = fixture(), before = structuredClone(f.resource), plan = await f.prepare();
   expect(plan[0]!.targets).toHaveLength(10); expect(f.resource).toEqual(before);
+  expect(plan[0]!.targets.filter(target => target.kind === "studio-proxy-route").map(target => [target.hostname, target.listenPort])).toEqual([["original.localhost", 3200], ["original.localhost", 8100]]);
   await expect(assertCleanupAdapterResources({ taskId: f.task.id, resources: [f.resource], plan, removed: true }, f.observer)).rejects.toThrow("independently verified");
   f.removed(); await assertCleanupAdapterResources({ taskId: f.task.id, resources: [f.resource], plan, removed: true }, f.observer);
   await assertCleanupAdapterResources({ taskId: f.task.id, resources: [f.resource], plan, removed: true }, f.observer);
   expect(f.resource.metadata).toEqual(before.metadata);
   for (const root of ["/private/studio", "/private/proxy"]) expect(() => captureAdapterDependencies(root, [f.resource], plan)).toThrow("confirmation inputs");
 });
-test.each(["missing-member", "extra-member", "missing-route", "mixed-proof", "generic-compose", "shared-network", "shared-proxy", "wrong-container", "wrong-port", "foreign-host", "source-proof", "source-config", "changed-original-volume", "retained-source"])("stock %s cannot broaden prepared cleanup", async kind => {
+test.each(["missing-member", "extra-member", "missing-route", "mixed-proof", "generic-compose", "shared-network", "shared-proxy", "wrong-container", "wrong-port", "foreign-host", "different-route-host", "duplicate-route-slot", "source-proof", "source-config", "changed-original-volume", "retained-source"])("stock %s cannot broaden prepared cleanup", async kind => {
   const f = fixture(), route = f.raw.find(target => target.kind === "studio-proxy-route");
   if (kind === "missing-member") f.raw.splice(0, 1);
   if (kind === "extra-member") f.raw.push({ ...f.raw[0], id: hash(99) });
@@ -54,6 +55,8 @@ test.each(["missing-member", "extra-member", "missing-route", "mixed-proof", "ge
   if (kind === "wrong-container") route.containerId = hash(2);
   if (kind === "wrong-port") route.listenPort = 8200;
   if (kind === "foreign-host") route.hostname = "example.com";
+  if (kind === "different-route-host") route.hostname = "foreign.localhost";
+  if (kind === "duplicate-route-slot") route.listenPort = 8100;
   if (kind === "source-proof") for (const target of f.raw) target.scope = { ...target.scope, studio: { ...target.scope.studio, file: "/source/original/enrolled.json" } };
   if (kind === "source-config") for (const target of f.raw.filter(target => target.kind === "studio-proxy-route")) target.scope = { ...target.scope, configuration: { ...target.scope.configuration, file: "/source/original/nginx.conf" } };
   if (kind === "changed-original-volume") f.resource.metadata.volumes[0] = "foreign-data";

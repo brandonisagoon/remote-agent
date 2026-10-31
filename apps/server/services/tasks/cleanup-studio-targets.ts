@@ -40,6 +40,7 @@ export function assertStudioCleanupTargets(result: z.infer<typeof CleanupObserve
   if (routes.some(route => route.containerId !== workspace || route.scope.proxyId !== routes[0]!.scope.proxyId
     || cleanupDigest(route.scope.configuration) !== cleanupDigest(routes[0]!.scope.configuration)
     || containers.some(container => container.id === route.scope.proxyId) || networks.some(target => target.id === route.scope.proxyId))
-    || new Set(routes.map(route => route.id)).size !== 2 || new Set(routes.map(route => route.hostname)).size !== 2
+    || new Set(routes.map(route => route.id)).size !== 2 || new Set(routes.map(route => route.hostname)).size !== 1
+    || new Set(routes.map(route => `${route.hostname}:${route.listenPort}`)).size !== 2
     || cleanupDigest(routes.map(route => route.listenPort).sort()) !== cleanupDigest([3200, 8100])) throw new Error("Stock Studio proxy routes must select the original workspace and shared proxy");
 }

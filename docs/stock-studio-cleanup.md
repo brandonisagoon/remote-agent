@@ -10,7 +10,8 @@ volumes, the private default network and two registered proxy routes. Every targ
 binds the same original task, development purpose, project and immutable enrolled
 record. Container IDs, volume names and default-network ID must match the
 original resource. The routes select the original workspace container, the same
-shared proxy and configuration inode, and ports 3200 and 8100. Shared proxy and
+shared proxy and configuration inode, and one hostname on distinct ports 3200
+and 8100. Shared proxy and
 network objects are preservation facts, never removal targets.
 
 The configured observer verifies the external ownership bytes and physical
