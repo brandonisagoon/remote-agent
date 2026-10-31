@@ -1489,3 +1489,87 @@ test.skipIf(!process.env.DRAFTED_PRIVATE_EXPORT_INTEGRATION_ROOT)("actual privat
     expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
   } finally { await stopPreparation(); server.stop(true); }
 }, 20_000);
+
+async function nativeAppScopeFixture() {
+  const f = await fixture("native-task"), env = path.join(directory, "environments", f.task.id), project = `drafted-${f.task.id}-development`;
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+  const processes = { api: { pid: 101, listen: "127.0.0.1:19711" }, parcelWorker: { pid: 102, health: "http://127.0.0.1:19714/health" }, web: { pid: 103, listenerPid: 104, listen: "[::1]:19710" }, flagsFixture: { pid: 105, listen: "https://127.0.0.1:19712" }, proxy: { pid: 106, listen: "127.0.0.1:19713" } };
+  const values = [
+    { id: "apps-r2", key: "local-http-development-r2", kind: "local-http", purpose: "development", state: "released", externalId: "http://localhost:19713", metadata: { supersedes: "local-http-development (released)", launcher: "<envDirectory>/run.sh <api|web|posthog|proxy|worker>", pidFiles: "<envDirectory>/*.pid", processes } },
+    { id: "apps-r3", key: "local-http-development-r3", kind: "local-http", purpose: "development", state: "released", externalId: "http://localhost:19713", metadata: { supersedes: "local-http-development-r2", processes: { api: { ...processes.api, pid: 107, spatial: "Neon task_spatial" }, parcelWorker: { ...processes.parcelWorker, pid: 108, spatial: "Neon task_spatial" }, web: { listen: processes.web.listen }, flagsFixture: { listen: processes.flagsFixture.listen }, proxy: { listen: processes.proxy.listen } } } },
+    { id: "apps-compose", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", state: "ready", externalId: project, metadata: { composeFile: path.join(env, "compose.yml"), envDirectory: env } },
+    { id: "apps-neon", key: "spatial-neon-development", kind: "neon-branch-database", purpose: "development", state: "ready", externalId: "br-original/task_spatial", metadata: { runtimeDatabase: "task_spatial", supersedes: "local PostGIS in compose-development-r2 (stopped by owner cutover; volume retained; not restarted)", cutoverReceipt: path.join(directory, "cutovers", project, "receipt.private.json") } },
+  ];
+  for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+  const keys = values.map(value => value.key).sort(), pids = [103, 104, 105, 107, 108, 109];
+  const renew = (nativePids: number[] | undefined = pids, resourceKeys: string[] | undefined = keys) => app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey, resourceKeys, nativePids }) });
+  return { ...f, values, keys, pids, env, prepared, active, app, renew };
+}
+
+test("native app scope binds original Released aliases and exact PID exclusions without changing the original operation", async () => {
+  const f = await nativeAppScopeFixture(), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const before = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  const response = await f.renew([...f.pids].reverse()); expect(response.status).toBe(200);
+  const value = await response.json();
+  expect(value).toMatchObject({ preparedRevision: f.prepared.preparedRevision, cleanup: { operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation) }, nativeApps: { version: 1, pids: f.pids } });
+  expect(value.nativeApps.recordedBefore).toBe(frozen.find(row => row.sequence === f.prepared.preparedRevision)!.occurredAt.toISOString());
+  expect(value.resources).toEqual(before.map(resource => ({ id: resource.id, key: resource.key, identityDigest: finalizationResourceIdentity(resource).identityDigest })).sort((a, b) => a.key.localeCompare(b.key)));
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(before);
+});
+
+test.each(["root", "released-descendant", "same-task-alias", "environment", "worktree", "pause", "revoke", "changed-resource", "missing-root", "partial-scope", "wrong-scope", "duplicate", "oversized"])("native app scope refuses %s before any effect authority", async change => {
+  const f = await nativeAppScopeFixture();
+  expect((await f.renew()).status).toBe(200);
+  const foreign = ["root", "released-descendant", "environment", "worktree"].includes(change);
+  if (foreign) await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "foreign", toolingRoot: f.root, toolingRevision: "b".repeat(40), ...(change === "worktree" ? { worktreePath: path.join(f.worktree, "nested") } : {}) } });
+  if (["root", "released-descendant", "same-task-alias", "environment"].includes(change)) await db.prisma.remoteTaskResource.create({ data: { taskId: change === "same-task-alias" ? f.task.id : "foreign", key: "new-claim", kind: change === "environment" ? "directory" : "local-http", purpose: "development", state: change === "released-descendant" ? "released" : "ready", externalId: change === "environment" ? path.join(f.env, "child") : "http://localhost:1", metadata: { pid: change === "root" ? 107 : 109 } } });
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "revoke") await f.revoke();
+  if (change === "changed-resource") await db.prisma.remoteTaskResource.update({ where: { id: "apps-r3" }, data: { metadata: { changed: true } } });
+  const pids = change === "missing-root" ? [109] : change === "duplicate" ? [...f.pids, 109] : change === "oversized" ? Array.from({ length: 257 }, (_, index) => index + 1) : f.pids;
+  const keys = change === "partial-scope" ? [f.keys[0]!] : change === "wrong-scope" ? ["spatial-neon-development"] : f.keys;
+  const response = await f.renew(pids, keys); expect(response.status).toBe(["duplicate", "oversized"].includes(change) ? 400 : 409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: CLEANUP_OPERATION } })).toBe(1);
+});
+
+test.skipIf(!process.env.DRAFTED_NATIVE_APPS_INTEGRATION_ROOT || process.platform !== "darwin")("actual native apps and Unix authority stop only the frozen family, reject late claims and recover the same proof", async () => {
+  const f = await fixture("original71"), root = process.env.DRAFTED_NATIVE_APPS_INTEGRATION_ROOT!;
+  const { nativeAppFixture } = await import(path.join(root, "test/fixtures/native-apps.ts"));
+  const { taskRegistry } = await import(path.join(root, "src/control.ts"));
+  const { stopRecordedTaskApps } = await import(path.join(root, "src/legacy-native.ts"));
+  const { inspectHostProcess } = await import(path.join(root, "src/runtime-transfer-host.ts"));
+  const { terminateHostProcess } = await import(path.join(root, "src/runtime-transfer-signal.ts"));
+  const p = await nativeAppFixture({ root: directory, taskId: f.task.id, checkout: f.worktree });
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  try {
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+    for (const value of p.task.resources) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
+    git(f.worktree, "add", "apps", "node_modules"); git(f.worktree, "commit", "-m", "Disposable native app fixture");
+    f.remote.remoteHead = git(f.worktree, "rev-parse", "HEAD"); f.remote.pullRequest.headRefOid = f.remote.remoteHead;
+    await recordCompletionVerification({ ...f.context, verification: { requestKey: "native-verified", passed: true, evidence: ["Disposable native fixtures verified"] } });
+    await prepareTaskFinalization(f.input, f.dependencies); const active = await bindPreparedCleanup(f.input, async () => {});
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), resources = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } });
+    await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "foreign", toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient })).route("/api/tasks", taskRoutes).route("/api/sessions", sessionTaskRoutes);
+    const socket = path.join("/private/tmp", `native-apps-${crypto.randomUUID().slice(0, 8)}.sock`); server = Bun.serve({ unix: socket, fetch: app.fetch });
+    const registry = taskRegistry(socket, f.task.id, 3000); let lateClaim = true, loseReply = true;
+    p.provider.terminate = async (process: any, beforeSignal: () => Promise<void>) => {
+      await terminateHostProcess(process, async (pid: number) => { const current = await inspectHostProcess(pid);
+        if (lateClaim) { lateClaim = false; await db.prisma.remoteTaskResource.create({ data: { id: "late-claim", taskId: "foreign", key: "claimed-child", kind: "local-http", purpose: "review", state: "released", externalId: "http://localhost:1", metadata: { pid } } }); }
+        return current;
+      }, beforeSignal); p.signalled.push(process.pid);
+    };
+    const run = () => stopRecordedTaskApps({ registry, provider: p.provider, proofDirectory: p.proofs, afterSignal: async () => { if (loseReply) { loseReply = false; throw Error("lost signal reply"); } } });
+    await expect(run()).rejects.toThrow("another resource owner"); expect(p.signalled).toEqual([]);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-claim" } });
+    await expect(run()).rejects.toThrow("lost signal reply"); expect(p.signalled).toHaveLength(1);
+    await run(); await run(); expect(p.signalled.sort()).toEqual(p.children.map((child: any) => child.pid).sort()); expect(p.signalled).not.toContain(process.pid);
+    expect(await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id }, orderBy: { id: "asc" } })).toEqual(resources);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(active.operation);
+  } finally { await p.cleanup(); server?.stop(true); }
+}, 30_000);
