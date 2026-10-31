@@ -9,6 +9,7 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { ArchiveRetentionProof } from "./archive-retention-schema.ts";
 import { assertPreparedCleanup, cleanupRetainedResourceIds } from "./cleanup-lifecycle.ts";
 import { assertPrivateExportScope } from "./cleanup-private-export-scope.ts";
+import { matchesClerkCreation, type prepareClerkCreation } from "./clerk-creation-evidence.ts";
 
 export const CleanupNativePids = z.array(z.number().int().positive().max(0x7fffffff)).min(1).max(256).refine(values => new Set(values).size === values.length);
 
@@ -23,7 +24,8 @@ const directoryKinds = new Set(["directory", "private-env-files"]);
 /** This is a local ownership recheck of an already frozen v1 operation, not a
  * new plan or proof of physical absence. Client adapters still verify held
  * filesystem/provider identities and their durable retry journals. */
-export async function cleanupResourceScope(prisma: Database, config: Parameters<typeof cleanupRetainedResourceIds>[1], active: Active, keys: string[], nativePids?: number[]) {
+export async function cleanupResourceScope(prisma: Database, config: Parameters<typeof cleanupRetainedResourceIds>[1], active: Active, keys: string[], options: { nativePids?: number[]; creation?: NonNullable<Awaited<ReturnType<typeof prepareClerkCreation>>> } = {}) {
+  const { nativePids, creation } = options;
   CleanupResourceKeys.parse(keys);
   if (active.kind !== "v1") throw new Error("Legacy resource scope requires the existing version 1 cleanup");
   const selected = keys.map(key => active.binding.resources.find(resource => resource.key === key));
@@ -90,7 +92,7 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     const resource = resources[0]!;
     const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata ?? {});
     if (resources.length !== 1 || resource.kind !== "clerk-test-user" || resource.purpose !== "development"
-      || !/^user_[A-Za-z0-9]+$/.test(resource.externalId) || metadata.createdByTask !== true) throw new Error("Legacy resource scope is not a supported task-created test user");
+      || !/^user_[A-Za-z0-9]+$/.test(resource.externalId) || metadata.createdByTask !== true && !matchesClerkCreation(active, resource, creation)) throw new Error("Legacy resource scope is not a supported task-created test user");
     await assertClerkResourceSharing(prisma, active.task.id, [{ resourceId: resource.id, purpose: resource.purpose,
       identityDigest: finalizationResourceIdentity(resource).identityDigest, kind: "clerk-user", id: resource.externalId }]);
   }

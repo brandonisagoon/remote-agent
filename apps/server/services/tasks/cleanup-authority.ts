@@ -3,6 +3,7 @@ import type { FinalizationContext } from "./finalization-receipts.ts";
 import { assertPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { cleanupResourceScope } from "./cleanup-resource-scope.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
+import { prepareClerkCreation, commitClerkCreation } from "./clerk-creation-evidence.ts";
 
 /** Renew the same checked preparation without sending its inventory again.
  * Keep the existing authority path, including pause, revocation, resource and
@@ -20,15 +21,18 @@ export async function renewCleanupAuthority(input: FinalizationContext & { resou
   };
   if (!input.resourceKeys) { if (input.nativePids) throw new Error("Native PID exclusions need selected resources"); return result; }
   if (receipt.confirmedRevision !== undefined) throw new Error("Confirmed cleanup cannot authorize legacy resource effects");
+  const before = await assertPreparedCleanup(input);
+  const creation = await prepareClerkCreation(input.prisma, input.config, before, input.resourceKeys);
   return input.prisma.$transaction(async tx => {
     const active = await assertPreparedCleanup({ ...input, prisma: tx });
     if (active.preparation.sequence !== result.preparedRevision || active.operationRevision !== result.cleanup.operationRevision
       || retirementDigest(active.operation) !== result.cleanup.operationDigest) throw new Error("Cleanup operation changed during resource scope observation");
     const confirmed = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: "finalization-confirmed", key: input.requestKey } });
     if (confirmed) throw new Error("Confirmed cleanup cannot authorize legacy resource effects");
-    const resources = await cleanupResourceScope(tx, input.config, active, input.resourceKeys!, input.nativePids);
+    const resources = await cleanupResourceScope(tx, input.config, active, input.resourceKeys!, { creation, nativePids: input.nativePids });
     const nativeApps = active.binding.resources.some(resource => input.resourceKeys!.includes(resource.key) && resource.kind === "local-http")
       ? { version: 1 as const, recordedBefore: active.preparation.occurredAt.toISOString(), ...(input.nativePids ? { pids: [...input.nativePids].sort((a, b) => a - b) } : {}) } : undefined;
-    return { ...result, resources, ...(nativeApps ? { nativeApps } : {}) };
+    const clerkCreation = creation ? await commitClerkCreation(tx, active, creation) : undefined;
+    return { ...result, resources, ...(nativeApps ? { nativeApps } : {}), ...(clerkCreation ? { clerkCreation } : {}) };
   });
 }

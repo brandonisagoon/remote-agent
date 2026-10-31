@@ -309,3 +309,10 @@ independently prove every process lifetime and hold the kernel identity while
 renewing immediately before an individual signal. The saved full set is reused
 through partial-stop retries, even after members exit. No new preparation,
 resource metadata link or cleanup operation is written.
+### Original Clerk creation evidence
+
+For the exact older development test-user recipe with no `createdByTask` flag, selected-key renewal may derive a creation witness from the original delegate's configured Acpx record. Initial derivation runs outside the SQL transaction with bounded, held local reads. The frozen Compose environment and private-export location must agree; exact known script bytes, private user result, successful paired create output and subsequent matching resource registration must all correspond. Text-only history, reused users, unrelated delegates, altered registration and ambiguous evidence refuse.
+
+Inside the existing authority transaction, current preparation/operation, selected resource, global sharing checks and original delegate relation are rechecked before saving one redacted `cleanup-clerk-original-creation` fact. This fact is outside the finalizer owner-action set and changes neither original proof bytes nor resource metadata. The compact response binds its revision/digest to the original primary and operation. Cached renewals verify the same immutable fact and relationships without requiring retired local inputs to reappear. It grants no independent cleanup authority; the client still verifies the exact provider instance/user lifetime and current scope before deletion and fresh absence before acknowledgment.
+
+The actual Unix fixture covers durable witness response loss, cached recovery after local evidence retirement, late foreign ownership and owner pause, provider response loss and registry acknowledgment loss, with one effect and unchanged original preparation/operation. Live original-task acceptance remains separate.
