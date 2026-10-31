@@ -188,7 +188,7 @@ export function hasPreparedCleanup(prisma: Database, taskId: string, sessionId: 
   return prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(taskId, sessionId, requestKey) });
 }
 
-async function activeOperation(input: Context, allowConfirmedClosed = false) {
+async function activeOperation(input: Context, allowConfirmedClosed = false, supplementInspection = false) {
   const observed = await current(input, allowConfirmedClosed);
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(observed.task.id, input.sessionId, input.requestKey) });
   if (!event?.value) throw new Error("Cleanup operation is not bound; perform full preparation first");
@@ -196,7 +196,7 @@ async function activeOperation(input: Context, allowConfirmedClosed = false) {
   if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
   const supplement = await input.prisma.runtimeMetadataEvent.findFirst({ where: supplementWhere(observed.task.id, input.sessionId, input.requestKey) });
   assertBinding(observed.binding, supplement ? supplementedBinding(operation, event, EvidenceSupplement.parse(JSON.parse(supplement.value!))) : operation.binding);
-  if (!allowConfirmedClosed) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
+  if (!allowConfirmedClosed && !supplementInspection) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
   return { ...observed, operation, operationRevision: event.sequence };
 }
 
@@ -208,6 +208,10 @@ async function localSnapshot<T>(input: Context, read: (value: Context) => Promis
 }
 
 export const assertPreparedCleanup = (input: Context) => localSnapshot(input, value => activeOperation(value));
+
+/** Existing owner-authenticated adoption may add evidence outside an executing
+ * automatic turn. This reads the unchanged operation; it grants no effect. */
+export const inspectCleanupSupplementAuthority = (input: Context) => localSnapshot(input, value => activeOperation(value, false, true));
 
 /** Closed-session reporting is restricted to the existing confirmed fact. It
  * confers no new resource effect, preparation or arbitrary publication scope. */
