@@ -232,6 +232,8 @@ export async function cleanupRetainedResourceIds(prisma: Database, config: Serve
   const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
   const retained = await retainedArchiveResourceIds(prisma, config, active.prepared);
   for (const resource of cleanupDeliveryRetention(active)?.resources ?? []) retained.add(resource.id);
+  const { legacyComposeRetentionReceipt } = await import("./legacy-compose-finalization.ts");
+  for (const resource of (await legacyComposeRetentionReceipt(prisma, active))?.resources ?? []) retained.add(resource.id);
   return retained;
 }
 

@@ -1,3 +1,4 @@
+import { legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { serializeIssuePublication } from "../sessions/issue-updates.ts";
 import { cleanupStatusReceipt } from "./cleanup-status.ts";
 import { updateSourceIssue } from "../../integrations/linear/session-store/source-issue/update.ts";
@@ -20,7 +21,7 @@ const Report = z.object({ version: z.literal(1), taskId: z.string(), sessionId: 
   reportId: z.string().uuid(), payload: z.object({ requestKey: z.string(), body: z.string(), evidence: z.tuple([]) }).strict(),
   statusHandoff: z.object({ startReportId: z.string().uuid(), expectedStates: z.tuple([z.literal("Merge"), z.literal("Cleanup")]), state: z.literal("Done") }).strict().optional(),
 }).strict();
-type Database = Pick<PrismaClient, "runtimeIssueUpdate" | "runtimeMetadataEvent">;
+type Database = Pick<PrismaClient, "runtimeIssueUpdate" | "runtimeMetadataEvent" | "remoteTaskResource" | "remoteTask">;
 type Active = Awaited<ReturnType<typeof assertPreparedCleanup>>;
 const where = (taskId: string, sessionId: string, requestKey: string) => ({ runtimeSessionId: sessionId, source: `finalizer:${taskId}`, action: CLEANUP_REPORT, key: requestKey });
 
@@ -32,7 +33,8 @@ export async function queueCleanupReport(prisma: Database, active: Active, confi
     ? `Accepted external deliveries are preserved: ${active.prepared.delivery.deliveries.map(delivery => `${delivery.url} (reviewed ${delivery.reviewedHead}, merged ${delivery.mergeCommit})`).join("; ")}.${active.prepared.originalWork ? " Unfinished original work remains preserved in its verified archive and exact quarantine; it is not claimed as delivered." : ""}`
     : `Its accepted work at ${prepared.revision} is preserved.`;
   const started = await cleanupStatusReceipt(prisma, active);
-  const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. ${accepted} Required task resources are retired, explicitly retained evidence remains recorded, and the original development worktree and Git registration are absent.`, evidence: [] as [] };
+  const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
+  const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. ${accepted} Required task resources are retired, ${retainedCompose ? "verified stopped migration data and saved evidence remain explicitly retained" : "explicitly retained evidence remains recorded"}, and the original development worktree and Git registration are absent.`, evidence: [] as [] };
   const report = await prisma.runtimeIssueUpdate.upsert({ where: { runtimeSessionId_requestKey: { runtimeSessionId: prepared.sessionId, requestKey: payload.requestKey } }, update: {},
     create: { runtimeSessionId: prepared.sessionId, requestKey: payload.requestKey, connectionId: prepared.connectionId, issueId: prepared.issueId, input: payload, evidence: [] } });
   if (report.connectionId !== prepared.connectionId || report.issueId !== prepared.issueId || retirementDigest(report.input) !== retirementDigest(payload) || retirementDigest(report.evidence) !== retirementDigest([])) throw new Error("Cleanup report identity already belongs to another publication");
@@ -130,7 +132,8 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
     if (active.operationRevision !== saved.history.operationRevision || retirementDigest(active.operation) !== saved.history.operationDigest) throw new Error("Cleanup operation changed during inspection");
     const report = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
     const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined);
-    return { ...history, ...(finalizationRetention ? { finalizationRetention } : {}), cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
+    const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
+    return { ...history, ...(retainedCompose ? { retainedCompose } : {}), ...(finalizationRetention ? { finalizationRetention } : {}), cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
       preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !report?.published) } };
   } catch (error) { return { ...history, cleanupBlocked: error instanceof Error ? error.message : String(error) }; }
 }

@@ -1,3 +1,4 @@
+import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
@@ -261,7 +262,8 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
     if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
     if (confirmed && JSON.parse(confirmed.value!).preparedRevision !== active.preparation.sequence) throw new Error("Cleanup confirmation belongs to another preparation");
-    return result(active.prepared, active.preparation.sequence, confirmed?.sequence, await cleanupArchives(input, active.task.id), active.retirementSupplement, cleanupReference(input, active));
+    const retainedCompose = await legacyComposeRetentionReceipt(input.prisma, active);
+    return { ...result(active.prepared, active.preparation.sequence, confirmed?.sequence, await cleanupArchives(input, active.task.id), active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}) };
   }
   const candidate = await inspectPreparedCleanupAuthority(input);
   if (candidate.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
@@ -277,7 +279,8 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
   if (confirmed) await assertFinalizationRemoved(active.prepared);
-  return result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active));
+  const retainedCompose = await ensureLegacyComposeRetention(input, active, !confirmed);
+  return { ...result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}) };
 }
 
 function cleanupReference(input: FinalizationContext, active: Awaited<ReturnType<typeof assertPreparedCleanup>>) {
@@ -290,6 +293,7 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   await assertFinalizationAuthority(input.prisma, input.config, active.prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
   await assertFinalizationRemoved(active.prepared);
+  const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
   return input.prisma.$transaction(async tx => {
     await assertPreparedCleanup({ ...input, prisma: tx });
     await assertFinalizationAuthority(tx, input.config, active.prepared, true);
@@ -298,7 +302,7 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
     if (prior && JSON.parse(prior.value!).preparedRevision !== active.preparation.sequence) throw new Error("Cleanup confirmation belongs to another preparation");
     const confirmed = prior ?? await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify({ preparedRevision: active.preparation.sequence }) } });
     await queueCleanupReport(tx, active, confirmed.sequence);
-    return result(active.prepared, active.preparation.sequence, confirmed.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active));
+    return { ...result(active.prepared, active.preparation.sequence, confirmed.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}) };
   });
 }
 
