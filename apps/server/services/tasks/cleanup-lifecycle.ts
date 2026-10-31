@@ -188,7 +188,7 @@ export function hasPreparedCleanup(prisma: Database, taskId: string, sessionId: 
   return prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(taskId, sessionId, requestKey) });
 }
 
-async function activeOperation(input: Context, allowConfirmedClosed = false) {
+async function activeOperation(input: Context, allowConfirmedClosed = false, supplementInspection = false) {
   const observed = await current(input, allowConfirmedClosed);
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: operationWhere(observed.task.id, input.sessionId, input.requestKey) });
   if (!event?.value) throw new Error("Cleanup operation is not bound; perform full preparation first");
@@ -196,8 +196,14 @@ async function activeOperation(input: Context, allowConfirmedClosed = false) {
   if (operation.requestKey !== input.requestKey) throw new Error("Cleanup operation identity changed");
   const supplement = await input.prisma.runtimeMetadataEvent.findFirst({ where: supplementWhere(observed.task.id, input.sessionId, input.requestKey) });
   assertBinding(observed.binding, supplement ? supplementedBinding(operation, event, EvidenceSupplement.parse(JSON.parse(supplement.value!))) : operation.binding);
-  if (!allowConfirmedClosed) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
-  return { ...observed, operation, operationRevision: event.sequence };
+  if (!allowConfirmedClosed && !supplementInspection) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
+  const active = { ...observed, operation, operationRevision: event.sequence };
+  if (active.kind === "v1") {
+    const { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
+    const original = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+    if (original) await assertLegacyOriginalWorkAuthority(input.prisma, active, original);
+  }
+  return active;
 }
 
 async function localSnapshot<T>(input: Context, read: (value: Context) => Promise<T>): Promise<T> {
@@ -208,6 +214,10 @@ async function localSnapshot<T>(input: Context, read: (value: Context) => Promis
 }
 
 export const assertPreparedCleanup = (input: Context) => localSnapshot(input, value => activeOperation(value));
+
+/** Existing owner-authenticated adoption may add evidence outside an executing
+ * automatic turn. This reads the unchanged operation; it grants no effect. */
+export const inspectCleanupSupplementAuthority = (input: Context) => localSnapshot(input, value => activeOperation(value, false, true));
 
 /** Closed-session reporting is restricted to the existing confirmed fact. It
  * confers no new resource effect, preparation or arbitrary publication scope. */
@@ -228,6 +238,8 @@ export async function cleanupRetainedResourceIds(prisma: Database, config: Serve
   const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
   const retained = await retainedArchiveResourceIds(prisma, config, active.prepared);
   for (const resource of cleanupDeliveryRetention(active)?.resources ?? []) retained.add(resource.id);
+  const { legacyComposeRetentionReceipt } = await import("./legacy-compose-finalization.ts");
+  for (const resource of (await legacyComposeRetentionReceipt(prisma, active))?.resources ?? []) retained.add(resource.id);
   return retained;
 }
 

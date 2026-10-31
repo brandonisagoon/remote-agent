@@ -1,6 +1,7 @@
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
+import { LegacyComposeRetentionInput, LegacyComposeRetentionObservation } from "./legacy-compose-retention-schema.ts";
 import { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -63,7 +64,8 @@ function retainedEnvironment(input: z.infer<typeof RetainedPreviewInput>, resour
   return cleanupDigest({ id, key, kind, purpose, externalId, expiresAt, metadata }) === input.identityDigest;
 }
 export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task: z.strictObject({ id: z.string().min(1), primarySessionId: z.string().min(1), worktreePath: Absolute, toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) }),
-  resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional(), retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional() }).superRefine((input, ctx) => {
+  retainedCompose: LegacyComposeRetentionInput.optional(), resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional(), retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional() }).superRefine((input, ctx) => {
+    if (input.retainedCompose && (input.resource.kind !== "docker-compose-project" || input.resource.purpose !== "development" || input.resource.state !== "ready")) ctx.addIssue({ code: "custom", message: "Retained Compose observation requires its original Ready development group" });
     if (input.stage === "prepare" ? input.expectedTargets !== undefined : input.expectedTargets === undefined) ctx.addIssue({ code: "custom", message: "Only confirm requires the exact prepared targets" });
     if (new Set(input.resources.map(resource => resource.id)).size !== input.resources.length || new Set(input.resources.map(resource => resource.key)).size !== input.resources.length || !input.resources.some(resource => resource.id === input.resource.id && cleanupDigest(resource) === cleanupDigest(input.resource))) ctx.addIssue({ code: "custom", message: "Observer resource must occur exactly once in its task inventory" });
     if (input.expectedTargets && (!uniqueTargets(input.expectedTargets) || input.expectedTargets.some(target => target.scope.taskId !== input.task.id || target.scope.purpose !== input.resource.purpose))) ctx.addIssue({ code: "custom", message: "Prepared target scope or uniqueness is invalid" });
@@ -72,7 +74,8 @@ export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task
   });
 export type CleanupObserverInput = z.infer<typeof CleanupObserverInput>;
 export const CleanupObserverResult = z.strictObject({ version: z.literal(1), taskId: z.string(), resourceId: z.string(), resourceIdentityDigest: Hash,
-  adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), stoppedConsumers: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
+  retainedCompose: LegacyComposeRetentionObservation.optional(), adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), stoppedConsumers: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
+    if (result.retainedCompose && (result.adapter !== "compose" || result.retainedCompose.retainedTargetDigests.some(digest => !result.presentTargetDigests.includes(digest)))) ctx.addIssue({ code: "custom", message: "Retained Compose source must remain present" });
     if (new Set(result.dependencies).size !== result.dependencies.length || result.dependencies.includes(result.resourceId)) ctx.addIssue({ code: "custom", message: "Observer dependencies must be unique other resource IDs" });
     if (new Set(result.stoppedConsumers).size !== result.stoppedConsumers.length || result.stoppedConsumers.includes(result.resourceId) || result.stoppedConsumers.some(id => result.dependencies.includes(id))) ctx.addIssue({ code: "custom", message: "Stopped consumers must be unique other resource IDs, separate from full dependencies" });
     if (!uniqueTargets(result.targets) || new Set(result.targets.map(target => target.identityDigest)).size !== result.targets.length || new Set(result.presentTargetDigests).size !== result.presentTargetDigests.length) ctx.addIssue({ code: "custom", message: "Observer targets must be unique" });

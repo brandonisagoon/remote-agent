@@ -1770,3 +1770,91 @@ test.skipIf(process.platform !== "darwin" || !process.env.DRAFTED_CURRENT_DATABA
     expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
   } finally { await stopPreparation?.(); await server?.stop(true); await local.cleanup(); }
 }, 60000);
+
+async function retainedComposeFixture() {
+  const { legacyComposeFinalizationDependencies: dependencies } = await import("./legacy-compose-finalization.ts");
+  const { CleanupTarget, cleanupTargetDigest } = await import("./cleanup-observer-schema.ts");
+  const f = await fixture(), group = await db.prisma.remoteTaskResource.create({ data: { id: "retained-compose", taskId: f.task.id, key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, state: "ready", metadata: { composeFile: path.join(directory, "environment", "compose.yml") } } });
+  const source = await db.prisma.remoteTaskResource.create({ data: { id: "migrated-source", taskId: f.task.id, key: "spatial-neon-development", kind: "neon-branch-database", purpose: "development", externalId: "br-original/task_spatial", state: "released", metadata: { supersedes: `local PostGIS in ${group.key} (stopped by owner cutover; volume retained; not restarted)` } } });
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
+  const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
+  const { adoptLegacyOriginalWork, legacyOriginalWorkDependencies } = await import("./legacy-original-work.ts");
+  const archiveRoot = path.join(directory, "retained-source"); await mkdir(archiveRoot, { mode: 0o700 });
+  git(f.worktree, "bundle", "create", path.join(archiveRoot, "source.bundle"), "refs/heads/codex/task"); await chmod(path.join(archiveRoot, "source.bundle"), 0o600);
+  for (const file of ["index.diff", "worktree.diff"]) await writeFile(path.join(archiveRoot, file), "", { mode: 0o600 });
+  await writeFile(path.join(archiveRoot, "untracked.tar"), Buffer.alloc(1024), { mode: 0o600 });
+  const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex"), lines: string[] = [];
+  for (const file of (await readdir(archiveRoot)).sort()) lines.push(`${sha(await readFile(path.join(archiveRoot, file)))}  ${file}`);
+  const manifest = lines.join("\n") + "\n", manifestPath = path.join(archiveRoot, "MANIFEST.sha256"); await writeFile(manifestPath, manifest, { mode: 0o600 });
+  const operation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: active.operationRevision } });
+  const observationBefore = legacyOriginalWorkDependencies.observation;
+  legacyOriginalWorkDependencies.observation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
+  try { await adoptLegacyOriginalWork({ ...f.context, adoption: { kind: "original-work", requestKey: "source", finalizationRequestKey: f.input.requestKey, expectedPreparedRevision: prepared.preparedRevision,
+    expectedPreparedRawDigest: sha(active.preparation.value!), expectedOperationRevision: active.operationRevision, expectedOperationDigest: finalizationDigest(active.operation), expectedOperationRawDigest: sha(operation.value!),
+    archive: { archiveRoot, manifestPath, manifestSha256: sha(manifest), bundlePath: "source.bundle", bundleRef: "refs/heads/codex/task", indexPatchPath: "index.diff", worktreePatchPath: "worktree.diff", untrackedArchivePath: "untracked.tar", expectedWorkingTree: git(f.worktree, "rev-parse", "HEAD^{tree}"), ownedPaths: [] } } }); }
+  finally { legacyOriginalWorkDependencies.observation = observationBefore; }
+  const journalRoot = path.join(directory, "compose-journal"); await mkdir(journalRoot, { mode: 0o700 });
+  const journal = path.join(journalRoot, `${finalizationDigest({ taskId: f.task.id, resourceId: group.id })}.json`); await writeFile(journal, "fixture journal", { mode: 0o600 });
+  const descriptor = (file: string) => ({ file, dev: 1, ino: 2, mode: 0o100600, sha256: "a".repeat(64) });
+  const config = descriptor(path.join(directory, "environment", "compose.yml")), cutover = descriptor(path.join(directory, "cutover", "receipt.private.json"));
+  const targets = (["container", "network", "volume"] as const).map(kind => {
+    const base = { kind: `docker-${kind}`, id: kind === "volume" ? "retained-data" : (kind === "container" ? "a" : "b").repeat(64), presentAtPrepare: true,
+      scope: { taskId: f.task.id, purpose: "development", project: group.externalId, compose: { ...config, member: kind } },
+      identity: { createdAt: "2026-10-28T00:00:00Z", labelsDigest: "c".repeat(64), ...(kind === "container" ? { image: "original-image", networks: ["b".repeat(64)], volumes: ["retained-data"] } : kind === "network" ? { name: "original-network" } : {}) } };
+    return CleanupTarget.parse({ ...base, identityDigest: cleanupTargetDigest(base as never) });
+  }).sort((a, b) => a.identityDigest.localeCompare(b.identityDigest));
+  const observation = { version: 1, taskId: f.task.id, resourceId: group.id, resourceIdentityDigest: finalizationResourceIdentity(group).identityDigest,
+    adapter: "compose", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: targets.map(target => target.identityDigest).sort(), absent: false,
+    retainedCompose: { journal: descriptor(journal), config, cutover, sourceResourceId: source.id, sourceIdentityDigest: finalizationResourceIdentity(source).identityDigest,
+      bindingDigest: "d".repeat(64), retainedTargetDigests: targets.map(target => target.identityDigest).sort() } };
+  const original = { ...dependencies }, requests: unknown[] = [];
+  dependencies.journalRoot = () => journalRoot;
+  dependencies.resolve = async () => ({ version: 1, source: "configured-host", checkout: directory, revision: "a".repeat(40), adapter: path.join(directory, "observer.ts"), adapterSha256: "b".repeat(64) });
+  dependencies.observe = async input => { requests.push(structuredClone(input.request)); return structuredClone(observation); };
+  return { ...f, group, source, prepared, active, journal, observation, dependencies, requests, restore: () => Object.assign(dependencies, original) };
+}
+
+test("v1 retained Compose proof preserves unchanged Ready data under the original archived operation", async () => {
+  const f = await retainedComposeFixture();
+  const { ensureLegacyComposeRetention } = await import("./legacy-compose-finalization.ts");
+  try {
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+    const rows = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+    await expect(confirmTaskFinalization({ ...f.input, cleanup: true }, f.dependencies as never)).rejects.toThrow();
+    const retained = await ensureLegacyComposeRetention({ ...f.input, cleanup: true }, f.active, true);
+    expect(retained?.resources).toEqual([{ id: f.group.id, key: f.group.key, identityDigest: finalizationResourceIdentity(f.group).identityDigest }]);
+    expect(await prepareTaskFinalization({ ...f.input, cleanup: true, authorityOnly: true })).toMatchObject({ retainedCompose: retained, preparedRevision: f.prepared.preparedRevision });
+    const progress = await recordCleanupProgress({ ...f.context, progress: { requestKey: f.input.requestKey, operationRevision: f.active.operationRevision, operationDigest: retirementDigest(f.active.operation), outcomes: [] } });
+    expect(progress.resources.find(resource => resource.id === f.group.id)).toMatchObject({ state: "ready", outcome: "retained" });
+    expect(await ensureLegacyComposeRetention({ ...f.input, cleanup: true }, await assertPreparedCleanup(f.input), false)).toEqual(retained);
+    expect(await cleanupProjection(db.prisma, f.config, f.task)).toMatchObject({ retainedCompose: retained });
+    expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(rows);
+    for (const event of frozen) expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: event.sequence } })).toEqual(event);
+    expect(f.requests.at(-1)).toMatchObject({ stage: "confirm", retainedCompose: { preparedRevision: f.prepared.preparedRevision, cleanup: { operationRevision: f.active.operationRevision } } });
+  } finally { f.restore(); }
+});
+
+for (const change of ["pause", "operation", "foreign-short-id", "foreign-worktree", "cutover", "resource", "physical-error"] as const) test(`retained Compose supplementation or confirmation refuses ${change}`, async () => {
+  const f = await retainedComposeFixture();
+  const { ensureLegacyComposeRetention } = await import("./legacy-compose-finalization.ts");
+  try {
+    const receipt = await ensureLegacyComposeRetention({ ...f.input, cleanup: true }, f.active, true);
+    const frozen = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-retained-compose" } });
+    if (change === "pause") {
+      const observe = f.dependencies.observe; f.dependencies.observe = async input => { const result = await observe(input); await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); return result; };
+    }
+    if (change === "operation") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.active.operationRevision }, data: { value: JSON.stringify({ ...f.active.operation, requestKey: "different" }) } });
+    if (change === "foreign-short-id" || change === "foreign-worktree") {
+      await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "codex/foreign", toolingRoot: directory, toolingRevision: "a".repeat(40), ...(change === "foreign-worktree" ? { worktreePath: path.dirname(f.observation.retainedCompose.config.file) } : {}) } });
+      if (change === "foreign-short-id") await db.prisma.remoteTaskResource.create({ data: { taskId: "foreign", key: "other", kind: "docker-compose-project", purpose: "review", state: "ready", externalId: "other", metadata: { containers: { spatial: { id: "a".repeat(12) } } } } });
+    }
+    if (change === "cutover") f.observation.retainedCompose.cutover.sha256 = "f".repeat(64);
+    if (change === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.group.id }, data: { metadata: { changed: true } } });
+    if (change === "physical-error") f.dependencies.observe = async () => { throw new Error("Retained Compose partition is missing or running"); };
+    await expect(ensureLegacyComposeRetention({ ...f.input, cleanup: true }, f.active, false)).rejects.toThrow();
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+    expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: frozen.sequence } })).toEqual(frozen);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.group.id } })).state).toBe("ready");
+    expect(receipt?.preparedRevision).toBe(f.prepared.preparedRevision);
+  } finally { f.restore(); }
+});

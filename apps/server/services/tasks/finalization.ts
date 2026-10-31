@@ -1,3 +1,6 @@
+import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority, legacyOriginalWorkDependencies } from "./legacy-original-work.ts";
+import { assertLegacyOriginalWorkFiles } from "./legacy-original-work-files.ts";
+import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
@@ -261,7 +264,9 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
     if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
     const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
     if (confirmed && JSON.parse(confirmed.value!).preparedRevision !== active.preparation.sequence) throw new Error("Cleanup confirmation belongs to another preparation");
-    return result(active.prepared, active.preparation.sequence, confirmed?.sequence, await cleanupArchives(input, active.task.id), active.retirementSupplement, cleanupReference(input, active));
+    const retainedCompose = await legacyComposeRetentionReceipt(input.prisma, active);
+    const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+    return { ...result(active.prepared, active.preparation.sequence, confirmed?.sequence, await cleanupArchives(input, active.task.id), active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}), ...(legacyOriginalWork ? { legacyOriginalWork } : {}) };
   }
   const candidate = await inspectPreparedCleanupAuthority(input);
   if (candidate.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
@@ -272,12 +277,18 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   });
   // Full boundaries re-observe physical targets and retained archives. Native
   // batches explicitly request authorityOnly and avoid all these observations.
-  await observePreparedFilesystem(input, candidate.prepared, dependencies);
   const active = await assertPreparedCleanup(input);
   if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
+  const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+  if (legacyOriginalWork) {
+    await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: Boolean(confirmed) }, legacyOriginalWorkDependencies.observation);
+    await assertLegacyOriginalWorkAuthority(input.prisma, await assertPreparedCleanup(input), legacyOriginalWork);
+  } else await observePreparedFilesystem(input, candidate.prepared, dependencies);
   if (confirmed) await assertFinalizationRemoved(active.prepared);
-  return result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active));
+  await assertPreparedCleanup(input);
+  const retainedCompose = await ensureLegacyComposeRetention(input, active, !confirmed);
+  return { ...result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}), ...(legacyOriginalWork ? { legacyOriginalWork } : {}) };
 }
 
 function cleanupReference(input: FinalizationContext, active: Awaited<ReturnType<typeof assertPreparedCleanup>>) {
@@ -289,16 +300,21 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   await assertFinalizationAuthority(input.prisma, input.config, active.prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
+  const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+  if (legacyOriginalWork) await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: true }, legacyOriginalWorkDependencies.observation);
   await assertFinalizationRemoved(active.prepared);
+  const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
   return input.prisma.$transaction(async tx => {
-    await assertPreparedCleanup({ ...input, prisma: tx });
+    const latest = await assertPreparedCleanup({ ...input, prisma: tx });
+    if (legacyOriginalWork) await assertLegacyOriginalWorkAuthority(tx, latest, legacyOriginalWork);
+    else if (latest.kind === "v1" && await legacyOriginalWorkReceipt(tx, latest.prepared, latest.preparation.sequence)) throw new Error("Original source was adopted during confirmation; verify it before closing");
     await assertFinalizationAuthority(tx, input.config, active.prepared, true);
     const where = { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey };
     const prior = await tx.runtimeMetadataEvent.findFirst({ where });
     if (prior && JSON.parse(prior.value!).preparedRevision !== active.preparation.sequence) throw new Error("Cleanup confirmation belongs to another preparation");
     const confirmed = prior ?? await tx.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify({ preparedRevision: active.preparation.sequence }) } });
     await queueCleanupReport(tx, active, confirmed.sequence);
-    return result(active.prepared, active.preparation.sequence, confirmed.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active));
+    return { ...result(active.prepared, active.preparation.sequence, confirmed.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}), ...(legacyOriginalWork ? { legacyOriginalWork } : {}) };
   });
 }
 

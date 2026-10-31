@@ -8,7 +8,7 @@ type Store = Pick<PrismaClient, "remoteTaskResource" | "runtimeMetadataEvent" | 
 const Saved = z.object({ version: z.literal(1), taskId: z.string(), sessionId: z.string(), instructionId: z.string(),
   inputs: z.string().regex(/^[a-f0-9]{64}$/), attempt: z.number().int().min(1).max(3), retry: z.literal("now").optional() }).strict();
 const pending = ["preparing", "queued", "dispatching", "unknown"];
-const ownerActions = ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "prepared-done-retirement", "delivered-retirement-revoked", "legacy-evidence-retained", "external-delivery-binding"];
+const ownerActions = ["completion-contract", "completion-verification", "completion-owner-approval", "completion-retirement-authority", "prepared-done-retirement", "delivered-retirement-revoked", "legacy-evidence-retained", "finalization-legacy-original-work", "external-delivery-binding"];
 const proofActions = ["finalization-prepared", "finalization-cleanup-started", "finalization-confirmed", "finalization-original-administration", "finalization-cleanup-evidence-supplement"];
 export class CleanupRetryDeferred extends Error {
   constructor(readonly retryAt: string) { super(`Cleanup retry deferred until ${retryAt}; recorded inputs and cleanup progress are unchanged.`); }
