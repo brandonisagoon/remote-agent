@@ -85,42 +85,14 @@ export function originalWorkUntrackedTar(buffer: Buffer, expectedPaths: Readonly
   return { files, metadata };
 }
 
-export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
-  const selection = OriginalWorkInput.parse(input.originalWork);
-  if ("format" in selection) return prepareRecoveryOriginalWork({ ...input, originalWork: selection }, observation);
-  const resource = input.resources.find((entry) => entry.id === selection.archiveResourceId);
-  if (!resource || resource.kind !== "source-archive" || resource.state === "released") throw new Error("Original work requires its exact retained archive resource");
-  const root = resource.externalId, worktree = input.worktree;
+export async function verifyOriginalBundleArchive(input: { worktree: string; branch: string; approvedHead: string; root: string; selection: Pick<import("./original-work-schema.ts").BundleOriginalWorkSelection, "manifestPath" | "manifestSha256" | "bundlePath" | "bundleRef" | "indexPatchPath" | "worktreePatchPath" | "untrackedArchivePath" | "expectedWorkingTree" | "ownedPaths"> }) {
+  const { worktree, root, selection } = input;
   await assertFinalizationPath(root); await assertFinalizationPath(worktree);
   if (await realpath(root) !== root || await realpath(worktree) !== worktree || root === worktree || inside(root, worktree) || inside(worktree, root)) throw new Error("Retained archive must be outside the original cleanup tree");
   if (selection.ownedPaths.some((file) => !inside(worktree, file))) throw new Error("Original owned paths must stay inside the original worktree");
   const snapshot = await dirtySnapshot(worktree);
   if (snapshot.head !== input.approvedHead || snapshot.branch !== input.branch) throw new Error("Original archive must retain the original owner-approved HEAD and branch");
   const archive = await archiveObservation(root, selection.manifestPath, selection.manifestSha256);
-  const additionalArchives: NonNullable<OriginalWork["additionalArchives"]> = [];
-  const archiveIds = new Set([resource.id]);
-  for (const selected of selection.additionalArchives ?? []) {
-    const record = input.resources.find((entry) => entry.id === selected.resourceId);
-    if (!record || record.kind !== "source-archive" || record.state === "released" || archiveIds.has(record.id)) throw new Error("Additional archive requires a distinct exact retained resource");
-    archiveIds.add(record.id);
-    if (record.externalId === worktree || inside(worktree, record.externalId) || inside(record.externalId, worktree) || record.externalId === root || inside(root, record.externalId) || inside(record.externalId, root)) throw new Error("Retained archive roots must be separate from cleanup and one another");
-    const observed = await archiveObservation(record.externalId, selected.manifestPath, selected.manifestSha256, selected.format);
-    additionalArchives.push({ resourceId: record.id, identityDigest: finalizationResourceIdentity(record).identityDigest, root: record.externalId, manifestPath: selected.manifestPath, manifestSha256: selected.manifestSha256, format: selected.format, inventory: observed.inventory, inventoryDigest: observed.inventoryDigest });
-  }
-  const retainedResults: NonNullable<OriginalWork["retainedResults"]> = [], resultIds = new Set<string>();
-  for (const selected of selection.retainedResults ?? []) {
-    const record = input.resources.find((entry) => entry.id === selected.resourceId);
-    if (!record || record.state === "released" || !["rubin-chat", "rubin-property-revision", "studio-site-snapshot"].includes(record.kind) || resultIds.has(record.id)) throw new Error("Historical results require distinct exact supported resource identities");
-    resultIds.add(record.id);
-    const expectedDigest = archive.entries.get(selected.provenancePath);
-    if (!expectedDigest || !input.toolingRevision) throw new Error("Historical result provenance must belong to the retained archive and original tooling pin");
-    const provenancePath = member(root, selected.provenancePath), content = await bytes(provenancePath, 8 * 1024 * 1024);
-    if (sha(content) !== expectedDigest) throw new Error("Historical result provenance changed");
-    const provenance = z.object({ taskId: z.literal(input.taskId), toolingRevision: z.literal(input.toolingRevision), resources: z.array(z.object({ key: z.string(), kind: z.string(), purpose: z.string(), externalId: z.string(), state: z.string() }).strict()).max(10000) }).passthrough().parse(JSON.parse(content.toString()));
-    const matches = provenance.resources.filter((entry) => entry.key === record.key);
-    if (matches.length !== 1 || matches[0]!.kind !== record.kind || matches[0]!.purpose !== record.purpose || matches[0]!.externalId !== record.externalId) throw new Error("Historical result does not match its archived task identity");
-    retainedResults.push({ resourceId: record.id, identityDigest: finalizationResourceIdentity(record).identityDigest, provenancePath, provenanceSha256: expectedDigest });
-  }
   for (const name of [selection.bundlePath, selection.indexPatchPath, selection.worktreePatchPath, selection.untrackedArchivePath]) if (!archive.entries.has(name)) throw new Error("Restore input is not covered by the retained manifest");
   const indexPatch = await bytes(member(root, selection.indexPatchPath)), worktreePatch = await bytes(member(root, selection.worktreePatchPath));
   if (sha(indexPatch) !== snapshot.indexPatchSha256 || sha(worktreePatch) !== snapshot.worktreePatchSha256) throw new Error("Archived staged or unstaged changes do not match the original");
@@ -160,6 +132,40 @@ export async function prepareOriginalWork(input: { taskId: string; toolingRevisi
     if (workingTree !== selection.expectedWorkingTree) throw new Error("Independent archive restore differs from the selected content tree");
     restore = { gitDirectory: common, head: snapshot.head, indexTree, workingTree, fingerprint: restored.fingerprint, bundleSha256: sha(bundle), prerequisiteCommits };
   } finally { await rm(temporary, { recursive: true, force: true }); }
+  return { snapshot, archive, restore };
+}
+
+export async function prepareOriginalWork(input: { taskId: string; toolingRevision?: string; worktree: string; branch: string; approvedHead: string; resources: FinalizationResourceRecord[]; originalWork: OriginalWorkInput }, observation = finalizationResourceObservation) {
+  const selection = OriginalWorkInput.parse(input.originalWork);
+  if ("format" in selection) return prepareRecoveryOriginalWork({ ...input, originalWork: selection }, observation);
+  const resource = input.resources.find((entry) => entry.id === selection.archiveResourceId);
+  if (!resource || resource.kind !== "source-archive" || resource.state === "released") throw new Error("Original work requires its exact retained archive resource");
+  const root = resource.externalId, worktree = input.worktree;
+  const { snapshot, archive, restore } = await verifyOriginalBundleArchive({ worktree, branch: input.branch, approvedHead: input.approvedHead, root, selection });
+  const additionalArchives: NonNullable<OriginalWork["additionalArchives"]> = [];
+  const archiveIds = new Set([resource.id]);
+  for (const selected of selection.additionalArchives ?? []) {
+    const record = input.resources.find((entry) => entry.id === selected.resourceId);
+    if (!record || record.kind !== "source-archive" || record.state === "released" || archiveIds.has(record.id)) throw new Error("Additional archive requires a distinct exact retained resource");
+    archiveIds.add(record.id);
+    if (record.externalId === worktree || inside(worktree, record.externalId) || inside(record.externalId, worktree) || record.externalId === root || inside(root, record.externalId) || inside(record.externalId, root)) throw new Error("Retained archive roots must be separate from cleanup and one another");
+    const observed = await archiveObservation(record.externalId, selected.manifestPath, selected.manifestSha256, selected.format);
+    additionalArchives.push({ resourceId: record.id, identityDigest: finalizationResourceIdentity(record).identityDigest, root: record.externalId, manifestPath: selected.manifestPath, manifestSha256: selected.manifestSha256, format: selected.format, inventory: observed.inventory, inventoryDigest: observed.inventoryDigest });
+  }
+  const retainedResults: NonNullable<OriginalWork["retainedResults"]> = [], resultIds = new Set<string>();
+  for (const selected of selection.retainedResults ?? []) {
+    const record = input.resources.find((entry) => entry.id === selected.resourceId);
+    if (!record || record.state === "released" || !["rubin-chat", "rubin-property-revision", "studio-site-snapshot"].includes(record.kind) || resultIds.has(record.id)) throw new Error("Historical results require distinct exact supported resource identities");
+    resultIds.add(record.id);
+    const expectedDigest = archive.entries.get(selected.provenancePath);
+    if (!expectedDigest || !input.toolingRevision) throw new Error("Historical result provenance must belong to the retained archive and original tooling pin");
+    const provenancePath = member(root, selected.provenancePath), content = await bytes(provenancePath, 8 * 1024 * 1024);
+    if (sha(content) !== expectedDigest) throw new Error("Historical result provenance changed");
+    const provenance = z.object({ taskId: z.literal(input.taskId), toolingRevision: z.literal(input.toolingRevision), resources: z.array(z.object({ key: z.string(), kind: z.string(), purpose: z.string(), externalId: z.string(), state: z.string() }).strict()).max(10000) }).passthrough().parse(JSON.parse(content.toString()));
+    const matches = provenance.resources.filter((entry) => entry.key === record.key);
+    if (matches.length !== 1 || matches[0]!.kind !== record.kind || matches[0]!.purpose !== record.purpose || matches[0]!.externalId !== record.externalId) throw new Error("Historical result does not match its archived task identity");
+    retainedResults.push({ resourceId: record.id, identityDigest: finalizationResourceIdentity(record).identityDigest, provenancePath, provenanceSha256: expectedDigest });
+  }
   const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])).toString().split("\0").filter(Boolean);
   for (const name of ignored) if (!selection.ownedPaths.some((owned) => member(worktree, name) === owned || inside(owned, member(worktree, name)))) throw new Error("Ignored original material needs explicit owner-adopted paths");
   const installedDependencies = await prepareInstalledDependencies(worktree);
@@ -276,6 +282,12 @@ export async function assertOriginalWork(input: { taskId: string; originalWork: 
     const record = input.resources.find((entry) => entry.id === result.resourceId);
     if (!record || record.state === "released" || finalizationResourceIdentity(record).identityDigest !== result.identityDigest || sha(await bytes(result.provenancePath)) !== result.provenanceSha256) throw new Error("Historical result identity or provenance changed");
   }
+  await assertOriginalWorkCapture({ taskId: input.taskId, originalWork: proof, removed: input.removed }, observation);
+}
+
+export async function assertOriginalWorkCapture(input: { taskId: string; originalWork: import("./original-work-schema.ts").OriginalWorkCapture; removed: boolean }, observation = finalizationResourceObservation) {
+  const proof = input.originalWork;
+  if (proof.captureId !== `original-worktree:${input.taskId}`) throw new Error("Original source capture belongs to another task");
   await preparationStage("original-worktree", async () => {
     await assertFinalizationPath(proof.restore.gitDirectory);
     if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
