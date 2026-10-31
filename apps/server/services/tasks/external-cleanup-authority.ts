@@ -24,7 +24,7 @@ export async function assertExternalResourceProofs(prisma: Pick<PrismaClient, "r
 /** Local authority only. A generic Released record is never a physical proof:
  * full preparation/confirmation independently observes the frozen resources.
  * This seam binds that existing receipt to the common cleanup operation. */
-export async function inspectExternalCleanupAuthority(input: { prisma: ExternalDatabase; config: ServerConfig; sessionId: string; requestKey: string; allowConfirmedClosed?: boolean }) {
+export async function inspectExternalCleanupAuthority(input: { prisma: ExternalDatabase; config: ServerConfig; sessionId: string; requestKey: string; allowConfirmedClosed?: boolean; allowClosedCleanup?: boolean }) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
   await assertNoRemainingConsumers(input.prisma, task);
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("External cleanup requires the original finalization request");
@@ -38,7 +38,7 @@ export async function inspectExternalCleanupAuthority(input: { prisma: ExternalD
   const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: FINALIZATION_CONFIRMED } });
   if (input.allowConfirmedClosed && !confirmed) throw new Error("Closed external cleanup requires its exact confirmation");
   if (confirmed) await assertExternalResourceProofs(input.prisma, prepared, preparation.sequence, confirmed.value);
-  const current = await assertExternalBindingAuthority(input.prisma, input.config, binding, adopted.sequence, { allowConfirmedClosed: input.allowConfirmedClosed });
+  const current = await assertExternalBindingAuthority(input.prisma, input.config, binding, adopted.sequence, { allowConfirmedClosed: input.allowConfirmedClosed, allowClosedCleanup: input.allowClosedCleanup });
   const identity = current.identity;
   const branch = binding.version === 2 ? binding.cleanupSnapshot.branch : identity.branch;
   if (prepared.taskId !== task.id || prepared.sessionId !== input.sessionId || prepared.requestKey !== input.requestKey

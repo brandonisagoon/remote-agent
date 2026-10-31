@@ -371,3 +371,93 @@ progress, saved reporting and closure. Full original archive/source/admin checks
 precede the final retained Docker observation and transaction. A completed
 confirmation is immutable across receipt refresh; closed-report retries reuse
 the same UUID and body without repeating source or resource effects.
+
+
+### Continuing an operation after primary closure (DRA-172)
+
+The existing cleanup operation remains the only pending cleanup intent. If its
+original primary closes after preparation, ordinary closed-task upkeep may
+continue that same operation once the task is durably closed and the entire
+original family has no executing, queued or uncertain work. Historical spawned
+descendants are traversed with cycle, depth and size bounds even when their
+working directories differ. The operation must
+predate the recorded closure. An idle provider status with a finite `closedAt`
+is compatible with closure; an active or reopened primary is not.
+
+The original task, primary, tooling pin, preparation, owner authority and exact
+resource bindings are checked on every renewal and before confirmation. Ended
+source links retain their original identity. Existing retained archive and
+legacy evidence proofs remain readable; closure cannot create a cleanup
+operation or adopt new owner evidence. Paused tasks, changed resources, revoked
+authority and unresolved delegates preserve their resources. Plain close without
+a bound operation keeps its existing resource policy.
+
+Disposable tests exercise v1 and v2 continuation, retained-proof checks,
+automatic-inbox provenance, moved delegates, physical capture and lost receipt
+recovery. The actual Unix/CLI test loses a successful close response, then runs
+paginated `upkeep closed` and explicit `upkeep expired --task` through the same
+preparation and Git retirement. It creates no session or instruction and keeps
+original proof rows and retained PR history unchanged. These are source tests;
+no historical task was replayed for this change.
+
+## Direct tasks without a source issue
+
+A task launched without a Linear connection or issue can use the same persistent
+v1 cleanup operation after its existing owner-authenticated `research` or
+`local-only` completion contract and a passing checkout-bound verification are
+recorded. These are the existing completion APIs, not a new approval flow.
+The preparation explicitly records `localCompletion`, null source identity,
+contract revision, verification revision/digest and the original checkout.
+A partially linked task or one with an existing Linear ownership link cannot
+fall back to this path. Linked delivery requirements remain unchanged.
+
+The original primary, task/pin, accepted contract, verification, resource set,
+owner pause/revocation and settled family are rechecked through the existing
+preparation and compact authority boundaries. Changed contracts, verification,
+source links, active descendants, pending work or dirty tracked work refuse
+before retirement. Closed tasks may only continue a pre-closure operation under
+the existing closed-task rules; they cannot create a new preparation or adopt a
+new proof.
+
+Ignored material is not disposable because the tracked checkout is clean. An
+initial ignored inventory requires the existing same-operation original-source
+archive/adoption before the client can retire anything. Ignored files appearing
+later also refuse plain Git removal. The bearer owner uses the existing
+`legacy-evidence` and `kind: "original-work"` adoption seams to bind recoverable
+copies and source/administration capture without replacing the preparation,
+operation or resource IDs. Full boundaries recheck those inventories, including
+new or changed ignored files after adoption. Existing merge-specific saved
+archive formats are not reinterpreted as local delivery proof; copied local
+evidence uses the exact evidence manifest/adoption contract.
+
+Confirmation stores a strict `local-completion/v1` report under the existing
+cleanup-report event identity, atomically with confirmation. The result is
+`{published:false, recorded:true, reportId:"metadata:…"}`. It records local
+completion and never creates a Linear issue update or claims a PR/merge. The
+normal finalizer then closes the same primary. Lost capture, confirmation and
+report responses retry the original keys; closed retries read the same local
+record without repeating cleanup.
+
+`local-finalization.test.ts` uses real owner HTTP contracts, SQLite, disposable
+Git worktrees and the actual Drafted Unix client. It covers ignored-material
+refusal, exact evidence/source adoption, native source/administration capture,
+lost replies and same-primary closure. Handle/browser/provider observation is
+injected in that disposable pair; this is not live-task acceptance. Negative
+cases cover missing/changed verification and authority, source drift, paused or
+closed tasks, active/moved descendants, pending work, dirty work and changed
+ignored contents. Unsupported local completion produces fixed safe diagnostic
+codes rather than a generic failure or a fabricated remote delivery.
+
+Direct-task manifests registered as `kind: evidence, purpose: tooling` use a
+narrow copied-file retention variant. Adoption includes the complete evidence
+inventory while preserving those original Ready rows, purposes, metadata and
+paths. Only regular files with exact recorded/observed bytes and an independent
+copy in a disjoint proof root are accepted; tooling directories and other kinds
+are refused. A manifest already inside its retained archive cannot be its own
+copy: prepare a separate private copy-proof root containing that manifest and
+all selected evidence. Original archives are neither rewritten nor moved.
+Full preparation and confirmation verify the original tooling files and copied
+bytes; missing adoption prevents source retirement. These entries cannot obtain
+capture/release authority, and generic tooling-resource selection is unchanged.
+The actual Unix fixture includes six development evidence files and two retained
+tooling manifests, with original/copy mutation and overlapping-copy refusals.

@@ -243,7 +243,7 @@ taskRoutes.get("/", async (c) => {
   return c.json({ tasks: await Promise.all(tasks.map(async (task) => {
     const cleanup = await cleanupProjection(prisma, c.get("config"), task);
     return { ...taskResponse(task), ...await developmentProjection({ prisma, config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(prisma, task), ...await legacyEvidenceProjection(prisma, c.get("config"), task), ...await archiveRetentionProjection(prisma, c.get("config"), task), ...cleanup,
-      finalizationPending: task.phase === "closed" ? Boolean("cleanupOperation" in cleanup && cleanup.cleanupOperation?.reportingPending) : eligible.has(task.id) };
+      finalizationPending: task.phase === "closed" ? Boolean("cleanupOperation" in cleanup && cleanup.cleanupOperation && (!cleanup.cleanupOperation.confirmedRevision || cleanup.cleanupOperation.reportingPending)) : eligible.has(task.id) };
   })), nextCursor: rows.length > 100 ? tasks.at(-1)!.id : null });
 });
 taskRoutes.get("/:taskId", async (c) => {
