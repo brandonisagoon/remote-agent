@@ -25,13 +25,13 @@ export const LegacyEvidenceAdoptionInput = z.object({
 }).strict();
 export type LegacyEvidenceAdoptionInput = z.infer<typeof LegacyEvidenceAdoptionInput>;
 const EntryIdentity = {
-  resourceId: z.string(), key: z.string(), kind: z.literal("evidence"), purpose: z.enum(["browser", "development", "review"]),
+  resourceId: z.string(), key: z.string(), kind: z.literal("evidence"), purpose: z.enum(["browser", "development", "review", "tooling"]),
   externalId: Absolute, createdAt: z.string().datetime(), identityDigest: Sha,
   recorded: z.object({ sha256: Sha.optional(), size: z.number().int().nonnegative().optional() }).strict(),
 };
 export const LegacyEvidenceEntry = z.union([
   z.object({ ...EntryIdentity, digestProvenance: z.enum(["recorded-receipt", "observed-at-adoption"]), target: LegacyEvidenceTarget, retained: LegacyEvidenceFile }).strict(),
-  z.object({ ...EntryIdentity, digestProvenance: z.literal("observed-at-adoption"), target: LegacyEvidenceTreeTarget, retained: LegacyEvidenceRetainedTree }).strict(),
+  z.object({ ...EntryIdentity, purpose: z.enum(["browser", "development", "review"]), digestProvenance: z.literal("observed-at-adoption"), target: LegacyEvidenceTreeTarget, retained: LegacyEvidenceRetainedTree }).strict(),
 ]);
 export type LegacyEvidenceEntry = z.infer<typeof LegacyEvidenceEntry>;
 export const LegacyEvidenceProof = z.object({

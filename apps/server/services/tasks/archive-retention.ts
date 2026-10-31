@@ -9,6 +9,8 @@ import { archiveMember, observeSavedArchive, type SavedArchiveSelection } from "
 import { ARCHIVE_RETENTION, ArchiveRetentionProof, ArchiveRetentionReceipt, ArchiveRetentionCheck } from "./archive-retention-schema.ts";
 import { latestRetirement, RetirementGrant, retirementDigest } from "./retirement-receipts.ts";
 import { activeCleanupRoots } from "./cleanup-scope.ts";
+import { PreparationDiagnosticError } from "./preparation-errors.ts";
+import { assertLocalCompletion } from "./local-completion.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "remoteTaskResource" | "runtimeMetadataEvent" | "runtimeSessionResourceLink">;
 type Context = { prisma: PrismaClient; config: ServerConfig; preparedRevision: number; taskId: string };
@@ -44,10 +46,13 @@ async function context(prisma: Database, config: ServerConfig, taskId: string, p
     || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath
     || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId
     || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier) throw new Error("Saved archive task or original primary changed");
-  const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `owner:${taskId}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
-  if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Saved archive completion authority changed");
-  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(task.phase === "closed" || session.status === "closed" ? {} : { endedAt: null }) } });
-  if (!link) throw new Error("Saved archive source ownership changed");
+  if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else {
+    const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `owner:${taskId}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
+    if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Saved archive completion authority changed");
+    const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(task.phase === "closed" || session.status === "closed" ? {} : { endedAt: null }) } });
+    if (!link) throw new Error("Saved archive source ownership changed");
+  }
   if (prepared.retirementAuthority) {
     const latest = await latestRetirement(prisma, taskId, session.id), grant = latest && RetirementGrant.safeParse(JSON.parse(latest.value!));
     if (!latest || !grant?.success || latest.sequence !== prepared.retirementAuthority.revision || retirementDigest(grant.data) !== prepared.retirementAuthority.digest) throw new Error("Saved archive retirement authority changed");
@@ -132,6 +137,7 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
     if (!path.isAbsolute(root) || path.normalize(root) !== root || [current.prepared.worktree, current.prepared.gitCwd, current.prepared.gitDirectory, current.task.toolingRoot, current.task.pinnedToolingRoot].filter((value): value is string => Boolean(value)).some(file => within(file, root) || within(root, file))) throw new Error("Saved archive overlaps a protected repository or cleanup root");
     if (activeCleanupRoots(current.resources, new Set(candidates.map(candidate => candidate.id))).some(other => within(root, other) || within(other, root))) throw new Error("Saved archive overlaps another active cleanup resource");
     const manifests = [metadata.manifest, ...(metadata.addenda ?? [])].map(({ path, sha256, entries }) => ({ path, sha256, ...(entries === undefined ? {} : { entries }) }));
+    if (current.prepared.localCompletion) throw new PreparationDiagnosticError("LOCAL_RETENTION_UNSUPPORTED");
     const selection: SavedArchiveSelection = metadata.format === "task-private-backup/v1"
       ? { format: metadata.format, root, manifests: [manifests[0]!], taskId: task.id, issueIdentifier: current.prepared.issueIdentifier }
       : { root, manifests, taskId: task.id, issueIdentifier: current.prepared.issueIdentifier, mergeCommit: current.prepared.delivery.receipts.merge.sha! };

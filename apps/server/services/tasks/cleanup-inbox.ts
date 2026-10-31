@@ -9,6 +9,7 @@ import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { externalOwnerHistory, latestExternalBinding } from "./external-deliveries.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
 import { cleanupRetryEligibility, recordCleanupRetryInput } from "./cleanup-retry.ts";
+import { readLocalCompletion } from "./local-completion.ts";
 
 export const CLEANUP_INSTRUCTION = "finalization-cleanup-instruction";
 export const CLEANUP_REQUEST = "finalization-cleanup-request";
@@ -45,7 +46,9 @@ async function currentMarker(store: CleanupInboxStore, saved: z.infer<typeof Mar
     return task;
   }
   const contract = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: saved.sessionId, source: `owner:${task.id}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
-  if (!contract || contract.sequence !== saved.contractRevision || hash(contract.value ?? "") !== saved.contractDigest || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Scheduled cleanup acceptance changed");
+  if (!contract || contract.sequence !== saved.contractRevision || hash(contract.value ?? "") !== saved.contractDigest) throw new Error("Scheduled cleanup acceptance changed");
+  if (task.connectionId === null && task.issueIdentifier === null) await readLocalCompletion(store, task.id, saved.sessionId);
+  else if (JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Scheduled cleanup acceptance changed");
   return task;
 }
 async function family(store: CleanupInboxStore, task: RemoteTask) {

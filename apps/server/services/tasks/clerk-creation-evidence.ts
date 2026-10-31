@@ -53,6 +53,7 @@ export function originalClerkEnvironment(active: Active) {
 }
 
 function scope(active: Active, resource: Resource) {
+  if (!active.binding.issueIdentifier) throw new Error("Original Clerk creation requires its recorded source issue");
   const metadata = object(resource.metadata), instanceId = legacyCreatedInstance(metadata.instance), email = z.email().parse(metadata.email);
   if (active.kind !== "v1" || resource.kind !== "clerk-test-user" || resource.purpose !== "development" || metadata.createdByTask !== undefined
     || metadata.shared === true || metadata.preserved === true || metadata.preserve === true || !instanceId
@@ -137,7 +138,7 @@ async function deriveClerkCreation(prisma: Database, config: ServerConfig, activ
   if (registered.taskId !== active.task.id || !equal(finalizationResourceIdentity(registered), finalizationResourceIdentity(resource))) throw new Error("Original Clerk registration changed");
   if (metadata.credentialsFile !== "<envDirectory>/clerk-user.json (0600)") throw new Error("Original Clerk credential receipt has an unsupported location");
   const [script, jwksScript, credentials] = await Promise.all([held(path.join(environment, "scripts/clerk-user.ts"), 16384, false), held(path.join(environment, "scripts/clerk-jwks.ts"), 16384, false), held(path.join(environment, "clerk-user.json"), 16384, true)]);
-  if (script.bytes.toString() !== legacyClerkUserScript(active.binding.issueIdentifier, email) || jwksScript.bytes.toString() !== legacyClerkJwksScript) throw new Error("Original Clerk creation script differs from its supported test-only recipe");
+  if (!active.binding.issueIdentifier || script.bytes.toString() !== legacyClerkUserScript(active.binding.issueIdentifier, email) || jwksScript.bytes.toString() !== legacyClerkJwksScript) throw new Error("Original Clerk creation script differs from its supported test-only recipe");
   z.object({ userId: z.literal(resource.externalId), email: z.literal(email), password: z.string().min(1).max(1000) }).strict().parse(JSON.parse(credentials.bytes.toString()));
   const relations = await prisma.runtimeSessionRelation.findMany({ where: { targetSessionId: active.binding.sessionId, relationship: "spawned-by" }, take: 33 });
   if (relations.length > 32) throw new Error("Original Clerk delegate inventory exceeds its bound");
