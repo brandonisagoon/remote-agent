@@ -232,7 +232,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
 
 export function startInstructionDelivery(prisma: PrismaClient, runtime: AgentSessionRuntime, config: ServerConfig) {
   const tick = () => void Promise.resolve().then(async () => {
-    if (config.compute?.enabled) await (await import("../tasks/compute-admission.ts")).offerNextCompute({ prisma, machineId: config.machine, policy: config.compute })
+    if (config.compute?.enabled) await (await import("../tasks/compute-admission.ts")).offerNextCompute({ prisma, machineId: config.machine, policy: config.compute, config, runtime })
       .catch(() => console.error("Compute admission requires reconciliation"));
   }).then(() => deliverMessageControls(prisma, runtime, async (message) => {
     const { tracker } = await import("../../integrations/tracker/port.ts");

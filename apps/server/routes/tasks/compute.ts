@@ -26,7 +26,7 @@ computeRoutes.post("/:taskId/compute-request", async c => {
   const config = c.get("config");
   if (!config.compute?.enabled) return c.json({ enabled: false });
   try {
-    const input = { prisma: c.get("prisma"), machineId: config.machine, policy: config.compute };
+    const input = { prisma: c.get("prisma"), machineId: config.machine, policy: config.compute, config, runtime: c.get("agentRuntime") };
     const environment = await requestCompute({ ...input, config, taskId: c.req.param("taskId"), request: parsed.data });
     await offerNextCompute(input);
     const allocation = await input.prisma.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: ["claimed", "running", "unknown"] } }, orderBy: { createdAt: "desc" } });
@@ -40,7 +40,7 @@ computeRoutes.post("/:taskId/compute-claim", async c => {
   if (!config.compute?.enabled) return c.json({ error: "Host compute admission is not enabled" }, 409);
   try {
     const { offerId, ...request } = parsed.data;
-    return c.json(await claimCompute({ prisma: c.get("prisma"), machineId: config.machine, policy: config.compute, taskId: c.req.param("taskId"), offerId, request }));
+    return c.json(await claimCompute({ prisma: c.get("prisma"), machineId: config.machine, policy: config.compute, config, runtime: c.get("agentRuntime"), taskId: c.req.param("taskId"), offerId, request }));
   } catch { return c.json({ error: "Compute offer expired, changed or is unavailable; no compute was started", code: "compute_offer_unavailable" }, 409); }
 });
 computeRoutes.post("/:taskId/compute-decline", async c => {

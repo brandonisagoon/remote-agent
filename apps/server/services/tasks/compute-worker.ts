@@ -75,7 +75,7 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       }
     }
   }));
-  await offerNextCompute({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute });
+  await offerNextCompute({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute, config: input.config, runtime: input.runtime });
   return { observed, unavailable };
 }
 

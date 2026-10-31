@@ -1021,6 +1021,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       // provider process creation. Recovery uses this exact persisted time.
       await (await import("../../services/tasks/compute-admission.ts")).confirmComputeDelivery({
         prisma: this.prisma, machineId: this.config.machine, policy: this.config.compute,
+        config: this.config, runtime: this,
         sessionId: event.sessionId, requestId: event.requestId,
       }).catch(() => console.error("Compute offer delivery requires reconciliation"));
     }
