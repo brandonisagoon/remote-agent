@@ -299,6 +299,16 @@ The selected-key v1 authority route recognizes only the exact recorded `credenti
 
 The disposable Unix route/whole-finalizer regression covers a late foreign capture-path claim, an initially absent Compose journal, native capture, a lost applied registry acknowledgment, exact retained-source preservation and unchanged original preparation/operation events. No live original71 private-export action is claimed by these tests.
 
+For the exact historical r2/r3 task-app group, selected cleanup renewal returns
+`nativeApps: { version: 1, recordedBefore }`, where the timestamp is the original
+preparation event. An optional `nativePids` request is a bounded unique set of
+positive process IDs. It is valid only with that complete original resource
+scope, must include its recorded roots/listener, and is echoed sorted as
+`nativeApps.pids`. It only extends global ownership exclusions; the client must
+independently prove every process lifetime and hold the kernel identity while
+renewing immediately before an individual signal. The saved full set is reused
+through partial-stop retries, even after members exit. No new preparation,
+resource metadata link or cleanup operation is written.
 ### Original Clerk creation evidence
 
 For the exact older development test-user recipe with no `createdByTask` flag, selected-key renewal may derive a creation witness from the original delegate's configured Acpx record. Initial derivation runs outside the SQL transaction with bounded, held local reads. The frozen Compose environment and private-export location must agree; exact known script bytes, private user result, successful paired create output and subsequent matching resource registration must all correspond. Text-only history, reused users, unrelated delegates, altered registration and ambiguous evidence refuse.

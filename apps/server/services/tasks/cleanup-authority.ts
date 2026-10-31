@@ -8,7 +8,7 @@ import { prepareClerkCreation, commitClerkCreation } from "./clerk-creation-evid
 /** Renew the same checked preparation without sending its inventory again.
  * Keep the existing authority path, including pause, revocation, resource and
  * original-administration checks. This response cannot prepare a new cleanup. */
-export async function renewCleanupAuthority(input: FinalizationContext & { resourceKeys?: string[] }) {
+export async function renewCleanupAuthority(input: FinalizationContext & { resourceKeys?: string[]; nativePids?: number[] }) {
   const receipt = await prepareTaskFinalization({ ...input, cleanup: true, authorityOnly: true });
   if (!("cleanup" in receipt) || !receipt.cleanup) throw new Error("Cleanup renewal requires an existing bound operation");
   const result = {
@@ -19,7 +19,7 @@ export async function renewCleanupAuthority(input: FinalizationContext & { resou
     preparedRevision: receipt.preparedRevision,
     cleanup: receipt.cleanup,
   };
-  if (!input.resourceKeys) return result;
+  if (!input.resourceKeys) { if (input.nativePids) throw new Error("Native PID exclusions need selected resources"); return result; }
   if (receipt.confirmedRevision !== undefined) throw new Error("Confirmed cleanup cannot authorize legacy resource effects");
   const before = await assertPreparedCleanup(input);
   const creation = await prepareClerkCreation(input.prisma, input.config, before, input.resourceKeys);
@@ -29,8 +29,10 @@ export async function renewCleanupAuthority(input: FinalizationContext & { resou
       || retirementDigest(active.operation) !== result.cleanup.operationDigest) throw new Error("Cleanup operation changed during resource scope observation");
     const confirmed = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: "finalization-confirmed", key: input.requestKey } });
     if (confirmed) throw new Error("Confirmed cleanup cannot authorize legacy resource effects");
-    const resources = await cleanupResourceScope(tx, input.config, active, input.resourceKeys!, creation);
+    const resources = await cleanupResourceScope(tx, input.config, active, input.resourceKeys!, { creation, nativePids: input.nativePids });
+    const nativeApps = active.binding.resources.some(resource => input.resourceKeys!.includes(resource.key) && resource.kind === "local-http")
+      ? { version: 1 as const, recordedBefore: active.preparation.occurredAt.toISOString(), ...(input.nativePids ? { pids: [...input.nativePids].sort((a, b) => a - b) } : {}) } : undefined;
     const clerkCreation = creation ? await commitClerkCreation(tx, active, creation) : undefined;
-    return { ...result, resources, ...(clerkCreation ? { clerkCreation } : {}) };
+    return { ...result, resources, ...(nativeApps ? { nativeApps } : {}), ...(clerkCreation ? { clerkCreation } : {}) };
   });
 }
