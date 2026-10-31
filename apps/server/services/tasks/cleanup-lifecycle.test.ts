@@ -1421,7 +1421,7 @@ test.skipIf(process.platform !== "darwin" || !process.env.DRAFTED_PROXY_INTEGRAT
   } finally { const current = await inspectHostProcess(child.pid); if (current?.cwd === f.worktree) await terminateHostProcess(current, inspectHostProcess); await child.exited; await server?.stop(true); }
 }, 30000);
 
-async function neonScopeFixture() {
+async function neonScopeFixture(development = false) {
   const f = await fixture("original71");
   await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRoot: f.root } });
   const values = [
@@ -1429,6 +1429,12 @@ async function neonScopeFixture() {
     { id: "review-db", key: "spatial-neon-review", kind: "neon-branch-database", purpose: "review", externalId: "br-original/review_spatial", state: "ready", metadata: { database: "review_spatial", owner: "drafted_runtime", env: `${path.join(directory, "environments", `${f.task.id}-review`, "spatial.env")} (0600)`, release: "DROP DATABASE review_spatial after review services stop" } },
     { id: "review-service", key: "review-service", kind: "local-http", purpose: "review", externalId: "http://127.0.0.1:8080", state: "released", metadata: {} },
   ];
+  if (development) {
+    Object.assign(values[0]!.metadata, { supersedes: "local PostGIS in compose-development-r2 (stopped by owner cutover; volume retained; not restarted)" });
+    const environment = path.join(directory, "environments", f.task.id);
+    await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, id: "original-compose", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", state: "ready", externalId: `drafted-${f.task.id}-development`,
+      metadata: { envDirectory: environment, composeFile: path.join(environment, "compose.yml") } } });
+  }
   for (const value of values) await db.prisma.remoteTaskResource.create({ data: { ...value, taskId: f.task.id } });
   const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
   const app = new Hono<AppEnv>().use("*", contextMiddleware({ prisma: db.prisma, config: f.config, agentRuntime: createFakeAgentRuntime(), commandClient: bunCommandClient }))
@@ -1444,6 +1450,28 @@ test("Neon compact scope preserves the original operation and witnesses only its
   expect(await response.json()).toMatchObject({ preparedRevision: f.prepared.preparedRevision, cleanup: { operationRevision: f.active.operationRevision }, resources: [{ id: resource.id, key: resource.key, identityDigest: finalizationResourceIdentity(resource).identityDigest }] });
   expect((await f.renew(["spatial-neon-development"])).status).toBe(409);
   expect((await f.renew(["spatial-neon-development", "spatial-neon-review"])).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+});
+
+test("current development database scope keeps original proof bytes and includes its private backup storage", async () => {
+  const f = await neonScopeFixture(true), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  expect((await f.renew(["spatial-neon-development"])).status).toBe(200);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
+  await db.prisma.remoteTaskResource.update({ where: { id: "development-db" }, data: { state: "released" } });
+  expect((await f.renew(["spatial-neon-development"])).status).toBe(200);
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "original-compose" } })).state).toBe("ready");
+});
+
+test.each(["storage", "ancestor", "worktree", "database", "branch"])("current database scope refuses a late foreign %s claim", async change => {
+  const f = await neonScopeFixture(true), frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const { legacyNeonScope } = await import("./legacy-neon-scope.ts"), resources = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } });
+  const scope = legacyNeonScope({ id: f.task.id, resources }, resources.find(value => value.id === "development-db")!);
+  if (!scope.currentBackup) throw Error("Missing development backup scope");
+  await db.prisma.remoteTask.create({ data: { id: "foreign", requestKey: "foreign", branchName: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: f.task.toolingRevision,
+    ...(change === "worktree" ? { worktreePath: path.join(scope.storage, "nested") } : {}) } });
+  if (change !== "worktree") await db.prisma.remoteTaskResource.create({ data: { taskId: "foreign", key: "foreign", kind: change === "database" ? "neon-branch-database" : change === "branch" ? "neon-branch" : "directory", purpose: "development", state: "ready",
+    externalId: change === "database" ? "br-original/task_spatial" : change === "branch" ? "br-original" : change === "ancestor" ? path.dirname(scope.storage) : scope.storage } });
+  expect((await f.renew(["spatial-neon-development"])).status).toBe(409);
   expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(frozen);
 });
 
