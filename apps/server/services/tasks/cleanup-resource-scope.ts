@@ -1,6 +1,6 @@
 import path from "node:path";
 import { legacyNativeAppScope } from "./legacy-native-app-scope.ts";
-import { legacyNeonReviewScope } from "./legacy-neon-scope.ts";
+import { legacyNeonScope } from "./legacy-neon-scope.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import { z } from "zod";
 import { assertClerkResourceSharing } from "./cleanup-clerk.ts";
@@ -74,7 +74,22 @@ export async function cleanupResourceScope(prisma: Database, config: Parameters<
     for (const scope of scopes) for (let cursor = scope; ; cursor = path.dirname(cursor)) { ancestors.add(cursor); if (cursor === path.dirname(cursor)) break; }
     if (await prisma.remoteTask.findFirst({ where: { OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: `${scope}${path.sep}` } }))] } })) throw new Error("Legacy environment overlaps a registered task worktree");
   } else if (resources.length === 1 && resources[0]!.kind === "neon-branch-database") {
-    const resource = resources[0]!, scope = legacyNeonReviewScope({ id: active.task.id, resources: active.binding.resources }, resource);
+    const resource = resources[0]!, scope = legacyNeonScope({ id: active.task.id, resources: active.binding.resources }, resource);
+    if (scope.currentBackup) {
+      const protectedPaths = [active.binding.worktree, active.binding.repositoryRoot, active.binding.toolingRoot, active.binding.pinnedToolingRoot,
+        ...active.binding.resources.map(value => value.externalId).filter(path.isAbsolute)].filter((value): value is string => Boolean(value));
+      for (const reference of active.binding.authority) {
+        if (reference.action !== "finalization-archive-retention" && reference.action !== "legacy-evidence-retained") continue;
+        const event = await prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: reference.revision } }), value: unknown = JSON.parse(event.value!);
+        if (reference.action === "finalization-archive-retention") protectedPaths.push(...ArchiveRetentionProof.parse(value).resources.map(value => value.archive.root));
+        else protectedPaths.push(z.object({ archiveRoot: z.string() }).parse(value).archiveRoot);
+      }
+      if (protectedPaths.some(file => overlaps(scope.storage, file))) throw new Error("Current database backup overlaps original source or retained material");
+      await assertRegisteredPathSharing(prisma, active.task.id, [scope.storage]);
+      const ancestors: string[] = [];
+      for (let cursor = scope.storage; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
+      if (await prisma.remoteTask.findFirst({ where: { OR: [{ worktreePath: { in: ancestors } }, { worktreePath: { startsWith: scope.storage + path.sep } }] } })) throw new Error("Current database backup overlaps a registered task worktree");
+    }
     const claims = await prisma.remoteTaskResource.findMany({ where: { kind: { in: ["neon-branch-database", "neon-branch", "task-runtime"] }, state: { not: "released" } }, take: 10001 });
     if (claims.length > 10000) throw new Error("Neon ownership inventory exceeds its bounded scope");
     for (const claim of claims) {
