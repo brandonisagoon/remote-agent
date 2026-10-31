@@ -227,13 +227,13 @@ test("selected renewal rejects other compute and new work before any stop callba
   await expect(stop()).rejects.toThrow(); expect(effects).toBe(0);
 });
 
-test("legacy Compose is selected only through its exact observed suspension scope", async () => {
+test("legacy Compose keeps exact suspension scope and participates in explicit owner compute stop", async () => {
   const f = await fixture("docker-compose-project");
   const result = await considerComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify });
   const authority = await renewDevelopmentAuthority({ ...f.context, ...result.intent!, resourceKeys: [f.resource.key] });
   expect(authority.resources.map(value => value.id)).toEqual([f.resource.id]);
   const owner = await recordDevelopmentIntent({ ...f.context, request: { action: "pause", development: true, requestKey: "owner" } });
-  await expect(renewDevelopmentAuthority({ ...f.context, ...owner, resourceKeys: [f.resource.key] })).rejects.toThrow("exact current");
+  expect((await renewDevelopmentAuthority({ ...f.context, ...owner, resourceKeys: [f.resource.key] })).resources.map(value => value.id)).toEqual([f.resource.id]);
 });
 
 test("a suspension can only be superseded by its exact allocated compute claim", async () => {

@@ -30,7 +30,7 @@ const eventWhere = (task: Pick<RemoteTask, "id" | "primarySessionId">) => ({ run
  * to their concrete members by the existing adapters. */
 export function developmentCompute(resource: Pick<RemoteTaskResource, "purpose" | "state" | "kind" | "metadata">) {
   if (resource.purpose !== "development" || resource.state === "released") return false;
-  if (["native-app", "launch-agent", "launch-agents", "docker-container", "task-runtime"].includes(resource.kind)) return true;
+  if (["native-app", "launch-agent", "launch-agents", "docker-container", "docker-compose-project", "task-runtime"].includes(resource.kind)) return true;
   const metadata = resource.metadata as { pidFile?: unknown; observed?: { legacyNative?: unknown } } | null;
   return ["local-http", "local-process"].includes(resource.kind) && (typeof metadata?.pidFile === "string" || Boolean(metadata?.observed?.legacyNative));
 }
