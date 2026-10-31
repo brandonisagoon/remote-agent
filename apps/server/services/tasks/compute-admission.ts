@@ -6,12 +6,13 @@ import { COMPUTE_CLAIM_MS, ComputePolicy } from "../../../../lib/compute-policy.
 import { ComputeObservation } from "./compute-observation.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeRequest, assertSavedComputeResource, assertSavedComputeStopped, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
-export const ComputeRequest = z.object({ key: Key, purpose: z.enum(["development", "review"]), revision: z.string().regex(/^[a-f0-9]{40}$/), recipeDigest: Digest }).strict();
+export const ComputeRequest = z.object({ key: Key, purpose: z.enum(["development", "review"]), revision: z.string().regex(/^[a-f0-9]{40}$/), recipeDigest: Digest, saved: SavedComputeBinding.optional() }).strict();
 const activeOffers = ["queued", "offered", "claimed", "running", "unknown"];
 const computeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const at = (input: Context) => input.now ?? new Date();
@@ -38,9 +39,13 @@ export async function computeTaskOwner(store: OwnerStore, taskId: string, machin
     connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, sourceLinkId, baseCommit: task.baseCommit, branchName: task.branchName, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
   return { task, session, identity };
 }
-export async function assertComputeEnvironmentOwner(store: OwnerStore, environment: ComputeEnvironment) {
+export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Store, "remoteTaskResource">, environment: ComputeEnvironment) {
   const owned = await computeTaskOwner(store, environment.taskId, environment.machineId);
   if (owned.identity !== environment.taskIdentity || owned.session.id !== environment.primarySessionId) throw new ComputeOwnerUnavailable("Compute task ownership changed");
+  if (isSavedComputeEnvironment(environment)) {
+    try { await assertSavedComputeResource(store, { ...environment, saved: { resourceId: environment.resourceId!, resourceIdentity: environment.resourceIdentity! } }); }
+    catch (error) { if (error instanceof SavedComputeIdentityChanged) throw new ComputeOwnerUnavailable("Saved compute resource ownership changed", { cause: error }); throw error; }
+  }
   return owned;
 }
 /** Unknown existing environments consume the explicit budget conservatively.
@@ -101,13 +106,17 @@ export async function requestCompute(input: Context & { taskId: string; request:
   policy(input); const request = ComputeRequest.parse(input.request);
   return input.prisma.$transaction(async store => {
     const owned = await computeTaskOwner(store, input.taskId, input.machineId);
+    if (request.saved) await assertSavedComputeResource(store, { taskId: input.taskId, ...request, saved: request.saved });
     const old = await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: input.taskId, key: request.key } } });
     if (old) {
       if (old.taskIdentity !== owned.identity || old.purpose !== request.purpose || old.revision !== request.revision || old.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
+      assertSavedComputeRequest(old, request.saved);
       if (old.state === "suspended" && !(await store.computeWait.findUnique({ where: { environmentId: old.id } }))) await rotate(store, old, at(input));
       return old;
     }
-    const environment = await store.computeEnvironment.create({ data: { id: randomUUID(), taskId: input.taskId, primarySessionId: owned.session.id, machineId: input.machineId, taskIdentity: owned.identity, ...request } });
+    const { saved, ...recipe } = request;
+    const environment = await store.computeEnvironment.create({ data: { id: randomUUID(), taskId: input.taskId, primarySessionId: owned.session.id, machineId: input.machineId, taskIdentity: owned.identity, ...recipe,
+      ...(saved ? { resourceId: saved.resourceId, resourceIdentity: saved.resourceIdentity } : {}) } });
     await rotate(store, environment, at(input)); return environment;
   });
 }
@@ -171,9 +180,10 @@ export async function offerNextCompute(input: Context) {
       if (owned.session.status !== "idle" || await store.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: activeOffers } } })
         || await store.runtimeInstruction.count({ where: { sessionId: owned.session.id, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } })) continue;
       const id = randomUUID(), instructionId = `compute-offer:${id}`;
+      const command = isSavedComputeEnvironment(environment) ? `resource resume --key ${environment.key} --compute-offer ${id}` : `normal runtime start command with --compute-offer ${id}`;
       const offer = await store.computeOffer.create({ data: { id, environmentId: environment.id, machineId: input.machineId, instructionId, dispatchDeadline: new Date(at(input).getTime() + settings.deliveryTimeoutSeconds * 1000) } });
       await store.runtimeInstruction.create({ data: { id: instructionId, sessionId: owned.session.id, text:
-        `Compute may be available for environment ${environment.id}. This offer is reserved only when this turn starts and expires 60 seconds after confirmed delivery. First resolve_tooling_capability with capability runtime, then use that returned immutable adapter for the normal runtime start command with --compute-offer ${id}. Preserve the original task tooling pin. A conversational reply does not claim it. If the command reports expired or superseded, continue useful work without compute; the service will offer again fairly. Preserve the task's existing work and data.` } });
+        `Compute may be available for environment ${environment.id}. This offer is reserved only when this turn starts and expires 60 seconds after confirmed delivery. First resolve_tooling_capability with capability runtime, then use that returned immutable adapter for the ${command}. Preserve the original task tooling pin. A conversational reply does not claim it. If the command reports expired or superseded, continue useful work without compute; the service will offer again fairly. Preserve the task's existing work and data.` } });
       return offer;
     }
     return null;
@@ -210,9 +220,16 @@ export async function claimCompute(input: Context & { taskId: string; offerId: s
     const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);
-    if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(request).some(([key, value]) => environment[key as keyof typeof request] !== value)) throw new Error("Compute claim does not match its exact environment");
+    const { saved, ...recipe } = request;
+    if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim does not match its exact environment");
+    assertSavedComputeRequest(environment, saved);
     if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { offer, environment, resumed: true }; }
     if (offer.state !== "offered" || !offer.expiresAt || offer.expiresAt <= at(input)) throw new Error("Compute offer is expired or superseded");
+    if (saved) {
+      const observed = ComputeObservation.safeParse(environment.observation);
+      if (!observed.success) throw new Error("Saved compute requires a fresh stopped observation before claiming");
+      assertSavedComputeStopped(environment, observed.data, at(input), input.policy.collectorFreshnessSeconds);
+    }
     const slot = await store.computeSlot.findUnique({ where: { allocationId: offer.id } });
     const occupied = await store.computeSlot.count({ where: { machineId: input.machineId, allocationId: { not: null } } });
     if (!slot || occupied + await unaccounted(store, input) > input.policy.slots) throw new Error("Compute reservation is unavailable");

@@ -7,7 +7,7 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { readConfiguredComputeObservation } from "./compute-observer.ts";
 import { recordComputeObservation } from "./compute-observation.ts";
 
-export const ComputeEnrollment = ComputeRequest.extend({ environmentId: z.string().uuid(), resourceIdentity: z.string().regex(/^[a-f0-9]{64}$/),
+export const ComputeEnrollment = ComputeRequest.omit({ saved: true }).extend({ environmentId: z.string().uuid(), resourceIdentity: z.string().regex(/^[a-f0-9]{64}$/),
   configuration: z.object({ configurationFile: z.string().min(1).max(4096).refine(value => path.isAbsolute(value) && path.normalize(value) === value), configurationSha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
 }).strict();
 /** Existing owner-only configuration coordination. This records independent

@@ -5,6 +5,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { ComputeRoute, trafficSummary, type TrafficState } from "../../../../lib/compute-telemetry.ts";
 import { ComputeDecisionEvidence } from "./compute-decision.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { assertSavedComputeObservation, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = z.string().min(1).max(256);
@@ -28,6 +29,7 @@ const stamp = (input: Context) => input.now?.getTime() ?? Date.now();
 export async function recordComputeObservation(input: Context & { observation: ComputeObservation }) {
   const value = ComputeObservation.parse(input.observation);
   const env = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
+  if (isSavedComputeEnvironment(env)) assertSavedComputeObservation(env, value);
   await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(input.prisma, env);
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: env.taskId } });
   const resource = await input.prisma.remoteTaskResource.findUnique({ where: { id: value.resourceId } });
