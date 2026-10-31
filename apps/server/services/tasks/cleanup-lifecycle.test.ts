@@ -28,6 +28,7 @@ import { cleanupProjection, cleanupReportDelivery } from "./cleanup-report.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
 import { clerkCreationRecord } from "../../../../test-support/clerk-creation-fixture.ts";
 import { legacyClerkUserScript, legacyClerkJwksScript } from "./clerk-creation-recipe.ts";
+import { prepareClerkCreation, commitClerkCreation } from "./clerk-creation-evidence.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -432,7 +433,8 @@ async function originalCreatedClerkFixture() {
   await writeFile(path.join(environment, "scripts/clerk-user.ts"), legacyClerkUserScript("DRA-75", email), { mode: 0o644 });
   await writeFile(path.join(environment, "scripts/clerk-jwks.ts"), legacyClerkJwksScript, { mode: 0o644 });
   await writeFile(path.join(environment, "clerk-user.json"), JSON.stringify({ userId: "user_Original", email, password: "private-fixture-value" }), { mode: 0o600 });
-  await db.prisma.remoteTaskResource.create({ data: { id: "environment", taskId: f.task.id, key: "development-env-directory", kind: "directory", purpose: "development", externalId: environment, state: "ready", metadata: { trackedGreenfieldEdits: false } } });
+  await db.prisma.remoteTaskResource.create({ data: { id: "environment", taskId: f.task.id, key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: `drafted-${f.task.id}-development`, state: "ready", metadata: { envDirectory: environment, composeFile: path.join(environment, "compose.yml") } } });
+  await db.prisma.remoteTaskResource.create({ data: { id: "export", taskId: f.task.id, key: "credentials-export-development", kind: "private-file", purpose: "development", externalId: path.join(environment, "provider.src.env"), state: "ready", metadata: {} } });
   const resource = await db.prisma.remoteTaskResource.create({ data: { id: "created-user", taskId: f.task.id, key: "clerk-test-user-development", kind: "clerk-test-user", purpose: "development", externalId: "user_Original", state: "ready",
     metadata: { instance: `Clerk test instance (sk_test/pk_test guarded), kid ${instanceId}`, email, credentialsFile: "<envDirectory>/clerk-user.json (0600)" } } });
   const actor = await db.prisma.runtimeSession.create({ data: { id: "environment-delegate", scopeKey: "environment-delegate", acpxRecordId: "environment-delegate", acpxSessionId: "original-provider-session", role: "delegate", agentCommand: "claude", status: "closed", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
@@ -479,6 +481,56 @@ test.each(["missing", "reused", "script", "local-user", "foreign-claim", "pause"
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-clerk-original-creation" } })).toBe(0);
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
 });
+
+test("original Clerk creator relationship is compared again after bounded file observation", async () => {
+  const f = await originalCreatedClerkFixture(), prepared = await prepareClerkCreation(db.prisma, f.config, f.active, [f.resource.key]);
+  await db.prisma.runtimeSession.update({ where: { id: f.actor.id }, data: { acpxSessionId: "replaced-provider-session" } });
+  await expect(db.prisma.$transaction(async tx => commitClerkCreation(tx, await assertPreparedCleanup({ ...f.input, prisma: tx }), prepared!))).rejects.toThrow("relationship changed");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "cleanup-clerk-original-creation" } })).toBe(0);
+});
+
+test.skipIf(!process.env.DRAFTED_CLERK_INTEGRATION_ROOT)("actual original creation witness survives lost renewal/delete/receipt replies and rejects final-read claims", async () => {
+  const f = await originalCreatedClerkFixture(), socket = path.join(directory, "original-clerk.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+  try {
+    const root = process.env.DRAFTED_CLERK_INTEGRATION_ROOT!, { taskRegistry } = await import(path.join(root, "src/control.ts"));
+    const { cleanupClerkProvider } = await import(path.join(root, "src/cleanup-observer-clerk.ts"));
+    const { manageResource } = await import(path.join(root, "src/resources.ts"));
+    const registry = taskRegistry(socket, f.task.id, 3000), journalRoot = path.join(directory, "clerk-retry");
+    let present = true, reads = 0, effects = 0, loseRenew = true, loseDelete = true, loseReceipt = true, lateClaim = true, pause = false;
+    await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", branchName: "codex/other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, toolingRoot: f.root, toolingRevision: "b".repeat(40) } });
+    const renew = registry.renewCleanupAuthority;
+    registry.renewCleanupAuthority = async (input: unknown) => { const value = await renew(input); if (loseRenew) { loseRenew = false; throw new Error("lost original creation witness reply"); } return value; };
+    const task = registry.task;
+    registry.task = async () => { const value = await task(); if (lateClaim && reads >= 2) { lateClaim = false; await db.prisma.remoteTaskResource.create({ data: { id: "late-shared", taskId: "other", key: "shared", kind: "clerk-test-session", purpose: "review", externalId: "sess_Shared", state: "ready", metadata: { userId: f.resource.externalId } } }); } return value; };
+    const provider = cleanupClerkProvider(async (url: string | URL, options: RequestInit) => {
+      const route = new URL(String(url)).pathname;
+      if (route === "/v1/instance") return Response.json({ id: "ins_Original", environment_type: "development" });
+      if (route !== `/v1/users/${f.resource.externalId}`) throw new Error("Unselected provider target");
+      if (options.method === "GET") { reads++; if (pause) { pause = false; await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); }
+        return present ? Response.json({ id: f.resource.externalId, created_at: 1793223854938, email_addresses: [{ email_address: "dra75.scopetas+clerk_test@example.com" }] }) : new Response(null, { status: 404 }); }
+      if (options.method !== "DELETE") throw new Error("Unsupported provider effect");
+      effects++; present = false; if (loseDelete) { loseDelete = false; throw new Error("lost exact DELETE reply"); }
+      return Response.json({ id: f.resource.externalId, deleted: true });
+    }, async () => ({ descriptor: { backupFile: path.join(directory, "fixed.enc.json"), backupSha256: "a".repeat(64), keyFile: path.join(directory, "fixed.key"), keyId: "b".repeat(64) }, secret: "sk_test_disposable" }));
+    const run = () => manageResource({ registry, key: f.resource.key, action: "release", clerk: { provider, journalRoot } });
+    await expect(run()).rejects.toThrow("lost original creation witness reply"); expect(reads).toBe(0); expect(effects).toBe(0);
+    const fact = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "cleanup-clerk-original-creation" } });
+    await rm(f.recordPath); await rm(f.environment, { recursive: true });
+    await expect(run()).rejects.toThrow("shared"); expect(effects).toBe(0);
+    await db.prisma.remoteTaskResource.delete({ where: { id: "late-shared" } });
+    pause = true; await expect(run()).rejects.toThrow(); expect(effects).toBe(0);
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    await expect(run()).rejects.toThrow("Clerk cleanup request failed"); expect(effects).toBe(1);
+    const write = registry.resource;
+    registry.resource = async (value: unknown) => { await write(value); if (loseReceipt) { loseReceipt = false; throw new Error("lost original Released reply"); } };
+    await expect(run()).rejects.toThrow("lost original Released reply");
+    expect(await run()).toMatchObject({ state: "released" }); expect(effects).toBe(1);
+    const released = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }); expect(released.metadata).toEqual(f.resource.metadata);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: f.original.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(f.original);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "cleanup-clerk-original-creation" } })).toEqual([fact]);
+    expect((await assertPreparedCleanup(f.input)).operation).toEqual(f.active.operation);
+  } finally { await server.stop(true); }
+}, 30_000);
 
 async function legacyPreviewFixture(review = false, change?: (values: any[]) => void, uuidFormat = false) {
   const f = await fixture();

@@ -31,9 +31,25 @@ const sha = (value: Buffer) => createHash("sha256").update(value).digest("hex");
 
 async function held(file: string, limit: number, privateFile: boolean) {
   const before = await lstat(file), bytes = await readArchiveBytes(file, limit), after = await lstat(file);
-  if ((before.mode & 0o7777) !== (privateFile ? 0o600 : 0o644) || before.dev !== after.dev || before.ino !== after.ino
+  if (!(privateFile ? [0o600] : [0o600, 0o644]).includes(before.mode & 0o7777) || before.dev !== after.dev || before.ino !== after.ino
     || before.mode !== after.mode || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) throw new Error("Original Clerk creation input changed");
   return { bytes, identity: { path: file, dev: before.dev, ino: before.ino, mode: before.mode, size: before.size, sha256: sha(bytes) } };
+}
+
+/** This older recipe has no directory resource. Its original Compose record
+ * and private export independently name the same task environment. A folder
+ * name by itself, or a newly registered directory, supplies no provenance. */
+export function originalClerkEnvironment(active: Active) {
+  const resources = active.operation.binding.resources;
+  const groups = resources.filter(value => value.kind === "docker-compose-project" && value.purpose === "development" && value.state !== "released"
+    && value.externalId === `drafted-${active.task.id}-development`);
+  if (groups.length !== 1) throw new Error("Original Clerk creation has no unique frozen Compose environment");
+  const metadata = object(groups[0]!.metadata), environment = z.string().parse(metadata.envDirectory);
+  const exports = resources.filter(value => value.key === "credentials-export-development" && value.kind === "private-file" && value.purpose === "development");
+  if (!path.isAbsolute(environment) || path.normalize(environment) !== environment || environment.includes("\0")
+    || path.basename(environment) !== active.task.id || path.basename(path.dirname(environment)) !== "environments"
+    || metadata.composeFile !== path.join(environment, "compose.yml") || exports.length !== 1 || exports[0]!.externalId !== path.join(environment, "provider.src.env")) throw new Error("Original Clerk environment associations differ");
+  return environment;
 }
 
 function scope(active: Active, resource: Resource) {
@@ -108,17 +124,14 @@ export function originalClerkToolEvidence(recordValue: unknown, input: { actor: 
 
 /** Expensive initial input observation is outside the SQL transaction. Later
  * renewals use the immutable redacted fact, even after local inputs retire. */
-export async function prepareClerkCreation(prisma: Database, config: ServerConfig, active: Active, keys: string[]) {
+async function deriveClerkCreation(prisma: Database, config: ServerConfig, active: Active, keys: string[]) {
   if (keys.length !== 1 || active.kind !== "v1") return undefined;
   const resource = active.binding.resources.find(value => value.key === keys[0]);
   if (!resource || resource.kind !== "clerk-test-user" || object(resource.metadata).createdByTask === true) return undefined;
   const selected = scope(active, resource), where = eventWhere(active, resource.id), existing = await prisma.runtimeMetadataEvent.findMany({ where, take: 2 });
   if (existing.length > 1) throw new Error("Original Clerk creation fact is ambiguous");
   if (existing[0]) return { fact: Fact.parse(JSON.parse(existing[0].value!)), existing: { sequence: existing[0].sequence, value: existing[0].value! } };
-  const environments = active.binding.resources.filter(value => value.key === "development-env-directory" && value.kind === "directory" && value.purpose === "development");
-  const environment = environments[0]?.externalId;
-  if (environments.length !== 1 || !environment || !path.isAbsolute(environment) || path.normalize(environment) !== environment
-    || path.basename(environment) !== active.task.id || path.basename(path.dirname(environment)) !== "environments") throw new Error("Original Clerk creation has no exact registered environment");
+  const environment = originalClerkEnvironment(active);
   const metadata = object(resource.metadata), email = z.string().parse(metadata.email);
   const registered = await prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } });
   if (registered.taskId !== active.task.id || !equal(finalizationResourceIdentity(registered), finalizationResourceIdentity(resource))) throw new Error("Original Clerk registration changed");
@@ -142,6 +155,13 @@ export async function prepareClerkCreation(prisma: Database, config: ServerConfi
   }
   if (candidates.length !== 1) throw new Error("Original Clerk creation lacks one authenticated paired execution and registration");
   return { fact: candidates[0]!, existing: undefined };
+}
+
+export async function prepareClerkCreation(...input: Parameters<typeof deriveClerkCreation>) {
+  try { return await deriveClerkCreation(...input); }
+  // JSON/Zod/OS errors can contain private input excerpts. The route must never
+  // publish those; failed derivation supplies neither witness nor effect scope.
+  catch { throw new Error("Original Clerk creation evidence is missing, altered, or does not prove this task created the selected user"); }
 }
 
 /** Called only after the normal current-operation check and global sharing

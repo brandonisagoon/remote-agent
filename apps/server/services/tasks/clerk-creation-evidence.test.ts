@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { originalClerkToolEvidence } from "./clerk-creation-evidence.ts";
+import { originalClerkToolEvidence, originalClerkEnvironment } from "./clerk-creation-evidence.ts";
 import { clerkCreationRecord } from "../../../../test-support/clerk-creation-fixture.ts";
 
 function fixture() {
@@ -16,6 +16,30 @@ test("paired original creation and later registration produce only redacted dige
   expect(evidence.creationDigest).toMatch(/^[a-f0-9]{64}$/); expect(JSON.stringify(evidence)).not.toContain(f.input.email);
   f.record.messages.push({ Agent: { content: [], tool_results: {} as any } });
   expect(originalClerkToolEvidence(f.record, f.input)).toEqual(evidence);
+});
+test("actual historical output trailers and frozen Compose/export association need no directory record", () => {
+  const f = fixture(), output = f.record.messages[0]!.Agent.tool_results["create-exact-user"]!;
+  if (typeof output.output !== "string") throw new Error("Expected the creation command's text result");
+  output.output += `-rw-------@ 1 owner  staff  451 Oct 28 14:44 clerk-jwt.pem\n-rw-------@ 1 owner  staff  162 Oct 28 14:44 clerk-user.json\nShell cwd was reset to ${f.input.actor.cwd}\n`;
+  output.content.Text = output.output;
+  expect(originalClerkToolEvidence(f.record, f.input)).toBeDefined();
+  const resources = [
+    { id: "old-group", key: "compose-development", kind: "docker-compose-project", purpose: "development", externalId: "drafted-originaltask-development", state: "released", metadata: { envDirectory: "old" } },
+    { id: "group", key: "compose-development-r2", kind: "docker-compose-project", purpose: "development", externalId: "drafted-originaltask-development", state: "ready", metadata: { envDirectory: f.input.environment, composeFile: f.input.environment + "/compose.yml" } },
+    { id: "export", key: "credentials-export-development", kind: "private-file", purpose: "development", externalId: f.input.environment + "/provider.src.env", state: "ready" },
+  ];
+  const active = { task: { id: f.input.taskId }, operation: { binding: { resources } } } as any;
+  expect(originalClerkEnvironment(active)).toBe(f.input.environment);
+  for (const change of ["group", "config", "export", "duplicate", "foreign", "released"] as const) {
+    const changed = structuredClone(active), list = changed.operation.binding.resources;
+    if (change === "group") list[1].externalId = "drafted-other-development";
+    if (change === "config") list[1].metadata.composeFile += ".other";
+    if (change === "export") list[2].externalId += ".other";
+    if (change === "duplicate") list.push(structuredClone(list[1]));
+    if (change === "foreign") list[1].metadata.envDirectory = "/private/environments/foreign";
+    if (change === "released") list[1].state = "released";
+    expect(() => originalClerkEnvironment(changed)).toThrow();
+  }
 });
 test.each(["reused", "wrong-user", "wrong-instance", "wrong-email", "failed", "unpaired", "command", "incomplete", "raw-input", "registration-id", "registration-task", "registration-time", "registration-meta", "result-content", "before-create", "duplicate", "wrong-actor", "text-only"])("original creation refuses %s evidence", change => {
   const f = fixture(), agent = f.record.messages[0]!.Agent as any, create = agent.content[0].ToolUse, register = agent.content[1].ToolUse, created = agent.tool_results[create.id], registered = agent.tool_results[register.id];
