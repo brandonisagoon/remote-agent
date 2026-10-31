@@ -26,6 +26,7 @@ const key = (machineId: string, taskId: string, purpose: string) => finalization
 
 async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
   const purpose = Purpose.parse(row.purpose), ids = Ids.parse(row.resourceIds);
+  if (row.id !== key(row.machineId, row.taskId, purpose)) throw new Error("Compute baseline group identity changed");
   const task = await store.remoteTask.findUniqueOrThrow({ where: { id: row.taskId } });
   if (task.machineId !== row.machineId || !task.primarySessionId || !task.worktreePath) throw new Error("Compute baseline original task is unavailable");
   const primary = await store.runtimeSession.findUniqueOrThrow({ where: { id: task.primarySessionId } });
@@ -90,28 +91,39 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
     if (!groups.has(id) && !environments.some(environment => environment.resourceId === resource.id)) groups.set(id, { taskId: resource.taskId, purpose: resource.purpose, ids: [] });
   }
   if (groups.size > 1000) throw new Error("Compute baseline group inventory exceeds its bound");
-  let observed = 0, unavailable = 0;
-  for (const [id, group] of groups) {
-    try {
-      const resourceIds = [...new Set([...group.ids, ...resources.filter(resource => resource.taskId === group.taskId && resource.purpose === group.purpose).map(resource => resource.id)])].sort();
-      Ids.parse(resourceIds);
-      const row = await input.prisma.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
-      const before = await snapshot(input.prisma, row, input.runtime);
-      if (!before.settled) { unavailable++; continue; }
-      const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
-        purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
-      const observation = ComputeBaselineObservation.parse(await read(input, before.task, request));
-      const credited = await input.prisma.$transaction(async tx => {
-        const held = await tx.computeBaseline.findUniqueOrThrow({ where: { id } });
-        if (held.refreshToken !== token) return false;
-        const current = await snapshot(tx, held, input.runtime);
-        if (!current.settled || current.digest !== before.digest || !matches(observation, held, current, input.now ?? new Date(), (input.config.compute ?? ComputePolicy.parse({})).collectorFreshnessSeconds)) return false;
-        const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
-        return saved.count === 1;
-      });
-      if (credited) observed++; else unavailable++;
-    } catch { unavailable++; }
-  }
+  let observed = 0, unavailable = 0, index = 0;
+  const entries = [...groups];
+  await Promise.all(Array.from({ length: Math.min(4, entries.length) }, async () => {
+    for (;;) {
+      const entry = entries[index++]; if (!entry) return;
+      const [id, group] = entry;
+      try {
+        const row = await input.prisma.$transaction(async tx => {
+          // Another process may have discovered a member after this inventory,
+          // including one already Released again. Retained claims never shrink.
+          const current = await tx.computeBaseline.findUnique({ where: { id } });
+          const resourceIds = [...new Set([...group.ids, ...(current ? Ids.parse(current.resourceIds) : []),
+            ...resources.filter(resource => resource.taskId === group.taskId && resource.purpose === group.purpose).map(resource => resource.id)])].sort();
+          Ids.parse(resourceIds);
+          return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
+        });
+        const before = await snapshot(input.prisma, row, input.runtime);
+        if (!before.settled) { unavailable++; continue; }
+        const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
+          purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
+        const observation = ComputeBaselineObservation.parse(await read(input, before.task, request));
+        const credited = await input.prisma.$transaction(async tx => {
+          const held = await tx.computeBaseline.findUniqueOrThrow({ where: { id } });
+          if (held.refreshToken !== token) return false;
+          const current = await snapshot(tx, held, input.runtime);
+          if (!current.settled || current.digest !== before.digest || !matches(observation, held, current, input.now ?? new Date(), (input.config.compute ?? ComputePolicy.parse({})).collectorFreshnessSeconds)) return false;
+          const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
+          return saved.count === 1;
+        });
+        if (credited) observed++; else unavailable++;
+      } catch { unavailable++; }
+    }
+  }));
   return { observed, unavailable };
 }
 

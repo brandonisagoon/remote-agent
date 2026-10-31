@@ -96,6 +96,31 @@ test("older in-flight observation cannot overwrite a newer failed refresh", asyn
   release(); expect(await old).toEqual({ observed: 0, unavailable: 1 });
   expect(await offerNextCompute(f.admission)).toBeNull();
 });
+test("old inventory cannot erase a newer retained member after its registry release", async () => {
+  const f = await fixture(); await refreshComputeBaselines(f.context, f.read);
+  const findMany = f.prisma.computeBaseline.findMany;
+  let entered!: () => void, release!: () => void, first = true;
+  const ready = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  f.prisma.computeBaseline.findMany = (async (...args: any[]) => {
+    const rows = await (findMany as any)(...args);
+    if (first) { first = false; entered(); await gate; }
+    return rows;
+  }) as typeof findMany;
+  const read: typeof f.read = async (...args) => {
+    const result = await f.read(...args) as any;
+    for (const resource of result.resources) if (resource.resourceId === "late") resource.state = "running";
+    return result;
+  };
+  try {
+    const old = refreshComputeBaselines(f.context, read); await ready;
+    await f.prisma.remoteTaskResource.create({ data: { id: "late", taskId: "old", key: "late", kind: "docker-container", purpose: "development", externalId: "late-container", state: "ready" } });
+    expect(await refreshComputeBaselines(f.context, read)).toEqual({ observed: 0, unavailable: 1 });
+    await f.prisma.remoteTaskResource.update({ where: { id: "late" }, data: { state: "released" } });
+    release(); expect(await old).toEqual({ observed: 0, unavailable: 1 });
+    expect((await f.prisma.computeBaseline.findFirstOrThrow()).resourceIds).toEqual(["app", "database", "late"]);
+    expect(await offerNextCompute(f.admission)).toBeNull();
+  } finally { release(); f.prisma.computeBaseline.findMany = findMany; }
+});
 test("inventory failure invalidates old credit before the failing read", async () => {
   const f = await fixture(); await refreshComputeBaselines(f.context, f.read);
   const read = f.prisma.remoteTaskResource.findMany;
@@ -103,6 +128,24 @@ test("inventory failure invalidates old credit before the failing read", async (
   try { await expect(refreshComputeBaselines(f.context, f.read)).rejects.toThrow("inventory unavailable"); }
   finally { f.prisma.remoteTaskResource.findMany = read; }
   expect(await offerNextCompute(f.admission)).toBeNull();
+});
+test("four bounded readers reconcile fourteen original groups before one-slot admission", async () => {
+  const f = await fixture();
+  for (let index = 1; index < 14; index++) {
+    const id = `old-${index}`;
+    await f.prisma.runtimeSession.create({ data: { id, scopeKey: id, agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: `/${id}`, status: "closed", closedAt: f.now } });
+    await f.prisma.remoteTask.create({ data: { id, requestKey: id, repositoryId: "repo", machineId: "host", branchName: `codex/${id}`, worktreePath: `/${id}`, toolingRoot: "/old/tooling", toolingRevision: "a".repeat(40), primarySessionId: id, phase: "closed" } });
+    await f.prisma.remoteTaskResource.create({ data: { taskId: id, key: "app", kind: "docker-container", purpose: "development", externalId: `${id}-container`, state: "ready" } });
+  }
+  let active = 0, maximum = 0, reads = 0;
+  expect(await refreshComputeBaselines(f.context, async (...args) => {
+    active++; maximum = Math.max(maximum, active); reads++;
+    try { await new Promise(resolve => setTimeout(resolve, 5)); return await f.read(...args); }
+    finally { active--; }
+  })).toEqual({ observed: 14, unavailable: 0 });
+  expect(reads).toBe(14); expect(maximum).toBeLessThanOrEqual(4);
+  expect(await offerNextCompute(f.admission)).not.toBeNull();
+  expect(await f.prisma.computeEnvironment.count()).toBe(1);
 });
 test.each(["task", "member", "active", "stale"])("%s changed during the physical read cannot publish credit", async kind => {
   const f = await fixture();
