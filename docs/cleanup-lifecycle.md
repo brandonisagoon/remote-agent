@@ -322,3 +322,32 @@ The actual Unix fixture covers durable witness response loss, cached recovery af
 The same selected-key operation may recognize the exact original development `task_spatial` tuple when its recorded cutover, retained local Compose group and source identity agree. Other development compute and the review database must already be Released. The server protects deterministic private backup storage against every registered cleanup root, retained material, foreign resource claim and registered worktree. It performs no provider, Docker, dump or credential reads during this scope check. The wire and original preparation/operation remain unchanged.
 
 The client retains a complete immutable custom archive before the existing database-only dispatch, independently verifies saved native process absence and stopped local consumers, and checks absence from the recorded surviving verification database. Remote Released state never removes local migration-source protection. The actual Unix whole-finalizer regression covers normal native/export ordering, late storage ownership, lost DELETE and Released replies, one provider effect, unchanged original events/resources and retained local data. This is disposable verification, not original-task execution.
+
+### Original source in a version 1 operation
+
+The existing bearer-authenticated task `legacy-evidence` route accepts a strict
+`kind: "original-work"` adoption. It names the exact original preparation and
+operation revisions and raw/canonical digests plus a private, manifest-covered
+bundle archive. The independent restore must equal the accepted clean snapshot.
+Ignored material requires explicit owner-selected paths and remains in the
+whole-source capture; the existing installed-dependency identity rules apply.
+
+One append-only `finalization-legacy-original-work` proof holds the file archive,
+restore result, exact source inventory and linked Git administration capture.
+It is outside the original owner-action epoch and neither registers a resource
+nor rewrites the historical preparation, operation or evidence supplements.
+Owner retries reuse the exact proof, including after both original paths are
+captured. Trusted primary IPC still cannot adopt this owner authority.
+
+Compact renewal rechecks the original operation, proof and global path claims.
+Full boundaries recheck archive bytes, any retained common-Git prerequisites,
+source/admin inventories and handle boundaries, and actual Git registration
+absence. The shared capture engine preserves each original inode and retries
+lost capture replies without calling Git removal or resetting source. The
+retained Compose boundary separately observes external recipe/cutover files and
+stopped Docker lifetimes after original source paths disappear.
+
+Disposable owner-route/Unix tests cover the 56-record shape, raw-only operation
+CAS drift, foreign path claims, exact clean snapshot and ignored-byte refusal,
+private archive drift, native source/admin lost replies and path recreation.
+Live archive/adoption/capture is separate from this source verification.
