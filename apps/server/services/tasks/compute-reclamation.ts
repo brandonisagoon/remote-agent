@@ -67,8 +67,15 @@ async function snapshot(store: Store, input: Context) {
  * recreate source, or mutate provider resources. Active authority is unchanged. */
 export async function reclaimStoppedCompute(input: Context, read = readInstalledComputeReclamation) {
   if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
+  // Retire any earlier zero-capacity observation before a fallible physical
+  // read. Failed/unknown/restarted compute must not reuse a fresh stopped cache.
+  // This is conservative accounting only; no resource or owner fact changes.
+  const recorded = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
+  if (recorded.machineId !== input.config.machine) throw new Error("Compute reclamation belongs to another host");
+  const invalidated = await input.prisma.computeEnvironment.updateMany({ where: { id: recorded.id, machineId: input.config.machine, updatedAt: recorded.updatedAt }, data: { state: "unknown" } });
+  if (invalidated.count !== 1) throw new Error("Compute reclamation allocation changed before observation");
   const before = await snapshot(input.prisma, input);
-  if (!before.settled) return { released: false };
+  if (!before.task.ownerPaused && before.task.phase !== "closed" && before.resource.state !== "released" || !before.settled) return { released: false };
   const { environment, task, resource, identity } = before;
   const request = { version: 1, task: { id: task.id, primarySessionId: environment.primarySessionId, toolingRevision: task.toolingRevision, worktreePath: task.worktreePath },
     environment: { id: environment.id, key: environment.key, purpose: environment.purpose, revision: environment.revision, recipeDigest: environment.recipeDigest },

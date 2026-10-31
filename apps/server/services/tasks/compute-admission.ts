@@ -80,7 +80,12 @@ async function unaccounted(store: Store, input: Context) {
       && observation.data.environmentId === environment.id && observation.data.taskId === environment.taskId
       && at(input).getTime() >= observation.data.observedAt && at(input).getTime() - observation.data.observedAt <= input.policy.collectorFreshnessSeconds * 1000;
   }).map(value => value.resourceId).filter(Boolean));
-  return new Set(resources.filter(resource => !recorded.has(resource.id)).map(resource => `${resource.taskId}:${resource.purpose}`)).size;
+  // A Released registry row is not proof that a later observation is idle.
+  // Unallocated running/unknown environments remain host usage until a fresh
+  // physical reclamation succeeds, even after ordinary resource cleanup.
+  const uncertain = environments.filter(environment => !occupied.has(environment.id) && ["running", "unknown", "starting"].includes(environment.state));
+  return new Set([...resources.filter(resource => !recorded.has(resource.id)).map(resource => `${resource.taskId}:${resource.purpose}`),
+    ...uncertain.map(environment => `${environment.taskId}:${environment.purpose}`)]).size;
 }
 async function freeSlot(store: Store, input: Context) {
   const settings = policy(input), unavailable = await unaccounted(store, input);

@@ -58,6 +58,19 @@ test("collector reclaims paused capacity before any active observer or Decisions
   const next = await offerNextCompute(context); expect(next).not.toBeNull();
   expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: next!.environmentId } })).taskId).toBe("next");
 });
+for (const closed of [false, true]) test.each(["running", "unknown", "failed"])(`new %s evidence invalidates prior free capacity (closed=${closed})`, async state => {
+  const f = await fixture(closed);
+  expect(await reclaimStoppedCompute(f.context, f.read)).toEqual({ released: true });
+  const read: typeof f.read = async (...args) => { if (state === "failed") throw new Error("physical observer unavailable"); return { ...await f.read(...args) as object, state }; };
+  if (state === "failed") await expect(reclaimStoppedCompute(f.context, read)).rejects.toThrow("observer unavailable");
+  else expect(await reclaimStoppedCompute(f.context, read)).toEqual({ released: false });
+  const session = await f.prisma.runtimeSession.create({ data: { id: "next", scopeKey: "next", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/next", status: "idle" } });
+  await f.prisma.remoteTask.create({ data: { id: "next", requestKey: "next", repositoryId: "repo", machineId: "host", branchName: "next", worktreePath: session.cwd, toolingRoot: "/tooling", toolingRevision: "a".repeat(40), primarySessionId: session.id, phase: "working" } });
+  const context = { prisma: f.prisma, machineId: "host", policy: f.config.compute! };
+  await requestCompute({ ...context, taskId: "next", request: { key: "new", purpose: "development", revision: "a".repeat(40), recipeDigest: "b".repeat(64) } });
+  expect(await offerNextCompute(context)).toBeNull();
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).ownerPaused).toBe(!closed);
+});
 test.each([false, true])("cleanup metadata progress keeps the original physical target (replacement=%s)", async replacement => {
   const f = await fixture(true);
   await f.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { configuration: Prisma.DbNull, observation: {

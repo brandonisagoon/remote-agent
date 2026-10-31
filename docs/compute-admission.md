@@ -31,7 +31,7 @@ network-name/host-port translations, synthetic measured app callbacks, a seeded
 confirmed delivery event and an injected Decisions answer. Actual Greenfield
 framework and queue hooks have separate tests; this is not pilot acceptance.
 
-After an ordinary owner pause or task closure, the collector can still observe
+DRA-241: after an ordinary owner pause or task closure, the collector can still observe
 physical capacity through the already-installed configured runtime. It cannot
 install tooling, recreate source, start compute or reopen a task. A distinct
 reclamation result binds the original environment/allocation, exact Docker members
@@ -42,7 +42,11 @@ missing native proofs and observation errors retain capacity. Only fresh stopped
 or absent evidence releases the slot; the result cannot authorize a claim or an
 inactivity decision. Original task/resource metadata and owner pauses are unchanged.
 
-Final affected reclamation checks passed 127 tests / 471 assertions on the server
+Before each fallible physical read, earlier free-capacity evidence is invalidated.
+Running or unknown environments remain counted even when their registry row is
+Released; an outage cannot reuse an old stopped observation as zero usage.
+
+Final affected reclamation checks passed 133 tests / 495 assertions on the server
 and 63 / 195 on Drafted, with both typechecks. Independent review and final broad
 checks remain before the root-owned deployment and disposable rollout acceptance.
 No live host configuration or original task was changed by these source tests.
