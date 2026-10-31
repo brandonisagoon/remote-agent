@@ -461,3 +461,12 @@ bytes; missing adoption prevents source retirement. These entries cannot obtain
 capture/release authority, and generic tooling-resource selection is unchanged.
 The actual Unix fixture includes six development evidence files and two retained
 tooling manifests, with original/copy mutation and overlapping-copy refusals.
+
+The opt-in `DRAFTED_RUNTIME_CLEANUP_ROOT` Unix integration in
+`cleanup-lifecycle.test.ts` exercises the actual external `manageRuntime` client
+against the unchanged server cleanup authority and registry. Its frozen runtime
+metadata survives per-provider progress, lost progress/provider/Released replies
+and retry, while identity/order/lifetime changes and owner pause still refuse.
+The private runtime journal and observation field carry progress; the original
+preparation, operation and registered ownership remain unchanged. Docker and
+remote provider effects are injected; no live cleanup is performed by this test.
