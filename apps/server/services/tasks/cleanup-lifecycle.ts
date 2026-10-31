@@ -197,7 +197,13 @@ async function activeOperation(input: Context, allowConfirmedClosed = false, sup
   const supplement = await input.prisma.runtimeMetadataEvent.findFirst({ where: supplementWhere(observed.task.id, input.sessionId, input.requestKey) });
   assertBinding(observed.binding, supplement ? supplementedBinding(operation, event, EvidenceSupplement.parse(JSON.parse(supplement.value!))) : operation.binding);
   if (!allowConfirmedClosed && !supplementInspection) await automaticCleanupTurn(inboxStore(input.prisma), observed.task, Boolean(operation.automatic), input.runtime);
-  return { ...observed, operation, operationRevision: event.sequence };
+  const active = { ...observed, operation, operationRevision: event.sequence };
+  if (active.kind === "v1") {
+    const { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
+    const original = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
+    if (original) await assertLegacyOriginalWorkAuthority(input.prisma, active, original);
+  }
+  return active;
 }
 
 async function localSnapshot<T>(input: Context, read: (value: Context) => Promise<T>): Promise<T> {

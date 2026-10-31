@@ -50,12 +50,13 @@ async function fixture(taskId = "task") {
   return { root, worktree, config, session, task, issue, states, context, contract, remote, observer, input, dependencies, remove, revoke };
 }
 
-async function preparedFixture() {
+async function preparedFixture(configure?: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>) {
   const f = await fixture("original71");
   // Match the actual clean v1 source with deliberately retained ignored bytes.
   await writeFile(path.join(f.root, ".git/info/exclude"), "cache/\n");
   await mkdir(path.join(f.worktree, "cache")); await writeFile(path.join(f.worktree, "cache", "owner-material.bin"), Buffer.from([0, 255, 2]));
   for (let index = 0; index < 56; index++) await db.prisma.remoteTaskResource.create({ data: { id: `original-${index}`, taskId: f.task.id, key: `original-${index}`, kind: index === 55 ? "docker-compose-project" : "evidence", purpose: "development", externalId: `original-external-${index}`, state: index === 55 ? "ready" : "released", metadata: { original: index } } });
+  await configure?.(f);
   const prepared = await prepareTaskFinalization(f.input, f.dependencies), active = await bindPreparedCleanup(f.input, async () => {});
   const preparation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.preparedRevision } });
   const operation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: active.operationRevision } });
@@ -165,3 +166,84 @@ actual("actual owner Unix adoption and native source/admin lost-reply capture pr
     await mkdir(f.worktree); await expect(assertLegacyOriginalWorkFiles({ taskId: f.task.id, originalWork: proof, removed: true }, idle)).rejects.toThrow("recreated");
   } finally { await server.stop(true); }
 }, 30_000);
+
+actual("actual v1 finalizer retains stopped Docker data and recovers source/admin/confirmation loss with all56 original IDs", async () => {
+  const root = process.env.DRAFTED_ORIGINAL_SOURCE_INTEGRATION_ROOT!;
+  const client = (file: string) => import(pathToFileURL(path.join(root, `src/${file}.ts`)).href);
+  const { manageResource } = await client("resources"), { taskRegistry } = await client("control"), { finalizeTask } = await client("finalize");
+  const { observeCleanupResource } = await client("cleanup-observer"), { prepareLegacyOriginalArchive } = await client("legacy-original-archive"), { run } = await client("process");
+  const { legacyComposeFinalizationDependencies: retention } = await import("./legacy-compose-finalization.ts");
+  const { cleanupReportDelivery } = await import("./cleanup-report.ts");
+  const { startRuntimeEventProjection } = await import("../sessions/runtime-events/projection.ts");
+  const savedRetention = { ...retention }, savedReport = { ...cleanupReportDelivery };
+  const project = "drafted-original71-development", container = "a".repeat(64), network = "b".repeat(64), volume = `${project}-spatial`;
+  const environment = path.join(directory, "environments", "original71"), configFile = path.join(environment, "compose.yml"), journalRoot = path.join(directory, "compose-journal");
+  const cutoverDirectory = path.join(directory, "cutovers", project), cutoverFile = path.join(cutoverDirectory, "receipt.private.json");
+  await mkdir(environment, { recursive: true, mode: 0o700 }); await writeFile(configFile, "name: retained-original-source\n", { mode: 0o600 });
+  await mkdir(cutoverDirectory, { recursive: true, mode: 0o700 });
+  const cutover = { project, branchId: "br-original", state: "migrated", startedAt: "2026-10-29T00:22:10.729Z", completedAt: "2026-10-29T00:23:25.270Z",
+    files: [configFile, path.join(environment, "spatial.env")].map((file, index) => ({ file, backup: path.join(cutoverDirectory, `file-${index}.backup`) })) };
+  await writeFile(cutoverFile, JSON.stringify(cutover), { mode: 0o600 });
+  const f = await preparedFixture(async f => {
+    await db.prisma.remoteTaskResource.update({ where: { id: "original-55" }, data: { key: "compose-development-r2", externalId: project, metadata: { composeFile: configFile, containers: { spatial: container }, volumes: [volume], network: `${network.slice(0, 12)} (${project}-default)` } } });
+    await db.prisma.remoteTaskResource.update({ where: { id: "original-54" }, data: { key: "spatial-neon-development", kind: "neon-branch-database", externalId: "br-original/task_spatial", metadata: { cutoverReceipt: cutoverFile, runtimeDatabase: "task_spatial", supersedes: "local PostGIS in compose-development-r2 (stopped by owner cutover; volume retained; not restarted)" } } });
+  });
+  const labels = { "dev.drafted.task": f.task.id, "dev.drafted.purpose": "development", "com.docker.compose.project": project };
+  const objects = new Map<string, any>([
+    [`container:${container}`, { id: container, createdAt: "original-container", running: false, image: "sha256:spatial", labels: { ...labels, "com.docker.compose.service": "spatial", "com.docker.compose.project.config_files": configFile, "com.docker.compose.project.working_dir": environment }, networks: [network], volumes: [volume] }],
+    [`network:${network}`, { id: network, name: `${project}-default`, createdAt: "original-network", labels: { ...labels, "com.docker.compose.network": "default" } }],
+    [`volume:${volume}`, { id: volume, createdAt: "original-volume", labels }],
+  ]);
+  let effects = 0, observed = 0, closed = 0;
+  const docker = { inspect: async (kind: string, id: string) => structuredClone(objects.get(`${kind}:${id}`) ?? null), resolve: async (kind: string, id: string) => structuredClone([...objects].find(([key, value]) => key.startsWith(`${kind}:`) && (value.id.startsWith(id) || value.name === id))?.[1] ?? null),
+    inventory: async (kind: string) => structuredClone([...objects].filter(([key]) => key.startsWith(`${kind}:`)).map(([, value]) => value)),
+    stop: async () => { effects++; throw Error("Retained source must never stop again"); }, remove: async () => { effects++; throw Error("Retained source must never be removed"); } };
+  retention.journalRoot = () => journalRoot;
+  retention.resolve = async () => ({ version: 1, source: "configured-host", checkout: root, revision: "a".repeat(40), adapter: path.join(root, "src/cli.ts"), adapterSha256: "b".repeat(64) });
+  retention.observe = async input => { observed++; return observeCleanupResource(input.request, { docker, retainedComposeJournalRoot: journalRoot }); };
+  cleanupReportDelivery.read = async () => { throw Error("Fixture reporting unavailable"); };
+  const socket = path.join(directory, "finalizer.sock"), server = Bun.serve({ unix: socket, fetch: f.app.fetch }); await chmod(socket, 0o600);
+  const stopProjection = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime: createFakeAgentRuntime() }, async () => {});
+  try {
+    const ownerRoot = path.join(directory, "owner-backup"); await mkdir(ownerRoot, { mode: 0o700 });
+    const { archive: _archive, ...binding } = f.adoption;
+    f.adoption.archive = await prepareLegacyOriginalArchive({ taskId: f.task.id, sessionId: f.session.id, toolingRevision: f.task.toolingRevision, worktree: f.worktree,
+      revision: f.prepared.revision, branch: f.prepared.branch, archiveRoot: path.join(ownerRoot, "source"), ownedPaths: [path.join(f.worktree, "cache")], binding }, { assertAuthority: async () => { await inspectCleanupSupplementAuthority(f.input); } });
+    const adopted = await f.request(); expect(adopted.status).toBe(200); const proof = LegacyOriginalWorkReceipt.parse(await adopted.json()).proof.originalWork;
+    const originalInode = (await lstat(f.worktree)).ino, adminInode = (await lstat(proof.administration.administrationCapture.path)).ino;
+    const rawEvents = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), rows = await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "waiting" } });
+    const registry = taskRegistry(socket, f.task.id, 20_000); registry.publishCleanupStatus = undefined;
+    const close = async () => { const response = await f.app.request(`/api/tasks/${f.task.id}/automation`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "close", cleanup: true }) }); if (!response.ok) throw Error(await response.text()); closed++; };
+    const manage = (input: any) => manageResource({ ...input, docker, compose: { journalRoot } });
+    const args = { registry, cleanup: true, close, manage, preparedCleanup: { observation: idle } };
+    await expect(finalizeTask({ ...args, preparedCleanup: { observation: idle, captureHooks: { afterCapture() { throw Error("lost source capture reply"); } } } })).rejects.toThrow("lost source capture reply");
+    expect((await lstat(proof.target.quarantine.path)).ino).toBe(originalInode); expect(closed).toBe(0); expect(effects).toBe(0);
+    objects.get(`container:${container}`).running = true;
+    await expect(finalizeTask(args)).rejects.toThrow(); expect(closed).toBe(0);
+    objects.get(`container:${container}`).running = false;
+    const cutoverBytes = await readFile(cutoverFile); await writeFile(cutoverFile, JSON.stringify({ ...cutover, branchId: "br-replaced" }));
+    await expect(finalizeTask(args)).rejects.toThrow(); expect(closed).toBe(0); await writeFile(cutoverFile, cutoverBytes);
+    let lostAdmin = false;
+    await expect(finalizeTask({ ...args, runner: async (command: string[], cwd: string) => { const result = await run(command, cwd); if (!lostAdmin && !await Bun.file(proof.administration.administrationCapture.path + "/HEAD").exists()) { lostAdmin = true; throw Error("lost administration capture reply"); } return result; } })).rejects.toThrow("lost administration capture reply");
+    expect((await lstat(proof.administration.administrationCapture.quarantine.path)).ino).toBe(adminInode);
+    const confirm = registry.confirmFinalization; let lostConfirmation = false;
+    registry.confirmFinalization = async (request: unknown) => { const result = await confirm(request); if (!lostConfirmation) { lostConfirmation = true; throw Error("lost confirmation reply"); } return result; };
+    await expect(finalizeTask(args)).rejects.toThrow("lost confirmation reply"); expect(closed).toBe(0);
+    expect(await finalizeTask({ ...args, manage: async () => { throw Error("Confirmed retry must not clean resources"); }, runner: async () => { throw Error("Confirmed retry must not capture again"); } })).toMatchObject({ closed: true, reporting: { state: "pending" } });
+    expect(closed).toBe(1); expect(effects).toBe(0); expect(observed).toBeGreaterThan(4);
+    expect(await db.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } })).toEqual(rows); expect(rows).toHaveLength(56); await f.unchanged();
+    for (const event of rawEvents) expect(await db.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: event.sequence } })).toEqual(event);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
+    const report = await db.prisma.runtimeIssueUpdate.findFirstOrThrow({ where: { requestKey: `${f.input.requestKey}:cleanup-report` } });
+    expect(JSON.stringify(report.input)).toContain("source remains recoverable"); expect(JSON.stringify(report.input)).toContain("stopped migration data");
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    let comment: any = null, creates = 0;
+    cleanupReportDelivery.read = async () => f.issue as never;
+    cleanupReportDelivery.comment = async () => comment;
+    cleanupReportDelivery.create = async (_key, input) => { creates++; comment = { id: input.id, issue: { id: input.issueId }, body: input.body, parentId: null }; throw Error("lost published report response"); };
+    expect(await finalizeTask({ ...args, manage: async () => { throw Error("Closed retry cannot clean"); } })).toMatchObject({ closed: true, alreadyClosed: true, reporting: { state: "published", reportId: report.id } });
+    expect(creates).toBe(1); expect((await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: report.id } })).input).toEqual(report.input);
+    await assertLegacyOriginalWorkFiles({ taskId: f.task.id, originalWork: proof, removed: true }, idle);
+  } finally { await stopProjection(); await server.stop(true); Object.assign(retention, savedRetention); Object.assign(cleanupReportDelivery, savedReport); }
+}, 60_000);

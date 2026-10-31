@@ -351,3 +351,21 @@ Disposable owner-route/Unix tests cover the 56-record shape, raw-only operation
 CAS drift, foreign path claims, exact clean snapshot and ignored-byte refusal,
 private archive drift, native source/admin lost replies and path recreation.
 Live archive/adoption/capture is separate from this source verification.
+
+The `finalization-retained-compose` supplement records a configured read-only
+observer result for the exact original Ready development group and its migrated
+Neon correspondence. Preparation and confirmation independently verify the
+external retirement journal, config and cutover plus the retained container,
+volume and network lifetimes. A running/recreated member or additional consumer
+refuses confirmation. The original Ready record remains Ready; all unrelated
+Ready resources continue to block finalization.
+
+The version 1 receipt exposes optional `legacyOriginalWork` and `retainedCompose`
+fields. Old receipts keep their shape. The original source proof is fixed before
+finalization begins; a retention observation may be added after ordinary group
+retirement, with all previous receipt fields immutable. Both supplements reuse
+the original preparation/operation and are checked by ordinary confirmation,
+progress, saved reporting and closure. Full original archive/source/admin checks
+precede the final retained Docker observation and transaction. A completed
+confirmation is immutable across receipt refresh; closed-report retries reuse
+the same UUID and body without repeating source or resource effects.

@@ -75,10 +75,11 @@ test("unstarted cancellation costs no delay and old immutable markers receive on
   await expect(f.enqueue("unchanged")).rejects.toBeInstanceOf(CleanupRetryDeferred);
 });
 
-test.each(["resource", "proof", "capability", "native-proof"] as const)("a relevant %s change permits immediate retry and restarts the bounded delay", async kind => {
+test.each(["resource", "proof", "original-source", "capability", "native-proof"] as const)("a relevant %s change permits immediate retry and restarts the bounded delay", async kind => {
   const f = await fixture(), resource = await f.resource(), first = await f.enqueue("first"); await f.finish(first.instructionId);
   if (kind === "resource") await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { state: "released" } });
   if (kind === "proof") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: "finalizer-archives:task", action: "finalization-archive-retention", key: "finalize:task", value: '{"exact":"new-retained-proof"}' } });
+  if (kind === "original-source") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: "owner:task", action: "finalization-legacy-original-work", key: "finalize:task", value: '{"exact":"accepted-source-archive"}' } });
   if (kind === "capability") f.config.repository.tooling!.revision = "c".repeat(40);
   if (kind === "native-proof") await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { metadata: { identity: "frozen", observed: { legacyNative: { proof: "immutable-proof", digest: "c".repeat(64) } } } } });
   const next = await f.enqueue("changed"); await f.finish(next.instructionId);

@@ -1,3 +1,4 @@
+import { legacyOriginalWorkReceipt } from "./legacy-original-work.ts";
 import { legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { serializeIssuePublication } from "../sessions/issue-updates.ts";
 import { cleanupStatusReceipt } from "./cleanup-status.ts";
@@ -29,9 +30,10 @@ const where = (taskId: string, sessionId: string, requestKey: string) => ({ runt
  * cleanup fact before closure; it neither reads nor changes Linear. */
 export async function queueCleanupReport(prisma: Database, active: Active, confirmedRevision: number) {
   const prepared = active.prepared;
+  const original = active.kind === "v1" && await legacyOriginalWorkReceipt(prisma, active.prepared, active.preparation.sequence);
   const accepted = active.kind === "v2"
     ? `Accepted external deliveries are preserved: ${active.prepared.delivery.deliveries.map(delivery => `${delivery.url} (reviewed ${delivery.reviewedHead}, merged ${delivery.mergeCommit})`).join("; ")}.${active.prepared.originalWork ? " Unfinished original work remains preserved in its verified archive and exact quarantine; it is not claimed as delivered." : ""}`
-    : `Its accepted work at ${prepared.revision} is preserved.`;
+    : `Its accepted work at ${prepared.revision} is preserved.${original ? " The original source remains recoverable in its verified archive and exact source and Git administration captures." : ""}`;
   const started = await cleanupStatusReceipt(prisma, active);
   const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
   const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. ${accepted} Required task resources are retired, ${retainedCompose ? "verified stopped migration data and saved evidence remain explicitly retained" : "explicitly retained evidence remains recorded"}, and the original development worktree and Git registration are absent.`, evidence: [] as [] };
