@@ -118,6 +118,18 @@ test("a foreign archive claim or raw-only operation change during observation re
   } };
   await expect(f.adopt()).rejects.toThrow("another task"); expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: LEGACY_ORIGINAL_WORK } })).toBe(0);
 });
+test("compact renewal protects another task's file-only retained proof without a resource row", async () => {
+  const f = await preparedFixture(), receipt = await f.adopt();
+  const foreignSession = await db.prisma.runtimeSession.create({ data: { scopeKey: "foreign", agentCommand: "codex", status: "closed", role: "primary", cwd: path.join(directory, "old-foreign-source"), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+  const foreignTask = await db.prisma.remoteTask.create({ data: { requestKey: "foreign", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "foreign", toolingRoot: f.root, toolingRevision: "b".repeat(40), primarySessionId: foreignSession.id } });
+  // A historical file-only proof remains a path claim even after its task
+  // closed. No TaskResource exists for this retained archive by design.
+  const proof = { ...receipt.proof, taskId: foreignTask.id, sessionId: foreignSession.id, requestKey: `finalize:${foreignTask.id}` };
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: foreignSession.id, source: `owner:${foreignTask.id}`, action: LEGACY_ORIGINAL_WORK, key: proof.requestKey, value: JSON.stringify(proof) } });
+  await expect(assertLegacyOriginalWorkAuthority(db.prisma, await inspectCleanupSupplementAuthority(f.input), receipt)).rejects.toThrow("another task's retained proof");
+  expect((await lstat(f.worktree)).isDirectory()).toBe(true); expect(await db.prisma.remoteTaskResource.count()).toBe(56); await f.unchanged();
+});
+
 test("adopted archive replacement and changed ignored bytes refuse every full boundary", async () => {
   const f = await preparedFixture(), receipt = await f.adopt(), originalWork = receipt.proof.originalWork;
   const before = await readFile(path.join(f.worktree, "cache/owner-material.bin")); await writeFile(path.join(f.worktree, "cache/owner-material.bin"), "changed");
