@@ -1,5 +1,5 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
-import { ComputeEnrollment, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
+import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
@@ -7,6 +7,12 @@ import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, offe
 
 export const computeRoutes = new Hono<AppEnv>();
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
+computeRoutes.get("/:taskId/compute-enroll", async c => {
+  const key = ComputeEnrollment.shape.key.safeParse(c.req.query("key"));
+  if (!key.success) return c.json({ error: "Exact saved resource key is required" }, 400);
+  try { return c.json(await computeEnrollmentStatus({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), key: key.data })); }
+  catch { return c.json({ error: "Existing compute enrollment ownership could not be verified" }, 409); }
+});
 computeRoutes.post("/:taskId/compute-enroll", async c => {
   const request = ComputeEnrollment.safeParse(await c.req.json());
   if (!request.success) return c.json({ error: "Exact owned compute configuration is required" }, 400);

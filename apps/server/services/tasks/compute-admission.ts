@@ -24,10 +24,10 @@ function policy(input: Context) {
 }
 class ComputeOwnerUnavailable extends Error {}
 type OwnerStore = Pick<Store, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
-export async function computeTaskOwner(store: OwnerStore, taskId: string, machineId: string) {
+export async function computeTaskOwner(store: OwnerStore, taskId: string, machineId: string, options: { allowPaused?: boolean } = {}) {
   const task = await store.remoteTask.findUnique({ where: { id: taskId } });
   const session = task?.primarySessionId && await store.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!task || !session || task.machineId !== machineId || session.machineId !== machineId || task.ownerPaused || task.phase === "closed" || session.closedAt || session.status === "closed"
+  if (!task || !session || task.machineId !== machineId || session.machineId !== machineId || task.ownerPaused && !options.allowPaused || task.phase === "closed" || session.closedAt || session.status === "closed"
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || !task.worktreePath) throw new ComputeOwnerUnavailable("Compute requires the original eligible task primary");
   await assertDevelopmentWork({ prisma: store }, task);
   let sourceLinkId: string | null = null;
@@ -40,8 +40,8 @@ export async function computeTaskOwner(store: OwnerStore, taskId: string, machin
     connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, sourceLinkId, baseCommit: task.baseCommit, branchName: task.branchName, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot });
   return { task, session, identity };
 }
-export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Store, "remoteTaskResource">, environment: ComputeEnvironment) {
-  const owned = await computeTaskOwner(store, environment.taskId, environment.machineId);
+export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Store, "remoteTaskResource">, environment: ComputeEnvironment, options: { allowPaused?: boolean } = {}) {
+  const owned = await computeTaskOwner(store, environment.taskId, environment.machineId, options);
   if (owned.identity !== environment.taskIdentity || owned.session.id !== environment.primarySessionId) throw new ComputeOwnerUnavailable("Compute task ownership changed");
   if (isSavedComputeEnvironment(environment)) {
     try { await assertSavedComputeResource(store, { ...environment, saved: { resourceId: environment.resourceId!, resourceIdentity: environment.resourceIdentity! } }); }
@@ -103,13 +103,21 @@ async function withdraw(store: Store, offerId: string, reason: "expired" | "decl
   return true;
 }
 
-async function savedRevisionAllocations(store: Pick<Store, "computeOffer" | "computeSlot">, environmentId: string) {
+export async function savedRevisionAllocations(store: Pick<Store, "computeOffer" | "computeSlot">, environmentId: string) {
   const offers = await store.computeOffer.findMany({ where: { environmentId }, orderBy: { id: "asc" }, take: 1001 });
   if (offers.length > 1000) throw new Error("Saved compute revision history exceeds its bound");
   if (offers.some(value => ["claimed", "running", "unknown"].includes(value.state))) throw new Error("Saved compute revision still has an active or uncertain allocation");
   const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(value => value.id) } }, orderBy: { id: "asc" }, take: 1001 });
   if (slots.length > 1000 || slots.some(slot => !offers.some(offer => offer.id === slot.allocationId && offer.state === "offered" && offer.claimedAt === null))) throw new Error("Saved compute revision has an unexplained slot");
   return { offers, slots };
+}
+
+/** Owner enrollment can replace a stopped instrumentation generation, but it
+ * never releases an executing allocation or gives an old offer a new recipe. */
+export async function withdrawComputeConfigurationOffers(store: Store, environment: ComputeEnvironment, allocations: Awaited<ReturnType<typeof savedRevisionAllocations>>, now: Date) {
+  const waiting = await store.computeWait.findUnique({ where: { environmentId: environment.id } });
+  for (const offer of allocations.offers) if (["queued", "offered"].includes(offer.state)) await withdraw(store, offer.id, "ineligible", now);
+  if (waiting) await rotate(store, environment, now);
 }
 
 export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation) {

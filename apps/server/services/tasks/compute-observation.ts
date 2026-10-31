@@ -26,12 +26,13 @@ const stamp = (input: Context) => input.now?.getTime() ?? Date.now();
 
 /** Called only with a result of the configured immutable read-only observer.
  * No HTTP endpoint accepts client-supplied proof/paths/coverage booleans. */
-export async function recordComputeObservation(input: Context & { observation: ComputeObservation }) {
+export async function recordComputeObservation(input: Context & { observation: ComputeObservation; ownerEnrollment?: true }) {
   const value = ComputeObservation.parse(input.observation);
   const env = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
   const saved = isSavedComputeEnvironment(env);
   if (saved) assertSavedComputeObservation(env, value, true);
-  await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(input.prisma, env);
+  if (input.ownerEnrollment && value.state !== "stopped") throw new Error("Paused owner enrollment needs stopped compute");
+  await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(input.prisma, env, { allowPaused: input.ownerEnrollment });
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: env.taskId } });
   const resource = await input.prisma.remoteTaskResource.findUnique({ where: { id: value.resourceId } });
   if (!resource || resource.taskId !== env.taskId || resource.purpose !== env.purpose || resource.state === "released" || task.primarySessionId !== env.primarySessionId
