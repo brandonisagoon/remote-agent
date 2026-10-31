@@ -95,7 +95,7 @@ test.each(["leave-running", "eligible-for-authorized-closure", "insufficient-evi
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).phase).toBe("working");
 });
 
-test.each(["queued-work", "pause", "review", "operation", "stream", "gap"])("new %s during classification invalidates the exact snapshot", async changed => {
+test.each(["queued-work", "pause", "review", "operation", "stream", "gap", "source-revision"])("new %s during classification invalidates the exact snapshot", async changed => {
   const f = await fixture();
   const result = await considerComputeSuspension(f.input, { refresh: f.refresh, classify: async (evidence, settings) => {
     if (changed === "queued-work") await db.prisma.runtimeInstruction.create({ data: { id: "new-work", sessionId: "primary", text: "continue", state: "queued" } });
@@ -104,10 +104,23 @@ test.each(["queued-work", "pause", "review", "operation", "stream", "gap"])("new
     if (changed === "operation") f.observation.operations.active = 1;
     if (changed === "stream") { await f.event({ kind: "start", requestId: "request", classification: "meaningful" }); await f.event({ kind: "stream", requestId: "request" }); }
     if (changed === "gap") await f.event({ kind: "gap", reason: "collector-failure" });
+    if (changed === "source-revision") Object.assign(f.observation, { sourceRevision: "0".repeat(40) });
     return f.classify(evidence, settings);
   } });
   expect(result.outcome).toBe("stale"); expect(result.intent).toBeUndefined();
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
+});
+test("development source evidence changes independently of immutable launch provenance", async () => {
+  const f = await fixture(), initial = await collectComputeEvidence(f.input), launch = f.environment.revision;
+  Object.assign(f.observation, { sourceRevision: "0".repeat(40) }); await f.refresh();
+  const next = await collectComputeEvidence(f.input);
+  expect(next.evidence.task.revision).toBe("0".repeat(40)); expect(next.snapshotDigest).not.toBe(initial.snapshotDigest);
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).revision).toBe(launch);
+  expect(f.traffic().route.revision).toBe(launch);
+  await f.refresh(); expect((await collectComputeEvidence(f.input)).snapshotDigest).toBe(next.snapshotDigest);
+  const decision = await considerComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify });
+  Object.assign(f.observation, { sourceRevision: "1".repeat(40) });
+  await expect(renewDevelopmentAuthority({ ...f.context, ...decision.intent!, resourceKeys: [f.resource.key] })).rejects.toThrow("evidence changed");
 });
 
 test("existing incomplete coverage skips classification and retains a truthful decision receipt", async () => {

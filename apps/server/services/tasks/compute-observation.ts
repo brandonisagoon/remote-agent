@@ -11,6 +11,7 @@ const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = z.string().min(1).max(256);
 export const ComputeObservation = z.object({ version: z.literal(1), environmentId: Identity,
   taskId: Identity, primarySessionId: Identity, purpose: z.enum(["development", "review"]), revision: z.string().regex(/^[a-f0-9]{40}$/),
+  sourceRevision: z.string().regex(/^[a-f0-9]{40}$/).optional(),
   recipeDigest: Digest, resourceId: Identity, resourceIdentity: Digest,
   observedAt: z.number().int().nonnegative(), state: z.enum(["running", "stopped", "absent", "unknown"]),
   coverage: z.enum(["complete", "incomplete"]), configurationDigest: Digest,
@@ -18,7 +19,7 @@ export const ComputeObservation = z.object({ version: z.literal(1), environmentI
   // observed configuration. Empty or missing job coverage is not idle.
   routes: z.array(ComputeRoute).max(32),
   operations: z.object({ coverage: z.enum(["complete", "incomplete"]), active: z.number().int().nonnegative(), generation: Digest }).strict(),
-}).strict();
+}).strict().refine(value => !value.sourceRevision || value.purpose === "development", "Actual source revision is only development evidence");
 export type ComputeObservation = z.infer<typeof ComputeObservation>;
 type Store = Pick<Prisma.TransactionClient, "computeEnvironment" | "computeTraffic" | "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeInstruction" | "runtimeLifecycleEvent" | "runtimeMetadataEvent">;
 type Context = { prisma: Store; config: ServerConfig; environmentId: string; now?: Date };
@@ -31,6 +32,7 @@ export async function recordComputeObservation(input: Context & { observation: C
   const env = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
   const saved = isSavedComputeEnvironment(env);
   if (saved) assertSavedComputeObservation(env, value, true);
+  if (value.sourceRevision && (saved || value.purpose !== "development")) throw new Error("Actual source revision is only measured development evidence");
   if (input.ownerEnrollment && value.state !== "stopped") throw new Error("Paused owner enrollment needs stopped compute");
   await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(input.prisma, env, { allowPaused: input.ownerEnrollment });
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: env.taskId } });
@@ -102,7 +104,7 @@ export async function computeEvidenceState(input: Context & { allowStopped?: boo
     sessions: sessions.map(value => ({ id: value.id, status: value.status, closedAt: value.closedAt })), instructions: instructions.map(value => ({ id: value.id, state: value.state, updatedAt: value.updatedAt })),
     lifecycle: lifecycle.map(value => ({ sequence: value.sequence, phase: value.phase, requestId: value.requestId })),
     traffic: summaries.map(value => ({ route: value.route, epoch: value.epoch, coverage: stopped ? "complete" : value.coverage, coverageSince: value.coverageSince, lastMeaningfulAt: value.lastMeaningfulAt, lastUnknownAt: value.lastUnknownAt, inFlight: value.inFlight, activeStreams: value.activeStreams })).sort((a,b) => a.route.id.localeCompare(b.route.id)) });
-  const evidence = ComputeDecisionEvidence.parse({ version: 1, task: { id: task.id, primarySessionId: primary.id, environmentId: env.id, purpose: env.purpose, revision: env.revision }, observedAt: now, evidenceDigest: snapshotDigest,
+  const evidence = ComputeDecisionEvidence.parse({ version: 1, task: { id: task.id, primarySessionId: primary.id, environmentId: env.id, purpose: env.purpose, revision: observation.sourceRevision ?? env.revision }, observedAt: now, evidenceDigest: snapshotDigest,
     traffic: { coverage: covered ? "complete" : "incomplete", lastMeaningfulAt: last("lastMeaningfulAt"), lastUnknownAt: last("lastUnknownAt"), inFlight: summaries.reduce((sum,value) => sum+value.inFlight,0), activeStreams: summaries.reduce((sum,value) => sum+value.activeStreams,0), quietForMs: summaries.length ? Math.max(0, Math.min(...summaries.map(value => now - Math.max(value.coverageSince, value.lastMeaningfulAt ?? 0, value.lastUnknownAt ?? 0)))) : 0, collectorAgeMs: Math.max(0, now - Math.min(observation.observedAt, ...summaries.map(value => value.observedAt))) },
     activity: { ownedSessionsSettled: settled, operationsComplete, pendingInstructions: pending, ownerPaused: task.ownerPaused, reviewProtected, latestInstructionAt: instructions.length ? Math.max(...instructions.map(value => value.createdAt.getTime())) : null }, conversation: [] });
   return { evidence, snapshotDigest, eligible, physicalState: observation.state, sessionIds: sessions.filter(value => !value.closedAt && value.status !== "closed").map(value => value.id), resource: { id: resource.id, key: resource.key, identityDigest: observation.resourceIdentity } };

@@ -1,5 +1,11 @@
 import { expect, test } from "bun:test";
-import { sanitizeComputeConversation } from "./compute-observation.ts";
+import { ComputeObservation, sanitizeComputeConversation } from "./compute-observation.ts";
+test("review observations cannot add mutable development source evidence", () => {
+  const value = { version: 1, environmentId: "environment", taskId: "task", primarySessionId: "primary", purpose: "review", revision: "a".repeat(40), sourceRevision: "b".repeat(40),
+    recipeDigest: "c".repeat(64), resourceId: "resource", resourceIdentity: "d".repeat(64), observedAt: Date.now(), state: "running", coverage: "incomplete", configurationDigest: "e".repeat(64), routes: [], operations: { coverage: "incomplete", active: 0, generation: "f".repeat(64) } };
+  expect(ComputeObservation.safeParse(value).success).toBe(false);
+  expect(ComputeObservation.safeParse({ ...value, sourceRevision: undefined }).success).toBe(true);
+});
 test("standalone and inline credential-shaped values are removed before Decisions input", () => {
   const standalone = "sk-proj-" + "synthetic".repeat(8), inline = "sk-" + "example".repeat(8), known = "opaque_fixture_credential_123";
   const value = sanitizeComputeConversation([{ role: "user", text: `${standalone}\nUse this ${inline} for development. Keep the app stopped.\n${known}` }], [known]);
