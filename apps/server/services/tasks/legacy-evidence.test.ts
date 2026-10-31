@@ -12,6 +12,7 @@ import type { RemoteTask, RemoteTaskResource } from "../../../../generated/prism
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
+import { bindPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tree.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
@@ -647,3 +648,24 @@ test.skipIf(!draftedRoot || process.platform !== "darwin")("actual stopped nativ
     expect((await prepareTaskFinalization({ ...f.finalInput, cleanup: true, authorityOnly: true }, f.dependencies)).cleanup).toEqual(active.cleanup);
   } finally { server?.stop(true); Object.assign(evidenceWriterObservation, original); legacyEvidenceDependencies.prepare = oldPrepare; await writer?.dispose(); }
 }, 30_000);
+
+
+test("closed original operation uses its adopted evidence and refuses new owner adoption", async () => {
+  const f = await fixture(), saved = await f.adopt();
+  await bindPreparedCleanup(f.finalInput, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const closedAt = new Date();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed", closedAt } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: closedAt } });
+  await expect(f.adopt()).rejects.toThrow("open original primary");
+  const entry = saved.proof.entries[0]!;
+  expect(await f.manage(saved, entry.key, "authorize")).toBeDefined();
+  await capture(saved);
+  expect(await f.manage(saved, entry.key, "confirm")).toBeDefined();
+  expect(await f.manage(saved, entry.key, "confirm")).toBeDefined();
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  expect(await readFile(path.join(f.archive, f.files[0]!.path), "utf8")).toBe("saved capture\n");
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  await expect(f.manage(saved, entry.key, "authorize")).rejects.toThrow();
+});

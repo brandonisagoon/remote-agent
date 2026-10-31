@@ -69,12 +69,12 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
   const { hasPreparedCleanup, assertPreparedCleanup, cleanupRetainedResourceIds } = await import("./cleanup-lifecycle.ts");
   const lifecycle = await hasPreparedCleanup(prisma, task.id, session.id, prepared.requestKey);
   const active = lifecycle ? await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey }) : undefined;
-  if (task.primarySessionId !== session.id || session.role !== "primary" || session.status === "closed" || task.ownerPaused || task.phase === "closed" || !lifecycle && !cleanup && task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
+  if (task.primarySessionId !== session.id || session.role !== "primary" || !active && (session.status === "closed" || session.closedAt || task.phase === "closed") || task.ownerPaused || !lifecycle && !cleanup && task.phase !== "complete") throw new Error("Finalization ownership, phase or task identity changed");
   if (task.repositoryId !== prepared.repositoryId || task.machineId !== prepared.machineId || task.machineId !== config.machine || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.cwd !== task.worktreePath || task.branchName !== prepared.branch || task.connectionId !== prepared.connectionId || task.issueIdentifier !== prepared.issueIdentifier) throw new Error("Finalization task identity changed");
   // Compare configured path identity without requiring the removed checkout.
   if (task.worktreePath !== prepared.taskWorktree) throw new Error("Finalization worktree ownership changed");
   if (await realpath(getRepositoryConfig(config, task.repositoryId).root) !== prepared.gitCwd) throw new Error("Finalization configured repository changed");
-  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", endedAt: null } });
+  const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(active?.closedContinuation ? {} : { endedAt: null }) } });
   if (!link) throw new Error("Finalization source ownership changed");
   const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${task.id}` }, orderBy: { sequence: "desc" } });
   if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Finalization completion authority was revoked or replaced");

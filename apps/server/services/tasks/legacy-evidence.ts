@@ -25,10 +25,16 @@ export function legacyEvidenceResourceDigest(resource: RemoteTaskResource) {
     externalId: resource.externalId, expiresAt: resource.expiresAt?.toISOString() ?? null, createdAt: resource.createdAt.toISOString(), metadata: immutable });
 }
 
-async function preparation(prisma: Database, config: ServerConfig, taskId: string, revision: number, requestKey: string) {
+async function preparation(prisma: Database, config: ServerConfig, taskId: string, revision: number, requestKey: string, existing = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
-  const session = task.primarySessionId && await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } });
-  if (!session || task.ownerPaused || task.phase === "closed" || session.status === "closed" || session.role !== "primary" || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Legacy evidence requires the open original primary and unchanged owner authority");
+  const session = task.primarySessionId ? await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } }) : null;
+  const closed = task.phase === "closed" || session?.status === "closed" || Boolean(session?.closedAt);
+  if (!session || task.ownerPaused || closed && !existing || session.role !== "primary" || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Legacy evidence requires the open original primary and unchanged owner authority");
+  if (closed) {
+    const { assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+    const active = await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey });
+    if (active.preparation.sequence !== revision) throw new Error("Legacy evidence cleanup preparation changed");
+  }
   const event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
   if (!event || event.action !== FINALIZATION_PREPARED || event.runtimeSessionId !== session.id || event.source !== `finalizer:${taskId}` || event.key !== requestKey) throw new Error("Legacy evidence requires the exact existing finalization preparation");
   const raw = JSON.parse(event.value!);
@@ -37,7 +43,7 @@ async function preparation(prisma: Database, config: ServerConfig, taskId: strin
   if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== requestKey || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier || prepared.delivery.boundary !== "merge" || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha || prepared.delivery.receipts.contractRevision !== prepared.contractRevision) throw new Error("Legacy evidence preparation identity or verified merge changed");
   const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${taskId}` }, orderBy: { sequence: "desc" } });
   if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Legacy evidence completion authority was revoked or replaced");
-  const linked = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", endedAt: null } });
+  const linked = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
   if (!linked) throw new Error("Legacy evidence source ownership changed");
   const identityDigest = finalizationDigest({ taskId, sessionId: session.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier,
     worktree: task.worktreePath, branch: task.branchName, baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot,
@@ -74,7 +80,7 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
   const event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
   if (!event || event.action !== LEGACY_EVIDENCE_RETAINED || event.source !== `owner:${taskId}`) throw new Error("Legacy evidence has no authenticated retention proof");
   const proof = LegacyEvidenceProof.parse(JSON.parse(event.value!));
-  const current = await preparation(prisma, config, taskId, proof.preparedRevision, proof.finalizationRequestKey);
+  const current = await preparation(prisma, config, taskId, proof.preparedRevision, proof.finalizationRequestKey, true);
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, source: `owner:${taskId}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
   if (latest?.sequence !== event.sequence || event.runtimeSessionId !== current.session.id || event.key !== proof.input.requestKey || proof.taskId !== taskId || proof.sessionId !== current.session.id || proof.identityDigest !== current.identityDigest || proof.preparedDigest !== finalizationDigest(JSON.parse(current.event.value!)) || proof.contractRevision !== current.prepared.contractRevision) throw new Error("Legacy evidence proof or preparation authority changed");
   const resources = await prisma.remoteTaskResource.findMany({ where: { taskId } });

@@ -29,10 +29,11 @@ const activeWorkers = new WeakMap<PrismaClient, { tick(): void; stop(): Promise<
 async function epoch(input: Context) {
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { primarySessionId: input.sessionId } });
   const session = await input.prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
-  if (input.requestKey !== `finalize:${task.id}` || task.ownerPaused || task.phase === "closed" || session.status === "closed" || session.role !== "primary"
+  const closed = task.phase === "closed" || session.status === "closed" || Boolean(session.closedAt);
+  if (input.requestKey !== `finalize:${task.id}` || task.ownerPaused || session.role !== "primary"
     || task.machineId !== input.config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Preparation original task ownership changed, paused or closed");
-  await automaticCleanupTurn(input.prisma, task, false, input.runtime);
-  if (await hasPreparedCleanup(input.prisma, task.id, session.id, input.requestKey)) await assertPreparedCleanup(input);
+  if (closed || await hasPreparedCleanup(input.prisma, task.id, session.id, input.requestKey)) await assertPreparedCleanup(input);
+  if (!closed) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
   const turn = await input.prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: session.id }, orderBy: { sequence: "desc" } });
   const owners = await input.prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: session.id, source: `owner:${task.id}` }, orderBy: { sequence: "asc" } });
   const resources = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id }, orderBy: { id: "asc" } });

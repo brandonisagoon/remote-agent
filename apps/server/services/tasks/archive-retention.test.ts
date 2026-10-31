@@ -18,6 +18,7 @@ import { observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { observeSavedArchive } from "./archive-observation.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
 import { adoptLegacyEvidence, manageLegacyEvidence } from "./legacy-evidence.ts";
+import { bindPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
 let db: TestDatabase, directory: string;
@@ -389,3 +390,22 @@ test.skipIf(!draftedRoot).each(["evidence-archive", "private-backup"])("actual o
   } finally { await server.stop(true); }
 }, 60_000);
 
+
+
+test("closed original operation rechecks an existing archive proof without adopting a new one", async () => {
+  const f = await fixture(), saved = retention(f.prepared!);
+  await bindPreparedCleanup(f.input, async () => {});
+  const frozen = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const closedAt = new Date();
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "idle", closedAt } });
+  await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: closedAt } });
+  expect(await f.check(saved)).toEqual(saved);
+  expect(retention(await prepareTaskFinalization({ ...f.input, cleanup: true }, f.finalizationDependencies))).toEqual(saved);
+  f.remove();
+  expect(retention(await confirmTaskFinalization({ ...f.input, cleanup: true }, f.finalizationDependencies))).toEqual(saved);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+  await writeFile(path.join(f.archive, "README.md"), "changed retained bytes");
+  await expect(f.check(saved)).rejects.toThrow("contents or inode inventory changed");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: ARCHIVE_RETENTION } })).toBe(1);
+});

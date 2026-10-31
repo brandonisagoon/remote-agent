@@ -28,12 +28,19 @@ async function context(prisma: Database, config: ServerConfig, taskId: string, p
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: prepared.sessionId } });
   const confirmed = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "finalization-confirmed", source: event.source, key: event.key } });
-  if (!["complete", "closed"].includes(task.phase)) {
+  const closed = task.phase === "closed" || session.status === "closed" || Boolean(session.closedAt);
+  let continuation = false;
+  if (closed && !confirmed) {
+    const { assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
+    const active = await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
+    if (active.preparation.sequence !== event.sequence) throw new Error("Saved archive preparation changed");
+    continuation = active.closedContinuation;
+  } else if (!["complete", "closed"].includes(task.phase)) {
     const { inspectPreparedCleanupAuthority } = await import("./cleanup-lifecycle.ts");
     await inspectPreparedCleanupAuthority({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
   }
   if (task.primarySessionId !== session.id || session.role !== "primary" || task.ownerPaused
-    || (task.phase === "closed" || session.status === "closed") && (!confirmed || JSON.parse(confirmed.value!).preparedRevision !== event.sequence)
+    || closed && !continuation && (!confirmed || JSON.parse(confirmed.value!).preparedRevision !== event.sequence)
     || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath
     || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId
     || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier) throw new Error("Saved archive task or original primary changed");
