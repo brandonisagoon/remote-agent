@@ -61,6 +61,7 @@ console.log(JSON.stringify(await observeCompute(input, { docker, request: fetch,
   const runtime = createFakeAgentRuntime([primary]), app = createApp({ config, prisma, agentRuntime: runtime, trustLocal: true });
   const server = Bun.serve({ unix: socket, fetch: app.fetch }); cleanup.push(async () => { await server.stop(true); });
   const { taskRegistry } = await import(path.join(clientRoot!, "src/control.ts"));
+  const { continueDevelopmentIntent } = await import(path.join(clientRoot!, "src/development-intent.ts"));
   const { dockerResources, manageResource } = await import(path.join(clientRoot!, "src/resources.ts"));
   const registry = taskRegistry(socket, task.id), effects: string[] = [];
   const docker = dockerResources(async (...args: string[]) => {
@@ -81,12 +82,15 @@ console.log(JSON.stringify(await observeCompute(input, { docker, request: fetch,
     await prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "completed" } });
     await prisma.runtimeLifecycleEvent.create({ data: { id: `${offer.id}:completed`, runtimeSessionId: primary.id, requestId: offer.instructionId, phase: "completed", occurredAt: new Date() } });
   };
-  expect(await manage("resume")).toMatchObject({ phase: "waiting-compute" });
+  await registry.setDevelopmentIntent({ action: "resume", development: true, requestKey: "explicit-owner-resume" });
+  const continueResume = () => continueDevelopmentIntent(registry, (input: any) => manageResource({ ...input, docker }));
+  expect(await continueResume()).toMatchObject({ pending: { reason: "waiting-compute" } });
   const environmentId = (await prisma.computeEnvironment.findFirstOrThrow()).id;
   const refresh = () => refreshComputeObservation({ prisma, config, environmentId });
   const reconcile = () => reconcileObservedCompute({ ...context, environmentId, runtime });
   await refresh(); await offerNextCompute(context); const first = await deliver();
   expect(await manage("resume", first.id)).toMatchObject({ state: "ready" });
+  expect((await continueResume()).developmentIntent.state).toBe("complete");
   await refresh(); expect(await reconcile()).toEqual({ released: false }); await settle(first);
   if (when === "while-running") {
     git(product, "commit", "--allow-empty", "-qm", "ordinary product change during development");
