@@ -16,7 +16,7 @@ async function git(worktree: string, args: string[]) {
 
 /** Retain exact ignored install roots, bound to their tracked package/lock files.
  * Dependency contents are not individually hashed or deleted. */
-export async function prepareInstalledDependencies(worktree: string): Promise<Dependencies> {
+export async function prepareInstalledDependencies(worktree: string, fullyInventoriedRoots: string[] = []): Promise<Dependencies> {
   const tracked = new Set((await git(worktree, ["ls-files", "-z"])).split("\0").filter(Boolean));
   const lockNames = locks.filter(file => tracked.has(file));
   const ignored = (await git(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"])).split("\0").filter(Boolean);
@@ -27,6 +27,7 @@ export async function prepareInstalledDependencies(worktree: string): Promise<De
     if (path.isAbsolute(relative) || path.normalize(relative) !== relative || relative.split(path.sep).includes("..")) throw new Error("Installed dependency path is invalid");
     const file = path.join(worktree, relative), packageFile = path.join(path.dirname(relative), "package.json");
     if (!lockNames.length || !tracked.has(packageFile) || await git(worktree, ["ls-files", "-z", "--", relative])) throw new Error("Installed dependencies need their tracked package and lock pins");
+    if (fullyInventoriedRoots.includes(file)) continue;
     await assertFinalizationPath(file);
     const stat = await lstat(file);
     if (!stat.isDirectory() || stat.uid !== process.getuid?.() || (stat.mode & 0o022) !== 0 || await realpath(file) !== file) throw new Error("Installed dependency directory is shared, unowned or redirected");
