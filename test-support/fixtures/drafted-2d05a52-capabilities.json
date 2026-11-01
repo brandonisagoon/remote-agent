@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "capabilities": {
+    "prepare": {
+      "instructions": "agent-skills/prepare/instructions.md",
+      "adapter": "src/cli.ts"
+    },
+    "merge": {
+      "instructions": "agent-skills/merge/instructions.md",
+      "adapter": "src/cli.ts"
+    },
+    "development-credentials": {
+      "instructions": "credentials/README.md",
+      "adapter": "src/credentials-backup.ts"
+    },
+    "cleanup": {
+      "instructions": "projects/greenfield/cleanup.md",
+      "adapter": "src/cli.ts",
+      "observationContracts": [
+        "retained-preview-inputs/v1"
+      ]
+    },
+    "runtime": {
+      "instructions": "projects/greenfield/runtime.md",
+      "adapter": "src/cli.ts",
+      "observationContracts": [
+        "compute-traffic/v1",
+        "compute-baseline/v1"
+      ]
+    },
+    "browser": {
+      "instructions": "projects/greenfield/browser.md",
+      "adapter": "src/cli.ts"
+    }
+  }
+}

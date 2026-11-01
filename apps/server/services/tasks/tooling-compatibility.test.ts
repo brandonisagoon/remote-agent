@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import deployedManifest from "../../../../test-support/fixtures/drafted-2d05a52-capabilities.json";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -158,6 +159,55 @@ for (const capability of ["runtime", "browser"] as const) {
     expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
     await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
     await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability })).rejects.toThrow("paused");
+  });
+}
+
+// Exact manifest from Drafted 2d05a52d6ad9fe6237772ef9d07dae3a5740c894.
+// Exercise the committed manifest through the same route used by real primaries.
+async function withRuntimeManifest(contracts: unknown) {
+  const f = await fixture(true);
+  const manifest = structuredClone(deployedManifest);
+  write(f.source, manifest.capabilities.runtime.instructions, "Reviewed deployed runtime instructions");
+  write(f.source, ".remote-agent-capabilities.json", JSON.stringify({ ...manifest, capabilities: {
+    ...manifest.capabilities, runtime: { ...manifest.capabilities.runtime, observationContracts: contracts },
+  } }));
+  const revision = commit(f.source);
+  f.repository.tooling.revision = revision;
+  const hostPin = f.pin(revision);
+  const app = createApp({ config: f.config, prisma: db.prisma, agentRuntime: f.runtime });
+  const request = () => app.request(`/api/sessions/${f.session.id}/tooling-capability`, {
+    method: "POST", headers: { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ capability: "runtime" }),
+  });
+  return { ...f, revision, hostPin, request };
+}
+
+for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"]]) {
+  test(`deployed runtime manifest resolves supported contracts ${contracts.join(",")}`, async () => {
+    const f = await withRuntimeManifest(contracts);
+    const response = await f.request();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ receipt: { capability: "runtime", source: "configured-host",
+      capabilityRevision: f.revision, taskToolingRevision: f.oldRevision, adapter: realpathSync(path.join(f.hostPin, "src/cli.ts")) } });
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(1);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect(await db.prisma.remoteTaskResource.count()).toBe(0);
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({
+      primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin,
+    });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    expect((await f.request()).status).toBe(409);
+  });
+}
+
+for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["compute-traffic/v1", "unknown/v1"],
+  ["compute-traffic/v2"], ["compute-traffic/v1", "compute-baseline/v1", "compute-baseline/v1"], "compute-traffic/v1", null]) {
+  test(`deployed runtime manifest rejects invalid contracts ${JSON.stringify(contracts)}`, async () => {
+    const f = await withRuntimeManifest(contracts);
+    expect((await f.request()).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
   });
 }
 
