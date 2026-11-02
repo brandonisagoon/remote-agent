@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -341,4 +341,91 @@ test("malformed interactive transaction context refuses authority without native
   legacyOriginalWorkDependencies.generatedOwner = async () => { observed = true; return "f".repeat(64); };
   const prisma = new Proxy(db.prisma, { get(target, key, receiver) { if (key === Symbol.for("prisma.client.transaction.scope_context")) return { kind: "nested", txId: "tx", scopeId: "scope", scopeState: {} }; return Reflect.get(target, key, receiver); } });
   await expect(assertPreparedCleanup({ ...f.input, prisma })).rejects.toThrow("Unsupported local cleanup transaction context"); expect(observed).toBe(false);
+}, 15000);
+
+test.each([false, true])("task status routes never invoke native cleanup verification (closed=%s)", async closed => {
+  const f = await generatedFixture();
+  if (closed) {
+    await db.prisma.remoteTaskResource.updateMany({ where: { taskId: f.task.id }, data: { state: "released" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `finalizer:${f.task.id}`, action: "finalization-confirmed", key: f.input.requestKey, value: JSON.stringify({ preparedRevision: f.preparation.sequence }) } });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+    await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed", closedAt: new Date() } });
+  }
+  let nativeChecks = 0;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; throw new Error("native verification must remain at the effect boundary"); };
+  for (const route of [`/api/tasks/${f.task.id}`, `/api/sessions/${f.session.id}/task`, "/api/tasks", "/api/tasks?pagination=id"]) {
+    const response = await f.app.request(route), body = await response.json();
+    expect(response.status).toBe(200);
+    const task = body.task ?? body.tasks.find((task: { id: string }) => task.id === f.task.id);
+    expect(task.cleanupOperation?.operationRevision).toBe(f.operation.sequence);
+    if (closed) expect(task.cleanupOperation.confirmedRevision).toBeGreaterThan(f.preparation.sequence);
+  }
+  expect(nativeChecks).toBe(0);
+  if (!closed) {
+    const effect = await f.app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
+    expect(effect.status).toBe(409); expect(nativeChecks).toBe(1);
+  }
+}, 15000);
+
+test.each(["paused", "revoked", "malformed-proof"])("local status preserves history but blocks actionable cleanup for %s", async kind => {
+  const f = await generatedFixture();
+  legacyOriginalWorkDependencies.generatedOwner = async () => { throw new Error("status attempted a native observation"); };
+  if (kind === "paused") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (kind === "revoked") await f.revoke();
+  if (kind === "malformed-proof") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.receipt.revision }, data: { value: "{}" } });
+  const response = await f.app.request(`/api/tasks/${f.task.id}`), body = await response.json();
+  expect(response.status).toBe(200); expect(body.task.cleanupHistory.operationRevision).toBe(f.operation.sequence);
+  expect(body.task.cleanupOperation).toBeUndefined(); expect(body.task.cleanupBlocked).toBeString();
+}, 15000);
+
+
+test("pending preparation polls stay local and join the single native worker", async () => {
+  const f = await generatedFixture();
+  const { requestFinalizationPreparation, preparationJournalWorker } = await import("./finalization-preparation.ts");
+  const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "full-check" };
+  let nativeChecks = 0, preparations = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; await gate; return "f".repeat(64); };
+  const accepted = await requestFinalizationPreparation(input, attempt); expect(nativeChecks).toBe(0);
+  const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, async () => {
+    preparations++; await assertPreparedCleanup(f.input);
+    return { ...f.prepared, cleanup: { operationRevision: f.operation.sequence, operationDigest: finalizationDigest(f.active.operation) } };
+  });
+  try {
+    worker.tick(); const deadline = Date.now() + 2000;
+    while (!nativeChecks) { if (Date.now() > deadline) throw Error("Native worker did not start"); await Bun.sleep(1); }
+    for (let i = 0; i < 3; i++) { const pending = await requestFinalizationPreparation(input, attempt); expect(pending.preparation.acceptedRevision).toBe(accepted.preparation.acceptedRevision); expect(pending.preparation.state).toBe("running"); }
+    expect(nativeChecks).toBe(1); expect(preparations).toBe(1);
+    release(); await worker.idle();
+    const ready = await requestFinalizationPreparation(input, attempt); expect(ready.preparation.state).toBe("ready"); expect(nativeChecks).toBe(2);
+  } finally { release(); await worker.stop(); }
+}, 15000);
+
+test("ready confirmation rechecks native authority once and rejects a changed saved result", async () => {
+  const f = await generatedFixture();
+  const { requestFinalizationConfirmation, preparationJournalWorker } = await import("./finalization-preparation.ts");
+  const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "confirmation" };
+  let nativeChecks = 0; legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; return "f".repeat(64); };
+  const pending = await requestFinalizationConfirmation(input, attempt); expect(nativeChecks).toBe(0);
+  const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, undefined, async () => {
+    const confirmed = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `finalizer:${f.task.id}`, action: "finalization-confirmed", key: f.input.requestKey, value: JSON.stringify({ preparedRevision: f.preparation.sequence }) } });
+    return { ...f.prepared, confirmedRevision: confirmed.sequence, cleanup: { operationRevision: f.operation.sequence, operationDigest: finalizationDigest(f.active.operation) } };
+  });
+  try { worker.tick(); await worker.idle(); nativeChecks = 0;
+    const ready = await requestFinalizationConfirmation(input, attempt); expect(ready.confirmation.state).toBe("ready"); expect(nativeChecks).toBe(1);
+    const status = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: f.session.id, action: "finalization-preparation-status", key: String(pending.confirmation.acceptedRevision) }, orderBy: { sequence: "desc" } });
+    const value = JSON.parse(status.value!); value.result.confirmedRevision += 1000; await db.prisma.runtimeMetadataEvent.update({ where: { sequence: status.sequence }, data: { value: JSON.stringify(value) } });
+    await expect(requestFinalizationConfirmation(input, attempt)).rejects.toThrow("Confirmation result does not match");
+  } finally { await worker.stop(); }
+}, 15000);
+
+test("a failed physical worker cannot publish ready through local polling", async () => {
+  const f = await generatedFixture();
+  const { requestFinalizationPreparation, preparationJournalWorker } = await import("./finalization-preparation.ts");
+  const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "full-check" };
+  legacyOriginalWorkDependencies.generatedOwner = async () => { throw Error("Physical source witness unavailable"); };
+  await requestFinalizationPreparation(input, attempt);
+  const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, () => assertPreparedCleanup(f.input));
+  try { worker.tick(); await worker.idle(); const result = await requestFinalizationPreparation(input, attempt); expect(result.preparation.state).toBe("failed"); expect(result).not.toHaveProperty("receipt"); }
+  finally { await worker.stop(); }
 }, 15000);

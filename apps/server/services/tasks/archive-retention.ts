@@ -21,7 +21,7 @@ const where = (taskId: string, sessionId: string) => ({ runtimeSessionId: sessio
 
 /** Read-only identity checks also support closed-task upkeep. A confirmed close
  * cannot widen the archive scope or erase the original preparation/grant. */
-async function context(prisma: Database, config: ServerConfig, taskId: string, preparedRevision: number) {
+async function context(prisma: Database, config: ServerConfig, taskId: string, preparedRevision: number, projection = false) {
   const event = await prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: preparedRevision } });
   const raw = JSON.parse(event.value!);
   if (raw.version !== undefined) throw new Error("Saved archive retention supplements only version 1 preparation");
@@ -33,8 +33,8 @@ async function context(prisma: Database, config: ServerConfig, taskId: string, p
   const closed = task.phase === "closed" || session.status === "closed" || Boolean(session.closedAt);
   let continuation = false;
   if (closed && !confirmed) {
-    const { assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
-    const active = await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
+    const { assertPreparedCleanup, inspectPreparedCleanupState } = await import("./cleanup-lifecycle.ts");
+    const active = await (projection ? inspectPreparedCleanupState : assertPreparedCleanup)({ prisma, config, sessionId: session.id, requestKey: prepared.requestKey });
     if (active.preparation.sequence !== event.sequence) throw new Error("Saved archive preparation changed");
     continuation = active.closedContinuation;
   } else if (!["complete", "closed"].includes(task.phase)) {
@@ -82,10 +82,10 @@ function assertRecords(current: Awaited<ReturnType<typeof context>>, proof: Arch
   if (proof.archives.some(archive => cleanup.some(root => within(root, archive.selection.root) || within(archive.selection.root, root)))) throw new Error("Saved archive now overlaps an active cleanup resource");
 }
 
-async function load(prisma: Database, config: ServerConfig, taskId: string, revision: number) {
+async function load(prisma: Database, config: ServerConfig, taskId: string, revision: number, projection = false) {
   const event = await prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: revision } });
   const proof = ArchiveRetentionProof.parse(JSON.parse(event.value!));
-  const current = await context(prisma, config, taskId, proof.preparedRevision);
+  const current = await context(prisma, config, taskId, proof.preparedRevision, projection);
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: where(taskId, current.session.id), orderBy: { sequence: "desc" } });
   if (event.action !== ARCHIVE_RETENTION || event.source !== `finalizer-archives:${taskId}` || event.runtimeSessionId !== current.session.id || event.key !== proof.requestKey || latest?.sequence !== event.sequence) throw new Error("Saved archive retention proof changed");
   assertRecords(current, proof);
@@ -172,13 +172,17 @@ export async function ensureArchiveRetention(input: Context): Promise<ArchiveRet
 }
 
 /** Database-only gate for transactions; callers verify bytes outside the lock. */
-export async function retainedArchiveResourceIds(prisma: Database, config: ServerConfig, prepared: PreparedFinalization) {
+async function retainedIds(prisma: Database, config: ServerConfig, prepared: PreparedFinalization, projection: boolean) {
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: where(prepared.taskId, prepared.sessionId), orderBy: { sequence: "desc" } });
   if (!event) return new Set<string>();
-  const loaded = await load(prisma, config, prepared.taskId, event.sequence);
+  const loaded = await load(prisma, config, prepared.taskId, event.sequence, projection);
   if (loaded.prepared.requestKey !== prepared.requestKey || finalizationDigest(loaded.prepared) !== finalizationDigest(prepared)) throw new Error("Saved archive preparation changed");
   return new Set(loaded.proof.resources.map(resource => resource.id));
 }
+
+export const retainedArchiveResourceIds = (prisma: Database, config: ServerConfig, prepared: PreparedFinalization) => retainedIds(prisma, config, prepared, false);
+/** Status-only local retention projection; never authorizes an effect. */
+export const projectedRetainedArchiveResourceIds = (prisma: Database, config: ServerConfig, prepared: PreparedFinalization) => retainedIds(prisma, config, prepared, true);
 
 export async function verifyPreparedArchives(prisma: PrismaClient, config: ServerConfig, prepared: PreparedFinalization) {
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: where(prepared.taskId, prepared.sessionId), orderBy: { sequence: "desc" } });
@@ -202,7 +206,7 @@ export async function archiveRetentionProjection(prisma: PrismaClient, config: S
   if (!task.primarySessionId) return {};
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: where(task.id, task.primarySessionId), orderBy: { sequence: "desc" } });
   if (!event) return {};
-  try { return { archiveRetentionRequired: true as const, archiveRetention: (await load(prisma, config, task.id, event.sequence)).receipt }; }
+  try { return { archiveRetentionRequired: true as const, archiveRetention: (await load(prisma, config, task.id, event.sequence, true)).receipt }; }
   catch { return { archiveRetentionRequired: true as const }; }
 }
 

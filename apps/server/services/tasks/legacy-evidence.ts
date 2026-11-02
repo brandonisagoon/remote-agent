@@ -1,5 +1,5 @@
 import { activeCleanupRoots } from "./cleanup-scope.ts";
-import { retainedArchiveResourceIds } from "./archive-retention.ts";
+import { retainedArchiveResourceIds, projectedRetainedArchiveResourceIds } from "./archive-retention.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { PrismaClient, RemoteTaskResource } from "../../../../generated/prisma/client.ts";
@@ -27,14 +27,14 @@ export function legacyEvidenceResourceDigest(resource: RemoteTaskResource) {
     externalId: resource.externalId, expiresAt: resource.expiresAt?.toISOString() ?? null, createdAt: resource.createdAt.toISOString(), metadata: immutable });
 }
 
-async function preparation(prisma: Database, config: ServerConfig, taskId: string, revision: number, requestKey: string, existing = false) {
+async function preparation(prisma: Database, config: ServerConfig, taskId: string, revision: number, requestKey: string, existing = false, projection = false) {
   const task = await prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const session = task.primarySessionId ? await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId } }) : null;
   const closed = task.phase === "closed" || session?.status === "closed" || Boolean(session?.closedAt);
   if (!session || task.ownerPaused || closed && !existing || session.role !== "primary" || task.machineId !== config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Legacy evidence requires the open original primary and unchanged owner authority");
   if (closed) {
-    const { assertPreparedCleanup } = await import("./cleanup-lifecycle.ts");
-    const active = await assertPreparedCleanup({ prisma, config, sessionId: session.id, requestKey });
+    const { assertPreparedCleanup, inspectPreparedCleanupState } = await import("./cleanup-lifecycle.ts");
+    const active = await (projection ? inspectPreparedCleanupState : assertPreparedCleanup)({ prisma, config, sessionId: session.id, requestKey });
     if (active.preparation.sequence !== revision) throw new Error("Legacy evidence cleanup preparation changed");
   }
   const event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
@@ -82,15 +82,15 @@ async function assertUnsharedDirectory(prisma: Database, taskId: string, resourc
   if (shared) throw new Error("Directory evidence overlaps another task or resource");
 }
 
-async function loadProof(prisma: Database, config: ServerConfig, taskId: string, revision: number) {
+async function loadProof(prisma: Database, config: ServerConfig, taskId: string, revision: number, projection = false) {
   const event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: revision } });
   if (!event || event.action !== LEGACY_EVIDENCE_RETAINED || event.source !== `owner:${taskId}`) throw new Error("Legacy evidence has no authenticated retention proof");
   const proof = LegacyEvidenceProof.parse(JSON.parse(event.value!));
-  const current = await preparation(prisma, config, taskId, proof.preparedRevision, proof.finalizationRequestKey, true);
+  const current = await preparation(prisma, config, taskId, proof.preparedRevision, proof.finalizationRequestKey, true, projection);
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: current.session.id, source: `owner:${taskId}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
   if (latest?.sequence !== event.sequence || event.runtimeSessionId !== current.session.id || event.key !== proof.input.requestKey || proof.taskId !== taskId || proof.sessionId !== current.session.id || proof.identityDigest !== current.identityDigest || proof.preparedDigest !== finalizationDigest(JSON.parse(current.event.value!)) || proof.contractRevision !== current.prepared.contractRevision) throw new Error("Legacy evidence proof or preparation authority changed");
   const resources = await prisma.remoteTaskResource.findMany({ where: { taskId } });
-  const retainedIds = await retainedArchiveResourceIds(prisma, config, current.prepared);
+  const retainedIds = await (projection ? projectedRetainedArchiveResourceIds : retainedArchiveResourceIds)(prisma, config, current.prepared);
   const roots = cleanupRoots(current.task, current.prepared, resources, true, retainedIds);
   const wholeRoots = cleanupRoots(current.task, current.prepared, resources, false, retainedIds);
   if (roots.some((root) => within(root, proof.archiveRoot) || within(proof.archiveRoot, root)) || proof.entries.some((entry) => wholeRoots.some((root) => (!isEvidenceTree(entry) && within(root, entry.target.path)) || within(root, entry.target.quarantine.directory)))) throw new Error("Retained evidence now overlaps a task cleanup root");
@@ -108,7 +108,7 @@ async function loadProof(prisma: Database, config: ServerConfig, taskId: string,
 
 // Local authority only: physical saved-copy/capture checks stay at adoption and
 // every evidence operation. The cleanup supplement reuses this exact binding.
-export const inspectLegacyEvidenceAuthority = loadProof;
+export const inspectLegacyEvidenceAuthority = (prisma: Database, config: ServerConfig, taskId: string, revision: number) => loadProof(prisma, config, taskId, revision);
 
 /** Only the owner's authenticated route can adopt old receipts. The old
  * preparation and metadata remain byte-for-byte untouched; missing hashes are
@@ -265,7 +265,7 @@ export async function legacyEvidenceProjection(prisma: PrismaClient, config: Ser
   if (!task.primarySessionId) return {};
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `owner:${task.id}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
   if (!event) return {};
-  try { return { legacyEvidenceRetentionRequired: true as const, legacyEvidenceRetention: (await loadProof(prisma, config, task.id, event.sequence)).receipt }; }
+  try { return { legacyEvidenceRetentionRequired: true as const, legacyEvidenceRetention: (await loadProof(prisma, config, task.id, event.sequence, true)).receipt }; }
   catch { return { legacyEvidenceRetentionRequired: true as const }; }
 }
 
