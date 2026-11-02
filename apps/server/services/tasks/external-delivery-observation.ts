@@ -73,6 +73,14 @@ export async function observeExternalRemote(delivery: ExternalDeliveryInput, rev
   return { id: delivery.id, repository: delivery.repository, pullRequest: delivery.pullRequest, url: pr.html_url, reviewedHead: delivery.reviewedHead, mergeCommit: pr.merge_commit_sha, mergedAt: pr.merged_at, baseHead: base.sha, ci };
 }
 
+/** Discover the merge through the normal read-only GitHub transport, then run
+ * the same exact head/branch/base/ancestry checks as accepted external history.
+ * This observes a retained reference, not a replacement completion contract. */
+export async function observeLocalCleanupReference(reference: { id: string; repository: string; pullRequest: number; reviewedHead: string; branch: string; baseBranch: string }, client: CommandClient = bunCommandClient) {
+  const pr = z.object({ merge_commit_sha: Sha }).parse(JSON.parse(await run(client, path.parse(process.cwd()).root, "gh", ["api", `repos/${reference.repository}/pulls/${reference.pullRequest}`])));
+  return observeExternalRemote({ ...reference, sourcePath: "/", expectedMergeCommit: pr.merge_commit_sha, verificationRefs: [] }, false, client);
+}
+
 export const externalDeliveryObservation = { source: observeExternalSource, reports: observeExternalReports, remote: observeExternalRemote };
 export async function observeExternalDeliveries(deliveries: ExternalDeliveryInput[], mergeOrder: string[], reviewRequired: boolean, observer = externalDeliveryObservation) {
   const results = await Promise.all(mergeOrder.map(async (id) => {

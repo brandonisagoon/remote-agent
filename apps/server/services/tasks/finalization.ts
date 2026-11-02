@@ -1,3 +1,4 @@
+import { ensureLocalCleanupReference } from "./local-cleanup-reference.ts";
 import { verifyRetainedToolingEvidence } from "./legacy-evidence.ts";
 import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority, legacyOriginalWorkDependencies } from "./legacy-original-work.ts";
 import { assertLegacyOriginalWorkFiles } from "./legacy-original-work-files.ts";
@@ -314,6 +315,7 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   if (confirmed) await assertFinalizationRemoved(active.prepared);
   await assertPreparedCleanup(input);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, !confirmed);
+  if (!confirmed) await ensureLocalCleanupReference({ prisma: input.prisma, active, assertAuthority: prisma => assertPreparedCleanup({ ...input, prisma }) });
   return { ...result(active.prepared, active.preparation.sequence, confirmed?.sequence, archiveRetention, active.retirementSupplement, cleanupReference(input, active)), ...(retainedCompose ? { retainedCompose } : {}), ...(legacyOriginalWork ? { legacyOriginalWork } : {}) };
 }
 

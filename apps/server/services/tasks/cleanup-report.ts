@@ -1,3 +1,4 @@
+import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
 import { legacyOriginalWorkReceipt } from "./legacy-original-work.ts";
 import { legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { serializeIssuePublication } from "../sessions/issue-updates.ts";
@@ -143,7 +144,8 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
     const report = active.kind === "v1" && active.prepared.localCompletion && saved.history.recordedConfirmationRevision
       ? await readLocalCleanupReport(prisma, active as Awaited<ReturnType<typeof inspectCompletedCleanupState>>)
       : await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
-    const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined);
+    const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined)
+      ?? await localCleanupReferenceRetention(prisma, active, saved.history.recordedConfirmationRevision ?? undefined);
     const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
     return { ...history, ...(retainedCompose ? { retainedCompose } : {}), ...(finalizationRetention ? { finalizationRetention } : {}), cleanupOperation: { operationRevision: active.operationRevision, operationDigest: retirementDigest(active.operation),
       preparedRevision: active.preparation.sequence, ...(saved.history.recordedConfirmationRevision ? { confirmedRevision: saved.history.recordedConfirmationRevision } : {}), reportingPending: Boolean(saved.history.recordedConfirmationRevision && !(report?.published || report && "recorded" in report && report.recorded)) } };

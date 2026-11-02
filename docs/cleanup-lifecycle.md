@@ -470,3 +470,23 @@ and retry, while identity/order/lifetime changes and owner pause still refuse.
 The private runtime journal and observation field carry progress; the original
 preparation, operation and registered ownership remain unchanged. Docker and
 remote provider effects are injected; no live cleanup is performed by this test.
+
+
+## Direct local completion with a published reference
+
+A direct v1 `local-only` task may have one frozen Ready pull-request bookmark
+whose historical metadata predates its merge. Full preparation can independently
+observe that exact repository, accepted head, branch, base and merge ancestry
+through the existing read-only GitHub checker. It saves an additive
+`finalization-local-reference` proof behind a fresh local authority/receipt CAS.
+The proof binds the original raw preparation and operation, original-source
+adoption when present, task/pin and complete immutable resource identities.
+
+This retains the bookmark as Ready through the existing `finalizationRetention`
+projection. It does not convert local completion into a Merge workflow, create a
+TaskDelivery or Linear binding, rewrite historical `draft` metadata, or release a
+physical resource. Status/projection and authority-only reads never contact
+GitHub or create the supplement. Existing physical authority checks remain intact.
+Unknown or ambiguous references still refuse; confirmation cannot create a new
+supplement after cleanup. The configured client already understands this v1
+retained-reference projection, so no client/config migration is required.
