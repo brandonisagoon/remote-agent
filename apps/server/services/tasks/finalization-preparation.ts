@@ -6,7 +6,7 @@ import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.t
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { FinalizationContext } from "./finalization-receipts.ts";
 import { automaticCleanupTurn } from "./cleanup-inbox.ts";
-import { assertPreparedCleanup, hasPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { assertPreparedCleanup, hasPreparedCleanup, inspectPreparedCleanupState } from "./cleanup-lifecycle.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
 import { preparationStage, withPreparationDiagnostics } from "./preparation-diagnostics.ts";
 import { PreparationFailure, preparationFailure } from "./preparation-errors.ts";
@@ -32,7 +32,7 @@ async function epoch(input: Context) {
   const closed = task.phase === "closed" || session.status === "closed" || Boolean(session.closedAt);
   if (input.requestKey !== `finalize:${task.id}` || task.ownerPaused || session.role !== "primary"
     || task.machineId !== input.config.machine || session.machineId !== task.machineId || session.repositoryId !== task.repositoryId || session.cwd !== task.worktreePath) throw new Error("Preparation original task ownership changed, paused or closed");
-  if (closed || await hasPreparedCleanup(input.prisma, task.id, session.id, input.requestKey)) await assertPreparedCleanup(input);
+  if (closed || await hasPreparedCleanup(input.prisma, task.id, session.id, input.requestKey)) await inspectPreparedCleanupState(input);
   if (!closed) await automaticCleanupTurn(input.prisma, task, false, input.runtime);
   const turn = await input.prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: session.id }, orderBy: { sequence: "desc" } });
   const owners = await input.prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: session.id, source: `owner:${task.id}` }, orderBy: { sequence: "asc" } });
@@ -75,13 +75,13 @@ export async function requestFinalizationPreparation(input: Context, attempt: Pr
 
 export async function requestFinalizationConfirmation(input: Context, attempt: PreparationAttempt) {
   if (attempt.boundary !== "confirmation") throw new Error("Confirmation requires its exact boundary");
-  await assertPreparedCleanup(input);
+  await inspectPreparedCleanupState(input);
   const { preparation, ...result } = await requestBoundary(input, attempt, "confirm");
   return { confirmation: preparation, ...result };
 }
 
 async function assertConfirmedResult(input: Context, value: unknown) {
-  const active = await assertPreparedCleanup(input);
+  const active = await inspectPreparedCleanupState(input);
   const result = z.object({ taskId: z.string(), sessionId: z.string(), requestKey: z.string(), preparedRevision: z.number().int().positive(), confirmedRevision: z.number().int().positive(),
     cleanup: z.object({ operationRevision: z.number().int().positive(), operationDigest: z.string() }).strict() }).passthrough().parse(value);
   const event = await input.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: result.confirmedRevision } });
