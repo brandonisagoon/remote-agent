@@ -261,22 +261,31 @@ async function observedOperation(input: Context, allowConfirmedClosed = false, s
 
 export const assertPreparedCleanup = (input: Context) => observedOperation(input);
 
+/** Database-only status, not native effect authority. Effect callers must use
+ * assertPreparedCleanup and its full physical renewal. */
+export const inspectPreparedCleanupState = (input: Context) => localSnapshot(input, value => activeOperation(value));
+
 /** Existing owner-authenticated adoption may add evidence outside an executing
  * automatic turn. This reads the unchanged operation; it grants no effect. */
 export const inspectCleanupSupplementAuthority = (input: Context) => observedOperation(input, false, true);
 
 /** Closed-session reporting is restricted to the existing confirmed fact. It
  * confers no new resource effect, preparation or arbitrary publication scope. */
-export async function assertCompletedCleanup(input: Context) {
-  const observed = await observedOperation(input, true);
+async function completedState(input: Context, observed?: Awaited<ReturnType<typeof activeOperation>>) {
   return localSnapshot(input, async scope => {
     const active = await activeOperation(scope, true);
-    if (retirementDigest(observed.binding) !== retirementDigest(active.binding) || retirementDigest(observed.originalWorkReceipt ?? null) !== retirementDigest(active.originalWorkReceipt ?? null) || observed.authorityEpoch !== active.authorityEpoch) throw new Error("Cleanup reporting authority changed during source verification");
+    if (observed && (retirementDigest(observed.binding) !== retirementDigest(active.binding) || retirementDigest(observed.originalWorkReceipt ?? null) !== retirementDigest(active.originalWorkReceipt ?? null) || observed.authorityEpoch !== active.authorityEpoch)) throw new Error("Cleanup reporting authority changed during source verification");
     const confirmed = await scope.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: scope.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: scope.requestKey } });
     const retained = await cleanupRetainedResourceIds(scope.prisma, scope.config, active);
     if (active.binding.resources.some(resource => ["development", "browser", "review"].includes(resource.purpose) && resource.state !== "released" && !retained.has(resource.id))) throw new Error("Cleanup reporting has unresolved required resources");
     return { ...active, confirmed };
   });
+}
+
+/** Database-only confirmed status; this does not verify physical absence. */
+export const inspectCompletedCleanupState = (input: Context) => completedState(input);
+export async function assertCompletedCleanup(input: Context) {
+  return completedState(input, await observedOperation(input, true));
 }
 
 /** Accepted v2 dispositions, v1 archive proofs and exact accepted PR history remain distinct. Neither

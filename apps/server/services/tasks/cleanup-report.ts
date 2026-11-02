@@ -9,7 +9,7 @@ import { scopeConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createThreadedIssueComment, fetchIssueCommentIdentity } from "../../integrations/linear/comments.ts";
 import { getSourceIssueForUpdate } from "../../integrations/linear/session-store/source-issue/read.ts";
 import { registerThread } from "../sessions/threads.ts";
-import { assertCompletedCleanup, assertPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { assertCompletedCleanup, assertPreparedCleanup, inspectCompletedCleanupState, inspectPreparedCleanupState } from "./cleanup-lifecycle.ts";
 import { inspectSavedCleanup } from "./cleanup-inspection.ts";
 import { cleanupProgressProjection } from "./cleanup-progress.ts";
 import { retirementDigest } from "./retirement-receipts.ts";
@@ -138,10 +138,10 @@ export async function cleanupProjection(prisma: PrismaClient, config: ServerConf
   try {
     if (task.primarySessionId !== sessionId) throw new Error("Cleanup original primary identity changed");
     const input = { prisma, config, sessionId, requestKey };
-    const active = saved.history.recordedConfirmationRevision ? await assertCompletedCleanup(input) : await assertPreparedCleanup(input);
+    const active = saved.history.recordedConfirmationRevision ? await inspectCompletedCleanupState(input) : await inspectPreparedCleanupState(input);
     if (active.operationRevision !== saved.history.operationRevision || retirementDigest(active.operation) !== saved.history.operationDigest) throw new Error("Cleanup operation changed during inspection");
     const report = active.kind === "v1" && active.prepared.localCompletion && saved.history.recordedConfirmationRevision
-      ? await readLocalCleanupReport(prisma, await assertCompletedCleanup(input))
+      ? await readLocalCleanupReport(prisma, active as Awaited<ReturnType<typeof inspectCompletedCleanupState>>)
       : await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: `${requestKey}:cleanup-report` } } });
     const finalizationRetention = cleanupDeliveryRetention(active, saved.history.recordedConfirmationRevision ?? undefined);
     const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);

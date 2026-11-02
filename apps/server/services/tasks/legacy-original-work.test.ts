@@ -342,3 +342,38 @@ test("malformed interactive transaction context refuses authority without native
   const prisma = new Proxy(db.prisma, { get(target, key, receiver) { if (key === Symbol.for("prisma.client.transaction.scope_context")) return { kind: "nested", txId: "tx", scopeId: "scope", scopeState: {} }; return Reflect.get(target, key, receiver); } });
   await expect(assertPreparedCleanup({ ...f.input, prisma })).rejects.toThrow("Unsupported local cleanup transaction context"); expect(observed).toBe(false);
 }, 15000);
+
+test.each([false, true])("task status routes never invoke native cleanup verification (closed=%s)", async closed => {
+  const f = await generatedFixture();
+  if (closed) {
+    await db.prisma.remoteTaskResource.updateMany({ where: { taskId: f.task.id }, data: { state: "released" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `finalizer:${f.task.id}`, action: "finalization-confirmed", key: f.input.requestKey, value: JSON.stringify({ preparedRevision: f.preparation.sequence }) } });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+    await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "closed", closedAt: new Date() } });
+  }
+  let nativeChecks = 0;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; throw new Error("native verification must remain at the effect boundary"); };
+  for (const route of [`/api/tasks/${f.task.id}`, `/api/sessions/${f.session.id}/task`, "/api/tasks", "/api/tasks?pagination=id"]) {
+    const response = await f.app.request(route), body = await response.json();
+    expect(response.status).toBe(200);
+    const task = body.task ?? body.tasks.find((task: { id: string }) => task.id === f.task.id);
+    expect(task.cleanupOperation?.operationRevision).toBe(f.operation.sequence);
+    if (closed) expect(task.cleanupOperation.confirmedRevision).toBeGreaterThan(f.preparation.sequence);
+  }
+  expect(nativeChecks).toBe(0);
+  if (!closed) {
+    const effect = await f.app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
+    expect(effect.status).toBe(409); expect(nativeChecks).toBe(1);
+  }
+}, 15000);
+
+test.each(["paused", "revoked", "malformed-proof"])("local status preserves history but blocks actionable cleanup for %s", async kind => {
+  const f = await generatedFixture();
+  legacyOriginalWorkDependencies.generatedOwner = async () => { throw new Error("status attempted a native observation"); };
+  if (kind === "paused") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (kind === "revoked") await f.revoke();
+  if (kind === "malformed-proof") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.receipt.revision }, data: { value: "{}" } });
+  const response = await f.app.request(`/api/tasks/${f.task.id}`), body = await response.json();
+  expect(response.status).toBe(200); expect(body.task.cleanupHistory.operationRevision).toBe(f.operation.sequence);
+  expect(body.task.cleanupOperation).toBeUndefined(); expect(body.task.cleanupBlocked).toBeString();
+}, 15000);
