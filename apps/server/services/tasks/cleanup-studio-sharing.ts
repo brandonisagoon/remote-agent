@@ -32,11 +32,15 @@ function values(value: unknown): string[] {
   return items.flatMap(item => typeof item === "string" ? [item] : [object(item).id, object(item).name, object(item).Id, object(item).Name].filter((id): id is string => typeof id === "string"));
 }
 function networkValues(value: unknown) {
-  return values(value).map(candidate => {
+  return values(value).flatMap(candidate => {
     const exact = /^([a-f0-9]{12,64})(?: \([a-zA-Z0-9][a-zA-Z0-9_.-]*\))?$/.exec(candidate);
-    if (exact) return exact[1]!;
+    if (exact) return [exact[1]!];
+    // Historical registry displays contain ID, name and CIDR. They are only
+    // negative ownership claims: neither annotation grants retirement authority.
+    const display = /^([a-f0-9]{12,64}) ([a-zA-Z0-9][a-zA-Z0-9_.-]*) (\S+)$/.exec(candidate);
+    if (display && z.cidrv4().safeParse(display[3]).success) return [display[1]!, display[2]!];
     if (/^[a-f0-9]{12}/.test(candidate)) throw Error("Registered Docker network identity is ambiguous");
-    return candidate;
+    return [candidate];
   });
 }
 /** Negative registry checks supplement the immutable physical owner proof. Shared
@@ -47,7 +51,7 @@ export async function assertStudioResourceSharing(prisma: Database, taskId: stri
   if (records.length > 10000) throw Error("Studio ownership inventory exceeds its bound");
   for (const own of selected) {
     if (!records.some(record => record.id === own.resourceId)) throw Error("Studio selected resource is missing");
-    const ids = [...own.containers, own.network], exact = new Set([own.project, ...own.volumes]);
+    const ids = [...own.containers, own.network], exact = new Set([own.project, `${own.project}_default`, ...own.volumes]);
     for (const record of records) {
       if (record.id === own.resourceId) {
         if (record.taskId !== taskId || record.purpose !== "development" || finalizationResourceIdentity(record).identityDigest !== own.identityDigest) throw Error("Studio selected resource identity changed");

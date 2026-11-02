@@ -38,3 +38,12 @@ removal and lost Released/source-capture/confirmation replies recover through th
 same operation. Docker operations, the proxy owner writer and filesystem-handle
 observations are injected in that pair. Actual physical acceptance remains
 separate from source validation and protected delivery.
+
+
+Negative registry sharing checks also recognize the strict historical network
+display `ID NAME IPv4/CIDR`. Both the 12–64 character hex ID prefix and network
+name remain ownership claims; the subnet is validated description, never a
+grant. A claim for the selected ID or its conservative Compose default-name
+alias blocks cleanup. Malformed CIDRs and unknown prefix annotations still
+refuse. This does not broaden selected-resource parsing, change a registry row,
+or replace the separate immutable physical ownership proof.

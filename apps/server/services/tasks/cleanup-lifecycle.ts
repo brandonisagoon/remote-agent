@@ -1,3 +1,4 @@
+import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
 import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { automaticCleanupTurn, AutomaticCleanup, type CleanupInboxStore } from "./cleanup-inbox.ts";
@@ -294,7 +295,7 @@ export async function cleanupRetainedResourceIds(prisma: Database, config: Serve
   if (active.kind === "v2") return active.retainedResourceIds;
   const { retainedArchiveResourceIds } = await import("./archive-retention.ts");
   const retained = await retainedArchiveResourceIds(prisma, config, active.prepared);
-  for (const resource of cleanupDeliveryRetention(active)?.resources ?? []) retained.add(resource.id);
+  for (const resource of (cleanupDeliveryRetention(active) ?? await localCleanupReferenceRetention(prisma, active))?.resources ?? []) retained.add(resource.id);
   const { legacyComposeRetentionReceipt } = await import("./legacy-compose-finalization.ts");
   for (const resource of (await legacyComposeRetentionReceipt(prisma, active))?.resources ?? []) retained.add(resource.id);
   return retained;

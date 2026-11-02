@@ -55,3 +55,24 @@ test("prepared full IDs still reject historical prefix claims and inventory read
   await expect(assertStudioResourceSharing(db.prisma, f.task.id, [selection])).rejects.toThrow("another registered owner");
   await expect(assertStudioResourceSharing({ ...db.prisma, remoteTaskResource: { findMany: async () => { throw Error("read failed"); } } } as never, f.task.id, [selection])).rejects.toThrow("read failed");
 });
+
+
+test.each([12, 64])("unrelated legacy network display keeps both negative claims (%s hex characters)", async length => {
+  const f = await fixture();
+  const other = await f.foreign("docker-compose-project", "other-project", { network: `${"e".repeat(length)} other-project-default 10.236.91.0/24` });
+  await f.check();
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: other.id } })).toEqual(other);
+});
+test.each(["short-prefix", "full-id", "default-name", "bad-cidr", "extra-column", "trailing-annotation"])("legacy network display refuses %s without changing records", async condition => {
+  const f = await fixture();
+  let display = `${"e".repeat(12)} other-default 10.236.91.0/24`;
+  if (condition === "short-prefix") display = `${"d".repeat(12)} other-default 10.236.91.0/24`;
+  if (condition === "full-id") display = `${"d".repeat(64)} other-default 10.236.91.0/24`;
+  if (condition === "default-name") display = `${"e".repeat(12)} ${f.resource.externalId}_default 10.236.91.0/24`;
+  if (condition === "bad-cidr") display = `${"e".repeat(12)} other-default 10.999.91.0/24`;
+  if (condition === "extra-column") display += " unknown";
+  if (condition === "trailing-annotation") display += " (other)";
+  const other = await f.foreign("docker-compose-project", "other-project", { network: display });
+  await expect(f.check()).rejects.toThrow();
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: other.id } })).toEqual(other);
+});
