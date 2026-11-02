@@ -56,11 +56,16 @@ async function current(input: Context, allowConfirmedClosed = false) {
   if (!task.worktreePath || task.ownerPaused || (task.connectionId === null) !== (task.issueIdentifier === null)
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Cleanup original ownership is changed, paused or closed");
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("Cleanup requires the existing stable finalization identity");
+  let sourceLinkEpoch: unknown = null;
   if (task.connectionId !== null && task.issueIdentifier !== null) {
     const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId,
       resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles", ...(closed ? {} : { endedAt: null }) } });
     if (!link) throw new Error("Cleanup original source ownership changed");
+    sourceLinkEpoch = link;
   }
+  const authorityEpoch = retirementDigest({ taskUpdatedAt: task.updatedAt.toISOString(), primarySessionId: task.primarySessionId, sourceLinkEpoch,
+    session: { id: session.id, role: session.role, status: session.status, closedAt: session.closedAt?.toISOString() ?? null, cwd: session.cwd, repositoryId: session.repositoryId, machineId: session.machineId,
+      acpxRecordId: session.acpxRecordId, acpxSessionId: session.acpxSessionId, agentSessionId: session.agentSessionId } });
   const preparation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED }, orderBy: { sequence: "desc" } });
   if (!preparation?.value || preparation.key !== input.requestKey) throw new Error("Cleanup requires the exact existing preparation");
   const raw = JSON.parse(preparation.value);
@@ -76,7 +81,7 @@ async function current(input: Context, allowConfirmedClosed = false) {
       preparedRevision: preparation.sequence, preparedDigest: sha(preparation.value), resources,
       authority: external.authorityEvents.map(event => ({ revision: event.sequence, source: event.source, action: event.action, key: event.key, digest: sha(event.value ?? "") })),
     });
-    return { kind: "v2" as const, ...external, closedContinuation, binding, retirementSupplement: undefined };
+    return { kind: "v2" as const, ...external, closedContinuation, binding, authorityEpoch, retirementSupplement: undefined };
   }
   if (raw.version !== undefined) throw new Error("Prepared lifecycle currently requires version 1 preparation");
   const prepared = PreparedFinalization.parse(raw);
@@ -131,7 +136,7 @@ async function current(input: Context, allowConfirmedClosed = false) {
     assertResources(resources, saved.resources);
     if ("preparedRevision" in grant && (grant.preparedRevision !== preparation.sequence || grant.preparedDigest !== binding.preparedDigest)) throw new Error("Cleanup Done supplement preparation changed");
   }
-  return { kind: "v1" as const, closedContinuation, task, prepared, preparation, binding, retirementSupplement: done ? { revision: done.sequence, digest: retirementDigest(JSON.parse(done.value!)) } : undefined };
+  return { kind: "v1" as const, closedContinuation, task, prepared, preparation, binding, authorityEpoch, retirementSupplement: done ? { revision: done.sequence, digest: retirementDigest(JSON.parse(done.value!)) } : undefined };
 }
 
 function assertResources(current: z.infer<typeof Resource>[], expected: z.infer<typeof Resource>[]) {
@@ -214,28 +219,59 @@ async function activeOperation(input: Context, allowConfirmedClosed = false, sup
     const { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
     const original = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
     if (original) await assertLegacyOriginalWorkAuthority(input.prisma, active, original, input.config);
+    return { ...active, originalWorkReceipt: original };
   }
-  return active;
+  return { ...active, originalWorkReceipt: undefined };
+}
+
+/** The pinned Prisma runtime supports nested transactions, so the presence of
+ * $transaction does not distinguish an interactive transaction client. Its
+ * scope-context symbol is installed by _createItxClient; unknown shapes refuse. */
+function inLocalTransaction(prisma: Database) {
+  if (Reflect.get(prisma, "_clientVersion") !== "7.9.1") throw new Error("Unsupported Prisma version for local cleanup observation");
+  const scope = Reflect.get(prisma, Symbol.for("prisma.client.transaction.scope_context"));
+  if (scope === undefined) return false;
+  if (!scope || scope.kind !== "nested" || typeof scope.txId !== "string" || typeof scope.scopeId !== "string" || !scope.scopeState || typeof scope.scopeState !== "object" || !Array.isArray(scope.scopeState.stack)) throw new Error("Unsupported local cleanup transaction context");
+  return true;
 }
 
 async function localSnapshot<T>(input: Context, read: (value: Context) => Promise<T>): Promise<T> {
   const database = input.prisma as Database & Partial<Pick<PrismaClient, "$transaction">>;
   // A batch observes one consistent local epoch. Callers already inside a
   // mutation transaction reuse it rather than opening a nested transaction.
-  return database.$transaction ? database.$transaction(tx => read({ ...input, prisma: tx })) : read(input);
+  return database.$transaction && !inLocalTransaction(input.prisma) ? database.$transaction(tx => read({ ...input, prisma: tx })) : read(input);
 }
 
-export const assertPreparedCleanup = (input: Context) => localSnapshot(input, value => activeOperation(value));
+/** The database epoch stays short. A nested mutation already owns that epoch;
+ * it rechecks local authority without starting native work in its transaction. */
+async function observedOperation(input: Context, allowConfirmedClosed = false, supplementInspection = false) {
+  const read = (value: Context) => activeOperation(value, allowConfirmedClosed, supplementInspection);
+  const before = await localSnapshot(input, read);
+  const database = input.prisma as Database & Partial<Pick<PrismaClient, "$transaction">>;
+  if (!database.$transaction || inLocalTransaction(input.prisma)) return before;
+  if (before.kind === "v1" && before.originalWorkReceipt?.proof.originalWork.generatedData) {
+    const { observeLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
+    await observeLegacyOriginalWorkAuthority(input.prisma, before, before.originalWorkReceipt, input.config);
+  }
+  const after = await localSnapshot(input, read);
+  const epoch = (value: Awaited<ReturnType<typeof activeOperation>>) => retirementDigest({ authorityEpoch: value.authorityEpoch, binding: value.binding, operation: value.operation, operationRevision: value.operationRevision, originalWorkReceipt: value.originalWorkReceipt ?? null });
+  if (epoch(before) !== epoch(after)) throw new Error("Cleanup authority changed during native source verification");
+  return after;
+}
+
+export const assertPreparedCleanup = (input: Context) => observedOperation(input);
 
 /** Existing owner-authenticated adoption may add evidence outside an executing
  * automatic turn. This reads the unchanged operation; it grants no effect. */
-export const inspectCleanupSupplementAuthority = (input: Context) => localSnapshot(input, value => activeOperation(value, false, true));
+export const inspectCleanupSupplementAuthority = (input: Context) => observedOperation(input, false, true);
 
 /** Closed-session reporting is restricted to the existing confirmed fact. It
  * confers no new resource effect, preparation or arbitrary publication scope. */
 export async function assertCompletedCleanup(input: Context) {
+  const observed = await observedOperation(input, true);
   return localSnapshot(input, async scope => {
     const active = await activeOperation(scope, true);
+    if (retirementDigest(observed.binding) !== retirementDigest(active.binding) || retirementDigest(observed.originalWorkReceipt ?? null) !== retirementDigest(active.originalWorkReceipt ?? null) || observed.authorityEpoch !== active.authorityEpoch) throw new Error("Cleanup reporting authority changed during source verification");
     const confirmed = await scope.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: scope.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: scope.requestKey } });
     const retained = await cleanupRetainedResourceIds(scope.prisma, scope.config, active);
     if (active.binding.resources.some(resource => ["development", "browser", "review"].includes(resource.purpose) && resource.state !== "released" && !retained.has(resource.id))) throw new Error("Cleanup reporting has unresolved required resources");
