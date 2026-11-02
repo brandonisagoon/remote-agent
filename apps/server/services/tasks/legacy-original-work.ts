@@ -1,3 +1,4 @@
+import { observeGeneratedCacheOwner } from "./generated-cache-owner.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
@@ -87,12 +88,20 @@ async function assertStorage(prisma: Database, active: Active, proof: LegacyOrig
 
 /** Shared by the owner adoption CAS and the normal finalizer's compact renewal.
  * It gives no effect authority; the caller still uses its original operation. */
-export async function assertLegacyOriginalWorkAuthority(prisma: Database, active: Active, receipt: LegacyOriginalWorkReceipt) {
+export async function assertLegacyOriginalWorkAuthority(prisma: Database, active: Active, receipt: LegacyOriginalWorkReceipt, config?: ServerConfig) {
   if (active.kind !== "v1" || receipt.digest !== finalizationDigest(receipt.proof) || receipt.proof.bindingDigest !== bindingDigest(active) || receipt.proof.toolingRevision !== active.binding.toolingRevision
     || receipt.proof.preparedRevision !== active.preparation.sequence || receipt.proof.operationRevision !== active.operationRevision || receipt.proof.operationDigest !== finalizationDigest(active.operation)) throw new Error("Original source supplement authority or task identity changed");
   const current = await legacyOriginalWorkReceipt(prisma, active.prepared, active.preparation.sequence);
   if (!current || finalizationDigest(current) !== finalizationDigest(receipt)) throw new Error("Original source supplement was replaced");
   await assertStorage(prisma, active, receipt.proof);
+  if (receipt.proof.originalWork.generatedData) {
+    if (!config) throw Error("Generated source renewal needs the server-configured native observer");
+    await observeGeneratedCacheOwner({ prisma, config, task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,
+      operationRevision:active.operationRevision,operationDigest:finalizationDigest(active.operation),target:receipt.proof.originalWork.target,ownerSha256:receipt.proof.originalWork.generatedData.ownerSha256 });
+    // Compact authorization is a physical boundary too: root/package identity
+    // alone cannot establish that writable cache bytes remain unchanged.
+    await assertLegacyOriginalWorkFiles({ taskId:active.task.id,originalWork:receipt.proof.originalWork,removed:false },legacyOriginalWorkDependencies.observation);
+  }
 }
 
 export const legacyOriginalWorkDependencies = { observation: finalizationResourceObservation as ResourceObservation };
@@ -110,13 +119,14 @@ export async function adoptLegacyOriginalWork(input: { prisma: PrismaClient; con
   const existing = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
   if (existing) {
     if (finalizationDigest(existing.proof.input) !== finalizationDigest(adoption)) throw new Error("Original source already has a different immutable adoption");
-    await assertLegacyOriginalWorkAuthority(input.prisma, active, existing);
+    await assertLegacyOriginalWorkAuthority(input.prisma, active, existing, input.config);
     await assertLegacyOriginalWorkFiles({ taskId: input.taskId, originalWork: existing.proof.originalWork, removed: false }, legacyOriginalWorkDependencies.observation);
-    await assertLegacyOriginalWorkAuthority(input.prisma, await inspectCleanupSupplementAuthority(context), existing);
+    await assertLegacyOriginalWorkAuthority(input.prisma, await inspectCleanupSupplementAuthority(context), existing, input.config);
     return existing;
   }
   const originalWork = await prepareLegacyOriginalWorkFiles({ taskId: input.taskId, worktree: active.prepared.worktree, branch: active.prepared.branch, approvedHead: active.prepared.revision,
-    fingerprint: active.prepared.delivery.receipts.snapshot.fingerprint, archive: adoption.archive }, legacyOriginalWorkDependencies.observation);
+    fingerprint: active.prepared.delivery.receipts.snapshot.fingerprint, archive: adoption.archive,
+    observeGeneratedOwner: () => observeGeneratedCacheOwner({ prisma:input.prisma,config:input.config,task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,operationRevision:active.operationRevision,operationDigest:finalizationDigest(active.operation) }) }, legacyOriginalWorkDependencies.observation);
   const proof = LegacyOriginalWorkProof.parse({ version: 1, input: adoption, taskId: input.taskId, sessionId: active.binding.sessionId, toolingRevision: active.binding.toolingRevision,
     requestKey: active.prepared.requestKey, preparedRevision: active.preparation.sequence, preparedDigest: finalizationDigest(active.prepared), preparedRawDigest: hash(active.preparation.value!),
     operationRevision: active.operationRevision, operationDigest: finalizationDigest(active.operation), operationRawDigest: hash(operation.value!), bindingDigest: bindingDigest(active), originalWork });

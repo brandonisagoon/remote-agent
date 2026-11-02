@@ -308,7 +308,7 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
   if (legacyOriginalWork) {
     await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: Boolean(confirmed) }, legacyOriginalWorkDependencies.observation);
-    await assertLegacyOriginalWorkAuthority(input.prisma, await assertPreparedCleanup(input), legacyOriginalWork);
+    await assertLegacyOriginalWorkAuthority(input.prisma, await assertPreparedCleanup(input), legacyOriginalWork, input.config);
   } else await observePreparedFilesystem(input, candidate.prepared, dependencies);
   await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
   if (confirmed) await assertFinalizationRemoved(active.prepared);
@@ -334,7 +334,7 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
   return input.prisma.$transaction(async tx => {
     const latest = await assertPreparedCleanup({ ...input, prisma: tx });
-    if (legacyOriginalWork) await assertLegacyOriginalWorkAuthority(tx, latest, legacyOriginalWork);
+    if (legacyOriginalWork) await assertLegacyOriginalWorkAuthority(tx, latest, legacyOriginalWork, input.config);
     else if (latest.kind === "v1" && await legacyOriginalWorkReceipt(tx, latest.prepared, latest.preparation.sequence)) throw new Error("Original source was adopted during confirmation; verify it before closing");
     await assertFinalizationAuthority(tx, input.config, active.prepared, true);
     const where = { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey };

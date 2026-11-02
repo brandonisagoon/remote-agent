@@ -1,3 +1,4 @@
+import { prepareGeneratedCaches } from "./generated-cache-capture.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { observeArchive } from "./archive-observation.ts";
@@ -10,7 +11,7 @@ import { assertOriginalWorkCapture, verifyOriginalBundleArchive } from "./origin
 
 /** Reuses the same bundle restore, whole-source and linked administration
  * engines as v2, without inventing a resource or changing v1 preparation. */
-export async function prepareLegacyOriginalWorkFiles(input: { taskId: string; worktree: string; branch: string; approvedHead: string; fingerprint: string; archive: LegacyOriginalArchiveInput }, observation: ResourceObservation = finalizationResourceObservation) {
+export async function prepareLegacyOriginalWorkFiles(input: { taskId: string; worktree: string; branch: string; approvedHead: string; fingerprint: string; archive: LegacyOriginalArchiveInput; observeGeneratedOwner?: () => Promise<string> }, observation: ResourceObservation = finalizationResourceObservation) {
   const selection = LegacyOriginalArchiveInput.parse(input.archive), root = selection.archiveRoot;
   const { snapshot, archive, restore } = await verifyOriginalBundleArchive({ ...input, root, selection });
   if (!snapshot.clean || snapshot.fingerprint !== input.fingerprint) throw new Error("Legacy original source differs from its exact accepted clean snapshot");
@@ -19,13 +20,18 @@ export async function prepareLegacyOriginalWorkFiles(input: { taskId: string; wo
     const file = path.join(input.worktree, name);
     if (!selection.ownedPaths.some(owned => file === owned || file.startsWith(`${owned}${path.sep}`))) throw new Error("Ignored original material needs explicit owner-adopted paths");
   }
-  const installedDependencies = await prepareInstalledDependencies(input.worktree), captureId = `original-worktree:${input.taskId}`;
+  const selected = selection.generatedDataRoots ?? [];
+  if (selected.length && !input.observeGeneratedOwner) throw Error("Generated cache capture requires its native stopped-owner observer");
+  const ownerSha256 = selected.length ? await input.observeGeneratedOwner!() : undefined;
+  const generatedRoots = await prepareGeneratedCaches(input.worktree, selected, selection.ownedPaths);
+  const installedDependencies = await prepareInstalledDependencies(input.worktree, selected), captureId = `original-worktree:${input.taskId}`;
   await (installedDependencies.length ? observation.linkedRootIdle ?? observation.rootIdle : observation.rootIdle)(input.worktree);
   const inventory = await finalizationInventory(input.worktree, [input.worktree], new Map(installedDependencies.map(dependency => [dependency.path, captureId])), new Map());
   const directory = path.join(path.dirname(input.worktree), `.drafted-finalization-${randomUUID()}`);
-  const capture = { version: 1 as const, captureId, snapshot, restore, ...(installedDependencies.length ? { installedDependencies } : {}),
+  const capture = { version: 1 as const, captureId, snapshot, restore, ...(ownerSha256 ? { generatedData: { ownerSha256, roots: generatedRoots } } : {}), ...(installedDependencies.length ? { installedDependencies } : {}),
     target: { type: "tree" as const, path: input.worktree, inventory, sourcePaths: [input.worktree], quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } };
   const proof = LegacyOriginalWork.parse({ ...capture, archive: { root, manifestPath: selection.manifestPath, manifestSha256: selection.manifestSha256, inventory: archive.inventory, inventoryDigest: archive.inventoryDigest }, administration: await prepareOriginalAdministration(input.taskId, capture) });
+  if (selected.length && await input.observeGeneratedOwner!() !== ownerSha256) throw Error("Generated cache original owner changed during adoption");
   await assertLegacyOriginalWorkFiles({ taskId: input.taskId, originalWork: proof, removed: false }, observation);
   return proof;
 }

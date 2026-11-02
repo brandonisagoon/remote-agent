@@ -1,3 +1,4 @@
+import { assertGeneratedCaches } from "./generated-cache-capture.ts";
 import { prepareInstalledDependencies, assertInstalledDependencies } from "./installed-dependencies.ts";
 import { assertOriginalAdministration, prepareOriginalAdministration } from "./original-work-administration.ts";
 import { archiveMember as member, readArchiveBytes as bytes, observeArchive as archiveObservation } from "./archive-observation.ts";
@@ -293,6 +294,7 @@ export async function assertOriginalWorkCapture(input: { taskId: string; origina
     if (await realpath(proof.restore.gitDirectory) !== proof.restore.gitDirectory || await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `refs/heads/${proof.snapshot.branch}`]) !== proof.snapshot.head) throw new Error("Original retained branch or repository changed");
     for (const prerequisite of "prerequisiteCommits" in proof.restore ? proof.restore.prerequisiteCommits : []) if (await textGit(proof.restore.gitDirectory, ["rev-parse", "--verify", `${prerequisite}^{commit}`]) !== prerequisite) throw new Error("Retained thin-bundle prerequisite is unavailable");
     const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: proof.captureId, target: proof.target });
+    if (proof.generatedData) await assertGeneratedCaches(proof.target, proof.generatedData, capture.physicalPath);
     await assertInstalledDependencies(proof.target, proof.installedDependencies ?? [], proof.captureId, capture.physicalPath);
     await assertFinalizationTree(proof.target, capture.physicalPath);
     if (input.removed && !capture.captured) throw new Error("Original work has not been preserved in quarantine");

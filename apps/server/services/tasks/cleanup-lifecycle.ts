@@ -213,7 +213,7 @@ async function activeOperation(input: Context, allowConfirmedClosed = false, sup
   if (active.kind === "v1") {
     const { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
     const original = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
-    if (original) await assertLegacyOriginalWorkAuthority(input.prisma, active, original);
+    if (original) await assertLegacyOriginalWorkAuthority(input.prisma, active, original, input.config);
   }
   return active;
 }

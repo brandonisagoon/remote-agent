@@ -1,3 +1,4 @@
+import { GeneratedCacheData } from "./generated-cache-schema.ts";
 import path from "node:path";
 import { z } from "zod";
 import { FinalizationInventoryEntry, FinalizationTreeTarget, LinkedWorktreePlan } from "./finalization-resources.ts";
@@ -51,9 +52,10 @@ export const OriginalWork = z.object({ version: z.literal(1), captureId: z.strin
   target: FinalizationTreeTarget,
   administration: OriginalWorkAdministration.optional(),
   installedDependencies: LinkedWorktreePlan.shape.installedDependencies.optional(),
+  generatedData: GeneratedCacheData.optional(),
 }).strict();
 export type OriginalWork = z.infer<typeof OriginalWork>;
-export type OriginalWorkCapture = Pick<OriginalWork, "captureId" | "snapshot" | "restore" | "target" | "administration" | "installedDependencies">;
+export type OriginalWorkCapture = Pick<OriginalWork, "captureId" | "snapshot" | "restore" | "target" | "administration" | "installedDependencies" | "generatedData">;
 
 export const OriginalAdministrationProof = z.object({
   version: z.literal(1), taskId: z.string().min(1), sessionId: z.string().min(1), requestKey: z.string().min(1),
