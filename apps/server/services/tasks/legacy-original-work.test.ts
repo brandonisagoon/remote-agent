@@ -9,7 +9,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization } from "./finalization.ts";
-import { bindPreparedCleanup, inspectCleanupSupplementAuthority } from "./cleanup-lifecycle.ts";
+import { bindPreparedCleanup, inspectCleanupSupplementAuthority, assertPreparedCleanup } from "./cleanup-lifecycle.ts";
 import { finalizationDigest, type ResourceObservation } from "./finalization-resources.ts";
 import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
@@ -20,14 +20,16 @@ import { LEGACY_ORIGINAL_WORK, LegacyOriginalWorkReceipt, type LegacyOriginalWor
 let db: TestDatabase, directory: string;
 const idle: ResourceObservation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
 const defaultObservation = legacyOriginalWorkDependencies.observation;
+const defaultGeneratedOwner = legacyOriginalWorkDependencies.generatedOwner;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "legacy-original-"))); legacyOriginalWorkDependencies.observation = idle; });
-afterEach(async () => { legacyOriginalWorkDependencies.observation = defaultObservation; await db.cleanup(); await rm(directory, { recursive: true, force: true }); });
+afterEach(async () => { legacyOriginalWorkDependencies.generatedOwner = defaultGeneratedOwner; legacyOriginalWorkDependencies.observation = defaultObservation; await db.cleanup(); await rm(directory, { recursive: true, force: true }); });
 const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 function git(cwd: string, ...args: string[]) { const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (result.exitCode) throw new Error(result.stderr.toString()); return result.stdout.toString().trim(); }
-async function fixture(taskId = "task") {
+async function fixture(taskId = "task", generated = false) {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree");
   await mkdir(root); git(root, "init", "-b", "main");
   git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
+  if (generated) { await writeFile(path.join(root, "package.json"), "{}\n"); await writeFile(path.join(root, "bun.lock"), "fixture lock\n"); }
   await writeFile(path.join(root, "README.md"), "accepted content\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture");
   await writeFile(path.join(root, "accepted.txt"), "accepted second commit\n"); git(root, "add", "."); git(root, "commit", "-m", "accepted");
   git(root, "worktree", "add", "-b", "codex/task", worktree);
@@ -50,8 +52,8 @@ async function fixture(taskId = "task") {
   return { root, worktree, config, session, task, issue, states, context, contract, remote, observer, input, dependencies, remove, revoke };
 }
 
-async function preparedFixture(configure?: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>) {
-  const f = await fixture("original71");
+async function preparedFixture(configure?: (f: Awaited<ReturnType<typeof fixture>>) => Promise<void>, generated = false) {
+  const f = await fixture("original71", generated);
   // Match the actual clean v1 source with deliberately retained ignored bytes.
   await writeFile(path.join(f.root, ".git/info/exclude"), "cache/\n");
   await mkdir(path.join(f.worktree, "cache")); await writeFile(path.join(f.worktree, "cache", "owner-material.bin"), Buffer.from([0, 255, 2]));
@@ -268,3 +270,75 @@ actual("actual v1 finalizer retains stopped Docker data and recovers source/admi
     await assertLegacyOriginalWorkFiles({ taskId: f.task.id, originalWork: proof, removed: true }, idle);
   } finally { await stopProjection(); await server.stop(true); Object.assign(retention, savedRetention); Object.assign(cleanupReportDelivery, savedReport); }
 }, 60_000);
+
+async function generatedFixture() {
+  legacyOriginalWorkDependencies.generatedOwner = async () => "f".repeat(64);
+  const f = await preparedFixture(async f => {
+    await writeFile(path.join(f.root, ".git/info/exclude"), "cache/\nnode_modules/\n");
+    await mkdir(path.join(f.worktree, "node_modules/.vite"), { recursive: true });
+    await writeFile(path.join(f.worktree, "node_modules/.vite/cache.js"), "generated cache\n");
+    await chmod(path.join(f.worktree, "node_modules"), 0o777);
+  }, true);
+  const generated = path.join(f.worktree, "node_modules");
+  f.adoption.archive.ownedPaths.push(generated); f.adoption.archive.generatedDataRoots = [generated];
+  const receipt = await f.adopt();
+  return { ...f, receipt };
+}
+
+test("slow native renewal runs outside Prisma's five-second transaction and nested metadata checks stay local", async () => {
+  const f = await generatedFixture(); let observations = 0;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { observations++; await Bun.sleep(5200); return "f".repeat(64); };
+  const active = await assertPreparedCleanup(f.input);
+  expect(active.operationRevision).toBe(f.active.operationRevision); expect(observations).toBe(1);
+  legacyOriginalWorkDependencies.generatedOwner = async () => { throw new Error("native observation entered a database transaction"); };
+  await db.prisma.$transaction(async tx => {
+    const current = await assertPreparedCleanup({ ...f.input, prisma: tx });
+    await assertLegacyOriginalWorkAuthority(tx, current, f.receipt, f.config);
+  });
+  const { recordCleanupProgress } = await import("./cleanup-progress.ts");
+  const progress = await recordCleanupProgress({ ...f.context, progress: { requestKey: f.input.requestKey, operationRevision: f.active.operationRevision, operationDigest: finalizationDigest(f.active.operation), outcomes: [] } });
+  expect(progress.operationRevision).toBe(f.active.operationRevision);
+  await f.unchanged();
+}, 15000);
+
+test.each(["pause", "pause-roundtrip", "session-owner", "revocation", "operation", "original-proof"])("native verification refuses %s changed while observing", async kind => {
+  const f = await generatedFixture();
+  legacyOriginalWorkDependencies.generatedOwner = async () => {
+    if (kind === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    if (kind === "pause-roundtrip") { await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } }); }
+    if (kind === "session-owner") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { acpxSessionId: "changed-owner" } });
+    if (kind === "revocation") await f.revoke();
+    if (kind === "operation") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.operation.sequence }, data: { value: JSON.stringify({ ...JSON.parse(f.operation.value!), requestKey: "changed" }) } });
+    if (kind === "original-proof") { const proof = structuredClone(f.receipt.proof); proof.input.requestKey = "changed"; await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.receipt.revision }, data: { value: JSON.stringify(proof) } }); }
+    return "f".repeat(64);
+  };
+  await expect(assertPreparedCleanup(f.input)).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+  expect((await lstat(f.worktree)).isDirectory()).toBe(true);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).not.toBe("closed");
+}, 15000);
+
+test("an original-source adoption appearing between local epochs invalidates renewal", async () => {
+  const f = await generatedFixture();
+  const saved = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: f.receipt.revision } });
+  await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: f.receipt.revision } });
+  let inserted = false;
+  const prisma = new Proxy(db.prisma, { get(target, key, receiver) {
+    if (key !== "$transaction") return Reflect.get(target, key, receiver);
+    return async (read: Parameters<typeof db.prisma.$transaction>[0]) => {
+      const result = await db.prisma.$transaction(read as never);
+      if (!inserted) { inserted = true; await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: saved.runtimeSessionId, source: saved.source, action: saved.action, key: saved.key, value: saved.value } }); }
+      return result;
+    };
+  } });
+  await expect(assertPreparedCleanup({ ...f.input, prisma })).rejects.toThrow("changed during native source verification");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+  expect((await lstat(f.worktree)).isDirectory()).toBe(true);
+}, 15000);
+
+test("malformed interactive transaction context refuses authority without native work", async () => {
+  const f = await generatedFixture(); let observed = false;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { observed = true; return "f".repeat(64); };
+  const prisma = new Proxy(db.prisma, { get(target, key, receiver) { if (key === Symbol.for("prisma.client.transaction.scope_context")) return { kind: "nested", txId: "tx", scopeId: "scope", scopeState: {} }; return Reflect.get(target, key, receiver); } });
+  await expect(assertPreparedCleanup({ ...f.input, prisma })).rejects.toThrow("Unsupported local cleanup transaction context"); expect(observed).toBe(false);
+}, 15000);

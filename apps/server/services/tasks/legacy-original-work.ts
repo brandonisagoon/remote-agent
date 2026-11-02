@@ -14,7 +14,8 @@ import { assertLegacyOriginalWorkFiles, prepareLegacyOriginalWorkFiles } from ".
 import { LEGACY_ORIGINAL_WORK, LegacyOriginalWorkAdoption, LegacyOriginalWorkProof, LegacyOriginalWorkReceipt } from "./legacy-original-work-schema.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
-type Active = Awaited<ReturnType<typeof inspectCleanupSupplementAuthority>>;
+type WithoutOriginal<T> = T extends unknown ? Omit<T, "originalWorkReceipt"> : never;
+type Active = WithoutOriginal<Awaited<ReturnType<typeof inspectCleanupSupplementAuthority>>>;
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const within = (a: string, b: string) => a === b || b.startsWith(a + path.sep);
 const overlaps = (a: string, b: string) => within(a, b) || within(b, a);
@@ -86,25 +87,32 @@ async function assertStorage(prisma: Database, active: Active, proof: LegacyOrig
   if (await prisma.remoteTask.findFirst({ where: { id: { not: active.task.id }, OR: [{ worktreePath: { in: [...ancestors] } }, ...scopes.map(scope => ({ worktreePath: { startsWith: scope + path.sep } }))] } })) throw new Error("Original source capture overlaps another registered worktree");
 }
 
-/** Shared by the owner adoption CAS and the normal finalizer's compact renewal.
- * It gives no effect authority; the caller still uses its original operation. */
+/** Database-only identity and immutable receipt validation, including inside
+ * a mutation CAS. Native effect boundaries must also observe the source through
+ * observeLegacyOriginalWorkAuthority outside their database transaction. */
 export async function assertLegacyOriginalWorkAuthority(prisma: Database, active: Active, receipt: LegacyOriginalWorkReceipt, config?: ServerConfig) {
   if (active.kind !== "v1" || receipt.digest !== finalizationDigest(receipt.proof) || receipt.proof.bindingDigest !== bindingDigest(active) || receipt.proof.toolingRevision !== active.binding.toolingRevision
     || receipt.proof.preparedRevision !== active.preparation.sequence || receipt.proof.operationRevision !== active.operationRevision || receipt.proof.operationDigest !== finalizationDigest(active.operation)) throw new Error("Original source supplement authority or task identity changed");
   const current = await legacyOriginalWorkReceipt(prisma, active.prepared, active.preparation.sequence);
   if (!current || finalizationDigest(current) !== finalizationDigest(receipt)) throw new Error("Original source supplement was replaced");
   await assertStorage(prisma, active, receipt.proof);
+}
+
+/** Native observations run only outside a local database transaction. */
+export async function observeLegacyOriginalWorkAuthority(prisma: Database, active: Active, receipt: LegacyOriginalWorkReceipt, config: ServerConfig) {
+  await assertLegacyOriginalWorkAuthority(prisma, active, receipt, config);
   if (receipt.proof.originalWork.generatedData) {
     if (!config) throw Error("Generated source renewal needs the server-configured native observer");
-    await observeGeneratedCacheOwner({ prisma, config, task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,
+    await legacyOriginalWorkDependencies.generatedOwner({ prisma, config, task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,
       operationRevision:active.operationRevision,operationDigest:finalizationDigest(active.operation),target:receipt.proof.originalWork.target,ownerSha256:receipt.proof.originalWork.generatedData.ownerSha256 });
     // Compact authorization is a physical boundary too: root/package identity
     // alone cannot establish that writable cache bytes remain unchanged.
     await assertLegacyOriginalWorkFiles({ taskId:active.task.id,originalWork:receipt.proof.originalWork,removed:false },legacyOriginalWorkDependencies.observation);
   }
+  await assertLegacyOriginalWorkAuthority(prisma, active, receipt, config);
 }
 
-export const legacyOriginalWorkDependencies = { observation: finalizationResourceObservation as ResourceObservation };
+export const legacyOriginalWorkDependencies = { observation: finalizationResourceObservation as ResourceObservation, generatedOwner: observeGeneratedCacheOwner };
 export async function adoptLegacyOriginalWork(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; adoption: LegacyOriginalWorkAdoption }) {
   const adoption = LegacyOriginalWorkAdoption.parse(input.adoption);
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
@@ -126,7 +134,7 @@ export async function adoptLegacyOriginalWork(input: { prisma: PrismaClient; con
   }
   const originalWork = await prepareLegacyOriginalWorkFiles({ taskId: input.taskId, worktree: active.prepared.worktree, branch: active.prepared.branch, approvedHead: active.prepared.revision,
     fingerprint: active.prepared.delivery.receipts.snapshot.fingerprint, archive: adoption.archive,
-    observeGeneratedOwner: () => observeGeneratedCacheOwner({ prisma:input.prisma,config:input.config,task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,operationRevision:active.operationRevision,operationDigest:finalizationDigest(active.operation) }) }, legacyOriginalWorkDependencies.observation);
+    observeGeneratedOwner: () => legacyOriginalWorkDependencies.generatedOwner({ prisma:input.prisma,config:input.config,task:active.task,preparedRevision:active.preparation.sequence,requestKey:active.prepared.requestKey,operationRevision:active.operationRevision,operationDigest:finalizationDigest(active.operation) }) }, legacyOriginalWorkDependencies.observation);
   const proof = LegacyOriginalWorkProof.parse({ version: 1, input: adoption, taskId: input.taskId, sessionId: active.binding.sessionId, toolingRevision: active.binding.toolingRevision,
     requestKey: active.prepared.requestKey, preparedRevision: active.preparation.sequence, preparedDigest: finalizationDigest(active.prepared), preparedRawDigest: hash(active.preparation.value!),
     operationRevision: active.operationRevision, operationDigest: finalizationDigest(active.operation), operationRawDigest: hash(operation.value!), bindingDigest: bindingDigest(active), originalWork });
