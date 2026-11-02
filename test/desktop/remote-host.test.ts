@@ -50,6 +50,36 @@ test("credential markers cannot be copied to another field or connection", () =>
   expect(() => restoreHostSecrets({ newConnection: { apiKey: STORED_SECRET } }, current)).toThrow("Stored credential");
 });
 
+test("remote compute config conceals its decision key and preserves it through an unrelated save", async () => {
+  const { file } = fixture();
+  const key = "private-decision-key-canary";
+  writeFileSync(file, JSON.stringify({ ...example, machine: { ...example.machine, compute: { slots: 1, decisionApiKey: key } } }));
+  const document = await desktopOperation(file, { method: "config:get", args: [] }) as ConfigDocument;
+  if (!document.valid) throw new Error("Invalid fixture");
+  expect(document.value.machine.compute?.decisionApiKey).toBe(STORED_SECRET);
+  expect(JSON.stringify(document)).not.toContain(key);
+  document.value.machine.compute!.slots = 2;
+  const saved = await desktopOperation(file, { method: "config:save", args: [{ expectedRevision: document.revision, value: document.value }] }) as ConfigDocument;
+  const actual = readConfigDocument(file);
+  if (!actual.valid || !saved.valid) throw new Error("Invalid saved fixture");
+  expect(actual.value.machine.compute).toMatchObject({ slots: 2, decisionApiKey: key });
+  expect(saved.value.machine.compute?.decisionApiKey).toBe(STORED_SECRET);
+  expect(JSON.stringify(saved)).not.toContain(key);
+  expect(saved.raw).toBe("");
+});
+
+test.each(["wrong-path", "missing-current"])("remote compute save rejects a %s decision-key marker without writing", async kind => {
+  const { file } = fixture();
+  writeFileSync(file, JSON.stringify({ ...example, machine: { ...example.machine, compute: { slots: 1, ...(kind === "wrong-path" ? { decisionApiKey: "private-decision-key-canary" } : {}) } } }));
+  const document = await desktopOperation(file, { method: "config:get", args: [] }) as ConfigDocument;
+  if (!document.valid) throw new Error("Invalid fixture");
+  const before = readFileSync(file, "utf8");
+  if (kind === "wrong-path") document.value.machine.compute!.decisionModel = STORED_SECRET as "gpt-6-luna";
+  else document.value.machine.compute!.decisionApiKey = STORED_SECRET;
+  await expect(desktopOperation(file, { method: "config:save", args: [{ expectedRevision: document.revision, value: document.value }] })).rejects.toThrow("Stored credential");
+  expect(readFileSync(file, "utf8")).toBe(before);
+});
+
 test("changing machine identity is rejected before a remote config write", async () => {
   const { file } = fixture();
   const current = readConfigDocument(file);
