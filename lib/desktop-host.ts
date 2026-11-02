@@ -17,7 +17,7 @@ export const DesktopHostsSchema = z.object({ activeId: z.string(), hosts: z.arra
 });
 export type DesktopHosts = z.infer<typeof DesktopHostsSchema>;
 export const STORED_SECRET = "__REMOTE_AGENT_STORED_SECRET__";
-const secretKeys = new Set(["secret", "clientSecret", "apiKey"]);
+const secretKeys = new Set(["secret", "clientSecret", "apiKey", "decisionApiKey"]);
 
 /** Markers are resolved against the same path in a revision-checked document.
  * A marker cannot copy a credential into a different connection or field. */
