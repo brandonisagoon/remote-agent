@@ -17,19 +17,30 @@ export async function requireClosedTask(db: Pick<PrismaClient, "remoteTask">, sc
         throw Error("Exact unpaused closed-task ownership is required");
     return task;
 }
-export async function readClosedFamilyOwnership(db: OwnershipStore, scope: ClosedFamilyScope, host: string) {
-    const task = await requireClosedTask(db, scope, host);
-    const relations = await db.runtimeSessionRelation.findMany({ where: { OR: [{ targetSessionId: scope.primarySessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }, { sourceSessionId: scope.delegateSessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }] }, orderBy: { id: "asc" }, take: 129 });
+/** Bind every historical parent edge touching the admitted direct family.
+ * Nested, moved and cyclic families are outside this narrow operator repair. */
+export async function closedFamilyRelations(db: Pick<OwnershipStore, "runtimeSessionRelation">, ids: string[]) {
+    const relations = await db.runtimeSessionRelation.findMany({ where: { relationship: { in: ["spawned-by", "notifies-parent"] }, OR: [{ sourceSessionId: { in: ids } }, { targetSessionId: { in: ids } }] }, orderBy: { id: "asc" }, take: 129 });
     if (relations.length > 128)
         throw Error("Closed family relation history exceeds its bounded scope");
-    const links = relations.filter(r => r.sourceSessionId === scope.delegateSessionId && r.relationship === "spawned-by");
+    return relations;
+}
+export async function readClosedFamilyOwnership(db: OwnershipStore, scope: ClosedFamilyScope, host: string) {
+    const task = await requireClosedTask(db, scope, host);
+    const directRelations = await db.runtimeSessionRelation.findMany({ where: { OR: [{ targetSessionId: scope.primarySessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }, { sourceSessionId: scope.delegateSessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }] }, orderBy: { id: "asc" }, take: 129 });
+    if (directRelations.length > 128)
+        throw Error("Closed family relation history exceeds its bounded scope");
+    const links = directRelations.filter(r => r.sourceSessionId === scope.delegateSessionId && r.relationship === "spawned-by");
     if (links.length !== 1 || links[0]!.targetSessionId !== scope.primarySessionId || links[0]!.endedAt)
         throw Error("Original live delegate provenance is required");
-    if (relations.some(r => r.sourceSessionId === scope.delegateSessionId && r.targetSessionId !== scope.primarySessionId))
+    if (directRelations.some(r => r.sourceSessionId === scope.delegateSessionId && r.targetSessionId !== scope.primarySessionId))
         throw Error("Selected delegate has foreign parent provenance");
-    const ids = [...new Set([scope.primarySessionId, ...relations.filter(r => r.relationship === "spawned-by" && r.targetSessionId === scope.primarySessionId).map(r => r.sourceSessionId)])].sort();
+    const ids = [...new Set([scope.primarySessionId, ...directRelations.filter(r => r.relationship === "spawned-by" && r.targetSessionId === scope.primarySessionId).map(r => r.sourceSessionId)])].sort();
     if (ids.length > 32)
         throw Error("Closed family exceeds its bounded reconciliation scope");
+    const relations = await closedFamilyRelations(db, ids);
+    if (relations.some(r => r.sourceSessionId === scope.primarySessionId || r.targetSessionId !== scope.primarySessionId || !ids.includes(r.sourceSessionId)))
+        throw Error("Nested, moved or cyclic family provenance requires separate reconciliation");
     const sessions = await db.runtimeSession.findMany({ where: { id: { in: ids } }, orderBy: { id: "asc" } });
     if (sessions.length !== ids.length)
         throw Error("Original family session is missing");

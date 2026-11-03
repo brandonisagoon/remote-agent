@@ -10,13 +10,16 @@ import { createApp } from "../../app.ts";
 import { prepareClosedFamily, commitClosedFamily, closedFamilyReceipt, ClosedFamilyCommit } from "./closed-family.ts";
 import { closedFamilyDigest, closedTextDigest } from "./closed-family-ownership.ts";
 import { resolveTaskInstruction } from "./inbox.ts";
-async function fixture(work: (f: Awaited<ReturnType<typeof createFixture>>) => Promise<void>) { const f = await createFixture(); try {
-    await work(f);
+async function fixture(work: (f: Awaited<ReturnType<typeof createFixture>>) => Promise<void>) {
+    const f = await createFixture();
+    try {
+        await work(f);
+    }
+    finally {
+        await f.db.cleanup();
+        await rm(f.root, { recursive: true, force: true });
+    }
 }
-finally {
-    await f.db.cleanup();
-    await rm(f.root, { recursive: true, force: true });
-} }
 async function createFixture() {
     const db = await createTestDatabase(), root = await mkdtemp(path.join(tmpdir(), "closed-family-test-")), config = testConfig({ machine: "macbook-air", acpxStateDir: root });
     const scope = { primarySessionId: "primary", delegateSessionId: "delegate", repositoryId: "repo", machineId: config.machine, worktreePath: root, toolingRevision: "a".repeat(40) };
@@ -133,11 +136,14 @@ test("runtime reservation prevents turn, recovery, enqueue and close races", () 
 test("changed provider record during reserved commit rolls back every SQL disposition", () => fixture(async (f) => {
     const p = (await f.prepare() as any).preparation, before = await f.db.prisma.runtimeInstruction.findMany(), reserve = f.runtime.withClosedFamilyReservation!.bind(f.runtime);
     let calls = 0;
-    f.runtime.withClosedFamilyReservation = async (input) => reserve({ ...input, run: (evidence, assert) => input.run(evidence, async () => { if (++calls === 2) {
-            const record = (await f.store.load("delegate"))!;
-            record.lastUsedAt = "2026-01-03T00:00:00Z";
-            await f.store.save(record);
-        } await assert(); }) });
+    f.runtime.withClosedFamilyReservation = async (input) => reserve({ ...input, run: (evidence, assert) => input.run(evidence, async () => {
+            if (++calls === 2) {
+                const record = (await f.store.load("delegate"))!;
+                record.lastUsedAt = "2026-01-03T00:00:00Z";
+                await f.store.save(record);
+            }
+            await assert();
+        }) });
     await expect(commitClosedFamily(f.ctx, f.commitInput(p))).rejects.toThrow("record changed");
     expect(await f.db.prisma.runtimeInstruction.findMany()).toEqual(before);
     expect(await f.db.prisma.runtimeMetadataEvent.count({ where: { action: "closed-family-committed" } })).toBe(0);
@@ -145,10 +151,19 @@ test("changed provider record during reserved commit rolls back every SQL dispos
 test("audit write failure rolls back instructions, logical closure and ended relations", () => fixture(async (f) => {
     const p = (await f.prepare() as any).preparation, before = closedFamilyDigest({ instructions: await f.db.prisma.runtimeInstruction.findMany(), sessions: await f.db.prisma.runtimeSession.findMany(), relations: await f.db.prisma.runtimeSessionRelation.findMany() });
     const transaction = f.db.prisma.$transaction.bind(f.db.prisma);
-    const prisma = new Proxy(f.db.prisma, { get(target, key) { if (key === "$transaction")
-            return (work: any) => transaction(async (tx: any) => work(new Proxy(tx, { get(t, k) { if (k === "runtimeMetadataEvent")
-                    return new Proxy(t[k], { get(model, method) { if (method === "create")
-                            return async () => { throw Error("injected audit failure"); }; return model[method]; } }); return t[k]; } }))); return (target as any)[key]; } });
+    const prisma = new Proxy(f.db.prisma, { get(target, key) {
+            if (key === "$transaction")
+                return (work: any) => transaction(async (tx: any) => work(new Proxy(tx, { get(t, k) {
+                        if (k === "runtimeMetadataEvent")
+                            return new Proxy(t[k], { get(model, method) {
+                                    if (method === "create")
+                                        return async () => { throw Error("injected audit failure"); };
+                                    return model[method];
+                                } });
+                        return t[k];
+                    } })));
+            return (target as any)[key];
+        } });
     await expect(commitClosedFamily({ ...f.ctx, prisma }, f.commitInput(p))).rejects.toThrow("audit failure");
     expect(closedFamilyDigest({ instructions: await f.db.prisma.runtimeInstruction.findMany(), sessions: await f.db.prisma.runtimeSession.findMany(), relations: await f.db.prisma.runtimeSessionRelation.findMany() })).toBe(before);
 }));
@@ -247,4 +262,53 @@ test("receipt readback rejects a new parent link and changed original task bindi
     await f.db.prisma.remoteTask.update({ where: { id: "task" }, data: { baseCommit: "b".repeat(40) } });
     await f.db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "primary", targetSessionId: "primary", relationship: "notifies-parent" } });
     await expect(closedFamilyReceipt(f.ctx, f.input.requestKey)).rejects.toThrow("provenance changed");
+}));
+async function nestedDelegate(f: Awaited<ReturnType<typeof createFixture>>, mode: string, parent = "delegate") {
+    await f.db.prisma.runtimeSession.create({ data: { id: "grandchild", scopeKey: "grandchild", agentCommand: "codex", status: mode === "active" ? "active" : "closed", closedAt: new Date(), role: "delegate", cwd: mode === "moved" ? path.join(f.root, "moved") : f.root, repositoryId: "repo", machineId: f.config.machine } });
+    await f.db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "grandchild", targetSessionId: parent, relationship: "spawned-by", endedAt: ["moved", "settled", "cycle"].includes(mode) ? new Date() : null } });
+    if (mode === "pending")
+        await f.db.prisma.runtimeInstruction.create({ data: { id: "grandchild-unknown", sessionId: "grandchild", state: "unknown", text: "Original unresolved descendant instruction" } });
+    if (mode === "cycle")
+        await f.db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "primary", targetSessionId: "grandchild", relationship: "spawned-by", endedAt: new Date() } });
+}
+for (const mode of ["active", "pending", "moved", "cycle", "settled"])
+    test(`narrow recovery refuses nested original family including historical edges: ${mode}`, () => fixture(async (f) => {
+        await nestedDelegate(f, mode);
+        const before = closedFamilyDigest({ sessions: await f.db.prisma.runtimeSession.findMany(), instructions: await f.db.prisma.runtimeInstruction.findMany(), relations: await f.db.prisma.runtimeSessionRelation.findMany() });
+        await expect(f.prepare()).rejects.toThrow("family provenance");
+        expect(closedFamilyDigest({ sessions: await f.db.prisma.runtimeSession.findMany(), instructions: await f.db.prisma.runtimeInstruction.findMany(), relations: await f.db.prisma.runtimeSessionRelation.findMany() })).toBe(before);
+        expect(await f.db.prisma.runtimeMetadataEvent.count()).toBe(0);
+    }));
+test("nested history under another original direct child also refuses", () => fixture(async (f) => {
+    await f.db.prisma.runtimeSession.create({ data: { id: "sibling", scopeKey: "sibling", agentCommand: "codex", status: "closed", role: "delegate", cwd: f.root, repositoryId: "repo", machineId: f.config.machine } });
+    await f.db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "sibling", targetSessionId: "primary", relationship: "spawned-by", endedAt: new Date() } });
+    await nestedDelegate(f, "moved", "sibling");
+    await expect(f.prepare()).rejects.toThrow("family provenance");
+}));
+test("a nested edge appearing after prepared plan observation invalidates the commit snapshot", () => fixture(async (f) => {
+    const p = (await f.prepare() as any).preparation, reserve = f.runtime.withClosedFamilyReservation!.bind(f.runtime);
+    f.runtime.withClosedFamilyReservation = async (input) => reserve({ ...input, run: (evidence, assert) => {
+            let inserted = false;
+            return input.run(evidence, async () => {
+                if (!inserted) {
+                    inserted = true;
+                    await nestedDelegate(f, "pending");
+                }
+                await assert();
+            });
+        } });
+    await expect(commitClosedFamily(f.ctx, f.commitInput(p))).rejects.toThrow("family provenance");
+    expect((await f.db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.unknown.id } })).state).toBe("unknown");
+    expect((await f.db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: f.queued.id } })).state).toBe("queued");
+    expect((await f.db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: "delegate" } })).status).toBe("idle");
+    expect(await f.db.prisma.runtimeMetadataEvent.count({ where: { action: "closed-family-committed" } })).toBe(0);
+}));
+test("a late nested edge invalidates receipt readback and both idempotent API replays", () => fixture(async (f) => {
+    const p = (await f.prepare() as any).preparation, input = f.commitInput(p);
+    await commitClosedFamily(f.ctx, input);
+    await nestedDelegate(f, "moved");
+    await expect(closedFamilyReceipt(f.ctx, f.input.requestKey)).rejects.toThrow("provenance changed");
+    await expect(commitClosedFamily(f.ctx, input)).rejects.toThrow("provenance changed");
+    await expect(f.prepare()).rejects.toThrow("provenance changed");
+    expect(await f.db.prisma.runtimeMetadataEvent.count({ where: { action: "closed-family-committed" } })).toBe(1);
 }));

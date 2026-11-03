@@ -22,6 +22,12 @@ Use the existing authenticated task API:
    owner, preparation or decision refuses. Changed provenance invalidates
    receipt readback.
 
+This narrow recovery admits only a direct primary/delegate family. Any nested,
+moved or cyclic parent link, including ended historical links, refuses before
+preparation. Every parent edge touching an admitted family member is bound in
+the preparation and receipt, so a late nested link also invalidates commit or
+receipt replay. Nested families require separate reconciliation.
+
 The runtime reserves all original family sessions and refuses active turns,
 queued turns, handles, recovery, release, execution-directory ownership or
 shutdown. It reads original provider records twice, verifies their exact

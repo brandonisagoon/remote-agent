@@ -4,7 +4,7 @@ import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { ClosedFamilyScope, ClosedProviderEvidence, ClosedFamilyReservation } from "../../../../types/runtime/closed-family.ts";
-import { canonical, closedFamilyDigest as digest, readClosedFamilyOwnership, requireClosedTask, closedTextDigest as textDigest } from "./closed-family-ownership.ts";
+import { canonical, closedFamilyRelations, closedFamilyDigest as digest, readClosedFamilyOwnership, requireClosedTask, closedTextDigest as textDigest } from "./closed-family-ownership.ts";
 const Hash = z.string().regex(/^[a-f0-9]{64}$/), Id = z.string().min(1).max(200);
 const Selection = z.strictObject({ primarySessionId: Id, delegateSessionId: Id, repositoryId: Id, machineId: Id, worktreePath: z.string().refine(v => path.isAbsolute(v) && path.normalize(v) === v), toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) });
 export const ClosedFamilyPrepare = z.strictObject({ requestKey: Id, scope: Selection });
@@ -76,8 +76,11 @@ async function plan(db: Store, scope: ClosedFamilyScope, host: string, evidence:
 }
 async function staticScope(ctx: Context, scope: ClosedFamilyScope) { await requireClosedTask(ctx.prisma, scope, ctx.config.machine); }
 function selection(ctx: Context, input: z.infer<typeof ClosedFamilyPrepare>): ClosedFamilyScope { return { ...input.scope, taskId: ctx.taskId }; }
-function reservation<T>(ctx: Context, input: ClosedFamilyReservation<T>): Promise<T> { if (!ctx.runtime.withClosedFamilyReservation)
-    throw Error("Runtime cannot reserve and verify this closed family"); return ctx.runtime.withClosedFamilyReservation<T>(input); }
+function reservation<T>(ctx: Context, input: ClosedFamilyReservation<T>): Promise<T> {
+    if (!ctx.runtime.withClosedFamilyReservation)
+        throw Error("Runtime cannot reserve and verify this closed family");
+    return ctx.runtime.withClosedFamilyReservation<T>(input);
+}
 export async function prepareClosedFamily(ctx: Context, input: z.infer<typeof ClosedFamilyPrepare>) {
     const scope = selection(ctx, input);
     await staticScope(ctx, scope);
@@ -192,7 +195,9 @@ export async function closedFamilyReceipt(ctx: Omit<Context, "runtime">, key: st
         if (!row || row.sourceSessionId !== relation.sourceSessionId || row.targetSessionId !== relation.targetSessionId || row.relationship !== relation.relationship || (row.endedAt?.toISOString() ?? null) !== (receipt.endedRelationIds.includes(relation.id) ? receipt.at : relation.endedAt))
             throw Error("Audited original relation changed");
     }
-    const relations = await ctx.prisma.runtimeSessionRelation.findMany({ where: { OR: [{ targetSessionId: receipt.scope.primarySessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }, { sourceSessionId: receipt.scope.delegateSessionId, relationship: { in: ["spawned-by", "notifies-parent"] } }] } });
+    const relations = await closedFamilyRelations(ctx.prisma, receipt.originalSessions.map((session: {
+        id: string;
+    }) => session.id));
     if (relations.length !== receipt.originalRelations.length || relations.some(r => !receipt.originalRelations.some((original: {
         id: string;
     }) => original.id === r.id)))
