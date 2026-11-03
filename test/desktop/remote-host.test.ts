@@ -59,13 +59,18 @@ test("remote compute config conceals its decision key and preserves it through a
   expect(document.value.machine.compute?.decisionApiKey).toBe(STORED_SECRET);
   expect(JSON.stringify(document)).not.toContain(key);
   document.value.machine.compute!.slots = 2;
+  document.value.machine.compute!.maxManagedAllocations = 1;
   const saved = await desktopOperation(file, { method: "config:save", args: [{ expectedRevision: document.revision, value: document.value }] }) as ConfigDocument;
   const actual = readConfigDocument(file);
   if (!actual.valid || !saved.valid) throw new Error("Invalid saved fixture");
-  expect(actual.value.machine.compute).toMatchObject({ slots: 2, decisionApiKey: key });
+  expect(actual.value.machine.compute).toMatchObject({ slots: 2, maxManagedAllocations: 1, decisionApiKey: key });
   expect(saved.value.machine.compute?.decisionApiKey).toBe(STORED_SECRET);
   expect(JSON.stringify(saved)).not.toContain(key);
   expect(saved.raw).toBe("");
+  saved.value.machine.compute!.maxManagedAllocations = undefined;
+  await desktopOperation(file, { method: "config:save", args: [{ expectedRevision: saved.revision, value: saved.value }] });
+  expect(readConfigDocument(file).value?.machine.compute?.maxManagedAllocations).toBeUndefined();
+  expect(JSON.parse(readFileSync(file, "utf8")).machine.compute).not.toHaveProperty("maxManagedAllocations");
 });
 
 test.each(["wrong-path", "missing-current"])("remote compute save rejects a %s decision-key marker without writing", async kind => {

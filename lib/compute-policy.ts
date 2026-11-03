@@ -5,6 +5,7 @@ import { z } from "zod";
 export const ComputePolicy = z.object({
   enabled: z.boolean().default(false),
   slots: z.number().int().min(0).max(1000).default(0),
+  maxManagedAllocations: z.number().int().min(0).max(1000).optional(),
   quietPeriodSeconds: z.number().int().min(30).max(604800).default(1800),
   collectorFreshnessSeconds: z.number().int().min(2).max(300).default(15),
   deliveryTimeoutSeconds: z.number().int().min(5).max(300).default(30),

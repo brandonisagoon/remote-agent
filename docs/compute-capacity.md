@@ -11,7 +11,8 @@ With admission enabled, `capacity` contains:
   uncertain unallocated environments, after revalidating existing proof.
 - `occupied`: O, allocated slots at every ordinal, including ordinals above a
   reduced budget.
-- `usable`: `max(0, slots - unaccounted)`.
+- `usable`: `max(0, slots - unaccounted)`, limited to
+  `maxManagedAllocations` when configured.
 - `headroom`: `usable - occupied`, including negative values.
 - `observedAt`: the observation's timestamp.
 
@@ -29,3 +30,26 @@ and the existing private control-socket boundary apply.
 This is a point-in-time observation, not a reservation or permission to start.
 Normal delivery and claim still recheck capacity and ownership. A later policy
 change or task lifecycle event can invalidate the observed headroom.
+
+`machine.compute.maxManagedAllocations` is an optional independent limit on
+managed application allocations, including offered, running and unknown
+reservations at every slot ordinal. Leaving it unset preserves the total-budget
+behavior. Zero blocks new reservations; it does not stop or release existing
+allocations. The desktop machine's Application compute settings accept a blank
+value to remove the limit. Saving either limit requires a server restart. This
+setting does not limit concurrent agent turns.
+
+For an explicit opt-in, set `machine.compute.maxManagedAllocations` to `1`
+alongside the existing total `slots` budget. The example and initialized
+configuration leave this optional limit unset.
+
+With the limit configured, diagnostics also return `maxManagedAllocations` and
+`budgetUsable` (the unclamped `max(0, slots - unaccounted)`). For example, a total
+budget of 19 with U varying from 14 to 18 and a managed limit of 1 has `usable: 1`
+and permits at most one occupied managed slot. If U reaches 19, usable capacity
+is zero. Original unknown usage remains reserved by the same calculation.
+
+Selection, delivery reservation and the first claim recheck the same effective
+capacity. Lowering the limit below existing occupancy reports negative headroom
+and refuses new reservations or first claims without deleting existing slots.
+Retries of an already claimed allocation retain their existing start intent.
