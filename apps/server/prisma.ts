@@ -1,6 +1,5 @@
-import { PrismaLibSql } from "@prisma/adapter-libsql";
-
 import { PrismaClient } from "../../generated/prisma/client.ts";
+import { DiagnosticPrismaLibSql } from "./database-diagnostic.ts";
 
 /**
  * Prisma over libSQL.
@@ -17,7 +16,7 @@ import { PrismaClient } from "../../generated/prisma/client.ts";
  * an upstream replacement passes prisma.test.ts without forced GC.
  */
 export function createPrismaClient(databaseUrl: string): PrismaClient {
-  const adapter = new PrismaLibSql({ url: databaseUrl });
+  const adapter = new DiagnosticPrismaLibSql({ url: databaseUrl });
   return new PrismaClient({ adapter });
 }
 
