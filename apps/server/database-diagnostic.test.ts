@@ -87,3 +87,26 @@ test("the actual Prisma file adapter records queries and BEGIN/COMMIT/ROLLBACK w
     expect(starts.some((event) => event.argumentCount === 1)).toBe(true);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("diagnostic file client preserves positional array and named execute arguments", () => {
+  const directory = mkdtempSync(path.join(tmpdir(), "db-diagnostic-overloads-"));
+  try {
+    const result = spawnSync(process.execPath, ["-e", `
+      import { DiagnosticPrismaLibSql } from ${JSON.stringify(path.join(import.meta.dir, "database-diagnostic.ts"))};
+      const client = new DiagnosticPrismaLibSql({ url: process.env.DIAGNOSTIC_TEST_DB }).createClient({ url: process.env.DIAGNOSTIC_TEST_DB });
+      const array = await client.execute("SELECT ? AS value, ? AS other", ["array-secret", 42]);
+      const named = await client.execute("SELECT $value AS value", { value: "named-secret" });
+      console.log(JSON.stringify([array.rows[0].value === "array-secret", array.rows[0].other === 42, named.rows[0].value === "named-secret"]));
+      client.close();
+    `], {
+      env: { ...process.env, REMOTE_AGENT_DB_DIAGNOSTIC_SECONDS: "60", DIAGNOSTIC_TEST_DB: `file:${path.join(directory, "test.sqlite")}` },
+      encoding: "utf8", timeout: 10_000,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("[true,true,true]");
+    const events = result.stderr.trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.phase === "start").map((event) => event.argumentCount)).toEqual([2, 1]);
+    expect(events.filter((event) => event.phase === "finish").map((event) => event.outcome)).toEqual(["ok", "ok"]);
+    expect(result.stderr).not.toMatch(/array-secret|named-secret|SELECT|value|other/);
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { writeSync } from "node:fs";
-import type { Client, Config } from "@libsql/client";
+import type { Client, Config, InArgs, InStatement } from "@libsql/client";
 import { PrismaLibSql } from "@prisma/adapter-libsql";
 
 const MAX_RECORDS = 2_000;
@@ -63,11 +63,13 @@ export class DiagnosticPrismaLibSql extends PrismaLibSql {
     const seconds = process.env.REMOTE_AGENT_DB_DIAGNOSTIC_SECONDS;
     if (!seconds || !/^[1-9]\d{0,2}$/.test(seconds) || Number(seconds) > 300) return client;
     const run = diagnostic ??= createDatabaseDiagnostic(seconds);
-    const execute = client.execute.bind(client);
-    client.execute = (statement) => {
+    const execute = client.execute;
+    client.execute = (...parameters: [statement: InStatement] | [sql: string, args?: InArgs]) => {
+      const [statement, positionalArgs] = parameters;
       const sql = typeof statement === "string" ? statement : statement.sql;
-      const args = typeof statement === "string" ? undefined : statement.args;
-      return run("execute", sql, args ? Object.keys(args).length : 0, () => execute(statement));
+      const args = typeof statement === "string" ? positionalArgs : statement.args;
+      return run("execute", sql, args ? Object.keys(args).length : 0,
+        () => Reflect.apply(execute, client, parameters) as ReturnType<Client["execute"]>);
     };
     const executeMultiple = client.executeMultiple.bind(client);
     client.executeMultiple = (sql) => run("executeMultiple", sql, 0, () => executeMultiple(sql));
