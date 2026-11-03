@@ -9,8 +9,8 @@ import { refreshComputeBaselines } from "../../services/tasks/compute-baseline.t
 let db: TestDatabase;
 beforeEach(async () => { db = await createTestDatabase(); });
 afterEach(async () => { await db.cleanup(); });
-async function fixture(enabled = true) {
-  const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled, slots: 0 }) }), runtime = createFakeAgentRuntime();
+async function fixture(enabled = true, maxManagedAllocations?: number, slots = 0) {
+  const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled, slots, maxManagedAllocations }) }), runtime = createFakeAgentRuntime();
   const now = new Date(); let observed = 0;
   runtime.observeSessionActivity = () => { observed++; return { state: "unknown", observedAt: Date.now() }; };
   await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", machineId: "host", repositoryId: "repo", cwd: "/fixture", role: "primary", status: "closed", closedAt: now } });
@@ -32,6 +32,8 @@ test("opt-in GET uses the daemon observation and preserves every row without ref
   expect(response.status).toBe(200);
   expect(body).toMatchObject({ enabled: true, capacity: { slots: 0, unaccounted: 0, occupied: 0, usable: 0, headroom: 0 } });
   expect(Number.isFinite(Date.parse(body.capacity.observedAt))).toBe(true);
+  expect(body.capacity).not.toHaveProperty("maxManagedAllocations");
+  expect(body.capacity).not.toHaveProperty("budgetUsable");
   expect(f.observations()).toBeGreaterThan(priorObservations);
   expect(await allRows()).toEqual(before);
   expect(JSON.stringify(body)).not.toContain(configKey(f.config));
@@ -67,4 +69,17 @@ test("all occupied ordinals remain debited and negative headroom is visible with
   const before = await allRows();
   expect(await (await f.get()).json()).toMatchObject({ capacity: { slots: 0, unaccounted: 0, occupied: 1, usable: 0, headroom: -1 } });
   expect(await allRows()).toEqual(before);
+});
+
+test("configured managed cap exposes effective and total-budget capacity without changing any rows", async () => {
+  const f = await fixture(true, 1, 19), before = await allRows();
+  expect(await (await f.get()).json()).toMatchObject({ capacity: { slots: 19, maxManagedAllocations: 1, budgetUsable: 19, unaccounted: 0, occupied: 0, usable: 1, headroom: 1 } });
+  expect(await allRows()).toEqual(before);
+  await db.prisma.computeSlot.create({ data: { id: "host:99", machineId: "host", ordinal: 99, allocationId: "unknown-reservation" } });
+  expect(await (await f.get()).json()).toMatchObject({ capacity: { budgetUsable: 19, occupied: 1, usable: 1, headroom: 0 } });
+});
+
+test("a managed cap cannot turn insufficient total budget into capacity", async () => {
+  const f = await fixture(true, 1, 0);
+  expect(await (await f.get()).json()).toMatchObject({ capacity: { maxManagedAllocations: 1, budgetUsable: 0, usable: 0, headroom: 0 } });
 });

@@ -15,11 +15,11 @@ async function task(id: string) {
   await db.prisma.remoteTask.create({ data: { id, requestKey: id, repositoryId: "repo", machineId: "host", branchName: `codex/${id}`, worktreePath: session.cwd, toolingRoot: "/fixture/tooling", toolingRevision: "c".repeat(40), primarySessionId: session.id, phase: "working" } });
   return requestCompute({ ...context(), taskId: id, request });
 }
-async function started(offer: NonNullable<Awaited<ReturnType<typeof offerNextCompute>>>, ms = 0) {
+async function started(offer: NonNullable<Awaited<ReturnType<typeof offerNextCompute>>>, ms = 0, policy = settings) {
   const instruction = await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "dispatching", executionRequestId: offer.instructionId } });
   await db.prisma.runtimeSession.update({ where: { id: instruction.sessionId }, data: { status: "active" } });
   await db.prisma.runtimeLifecycleEvent.create({ data: { id: `${offer.instructionId}:started`, runtimeSessionId: instruction.sessionId, requestId: offer.instructionId, phase: "started", occurredAt: context(ms).now } });
-  return confirmComputeDelivery({ ...context(ms), sessionId: instruction.sessionId, requestId: offer.instructionId });
+  return confirmComputeDelivery({ ...context(ms), policy, sessionId: instruction.sessionId, requestId: offer.instructionId });
 }
 async function finishTurn(offer: NonNullable<Awaited<ReturnType<typeof offerNextCompute>>>) {
   const instruction = await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "completed" } });
@@ -190,4 +190,29 @@ test("an inspection failure cannot revoke a queued offer or free reserved capaci
   finally { db.prisma.$transaction = original as typeof db.prisma.$transaction; }
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe("queued");
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: offer.instructionId } })).state).toBe("dispatching");
+});
+
+const capped = (limit = 1) => ({ ...context(), policy: ComputePolicy.parse({ enabled: true, slots: 19, maxManagedAllocations: limit }) });
+test("lowering the managed cap after selection refuses delivery without reserving a slot", async () => {
+  await task("one"); const queued = (await offerNextCompute(capped()))!;
+  expect(await started(queued, 0, capped(0).policy)).toBeNull();
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: queued.id } })).state).toBe("expired");
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+});
+test("first claim rechecks the managed cap against every offered or unknown ordinal", async () => {
+  await task("one"); const queued = (await offerNextCompute(capped()))!; await started(queued, 0, capped().policy);
+  await db.prisma.computeSlot.create({ data: { id: "host:99", machineId: "host", ordinal: 99, allocationId: "unknown-old-allocation" } });
+  await expect(claimCompute({ ...capped(), taskId: "one", offerId: queued.id, request })).rejects.toThrow("reservation is unavailable");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: queued.id } })).claimedAt).toBeNull();
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(2);
+});
+test("racing durable deliveries cannot reserve two allocations under a managed cap of one", async () => {
+  await task("one"); const secondEnvironment = await task("two"), first = (await offerNextCompute(capped()))!;
+  // Two durable messages can predate a policy reduction or concurrent recovery.
+  const second = await db.prisma.computeOffer.create({ data: { id: "second-queued", environmentId: secondEnvironment.id, machineId: "host", instructionId: "second-instruction", dispatchDeadline: new Date(began.getTime() + 30000) } });
+  await db.prisma.runtimeInstruction.create({ data: { id: second.instructionId, sessionId: "primary-two", text: "existing durable offer" } });
+  const outcomes = await Promise.all([started(first, 0, capped().policy), started(second, 0, capped().policy)]);
+  expect(outcomes.filter(value => value?.state === "offered")).toHaveLength(1);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
+  expect(await db.prisma.computeOffer.count({ where: { state: "offered" } })).toBe(1);
 });

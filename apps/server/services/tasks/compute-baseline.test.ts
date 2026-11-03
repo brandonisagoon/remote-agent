@@ -6,7 +6,7 @@ import { createTestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
-import { claimCompute, confirmComputeDelivery, offerNextCompute, readComputeCapacity, requestCompute } from "./compute-admission.ts";
+import { claimCompute, confirmComputeDelivery, offerNextCompute, readComputeCapacity, reconcileComputeOffers, requestCompute } from "./compute-admission.ts";
 import { refreshComputeBaselines } from "./compute-baseline.ts";
 
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -220,4 +220,28 @@ test.each(["running", "unknown", "starting"])("unallocated %s environments remai
   await f.prisma.computeEnvironment.updateMany({ where: { taskId: "waiting" }, data: { state } });
   expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, occupied: 0, headroom: 0 });
   expect(await offerNextCompute(f.admission)).toBeNull();
+});
+
+test("changing original credit with two eligible waiters never exceeds one managed reservation or claim", async () => {
+  const f = await fixture(), admission = { ...f.admission, policy: ComputePolicy.parse({ enabled: true, slots: 3, maxManagedAllocations: 1 }) };
+  await f.prisma.runtimeSession.create({ data: { id: "second", scopeKey: "second", agentCommand: "codex", machineId: "host", repositoryId: "repo", role: "primary", cwd: "/second", status: "idle" } });
+  await f.prisma.remoteTask.create({ data: { id: "second", requestKey: "second", machineId: "host", repositoryId: "repo", primarySessionId: "second", worktreePath: "/second", branchName: "codex/second", toolingRoot: "/tooling", toolingRevision: "a".repeat(40), phase: "working" } });
+  await requestCompute({ ...admission, taskId: "second", request: f.request });
+  const originals = await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" } });
+  expect(await readComputeCapacity({ ...admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, budgetUsable: 2, usable: 1 });
+  const first = (await offerNextCompute(admission))!;
+  await f.prisma.runtimeInstruction.update({ where: { id: first.instructionId }, data: { state: "dispatching", executionRequestId: first.instructionId } });
+  await f.prisma.runtimeLifecycleEvent.create({ data: { id: "cap-start", runtimeSessionId: "waiting", requestId: first.instructionId, phase: "started", occurredAt: f.now } });
+  expect((await confirmComputeDelivery({ ...admission, sessionId: "waiting", requestId: first.instructionId }))?.state).toBe("offered");
+  await refreshComputeBaselines(f.context, f.read);
+  expect(await readComputeCapacity({ ...admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, budgetUsable: 3, usable: 1, occupied: 1, headroom: 0 });
+  expect(await offerNextCompute(admission)).toBeNull();
+  await refreshComputeBaselines(f.context, async () => { throw Error("physical proof unavailable"); });
+  expect(await readComputeCapacity({ ...admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, occupied: 1, usable: 1, headroom: 0 });
+  expect((await claimCompute({ ...admission, taskId: "waiting", offerId: first.id, request: f.request })).offer.state).toBe("claimed");
+  await reconcileComputeOffers({ ...admission, now: new Date(f.now.getTime() + 600000) });
+  expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("unknown");
+  expect(await offerNextCompute({ ...admission, now: new Date(f.now.getTime() + 600001) })).toBeNull();
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
+  expect(await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" } })).toEqual(originals);
 });

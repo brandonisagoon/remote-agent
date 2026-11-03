@@ -109,8 +109,10 @@ export async function computeAdmissionCapacity(store: Store, input: Context) {
   const settings = policy(input), unaccountedGroups = await unaccounted(store, input);
   // Count every occupied ordinal, including slots above a reduced budget.
   const occupied = await store.computeSlot.count({ where: { machineId: input.machineId, allocationId: { not: null } } });
-  const usable = Math.max(0, settings.slots - unaccountedGroups);
-  return { slots: settings.slots, unaccounted: unaccountedGroups, occupied, usable, headroom: usable - occupied };
+  const budgetUsable = Math.max(0, settings.slots - unaccountedGroups);
+  const usable = Math.min(budgetUsable, settings.maxManagedAllocations ?? budgetUsable);
+  return { slots: settings.slots, unaccounted: unaccountedGroups, occupied, usable, headroom: usable - occupied,
+    ...(settings.maxManagedAllocations === undefined ? {} : { maxManagedAllocations: settings.maxManagedAllocations, budgetUsable }) };
 }
 
 /** Observe the daemon's real activity and existing proof in a read transaction.
@@ -340,7 +342,7 @@ export async function claimCompute(input: Context & { taskId: string; offerId: s
     const slot = await store.computeSlot.findUnique({ where: { allocationId: offer.id } });
     if (!slot) throw new Error("Compute reservation is unavailable");
     const capacity = await computeAdmissionCapacity(store, input);
-    if (capacity.occupied + capacity.unaccounted > capacity.slots) throw new Error("Compute reservation is unavailable");
+    if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new Error("Compute reservation is unavailable");
     const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input) } });
     await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
     const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });
