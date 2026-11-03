@@ -1,3 +1,4 @@
+import { ClosedFamilyPrepare, ClosedFamilyCommit, prepareClosedFamily, commitClosedFamily, closedFamilyReceipt } from "../../services/sessions/closed-family.ts";
 import { TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
 import { preparationStage } from "../../services/tasks/preparation-diagnostics.ts";
 import { CleanupOperation, assertPreparedCleanup, hasPreparedCleanup } from "../../services/tasks/cleanup-lifecycle.ts";
@@ -14,6 +15,19 @@ import { AutomationInput, DevelopmentAuthorityInput, DevelopmentCompleteInput, a
 import { taskResponse } from "./response.ts";
 
 export const taskSupervisionRoutes = new Hono<AppEnv>();
+
+// Explicit owner control API. No MCP tool, replay or general closed-task bypass.
+taskSupervisionRoutes.post("/:taskId/closed-family/prepare", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
+ const parsed=ClosedFamilyPrepare.safeParse(await c.req.json());if(!parsed.success)return c.json({error:"Select the exact original closed family"},400);
+ try{return c.json(await prepareClosedFamily({prisma:c.get("prisma"),runtime:c.get("agentRuntime"),config:c.get("config"),taskId:c.req.param("taskId")},parsed.data));}catch(error){return c.json({error:error instanceof Error?error.message:String(error)},409);}
+}));
+taskSupervisionRoutes.post("/:taskId/closed-family/commit", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
+ const parsed=ClosedFamilyCommit.safeParse(await c.req.json());if(!parsed.success)return c.json({error:"Use the saved preparation and explicit history dispositions"},400);
+ try{return c.json(await commitClosedFamily({prisma:c.get("prisma"),runtime:c.get("agentRuntime"),config:c.get("config"),taskId:c.req.param("taskId")},parsed.data));}catch(error){return c.json({error:error instanceof Error?error.message:String(error)},409);}
+}));
+taskSupervisionRoutes.get("/:taskId/closed-family/receipts/:requestKey", async c => taskRequest(c, TASK_READ_DEADLINE_MS, async () => {
+ try{return c.json(await closedFamilyReceipt({prisma:c.get("prisma"),config:c.get("config"),taskId:c.req.param("taskId")},c.req.param("requestKey")));}catch(error){return c.json({error:error instanceof Error?error.message:String(error)},409);}
+}));
 
 taskSupervisionRoutes.post("/:taskId/development-authority", async c => {
   const parsed = DevelopmentAuthorityInput.safeParse(await c.req.json());

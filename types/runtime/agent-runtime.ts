@@ -1,3 +1,4 @@
+import type { ClosedFamilyReservation } from "./closed-family.ts";
 import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
@@ -125,6 +126,8 @@ export interface AgentSessionRuntime {
    * task checks and durable transition run under the same runtime reservation. */
   releaseIdleTransports?(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void>;
   assertClosedProviderAbsent?(sessionId: string): Promise<void>;
+  /** Operator-only logical settlement; never opens/closes/signals a provider. */
+  withClosedFamilyReservation?<T>(input: ClosedFamilyReservation<T>): Promise<T>;
   observeSessionActivity?(sessionId: string): { state: "executing" | "queued" | "unknown"; observedAt: number; requestId?: string };
   listSessions(input?: {
     cwd?: string;

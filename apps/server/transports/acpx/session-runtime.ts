@@ -1,3 +1,5 @@
+import type { ClosedFamilyReservation, ClosedProviderEvidence } from "../../../../types/runtime/closed-family.ts";
+import { readClosedFamilyOwnership, closedFamilyDigest } from "../../services/sessions/closed-family-ownership.ts";
 import { readClosedSessionMessages } from "./closed-history.ts";
 import { cleanupExecutionDirectory, CleanupTransportBlockedError } from "../../services/tasks/cleanup-transport.ts";
 import { assertRequestActive } from "../../request-lifetime.ts";
@@ -621,11 +623,18 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     requestId?: string;
     sourceMessageId?: string;
   }): Promise<string> {
+    if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
     const session = await this.requireSession(input.sessionId);
+    if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
     if (session.status === "closed") throw new Error("Session is closed");
     // A fallback router can race its recovery pass. Claim source ownership
     // with the instruction so a losing route cannot publish false failure.
-    const receipt = await this.prisma.$transaction((tx) => queueInstruction(tx, input));
+    const receipt = await this.prisma.$transaction(async (tx) => {
+      if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
+      const current = await tx.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
+      if (current.status === "closed") throw new Error("Session is closed");
+      return queueInstruction(tx, input);
+    });
     void deliverInstructions(this.prisma, this, this.config).catch(() => undefined);
     return receipt.id;
   }
@@ -728,8 +737,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
   }
 
   async close(sessionId: string, reason: string): Promise<void> {
+    if (this.recoveringSessions.has(sessionId)) throw new Error("Session is being reconciled");
     for (const waiting of this.waitingTurns.get(sessionId) ?? []) waiting.abort();
     const session = await this.requireSession(sessionId);
+    if (this.recoveringSessions.has(sessionId)) throw new Error("Session is being reconciled");
     const handle = this.handles.get(sessionId);
     if (handle) await this.runtimeFor(sessionId).close({ handle, reason });
     else {
@@ -814,6 +825,37 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     if (JSON.stringify(await this.store.load(session.acpxRecordId!)) !== JSON.stringify(record)) throw new Error("Closed historical provider record changed during absence observation");
     if (busy()) throw new Error("Closed historical provider still has live or uncertain ownership");
     assertProviderStopped(record);
+  }
+
+  async withClosedFamilyReservation<T>(input: ClosedFamilyReservation<T>): Promise<T> {
+    const initial = await readClosedFamilyOwnership(this.prisma, input.scope, this.config.machine);
+    const ids = initial.ids;
+    const busy = (id: string) => this.handles.has(id) || this.runtimes.has(id) || this.activeTurns.has(id) || this.turnChains.has(id)
+      || this.recoveringSessions.has(id) || this.releasingSessions.has(id) || Boolean(this.waitingTurns.get(id)?.size) || this.executionDirectories.has(id);
+    if (this.shuttingDown || ids.some(busy)) throw new Error("Closed family has live or uncertain runtime ownership");
+    for (const id of ids) { this.recoveringSessions.add(id); this.releasingSessions.add(id); }
+    try {
+      const current = await readClosedFamilyOwnership(this.prisma, input.scope, this.config.machine);
+      if (closedFamilyDigest(initial) !== closedFamilyDigest(current)) throw new Error("Closed family ownership changed before reservation");
+      const saved: Array<{session: (typeof current.sessions)[number]; record: AcpSessionRecord}> = [];
+      for (const session of current.sessions) {
+        const record = session.acpxRecordId ? await this.store.load(session.acpxRecordId) : undefined;
+        if (!record || record.acpxRecordId !== session.acpxRecordId || record.acpSessionId !== session.acpxSessionId || record.cwd !== session.cwd || record.agentSessionId !== (session.agentSessionId ?? undefined)) throw new Error("Original closed-family provider identity is unavailable");
+        assertProviderStopped(record); saved.push({ session, record });
+      }
+      const assertUnchanged = async () => {
+        assertRequestActive();
+        for (const {session,record} of saved) {
+          if (this.handles.has(session.id) || this.runtimes.has(session.id) || this.activeTurns.has(session.id) || this.turnChains.has(session.id) || this.waitingTurns.get(session.id)?.size) throw new Error("Closed family gained a provider writer");
+          if (closedFamilyDigest(await this.store.load(session.acpxRecordId!)) !== closedFamilyDigest(record)) throw new Error("Closed-family provider record changed");
+          assertProviderStopped(record);
+        }
+      };
+      await assertUnchanged();
+      const evidence: ClosedProviderEvidence[] = saved.map(({session,record}) => ({sessionId:session.id,recordDigest:closedFamilyDigest(record),historyDigest:closedFamilyDigest(record.messages),messages:record.messages,
+        lastPromptAt:record.lastPromptAt??null,lastUsedAt:record.lastUsedAt,lastRequestId:record.lastRequestId??null,absence:record.pid===undefined?"recorded-exit":"recorded-pid-ESRCH"}));
+      return await input.run(evidence, assertUnchanged);
+    } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
   }
 
   async releaseIdleTransports(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void> {
