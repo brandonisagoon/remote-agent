@@ -10,6 +10,7 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObservation, assertSavedComputeRequest, assertSavedComputeResource, assertSavedComputeStopped, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
 import { ComputeReclamation } from "./compute-reclamation-schema.ts";
+import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date; config?: ServerConfig; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
@@ -140,7 +141,7 @@ async function rotate(store: Store, environment: ComputeEnvironment, now: Date) 
   await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
   await store.computeWait.create({ data: { environmentId: environment.id, machineId: environment.machineId, eligibleAt: now } });
 }
-async function withdraw(store: Store, offerId: string, reason: "expired" | "declined" | "ineligible", now: Date) {
+async function withdraw(store: Store, offerId: string, reason: "expired" | "declined" | "ineligible", now: Date, options: { preserveQueue?: boolean } = {}) {
   const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: offerId } });
   if (!["queued", "offered"].includes(offer.state)) return false;
   await store.computeOffer.update({ where: { id: offer.id }, data: { state: reason, completedAt: now } });
@@ -150,7 +151,7 @@ async function withdraw(store: Store, offerId: string, reason: "expired" | "decl
   await store.runtimeInstruction.updateMany({ where: { id: offer.instructionId, state: "queued" }, data: { state: "cancelled", detail: `Compute offer ${reason}` } });
   const env = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
   await store.computeEnvironment.update({ where: { id: env.id }, data: { state: "waiting" } });
-  await rotate(store, env, now);
+  if (!options.preserveQueue) await rotate(store, env, now);
   return true;
 }
 
@@ -171,14 +172,38 @@ export async function withdrawComputeConfigurationOffers(store: Store, environme
   if (waiting) await rotate(store, environment, now);
 }
 
-export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation) {
+/** Before the first claim, admission is the authority that prevents provider
+ * creation. A complete never-claimed ledger can advance with product HEAD;
+ * absent local files alone must never make a previously started app eligible. */
+async function unstartedRevisionEvidence(store: Store, environment: ComputeEnvironment) {
+  const owned = await assertComputeEnvironmentOwner(store, environment);
+  if (owned.task.phase === "complete" || environment.purpose !== "development" || !["waiting", "offered"].includes(environment.state)
+    || environment.resourceId !== null || environment.resourceIdentity !== null || environment.configuration !== null || environment.observation !== null) throw new Error("Compute revision requires a never-started development environment");
+  const intent = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owned.session.id, source: `development:${environment.taskId}`, action: "development-compute-intent" }, orderBy: { sequence: "desc" } });
+  if (intent && z.object({ version: z.literal(1), action: z.enum(["stop", "resume"]) }).parse(JSON.parse(intent.value!)).action !== "resume") throw new Error("Compute revision cannot supersede development stop");
+  const allocations = await savedRevisionAllocations(store, environment.id);
+  if (allocations.offers.some(offer => offer.claimedAt !== null || !["queued", "offered", "expired", "declined", "ineligible"].includes(offer.state))) throw new Error("Compute revision has a prior or uncertain claim");
+  if (await store.remoteTaskResource.count({ where: { taskId: environment.taskId, purpose: environment.purpose } })
+    || await store.computeTraffic.count({ where: { environmentId: environment.id } })) throw new Error("Compute revision has existing resources or traffic");
+  const waiting = await store.computeWait.findUnique({ where: { environmentId: environment.id } });
+  if (!waiting || waiting.machineId !== environment.machineId) throw new Error("Compute revision has no original queue entry");
+  return { identity: owned.identity, worktree: owned.task.worktreePath!, allocations, waiting, intent };
+}
+
+export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation, readUnstartedHead = readComputeWorktreeRevision) {
   policy(input); const request = ComputeRequest.parse(input.request);
   const prior = await input.prisma.computeEnvironment.findUnique({ where: { taskId_key: { taskId: input.taskId, key: request.key } } });
   // A saved app can survive normal product commits. Observe the actual new
   // HEAD before changing its generation; never relabel an old observation.
   const transition = await (async () => {
     if (!prior || prior.revision === request.revision) return;
-    if (!request.saved || !input.config || input.config.machine !== input.machineId) throw new Error("Compute request identity changed");
+    if (!input.config || input.config.machine !== input.machineId) throw new Error("Compute request identity changed");
+    if (!request.saved) {
+      if (prior.purpose !== request.purpose || prior.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
+      const evidence = await unstartedRevisionEvidence(input.prisma, prior);
+      if (await readUnstartedHead(evidence.worktree) !== request.revision) throw new Error("Compute request does not match worktree HEAD");
+      return { unstarted: evidence };
+    }
     const owned = await assertComputeEnvironmentOwner(input.prisma, prior);
     assertSavedComputeRequest(prior, request.saved);
     if (prior.taskIdentity !== owned.identity || prior.purpose !== request.purpose || prior.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
@@ -199,6 +224,16 @@ export async function requestCompute(input: Context & { taskId: string; request:
     if (old) {
       if (old.taskIdentity !== owned.identity || old.purpose !== request.purpose || old.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
       assertSavedComputeRequest(old, request.saved);
+      if (transition && "unstarted" in transition) {
+        const evidence = await unstartedRevisionEvidence(store, old);
+        if (finalizationDigest(old) !== finalizationDigest(prior) || finalizationDigest(evidence) !== finalizationDigest(transition.unstarted)
+          || await readUnstartedHead(evidence.worktree) !== request.revision) throw new Error("Unstarted compute revision changed during observation");
+        // Withdraw old unclaimed offers without rotating the existing queue.
+        // Old instructions and results remain; their old offers cannot claim.
+        for (const offer of evidence.allocations.offers) if (["queued", "offered"].includes(offer.state)) await withdraw(store, offer.id, "ineligible", at(input), { preserveQueue: true });
+        await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: old.primarySessionId, source: `compute:${old.taskId}`, action: "compute-unstarted-revision", key: finalizationDigest({ environmentId: old.id, from: old.revision, to: request.revision }), value: JSON.stringify({ version: 1, environmentId: old.id, taskIdentity: old.taskIdentity, fromRevision: old.revision, toRevision: request.revision, evidence }) } });
+        return store.computeEnvironment.update({ where: { id: old.id }, data: { revision: request.revision, state: "waiting" } });
+      }
       if (transition) {
         const current = await store.remoteTaskResource.findUniqueOrThrow({ where: { id: transition.resource.id } });
         const allocations = await savedRevisionAllocations(store, old.id);
