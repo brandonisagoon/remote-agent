@@ -15,6 +15,8 @@ import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { adoptLegacyOriginalWork, assertLegacyOriginalWorkAuthority, legacyOriginalWorkDependencies, legacyOriginalWorkReceipt } from "./legacy-original-work.ts";
 import { assertLegacyOriginalWorkFiles } from "./legacy-original-work-files.ts";
+import { checkCleanupInventoryOwnership } from "./cleanup-inventory-ownership.ts";
+import { renewCleanupAuthority } from "./cleanup-authority.ts";
 import { LEGACY_ORIGINAL_WORK, LegacyOriginalWorkReceipt, type LegacyOriginalWorkAdoption } from "./legacy-original-work-schema.ts";
 
 let db: TestDatabase, directory: string;
@@ -271,13 +273,19 @@ actual("actual v1 finalizer retains stopped Docker data and recovers source/admi
   } finally { await stopProjection(); await server.stop(true); Object.assign(retention, savedRetention); Object.assign(cleanupReportDelivery, savedReport); }
 }, 60_000);
 
-async function generatedFixture() {
+async function generatedFixture(scanFiles = 0, directoryScope = false) {
   legacyOriginalWorkDependencies.generatedOwner = async () => "f".repeat(64);
   const f = await preparedFixture(async f => {
     await writeFile(path.join(f.root, ".git/info/exclude"), "cache/\nnode_modules/\n");
     await mkdir(path.join(f.worktree, "node_modules/.vite"), { recursive: true });
     await writeFile(path.join(f.worktree, "node_modules/.vite/cache.js"), "generated cache\n");
     await chmod(path.join(f.worktree, "node_modules"), 0o777);
+    for (let start = 0; start < scanFiles; start += 64) await Promise.all(Array.from({ length: Math.min(64, scanFiles - start) }, (_, index) => writeFile(path.join(f.worktree, "cache", `scan-${start + index}`), `retained-${start + index}`)));
+    if (directoryScope) {
+      const environment = path.join(directory, "environments", f.task.id); await mkdir(environment, { recursive: true, mode: 0o700 });
+      await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development-env-directory", kind: "directory", purpose: "development", externalId: environment, state: "ready", metadata: { trackedGreenfieldEdits: false } } });
+    }
+
   }, true);
   const generated = path.join(f.worktree, "node_modules");
   f.adoption.archive.ownedPaths.push(generated); f.adoption.archive.generatedDataRoots = [generated];
@@ -429,3 +437,72 @@ test("a failed physical worker cannot publish ready through local polling", asyn
   try { worker.tick(); await worker.idle(); const result = await requestFinalizationPreparation(input, attempt); expect(result.preparation.state).toBe("failed"); expect(result).not.toHaveProperty("receipt"); }
   finally { await worker.stop(); }
 }, 15000);
+
+
+const livenessClientRoot = process.env.DRAFTED_LIVENESS_CLIENT_ROOT;
+test.skipIf(!livenessClientRoot)("paired client scans more than1024 real entries with read-only liveness while effect renewal stays physical", async () => {
+  const f = await generatedFixture(1100, true); let physical = 0;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { physical++; return "f".repeat(64); };
+  const server = Bun.serve({ unix: path.join(directory, "liveness.sock"), fetch: f.app.fetch });
+  try {
+    const { taskRegistry, CleanupAuthority, CleanupInventoryOwnership } = await import(pathToFileURL(path.join(livenessClientRoot!, "src/control.ts")).href);
+    const { verifyPreparedInventory } = await import(pathToFileURL(path.join(livenessClientRoot!, "src/finalization-resources.ts")).href);
+    const registry = taskRegistry(path.join(directory, "liveness.sock"), f.task.id);
+    const before = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+    let reads = 0; const started = performance.now();
+    await verifyPreparedInventory(f.receipt.proof.originalWork.target, f.worktree, async () => {
+      const receipt = await registry.checkCleanupInventoryOwnership({ requestKey: f.input.requestKey }); reads++;
+      expect(CleanupInventoryOwnership.safeParse(receipt).success).toBe(true);
+      expect(CleanupAuthority.safeParse(receipt).success).toBe(false);
+    });
+    expect(f.receipt.proof.originalWork.target.inventory.length).toBeGreaterThan(1024); expect(reads).toBeGreaterThanOrEqual(4); expect(physical).toBe(0);
+    const scanMs = performance.now() - started;
+    const effectStarted = performance.now();
+    const scoped = await registry.renewCleanupAuthority({ requestKey: f.input.requestKey, resourceKeys: ["development-env-directory"] });
+    const effectMs = performance.now() - effectStarted;
+    expect(scoped.resources).toHaveLength(1); expect(physical).toBe(2);
+    expect(CleanupInventoryOwnership.safeParse(scoped).success).toBe(false);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(before);
+    console.info(JSON.stringify({ fixtureOnly: true, actualPairedHttpClient: true, inventoryEntries: f.receipt.proof.originalWork.target.inventory.length, readChecks: reads, scanMs, scopedPhysicalChecks: physical, scopedEffectMs: effectMs, nativeObserver: "injected stopped-owner fixture; real SQLite/Git/file hashes" }));
+  } finally { server.stop(true); }
+}, 60_000);
+
+test.each(["pause", "owner", "path", "operation", "original-proof"])("read-only inventory ownership refuses %s drift without native observations", async change => {
+  const f = await generatedFixture(); let native = 0;
+  legacyOriginalWorkDependencies.generatedOwner = async () => { native++; throw Error("Read-only check entered a physical observer"); };
+  const first = await checkCleanupInventoryOwnership(f.input); expect(first.purpose).toBe("inventory-read-only");
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "owner") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { acpxSessionId: "other-owner" } });
+  if (change === "path") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { worktreePath: path.join(directory, "replacement") } });
+  if (change === "operation") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.operation.sequence }, data: { value: JSON.stringify({ ...JSON.parse(f.operation.value!), requestKey: "other" }) } });
+  if (change === "original-proof") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.receipt.revision }, data: { value: JSON.stringify({ ...f.receipt.proof, toolingRevision: "b".repeat(40) }) } });
+  await expect(checkCleanupInventoryOwnership({ ...f.input, ownershipEpoch: first.ownershipEpoch })).rejects.toThrow(); expect(native).toBe(0);
+}, 15_000);
+
+test.skipIf(!livenessClientRoot).each(["source", "cache", "archive", "admin", "pause", "owner"])("late %s change after inventory reads still refuses source capture", async change => {
+  const f = await generatedFixture();
+  const { retireArchivedWorktree } = await import(pathToFileURL(path.join(livenessClientRoot!, "src/archived-worktree.ts")).href);
+  const proof = f.receipt.proof.originalWork; let captured = false, ownerChangePending = false;
+  const observedOwner = legacyOriginalWorkDependencies.generatedOwner;
+  legacyOriginalWorkDependencies.generatedOwner = async input => {
+    if (ownerChangePending) { ownerChangePending = false; await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { acpxSessionId: "late-owner" } }); }
+    return observedOwner(input);
+  };
+  const mutate = async () => {
+    if (change === "source") await writeFile(path.join(f.worktree, "README.md"), "changed source");
+    if (change === "cache") await writeFile(path.join(f.worktree, "node_modules/.vite/cache.js"), "changed generated bytes");
+    if (change === "archive") await writeFile(path.join(f.archive, "index.diff"), "changed archive");
+    if (change === "admin") await writeFile(proof.administration!.git.index.path, "changed admin index");
+    if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    if (change === "owner") ownerChangePending = true;
+  };
+  await expect(retireArchivedWorktree({ taskId: f.task.id, worktree: f.worktree, revision: proof.snapshot.head, branch: proof.snapshot.branch,
+    gitDirectory: proof.restore.gitDirectory, gitCwd: f.root, target: proof.target, generatedData: proof.generatedData, installedDependencies: proof.installedDependencies, administration: proof.administration,
+    assertAuthority: async () => { await renewCleanupAuthority(f.input); },
+    inventoryOwnershipCheck: () => async () => { await checkCleanupInventoryOwnership(f.input); }, observation: idle,
+    captureHooks: { beforeCapture: mutate, afterCapture: async () => { captured = true; } },
+  })).rejects.toThrow();
+  expect(captured).toBe(false); expect((await lstat(f.worktree)).isDirectory()).toBe(true);
+  expect((await lstat(proof.administration!.git.administrativeDirectory)).isDirectory()).toBe(true);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+}, 30_000);

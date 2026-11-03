@@ -249,3 +249,21 @@ test("direct cleanup uses the existing inbox key and rejects changed verificatio
     expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.task.toolingRevision);
   } finally { await f.server.stop(true); }
 });
+
+
+test.each(["delegate", "moved-descendant", "pending", "primary-role", "primary-owner"])("inventory-read liveness preserves direct cleanup %s guards", async condition => {
+  const f = await fixture("local-only");
+  try {
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(200);
+    const first = await f.request("cleanup-inventory-ownership", { requestKey: f.input.requestKey }); expect(first.status).toBe(200);
+    if (["delegate", "moved-descendant"].includes(condition)) {
+      const child = await db.prisma.runtimeSession.create({ data: { scopeKey: "child", agentCommand: "codex", status: "active", role: "delegate", cwd: condition === "delegate" ? f.worktree : path.join(directory, "moved"), repositoryId: f.task.repositoryId, machineId: f.task.machineId } });
+      await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: child.id, targetSessionId: f.session.id, relationship: "spawned-by" } });
+    }
+    if (condition === "pending") await db.prisma.runtimeInstruction.create({ data: { id: "pending", sessionId: f.session.id, text: "Owner work", state: "queued" } });
+    if (condition === "primary-role") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { role: "delegate" } });
+    if (condition === "primary-owner") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { primarySessionId: null } });
+    expect((await f.request("cleanup-inventory-ownership", { requestKey: f.input.requestKey, ownershipEpoch: first.data.ownershipEpoch })).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+  } finally { f.server.stop(true); }
+}, 15_000);

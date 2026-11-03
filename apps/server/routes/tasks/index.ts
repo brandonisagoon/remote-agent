@@ -87,6 +87,17 @@ sessionTaskRoutes.post("/:sessionId/reply-context", async (c) => {
   catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
 });
 
+taskRoutes.post("/:taskId/cleanup-inventory-ownership", async (c) => {
+  const parsed = FinalizationInput.pick({ requestKey: true, finalizationVersion: true }).extend({ ownershipEpoch: z.string().regex(/^[a-f0-9]{64}$/).optional() }).strict().safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Use the exact existing cleanup identity for an inventory read" }, 400);
+  const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
+  if (!task?.primarySessionId) return c.json({ error: "Task has no original primary" }, 409);
+  try {
+    const { checkCleanupInventoryOwnership } = await import("../../services/tasks/cleanup-inventory-ownership.ts");
+    return c.json(await checkCleanupInventoryOwnership({ ...parsed.data, prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: task.primarySessionId }));
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
+
 taskRoutes.post("/:taskId/cleanup-authority", async (c) => {
   const parsed = FinalizationInput.pick({ requestKey: true, finalizationVersion: true }).extend({ resourceKeys: CleanupResourceKeys.optional(), nativePids: CleanupNativePids.optional() }).safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "A stable cleanup requestKey is required" }, 400);
