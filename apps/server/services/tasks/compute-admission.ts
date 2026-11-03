@@ -103,12 +103,30 @@ async function refreshBaseline(input: Context) {
   pending.set(input.machineId, work);
   try { return await work; } finally { if (pending.get(input.machineId) === work) pending.delete(input.machineId); }
 }
-async function freeSlot(store: Store, input: Context) {
-  const settings = policy(input), unavailable = await unaccounted(store, input);
-  const usable = Math.max(0, settings.slots - unavailable);
-  // Count allocations at every ordinal, including slots left above a reduced
-  // budget. Moving the free-slot range alone could overbook the host.
+/** The same conservative budget used by selection, claim and diagnostics.
+ * Reads only: stale/missing proof retains its existing reservation. */
+export async function computeAdmissionCapacity(store: Store, input: Context) {
+  const settings = policy(input), unaccountedGroups = await unaccounted(store, input);
+  // Count every occupied ordinal, including slots above a reduced budget.
   const occupied = await store.computeSlot.count({ where: { machineId: input.machineId, allocationId: { not: null } } });
+  const usable = Math.max(0, settings.slots - unaccountedGroups);
+  return { slots: settings.slots, unaccounted: unaccountedGroups, occupied, usable, headroom: usable - occupied };
+}
+
+/** Observe the daemon's real activity and existing proof in a read transaction.
+ * This never refreshes proof, reconciles offers or creates a slot/claim. */
+export async function readComputeCapacity(input: Context & { taskId: string }) {
+  if (!input.runtime?.observeSessionActivity) throw new Error("Compute execution observation is unavailable");
+  const now = at(input);
+  return input.prisma.$transaction(async store => {
+    const task = await store.remoteTask.findUnique({ where: { id: input.taskId } });
+    if (!task || task.machineId !== input.machineId) throw new Error("Compute diagnostic owner is unavailable");
+    return { ...await computeAdmissionCapacity(store, { ...input, now }), observedAt: now.toISOString() };
+  });
+}
+
+async function freeSlot(store: Store, input: Context) {
+  const { usable, occupied } = await computeAdmissionCapacity(store, input);
   if (occupied >= usable) return null;
   for (let ordinal = 0; ordinal < usable; ordinal++) {
     const id = `${input.machineId}:${ordinal}`;
@@ -320,8 +338,9 @@ export async function claimCompute(input: Context & { taskId: string; offerId: s
       assertSavedComputeStopped(environment, observed.data, at(input), input.policy.collectorFreshnessSeconds);
     }
     const slot = await store.computeSlot.findUnique({ where: { allocationId: offer.id } });
-    const occupied = await store.computeSlot.count({ where: { machineId: input.machineId, allocationId: { not: null } } });
-    if (!slot || occupied + await unaccounted(store, input) > input.policy.slots) throw new Error("Compute reservation is unavailable");
+    if (!slot) throw new Error("Compute reservation is unavailable");
+    const capacity = await computeAdmissionCapacity(store, input);
+    if (capacity.occupied + capacity.unaccounted > capacity.slots) throw new Error("Compute reservation is unavailable");
     const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input) } });
     await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
     const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });

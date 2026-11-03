@@ -6,7 +6,7 @@ import { createTestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
-import { claimCompute, confirmComputeDelivery, offerNextCompute, requestCompute } from "./compute-admission.ts";
+import { claimCompute, confirmComputeDelivery, offerNextCompute, readComputeCapacity, requestCompute } from "./compute-admission.ts";
 import { refreshComputeBaselines } from "./compute-baseline.ts";
 
 const cleanups: (() => Promise<unknown>)[] = [];
@@ -33,13 +33,16 @@ async function fixture() {
 test("unbound closed/paused original group frees one justified slot, without enrollment or changing original facts", async () => {
   const f = await fixture();
   const original = { task: await f.prisma.remoteTask.findUnique({ where: { id: "old" } }), resources: await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" }, orderBy: { id: "asc" } }), session: await f.prisma.runtimeSession.findUnique({ where: { id: "old" } }) };
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, occupied: 0, headroom: 0 });
   expect(await offerNextCompute(f.admission)).toBeNull();
   expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, occupied: 0, headroom: 1 });
   const offer = await offerNextCompute(f.admission); expect(offer).not.toBeNull();
   await f.prisma.runtimeInstruction.update({ where: { id: offer!.instructionId }, data: { state: "dispatching", executionRequestId: offer!.instructionId } });
   await f.prisma.runtimeLifecycleEvent.create({ data: { id: "started", runtimeSessionId: "waiting", requestId: offer!.instructionId, phase: "started", occurredAt: f.now } });
   const delivered = await confirmComputeDelivery({ ...f.admission, sessionId: "waiting", requestId: offer!.instructionId });
   expect(delivered?.state).toBe("offered");
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, occupied: 1, headroom: 0 });
   expect((await claimCompute({ ...f.admission, taskId: "waiting", offerId: offer!.id, request: f.request })).offer.state).toBe("claimed");
   expect(await f.prisma.computeEnvironment.count({ where: { taskId: "old" } })).toBe(0);
   expect(await f.prisma.remoteTask.findUnique({ where: { id: "old" } })).toEqual(original.task);
@@ -58,6 +61,7 @@ test.each(["running", "unknown", "read-failure", "missing", "duplicate", "wrong-
     if (kind === "stale") result.observedAt -= 60_000;
     return result;
   })).toEqual({ observed: 0, unavailable: 1 });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
   expect(await offerNextCompute(f.admission)).toBeNull();
 });
 test.each(["changed", "new-member", "active-grandchild", "pending-grandchild", "late-claim"])("late %s invalidates complete original-group proof", async kind => {
@@ -72,6 +76,7 @@ test.each(["changed", "new-member", "active-grandchild", "pending-grandchild", "
     if (kind === "pending-grandchild") await f.prisma.runtimeInstruction.create({ data: { id: "pending", sessionId: "grandchild", text: "work", state: "unknown" } });
   }
   if (kind === "late-claim") await f.prisma.remoteTaskResource.create({ data: { taskId: "waiting", key: "overlap", kind: "docker-container", purpose: "development", externalId: "app".repeat(32), state: "ready" } });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: kind === "late-claim" ? 2 : 1, headroom: 0 });
   expect(await offerNextCompute(f.admission)).toBeNull();
 });
 test.each(["running", "failed"])("Released original members retain reservation after %s physical refresh", async kind => {
@@ -196,4 +201,23 @@ console.log(JSON.stringify({version:1,kind:'compute-baseline',machineId:input.ma
   }
   expect(await f.prisma.computeEnvironment.count({ where: { taskId: "old" } })).toBe(0);
   expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
+});
+
+test.each(["stale", "missing-runtime", "executing", "queued"])("diagnostic cannot turn %s activity/proof into free credit", async kind => {
+  const f = await fixture(); await refreshComputeBaselines(f.context, f.read);
+  const input = { ...f.admission, taskId: "waiting" };
+  if (kind === "missing-runtime") {
+    await expect(readComputeCapacity({ ...input, runtime: {} })).rejects.toThrow("observation is unavailable");
+  } else {
+    if (kind === "stale") input.now = new Date(f.now.getTime() + 15_001);
+    else f.runtime.observeSessionActivity = () => ({ state: kind as "executing" | "queued", observedAt: f.now.getTime() });
+    expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 1, headroom: 0 });
+    expect(await offerNextCompute(input)).toBeNull();
+  }
+});
+test.each(["running", "unknown", "starting"])("unallocated %s environments remain debited even with a stopped original group", async state => {
+  const f = await fixture(); await refreshComputeBaselines(f.context, f.read);
+  await f.prisma.computeEnvironment.updateMany({ where: { taskId: "waiting" }, data: { state } });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, occupied: 0, headroom: 0 });
+  expect(await offerNextCompute(f.admission)).toBeNull();
 });

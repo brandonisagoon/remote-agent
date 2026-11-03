@@ -3,7 +3,7 @@ import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../..
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
-import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, offerNextCompute, requestCompute } from "../../services/tasks/compute-admission.ts";
+import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, offerNextCompute, readComputeCapacity, requestCompute } from "../../services/tasks/compute-admission.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
@@ -19,7 +19,15 @@ computeRoutes.post("/:taskId/compute-enroll", async c => {
   try { return c.json(await enrollCompute({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data })); }
   catch { return c.json({ error: "Compute coverage enrollment could not be verified; existing configuration was preserved" }, 409); }
 });
-computeRoutes.get("/:taskId/compute-policy", c => c.json({ enabled: c.get("config").compute?.enabled === true }));
+computeRoutes.get("/:taskId/compute-policy", async c => {
+  const config = c.get("config"), enabled = config.compute?.enabled === true;
+  if (c.req.query("capacity") !== "1") return c.json({ enabled });
+  if (!enabled) return c.json({ enabled, capacity: null });
+  try {
+    const capacity = await readComputeCapacity({ prisma: c.get("prisma"), machineId: config.machine, policy: config.compute!, runtime: c.get("agentRuntime"), taskId: c.req.param("taskId") });
+    return c.json({ enabled, capacity });
+  } catch { return c.json({ error: "Compute capacity could not be observed; existing reservations were preserved" }, 409); }
+});
 computeRoutes.post("/:taskId/compute-request", async c => {
   const parsed = ComputeRequest.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Use the exact environment, purpose, revision and recipe digest" }, 400);
