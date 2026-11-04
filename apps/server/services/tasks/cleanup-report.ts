@@ -1,5 +1,4 @@
 import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
-import { legacyOriginalWorkReceipt } from "./legacy-original-work.ts";
 import { legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { serializeIssuePublication } from "../sessions/issue-updates.ts";
 import { cleanupStatusReceipt } from "./cleanup-status.ts";
@@ -34,10 +33,20 @@ export async function queueCleanupReport(prisma: Database, active: Active, confi
   if (active.kind === "v1" && active.prepared.localCompletion) return recordLocalCleanupReport(prisma, active, confirmedRevision);
   const prepared = active.prepared;
   if (!prepared.connectionId || !prepared.issueId || !prepared.issueIdentifier) throw new Error("Linked cleanup reporting requires its original source");
-  const original = active.kind === "v1" && await legacyOriginalWorkReceipt(prisma, active.prepared, active.preparation.sequence);
+  const saved = await prisma.runtimeMetadataEvent.findFirst({ where: where(prepared.taskId, prepared.sessionId, prepared.requestKey) });
+  if (saved) {
+    const previous = Report.parse(JSON.parse(saved.value!));
+    const report = await prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: previous.reportId } });
+    if (previous.taskId !== prepared.taskId || previous.sessionId !== prepared.sessionId || previous.operationRevision !== active.operationRevision
+      || previous.preparedRevision !== active.preparation.sequence || previous.confirmedRevision !== confirmedRevision
+      || previous.connectionId !== prepared.connectionId || previous.issueId !== prepared.issueId || previous.issueIdentifier !== prepared.issueIdentifier
+      || report.runtimeSessionId !== prepared.sessionId || report.requestKey !== previous.payload.requestKey || report.connectionId !== prepared.connectionId || report.issueId !== prepared.issueId
+      || retirementDigest(report.input) !== retirementDigest(previous.payload) || retirementDigest(report.evidence) !== retirementDigest([])) throw new Error("Cleanup reporting receipt changed");
+    return { reportId: report.id, published: report.published };
+  }
   const accepted = active.kind === "v2"
     ? `Accepted external deliveries are preserved: ${active.prepared.delivery.deliveries.map(delivery => `${delivery.url} (reviewed ${delivery.reviewedHead}, merged ${delivery.mergeCommit})`).join("; ")}.${active.prepared.originalWork ? " Unfinished original work remains preserved in its verified archive and exact quarantine; it is not claimed as delivered." : ""}`
-    : `Its accepted work at ${prepared.revision} is preserved.${original ? " The original source remains recoverable in its verified archive and exact source and Git administration captures." : ""}`;
+    : `Its accepted work at ${prepared.revision} is recorded. Finished development source was deleted; existing named artifacts remain retained.`;
   const started = await cleanupStatusReceipt(prisma, active);
   const retainedCompose = await legacyComposeRetentionReceipt(prisma, active);
   const payload = { requestKey: `${prepared.requestKey}:cleanup-report`, body: `Cleanup is confirmed for ${prepared.issueIdentifier}. ${accepted} Required task resources are retired, ${retainedCompose ? "verified stopped migration data and saved evidence remain explicitly retained" : "explicitly retained evidence remains recorded"}, and the original development worktree and Git registration are absent.`, evidence: [] as [] };

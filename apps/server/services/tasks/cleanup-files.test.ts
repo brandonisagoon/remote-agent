@@ -14,7 +14,12 @@ async function fixture(kind = "evidence") {
   const file = path.join(directory, "saved-evidence.txt"); await writeFile(file, "original retained bytes\n", { mode: 0o600 });
   const resources: FinalizationResourceRecord[] = [{ id: "file", key: "capture", kind, purpose: "browser", externalId: file, state: "ready", metadata: { sha256: sha("original retained bytes\n"), bytes: 24 } }];
   const input = { resources, taskId: "task", sessionId: "primary", toolingRoot: path.join(directory, "immutable-tooling"), sourcePaths: [], deliveries: [], ownership: { ownedPaths: [file] }, originalWork: true };
-  return { directory, file, resources, input, prepare: (observation = quiet) => prepareFinalizationResources(input, observation), verify: (plan: FinalizationResourcePlan[], removed = false, observation = quiet) => assertFinalizationResources({ taskId: "task", resources, plan, removed, originalWork: true }, observation) };
+  return { directory, file, resources, input, prepareDeletion: (observation = quiet) => prepareFinalizationResources(input, observation), prepare: async (observation = quiet) => {
+    const plan = await prepareFinalizationResources(input, observation);
+    // Historical accepted retention plans remain supported byte-for-byte.
+    for (const entry of plan) if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") delete entry.target.retirement;
+    return plan;
+  }, verify: (plan: FinalizationResourcePlan[], removed = false, observation = quiet) => assertFinalizationResources({ taskId: "task", resources, plan, removed, originalWork: true }, observation) };
 }
 async function checkpoint() {
   const f = await fixture("source-checkpoint"), root = path.join(f.directory, "checkpoint"); await mkdir(root, { mode: 0o755 }); await chmod(root, 0o755);
@@ -164,4 +169,45 @@ test.skipIf(!draftedRoot).each(["files", "checkpoint"])("actual prepared dispatc
   expect(await readFile(target.target.quarantine.journal)).toEqual(journal); expect((await lstat(target.target.quarantine.path)).ino).toBe(captured.ino);
   if (kind === "checkpoint") expect(await readFile(path.join(target.target.quarantine.path, "README.md"), "utf8")).toBe("ancillary notes stay retained\n");
   else expect(await readFile(target.target.quarantine.path, "utf8")).toBe("original retained bytes\n");
+}, 30_000);
+
+
+test("new finished filesystem plans require deletion and independently verify absence", async () => {
+  const f = await fixture(), plan = await f.prepareDeletion();
+  const entry = plan.find(value => value.disposition === "retire-file" || value.disposition === "retire-tree")!;
+  if (entry.disposition !== "retire-file" && entry.disposition !== "retire-tree") throw Error("missing deletion plan");
+  expect(entry.target.retirement).toBe("delete");
+  await f.verify(plan); await capture(plan);
+  await expect(f.verify(plan, true)).rejects.toThrow();
+  await rm(entry.target.quarantine.directory, { recursive: true });
+  for (const resource of f.resources) resource.state = "released";
+  await f.verify(plan, true); await f.verify(plan, true);
+  await writeFile(entry.target.path, "new owner bytes");
+  await expect(f.verify(plan, true)).rejects.toThrow();
+});
+
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual paired finished filesystem deletion resumes staging and verifies server absence", async () => {
+  const f = await fixture(), plan = await f.prepareDeletion(), root = process.env.DRAFTED_INTEGRATION_ROOT!;
+  const { releasePreparedResources } = await import(path.join(root, "src/finalization-resources.ts"));
+  const { FinalizationResourcePlan: ClientPlan, assertResourcePlan } = await import(path.join(root, "src/finalization-plan.ts"));
+  const { adapterReceipt } = await import(path.join(root, "test/fixtures/prepared-adapter.ts"));
+  const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(f.directory, "original-worktree"), toolingRevision: "a".repeat(40), phase: "waiting", finalizationVersion: 2, resources: f.resources };
+  const prepared = adapterReceipt(task, plan.map(entry => ClientPlan.parse(entry)));
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  let once = true;
+  const afterCapture = () => { if (once) { once = false; throw Error("lost staging reply"); } };
+  const run = () => releasePreparedResources({ registry, prepared, observation: { ...quiet, pathsIdle: async () => {} }, assertAuthority: () => f.verify(plan),
+    assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, captureHooks: { afterCapture }, fileCaptureHooks: { afterCapture } });
+  expect((await run()).results.some((value: { outcome: string }) => value.outcome === "failed")).toBeTrue();
+  await f.verify(plan);
+  for (const outcome of (await run()).results) expect(outcome).toMatchObject({ outcome: "deleted" });
+  await f.verify(plan, true);
+  for (const outcome of (await run()).results) expect(outcome).toMatchObject({ outcome: "deleted" });
+  for (const entry of plan) if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") {
+    expect(await lstat(entry.target.path).catch(() => null)).toBeNull();
+    expect(await lstat(entry.target.quarantine.directory).catch(() => null)).toBeNull();
+  }
 }, 30_000);

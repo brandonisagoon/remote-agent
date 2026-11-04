@@ -39,26 +39,28 @@ export async function prepareStandaloneFiles(input: { resources: FinalizationRes
       || input.plan.some(entry => entry.disposition === "retain-archive" && overlaps(entry.archive.root, directory))) throw new Error("Standalone capture destination overlaps retained or protected material");
     captureAdapterDependencies(directory, input.resources, input.plan);
     const plan = StandaloneFilePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-file", ...edges,
-      target: { type: "file", ...frozen, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
+      target: { type: "file", retirement: "delete", ...frozen, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
     result.push(plan);
   }
   if (result.length) {
     if (observation.pathsIdle) await observation.pathsIdle(result.map(entry => entry.target.path));
     else for (const entry of result) await idle(entry.target.path);
     for (const entry of result) {
-      const { type: _type, quarantine: _quarantine, ...expected } = entry.target;
+      const { type: _type, retirement: _retirement, quarantine: _quarantine, ...expected } = entry.target;
       if (finalizationDigest(await observeLegacyEvidenceFile(entry.target.path)) !== finalizationDigest(expected)) throw new Error("Standalone file changed during preparation");
     }
   }
   return result;
 }
 export async function assertStandaloneFiles(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; adapterObservation?: z.infer<typeof CleanupObserverBatchResult> }, observation: ResourceObservation) {
-  const idle = observation.linkedRootIdle ?? observation.rootIdle, paths: string[] = [], states: Array<{ entry: z.infer<typeof StandaloneFilePlan>; removed: boolean; captured: "captured" | "intact" | "pending" }> = [];
+  const idle = observation.linkedRootIdle ?? observation.rootIdle, paths: string[] = [], states: Array<{ entry: z.infer<typeof StandaloneFilePlan>; removed: boolean; captured: "captured" | "intact" | "pending" | "deleted" }> = [];
   for (const entry of input.plan.filter(entry => entry.disposition === "retire-file")) {
     const resource = input.resources.find(resource => resource.id === entry.id)!;
     if (!hasStandaloneFileResource(resource) || entry.externalId !== entry.target.path) throw new Error("Standalone file capture scope changed");
     const removed = input.removed || resource.state === "released", captured = await inspectPreparedFileCapture({ taskId: input.taskId, resourceId: entry.id, target: entry.target }, removed);
-    if (captured === "captured") assertCapturedDependencies(entry, input.resources, input.adapterObservation);
+    if (captured === "deleted" && (await missing(entry.target.path) || await missing(entry.target.quarantine.path))) throw new Error("Standalone deleted bytes were recreated");
+    if (entry.target.retirement === "delete" && removed && captured !== "deleted") throw new Error("Standalone deletion still has original or staged bytes");
+    if (captured === "captured" || captured === "deleted") assertCapturedDependencies(entry, input.resources, input.adapterObservation);
     paths.push(entry.target.path);
     if (captured === "captured") paths.push(entry.target.quarantine.path);
     states.push({ entry, removed, captured });

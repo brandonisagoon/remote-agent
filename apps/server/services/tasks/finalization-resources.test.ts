@@ -40,8 +40,14 @@ async function fixture(prefix = "ef-") {
     row("source", "source-copies", root), row("endpoint", "local-http", "http://127.0.0.1:55022", "development", { pid: 123456, script }),
   ];
   const input = { resources, taskId: "original-task", sessionId: "original-primary", toolingRoot, sourcePaths: [sourcePath], deliveries, ownership: { sourceCopyResourceId: "source", ownedPaths: [] as string[] } };
-  const prepare = (observation = quiet) => prepareFinalizationResources(input, observation);
-  return { temp, root, sourcePath, toolingRoot, profile, ownerFile, capture, prepared, resources, input, prepare };
+  const prepareDeletion = (observation = quiet) => prepareFinalizationResources(input, observation);
+  const prepare = async (observation = quiet) => {
+    const plan = await prepareDeletion(observation);
+    // Historical accepted recoverable-capture plans retain their old contract.
+    for (const entry of plan) if (entry.disposition === "retire-owned" && entry.target.type === "tree") delete entry.target.retirement;
+    return plan;
+  };
+  return { temp, root, sourcePath, toolingRoot, profile, ownerFile, capture, prepared, resources, input, prepare, prepareDeletion };
 }
 function tree(plan: FinalizationResourcePlan[]) {
   const result = plan.find((entry) => entry.disposition === "retire-owned" && entry.target.type === "tree");
@@ -322,3 +328,19 @@ describe("external-delivery resource ownership", () => {
     await expect(finalizationResourceObservation.browserAbsent({ session: "original-task", toolingRoot: f.toolingRoot })).rejects.toThrow("still running");
   });
 });
+
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("new owned source-copy plan deletes its staging and opaque browser data without an archive", async () => {
+  const f = await fixture(), plan = await f.prepareDeletion(), target = tree(plan);
+  expect(target.retirement).toBe("delete");
+  const { deletePreparedPath } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/quarantine.ts"));
+  const inspect = (removed = false) => assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed }, quiet);
+  const identity = { taskId: "original-task", resourceId: "source", planDigest: finalizationDigest(target) };
+  await expect(deletePreparedPath(target, identity, async () => {}, { afterDeleteEntry() { throw Error("interrupted prune"); } })).rejects.toThrow("interrupted prune");
+  await inspect();
+  await deletePreparedPath(target, identity, async () => {});
+  for (const entry of plan) if (entry.disposition === "retire-owned") f.resources.find(resource => resource.id === entry.id)!.state = "released";
+  await inspect(true); await inspect(true); await deletePreparedPath(target, identity, async () => {});
+  expect(await lstat(target.path).catch(() => null)).toBeNull();
+  expect(await lstat(target.quarantine.directory).catch(() => null)).toBeNull();
+}, 30_000);

@@ -318,7 +318,16 @@ test("shared cleanup requires independent adapter absence even after a generic R
       dependencies: [], stoppedConsumers: [], adapter: "docker", targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
   } };
   const dependencies = { ...f.dependencies, cleanupObserver: async () => capability,
-    resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, observation),
+    resources: async (input: Parameters<typeof prepareFinalizationResources>[0]) => {
+      const plan = await prepareFinalizationResources(input, observation);
+      // These fixtures represent already accepted historical retained-capture
+      // plans, which predate the new finished-task delete disposition.
+      for (const entry of plan) {
+        if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") delete entry.target.retirement;
+        else if (entry.disposition === "retire-owned" && entry.target.type === "tree") delete entry.target.retirement;
+      }
+      return plan;
+    },
     assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, observation) };
   const adopted = await adoptLegacyDelivery({ ...f.context, retirement: await f.request() }, dependencies);
   expect(observations).toBe(2);
@@ -397,7 +406,16 @@ test("captured preview confirmation uses current declared tooling without rewrit
     return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: tunnel.id, resourceIdentityDigest: finalizationResourceIdentity(tunnel).identityDigest, adapter: "preview", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
   } };
   const dependencies = { ...f.dependencies, cleanupObserver: async () => selected,
-    resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, observation),
+    resources: async (input: Parameters<typeof prepareFinalizationResources>[0]) => {
+      const plan = await prepareFinalizationResources(input, observation);
+      // These fixtures represent already accepted historical retained-capture
+      // plans, which predate the new finished-task delete disposition.
+      for (const entry of plan) {
+        if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") delete entry.target.retirement;
+        else if (entry.disposition === "retire-owned" && entry.target.type === "tree") delete entry.target.retirement;
+      }
+      return plan;
+    },
     assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, observation) };
   const retirement = await f.request(); retirement.ownership.ownedPaths = [env];
   await adoptLegacyDelivery({ ...f.context, retirement }, dependencies);

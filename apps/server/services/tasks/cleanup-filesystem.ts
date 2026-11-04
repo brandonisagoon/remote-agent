@@ -128,7 +128,7 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
     }
     const directory = path.join(path.dirname(root), `.drafted-finalization-${randomUUID()}`);
     const tree = RegisteredTreePlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-tree", treeKind: checkpoint ? "source-checkpoint" : "registered-directory", ...(checkpoint ? { manifest: checkpoint.manifest } : {}),
-      ...edges, target: { type: "tree", path: root, inventory, sourcePaths: [root],
+      ...edges, target: { type: "tree", retirement: "delete", path: root, inventory, sourcePaths: [root],
         quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } });
     result.push(tree);
     for (const child of children) {
@@ -160,7 +160,7 @@ export async function assertRegisteredCaptureSharing(prisma: Pick<PrismaClient, 
   const { assertStudioCleanupSharing } = await import("./cleanup-studio-sharing.ts");
   await assertStudioCleanupSharing(prisma, taskId, plan);
   const roots = plan.filter(entry => entry.disposition === "retire-tree" || entry.disposition === "retire-worktree" || entry.disposition === "retire-file" || entry.disposition === "retire-vault");
-  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
+  const scopes = roots.flatMap(entry => [entry.target.path, entry.target.quarantine.directory, ...(entry.target.retirement === "delete" ? [`${entry.target.quarantine.directory}.deleted.json`] : []), ...(entry.disposition === "retire-worktree" ? [entry.administrationCapture.path, entry.administrationCapture.quarantine.directory] : [])]);
   for (const browser of plan) if (browser.disposition === "retire-browser" && browser.capture.type === "standalone") scopes.push(browser.capture.target.path, browser.capture.target.quarantine.directory);
   scopes.push(...plan.filter(entry => entry.disposition === "retain-data").map(entry => entry.archive.root));
   await assertRegisteredPathSharing(prisma, taskId, scopes, plan.filter(entry => entry.disposition === "retire-vault").map(entry => entry.externalId));
@@ -188,6 +188,19 @@ export async function assertRegisteredCaptures(input: { taskId: string; resource
     if (trees.some(other => other.id !== tree.id && overlaps(tree.target.path, other.target.path))) throw new Error("Registered capture roots overlap");
     const record = input.resources.find(record => record.id === tree.id)!;
     const captured = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target: tree.target });
+    if (tree.target.retirement === "delete") {
+      if ((input.removed || record.state === "released") && !captured.deleted) throw new Error("Registered deletion still has staged or original bytes");
+      if (!captured.deleted) await assertFinalizationTree(tree.target, captured.physicalPath, captured.captured);
+      if (captured.captured || captured.deleted) assertCapturedDependencies(tree, input.resources, input.adapterObservation);
+      for (const child of children.filter(child => child.parentResourceId === tree.id)) {
+        await assertFinalizationPath(child.target.path);
+        if ((captured.captured || captured.deleted) && await missing(child.target.path)) throw new Error("Deleted child path was recreated");
+        if (input.removed && input.resources.find(resource => resource.id === child.id)?.state !== "released") throw new Error("Child deletion receipt is missing");
+      }
+      await observation.rootIdle(tree.target.path);
+      if (captured.captured) await observation.rootIdle(captured.physicalPath);
+      continue;
+    }
     if ((input.removed || record.state === "released") && !captured.captured) throw new Error("Registered directory has no verified retained capture");
     await assertFinalizationTree(tree.target, captured.physicalPath);
     if (tree.treeKind === "source-checkpoint") {

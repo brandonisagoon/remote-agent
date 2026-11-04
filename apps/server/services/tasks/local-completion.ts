@@ -8,6 +8,8 @@ import { PreparationDiagnosticError } from "./preparation-errors.ts";
 
 export const LocalCompletion = z.object({ kind: z.literal("local-completion/v1"), boundary: z.enum(["research", "local-only"]),
   verificationRevision: z.number().int().positive(), verificationDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  // Historical preparation fact; retained for receipt compatibility. Finished
+  // cleanup does not require a source archive merely because ignored files exist.
   sourceCaptureRequired: z.boolean(),
 }).strict();
 export type LocalCompletion = z.infer<typeof LocalCompletion>;

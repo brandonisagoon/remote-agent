@@ -45,8 +45,8 @@ async function assertFile(expected: z.infer<typeof LegacyEvidenceFile>, privateF
   const observed = await observeLegacyEvidenceFile(file, privateFile);
   if (finalizationDigest({ ...observed, path: expected.path }) !== finalizationDigest(expected)) throw new Error("Retained evidence identity or bytes changed");
 }
-function sourceFile(target: Extract<LegacyEvidenceProof["entries"][number]["target"], { type: "file" }>) {
-  const { type: _type, quarantine: _quarantine, ...file } = target;
+function sourceFile(target: (Extract<LegacyEvidenceProof["entries"][number]["target"], { type: "file" }> & { retirement?: "delete" })) {
+  const { type: _type, retirement: _retirement, quarantine: _quarantine, ...file } = target;
   return LegacyEvidenceFile.parse(file);
 }
 
@@ -122,13 +122,14 @@ export async function inspectLegacyEvidenceCapture(proof: LegacyEvidenceProof, e
 
 /** Shared exact-file capture observer. Legacy evidence still verifies its
  * independent retained copy before entering this unchanged journal protocol. */
-export async function inspectPreparedFileCapture(input: { taskId: string; resourceId: string; target: Extract<LegacyEvidenceProof["entries"][number]["target"], { type: "file" }> }, removed: boolean) {
+export async function inspectPreparedFileCapture(input: { taskId: string; resourceId: string; target: (Extract<LegacyEvidenceProof["entries"][number]["target"], { type: "file" }> & { retirement?: "delete" }) }, removed: boolean) {
   const { target } = input;
   const q = target.quarantine;
   if (path.dirname(q.directory) !== path.dirname(target.path) || q.path !== path.join(q.directory, "contents") || q.journal !== path.join(q.directory, "pending.json") || !path.basename(q.directory).startsWith(".drafted-evidence-")) throw new Error("Evidence quarantine identity is invalid");
   await assertFinalizationPath(target.path);
   const missing = await absent(target.path);
   if (await absent(q.directory)) {
+    if (missing && target.retirement === "delete") return "deleted" as const;
     if (missing || removed) throw new Error("Evidence retirement lacks its recoverable capture");
     await assertFile(sourceFile(target));
     return "intact" as const;
@@ -153,6 +154,7 @@ export async function inspectPreparedFileCapture(input: { taskId: string; resour
     await assertFile(sourceFile(target));
     return "pending" as const;
   }
+  if (capturedMissing && target.retirement === "delete") return "deleted" as const;
   if (capturedMissing) throw new Error("Evidence capture is missing");
   await assertFile(sourceFile(target), false, q.path);
   return "captured" as const;

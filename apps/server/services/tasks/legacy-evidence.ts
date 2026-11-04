@@ -13,7 +13,6 @@ import { LEGACY_EVIDENCE_CONFIRMED, LEGACY_EVIDENCE_RETAINED, LegacyEvidenceAdop
 
 import { isEvidenceTree, matchLegacyEvidenceTrees, observeLegacyEvidenceTree } from "./legacy-evidence-tree.ts";
 import { assertLegacyEvidenceWriters } from "./legacy-evidence-writers.ts";
-import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { assertLocalCompletion } from "./local-completion.ts";
 
 type Database = Pick<PrismaClient, "remoteTask" | "remoteTaskResource" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent">;
@@ -296,7 +295,18 @@ export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config
   const resources = await prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId, kind: "evidence", purpose: "tooling", state: { not: "released" } } });
   if (!resources.length) return;
   const event = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: prepared.sessionId, source: `owner:${prepared.taskId}`, action: LEGACY_EVIDENCE_RETAINED }, orderBy: { sequence: "desc" } });
-  if (!event) throw new PreparationDiagnosticError("LOCAL_EVIDENCE_RETENTION_REQUIRED");
+  if (!event) {
+    // Tooling artifacts are retained in place. Finished cleanup does not
+    // require making a second copy just to preserve an existing named file.
+    for (const resource of resources) {
+      if (within(prepared.worktree, resource.externalId)) throw new Error("Retained tooling evidence overlaps the source being removed");
+      const metadata = resource.metadata as Record<string, unknown> | null;
+      const observed = await observeLegacyEvidenceFile(resource.externalId);
+      const sizes = [metadata?.bytes, metadata?.byteSize, metadata?.size].filter(value => value !== undefined);
+      if (metadata?.sha256 !== observed.sha256 || !sizes.length || sizes.some(size => size !== observed.size)) throw new Error("Retained tooling evidence differs from its recorded identity");
+    }
+    return;
+  }
   const loaded = await loadProof(prisma, config, prepared.taskId, event.sequence);
   if (loaded.prepared.requestKey !== prepared.requestKey || loaded.receipt.proof.preparedDigest !== finalizationDigest(prepared)) throw new Error("Retained tooling evidence belongs to another preparation");
   const entries = loaded.receipt.proof.entries.filter(entry => entry.purpose === "tooling");

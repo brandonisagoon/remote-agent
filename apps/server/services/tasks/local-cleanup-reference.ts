@@ -52,7 +52,7 @@ async function bindings(prisma: Database, active: Active) {
     if (!event?.value || event.action !== "finalization-legacy-original-work" || event.source !== `owner:${active.task.id}` || event.runtimeSessionId !== active.binding.sessionId
       || event.key !== active.prepared.requestKey || finalizationDigest(JSON.parse(event.value)) !== receipt.digest) throw Error("Local cleanup reference original source adoption changed");
     originalWork = { revision: receipt.revision, digest: receipt.digest, rawDigest: hash(event.value) };
-  } else if (active.kind === "v1" && active.prepared.localCompletion?.sourceCaptureRequired) throw Error("Local cleanup reference requires its accepted original source adoption");
+  }
   return { taskId: active.task.id, sessionId: active.binding.sessionId, requestKey: active.prepared.requestKey, toolingRevision: active.binding.toolingRevision,
     preparedRevision: active.preparation.sequence, preparedRawDigest: hash(active.preparation.value), operationRevision: active.operationRevision,
     operationRawDigest: hash(operation.value), operationDigest: finalizationDigest(active.operation), bindingDigest: bindingDigest(active), ...(originalWork ? { originalWork } : {}) };

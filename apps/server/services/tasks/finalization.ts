@@ -1,7 +1,6 @@
 import { ensureLocalCleanupReference } from "./local-cleanup-reference.ts";
 import { verifyRetainedToolingEvidence } from "./legacy-evidence.ts";
-import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority, legacyOriginalWorkDependencies } from "./legacy-original-work.ts";
-import { assertLegacyOriginalWorkFiles } from "./legacy-original-work-files.ts";
+import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } from "./legacy-original-work.ts";
 import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
@@ -113,7 +112,7 @@ function result(prepared: PreparedFinalization, preparedRevision: number, confir
     ...(confirmedRevision ? { confirmedRevision } : {}), worktree: prepared.worktree, revision: prepared.revision,
     branch: prepared.branch, gitDirectory: prepared.gitDirectory, gitCwd: prepared.gitCwd,
     ...(archiveRetention ? { archiveRetention } : {}),
-    ...(cleanup ? { cleanup } : {}),
+    ...(cleanup ? { cleanup, sourceRetirement: "delete" as const } : {}),
     ...(prepared.localCompletion ? { localCompletion: prepared.localCompletion } : {}),
     ...(authority ? { retirement: { authorityRevision: authority.revision, authorityDigest: authority.digest,
       doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
@@ -189,7 +188,6 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
   if (local) assertLocalDelivery(delivery, local.reference, local.contract.sequence);
   else if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
   const worktree = await realpath(task.worktreePath!);
-  if (local) local.reference.sourceCaptureRequired = Boolean(await finalizationGit(worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"]));
   const gitCwd = await realpath(getRepositoryConfig(input.config, task.repositoryId).root);
   if (worktree === gitCwd) throw new Error("Finalization may not remove the configured repository root");
   const gitDirectory = await realpath(await finalizationGit(worktree, ["rev-parse", "--path-format=absolute", "--git-common-dir"]));
@@ -275,8 +273,6 @@ async function observePreparedFilesystem(input: FinalizationContext, prepared: P
   if (await worktreeIsMissing(prepared.worktree)) return assertFinalizationRemoved(prepared);
   if (await realpath(prepared.taskWorktree) !== prepared.worktree
     || JSON.stringify(await dependencies.snapshot(prepared.worktree)) !== JSON.stringify(prepared.delivery.receipts.snapshot)) throw new Error("Cleanup prepared worktree changed");
-  if (prepared.localCompletion && !prepared.localCompletion.sourceCaptureRequired
-    && await finalizationGit(prepared.worktree, ["ls-files", "--others", "--ignored", "--exclude-standard", "-z"])) throw new PreparationDiagnosticError("LOCAL_SOURCE_CAPTURE_REQUIRED");
   const entries = finalizationWorktrees(await finalizationGit(prepared.gitCwd, ["--git-dir", prepared.gitDirectory, "worktree", "list", "--porcelain", "-z"])).filter(entry => entry.worktree === prepared.registeredWorktree);
   if (entries.length !== 1 || entries[0]!.HEAD !== prepared.revision || entries[0]!.branch !== `refs/heads/${prepared.branch}`) throw new Error("Cleanup original worktree registration changed");
 }
@@ -307,10 +303,9 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   if (active.kind !== "v1") throw new Error("External cleanup must use its v2 finalizer");
   const confirmed = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, source: `finalizer:${active.task.id}`, action: FINALIZATION_CONFIRMED, key: input.requestKey } });
   const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
-  if (legacyOriginalWork) {
-    await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: Boolean(confirmed) }, legacyOriginalWorkDependencies.observation);
-    await assertLegacyOriginalWorkAuthority(input.prisma, await assertPreparedCleanup(input), legacyOriginalWork, input.config);
-  } else await observePreparedFilesystem(input, candidate.prepared, dependencies);
+  // Historical adoption remains an immutable artifact reference, not a mandate
+  // to archive or capture the finished source again before deleting it.
+  await observePreparedFilesystem(input, candidate.prepared, dependencies);
   await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
   if (confirmed) await assertFinalizationRemoved(active.prepared);
   await assertPreparedCleanup(input);
@@ -329,8 +324,6 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   await assertFinalizationAuthority(input.prisma, input.config, active.prepared, true);
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
   const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
-  if (active.prepared.localCompletion?.sourceCaptureRequired && !legacyOriginalWork) throw new PreparationDiagnosticError("LOCAL_SOURCE_CAPTURE_REQUIRED");
-  if (legacyOriginalWork) await assertLegacyOriginalWorkFiles({ taskId: active.task.id, originalWork: legacyOriginalWork.proof.originalWork, removed: true }, legacyOriginalWorkDependencies.observation);
   await assertFinalizationRemoved(active.prepared);
   await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
