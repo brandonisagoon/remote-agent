@@ -585,7 +585,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
       const record = resources.find(resource => resource.id === entry.id)!;
       if (entry.target.type === "endpoint") await observation.endpointAbsent(entry.target);
       else {
-        if (entry.target.type === "profile") await observation.browserAbsent(entry.target);
+        if (entry.target.type === "profile" && (capture.captured || capture.deleting || capture.deleted || input.removed || record.state === "released")) await observation.browserAbsent(entry.target);
         if (capture.captured || capture.deleted) { await assertFinalizationPath(entry.target.path); if (await statOrMissing(entry.target.path)) throw new Error("Original owned source was recreated"); }
       }
       if ((input.removed || record.state === "released") && !capture.deleted || input.removed && record.state !== "released") throw new Error("Owned source deletion is incomplete");

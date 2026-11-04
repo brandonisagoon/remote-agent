@@ -344,3 +344,15 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("new owned source-copy plan d
   expect(await lstat(target.path).catch(() => null)).toBeNull();
   expect(await lstat(target.quarantine.directory).catch(() => null)).toBeNull();
 }, 30_000);
+
+
+test("delete preparation precedes browser close while captured source still requires browser absence", async () => {
+  const f = await fixture(); let running = true;
+  const observation = { ...quiet, browserAbsent: async () => { if (running) throw Error("named browser is active"); } };
+  const plan = await f.prepareDeletion(observation);
+  await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, observation);
+  await capture(plan);
+  await expect(assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, observation)).rejects.toThrow("named browser");
+  running = false;
+  await assertFinalizationResources({ taskId: "original-task", resources: f.resources, plan, removed: false }, observation);
+});

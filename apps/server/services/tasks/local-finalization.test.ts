@@ -149,16 +149,28 @@ test.each([false, true])("finished local task prunes ignored files without an ar
   } finally { await f.server.stop(true); }
 }, 30_000);
 
-test.each(["retained-tooling", "retained-archive", "foreign-resource", "foreign-worktree"])("finished source pruning preserves %s", async condition => {
+test.each(["retained-tooling", "retained-archive", "foreign-resource", "foreign-worktree", "foreign-tooling-root", "foreign-tooling-child", "foreign-pinned-root", "foreign-pinned-child"])("finished source pruning preserves %s", async condition => {
   const f = await fixture();
   try {
     if (condition.startsWith("retained")) await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "retained", kind: condition === "retained-archive" ? "evidence-archive" : "evidence", purpose: condition === "retained-archive" ? "development" : "tooling", externalId: path.join(f.worktree, "retained"), state: "ready" } });
     else {
-      const other = await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "other", toolingRoot: f.root, toolingRevision: "a".repeat(40), ...(condition === "foreign-worktree" ? { worktreePath: path.join(f.worktree, "other") } : {}) } });
+      const other = await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", repositoryId: f.task.repositoryId, machineId: f.task.machineId, branchName: "other", toolingRoot: condition.startsWith("foreign-tooling") ? condition.endsWith("root") ? f.worktree : path.join(f.worktree, "tooling") : f.root,
+        ...(condition.startsWith("foreign-pinned") ? { pinnedToolingRoot: condition.endsWith("root") ? f.worktree : path.join(f.worktree, "immutable-tooling") } : {}), toolingRevision: "a".repeat(40), ...(condition === "foreign-worktree" ? { worktreePath: path.join(f.worktree, "other") } : {}) } });
       if (condition === "foreign-resource") await db.prisma.remoteTaskResource.create({ data: { taskId: other.id, key: "shared", kind: "evidence", purpose: "development", externalId: path.join(f.worktree, "shared"), state: "ready" } });
     }
     expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+    expect((await lstat(f.worktree)).isDirectory()).toBeTrue();
+  } finally { await f.server.stop(true); }
+}, 15_000);
+
+test("foreign tooling pins in a sibling scope permit finished source preparation", async () => {
+  const f = await fixture();
+  try {
+    await db.prisma.remoteTask.create({ data: { id: "other", requestKey: "other", repositoryId: f.task.repositoryId, machineId: f.task.machineId,
+      branchName: "other", toolingRoot: f.root, pinnedToolingRoot: path.join(directory, "sibling-immutable-tooling"), toolingRevision: "a".repeat(40) } });
+    expect(await db.prisma.remoteTaskResource.count()).toBe(0);
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(200);
     expect((await lstat(f.worktree)).isDirectory()).toBeTrue();
   } finally { await f.server.stop(true); }
 }, 15_000);

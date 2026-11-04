@@ -67,7 +67,9 @@ async function current(input: Context, allowConfirmedClosed = false) {
   for (let cursor = root; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
   if (await input.prisma.remoteTask.findFirst({ where: { id: { not: task.id }, OR: [
     { worktreePath: { in: ancestors } }, { worktreePath: { startsWith: `${root}${path.sep}` } },
-  ] } })) throw new Error("Cleanup source overlaps another task's worktree");
+    { toolingRoot: { in: ancestors } }, { toolingRoot: { startsWith: `${root}${path.sep}` } },
+    { pinnedToolingRoot: { in: ancestors } }, { pinnedToolingRoot: { startsWith: `${root}${path.sep}` } },
+  ] } })) throw new Error("Cleanup source overlaps another task's worktree or tooling pin");
   const protectedResource = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, state: { not: "released" } } });
   if (protectedResource.some(resource => within(resource.externalId) && (!['development', 'browser', 'review'].includes(resource.purpose)
     || ['evidence-archive', 'private-backup'].includes(resource.kind)))) throw new Error("Cleanup source contains an explicitly retained resource");
