@@ -4,6 +4,9 @@ import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, offerNextCompute, readComputeCapacity, requestCompute } from "../../services/tasks/compute-admission.ts";
+import { computeEvidenceState } from "../../services/tasks/compute-observation.ts";
+import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-attempt.ts";
+import { developmentProjection } from "../../services/tasks/development-intent.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
@@ -25,7 +28,16 @@ computeRoutes.get("/:taskId/compute-policy", async c => {
   if (!enabled) return c.json({ enabled, capacity: null });
   try {
     const capacity = await readComputeCapacity({ prisma: c.get("prisma"), machineId: config.machine, policy: config.compute!, runtime: c.get("agentRuntime"), taskId: c.req.param("taskId") });
-    return c.json({ enabled, capacity });
+    const prisma = c.get("prisma"), environments = await prisma.computeEnvironment.findMany({ where: { taskId: c.req.param("taskId"), machineId: config.machine }, orderBy: { id: "asc" }, take: 101 });
+    const idleConsiderations = environments.length > 100 ? [{ status: "unavailable" as const }] : await Promise.all(environments.map(async environment => {
+      try {
+        const input = { prisma, config, environmentId: environment.id };
+        const observed = await computeEvidenceState(input), projection = await developmentProjection({ ...input, taskId: c.req.param("taskId") });
+        const held = projection.developmentBlocked || projection.developmentIntent?.blocked || projection.developmentIntent?.state === "pending" && projection.developmentIntent.reason !== "runtime-suspended";
+        return await computeIdleAttemptStatus({ ...input, observed: { ...observed, eligible: observed.eligible && !held }, now: Date.now() });
+      } catch { return { environmentId: environment.id, status: "unavailable" as const }; }
+    }));
+    return c.json({ enabled, capacity, idleConsiderations });
   } catch { return c.json({ error: "Compute capacity could not be observed; existing reservations were preserved" }, 409); }
 });
 computeRoutes.post("/:taskId/compute-request", async c => {
