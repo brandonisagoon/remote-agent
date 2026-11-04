@@ -2,14 +2,13 @@ import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
-import { ComputeSuspensionDecision as Decision, ComputeDecisionEvidence, classifyCompute } from "./compute-decision.ts";
+import { ComputeSuspensionDecision as Decision, ComputeDecisionEvidence, ComputeDecisionResult as Result, computeDecisionDiagnostic, classifyCompute } from "./compute-decision.ts";
 import { assertComputeEvidence, collectComputeEvidence, computeEvidenceState, refreshComputeObservation } from "./compute-observation.ts";
 import { developmentProjection, recordRuntimeSuspension } from "./development-intent.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
 import { computeIdleAttemptStatus, currentComputeIdleClaim, finishComputeIdleAttempt, reserveComputeIdleAttempt, type ComputeIdleClaim } from "./compute-idle-attempt.ts";
 
-const Result = Decision.shape.result.unwrap();
 const Reference = Decision.shape.intent.unwrap();
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: Pick<AgentSessionRuntime, "history" | "observeSessionActivity">;
   environmentId: string; requestKey: string; attempt?: ComputeIdleClaim };
@@ -45,7 +44,7 @@ export async function considerComputeSuspension(input: Context, dependencies: Pa
   if (candidate && input.attempt && !await currentComputeIdleClaim({ ...input, claim: input.attempt, snapshotDigest: observed.snapshotDigest, now: (dependencies.now ?? Date.now)() })) throw new Error("Idle attempt is no longer current");
   const result = candidate ? Result.parse(await (dependencies.classify ?? classifyCompute)(evidence, {
     apiKey: input.config.compute.decisionApiKey ?? "", model: "gpt-6-luna",
-  })) : null;
+  })) : computeDecisionDiagnostic(observed.snapshotDigest, "ineligible-evidence");
   if (result && result.evidenceDigest !== observed.snapshotDigest) throw new Error("Compute decision returned different evidence");
   // Slow classification may outlast a request or collector restart. Complete
   // a fresh physical read before the database-only compare-and-swap below.
@@ -62,7 +61,7 @@ export async function considerComputeSuspension(input: Context, dependencies: Pa
       return { ...saved, revision: raced.sequence, replayed: true };
     }
     const claimCurrent = !input.attempt || Boolean(await currentComputeIdleClaim({ ...input, prisma: tx, claim: input.attempt, snapshotDigest: observed.snapshotDigest, now: decisionAt }));
-    let outcome: z.infer<typeof Decision>["outcome"] = !claimCurrent ? "stale" : candidate ? "advisory" : "not-eligible";
+    let outcome: z.infer<typeof Decision>["outcome"] = !claimCurrent ? "stale" : candidate ? result.kind === "diagnostic" ? "diagnostic" : "advisory" : "not-eligible";
     let intent: z.infer<typeof Reference> | undefined;
     if (claimCurrent && candidate && result?.choice === "suspend-compute" && !result.failure && result.requested) {
       outcome = "stale";

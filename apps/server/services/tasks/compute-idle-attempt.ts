@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { Prisma } from "../../../../generated/prisma/client.ts";
-import { ComputeSuspensionDecision } from "./compute-decision.ts";
+import { ComputeSuspensionDecision, HistoricalComputeDecisionChoice, ComputeDecisionFailure } from "./compute-decision.ts";
 import { ComputeObservation, type computeEvidenceState } from "./compute-observation.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
@@ -16,8 +16,8 @@ const State = z.object({ version: z.literal(1), environmentId: z.string(), lifet
   attempt: z.number().int().min(1).max(IDLE_ATTEMPT_LIMIT), requestKey: z.string().max(180), snapshotDigest: Hash,
   phase: z.enum(["claimed", "completed", "unknown", "attention"]), claimedAt: Time, expiresAt: Time,
   lastAttemptAt: Time, retryable: z.boolean(), decisionRevision: z.number().int().positive().optional(),
-  choice: ComputeSuspensionDecision.shape.result.unwrap().shape.choice.optional(),
-  failure: ComputeSuspensionDecision.shape.result.unwrap().shape.failure,
+  choice: HistoricalComputeDecisionChoice.optional(),
+  failure: ComputeDecisionFailure.optional(),
 }).strict();
 type State = z.infer<typeof State>;
 type Evidence = Awaited<ReturnType<typeof computeEvidenceState>>;
@@ -28,8 +28,8 @@ type Decision = z.infer<typeof ComputeSuspensionDecision>;
 
 const activity = (observed: Evidence) => ({ meaningfulAt: observed.evidence.traffic.lastMeaningfulAt, instructionAt: observed.evidence.activity.latestInstructionAt });
 const usedAgain = (before: State["activity"], after: State["activity"]) => (after.meaningfulAt ?? -1) > (before.meaningfulAt ?? -1) || (after.instructionAt ?? -1) > (before.instructionAt ?? -1);
-const retryable = (value: Decision) => value.outcome !== "suspension-recorded" && !["missing-credential", "refused"].includes(value.result?.failure ?? "")
-  && (value.outcome === "stale" || value.result === null || value.result.choice === "insufficient-evidence");
+const retryable = (value: Decision) => value.outcome !== "suspension-recorded" && !["missing-credential", "refused", "invalid-evidence", "input-too-large"].includes(value.result?.failure ?? "")
+  && (value.outcome === "stale" || value.result === null || value.result.choice === "insufficient-evidence" || Boolean(value.result.failure));
 const backoff = (attempt: number) => attempt >= 2 ? IDLE_SECOND_BACKOFF_MS : IDLE_FIRST_BACKOFF_MS;
 
 async function owner(input: Pick<Input, "prisma" | "environmentId">) {
