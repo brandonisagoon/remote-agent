@@ -1,3 +1,4 @@
+import { bindPreviewDeletionConfirmations } from "./cleanup-preview-retained.ts";
 import { SavedDataSelections, SavedScratchBinding } from "./cleanup-saved-data-schema.ts";
 import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
@@ -25,7 +26,7 @@ export const FinalizationInventoryEntry = z.discriminatedUnion("kind", [
   z.object({ ...Entry, kind: z.literal("opaque"), dependencyResourceId: z.string().min(1) }).strict(),
 ]);
 export type FinalizationInventoryEntry = z.infer<typeof FinalizationInventoryEntry>;
-export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
+export const FinalizationTreeTarget = z.object({ type: z.literal("tree"), retirement: z.literal("delete").optional(), path: Absolute, inventory: z.array(FinalizationInventoryEntry).min(1).max(250_000), sourcePaths: z.array(Absolute).min(1), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review"]), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Sha };
 const FrozenFile = z.object({ path: Absolute, ...NodeIdentity, size: z.number().int().nonnegative(), sha256: Sha }).strict();
 export const BrowserRetirementPlan = z.object({ ...Identity, kind: z.literal("browser-profile"), disposition: z.literal("retire-browser"), dependencies: z.array(z.string().min(1)).max(1),
@@ -46,7 +47,7 @@ export const RegisteredTreePlan = z.discriminatedUnion("treeKind", [
   z.object({ ...TreePlanIdentity, treeKind: z.literal("registered-directory") }).strict(),
   z.object({ ...TreePlanIdentity, kind: z.literal("source-checkpoint"), treeKind: z.literal("source-checkpoint"), manifest: FrozenFile }).strict(),
 ]);
-export const FinalizationFileTarget = FrozenFile.extend({ type: z.literal("file"), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
+export const FinalizationFileTarget = FrozenFile.extend({ type: z.literal("file"), retirement: z.literal("delete").optional(), quarantine: z.object({ directory: Absolute, path: Absolute, journal: Absolute }).strict() }).strict();
 export const BrowserVaultPlan = z.object({ ...Identity, kind: z.literal("browser-auth"), purpose: z.literal("browser"), disposition: z.literal("retire-vault"), dependencies: z.array(z.string().min(1)).max(0), vault: CleanupAdapterPlan, target: FinalizationFileTarget }).strict();
 export const BackedResourcePlan = z.object({ ...Identity, kind: z.enum(["fixture", "s3-object", "s3-bucket"]), purpose: z.enum(["development", "review"]), disposition: z.literal("retire-backed"),
   storage: z.object({ resourceId: z.string().min(1), targetDigests: z.array(Sha).length(1) }).strict(),
@@ -365,7 +366,7 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
     if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
     assertPlanDependencies(exceptional);
     assertFinalizationPlanPurposes(resources, exceptional); assertSavedDataPlanLinks(exceptional); assertSavedDataCaptureSeparation(exceptional, input.sourcePaths);
-    return exceptional;
+    return bindPreviewDeletionConfirmations(exceptional);
   }
   if (savedData.length) throw new Error("Saved data requires the independently planned original-work cleanup path");
   const source = active.find((resource) => resource.id === ownership.sourceCopyResourceId);
@@ -423,14 +424,14 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
   // Allocate only a frozen name here. The prepared client creates this private
   // same-filesystem sibling immediately before its exclusive capture rename.
   const directory = path.join(path.dirname(root), `.drafted-finalization-${randomUUID()}`);
-  plan.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(source), disposition: "retire-owned", dependencies: plan.filter((entry) => entry.disposition === "retire-owned").map((entry) => entry.id), target: { type: "tree", path: root, inventory: entries, sourcePaths: input.sourcePaths,
+  plan.push(FinalizationResourcePlan.parse({ ...finalizationResourceIdentity(source), disposition: "retire-owned", dependencies: plan.filter((entry) => entry.disposition === "retire-owned").map((entry) => entry.id), target: { type: "tree", retirement: "delete", path: root, inventory: entries, sourcePaths: input.sourcePaths,
     quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } }));
   return plan;
 }
 
 /** Whole-root capture preserves the complete frozen inventory. Neither missing
  * children nor new entries can become a successful quarantine proof. */
-export async function assertFinalizationTree(target: TreeTarget, physicalPath = target.path) {
+export async function assertFinalizationTree(target: TreeTarget, physicalPath = target.path, allowDeletedMembers = false) {
   await assertFinalizationPath(physicalPath);
   if (!(await statOrMissing(physicalPath))) throw new Error("Prepared source inventory is missing");
   const expected = new Map(target.inventory.map((entry) => [entry.path, entry]));
@@ -452,13 +453,13 @@ export async function assertFinalizationTree(target: TreeTarget, physicalPath = 
     else { const identity = await fileIdentity(file); if (identity.dev !== entry.dev || identity.ino !== entry.ino || identity.mode !== entry.mode || identity.sha256 !== entry.sha256 || identity.size !== entry.size) throw new Error("Prepared file contents changed"); }
   }
   await visit(physicalPath);
-  if (seen.size !== expected.size) throw new Error("Prepared source inventory is incomplete");
+  if (!allowDeletedMembers && seen.size !== expected.size) throw new Error("Prepared source inventory is incomplete");
   await assertFinalizationPath(physicalPath);
   const after = await lstat(physicalPath), original = expected.get(".")!;
   if (after.dev !== original.dev || after.ino !== original.ino || after.mode !== original.mode) throw new Error("Prepared source root changed during inspection");
 }
 
-async function readQuarantineJournal(file: string) {
+export async function readQuarantineJournal(file: string) {
   await assertFinalizationPath(file);
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -500,19 +501,23 @@ export async function inspectFinalizationQuarantine(input: { taskId: string; res
     if (path.dirname(target.path) !== input.sourceParent.path || parent && (!parent.isDirectory() || parent.uid !== process.getuid?.() || parent.dev !== input.sourceParent.dev || parent.ino !== input.sourceParent.ino || parent.mode !== input.sourceParent.mode) || !parent && source) throw new Error("Evidence source parent identity changed");
   }
   if (!directory) {
+    if (!source && target.retirement === "delete") return { captured: false as const, deleted: true as const, physicalPath: target.path };
     if (!source) throw new Error("Source disappearance has no retained quarantine proof");
     return { captured: false as const, physicalPath: target.path };
   }
   if (!directory.isDirectory() || (directory.mode & 0o7777) !== 0o700 || directory.uid !== process.getuid?.()) throw new Error("Quarantine must be an exact private directory");
   const root = target.inventory.find((entry) => entry.path === ".");
   if (!root || root.kind !== "directory" || directory.dev !== root.dev) throw new Error("Quarantine must preserve the original filesystem identity");
-  const journal = await readQuarantineJournal(quarantine.journal);
+  const journalMissing = !(await statOrMissing(quarantine.journal));
+  const journal = await readQuarantineJournal(target.retirement === "delete" && journalMissing ? `${quarantine.directory}.deleted.json` : quarantine.journal);
   if (journal.taskId !== input.taskId || journal.resourceId !== input.resourceId || journal.planDigest !== finalizationDigest(target) || journal.sourcePath !== target.path || journal.capturedPath !== quarantine.path || journal.source.dev !== root.dev || journal.source.ino !== root.ino || journal.source.mode !== root.mode || journal.quarantine.dev !== directory.dev || journal.quarantine.ino !== directory.ino) throw new Error("Quarantine journal does not match the prepared resource");
   const entries = (await readdir(quarantine.directory)).sort();
   if (entries.some((name) => name !== "contents" && name !== "pending.json")) throw new Error("Quarantine contains unexpected material");
   await assertFinalizationPath(quarantine.path);
   const captured = await statOrMissing(quarantine.path);
   if (source && captured) throw new Error("Original source root was recreated after capture");
+  if (!source && !captured && target.retirement === "delete") return { captured: false as const, deleting: true as const, physicalPath: target.path };
+  if (journalMissing) throw new Error("Deletion staging without its pending journal must be empty");
   if (!source && !captured) throw new Error("Source disappearance has no retained quarantine proof");
   if (captured && (!captured.isDirectory() || captured.dev !== root.dev || captured.ino !== root.ino || captured.mode !== root.mode)) throw new Error("Captured source root identity changed");
   const after = await lstat(quarantine.directory);
@@ -539,7 +544,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   const retainedTargets = new Map(plan.filter(entry => entry.disposition === "retain-adapter").map(entry => [entry.id, entry.retainedTargetDigests]));
   const { capturedPreviewInputs } = await import("./cleanup-preview-retained.ts");
   const retainedPreviewInputs = adapters.some(entry => entry.adapter === "preview") ? await capturedPreviewInputs({ ...input, plan }) : [];
-  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed, retainedTargets, retainedPreviewInputs, previewObserver: input.previewObserver }, observation.adapters) : undefined;
+  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, deletionPlans: plan, removed: input.removed, retainedTargets, retainedPreviewInputs, previewObserver: input.previewObserver }, observation.adapters) : undefined;
   if (retainedTargets.size) {
     const { assertPreservedAdapters } = await import("./cleanup-preservation.ts");
     await assertPreservedAdapters({ ...input, plan });
@@ -574,6 +579,22 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   const physical = plan.filter((entry): entry is Retirement => entry.disposition === "retire-owned");
   if (new Set(tree.dependencies).size !== tree.dependencies.length || tree.dependencies.length !== physical.length - 1 || physical.some((entry) => entry.id !== tree.id && !tree.dependencies.includes(entry.id))) throw new Error("Source capture must include every owned resource");
   const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target });
+  if (target.retirement === "delete") {
+    if (input.removed && !capture.deleted) throw new Error("Finalization still has owned source or staging bytes");
+    if (!capture.deleted && !capture.deleting) await assertFinalizationTree(target, capture.physicalPath, capture.captured);
+    for (const entry of physical) {
+      const record = resources.find(resource => resource.id === entry.id)!;
+      if (entry.target.type === "endpoint") await observation.endpointAbsent(entry.target);
+      else {
+        if (entry.target.type === "profile" && (capture.captured || capture.deleting || capture.deleted || input.removed || record.state === "released")) await observation.browserAbsent(entry.target);
+        if (capture.captured || capture.deleted) { await assertFinalizationPath(entry.target.path); if (await statOrMissing(entry.target.path)) throw new Error("Original owned source was recreated"); }
+      }
+      if ((input.removed || record.state === "released") && !capture.deleted || input.removed && record.state !== "released") throw new Error("Owned source deletion is incomplete");
+    }
+    await observation.rootIdle(target.path);
+    if (capture.captured) await observation.rootIdle(capture.physicalPath);
+    return;
+  }
   if (input.removed && !capture.captured) throw new Error("Finalization still has owned filesystem resources at their active paths");
   await assertFinalizationTree(target, capture.physicalPath);
   const remap = (file: string) => {

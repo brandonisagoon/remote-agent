@@ -419,16 +419,17 @@ before retirement. Closed tasks may only continue a pre-closure operation under
 the existing closed-task rules; they cannot create a new preparation or adopt a
 new proof.
 
-Ignored material is not disposable because the tracked checkout is clean. An
-initial ignored inventory requires the existing same-operation original-source
-archive/adoption before the client can retire anything. Ignored files appearing
-later also refuse plain Git removal. The bearer owner uses the existing
-`legacy-evidence` and `kind: "original-work"` adoption seams to bind recoverable
-copies and source/administration capture without replacing the preparation,
-operation or resource IDs. Full boundaries recheck those inventories, including
-new or changed ignored files after adoption. Existing merge-specific saved
-archive formats are not reinterpreted as local delivery proof; copied local
-evidence uses the exact evidence manifest/adoption contract.
+Finished-task cleanup prunes exact owned development resources and the original
+verified checkout, including ignored development files. It does not create an
+archive or require source adoption or restore proof. Historical preparations with
+`sourceCaptureRequired: true` and their existing operations remain byte-for-byte
+unchanged and use the same supported cleanup protocol. The field remains readable
+for compatibility and no longer imposes an archive prerequisite. Explicit retained
+artifacts and accepted retention plans remain protected; a retained resource inside
+the source path, another task's path claim, active dependents, owner pause or
+revoked authority prevents removal. Dirty tracked work still requires reconciliation.
+Idle suspension/resume retains the environment and data. Later issue fixes use a
+new task rather than keeping every completed development environment recoverable.
 
 Confirmation stores a strict `local-completion/v1` report under the existing
 cleanup-report event identity, atomically with confirmation. The result is
@@ -490,3 +491,38 @@ GitHub or create the supplement. Existing physical authority checks remain intac
 Unknown or ambiguous references still refuse; confirmation cannot create a new
 supplement after cleanup. The configured client already understands this v1
 retained-reference projection, so no client/config migration is required.
+
+
+New standalone-file and registered-directory retirement plans use
+`target.retirement: "delete"`. The native adapter renames an exact owned target
+into private temporary staging, removes only remaining entries matching the
+prepared inventory, and removes the staging directory. A small private deletion receipt outside
+staging binds its exact inode across a crash during final directory removal;
+it contains identity metadata and no saved source bytes. A released row plus
+independently observed absence of original and staged bytes confirms deletion.
+Interrupted deletion retries the same prepared identity and remaining entries;
+no archive, independent backup or restore proof is required. Historical plans
+without this disposition retain their established readable capture format.
+The v1 cleanup response uses `sourceRetirement: "delete"`, including when an old
+mandatory-policy source adoption is recorded. Its immutable receipt and existing
+artifact remain intact; that adoption does not trigger source capture, restore
+verification or a false claim that deleted source remains in quarantine.
+
+
+Delete-mode previews bind an existing independent credential identity to the
+same task/resource, account, zone, hostname and deleting targets in the current
+observer plan. The credential must remain outside every deleting resource and
+the original task source. Provider GETs verify the exact targets before pruning
+and again after local config/connector removal; changed or missing credentials,
+changed identities or recreated provider resources refuse confirmation. No saved
+config copy, archive or restore proof replaces current provider observation.
+
+Delete-mode browser plans keep the frozen profile/marker/namespace association
+and use the existing configured observer to verify the exact session is absent.
+Registered and standalone profile roots are deleted through temporary staging;
+completion requires both original and staged paths absent. Interruption stays
+retryable, while recreated sessions, profiles or markers never gain a second
+close/delete authorization. Historical explicitly retained capture plans remain
+supported. Ordinary cleanup no longer invokes the superseded generated-archive
+renewal hook; local authority epochs, native held-target checks and current
+provider observations continue enforcing the existing operation.

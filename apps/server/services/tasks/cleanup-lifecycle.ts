@@ -1,3 +1,5 @@
+import path from "node:path";
+import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
 import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
 import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
@@ -57,6 +59,20 @@ async function current(input: Context, allowConfirmedClosed = false) {
   if (!task.worktreePath || task.ownerPaused || (task.connectionId === null) !== (task.issueIdentifier === null)
     || session.role !== "primary" || session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Cleanup original ownership is changed, paused or closed");
   if (input.requestKey !== `finalize:${task.id}`) throw new Error("Cleanup requires the existing stable finalization identity");
+  // Pruning a finished checkout cannot swallow another task or retained data.
+  // These are local ownership checks, including at compact renewal boundaries.
+  const root = task.worktreePath, within = (file: string) => file === root || file.startsWith(`${root}${path.sep}`);
+  await assertRegisteredPathSharing(input.prisma, task.id, [root]);
+  const ancestors: string[] = [];
+  for (let cursor = root; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
+  if (await input.prisma.remoteTask.findFirst({ where: { id: { not: task.id }, OR: [
+    { worktreePath: { in: ancestors } }, { worktreePath: { startsWith: `${root}${path.sep}` } },
+    { toolingRoot: { in: ancestors } }, { toolingRoot: { startsWith: `${root}${path.sep}` } },
+    { pinnedToolingRoot: { in: ancestors } }, { pinnedToolingRoot: { startsWith: `${root}${path.sep}` } },
+  ] } })) throw new Error("Cleanup source overlaps another task's worktree or tooling pin");
+  const protectedResource = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, state: { not: "released" } } });
+  if (protectedResource.some(resource => within(resource.externalId) && (!['development', 'browser', 'review'].includes(resource.purpose)
+    || ['evidence-archive', 'private-backup'].includes(resource.kind)))) throw new Error("Cleanup source contains an explicitly retained resource");
   let sourceLinkEpoch: unknown = null;
   if (task.connectionId !== null && task.issueIdentifier !== null) {
     const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId,
@@ -250,10 +266,8 @@ async function observedOperation(input: Context, allowConfirmedClosed = false, s
   const before = await localSnapshot(input, read);
   const database = input.prisma as Database & Partial<Pick<PrismaClient, "$transaction">>;
   if (!database.$transaction || inLocalTransaction(input.prisma)) return before;
-  if (before.kind === "v1" && before.originalWorkReceipt?.proof.originalWork.generatedData) {
-    const { observeLegacyOriginalWorkAuthority } = await import("./legacy-original-work.ts");
-    await observeLegacyOriginalWorkAuthority(input.prisma, before, before.originalWorkReceipt, input.config);
-  }
+  // Finished cleanup prunes the verified source. An old mandatory adoption is
+  // historical evidence; it no longer renews archive/restore prerequisites.
   const after = await localSnapshot(input, read);
   const epoch = (value: Awaited<ReturnType<typeof activeOperation>>) => retirementDigest({ authorityEpoch: value.authorityEpoch, binding: value.binding, operation: value.operation, operationRevision: value.operationRevision, originalWorkReceipt: value.originalWorkReceipt ?? null });
   if (epoch(before) !== epoch(after)) throw new Error("Cleanup authority changed during native source verification");

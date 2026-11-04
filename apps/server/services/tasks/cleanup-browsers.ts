@@ -24,12 +24,16 @@ function targetOf(plan: Browser) {
   if (finalizationDigest(identity) !== finalizationDigest(sessionIdentity)) throw new Error("Browser session and filesystem resource identities differ");
   return session.targets[0];
 }
-async function profile(taskId: string, resource: FinalizationResourceRecord, target: Session, physicalRoot = path.dirname(resource.externalId)) {
+function profileBinding(taskId: string, resource: FinalizationResourceRecord, target: Session) {
   const meta = Metadata.parse(resource.metadata);
   const expectedSession = resource.key === "browser-profile" && resource.purpose === "browser" ? taskId : resource.key === "browser-profile:review" && resource.purpose === "review" ? `${taskId}-review` : null;
-  const root = path.dirname(resource.externalId), remap = (file: string) => path.join(physicalRoot, path.relative(root, file));
+  const root = path.dirname(resource.externalId);
   if (!expectedSession || meta.session !== expectedSession || target.id !== expectedSession || target.scope.taskId !== taskId || target.scope.purpose !== resource.purpose || target.scope.namespace !== "drafted"
     || path.basename(resource.externalId) !== "profile" || meta.ownerFile !== path.join(root, "profile-owner.json") || target.profile.path !== resource.externalId || target.profile.ownerFile !== meta.ownerFile || target.profile.ownerSha256 !== meta.ownerSha256) throw new Error("Browser marker, profile or session does not belong to this exact task resource");
+  return { meta, root };
+}
+async function profile(taskId: string, resource: FinalizationResourceRecord, target: Session, physicalRoot = path.dirname(resource.externalId)) {
+  const { meta, root } = profileBinding(taskId, resource, target), remap = (file: string) => path.join(physicalRoot, path.relative(root, file));
   await assertFinalizationPath(physicalRoot); await assertFinalizationPath(remap(resource.externalId));
   const stat = await lstat(remap(resource.externalId));
   if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.() || stat.mode & 0o077 || stat.dev !== target.profile.dev || stat.ino !== target.profile.ino || stat.mode !== target.profile.mode) throw new Error("Browser profile directory identity changed");
@@ -77,7 +81,7 @@ export async function prepareBrowserCaptures(input: { taskId: string; resources:
       || input.plan.some(entry => entry.disposition === "retain-archive" && overlaps(directory, entry.archive.root))) throw new Error("Browser retention destination overlaps protected or registered material");
     captureAdapterDependencies(directory, input.resources, input.plan.filter(entry => entry.id !== resource.id));
     const plan = BrowserRetirementPlan.parse({ ...finalizationResourceIdentity(resource), disposition: "retire-browser", dependencies: [], session,
-      capture: { type: "standalone", target: { type: "tree", path: root, sourcePaths: [root], inventory, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } } });
+      capture: { type: "standalone", target: { type: "tree", retirement: "delete", path: root, sourcePaths: [root], inventory, quarantine: { directory, path: path.join(directory, "contents"), journal: path.join(directory, "pending.json") } } } });
     if (plan.capture.type !== "standalone") throw new Error("Browser capture type changed");
     await assertFinalizationTree(plan.capture.target); await observation.rootIdle(root); result.push(plan);
   }
@@ -98,6 +102,24 @@ export async function assertBrowserCaptures(input: { taskId: string; resources: 
     const root = path.dirname(resource.externalId);
     if (!within(target.path, root)) throw new Error("Browser root escapes its retained capture");
     const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: captureResourceId, target });
+    if (target.retirement === "delete") {
+      profileBinding(input.taskId, resource, session);
+      const opaque = target.inventory.find(entry => entry.path === path.relative(target.path, resource.externalId));
+      if (!opaque || opaque.kind !== "opaque" || opaque.dependencyResourceId !== resource.id || opaque.dev !== session.profile.dev || opaque.ino !== session.profile.ino || opaque.mode !== session.profile.mode) throw new Error("Deleted browser differs from its exact opaque inventory member");
+      if ((input.removed || resource.state === "released") && !capture.deleted) throw new Error("Browser deletion still has source or staging bytes");
+      if (!capture.deleted && !capture.deleting) await assertFinalizationTree(target, capture.physicalPath, capture.captured);
+      if (!capture.captured && !capture.deleted && !capture.deleting) await profile(input.taskId, resource, session);
+      else {
+        await assertFinalizationPath(root);
+        if (await lstat(root).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; })) throw new Error("Deleted browser ownership root was recreated");
+        const observed = input.adapterObservation?.observations.find(entry => entry.resourceId === browser.id);
+        if (!observed || !observed.absent || observed.presentTargetDigests.length) throw new Error("Deleted browser session absence has not been independently verified");
+      }
+      if (input.removed && resource.state !== "released") throw new Error("Browser deletion receipt is missing");
+      await observation.rootIdle(target.path);
+      if (capture.captured) await observation.rootIdle(capture.physicalPath);
+      continue;
+    }
     if ((input.removed || resource.state === "released") && !capture.captured) throw new Error("Browser has no verified retained capture");
     await assertFinalizationTree(target, capture.physicalPath);
     const opaque = target.inventory.find(entry => entry.path === path.relative(target.path, resource.externalId));

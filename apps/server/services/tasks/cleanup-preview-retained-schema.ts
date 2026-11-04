@@ -14,3 +14,20 @@ export const RetainedPreviewInput = z.strictObject({
   root: z.strictObject(Node), config: File, connector: File,
 });
 export type RetainedPreviewInput = z.infer<typeof RetainedPreviewInput>;
+
+
+// Secret-free identity of an existing credential outside deleting scopes.
+export const IndependentPreviewCredential = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("origin-certificate"), file: Absolute, ...Node, sha256: Hash }),
+  z.strictObject({ kind: z.literal("runtime-file"), file: Absolute, ...Node, sha256: Hash }),
+  z.strictObject({ kind: z.literal("environment"), sha256: Hash }),
+]);
+export type IndependentPreviewCredential = z.infer<typeof IndependentPreviewCredential>;
+export const PreviewDeletionConfirmation = z.strictObject({
+  taskId: z.string().min(1), resourceId: z.string().min(1), resourceIdentityDigest: Hash,
+  purpose: z.enum(["development", "review", "browser"]), hostname: z.string().min(1), tunnelId: z.string().min(1),
+  zoneId: z.string().regex(/^[a-f0-9]{32}$/i), accountId: z.string().regex(/^[a-f0-9]{32}$/i), configFile: Absolute.optional(), sourceDigest: Hash.optional(),
+  credential: IndependentPreviewCredential,
+  deletions: z.array(z.strictObject({ resourceId: z.string().min(1), targetDigest: Hash, path: Absolute })).min(1).max(1000).optional(),
+});
+export type PreviewDeletionConfirmation = z.infer<typeof PreviewDeletionConfirmation>;

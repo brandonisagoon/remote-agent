@@ -78,7 +78,17 @@ async function fixture() {
   const remote = async (delivery: typeof manifest.deliveries[number]) => ({ id: delivery.id, repository: delivery.repository, pullRequest: delivery.pullRequest, url: `https://github.com/${delivery.repository}/pull/${delivery.pullRequest}`, reviewedHead: delivery.reviewedHead, mergeCommit: delivery.expectedMergeCommit, mergedAt: delivery.id === "publisher" ? "2026-01-01T00:01:00.000Z" : "2026-01-01T00:02:00.000Z", baseHead: "d".repeat(40), ci: delivery.verificationRefs.flatMap((ref) => ref.kind === "ci-run" ? [{ runId: ref.runId, head: ref.head, workflowId: ref.workflowId, name: "checks", conclusion: "success" as const }] : []) });
   const dependencies = { ...externalBindingDependencies, source: async () => ({ session, link, config, issue }), comment: async () => comment,
     observer: { ...externalDeliveryObservation, remote },
-    resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, noProcesses),
+    resources: async (input: Parameters<typeof prepareFinalizationResources>[0]) => {
+      const plan = await prepareFinalizationResources(input, noProcesses);
+      // These fixtures represent already accepted historical retained-capture
+      // plans, which predate the new finished-task delete disposition.
+      for (const entry of plan) {
+        if (entry.disposition === "retire-adapter") delete entry.previewConfirmation;
+        if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") delete entry.target.retirement;
+        else if (entry.disposition === "retire-owned" && entry.target.type === "tree") delete entry.target.retirement;
+      }
+      return plan;
+    },
     assertResources: (input: Parameters<typeof assertFinalizationResources>[0]) => assertFinalizationResources(input, noProcesses) };
   const input = { ...context, binding: manifest };
   const finalize = { prisma: db.prisma, config, sessionId: session.id, requestKey: "finalize:task", finalizationVersion: 2 as const };
@@ -828,3 +838,25 @@ test("DRA195 maps a three-PR outcome onto accepted v2 deliveries without inventi
   await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "delivered-retirement-revoked", key: "owner-revoked", value: "{}" } });
   expect((await workMapProjection(context, graph)).mapping!.deliveries.every(d => !d.boundaryObserved)).toBeTrue();
 });
+
+
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("new external finished cleanup deletes owned development source and confirms without archive adoption", async () => {
+  const f = await fixture();
+  const dependencies = { ...f.dependencies, resources: (input: Parameters<typeof prepareFinalizationResources>[0]) => prepareFinalizationResources(input, noProcesses) };
+  await adoptExternalDeliveries(f.input, dependencies);
+  const input = { ...f.finalize, cleanup: true as const }, prepared = await prepareExternalFinalization(input, dependencies);
+  const source = prepared.resources.find(entry => entry.disposition === "retire-owned" && entry.target.type === "tree");
+  if (!source || source.disposition !== "retire-owned" || source.target.type !== "tree") throw Error("missing owned source");
+  expect(source.target.retirement).toBe("delete");
+  expect(prepared.originalWork).toBeUndefined();
+  const { deletePreparedPath } = await import(path.join(process.env.DRAFTED_INTEGRATION_ROOT!, "src/quarantine.ts"));
+  await deletePreparedPath(source.target, { taskId: f.task.id, resourceId: source.id, planDigest: finalizationDigest(source.target) }, async () => {});
+  await db.prisma.remoteTaskResource.update({ where: { id: source.id }, data: { state: "released" } });
+  git(f.product, "worktree", "remove", f.worktree);
+  const confirmed = await confirmExternalFinalization(input, dependencies);
+  expect(confirmed.confirmedRevision).toBeGreaterThan(prepared.preparedRevision);
+  expect(await confirmExternalFinalization(input, dependencies)).toEqual(confirmed);
+  expect(await lstat(source.target.path).catch(() => null)).toBeNull();
+  expect(await lstat(source.target.quarantine.directory).catch(() => null)).toBeNull();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-legacy-original-work" } })).toBe(0);
+}, 30_000);

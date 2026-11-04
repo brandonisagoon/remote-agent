@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -10,10 +11,10 @@ import type { runCleanupResourceObserver } from "./cleanup-resource-observer.ts"
 const roots: string[] = [], originalFetch = globalThis.fetch;
 afterEach(async () => { globalThis.fetch = originalFetch; for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 const accountId = "a".repeat(32), zoneId = "b".repeat(32), tunnelId = "11111111-2222-3333-4444-555555555555", hostname = "drafted-dra98-dev.brandongoon.com", endpoint = "http://127.0.0.1:19913";
-async function fixture(client?: string) {
+async function fixture(client?: string, deletion = false, credentialInside = false, otherCredentialDeletion = false, credentialInSource = false) {
   const parent = await realpath(await mkdtemp(path.join(tmpdir(), "server-preview-capture-"))); roots.push(parent); await chmod(parent, 0o700);
-  const root = path.join(parent, "environment"), config = path.join(root, "cloudflared.yml"), connector = path.join(root, "tunnel.json"), certificate = path.join(parent, "brand.pem");
-  await mkdir(root, { mode: 0o700 });
+  const root = path.join(parent, "environment"), config = path.join(root, "cloudflared.yml"), connector = path.join(root, "tunnel.json"), certificate = path.join(credentialInSource ? path.join(parent, "original-checkout") : credentialInside ? root : parent, "brand.pem");
+  await mkdir(root, { mode: 0o700 }); await mkdir(path.dirname(certificate), { recursive: true, mode: 0o700 });
   await writeFile(config, JSON.stringify({ tunnel: tunnelId, "credentials-file": connector, origincert: certificate, ingress: [{ hostname, service: endpoint }, { service: "http_status:404" }] }), { mode: 0o600 });
   await writeFile(connector, JSON.stringify({ AccountTag: accountId, TunnelID: tunnelId, TunnelSecret: "synthetic-connector" }), { mode: 0o400 });
   await writeFile(certificate, `-----BEGIN ARGO TUNNEL TOKEN-----\n${Buffer.from(JSON.stringify({ accountID: accountId, zoneID: zoneId, apiToken: "synthetic-origin" })).toString("base64")}\n-----END ARGO TUNNEL TOKEN-----\n`, { mode: 0o600 });
@@ -22,17 +23,19 @@ async function fixture(client?: string) {
     resource("tunnel", "cloudflare-tunnel", "drafted-dra98-dev-task", { tunnelId, account: `Cubic ${accountId}`, configPath: config, credentialsFile: `${connector} (0400)`, ingress: `${hostname} -> ${endpoint}; everything else http_status:404`, taskOwned: true }),
     resource("dns", "cloudflare-dns-record", hostname, { needed: `proxied CNAME drafted-dra98-dev -> ${tunnelId}.cfargotunnel.com in zone brandongoon.com (${zoneId})`, preExisting: false }),
     resource("endpoint", "local-http", endpoint, { acceptedHosts: [hostname], launcher: "run.sh proxy" }, "released")];
+  if (otherCredentialDeletion) resources.push(resource("credential-file", "private-file", certificate, {}));
   const original = { version: 1 as const, source: "configured-host" as const, checkout: path.join(parent, "old-tooling"), revision: "c".repeat(40), adapter: path.join(parent, "old-tooling/cli.ts"), adapterSha256: "d".repeat(64) };
   const current = { ...original, checkout: path.join(parent, "current-tooling"), adapter: path.join(parent, "current-tooling/cli.ts"), revision: "e".repeat(40) };
   const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(parent, "original-checkout"), toolingRevision: "f".repeat(40) };
-  const calls: Parameters<typeof runCleanupResourceObserver>[0][] = []; let present = true;
+  const calls: Parameters<typeof runCleanupResourceObserver>[0][] = []; let present = true, recreatedDNS = false;
+  const certificateStat = await lstat(certificate), certificateHash = createHash("sha256").update(await readFile(certificate)).digest("hex");
   const native = client ? await import(path.join(client, "src/cleanup-observer.ts")) : undefined;
   const providerCalls: string[] = [];
   globalThis.fetch = (async (url: string, options: RequestInit) => {
     const route = url.replace("https://api.cloudflare.com/client/v4", ""); providerCalls.push(route);
     expect(options.method).toBe("GET"); expect(new Headers(options.headers).get("authorization")).toBe("Bearer synthetic-origin");
     const result = route === `/zones/${zoneId}` ? { id: zoneId, name: "brandongoon.com", account: { id: accountId } }
-      : route.includes("/dns_records") ? [] : route.includes("/cfd_tunnel") ? (present ? { id: tunnelId, name: resources[1]!.externalId, config_src: "local" } : null) : null;
+      : route.includes("/dns_records") ? recreatedDNS ? [{ id: "d".repeat(32), name: hostname, type: "CNAME", content: `${tunnelId}.cfargotunnel.com` }] : [] : route.includes("/cfd_tunnel") ? (present ? { id: tunnelId, name: resources[1]!.externalId, config_src: "local" } : null) : null;
     return Response.json({ success: true, result });
   }) as typeof fetch;
   const observe: typeof runCleanupResourceObserver = async input => {
@@ -40,15 +43,22 @@ async function fixture(client?: string) {
     if (native) return native.observeCleanupBatch(request);
     return { version: 1, taskId: task.id, observations: request.observations.map(item => {
       const record = resources.find(record => record.id === item.resourceId)!;
-      const raw = record.id === "tunnel" ? { kind: "local-ingress-route", id: hostname, scope: { taskId: task.id, purpose: "development", configFile: config, tunnelId }, hostname, sourceDigest: "a".repeat(64), routeDigest: "b".repeat(64), presentAtPrepare: true }
+      const raw = record.id === "tunnel" ? { kind: "local-ingress-route", id: hostname, scope: { taskId: task.id, purpose: "development", configFile: config, tunnelId }, hostname, sourceDigest: finalizationDigest(endpoint), routeDigest: "b".repeat(64), presentAtPrepare: true }
         : { kind: "cloudflare-dns-record", id: "d".repeat(32), scope: { taskId: task.id, purpose: "development", zoneId }, name: hostname, type: "CNAME", contentDigest: "b".repeat(64), presentAtPrepare: true };
       const target = CleanupTarget.parse({ ...raw, identityDigest: "0".repeat(64) }); target.identityDigest = cleanupTargetDigest(target);
       const targets = item.expectedTargets ?? [target];
-      return { version: 1, taskId: task.id, resourceId: item.resourceId, resourceIdentityDigest: finalizationResourceIdentity(record).identityDigest, adapter: "preview", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present };
+      return { version: 1, taskId: task.id, resourceId: item.resourceId, resourceIdentityDigest: finalizationResourceIdentity(record).identityDigest, adapter: "preview", previewConfirmation: { taskId: task.id, resourceId: record.id, resourceIdentityDigest: finalizationResourceIdentity(record).identityDigest,
+        purpose: record.purpose, hostname, tunnelId, zoneId, accountId, configFile: config, sourceDigest: finalizationDigest(endpoint),
+        credential: { kind: "origin-certificate", file: certificate, dev: certificateStat.dev, ino: certificateStat.ino, mode: certificateStat.mode, sha256: certificateHash } },
+        dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present };
     }) };
   };
   const observation: ResourceObservation = { adapters: observe, rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {} };
-  const plan = await prepareFinalizationResources({ taskId: task.id, sessionId: task.primarySessionId, resources, toolingRoot: original.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [root] }, originalWork: true, adapterContext: { task, capability: original } }, observation);
+  const plan = await prepareFinalizationResources({ taskId: task.id, sessionId: task.primarySessionId, resources, toolingRoot: original.checkout, sourcePaths: [], deliveries: [], ownership: { ownedPaths: [root, ...(otherCredentialDeletion ? [certificate] : [])] }, originalWork: true, adapterContext: { task, capability: original } }, observation);
+  if (!deletion) for (const entry of plan) {
+    if (entry.disposition === "retire-tree") delete entry.target.retirement;
+    if (entry.disposition === "retire-adapter") delete entry.previewConfirmation;
+  }
   const tree = plan.find(entry => entry.disposition === "retire-tree"); if (!tree || tree.disposition !== "retire-tree") throw new Error("Missing tree");
   const capture = async () => {
     if (client) await (await import(path.join(client, "src/quarantine.ts"))).capturePreparedTree(tree.target, { taskId: task.id, resourceId: tree.id, planDigest: finalizationDigest(tree.target) });
@@ -60,7 +70,7 @@ async function fixture(client?: string) {
     present = false; resources.forEach(resource => resource.state = "released");
   };
   const verify = (resolver: (() => Promise<typeof current>) | undefined = async () => current) => assertFinalizationResources({ taskId: task.id, resources, plan, removed: true, originalWork: true, previewObserver: resolver }, observation);
-  return { root, parent, config, connector, certificate, plan, tree, resources, original, current, capture, verify, calls, providerCalls, observation, task };
+  return { root, parent, config, connector, certificate, plan, tree, resources, original, current, capture, verify, calls, providerCalls, observation, task, recreateProvider: () => { recreatedDNS = true; }, releaseProvider: () => { present = false; resources.filter(resource => resource.kind !== "private-directory").forEach(resource => resource.state = "released"); } };
 }
 
 test("captured preview confirmation selects only a compatible observer and preserves frozen targets on retry", async () => {
@@ -131,4 +141,110 @@ test("a compatible observer cannot substitute a frozen preview target", async ()
     return result;
   };
   await expect(f.verify()).rejects.toThrow("target identity changed");
+});
+
+
+test.skipIf(!client)("delete-mode preview confirms exact provider absence after source and staging deletion using its independent credential", async () => {
+  const f = await fixture(client!, true), frozen = JSON.stringify(f.plan);
+  f.releaseProvider();
+  await assertFinalizationResources({ taskId: f.task.id, resources: f.resources, plan: f.plan, removed: false, originalWork: true }, f.observation);
+  const { deletePreparedPath } = await import(path.join(client!, "src/quarantine.ts"));
+  await deletePreparedPath(f.tree.target, { taskId: f.task.id, resourceId: f.tree.id, planDigest: finalizationDigest(f.tree.target) }, async () => {});
+  f.resources.find(resource => resource.id === f.tree.id)!.state = "released";
+  const before = f.providerCalls.length;
+  await f.verify(); await f.verify();
+  expect(f.providerCalls.length).toBeGreaterThan(before);
+  expect(await lstat(f.root).catch(() => null)).toBeNull();
+  expect(await lstat(f.tree.target.quarantine.directory).catch(() => null)).toBeNull();
+  expect((await lstat(f.certificate)).isFile()).toBeTrue();
+  expect(JSON.stringify(f.plan)).toBe(frozen);
+  expect(await capturedPreviewInputs({ taskId: f.task.id, resources: f.resources, plan: f.plan })).toEqual([]);
+}, 30_000);
+
+test.skipIf(!client).each(["account", "zone", "hostname", "credential", "missing-credential", "resource", "deletion-scope"])("delete-mode preview refuses changed %s before pruning", async change => {
+  const f = await fixture(client!, true); f.releaseProvider();
+  const adapter = f.plan.find(entry => entry.disposition === "retire-adapter" && entry.previewConfirmation);
+  if (!adapter || adapter.disposition !== "retire-adapter" || !adapter.previewConfirmation) throw Error("missing independent credential binding");
+  const proof = adapter.previewConfirmation;
+  if (change === "account") proof.accountId = "f".repeat(32);
+  if (change === "zone") proof.zoneId = "f".repeat(32);
+  if (change === "hostname") proof.hostname = "another.brandongoon.com";
+  if (change === "resource") proof.resourceId = "another-task-resource";
+  if (change === "deletion-scope") proof.deletions![0]!.targetDigest = "f".repeat(64);
+  if (change === "credential") await writeFile(f.certificate, "changed credential", { mode: 0o600 });
+  if (change === "missing-credential") await rm(f.certificate);
+  await expect(assertFinalizationResources({ taskId: f.task.id, resources: f.resources, plan: f.plan, removed: false, originalWork: true }, f.observation)).rejects.toThrow();
+  expect((await lstat(f.root)).isDirectory()).toBeTrue();
+  expect((await lstat(f.config)).isFile()).toBeTrue();
+}, 30_000);
+
+test.skipIf(!client)("preview cannot use a credential inside any deleting scope", async () => {
+  await expect(fixture(client!, true, true)).rejects.toThrow("credential overlaps");
+});
+
+
+test.skipIf(!client).each(["account", "zone", "hostname", "credential", "missing-credential", "recreated-provider"])("post-delete preview refuses %s without archive or credential fallback", async change => {
+  const f = await fixture(client!, true); f.releaseProvider();
+  await assertFinalizationResources({ taskId: f.task.id, resources: f.resources, plan: f.plan, removed: false, originalWork: true }, f.observation);
+  const { deletePreparedPath } = await import(path.join(client!, "src/quarantine.ts"));
+  await deletePreparedPath(f.tree.target, { taskId: f.task.id, resourceId: f.tree.id, planDigest: finalizationDigest(f.tree.target) }, async () => {});
+  f.resources.find(resource => resource.id === f.tree.id)!.state = "released";
+  const adapter = f.plan.find(entry => entry.disposition === "retire-adapter" && entry.previewConfirmation);
+  if (!adapter || adapter.disposition !== "retire-adapter" || !adapter.previewConfirmation) throw Error("missing binding");
+  if (change === "account") adapter.previewConfirmation.accountId = "f".repeat(32);
+  if (change === "zone") adapter.previewConfirmation.zoneId = "f".repeat(32);
+  if (change === "hostname") adapter.previewConfirmation.hostname = "unrelated.brandongoon.com";
+  if (change === "credential") await writeFile(f.certificate, "changed credential", { mode: 0o600 });
+  if (change === "missing-credential") await rm(f.certificate);
+  if (change === "recreated-provider") f.recreateProvider();
+  await expect(f.verify()).rejects.toThrow();
+  expect(await lstat(f.root).catch(() => null)).toBeNull();
+  expect(await lstat(f.tree.target.quarantine.directory).catch(() => null)).toBeNull();
+  expect(await capturedPreviewInputs({ taskId: f.task.id, resources: f.resources, plan: f.plan })).toEqual([]);
+}, 30_000);
+
+
+test.skipIf(!client)("remote-only preview keeps its existing runtime credential outside deletion without inventing a local config", async () => {
+  const previousToken = process.env.CLOUDFLARE_API_TOKEN;
+  process.env.CLOUDFLARE_API_TOKEN = "synthetic-runtime-preview";
+  const parent = await realpath(await mkdtemp(path.join(tmpdir(), "remote-preview-prune-"))); roots.push(parent); await chmod(parent, 0o700);
+  const root = path.join(parent, "environment"); await mkdir(root, { mode: 0o700 }); await writeFile(path.join(root, "discard.txt"), "finished bytes", { mode: 0o600 });
+  try {
+    globalThis.fetch = (async (url: string, options: RequestInit) => {
+      expect(options.method).toBe("GET"); expect(new Headers(options.headers).get("authorization")).toBe("Bearer synthetic-runtime-preview");
+      const route = url.replace("https://api.cloudflare.com/client/v4", "");
+      const result = route === `/zones/${zoneId}` ? { id: zoneId, name: "brandongoon.com", account: { id: accountId } } : route.includes("/dns_records") ? [] : null;
+      return Response.json({ success: true, result });
+    }) as typeof fetch;
+    const resources: FinalizationResourceRecord[] = [
+      { id: "environment", key: "environment", kind: "private-directory", purpose: "development", externalId: root, state: "ready", metadata: {} },
+      { id: "dns", key: "dns", kind: "cloudflare-dns-record", purpose: "development", externalId: hostname, state: "ready", metadata: { hostname, tunnelId, zoneId, accountId, dnsRecordId: "d".repeat(32) } },
+    ];
+    const task = { id: "task", primarySessionId: "primary", worktreePath: path.join(parent, "original"), toolingRevision: "f".repeat(40) };
+    const capability = { version: 1 as const, source: "configured-host" as const, checkout: path.join(parent, "tooling"), revision: "a".repeat(40), adapter: path.join(parent, "tooling/src/cli.ts"), adapterSha256: "b".repeat(64) };
+    const native = await import(path.join(client!, "src/cleanup-observer.ts"));
+    const observation: ResourceObservation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {}, adapters: async input => native.observeCleanupBatch(input.request) };
+    const plan = await prepareFinalizationResources({ taskId: task.id, sessionId: task.primarySessionId, resources, toolingRoot: capability.checkout, sourcePaths: [], deliveries: [],
+      ownership: { ownedPaths: [root] }, originalWork: true, adapterContext: { task, capability } }, observation);
+    const adapter = plan.find(entry => entry.disposition === "retire-adapter");
+    if (!adapter || adapter.disposition !== "retire-adapter") throw Error("missing remote preview");
+    expect(adapter.previewConfirmation?.configFile).toBeUndefined(); expect(adapter.previewConfirmation?.credential.kind).toBe("environment");
+    const tree = plan.find(entry => entry.disposition === "retire-tree"); if (!tree || tree.disposition !== "retire-tree") throw Error("missing deletion");
+    resources[1]!.state = "released";
+    const inspect = (removed = false) => assertFinalizationResources({ taskId: task.id, resources, plan, removed, originalWork: true }, observation);
+    await inspect();
+    const { deletePreparedPath } = await import(path.join(client!, "src/quarantine.ts"));
+    await deletePreparedPath(tree.target, { taskId: task.id, resourceId: tree.id, planDigest: finalizationDigest(tree.target) }, async () => {});
+    resources[0]!.state = "released";
+    await inspect(true); await inspect(true);
+    expect(await lstat(root).catch(() => null)).toBeNull(); expect(await lstat(tree.target.quarantine.directory).catch(() => null)).toBeNull();
+    process.env.CLOUDFLARE_API_TOKEN = "synthetic-replacement";
+    await expect(inspect(true)).rejects.toThrow();
+  } finally { if (previousToken === undefined) delete process.env.CLOUDFLARE_API_TOKEN; else process.env.CLOUDFLARE_API_TOKEN = previousToken; }
+}, 30_000);
+
+
+test.skipIf(!client).each(["other-deleting-resource", "original-task-source"])("independent preview credential cannot live inside %s", async location => {
+  await expect(fixture(client!, true, false, location === "other-deleting-resource", location === "original-task-source")).rejects.toThrow("credential overlaps");
+  expect((await lstat(path.join(roots.at(-1)!, "environment"))).isDirectory()).toBeTrue();
 });

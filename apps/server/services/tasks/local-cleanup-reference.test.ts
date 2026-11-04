@@ -116,7 +116,7 @@ test.each(["url", "head", "plan", "duplicate", "released"])("saved reference ref
   expect(f.observations()).toBe(before);
 }, 15_000);
 
-test("source adoption raw bytes remain part of the new reference binding", async () => {
+test.each(["delete-default", "accepted-associated-reference"])("source adoption raw bytes respect the %s reference contract", async contract => {
   const f = await fixture(true, true), archive = path.join(directory, "retained"); await mkdir(archive, { mode: 0o700 });
   git(f.worktree, "bundle", "create", path.join(archive, "source.bundle"), "refs/heads/codex/local"); await chmod(path.join(archive, "source.bundle"), 0o600);
   for (const name of ["index.diff", "worktree.diff"]) await writeFile(path.join(archive, name), "", { mode: 0o600 });
@@ -129,8 +129,24 @@ test("source adoption raw bytes remain part of the new reference binding", async
     archive: { archiveRoot: archive, manifestPath: path.join(archive, "MANIFEST.sha256"), manifestSha256: hash(manifest), bundlePath: "source.bundle", bundleRef: "refs/heads/codex/local", indexPatchPath: "index.diff", worktreePatchPath: "worktree.diff", untrackedArchivePath: "untracked.tar", expectedWorkingTree: git(f.worktree, "rev-parse", "HEAD^{tree}"), ownedPaths: [path.join(f.worktree, "cache")] } } });
   f.allow(); await prepareTaskFinalization(f.input); await f.unchanged();
   const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: adoption.revision } });
+  const reference = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: LOCAL_CLEANUP_REFERENCE } });
+  const proof = JSON.parse(reference.value!);
+  expect(proof.originalWork).toBeUndefined();
+  if (contract === "accepted-associated-reference") {
+    // Construct the already accepted historical format, whose explicit raw-byte
+    // association remains binding even though new delete-mode references omit it.
+    const active = await f.active();
+    proof.originalWork = { revision: event.sequence, digest: active.originalWorkReceipt!.digest, rawDigest: hash(event.value!) };
+    await db.prisma.runtimeMetadataEvent.update({ where: { sequence: reference.sequence }, data: { value: JSON.stringify(proof) } });
+  }
+  expect(await localCleanupReferenceRetention(db.prisma, await f.active())).toBeDefined();
+  const frozenReference = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: reference.sequence } });
   await db.prisma.runtimeMetadataEvent.update({ where: { sequence: event.sequence }, data: { value: event.value + " " } });
-  await expect((async () => localCleanupReferenceRetention(db.prisma, await f.active()))()).rejects.toThrow();
+  const observed = (async () => localCleanupReferenceRetention(db.prisma, await f.active()))();
+  if (contract === "accepted-associated-reference") await expect(observed).rejects.toThrow("binding changed");
+  else expect(await observed).toBeDefined();
+  expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: reference.sequence } })).toEqual(frozenReference);
+  await f.unchanged();
 }, 15_000);
 
 test.each(["valid", "head", "branch", "base", "draft", "unmerged", "ancestry"])("normal GitHub observer independently checks %s", async change => {
