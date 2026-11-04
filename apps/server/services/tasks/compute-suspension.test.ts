@@ -5,7 +5,7 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { applyTraffic, beginTraffic, type TrafficEnvelope, type TrafficState } from "../../../../lib/compute-telemetry.ts";
 import { classifyCompute } from "./compute-decision.ts";
 import { assertComputeEvidence, collectComputeEvidence, recordComputeObservation, type ComputeObservation } from "./compute-observation.ts";
-import { considerComputeSuspension } from "./compute-suspension.ts";
+import { considerComputeSuspension, considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { assertComputeStartIntent, completeDevelopmentIntent, developmentProjection, recordDevelopmentIntent, renewDevelopmentAuthority, supersedeRuntimeSuspension } from "./development-intent.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 
@@ -95,21 +95,29 @@ test.each(["leave-running", "eligible-for-authorized-closure", "insufficient-evi
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).phase).toBe("working");
 });
 
-test.each(["queued-work", "pause", "review", "operation", "stream", "gap", "source-revision"])("new %s during classification invalidates the exact snapshot", async changed => {
-  const f = await fixture();
-  const result = await considerComputeSuspension(f.input, { refresh: f.refresh, classify: async (evidence, settings) => {
+for (const [mode, consider] of [["exact-request", considerComputeSuspension], ["automatic", considerIdleComputeSuspension]] as const) {
+test.each(["queued-work", "pause", "review", "operation", "stream", "gap", "source-revision", "runtime-executing", "runtime-queued"])(`new %s during ${mode} classification invalidates the exact snapshot`, async changed => {
+  const f = await fixture(); let runtimeState: "executing" | "queued" | "unknown" = "unknown";
+  const runtime = { ...f.input.runtime, observeSessionActivity: () => ({ state: runtimeState, observedAt: Date.now() }) };
+  const result = await consider({ ...f.input, runtime }, { refresh: f.refresh, classify: async (evidence, settings) => {
     if (changed === "queued-work") await db.prisma.runtimeInstruction.create({ data: { id: "new-work", sessionId: "primary", text: "continue", state: "queued" } });
     if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
     if (changed === "review") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "review", kind: "task-runtime", purpose: "review", externalId: "other", state: "ready" } });
     if (changed === "operation") f.observation.operations.active = 1;
     if (changed === "stream") { await f.event({ kind: "start", requestId: "request", classification: "meaningful" }); await f.event({ kind: "stream", requestId: "request" }); }
     if (changed === "gap") await f.event({ kind: "gap", reason: "collector-failure" });
+    if (changed === "runtime-executing" || changed === "runtime-queued") {
+      runtimeState = changed === "runtime-executing" ? "executing" : "queued";
+      expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: "primary" } })).status).toBe("idle");
+      expect(await db.prisma.runtimeInstruction.count({ where: { state: "queued" } })).toBe(0);
+    }
     if (changed === "source-revision") Object.assign(f.observation, { sourceRevision: "0".repeat(40) });
     return f.classify(evidence, settings);
   } });
-  expect(result.outcome).toBe("stale"); expect(result.intent).toBeUndefined();
+  expect(result?.outcome).toBe("stale"); expect(result?.intent).toBeUndefined();
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
-});
+});}
+
 test("development source evidence changes independently of immutable launch provenance", async () => {
   const f = await fixture(), initial = await collectComputeEvidence(f.input), launch = f.environment.revision;
   Object.assign(f.observation, { sourceRevision: "0".repeat(40) }); await f.refresh();
@@ -325,4 +333,242 @@ test.each(["restart", "source", "gap", "operation", "pause", "resource"])("parti
   if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
   if (changed === "resource") await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { metadata: { replaced: true } } });
   await expect(renewDevelopmentAuthority({ ...f.context, ...f.decision.intent!, resourceKeys: [f.resource.key] })).rejects.toThrow();
+});
+
+
+// Reuse the owned-compute fixture above; no extra service or live classifier.
+test("automatic uncertainty has a finite persisted budget, fresh evidence, and no heartbeat paid loop", async () => {
+  const { computeIdleAttemptStatus, IDLE_FIRST_BACKOFF_MS, IDLE_SECOND_BACKOFF_MS } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(); let now = Date.now(), calls = 0;
+  const observedEvidence: Parameters<typeof classifyCompute>[0][] = [];
+  const dependencies = { refresh: f.refresh, now: () => now, classify: async (evidence: Parameters<typeof classifyCompute>[0], options: Parameters<typeof classifyCompute>[1]) => {
+    calls++; observedEvidence.push(evidence);
+    return classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) });
+  } };
+  const first = (await considerIdleComputeSuspension(f.input, dependencies))!;
+  const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: first.revision } });
+  expect(first.outcome).toBe("advisory"); expect(calls).toBe(1);
+  const snapshot = first.snapshotDigest;
+  for (const elapsed of [0, 1_000, IDLE_FIRST_BACKOFF_MS - 1]) {
+    now = JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-idle-attempt" }, orderBy: { sequence: "desc" } })).value!).lastAttemptAt + elapsed;
+    await f.refresh(); await considerIdleComputeSuspension(f.input, dependencies);
+    expect(calls).toBe(1);
+  }
+  now++;
+  f.input.runtime.history = async () => [{ role: "user", text: "The app remains saved for later; no work is running now." }];
+  const second = (await considerIdleComputeSuspension({ ...f.input, requestKey: "a-different-key-cannot-reset-the-budget" }, dependencies))!;
+  expect(calls).toBe(2); expect(second.snapshotDigest).toBe(snapshot);
+  expect(second.evidence.conversation[0]?.text).toContain("no work");
+  expect(observedEvidence[1]!.observedAt).toBeGreaterThanOrEqual(observedEvidence[0]!.observedAt);
+  await db.prisma.$disconnect();
+  now += IDLE_SECOND_BACKOFF_MS - 1;
+  await considerIdleComputeSuspension(f.input, dependencies); expect(calls).toBe(2);
+  now++;
+  expect((await considerIdleComputeSuspension(f.input, dependencies))!.outcome).toBe("advisory"); expect(calls).toBe(3);
+  now += 24 * 60 * 60_000;
+  // Coverage/operation generations and heartbeats change snapshots, not useful work.
+  f.observation.operations.generation = "9".repeat(64); await f.refresh();
+  for (let tick = 0; tick < 3; tick++) await considerIdleComputeSuspension(f.input, dependencies);
+  const status = await computeIdleAttemptStatus({ ...f.input, observed: await collectComputeEvidence(f.input), now });
+  expect(status).toMatchObject({ status: "attention", attempts: 3, maxAttempts: 3, nextEligibleAt: null, originalDecisionRevision: first.revision });
+  expect(calls).toBe(3);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-attempt" } })).toBe(7);
+  expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: first.revision } })).toEqual(original);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
+});
+
+test("an existing real-format advisory is attempt one and its later consideration preserves all original bytes", async () => {
+  const { IDLE_FIRST_BACKOFF_MS } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(), evidence = await collectComputeEvidence(f.input);
+  const initial = await considerComputeSuspension({ ...f.input, requestKey: `idle:${evidence.snapshotDigest}` }, { refresh: f.refresh,
+    classify: (value, options) => classifyCompute(value, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) }) });
+  const original = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: initial.revision } });
+  const now = Math.max(original.occurredAt.getTime(), initial.evidence.observedAt) + IDLE_FIRST_BACKOFF_MS;
+  const reconsidered = (await considerIdleComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify, now: () => now }))!;
+  expect(reconsidered.outcome).toBe("suspension-recorded"); expect(f.classifications()).toBe(1);
+  expect(reconsidered.requestKey).toBe(`${initial.requestKey}:attempt:2`);
+  expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: initial.revision } })).toEqual(original);
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).ownerPaused).toBe(false);
+});
+
+test.each(["pause", "review", "queued-work", "operation", "stream", "gap", "cleanup", "owner-resume", "unowned-allocation"])("automatic %s cannot acquire a paid-attempt claim", async changed => {
+  const f = await fixture();
+  if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  if (changed === "review") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "held-review", kind: "task-runtime", purpose: "review", externalId: "other", state: "ready" } });
+  if (changed === "queued-work") await db.prisma.runtimeInstruction.create({ data: { id: "queued-owner-work", sessionId: "primary", text: "new useful work", state: "queued" } });
+  if (changed === "operation") { f.observation.operations.active = 1; await f.refresh(); }
+  if (changed === "stream") { await f.event({ kind: "start", requestId: "stream", classification: "meaningful" }); await f.event({ kind: "stream", requestId: "stream" }); }
+  if (changed === "gap") await f.event({ kind: "gap", reason: "collector-failure" });
+  if (changed === "unowned-allocation") await db.prisma.computeOffer.create({ data: { id: "orphan", environmentId: f.environment.id, machineId: "host", instructionId: "orphan-instruction", state: "running", claimedAt: new Date(), dispatchDeadline: new Date() } });
+  if (changed === "cleanup") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: "finalization-cleanup-started", key: "finalize:task", value: "{}" } });
+  if (changed === "owner-resume") await recordDevelopmentIntent({ ...f.context, request: { action: "resume", development: true, requestKey: "pending-owner-resume" } });
+  await considerIdleComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify }).catch(() => undefined);
+  expect(f.classifications()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-attempt" } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-decision" } })).toBe(0);
+});
+
+test("two actual database clients can commit only one idle dispatch claim", async () => {
+  const { createPrismaClient, applyPragmas } = await import("../../prisma.ts");
+  const f = await fixture();
+  const database = (await db.prisma.$queryRawUnsafe<{ name: string; file: string }[]>("PRAGMA database_list")).find(row => row.name === "main")!;
+  await applyPragmas(db.prisma);
+  const second = createPrismaClient(`file:${database.file}`); await applyPragmas(second);
+  let calls = 0, collectors = 0, releaseCollectors!: () => void;
+  const collected = new Promise<void>(resolve => { releaseCollectors = resolve; });
+  const collect: typeof collectComputeEvidence = async input => {
+    const result = await collectComputeEvidence(input);
+    if (++collectors === 2) releaseCollectors();
+    await collected; return result;
+  };
+  const classify: typeof classifyCompute = async (evidence, options) => {
+    calls++; await Bun.sleep(20);
+    return classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) });
+  };
+  try {
+    const results = await Promise.allSettled([considerIdleComputeSuspension(f.input, { refresh: f.refresh, collect, classify }),
+      considerIdleComputeSuspension({ ...f.input, prisma: second, requestKey: "another-worker-key" }, { refresh: f.refresh, collect, classify })]);
+    expect(results.some(result => result.status === "fulfilled" && result.value)).toBe(true);
+    expect(calls).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-attempt" } })).toBe(2);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-decision" } })).toBe(1);
+  } finally { await second.$disconnect(); }
+});
+
+test("restart consumes an expired unknown attempt and a late suspend result cannot stop or replace a newer attempt", async () => {
+  const { IDLE_CLAIM_MS, IDLE_FIRST_BACKOFF_MS } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(); let now = Date.now(), entered!: () => void, release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; }), held = new Promise<void>(resolve => { release = resolve; });
+  const original = considerIdleComputeSuspension(f.input, { refresh: f.refresh, now: () => now, classify: async (evidence, options) => {
+    entered(); await held; return f.classify(evidence, options);
+  } });
+  await started;
+  try {
+    await considerIdleComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify, now: () => now }); expect(f.classifications()).toBe(0);
+    await db.prisma.$disconnect(); now += IDLE_CLAIM_MS;
+    await considerIdleComputeSuspension(f.input, { refresh: f.refresh, classify: f.classify, now: () => now }); expect(f.classifications()).toBe(0);
+    now += IDLE_FIRST_BACKOFF_MS;
+    const next = (await considerIdleComputeSuspension(f.input, { refresh: f.refresh, now: () => now,
+      classify: (evidence, options) => classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) }) }))!;
+    release(); const late = (await original)!;
+    expect(late.outcome).toBe("stale"); expect(late.intent).toBeUndefined();
+    const state = JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-idle-attempt" }, orderBy: { sequence: "desc" } })).value!);
+    expect(state).toMatchObject({ attempt: 2, phase: "completed", decisionRevision: next.revision });
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
+  } finally { release(); await original; }
+});
+
+test.each(["pause", "review", "operation", "queued-work", "runtime-busy", "owner-resume"])("a late %s at the claim boundary still creates no paid reservation", async changed => {
+  const f = await fixture(); let busy = false, inspected = false;
+  const runtime = { ...f.input.runtime, observeSessionActivity: () => ({ state: busy ? "executing" as const : "unknown" as const, observedAt: Date.now() }) };
+  await considerIdleComputeSuspension({ ...f.input, runtime }, { refresh: f.refresh, classify: f.classify, collect: async input => {
+    const fresh = await collectComputeEvidence(input); inspected = true;
+    if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    if (changed === "review") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "late-review", kind: "task-runtime", purpose: "review", externalId: "held", state: "ready" } });
+    if (changed === "operation") { f.observation.operations.active = 1; await f.refresh(); }
+    if (changed === "queued-work") await db.prisma.runtimeInstruction.create({ data: { id: "late-work", sessionId: "primary", text: "useful work", state: "queued" } });
+    if (changed === "runtime-busy") busy = true;
+    if (changed === "owner-resume") await recordDevelopmentIntent({ ...f.context, request: { action: "resume", development: true, requestKey: "late-owner-resume" } });
+    return fresh;
+  } }).catch(() => undefined);
+  expect(inspected).toBe(true);
+  expect(f.classifications()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-attempt" } })).toBe(0);
+});
+
+test("new useful work resets an exhausted episode but never bypasses environment spacing", async () => {
+  const { computeIdleAttemptStatus, IDLE_FIRST_BACKOFF_MS } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(); let now = Date.now(), calls = 0;
+  const dependencies = { refresh: f.refresh, now: () => now, classify: async (evidence: Parameters<typeof classifyCompute>[0], options: Parameters<typeof classifyCompute>[1]) => {
+    calls++; return classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) });
+  } };
+  await considerIdleComputeSuspension(f.input, dependencies);
+  now += IDLE_FIRST_BACKOFF_MS; await considerIdleComputeSuspension(f.input, dependencies);
+  now += 15 * 60_000; await considerIdleComputeSuspension(f.input, dependencies);
+  expect(calls).toBe(3);
+  // A completed owner instruction is useful work, even after the session settles.
+  await db.prisma.runtimeInstruction.create({ data: { id: "completed-useful-work", sessionId: "primary", text: "new work completed", state: "completed" } });
+  await considerIdleComputeSuspension(f.input, dependencies); expect(calls).toBe(3);
+  now += IDLE_FIRST_BACKOFF_MS;
+  await considerIdleComputeSuspension(f.input, dependencies); expect(calls).toBe(4);
+  const status = await computeIdleAttemptStatus({ ...f.input, observed: await collectComputeEvidence(f.input), now });
+  expect(status.attempts).toBe(1);
+});
+
+test.each(["missing-credential", "refused", "leave-running", "eligible-for-authorized-closure"])("automatic %s is visible without repeated paid attempts", async choice => {
+  const { computeIdleAttemptStatus } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(); let now = Date.now(), calls = 0;
+  const dependencies = { refresh: f.refresh, now: () => now, classify: async (evidence: Parameters<typeof classifyCompute>[0], options: Parameters<typeof classifyCompute>[1]) => {
+    calls++;
+    return classifyCompute(evidence, { ...options, apiKey: choice === "missing-credential" ? "" : options.apiKey,
+      fetch: async () => Response.json({ answers: [choice === "refused" ? { type: "refusal", name: "compute_action" } : { type: "choice", name: "compute_action", choice, confidence: 0.92 }] }) });
+  } };
+  await considerIdleComputeSuspension(f.input, dependencies); now += 24 * 60 * 60_000;
+  for (let tick = 0; tick < 3; tick++) await considerIdleComputeSuspension(f.input, dependencies);
+  const status = await computeIdleAttemptStatus({ ...f.input, observed: await collectComputeEvidence(f.input), now });
+  expect(status.status).toBe(["refused", "missing-credential"].includes(choice) ? "attention" : "advisory");
+  expect(calls).toBe(1); expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "development-compute-intent" } })).toBe(0);
+});
+
+test("the real worker reconsiders uncertainty then frees the stopped allocation for the normal next-task offer and claim", async () => {
+  const { tickCompute } = await import("./compute-worker.ts");
+  const { requestCompute, confirmComputeDelivery, claimCompute } = await import("./compute-admission.ts");
+  const { IDLE_FIRST_BACKOFF_MS } = await import("./compute-idle-attempt.ts");
+  const f = await fixture(); let now = Date.now(), calls = 0, stops = 0;
+  const pOffer = await db.prisma.computeOffer.create({ data: { id: "incumbent-P", environmentId: f.environment.id, machineId: "host", instructionId: "completed-P-start", state: "running", dispatchDeadline: new Date(), claimedAt: new Date() } });
+  await db.prisma.computeSlot.create({ data: { id: "host:0", machineId: "host", ordinal: 0, allocationId: pOffer.id } });
+  await db.prisma.runtimeSession.create({ data: { id: "primary-Q", scopeKey: "Q", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/fixture/Q", status: "idle" } });
+  await db.prisma.remoteTask.create({ data: { id: "Q", requestKey: "Q", repositoryId: "repo", machineId: "host", branchName: "codex/Q", worktreePath: "/fixture/Q", toolingRoot: "/fixture/tooling", toolingRevision: "c".repeat(40), primarySessionId: "primary-Q", phase: "working" } });
+  const admission = { prisma: db.prisma, machineId: "host", policy: config.compute! };
+  const q = await requestCompute({ ...admission, taskId: "Q", request: { key: "development", purpose: "development", revision: "a".repeat(40), recipeDigest: "b".repeat(64) } });
+  const dependencies = { refresh: f.refresh,
+    consider: (input: Parameters<typeof considerIdleComputeSuspension>[0]) => considerIdleComputeSuspension(input, { refresh: f.refresh, now: () => now,
+      classify: (evidence, options) => { calls++; return classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: calls === 1 ? "insufficient-evidence" : "suspend-compute", confidence: 0.92 }] }) }); } }),
+    continue: async (input: { intentRevision: number; intentDigest: string }) => {
+      expect(await db.prisma.computeOffer.count({ where: { environmentId: q.id } })).toBe(0);
+      const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
+      await renewDevelopmentAuthority({ ...f.context, ...reference, resourceKeys: [f.resource.key] });
+      stops++; f.observation.state = "stopped"; await f.refresh();
+      await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { state: "allocated" } });
+      const authority = await renewDevelopmentAuthority({ ...f.context, ...reference, resourceKeys: [f.resource.key] });
+      await completeDevelopmentIntent({ ...f.context, ...reference, resourcesEpoch: authority.resourcesEpoch, resources: authority.resources });
+    },
+  };
+  await tickCompute({ ...f.input, runtime: f.input.runtime as never }, dependencies);
+  expect(calls).toBe(1); expect(stops).toBe(0);
+  expect(await db.prisma.computeOffer.count({ where: { environmentId: q.id } })).toBe(0);
+  now += IDLE_FIRST_BACKOFF_MS;
+  await tickCompute({ ...f.input, runtime: f.input.runtime as never }, dependencies);
+  expect(calls).toBe(2); expect(stops).toBe(1);
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: pOffer.id } })).state).toBe("stopped");
+  const offered = await db.prisma.computeOffer.findFirstOrThrow({ where: { environmentId: q.id } });
+  expect(offered.state).toBe("queued"); expect(offered.deliveredAt).toBeNull();
+  await expect(claimCompute({ ...admission, taskId: "Q", offerId: offered.id, request: { key: q.key, purpose: "development", revision: q.revision, recipeDigest: q.recipeDigest } })).rejects.toThrow();
+  await db.prisma.runtimeInstruction.update({ where: { id: offered.instructionId }, data: { state: "dispatching", executionRequestId: offered.instructionId } });
+  await db.prisma.runtimeSession.update({ where: { id: "primary-Q" }, data: { status: "active" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "Q-started", runtimeSessionId: "primary-Q", requestId: offered.instructionId, phase: "started", occurredAt: new Date() } });
+  await confirmComputeDelivery({ ...admission, sessionId: "primary-Q", requestId: offered.instructionId });
+  expect(await claimCompute({ ...admission, taskId: "Q", offerId: offered.id, request: { key: q.key, purpose: "development", revision: q.revision, recipeDigest: q.recipeDigest } })).toMatchObject({ offer: { id: offered.id, state: "claimed" }, environment: { id: q.id, state: "starting" }, resumed: false });
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toMatchObject({ ownerPaused: false, phase: "working", worktreePath: "/fixture/task", toolingRevision: "c".repeat(40) });
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).state).toBe("allocated");
+});
+
+test("the authenticated capacity diagnostic exposes exhaustion without history reads, model calls or row changes", async () => {
+  const { createApp } = await import("../../app.ts");
+  const { createFakeAgentRuntime } = await import("../../../../test-support/agent-runtime.ts");
+  const f = await fixture(); let now = Date.now();
+  const dependencies = { refresh: f.refresh, now: () => now, classify: (evidence: Parameters<typeof classifyCompute>[0], options: Parameters<typeof classifyCompute>[1]) =>
+    classifyCompute(evidence, { ...options, fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "insufficient-evidence", confidence: 0.67 }] }) }) };
+  for (const advance of [0, 5 * 60_000, 15 * 60_000]) { now += advance; await considerIdleComputeSuspension(f.input, dependencies); }
+  const before = await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
+  const environment = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+  const runtime = createFakeAgentRuntime(); runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  runtime.history = async () => { throw Error("Read-only diagnostics cannot collect conversation"); };
+  const app = createApp({ config, prisma: db.prisma, agentRuntime: runtime });
+  expect((await app.request("/api/tasks/task/compute-policy?capacity=1")).status).toBe(401);
+  const response = await app.request("/api/tasks/task/compute-policy?capacity=1", { headers: { authorization: `Bearer ${config.apiKey}` } });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({ idleConsiderations: [{ environmentId: f.environment.id, status: "attention", attempts: 3, maxAttempts: 3, nextEligibleAt: null }] });
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(before);
+  expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toEqual(environment);
 });

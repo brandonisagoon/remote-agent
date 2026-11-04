@@ -35,6 +35,14 @@ export type ComputeDecisionEvidence = z.infer<typeof ComputeDecisionEvidence>;
 export const ComputeDecisionChoice = z.enum([
   "leave-running", "suspend-compute", "eligible-for-authorized-closure", "insufficient-evidence",
 ]);
+// Immutable receipts remain compatible with the original idle-decision format.
+export const ComputeSuspensionDecision = z.object({ version: z.literal(1), environmentId: z.string(), requestKey: z.string(), snapshotDigest: digest,
+  evidence: ComputeDecisionEvidence, result: z.object({ choice: ComputeDecisionChoice, confidence: z.number().min(0).max(1), model: z.literal("gpt-6-luna"),
+    evidenceDigest: digest, requestDigest: digest, requested: z.boolean(),
+    failure: z.enum(["missing-credential", "request-failed", "timeout", "http-error", "invalid-response", "refused"]).optional(),
+  }).strict().nullable(), outcome: z.enum(["not-eligible", "advisory", "stale", "suspension-recorded"]),
+  intent: z.object({ intentRevision: z.number().int().positive(), intentDigest: digest }).strict().optional(),
+}).strict();
 type Failure = "missing-credential" | "request-failed" | "timeout" | "http-error" | "invalid-response" | "refused";
 export type ComputeDecisionResult = {
   choice: z.infer<typeof ComputeDecisionChoice>;

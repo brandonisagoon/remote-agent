@@ -18,9 +18,15 @@ With admission enabled, `capacity` contains:
 
 The daemon uses its real session activity and the same calculation as normal
 selection and claim. Missing, stale, changed or incomplete proof retains its
-reservation. The request reads one database transaction; it does not refresh
+reservation. The capacity calculation reads one database transaction; it does not refresh
 proof, reconcile offers, create slots, queue work or call an observer/provider.
-It returns aggregate counts only, without credentials or resource identities.
+The capacity object returns aggregate counts without credentials or resource identities.
+The optional task-scoped `idleConsiderations` array reads saved attempt state and
+deterministic evidence separately. It exposes retry/attention status, counts,
+next eligible time and decision references; it never refreshes physical evidence,
+reads conversation, calls Decisions or writes a claim. It contains no resource
+paths or conversation text. These diagnostics are a point-in-time observation,
+not an atomic reservation with the capacity snapshot.
 
 Disabled admission returns `{ "enabled": false, "capacity": null }`. Missing
 daemon execution observation, a missing/foreign-host task, or an unavailable

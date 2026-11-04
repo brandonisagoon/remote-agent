@@ -87,3 +87,47 @@ refresh, including a restart or changed capability between these boundaries. Its
 physical answers are controlled fixture inputs; actual client physical observers
 have separate contract tests. Production activation and live acceptance remain
 root-owned and are not established by this source checkpoint.
+
+## Bounded reconsideration after uncertainty
+
+The host preserves each exact `compute-idle-decision` receipt. A stable evidence
+snapshot deliberately ignores heartbeats; it is not a permanent veto after one
+uncertain answer. The idle scheduler appends `compute-idle-attempt` records using
+the existing metadata journal. Each inactivity episode permits at most three
+automatic considerations: the initial attempt, a reconsideration after at least
+five minutes, and another after at least fifteen more minutes. Cooldowns begin
+at the completed attempt, not a wall-clock bucket. Downtime never dispatches a
+burst of missed attempts. A historical idle decision counts as the first
+attempt without rewriting its bytes.
+
+A new meaningful request or instruction, or a genuinely new owned application /
+allocation lifetime, can open another episode. Snapshot/coverage generation
+changes, arbitrary caller keys and heartbeats cannot replenish its budget. All
+episodes retain a minimum five-minute environment-wide spacing between attempts.
+An explicit leave-running or closure recommendation stays advisory. Missing
+credentials and refusals become attention, rather than a repeated paid loop.
+
+An attempt has a committed database claim before any model call. Concurrent
+collectors share that durable reservation, not a process-local lock. Its claim
+expires after two minutes; an interrupted/unknown dispatch consumes its attempt
+and is never resent under the same key. A later consideration applies backoff.
+Late results remain recorded but cannot replace a newer attempt or authorize a
+stop after losing their claim. Exhaustion is recorded once and requires useful
+new activity or a new owned lifetime before another episode.
+
+Each eligible consideration collects fresh physical ownership, coverage, live
+activity and sanitized conversation. Pauses, protected reviews, useful operations,
+queued work and pending explicit development controls prevent the claim itself.
+A suspension recommendation still requires the existing fresh evidence and
+per-effect development authority. Capacity is released only after physical stop
+reconciliation; the next task uses ordinary offer, delivery and claim semantics.
+Code/data, task history and tooling pins are retained. Unknown answers are never
+turned into permission to suspend, so exhaustion may leave the queue waiting.
+
+Authenticated `GET /api/tasks/:taskId/compute-policy?capacity=1` includes optional
+`idleConsiderations` diagnostics for that task: status, attempt count/limit, next
+eligible timestamp and original/latest decision references, choice and safe
+failure category. This reads saved state and deterministic evidence without
+refreshing providers, collecting conversation, making model requests or writing
+rows. Unavailable evidence is reported conservatively. There is no new control,
+configuration setting, model rationale requirement or desktop UI.

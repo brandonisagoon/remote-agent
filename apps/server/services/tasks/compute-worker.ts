@@ -3,7 +3,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { reconcileObservedCompute, offerNextCompute } from "./compute-admission.ts";
 import { refreshComputeObservation, computeEvidenceState } from "./compute-observation.ts";
-import { considerComputeSuspension } from "./compute-suspension.ts";
+import { considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
 import { verifiedComputeRuntime } from "./compute-observer.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
@@ -20,7 +20,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
-const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute };
+const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute };
 
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
@@ -60,7 +60,7 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
         } else {
           if (evidence.eligible && evidence.physicalState === "running") {
             const decision = await deps.consider({ ...context, requestKey: `idle:${evidence.snapshotDigest}` });
-            if (decision.intent && decision.outcome === "suspension-recorded") {
+            if (decision?.intent && decision.outcome === "suspension-recorded") {
               await deps.continue({ ...context, primarySessionId: environment.primarySessionId, ...decision.intent });
               await deps.refresh(context);
             }
