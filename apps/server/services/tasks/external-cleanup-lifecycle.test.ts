@@ -404,7 +404,13 @@ test("captured preview confirmation uses current declared tooling without rewrit
     if (input.compatibleCapability) { expect(input.compatibleCapability).toEqual(current); expect(request.retainedPreviewInputs?.[0]?.resourceId).toBe(environment.id); recovered++; }
     const target = { kind: "local-ingress-route" as const, id: "preview.example.com", scope: { taskId: "task", purpose: "development" as const, configFile, tunnelId: "original-tunnel" }, hostname: "preview.example.com", sourceDigest: "a".repeat(64), routeDigest: "b".repeat(64), presentAtPrepare: true };
     const targets = request.observations[0]!.expectedTargets ?? [{ ...target, identityDigest: cleanupTargetDigest(target) }];
-    return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: tunnel.id, resourceIdentityDigest: finalizationResourceIdentity(tunnel).identityDigest, adapter: "preview", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
+    // New preparation requires a verified independent credential. This synthetic
+    // observer supplies its secret-free identity before the fixture freezes the
+    // historical retained-capture shape below; production validation stays active.
+    const previewConfirmation = { taskId: "task", resourceId: tunnel.id, resourceIdentityDigest: finalizationResourceIdentity(tunnel).identityDigest,
+      purpose: "development", hostname: target.hostname, tunnelId: target.scope.tunnelId, configFile, sourceDigest: target.sourceDigest,
+      zoneId: "a".repeat(32), accountId: "b".repeat(32), credential: { kind: "environment", sha256: "c".repeat(64) } };
+    return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: tunnel.id, resourceIdentityDigest: finalizationResourceIdentity(tunnel).identityDigest, adapter: "preview", previewConfirmation, dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: present ? targets.map(target => target.identityDigest) : [], absent: !present }] };
   } };
   const dependencies = { ...f.dependencies, cleanupObserver: async () => selected,
     resources: async (input: Parameters<typeof prepareFinalizationResources>[0]) => {
