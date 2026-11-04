@@ -1,3 +1,4 @@
+import { verifyBearerToken } from "../../security.ts";
 import { ClosedFamilyPrepare, ClosedFamilyCommit, prepareClosedFamily, commitClosedFamily, closedFamilyReceipt } from "../../services/sessions/closed-family.ts";
 import { TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
 import { preparationStage } from "../../services/tasks/preparation-diagnostics.ts";
@@ -6,7 +7,7 @@ import { automaticCleanupTurn } from "../../services/tasks/cleanup-inbox.ts";
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
-import { queueInstruction, deliverInstructions, resolveTaskInstruction } from "../../services/sessions/inbox.ts";
+import { queueInstruction, deliverInstructions, resolveTaskInstruction, QueuedCancellationAuthenticationError } from "../../services/sessions/inbox.ts";
 import { answerSessionQuestion } from "../../services/sessions/questions.ts";
 import { readTaskActivity } from "../../services/tasks/activity.ts";
 import { ProjectionRetryStage, retryTaskRuntimeProjection } from "../../services/sessions/runtime-events/projection-retries.ts";
@@ -85,9 +86,9 @@ taskSupervisionRoutes.post("/:taskId/instructions/:instructionId/resolve", async
   if (!parsed.success) return c.json({ error: "Choose a resolution and record the evidence from inspecting session history" }, 400);
   const prisma = c.get("prisma");
   try {
-    const result = await resolveTaskInstruction(prisma, c.get("agentRuntime"), { taskId: c.req.param("taskId"), instructionId: c.req.param("instructionId"), ...parsed.data });
+    const result = await resolveTaskInstruction(prisma, c.get("agentRuntime"), { taskId: c.req.param("taskId"), instructionId: c.req.param("instructionId"), ...parsed.data, ownerAuthenticated: verifyBearerToken(c.req.header("authorization") ?? null, c.get("config").apiKey) });
     return c.json(result);
-  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+  } catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, error instanceof QueuedCancellationAuthenticationError ? 401 : 409); }
 });
 
 // Owner pause/resume is independent of browser viewing.

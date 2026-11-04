@@ -1,5 +1,6 @@
+import { isDeepStrictEqual } from "node:util";
 import { cleanupTransportAllowsInstruction } from "../tasks/cleanup-transport.ts";
-import { cleanupInstructionAllows, prepareQueuedCleanupTransport, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
+import { cleanupInstructionAllows, prepareQueuedCleanupTransport, CLEANUP_INSTRUCTION, type CleanupInboxStore } from "../tasks/cleanup-inbox.ts";
 import { randomUUID } from "node:crypto";
 import type { Prisma, PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
@@ -11,7 +12,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 const active = new WeakMap<AgentSessionRuntime, Set<string>>();
 const flushing = new WeakSet<AgentSessionRuntime>();
 
-type InboxStore = Pick<PrismaClient, "remoteTask" | "runtimeInstruction" | "runtimeSession" | "runtimeSessionRelation" | "runtimeMetadataEvent">;
+type InboxStore = Pick<PrismaClient, "remoteTask" | "runtimeInstruction" | "runtimeSession" | "runtimeSessionRelation" | "runtimeMetadataEvent" | "runtimeLifecycleEvent">;
 
 async function taskInstruction(store: InboxStore, taskId: string, instructionId: string) {
   const task = await store.remoteTask.findUnique({ where: { id: taskId } });
@@ -32,8 +33,12 @@ async function taskInstruction(store: InboxStore, taskId: string, instructionId:
 
 /** A human's explicit outcome decision is durable separately from delivery
  * state, so a lost HTTP response cannot authorize another retry after dispatch. */
+export class QueuedCancellationAuthenticationError extends Error {
+  constructor() { super("Queued cancellation requires the owner bearer token (owner MCP --config)"); }
+}
+
 export async function resolveTaskInstruction(prisma: PrismaClient, runtime: AgentSessionRuntime, input: {
-  taskId: string; instructionId: string; action: "acknowledge" | "cancel" | "retry"; reason: string; requestKey?: string;
+  taskId: string; instructionId: string; action: "acknowledge" | "cancel" | "retry"; reason: string; requestKey?: string; ownerAuthenticated?: boolean;
 }) {
   const key = input.instructionId;
   const source = `task-supervisor:${input.taskId}`;
@@ -45,22 +50,33 @@ export async function resolveTaskInstruction(prisma: PrismaClient, runtime: Agen
     const prior = decisions.find((decision) => JSON.parse(decision.value!).requestKey === (input.requestKey ?? null));
     if (prior) {
       if (prior.value !== value) throw new Error("Resolution request key already belongs to another decision");
-      return { ...owned, resolved: true };
+      return { ...owned, resolved: true, queuedCancel: false };
     }
     if (owned.task.phase === "closed" || owned.session.status === "closed") throw new Error("Task or session is closed");
     if (input.action === "retry" && owned.task.ownerPaused) throw new Error("Resume the owner-paused task before retrying an instruction");
-    if (owned.instruction.state !== "unknown") throw new Error("Instruction is not awaiting resolution");
-    return { ...owned, resolved: false };
+    const queuedCancel = owned.instruction.state === "queued" && input.action === "cancel";
+    if (!queuedCancel && owned.instruction.state !== "unknown") throw new Error("Instruction is not awaiting resolution");
+    if (queuedCancel) {
+      if (!input.ownerAuthenticated) throw new QueuedCancellationAuthenticationError();
+      if (!input.requestKey?.trim()) throw new Error("Queued cancellation requires a stable resolution request key");
+      if (owned.instruction.executionRequestId !== null || decisions.length) throw new Error("Queued instruction has prior execution or resolution history");
+      if (await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owned.session.id, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION, key } })) throw new Error("Typed cleanup instructions require their cleanup lifecycle");
+      if (await store.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: owned.session.id, OR: [{ requestId: key }, { requestId: { startsWith: `${key}:retry:` } }] } })) throw new Error("Queued instruction has execution lifecycle history");
+    }
+    return { ...owned, resolved: false, queuedCancel };
   };
   const first = await inspect(prisma);
   if (first.resolved) return { resolved: true as const };
-  if (!runtime.reconcileInterruptedSession) throw new Error("Runtime cannot verify interrupted provider liveness");
-  await runtime.reconcileInterruptedSession(first.session.id);
+  if (!first.queuedCancel) {
+    if (!runtime.reconcileInterruptedSession) throw new Error("Runtime cannot verify interrupted provider liveness");
+    await runtime.reconcileInterruptedSession(first.session.id);
+  }
   await prisma.$transaction(async (tx) => {
     const current = await inspect(tx);
     if (current.resolved) return;
+    if (first.queuedCancel && (!current.queuedCancel || !isDeepStrictEqual(first.task, current.task) || !isDeepStrictEqual(first.session, current.session) || !isDeepStrictEqual(first.instruction, current.instruction))) throw new Error("Queued cancellation ownership or instruction changed; inspect and retry");
     const changed = await tx.runtimeInstruction.updateMany({
-      where: { id: input.instructionId, sessionId: current.session.id, state: "unknown", updatedAt: current.instruction.updatedAt },
+      where: { id: input.instructionId, sessionId: current.session.id, state: first.queuedCancel ? "queued" : "unknown", updatedAt: current.instruction.updatedAt, ...(first.queuedCancel ? { executionRequestId: null } : {}) },
       data: { state: { acknowledge: "acknowledged", cancel: "cancelled", retry: "queued" }[input.action], detail: input.reason },
     });
     if (!changed.count) throw new Error("Instruction changed during resolution; inspect and retry");
