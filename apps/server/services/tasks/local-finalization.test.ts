@@ -1,3 +1,4 @@
+import { localCleanupReferenceDependencies } from "./local-cleanup-reference.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -176,10 +177,12 @@ test("foreign tooling pins in a sibling scope permit finished source preparation
 }, 15_000);
 
 const actual = process.env.DRAFTED_LOCAL_FINALIZATION_ROOT ? test : test.skip;
-actual.each([false, true, "adopted"])("actual client prunes finished development without an archive (historical flag=%s)", async historicalFlag => {
+actual.each([false, true, "adopted", "late-adopted-reference"])("actual client prunes finished development without an archive (historical flag=%s)", async historicalFlag => {
   const f = await fixture("local-only"), root = process.env.DRAFTED_LOCAL_FINALIZATION_ROOT!;
   const client = (file: string) => import(pathToFileURL(path.join(root, `src/${file}.ts`)).href);
   const { finalizeTask } = await client("finalize"), { taskRegistry, closeTask } = await client("control"), { manageResource } = await client("resources");
+  const priorReferenceObserver = localCleanupReferenceDependencies.observe;
+  let referenceResource: Awaited<ReturnType<typeof db.prisma.remoteTaskResource.findUniqueOrThrow>> | undefined;
   const stop = startRuntimeEventProjection({ prisma: db.prisma, config: f.config, runtime: createFakeAgentRuntime() }, async () => {});
   try {
     await writeFile(path.join(f.root, ".git/info/exclude"), "cache/\n"); await mkdir(path.join(f.worktree, "cache"));
@@ -190,7 +193,18 @@ actual.each([false, true, "adopted"])("actual client prunes finished development
     const sha = (value: string) => createHash("sha256").update(value).digest("hex");
     const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "development", kind: "evidence", purpose: "development", externalId: evidenceFile, state: "ready", metadata: { sha256: sha("development evidence"), bytes: 20 } } });
     const retained = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "retained", kind: "evidence", purpose: "tooling", externalId: retainedFile, state: "ready", metadata: { sha256: sha("explicit retained evidence"), bytes: 26 } } });
+    if (historicalFlag === "late-adopted-reference") {
+      git(f.root, "remote", "add", "origin", "https://github.com/owner/product.git");
+      referenceResource = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "original-pr", kind: "pull-request", purpose: "review", externalId: "https://github.com/owner/product/pull/7", state: "ready",
+        metadata: { repository: "owner/product", number: 7, head: f.task.baseCommit, branch: f.task.branchName, baseBranch: "main" } } });
+      localCleanupReferenceDependencies.observe = async reference => ({ id: reference.id, repository: reference.repository, pullRequest: reference.pullRequest,
+        url: "https://github.com/owner/product/pull/7", reviewedHead: reference.reviewedHead, mergeCommit: "b".repeat(40), mergedAt: "2026-01-01T00:00:00.000Z", baseHead: "c".repeat(40), ci: [] });
+    }
     const prepared = await f.request("prepare-finalization", f.input); expect(prepared.status).toBe(200);
+    if (referenceResource) {
+      const reference = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-local-reference" } });
+      expect(JSON.parse(reference.value!).originalWork).toBeUndefined();
+    }
     if (historicalFlag === true) {
       const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.data.preparedRevision } });
       const value = JSON.parse(event.value!); value.localCompletion.sourceCaptureRequired = true;
@@ -201,7 +215,7 @@ actual.each([false, true, "adopted"])("actual client prunes finished development
       await db.prisma.runtimeMetadataEvent.update({ where: { sequence: operation.sequence }, data: { value: JSON.stringify(bound) } });
     }
     let adopted: any;
-    if (historicalFlag === "adopted") {
+    if (historicalFlag === "adopted" || historicalFlag === "late-adopted-reference") {
       const { prepareLegacyOriginalArchive } = await client("legacy-original-archive");
       const event = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.data.preparedRevision } });
       const operation = await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: prepared.data.cleanup.operationRevision } });
@@ -219,7 +233,7 @@ actual.each([false, true, "adopted"])("actual client prunes finished development
         adopted = response.data.proof.originalWork;
       } finally { legacyOriginalWorkDependencies.observation = prior; }
     }
-    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-legacy-original-work"] } } });
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-legacy-original-work", "finalization-local-reference"] } } });
     const registry = taskRegistry(f.socket, f.task.id, 20_000);
     expect(await finalizeTask({ registry, cleanup: true, close: () => closeTask(f.socket, f.task.id), manage: (input: any) => manageResource(input) })).toMatchObject({ closed: true, reporting: { state: "recorded" } });
     expect(await lstat(f.worktree).catch(() => null)).toBeNull();
@@ -228,18 +242,19 @@ actual.each([false, true, "adopted"])("actual client prunes finished development
     expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: retained.id } })).toEqual(retained);
     expect(await readFile(retainedFile, "utf8")).toBe("explicit retained evidence");
     expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
-    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-legacy-original-work"] } } })).toEqual(frozen);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-legacy-original-work", "finalization-local-reference"] } } })).toEqual(frozen);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "legacy-evidence-retained" } })).toBe(0);
+    if (referenceResource) expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: referenceResource.id } })).toEqual(referenceResource);
     if (adopted) {
       expect((await lstat(adopted.archive.root)).isDirectory()).toBeTrue();
       expect(await lstat(adopted.target.quarantine.path).catch(() => null)).toBeNull();
       expect(await lstat(adopted.administration.administrationCapture.quarantine.path).catch(() => null)).toBeNull();
     }
     expect(await finalizeTask({ registry, cleanup: true, close: () => closeTask(f.socket, f.task.id) })).toMatchObject({ alreadyClosed: true });
-  } finally { await stop(); await f.server.stop(true); }
+  } finally { localCleanupReferenceDependencies.observe = priorReferenceObserver; await stop(); await f.server.stop(true); }
 }, 60_000);
 
-actual.each(["none", "changed-ignored", "new-ignored", "pause", "changed-manifest", "changed-manifest-copy", "tooling-directory", "tooling-kind", "shared-copy-root"])("actual client preserves unlinked source and evidence through capture/retry (late change=%s)", async change => {
+actual.each(["none", "changed-ignored", "new-ignored", "pause", "changed-manifest", "changed-manifest-copy", "tooling-directory", "tooling-kind", "shared-copy-root"])("actual client prunes finished source while preserving historical named evidence (late change=%s)", async change => {
   const f = await fixture(), root = process.env.DRAFTED_LOCAL_FINALIZATION_ROOT!;
   const client = (file: string) => import(pathToFileURL(path.join(root, `src/${file}.ts`)).href);
   const { finalizeTask } = await client("finalize"), { taskRegistry, closeTask } = await client("control"), { manageResource } = await client("resources");
@@ -316,7 +331,9 @@ actual.each(["none", "changed-ignored", "new-ignored", "pause", "changed-manifes
       branch: f.task.branchName, archiveRoot: path.join(parent, "source"), ownedPaths: [path.join(f.worktree, "cache")], binding }, { assertAuthority: async () => { await inspectCleanupSupplementAuthority({ prisma: db.prisma, config: f.config, sessionId: f.session.id, requestKey: f.input.requestKey }); } });
     const adopted = await f.request("legacy-evidence", { ...binding, archive }, true); expect(adopted.status).toBe(200);
     const proof = adopted.data.proof.originalWork, inode = (await lstat(f.worktree)).ino;
-    if (change !== "none") {
+    if (change === "changed-ignored") await writeFile(cache, "new disposable development material");
+    if (change === "new-ignored") await writeFile(path.join(f.worktree, "cache", "late.bin"), "later disposable development material");
+    if (!["none", "changed-ignored", "new-ignored"].includes(change)) {
       if (change === "changed-ignored") await writeFile(cache, "new owner material after adoption");
       if (change === "new-ignored") await writeFile(path.join(f.worktree, "cache", "late.bin"), "later ignored material");
       if (change === "changed-manifest") await writeFile(retainedRecords[0]!.externalId, "changed original manifest");
@@ -330,15 +347,14 @@ actual.each(["none", "changed-ignored", "new-ignored", "pause", "changed-manifes
       expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: operation.sequence } })).value).toBe(operation.value);
       return;
     }
-    await expect(finalizeTask({ ...args, preparedCleanup: { observation: idle, captureHooks: { afterCapture() { throw Error("lost source reply"); } } } })).rejects.toThrow("lost source reply");
-    expect((await lstat(proof.target.quarantine.path)).ino).toBe(inode); expect(closed).toBe(0);
     const confirm = registry.confirmFinalization; let lost = false;
     registry.confirmFinalization = async (input: unknown) => { const value = await confirm(input); if (!lost) { lost = true; throw Error("lost confirmation reply"); } return value; };
     await expect(finalizeTask(args)).rejects.toThrow("lost confirmation reply"); expect(closed).toBe(0);
     await db.prisma.$disconnect();
     expect(await finalizeTask({ ...args, manage: async () => { throw Error("must not repeat effects"); }, runner: async () => { throw Error("must not remove twice"); } })).toMatchObject({ closed: true, reporting: { state: "recorded" } });
     expect(closed).toBe(1); expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).toBe("closed");
-    expect(await readFile(retainedFile, "utf8")).toBe("published evidence"); expect(await readFile(path.join(proof.target.quarantine.path, "cache/result.bin"), "utf8")).toBe("original ignored material");
+    expect(await readFile(retainedFile, "utf8")).toBe("published evidence"); expect(await lstat(proof.target.quarantine.path).catch(() => null)).toBeNull();
+    expect((await lstat(proof.archive.root)).isDirectory()).toBeTrue();
     expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: evidence.id } })).state).toBe("released");
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).value).toBe(original.value);
     expect((await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: operation.sequence } })).value).toBe(operation.value);

@@ -507,3 +507,22 @@ The v1 cleanup response uses `sourceRetirement: "delete"`, including when an old
 mandatory-policy source adoption is recorded. Its immutable receipt and existing
 artifact remain intact; that adoption does not trigger source capture, restore
 verification or a false claim that deleted source remains in quarantine.
+
+
+Delete-mode previews bind an existing independent credential identity to the
+same task/resource, account, zone, hostname and deleting targets in the current
+observer plan. The credential must remain outside every deleting resource and
+the original task source. Provider GETs verify the exact targets before pruning
+and again after local config/connector removal; changed or missing credentials,
+changed identities or recreated provider resources refuse confirmation. No saved
+config copy, archive or restore proof replaces current provider observation.
+
+Delete-mode browser plans keep the frozen profile/marker/namespace association
+and use the existing configured observer to verify the exact session is absent.
+Registered and standalone profile roots are deleted through temporary staging;
+completion requires both original and staged paths absent. Interruption stays
+retryable, while recreated sessions, profiles or markers never gain a second
+close/delete authorization. Historical explicitly retained capture plans remain
+supported. Ordinary cleanup no longer invokes the superseded generated-archive
+renewal hook; local authority epochs, native held-target checks and current
+provider observations continue enforcing the existing operation.

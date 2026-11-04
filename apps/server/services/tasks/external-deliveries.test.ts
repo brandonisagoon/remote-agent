@@ -83,6 +83,7 @@ async function fixture() {
       // These fixtures represent already accepted historical retained-capture
       // plans, which predate the new finished-task delete disposition.
       for (const entry of plan) {
+        if (entry.disposition === "retire-adapter") delete entry.previewConfirmation;
         if (entry.disposition === "retire-file" || entry.disposition === "retire-tree") delete entry.target.retirement;
         else if (entry.disposition === "retire-owned" && entry.target.type === "tree") delete entry.target.retirement;
       }

@@ -2,7 +2,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { LegacyComposeRetentionInput, LegacyComposeRetentionObservation } from "./legacy-compose-retention-schema.ts";
-import { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
+import { RetainedPreviewInput, PreviewDeletionConfirmation } from "./cleanup-preview-retained-schema.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Nonempty = z.string().min(1);
@@ -70,7 +70,9 @@ function retainedEnvironment(input: z.infer<typeof RetainedPreviewInput>, resour
   return cleanupDigest({ id, key, kind, purpose, externalId, expiresAt, metadata }) === input.identityDigest;
 }
 export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task: z.strictObject({ id: z.string().min(1), primarySessionId: z.string().min(1), worktreePath: Absolute, toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) }),
-  retainedCompose: LegacyComposeRetentionInput.optional(), resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional(), retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional() }).superRefine((input, ctx) => {
+  previewConfirmation: PreviewDeletionConfirmation.optional(), retainedCompose: LegacyComposeRetentionInput.optional(), resource: CleanupObserverResource, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional(), retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional() }).superRefine((input, ctx) => {
+    if (input.previewConfirmation && (input.stage !== "confirm" || !input.previewConfirmation.deletions?.length || input.previewConfirmation.taskId !== input.task.id
+      || input.previewConfirmation.resourceId !== input.resource.id || input.previewConfirmation.purpose !== input.resource.purpose)) ctx.addIssue({ code: "custom", message: "Deletion confirmation requires its exact frozen resource and deletion scope" });
     if (input.retainedCompose && (input.resource.kind !== "docker-compose-project" || input.resource.purpose !== "development" || input.resource.state !== "ready")) ctx.addIssue({ code: "custom", message: "Retained Compose observation requires its original Ready development group" });
     if (input.stage === "prepare" ? input.expectedTargets !== undefined : input.expectedTargets === undefined) ctx.addIssue({ code: "custom", message: "Only confirm requires the exact prepared targets" });
     if (new Set(input.resources.map(resource => resource.id)).size !== input.resources.length || new Set(input.resources.map(resource => resource.key)).size !== input.resources.length || !input.resources.some(resource => resource.id === input.resource.id && cleanupDigest(resource) === cleanupDigest(input.resource))) ctx.addIssue({ code: "custom", message: "Observer resource must occur exactly once in its task inventory" });
@@ -80,7 +82,10 @@ export const CleanupObserverInput = z.strictObject({ version: z.literal(1), task
   });
 export type CleanupObserverInput = z.infer<typeof CleanupObserverInput>;
 export const CleanupObserverResult = z.strictObject({ version: z.literal(1), taskId: z.string(), resourceId: z.string(), resourceIdentityDigest: Hash,
-  retainedCompose: LegacyComposeRetentionObservation.optional(), adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), stoppedConsumers: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
+  previewConfirmation: PreviewDeletionConfirmation.optional(), retainedCompose: LegacyComposeRetentionObservation.optional(), adapter: CleanupAdapter, dependencies: z.array(Nonempty).max(1000), stoppedConsumers: z.array(Nonempty).max(1000), targets: z.array(CleanupTarget).min(1).max(1000), presentTargetDigests: z.array(Hash).max(1000), absent: z.boolean() }).superRefine((result, ctx) => {
+    if (result.previewConfirmation && (!["preview", "endpoint"].includes(result.adapter) || result.previewConfirmation.taskId !== result.taskId
+      || result.previewConfirmation.resourceId !== result.resourceId || result.previewConfirmation.resourceIdentityDigest !== result.resourceIdentityDigest
+      || result.targets.some(target => target.scope.purpose !== result.previewConfirmation!.purpose))) ctx.addIssue({ code: "custom", message: "Independent preview confirmation changed its exact resource scope" });
     if (result.retainedCompose && (result.adapter !== "compose" || result.retainedCompose.retainedTargetDigests.some(digest => !result.presentTargetDigests.includes(digest)))) ctx.addIssue({ code: "custom", message: "Retained Compose source must remain present" });
     if (new Set(result.dependencies).size !== result.dependencies.length || result.dependencies.includes(result.resourceId)) ctx.addIssue({ code: "custom", message: "Observer dependencies must be unique other resource IDs" });
     if (new Set(result.stoppedConsumers).size !== result.stoppedConsumers.length || result.stoppedConsumers.includes(result.resourceId) || result.stoppedConsumers.some(id => result.dependencies.includes(id))) ctx.addIssue({ code: "custom", message: "Stopped consumers must be unique other resource IDs, separate from full dependencies" });
@@ -97,12 +102,12 @@ export type CleanupObserverResult = z.infer<typeof CleanupObserverResult>;
 const ObserverTask = z.strictObject({ id: Nonempty, primarySessionId: Nonempty, worktreePath: Absolute, toolingRevision: z.string().regex(/^[a-f0-9]{40}$/) });
 export const CleanupObserverBatchInput = z.strictObject({ version: z.literal(1), task: ObserverTask, resources: z.array(CleanupObserverResource).min(1).max(1000), stage: z.enum(["prepare", "confirm"]),
   retainedPreviewInputs: z.array(RetainedPreviewInput).min(1).max(100).optional(),
-  observations: z.array(z.strictObject({ resourceId: Nonempty, expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional() })).min(1).max(1000),
+  observations: z.array(z.strictObject({ resourceId: Nonempty, previewConfirmation: PreviewDeletionConfirmation.optional(), expectedTargets: z.array(CleanupTarget).min(1).max(1000).optional() })).min(1).max(1000),
 }).superRefine((input, ctx) => {
   if (new Set(input.observations.map(value => value.resourceId)).size !== input.observations.length) ctx.addIssue({ code: "custom", message: "Batch resources must be unique" });
   for (const observation of input.observations) {
     const resource = input.resources.find(value => value.id === observation.resourceId);
-    if (!resource || !CleanupObserverInput.safeParse({ version: input.version, task: input.task, resources: input.resources, resource, stage: input.stage, expectedTargets: observation.expectedTargets, retainedPreviewInputs: input.retainedPreviewInputs }).success) ctx.addIssue({ code: "custom", message: "Batch observation does not bind an exact resource and stage" });
+    if (!resource || !CleanupObserverInput.safeParse({ version: input.version, task: input.task, resources: input.resources, resource, stage: input.stage, expectedTargets: observation.expectedTargets, previewConfirmation: observation.previewConfirmation, retainedPreviewInputs: input.retainedPreviewInputs }).success) ctx.addIssue({ code: "custom", message: "Batch observation does not bind an exact resource and stage" });
   }
 });
 export type CleanupObserverBatchInput = z.infer<typeof CleanupObserverBatchInput>;

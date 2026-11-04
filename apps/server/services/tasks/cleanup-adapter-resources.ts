@@ -1,5 +1,5 @@
 import { z } from "zod";
-import type { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
+import { PreviewDeletionConfirmation, type RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
 import { CleanupAdapter, CleanupObserverBatchInput, CleanupObserverBatchResult, CleanupObserverInput, CleanupObserverResource, CleanupTarget } from "./cleanup-observer-schema.ts";
 import { CleanupObserverCapability, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { assertStudioCleanupTargets } from "./cleanup-studio-targets.ts";
@@ -7,7 +7,7 @@ import { assertStudioCleanupTargets } from "./cleanup-studio-targets.ts";
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = { id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.enum(["development", "browser", "review", "tooling"]), savedDataResourceId: z.string().min(1).optional(), externalId: z.string().min(1), expiresAt: z.string().nullable(), identityDigest: Hash };
 export const CleanupAdapterPlan = z.strictObject({ ...Identity, disposition: z.literal("retire-adapter"), dependencies: z.array(z.string().min(1)).max(1000), stoppedConsumers: z.array(z.string().min(1)).max(1000), adapter: CleanupAdapter,
-  targets: z.array(CleanupTarget).min(1).max(1000), observer: z.strictObject({ capability: CleanupObserverCapability, task: CleanupObserverInput.shape.task }) });
+  previewConfirmation: PreviewDeletionConfirmation.optional(), targets: z.array(CleanupTarget).min(1).max(1000), observer: z.strictObject({ capability: CleanupObserverCapability, task: CleanupObserverInput.shape.task }) });
 export type CleanupAdapterPlan = z.infer<typeof CleanupAdapterPlan>;
 export type CleanupAdapterContext = z.infer<typeof CleanupAdapterPlan>["observer"];
 type Resource = z.infer<typeof CleanupObserverResource>;
@@ -59,6 +59,7 @@ function resultScope(input: z.infer<typeof CleanupObserverBatchInput>, value: un
       || item.targets.some(target => target.scope.taskId !== input.task.id || target.scope.purpose !== record.purpose)
       || [...item.dependencies, ...item.stoppedConsumers].some(id => !input.resources.some(record => record.id === id))) throw new Error("Cleanup observer resource ownership or dependencies changed");
     if (input.stage === "confirm" && !same(item.targets, selected.expectedTargets)) throw new Error("Cleanup observer target identity changed since preparation");
+    if (selected.previewConfirmation && JSON.stringify(item.previewConfirmation) !== JSON.stringify(selected.previewConfirmation)) throw new Error("Independent preview confirmation changed its accepted binding");
     assertStudioCleanupTargets(item, record, input.task);
   }
   return result;
@@ -73,17 +74,19 @@ export async function prepareCleanupAdapterResources(input: { context: CleanupAd
     const observed = result.observations.find(item => item.resourceId === identity.id)!;
     if (input.resources.find(resource => resource.id === identity.id)!.state === "released"
       && (!observed.absent || observed.targets.some(target => target.presentAtPrepare))) throw new Error("Historical released adapter is still present or has no initial absence proof");
-    return CleanupAdapterPlan.parse({ ...identity, disposition: "retire-adapter", dependencies: observed.dependencies, stoppedConsumers: observed.stoppedConsumers, adapter: observed.adapter, targets: observed.targets, observer: input.context });
+    return CleanupAdapterPlan.parse({ ...identity, disposition: "retire-adapter", dependencies: observed.dependencies, stoppedConsumers: observed.stoppedConsumers, adapter: observed.adapter, ...(observed.previewConfirmation ? { previewConfirmation: observed.previewConfirmation } : {}), targets: observed.targets, observer: input.context });
   });
 }
 
 /** Released is only a receipt state. A full confirm still independently proves
  * every prepared target absent, and a replay cannot absorb recreated targets. */
-export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean; retainedTargets?: Map<string, string[]>; retainedPreviewInputs?: RetainedPreviewInput[]; previewObserver?: () => Promise<CleanupObserverCapability> }, observe: Observe = runCleanupResourceObserver) {
+export async function assertCleanupAdapterResources(input: { taskId: string; resources: Resource[]; plan: CleanupAdapterPlan[]; removed: boolean; deletionPlans?: import("./finalization-resources.ts").FinalizationResourcePlan[]; retainedTargets?: Map<string, string[]>; retainedPreviewInputs?: RetainedPreviewInput[]; previewObserver?: () => Promise<CleanupObserverCapability> }, observe: Observe = runCleanupResourceObserver) {
   if (!input.plan.length) return;
   const plans = input.plan.map(plan => CleanupAdapterPlan.parse(plan)), context = plans[0]!.observer;
+  const { assertPreviewDeletionBindings } = await import("./cleanup-preview-retained.ts");
+  assertPreviewDeletionBindings(input.deletionPlans ?? plans);
   if (context.task.id !== input.taskId || plans.some(plan => !same(plan.observer, context))) throw new Error("Cleanup observer task or committed capability changed");
-  const request = CleanupObserverBatchInput.parse({ version: 1, task: context.task, resources: input.resources, stage: "confirm", observations: plans.map(plan => ({ resourceId: plan.id, expectedTargets: plan.targets })) });
+  const request = CleanupObserverBatchInput.parse({ version: 1, task: context.task, resources: input.resources, stage: "confirm", observations: plans.map(plan => ({ resourceId: plan.id, expectedTargets: plan.targets, ...(plan.previewConfirmation ? { previewConfirmation: plan.previewConfirmation } : {}) })) });
   const retained = input.retainedPreviewInputs ?? [];
   const recovered = plans.filter(plan => plan.adapter === "preview" && retained.some(value => input.resources.find(resource => resource.id === value.resourceId)?.purpose === plan.purpose));
   let value: unknown;

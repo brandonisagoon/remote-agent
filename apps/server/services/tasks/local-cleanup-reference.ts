@@ -41,13 +41,13 @@ function selection(active: Active) {
   return { resource: current, metadata };
 }
 
-async function bindings(prisma: Database, active: Active) {
+async function bindings(prisma: Database, active: Active, includeOriginalWork = false) {
   const operation = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: active.operationRevision } });
   if (!active.preparation.value || !operation?.value || operation.action !== "finalization-cleanup-started" || operation.source !== `finalizer:${active.task.id}`
     || operation.runtimeSessionId !== active.binding.sessionId || operation.key !== active.prepared.requestKey
     || finalizationDigest(JSON.parse(operation.value)) !== finalizationDigest(active.operation)) throw Error("Local cleanup reference operation bytes changed");
   let originalWork: z.infer<typeof Proof>["originalWork"];
-  if (active.originalWorkReceipt) {
+  if (includeOriginalWork && active.originalWorkReceipt) {
     const receipt = active.originalWorkReceipt, event = await prisma.runtimeMetadataEvent.findUnique({ where: { sequence: receipt.revision } });
     if (!event?.value || event.action !== "finalization-legacy-original-work" || event.source !== `owner:${active.task.id}` || event.runtimeSessionId !== active.binding.sessionId
       || event.key !== active.prepared.requestKey || finalizationDigest(JSON.parse(event.value)) !== receipt.digest) throw Error("Local cleanup reference original source adoption changed");
@@ -66,7 +66,7 @@ export async function localCleanupReferenceRetention(prisma: Database, active: A
   const selected = selection(active), proof = Proof.parse(JSON.parse(event.value!));
   if (!selected) throw Error("Unexpected local cleanup reference supplement");
   const { resource, observation, version, ...savedBinding } = proof;
-  if (finalizationDigest(savedBinding) !== finalizationDigest(await bindings(prisma, active)) || resource.disposition !== "retain-reference"
+  if (finalizationDigest(savedBinding) !== finalizationDigest(await bindings(prisma, active, Boolean(savedBinding.originalWork))) || resource.disposition !== "retain-reference"
     || finalizationResourceIdentity(selected.resource).identityDigest !== resource.identityDigest || resource.id !== selected.resource.id
     || resource.reference.deliveryId !== `finalizer:${active.task.id}:${active.preparation.sequence}` || resource.reference.type !== "pull-request"
     || observation.id !== selected.resource.id || observation.repository !== selected.metadata.repository || observation.pullRequest !== selected.metadata.number

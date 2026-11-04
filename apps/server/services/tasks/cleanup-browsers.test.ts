@@ -35,9 +35,18 @@ async function fixture(registered = false) {
       return { version: 1, taskId: "task", observations: [{ version: 1, taskId: "task", resourceId: "browser", resourceIdentityDigest: finalizationResourceIdentity(browser).identityDigest,
         adapter: "browser", dependencies: [], stoppedConsumers: [], targets, presentTargetDigests: running ? targets.map(target => target.identityDigest) : [], absent: !running }] };
     } };
-  const prepare = () => prepareFinalizationResources(input, observation);
+  const prepareDeletion = () => prepareFinalizationResources(input, observation);
+  const prepare = async () => {
+    const plan = await prepareDeletion();
+    // Historical accepted profile retention remains a readable protocol.
+    for (const entry of plan) {
+      if (entry.disposition === "retire-tree") delete entry.target.retirement;
+      if (entry.disposition === "retire-browser" && entry.capture.type === "standalone") delete entry.capture.target.retirement;
+    }
+    return plan;
+  };
   const verify = (plan: FinalizationResourcePlan[], removed = false) => assertFinalizationResources({ taskId: "task", resources, plan, removed, originalWork: true }, observation);
-  return { directory, environment, root, profile, ownerFile, browser, resources, input, prepare, verify, setRunning: (value: boolean) => { running = value; }, calls: () => calls };
+  return { directory, environment, root, profile, ownerFile, browser, resources, input, observation, prepare, prepareDeletion, verify, setRunning: (value: boolean) => { running = value; }, calls: () => calls };
 }
 function captureTarget(plan: FinalizationResourcePlan[]) {
   const browser = plan.find(entry => entry.disposition === "retire-browser");
@@ -110,3 +119,44 @@ test.skipIf(!draftedRoot).each([false, true])("actual prepared client closes onl
   expect((f.browser.metadata as Record<string, unknown>).toolingRoot).toBe(path.join(f.directory, "historical-tooling-do-not-execute"));
   running = true; f.setRunning(true); const recreated = await run(); expect(recreated.results.some((entry: { outcome: string }) => entry.outcome === "failed")).toBeTrue(); expect(closes).toEqual(["task"]);
 }, 30000);
+
+
+test.skipIf(!process.env.DRAFTED_CLEANUP_CLIENT).each([false, true])("paired delete-mode browser closes exactly once and deletes profile with registered=%s", async registered => {
+  const f = await fixture(registered), clientRoot = process.env.DRAFTED_CLEANUP_CLIENT!;
+  const { observeCleanupBatch } = await import(path.join(clientRoot, "src/cleanup-observer.ts"));
+  const { releasePreparedResources } = await import(path.join(clientRoot, "src/finalization-resources.ts"));
+  const { adapterReceipt } = await import(path.join(clientRoot, "test/fixtures/prepared-adapter.ts"));
+  let live = true, closes = 0;
+  const browser = { sessions: async () => live ? ["task", "unrelated"] : ["unrelated"], close: async (session: string) => { expect(session).toBe("task"); closes++; live = false; },
+    assertCapability: async (capability: unknown) => { expect(capability).toEqual(f.input.adapterContext.capability); } };
+  f.observation.adapters = async input => observeCleanupBatch(input.request, { browser });
+  const plan = await f.prepareDeletion(), selected = captureTarget(plan), originalOwner = await readFile(f.ownerFile);
+  expect(selected.target.retirement).toBe("delete");
+  const task = { ...f.input.adapterContext.task, resources: f.resources, finalizationVersion: 2, phase: "waiting" }, prepared = adapterReceipt(task, plan);
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => {
+    Object.assign(f.resources.find(resource => resource.key === update.key)!, update); await f.verify(plan);
+  } };
+  let interrupted = false;
+  const run = () => releasePreparedResources({ registry, prepared, adapters: { observer: { browser } }, observation: { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => { throw Error("must use configured browser capability"); } },
+    assertAuthority: () => f.verify(plan), assertBatchAuthority: async () => {}, captureHooks: { afterStagingJournalRemoval() { if (!interrupted) { interrupted = true; throw Error("lost deletion reply"); } } } });
+  expect((await run()).results.some((result: { outcome: string }) => result.outcome === "failed")).toBeTrue();
+  await f.verify(plan); await expect(f.verify(plan, true)).rejects.toThrow();
+  for (const result of (await run()).results) expect(result).toMatchObject({ outcome: "deleted" });
+  await f.verify(plan, true);
+  expect(closes).toBe(1);
+  expect(await lstat(selected.target.path).catch(() => null)).toBeNull();
+  expect(await lstat(selected.target.quarantine.directory).catch(() => null)).toBeNull();
+  for (const result of (await run()).results) expect(result).toMatchObject({ outcome: "deleted" });
+  expect(closes).toBe(1);
+  live = true;
+  expect((await run()).results.some((result: { outcome: string }) => result.outcome === "failed")).toBeTrue();
+  expect(closes).toBe(1);
+  live = false;
+  await mkdir(f.profile, { recursive: true, mode: 0o700 }); await writeFile(f.ownerFile, originalOwner, { mode: 0o600 });
+  expect((await run()).results.some((result: { outcome: string }) => result.outcome === "failed")).toBeTrue();
+  expect(closes).toBe(1); expect((await lstat(f.profile)).isDirectory()).toBeTrue();
+  await rm(f.root, { recursive: true }); await mkdir(f.root, { recursive: true, mode: 0o700 });
+  await writeFile(f.ownerFile, "new owner marker", { mode: 0o600 });
+  expect((await run()).results.some((result: { outcome: string }) => result.outcome === "failed")).toBeTrue();
+  expect(closes).toBe(1); expect(await readFile(f.ownerFile, "utf8")).toBe("new owner marker");
+}, 30_000);

@@ -1,7 +1,7 @@
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { finalizationDigest, finalizationResourceIdentity, inspectFinalizationQuarantine, assertFinalizationTree, type FinalizationResourceRecord, type FinalizationResourcePlan } from "./finalization-resources.ts";
-import { RetainedPreviewInput } from "./cleanup-preview-retained-schema.ts";
+import { RetainedPreviewInput, PreviewDeletionConfirmation } from "./cleanup-preview-retained-schema.ts";
 
 const object = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const same = isDeepStrictEqual;
@@ -12,7 +12,7 @@ const identity = (value: { dev: number; ino: number; mode: number }) => ({ dev: 
 export function retainedPreviewInputs(resources: FinalizationResourceRecord[], plans: FinalizationResourcePlan[]): RetainedPreviewInput[] {
   const result: RetainedPreviewInput[] = [];
   for (const plan of plans) {
-    if (plan.disposition !== "retire-tree" || plan.treeKind !== "registered-directory" || !["development", "review"].includes(plan.purpose)
+    if (plan.disposition !== "retire-tree" || plan.target.retirement === "delete" || plan.treeKind !== "registered-directory" || !["development", "review"].includes(plan.purpose)
       || plan.key !== `${plan.purpose}-env-directory`) continue;
     const root = plan.target.inventory.find(node => node.path === ".");
     const tunnel = resources.filter(resource => resource.kind === "cloudflare-tunnel" && resource.purpose === plan.purpose);
@@ -55,4 +55,47 @@ export async function capturedPreviewInputs(input: { taskId: string; resources: 
     selected.push(value);
   }
   return selected;
+}
+
+
+/** Bind an already verified independent credential to exact source deletion.
+ * Only ordinary provider GETs consume it; it is neither a saved source copy nor
+ * a substitute for current provider absence. */
+export function bindPreviewDeletionConfirmations(plans: FinalizationResourcePlan[]) {
+  const scopes = plans.flatMap(plan => {
+    const target = plan.disposition === "retire-file" || plan.disposition === "retire-tree" ? plan.target
+      : plan.disposition === "retire-browser" && plan.capture.type === "standalone" ? plan.capture.target
+      : plan.disposition === "retire-owned" && plan.target.type === "tree" ? plan.target : undefined;
+    return target?.retirement === "delete" ? [{ resourceId: plan.id, path: target.path, targetDigest: finalizationDigest(target) }] : [];
+  });
+  const effectPaths = plans.flatMap(plan => {
+    if (plan.disposition === "retire-adapter") return [plan.observer.task.worktreePath];
+    if (plan.disposition === "retire-file" || plan.disposition === "retire-tree" || plan.disposition === "retire-worktree" || plan.disposition === "retire-vault") return [plan.target.path];
+    if (plan.disposition === "retire-owned" && plan.target.type !== "endpoint") return [plan.target.path];
+    if (plan.disposition === "retire-browser" && plan.capture.type === "standalone") return [plan.capture.target.path];
+    return [];
+  });
+  const within = (root: string, file: string) => file === root || file.startsWith(`${root}${path.sep}`);
+  for (const plan of plans) {
+    if (plan.disposition !== "retire-adapter") continue;
+    const config = plan.targets.find(target => target.kind === "local-ingress-route");
+    const isPreview = plan.adapter === "preview" || plan.targets.some(target => ["cloudflare-dns-record", "cloudflare-tunnel", "cloudflare-ingress-route", "local-ingress-route"].includes(target.kind));
+    if (!isPreview || !scopes.length) { delete plan.previewConfirmation; continue; }
+    const proof = plan.previewConfirmation;
+    if (!proof || !proof.credential || proof.taskId !== plan.observer.task.id || proof.resourceId !== plan.id || proof.resourceIdentityDigest !== plan.identityDigest
+      || proof.purpose !== plan.purpose || config?.kind === "local-ingress-route" && (proof.hostname !== config.hostname || proof.tunnelId !== config.scope.tunnelId || proof.sourceDigest !== config.sourceDigest || proof.configFile !== config.scope.configFile)) throw new Error("Preview deletion requires its verified independent confirmation credential");
+    const credential = proof.credential;
+    if ("file" in credential && effectPaths.some(root => within(root, credential.file))) throw new Error("Independent preview credential overlaps a deleting scope");
+    plan.previewConfirmation = PreviewDeletionConfirmation.parse({ ...proof, deletions: scopes });
+  }
+  return plans;
+}
+
+export function assertPreviewDeletionBindings(plans: FinalizationResourcePlan[]) {
+  const copies = plans.map(plan => structuredClone(plan));
+  bindPreviewDeletionConfirmations(copies);
+  for (const plan of plans) if (plan.disposition === "retire-adapter") {
+    const current = copies.find(copy => copy.id === plan.id);
+    if (!current || current.disposition !== "retire-adapter" || finalizationDigest(current.previewConfirmation ?? null) !== finalizationDigest(plan.previewConfirmation ?? null)) throw new Error("Preview confirmation deletion scope or credential binding changed");
+  }
 }

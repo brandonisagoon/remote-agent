@@ -293,11 +293,11 @@ async function generatedFixture(scanFiles = 0, directoryScope = false) {
   return { ...f, receipt };
 }
 
-test("slow native renewal runs outside Prisma's five-second transaction and nested metadata checks stay local", async () => {
+test("ordinary cleanup skips superseded archive renewal and nested metadata checks stay local", async () => {
   const f = await generatedFixture(); let observations = 0;
-  legacyOriginalWorkDependencies.generatedOwner = async () => { observations++; await Bun.sleep(5200); return "f".repeat(64); };
+  legacyOriginalWorkDependencies.generatedOwner = async () => { observations++; throw Error("ordinary cleanup must not renew an archive"); };
   const active = await assertPreparedCleanup(f.input);
-  expect(active.operationRevision).toBe(f.active.operationRevision); expect(observations).toBe(1);
+  expect(active.operationRevision).toBe(f.active.operationRevision); expect(observations).toBe(0);
   legacyOriginalWorkDependencies.generatedOwner = async () => { throw new Error("native observation entered a database transaction"); };
   await db.prisma.$transaction(async tx => {
     const current = await assertPreparedCleanup({ ...f.input, prisma: tx });
@@ -309,18 +309,26 @@ test("slow native renewal runs outside Prisma's five-second transaction and nest
   await f.unchanged();
 }, 15000);
 
-test.each(["pause", "pause-roundtrip", "session-owner", "revocation", "operation", "original-proof"])("native verification refuses %s changed while observing", async kind => {
+test.each(["pause", "pause-roundtrip", "session-owner", "revocation", "operation", "original-proof"])("local cleanup authority refuses %s changed between epochs", async kind => {
   const f = await generatedFixture();
-  legacyOriginalWorkDependencies.generatedOwner = async () => {
+  const mutate = async () => {
     if (kind === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
     if (kind === "pause-roundtrip") { await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } }); await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } }); }
     if (kind === "session-owner") await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { acpxSessionId: "changed-owner" } });
     if (kind === "revocation") await f.revoke();
     if (kind === "operation") await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.operation.sequence }, data: { value: JSON.stringify({ ...JSON.parse(f.operation.value!), requestKey: "changed" }) } });
     if (kind === "original-proof") { const proof = structuredClone(f.receipt.proof); proof.input.requestKey = "changed"; await db.prisma.runtimeMetadataEvent.update({ where: { sequence: f.receipt.revision }, data: { value: JSON.stringify(proof) } }); }
-    return "f".repeat(64);
   };
-  await expect(assertPreparedCleanup(f.input)).rejects.toThrow();
+  let mutated = false;
+  const prisma = new Proxy(db.prisma, { get(target, key, receiver) {
+    if (key !== "$transaction") return Reflect.get(target, key, receiver);
+    return async (read: Parameters<typeof db.prisma.$transaction>[0]) => {
+      const result = await db.prisma.$transaction(read as never);
+      if (!mutated) { mutated = true; await mutate(); }
+      return result;
+    };
+  } });
+  await expect(assertPreparedCleanup({ ...f.input, prisma })).rejects.toThrow();
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
   expect((await lstat(f.worktree)).isDirectory()).toBe(true);
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).phase).not.toBe("closed");
@@ -371,7 +379,10 @@ test.each([false, true])("task status routes never invoke native cleanup verific
   expect(nativeChecks).toBe(0);
   if (!closed) {
     const effect = await f.app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
-    expect(effect.status).toBe(409); expect(nativeChecks).toBe(1);
+    expect(effect.status).toBe(200); expect(nativeChecks).toBe(0);
+    await f.revoke();
+    const revoked = await f.app.request(`/api/tasks/${f.task.id}/cleanup-authority`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ requestKey: f.input.requestKey }) });
+    expect(revoked.status).toBe(409); expect(nativeChecks).toBe(0);
   }
 }, 15000);
 
@@ -393,10 +404,10 @@ test("pending preparation polls stay local and join the single native worker", a
   const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "full-check" };
   let nativeChecks = 0, preparations = 0, release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
-  legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; await gate; return "f".repeat(64); };
+  legacyOriginalWorkDependencies.generatedOwner = async () => { throw Error("archive renewal must stay retired"); };
   const accepted = await requestFinalizationPreparation(input, attempt); expect(nativeChecks).toBe(0);
   const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, async () => {
-    preparations++; await assertPreparedCleanup(f.input);
+    preparations++; nativeChecks++; await gate; await assertPreparedCleanup(f.input);
     return { ...f.prepared, cleanup: { operationRevision: f.operation.sequence, operationDigest: finalizationDigest(f.active.operation) } };
   });
   try {
@@ -405,22 +416,23 @@ test("pending preparation polls stay local and join the single native worker", a
     for (let i = 0; i < 3; i++) { const pending = await requestFinalizationPreparation(input, attempt); expect(pending.preparation.acceptedRevision).toBe(accepted.preparation.acceptedRevision); expect(pending.preparation.state).toBe("running"); }
     expect(nativeChecks).toBe(1); expect(preparations).toBe(1);
     release(); await worker.idle();
-    const ready = await requestFinalizationPreparation(input, attempt); expect(ready.preparation.state).toBe("ready"); expect(nativeChecks).toBe(2);
+    const ready = await requestFinalizationPreparation(input, attempt); expect(ready.preparation.state).toBe("ready"); expect(nativeChecks).toBe(1);
   } finally { release(); await worker.stop(); }
 }, 15000);
 
-test("ready confirmation rechecks native authority once and rejects a changed saved result", async () => {
+test("ready confirmation preserves local authority and rejects a changed saved result", async () => {
   const f = await generatedFixture();
   const { requestFinalizationConfirmation, preparationJournalWorker } = await import("./finalization-preparation.ts");
   const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "confirmation" };
-  let nativeChecks = 0; legacyOriginalWorkDependencies.generatedOwner = async () => { nativeChecks++; return "f".repeat(64); };
+  let nativeChecks = 0; legacyOriginalWorkDependencies.generatedOwner = async () => { throw Error("archive renewal must stay retired"); };
   const pending = await requestFinalizationConfirmation(input, attempt); expect(nativeChecks).toBe(0);
   const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, undefined, async () => {
+    nativeChecks++;
     const confirmed = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `finalizer:${f.task.id}`, action: "finalization-confirmed", key: f.input.requestKey, value: JSON.stringify({ preparedRevision: f.preparation.sequence }) } });
     return { ...f.prepared, confirmedRevision: confirmed.sequence, cleanup: { operationRevision: f.operation.sequence, operationDigest: finalizationDigest(f.active.operation) } };
   });
   try { worker.tick(); await worker.idle(); nativeChecks = 0;
-    const ready = await requestFinalizationConfirmation(input, attempt); expect(ready.confirmation.state).toBe("ready"); expect(nativeChecks).toBe(1);
+    const ready = await requestFinalizationConfirmation(input, attempt); expect(ready.confirmation.state).toBe("ready"); expect(nativeChecks).toBe(0);
     const status = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: f.session.id, action: "finalization-preparation-status", key: String(pending.confirmation.acceptedRevision) }, orderBy: { sequence: "desc" } });
     const value = JSON.parse(status.value!); value.result.confirmedRevision += 1000; await db.prisma.runtimeMetadataEvent.update({ where: { sequence: status.sequence }, data: { value: JSON.stringify(value) } });
     await expect(requestFinalizationConfirmation(input, attempt)).rejects.toThrow("Confirmation result does not match");
@@ -433,7 +445,7 @@ test("a failed physical worker cannot publish ready through local polling", asyn
   const input = { ...f.input, cleanup: true as const }, attempt = { version: 1 as const, attemptId: randomUUID(), boundary: "full-check" };
   legacyOriginalWorkDependencies.generatedOwner = async () => { throw Error("Physical source witness unavailable"); };
   await requestFinalizationPreparation(input, attempt);
-  const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, () => assertPreparedCleanup(f.input));
+  const worker = preparationJournalWorker({ ...f.input, runtime: createFakeAgentRuntime() }, async () => { throw Error("Physical source witness unavailable"); });
   try { worker.tick(); await worker.idle(); const result = await requestFinalizationPreparation(input, attempt); expect(result.preparation.state).toBe("failed"); expect(result).not.toHaveProperty("receipt"); }
   finally { await worker.stop(); }
 }, 15000);

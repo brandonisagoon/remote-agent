@@ -1,3 +1,4 @@
+import { bindPreviewDeletionConfirmations } from "./cleanup-preview-retained.ts";
 import { SavedDataSelections, SavedScratchBinding } from "./cleanup-saved-data-schema.ts";
 import { CleanupAdapterPlan, assertCleanupAdapterResources, hasCleanupAdapter, hasHistoricalCleanupAdapter, prepareCleanupAdapterResources, type CleanupAdapterContext } from "./cleanup-adapter-resources.ts";
 import { CleanupObserverResource } from "./cleanup-observer-schema.ts";
@@ -365,7 +366,7 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
     if (unsupported.length) throw new Error(`Original-work adoption needs exact resource plans: ${unsupported.map((resource) => `${resource.key} (${resource.kind})`).join(", ")}`);
     assertPlanDependencies(exceptional);
     assertFinalizationPlanPurposes(resources, exceptional); assertSavedDataPlanLinks(exceptional); assertSavedDataCaptureSeparation(exceptional, input.sourcePaths);
-    return exceptional;
+    return bindPreviewDeletionConfirmations(exceptional);
   }
   if (savedData.length) throw new Error("Saved data requires the independently planned original-work cleanup path");
   const source = active.find((resource) => resource.id === ownership.sourceCopyResourceId);
@@ -543,7 +544,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   const retainedTargets = new Map(plan.filter(entry => entry.disposition === "retain-adapter").map(entry => [entry.id, entry.retainedTargetDigests]));
   const { capturedPreviewInputs } = await import("./cleanup-preview-retained.ts");
   const retainedPreviewInputs = adapters.some(entry => entry.adapter === "preview") ? await capturedPreviewInputs({ ...input, plan }) : [];
-  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, removed: input.removed, retainedTargets, retainedPreviewInputs, previewObserver: input.previewObserver }, observation.adapters) : undefined;
+  const adapterObservation = adapters.length ? await assertCleanupAdapterResources({ taskId: input.taskId, resources: observerResources(resources), plan: adapters, deletionPlans: plan, removed: input.removed, retainedTargets, retainedPreviewInputs, previewObserver: input.previewObserver }, observation.adapters) : undefined;
   if (retainedTargets.size) {
     const { assertPreservedAdapters } = await import("./cleanup-preservation.ts");
     await assertPreservedAdapters({ ...input, plan });
