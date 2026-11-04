@@ -187,7 +187,7 @@ test("new finished filesystem plans require deletion and independently verify ab
 });
 
 
-test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual paired finished filesystem deletion resumes staging and verifies server absence", async () => {
+test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT).each(["capture", "staging-removal"])("actual paired finished filesystem deletion resumes %s and verifies server absence", async interruption => {
   const f = await fixture(), plan = await f.prepareDeletion(), root = process.env.DRAFTED_INTEGRATION_ROOT!;
   const { releasePreparedResources } = await import(path.join(root, "src/finalization-resources.ts"));
   const { FinalizationResourcePlan: ClientPlan, assertResourcePlan } = await import(path.join(root, "src/finalization-plan.ts"));
@@ -200,9 +200,10 @@ test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual paired finished files
   let once = true;
   const afterCapture = () => { if (once) { once = false; throw Error("lost staging reply"); } };
   const run = () => releasePreparedResources({ registry, prepared, observation: { ...quiet, pathsIdle: async () => {} }, assertAuthority: () => f.verify(plan),
-    assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, captureHooks: { afterCapture }, fileCaptureHooks: { afterCapture } });
+    assertBatchAuthority: async () => { assertResourcePlan(task, prepared.resources); }, captureHooks: interruption === "capture" ? { afterCapture } : { afterStagingJournalRemoval: afterCapture }, fileCaptureHooks: interruption === "capture" ? { afterCapture } : { afterStagingJournalRemoval: afterCapture } });
   expect((await run()).results.some((value: { outcome: string }) => value.outcome === "failed")).toBeTrue();
   await f.verify(plan);
+  await expect(f.verify(plan, true)).rejects.toThrow();
   for (const outcome of (await run()).results) expect(outcome).toMatchObject({ outcome: "deleted" });
   await f.verify(plan, true);
   for (const outcome of (await run()).results) expect(outcome).toMatchObject({ outcome: "deleted" });

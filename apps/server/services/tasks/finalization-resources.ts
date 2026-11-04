@@ -458,7 +458,7 @@ export async function assertFinalizationTree(target: TreeTarget, physicalPath = 
   if (after.dev !== original.dev || after.ino !== original.ino || after.mode !== original.mode) throw new Error("Prepared source root changed during inspection");
 }
 
-async function readQuarantineJournal(file: string) {
+export async function readQuarantineJournal(file: string) {
   await assertFinalizationPath(file);
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -507,14 +507,16 @@ export async function inspectFinalizationQuarantine(input: { taskId: string; res
   if (!directory.isDirectory() || (directory.mode & 0o7777) !== 0o700 || directory.uid !== process.getuid?.()) throw new Error("Quarantine must be an exact private directory");
   const root = target.inventory.find((entry) => entry.path === ".");
   if (!root || root.kind !== "directory" || directory.dev !== root.dev) throw new Error("Quarantine must preserve the original filesystem identity");
-  const journal = await readQuarantineJournal(quarantine.journal);
+  const journalMissing = !(await statOrMissing(quarantine.journal));
+  const journal = await readQuarantineJournal(target.retirement === "delete" && journalMissing ? `${quarantine.directory}.deleted.json` : quarantine.journal);
   if (journal.taskId !== input.taskId || journal.resourceId !== input.resourceId || journal.planDigest !== finalizationDigest(target) || journal.sourcePath !== target.path || journal.capturedPath !== quarantine.path || journal.source.dev !== root.dev || journal.source.ino !== root.ino || journal.source.mode !== root.mode || journal.quarantine.dev !== directory.dev || journal.quarantine.ino !== directory.ino) throw new Error("Quarantine journal does not match the prepared resource");
   const entries = (await readdir(quarantine.directory)).sort();
   if (entries.some((name) => name !== "contents" && name !== "pending.json")) throw new Error("Quarantine contains unexpected material");
   await assertFinalizationPath(quarantine.path);
   const captured = await statOrMissing(quarantine.path);
   if (source && captured) throw new Error("Original source root was recreated after capture");
-  if (!source && !captured && target.retirement === "delete") return { captured: false as const, deleted: true as const, physicalPath: target.path };
+  if (!source && !captured && target.retirement === "delete") return { captured: false as const, deleting: true as const, physicalPath: target.path };
+  if (journalMissing) throw new Error("Deletion staging without its pending journal must be empty");
   if (!source && !captured) throw new Error("Source disappearance has no retained quarantine proof");
   if (captured && (!captured.isDirectory() || captured.dev !== root.dev || captured.ino !== root.ino || captured.mode !== root.mode)) throw new Error("Captured source root identity changed");
   const after = await lstat(quarantine.directory);
@@ -578,7 +580,7 @@ export async function assertFinalizationResources(input: { taskId: string; resou
   const capture = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target });
   if (target.retirement === "delete") {
     if (input.removed && !capture.deleted) throw new Error("Finalization still has owned source or staging bytes");
-    if (!capture.deleted) await assertFinalizationTree(target, capture.physicalPath, capture.captured);
+    if (!capture.deleted && !capture.deleting) await assertFinalizationTree(target, capture.physicalPath, capture.captured);
     for (const entry of physical) {
       const record = resources.find(resource => resource.id === entry.id)!;
       if (entry.target.type === "endpoint") await observation.endpointAbsent(entry.target);

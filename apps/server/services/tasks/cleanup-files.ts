@@ -53,7 +53,7 @@ export async function prepareStandaloneFiles(input: { resources: FinalizationRes
   return result;
 }
 export async function assertStandaloneFiles(input: { taskId: string; resources: FinalizationResourceRecord[]; plan: FinalizationResourcePlan[]; removed: boolean; adapterObservation?: z.infer<typeof CleanupObserverBatchResult> }, observation: ResourceObservation) {
-  const idle = observation.linkedRootIdle ?? observation.rootIdle, paths: string[] = [], states: Array<{ entry: z.infer<typeof StandaloneFilePlan>; removed: boolean; captured: "captured" | "intact" | "pending" | "deleted" }> = [];
+  const idle = observation.linkedRootIdle ?? observation.rootIdle, paths: string[] = [], states: Array<{ entry: z.infer<typeof StandaloneFilePlan>; removed: boolean; captured: "captured" | "intact" | "pending" | "deleted" | "deleting" }> = [];
   for (const entry of input.plan.filter(entry => entry.disposition === "retire-file")) {
     const resource = input.resources.find(resource => resource.id === entry.id)!;
     if (!hasStandaloneFileResource(resource) || entry.externalId !== entry.target.path) throw new Error("Standalone file capture scope changed");

@@ -138,6 +138,14 @@ export async function inspectPreparedFileCapture(input: { taskId: string; resour
   const names = await readdir(q.directory);
   if (names.some((name) => !["contents", "pending.json"].includes(name))) throw new Error("Evidence quarantine contains unexpected entries");
   if (await absent(q.journal)) {
+    if (target.retirement === "delete" && missing && names.length === 0) {
+      const { readQuarantineJournal } = await import("./finalization-resources.ts");
+      const journal = await readQuarantineJournal(`${q.directory}.deleted.json`);
+      if (journal.taskId !== input.taskId || journal.resourceId !== input.resourceId || journal.planDigest !== finalizationDigest(target)
+        || journal.sourcePath !== target.path || journal.capturedPath !== q.path || journal.source.dev !== target.dev || journal.source.ino !== target.ino || journal.source.mode !== target.mode
+        || journal.quarantine.dev !== directory.dev || journal.quarantine.ino !== directory.ino) throw new Error("Deletion receipt changed its exact staging identity");
+      return "deleting" as const;
+    }
     if (names.length || missing || removed) throw new Error("Evidence quarantine has no durable intent");
     await assertFile(sourceFile(target));
     return "intact" as const;
@@ -154,7 +162,7 @@ export async function inspectPreparedFileCapture(input: { taskId: string; resour
     await assertFile(sourceFile(target));
     return "pending" as const;
   }
-  if (capturedMissing && target.retirement === "delete") return "deleted" as const;
+  if (capturedMissing && target.retirement === "delete") return "deleting" as const;
   if (capturedMissing) throw new Error("Evidence capture is missing");
   await assertFile(sourceFile(target), false, q.path);
   return "captured" as const;

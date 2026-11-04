@@ -190,11 +190,11 @@ export async function assertRegisteredCaptures(input: { taskId: string; resource
     const captured = await inspectFinalizationQuarantine({ taskId: input.taskId, resourceId: tree.id, target: tree.target });
     if (tree.target.retirement === "delete") {
       if ((input.removed || record.state === "released") && !captured.deleted) throw new Error("Registered deletion still has staged or original bytes");
-      if (!captured.deleted) await assertFinalizationTree(tree.target, captured.physicalPath, captured.captured);
-      if (captured.captured || captured.deleted) assertCapturedDependencies(tree, input.resources, input.adapterObservation);
+      if (!captured.deleted && !captured.deleting) await assertFinalizationTree(tree.target, captured.physicalPath, captured.captured);
+      if (captured.captured || captured.deleted || captured.deleting) assertCapturedDependencies(tree, input.resources, input.adapterObservation);
       for (const child of children.filter(child => child.parentResourceId === tree.id)) {
         await assertFinalizationPath(child.target.path);
-        if ((captured.captured || captured.deleted) && await missing(child.target.path)) throw new Error("Deleted child path was recreated");
+        if ((captured.captured || captured.deleted || captured.deleting) && await missing(child.target.path)) throw new Error("Deleted child path was recreated");
         if (input.removed && input.resources.find(resource => resource.id === child.id)?.state !== "released") throw new Error("Child deletion receipt is missing");
       }
       await observation.rootIdle(tree.target.path);
