@@ -45,7 +45,7 @@ async function serve(socket: string, sessions: SessionSummary[], tasks: unknown[
   const server = createServer((request, response) => {
     requests.push(request.url!);
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify(request.url === "/api/tasks" ? { tasks } : { sessions }));
+    response.end(JSON.stringify(request.url === "/api/tasks?view=session-previews" ? { tasks } : { sessions }));
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(socket, resolve));
@@ -76,8 +76,8 @@ test("one repository combines independently named checkouts and preserves each m
   expect(rows.map((row) => [row.machineId, row.repositoryId, row.machineName])).toEqual([
     ["macbook-air", "repo-air", "MacBook Air"], ["macbook-pro", "repo-pro", "This Mac"],
   ]);
-  expect(airCalls).toEqual(["/api/tasks", "/api/sessions?includeClosed=true&repositoryId=repo-air"]);
-  expect(proCalls).toEqual(["/api/tasks", "/api/sessions?includeClosed=true&repositoryId=repo-pro"]);
+  expect(airCalls).toEqual(["/api/tasks?view=session-previews", "/api/sessions?includeClosed=true&repositoryId=repo-air"]);
+  expect(proCalls).toEqual(["/api/tasks?view=session-previews", "/api/sessions?includeClosed=true&repositoryId=repo-pro"]);
 });
 
 test("matching display names and local IDs never merge unrelated repositories", async () => {
