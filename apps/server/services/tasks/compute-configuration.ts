@@ -33,7 +33,6 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   if (environment.taskId !== input.taskId || environment.primarySessionId !== owner.session.id || environment.taskIdentity !== owner.identity || environment.machineId !== input.config.machine
     || environment.purpose !== "development" || environment.configuration !== null || environment.key !== input.request.resourceKey
     || resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.state === "released" || environment.resourceId !== resource.id
-    || environment.resourceIdentity !== finalizationResourceIdentity(resource).identityDigest
     || metadata.revision !== environment.revision || ![input.request.previousRecipeHash, input.request.recipeHash].includes(String(metadata.recipeHash))
     || ![input.request.previousRecipeHash, input.request.recipeHash].includes(environment.recipeDigest) || input.request.previousRecipeHash === input.request.recipeHash
     || offer.machineId !== input.config.machine || !offer.claimedAt || offer.completedAt || !["claimed", "running", "unknown"].includes(offer.state)
@@ -41,6 +40,19 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   const key = finalizationDigest({ environmentId: environment.id, offerId: offer.id, resourceId: resource.id, previousRecipeHash: input.request.previousRecipeHash, recipeHash: input.request.recipeHash });
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owner.session.id, source: `compute:${input.taskId}`, action: Action, key } });
   if (environment.recipeDigest === input.request.recipeHash && (!event || metadata.recipeHash !== input.request.recipeHash)) throw new Error("Configuration transition has no durable acknowledgment");
+  const identity = finalizationResourceIdentity(resource).identityDigest;
+  if (environment.resourceIdentity !== identity) {
+    // save() publishes progress before its separate ordinary bind. A crash in
+    // that gap may change the identity hash, but may not change any authority
+    // or physical target. Only a committed transition can reconcile this gap.
+    if (!event || environment.recipeDigest !== input.request.recipeHash) throw new Error("Configuration projection has no retained transition");
+    const original = JSON.parse(event.value!).resource;
+    const fixed = (value: typeof resource) => {
+      const { observed: _observed, observedAt: _at, progress: _progress, ...fields } = z.record(z.string(), z.unknown()).parse(value.metadata);
+      return finalizationResourceIdentity({ ...value, metadata: { ...fields, recipeHash: input.request.recipeHash } }).identityDigest;
+    };
+    if (fixed(resource) !== fixed(original)) throw new Error("Configuration projection changed its physical or configuration identity");
+  }
   const traffic = await input.prisma.computeTraffic.findMany({ where: { environmentId: environment.id }, orderBy: { routeId: "asc" }, take: 33 });
   if (traffic.length > 32) throw new Error("Configuration traffic inventory exceeds its bound");
   return { owner, offer, environment, resource, allocations, traffic, event, key };
@@ -92,6 +104,14 @@ export async function configureCompute(input: Input, read = readConfiguration, h
     } else {
       const prior = JSON.parse(current.event.value!);
       if (prior.proof.baselineSha256 !== proof.baselineSha256) throw new Error("Configuration baseline changed after acknowledgment");
+      const identity = finalizationResourceIdentity(current.resource).identityDigest;
+      if (identity !== current.environment.resourceIdentity) {
+        await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: `${Action}-projection`,
+          key: finalizationDigest({ transition: current.key, before: current.environment.resourceIdentity, after: identity }),
+          value: JSON.stringify({ transition: current.key, before: current.environment, resource: current.resource, proof }) } });
+        await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { resourceIdentity: identity, observation: Prisma.DbNull } });
+        await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
+      }
     }
     return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash };
   });

@@ -67,3 +67,22 @@ test("no durable transition means matching new digest alone cannot authorize ret
   await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { recipeDigest: nextHash } });
   await expect(configureCompute(f.input, f.read, f.head)).rejects.toThrow("durable acknowledgment");
 });
+
+test.each(["progress", "container", "coverage"])("crash after resource publication before bind reconciles only journaled progress: %s", async changed => {
+  const f = await fixture(); await configureCompute(f.input, f.read, f.head);
+  const saved = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } });
+  const metadata = { ...(saved.metadata as Record<string, unknown>), ...(changed === "progress" ? { progress: { step: "configuration", state: "failed", updatedAt: new Date().toISOString() } }
+    : changed === "container" ? { containerId: "replacement" } : { compute: { configurationSha256: "9".repeat(64) } }) };
+  const published = await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { state: "failed", metadata } });
+  const identity = finalizationResourceIdentity(published).identityDigest;
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).resourceIdentity).not.toBe(identity);
+  if (changed === "progress") {
+    await configureCompute(f.input, f.read, f.head);
+    expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).resourceIdentity).toBe(identity);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration-projection" } })).toBe(1);
+    await configureCompute(f.input, f.read, f.head);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration-projection" } })).toBe(1);
+  } else await expect(configureCompute(f.input, f.read, f.head)).rejects.toThrow("physical or configuration identity");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
+  expect((await db.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+});
