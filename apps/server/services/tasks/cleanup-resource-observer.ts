@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -38,9 +39,15 @@ async function waitForOwnedGroupExit(group: number) {
   while (true) {
     // The helper has already killed its group. This is observation only:
     // never signal a numeric group after its leader could have been reaped.
-    const current = Bun.spawnSync(["/bin/ps", "-axo", "pgid="], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 250, maxBuffer: 1024 * 1024 });
-    if (current.exitCode !== 0 || current.stderr.length || current.stdout.length > 1024 * 1024) throw failure("OBSERVER_GROUP");
-    if (!current.stdout.toString().split("\n").some(line => Number(line.trim()) === group)) return;
+    const groups = await new Promise<string>((resolve, reject) => {
+      execFile("/bin/ps", ["-axo", "pgid="], {
+        timeout: 250, maxBuffer: 1024 * 1024, encoding: "utf8",
+      }, (error, stdout, stderr) => {
+        if (error || stderr.length) reject(failure("OBSERVER_GROUP"));
+        else resolve(stdout);
+      });
+    });
+    if (!groups.split("\n").some(line => Number(line.trim()) === group)) return;
     if (Date.now() >= deadline) throw failure("OBSERVER_GROUP");
     await Bun.sleep(10);
   }
