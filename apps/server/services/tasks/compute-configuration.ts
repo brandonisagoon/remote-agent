@@ -5,15 +5,18 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admission.ts";
 import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
-import { verifiedComputeRuntime } from "./compute-observer.ts";
+import { verifiedComputeRuntime, readConfiguredComputeObservation } from "./compute-observer.ts";
+import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
 
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
+const Absolute = z.string().max(4096).refine(p => path.isAbsolute(p) && path.normalize(p) === p);
+const ComputeReference = z.object({ configurationFile: Absolute, configurationSha256: Sha }).strict();
 export const ComputeConfiguration = z.object({ offerId: z.string().uuid(), resourceKey: z.string().min(1).max(180), previousRecipeHash: Sha, recipeHash: Sha,
-  baselineFile: z.string().max(4096).refine(p => path.isAbsolute(p) && path.normalize(p) === p), lockPid: z.number().int().positive(), }).strict();
+  baselineFile: Absolute, lockPid: z.number().int().positive(), coverage: z.object({ previousFile: Absolute, next: ComputeReference }).strict(), }).strict();
 const Proof = z.object({ version: z.literal(1), taskId: z.string(), primarySessionId: z.string(), environmentId: z.string().uuid(), resourceId: z.string(), offerId: z.string().uuid(),
-  revision: z.string().regex(/^[a-f0-9]{40}$/), previousRecipeHash: Sha, recipeHash: Sha, receiptSha256: Sha, baselineSha256: Sha, lockSha256: Sha, stopped: z.literal(true) }).strict();
+  revision: z.string().regex(/^[a-f0-9]{40}$/), previousRecipeHash: Sha, recipeHash: Sha, receiptSha256: Sha, baselineSha256: Sha, lockSha256: Sha, stopped: z.literal(true), compute: ComputeReference }).strict();
 type Input = { prisma: PrismaClient; config: ServerConfig; taskId: string; request: z.infer<typeof ComputeConfiguration> };
 type Snapshot = Awaited<ReturnType<typeof snapshot>>;
 const Action = "compute-runtime-configuration";
@@ -52,7 +55,8 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
     // that gap may change the identity hash, but may not change any authority
     // or physical target. Only a committed transition can reconcile this gap.
     if (!event || environment.recipeDigest !== input.request.recipeHash) throw new Error("Configuration projection has no retained transition");
-    const original = JSON.parse(event.value!).resource;
+    const prior = JSON.parse(event.value!);
+    const original = { ...prior.resource, metadata: { ...prior.resource.metadata, recipeHash: input.request.recipeHash, compute: prior.compute } };
     const fixed = (value: typeof resource) => {
       const { observed: _observed, observedAt: _at, progress: _progress, ...fields } = z.record(z.string(), z.unknown()).parse(value.metadata);
       return finalizationResourceIdentity({ ...value, metadata: { ...fields, recipeHash: input.request.recipeHash } }).identityDigest;
@@ -83,16 +87,30 @@ async function readConfiguration(input: Input, before: Snapshot) {
  * application. A terminal stopped offer is history, never revived: ordinary
  * admission must allocate afresh. No offer, slot, start permission, pin or provider is created.
  * The journal and both hashes commit together; retries still re-observe ownership. */
-export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision) {
+export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision, observe = readConfiguredComputeObservation) {
   if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
   input = { ...input, request: ComputeConfiguration.parse(input.request) };
   const before = await snapshot(input);
   if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed");
   const proof = Proof.parse(await read(input, before));
   if (proof.taskId !== input.taskId || proof.primarySessionId !== before.owner.session.id || proof.environmentId !== before.environment.id || proof.resourceId !== before.resource.id
-    || proof.offerId !== input.request.offerId || proof.revision !== before.environment.revision || proof.previousRecipeHash !== input.request.previousRecipeHash || proof.recipeHash !== input.request.recipeHash) throw new Error("Configuration proof changed ownership");
+    || proof.offerId !== input.request.offerId || proof.revision !== before.environment.revision || proof.previousRecipeHash !== input.request.previousRecipeHash || proof.recipeHash !== input.request.recipeHash
+    || finalizationDigest(proof.compute) !== finalizationDigest(input.request.coverage.next)) throw new Error("Configuration proof changed ownership");
   const again = Proof.parse(await read(input, before));
-  if (finalizationDigest(again) !== finalizationDigest(proof) || await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration evidence changed during observation");
+  if (finalizationDigest(again) !== finalizationDigest(proof)) throw new Error("Configuration evidence changed during observation");
+  const metadata = { ...z.record(z.string(), z.json()).parse(before.resource.metadata), recipeHash: input.request.recipeHash, compute: proof.compute };
+  const projected = { ...before.resource, metadata };
+  const projectedIdentity = finalizationResourceIdentity(projected).identityDigest;
+  const candidate = { ...before.environment, recipeDigest: input.request.recipeHash, resourceIdentity: projectedIdentity, observation: null };
+  // The ordinary configured observer must accept the staged generation before
+  // it can be activated. This supplies real stopped accounting now and leaves
+  // a valid immutable manifest for subsequent collector refresh while queued.
+  const stopped = await observe(input, before.owner.task, candidate, projected, []);
+  const observation = ComputeObservation.parse(stopped.observation);
+  if (observation.state !== "stopped"
+    || observation.operations.active !== 0 || observation.configurationDigest !== proof.compute.configurationSha256) throw new Error("Staged configuration has no fresh stopped accounting");
+  if (stopped.traffic.length !== observation.routes.length || stopped.traffic.some(value => !observation.routes.some(route => finalizationDigest(route) === finalizationDigest(value.route)))) throw new Error("Staged configuration traffic proof changed");
+  if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed during observation");
   return input.prisma.$transaction(async tx => {
     // This fresh snapshot also checks current pause, original primary/source
     // link, intent, slot, active offer and prior transition receipt.
@@ -100,18 +118,17 @@ export async function configureCompute(input: Input, read = readConfiguration, h
     const stable = (value: Snapshot) => ({ identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment: value.environment, resource: value.resource, offer: value.offer, allocations: value.allocations, traffic: value.traffic, event: value.event, intent: value.intent });
     if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
     if (!current.event) {
-      const metadata = { ...z.record(z.string(), z.unknown()).parse(current.resource.metadata), recipeHash: input.request.recipeHash };
       const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
       await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
         value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
-          traffic: current.traffic, proof, baselineFile: input.request.baselineFile,
+          traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile,
           allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
       await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
         observation: Prisma.DbNull } });
       await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
     } else {
       const prior = JSON.parse(current.event.value!);
-      if (prior.proof.baselineSha256 !== proof.baselineSha256) throw new Error("Configuration baseline changed after acknowledgment");
+      if (prior.proof.baselineSha256 !== proof.baselineSha256 || finalizationDigest(prior.compute) !== finalizationDigest(proof.compute)) throw new Error("Configuration baseline or staged manifest changed after acknowledgment");
       const identity = finalizationResourceIdentity(current.resource).identityDigest;
       if (identity !== current.environment.resourceIdentity) {
         await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: `${Action}-projection`,
@@ -121,6 +138,13 @@ export async function configureCompute(input: Input, read = readConfiguration, h
         await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
       }
     }
-    return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash };
+    await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
+    await recordComputeObservation({ ...input, prisma: tx, environmentId: current.environment.id, observation });
+    for (const state of stopped.traffic) {
+      const previous = await tx.computeTraffic.findUnique({ where: { routeId: state.route.id } });
+      if (previous) throw new Error("Staged route is already owned by another environment");
+      await tx.computeTraffic.create({ data: { routeId: state.route.id, taskId: input.taskId, environmentId: current.environment.id, epoch: state.epoch, sequence: state.sequence, state } });
+    }
+    return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash, compute: proof.compute };
   });
 }
