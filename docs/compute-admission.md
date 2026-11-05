@@ -131,3 +131,42 @@ failure category. This reads saved state and deterministic evidence without
 refreshing providers, collecting conversation, making model requests or writing
 rows. Unavailable evidence is reported conservatively. There is no new control,
 configuration setting, model rationale requirement or desktop UI.
+
+## Current Decisions input and diagnostic outcomes
+
+DRA301's current input is version 2. It supplies the configured quiet/freshness
+thresholds, current request/unknown-request/stream counts, continuous coverage and
+collector ages, historical unknown-event age, and actual operation coverage/count.
+These are measurements, not candidate flags or instructions to choose suspension.
+An old unknown timestamp does not itself mean activity is currently unknown.
+Current unknown requests, recent unknown events, incomplete coverage and active
+work still fail the independent deterministic checks.
+
+Task/thread context includes the actual name, linked issue and phase plus ordered
+literal user/assistant excerpts. The last 32 messages are bounded; the latest eight
+receive up to 700 characters and older messages up to 240. Long messages preserve
+both ends and first/last control lines, including conflicting keep-running/release
+statements. Credentials, code and private URLs are removed before compacting.
+Message indexes and explicit omission/truncation counts disclose missing context;
+the collector never invents an intent narrative or claims a truncated instruction
+was released. The model can recommend leave-running when current need cannot be
+ruled out.
+
+New requests offer three choices: leave-running, suspend-compute and
+eligible-for-authorized-closure. They do not offer insufficient-evidence.
+A new successful result has `kind: "recommendation"` and the actual choice and
+confidence. Missing/invalid/ineligible inputs, provider errors, timeouts, refusals
+and invalid replies produce explicit server `kind: "diagnostic"` results with a
+failure category and request status, without a fabricated choice or confidence.
+No-request diagnostics have null request digests. Transient delivery diagnostics
+remain within the existing finite retry budget; a conservative leave-running
+recommendation remains advisory. Stop/closure authority is still independently
+validated and never follows merely from receiving a recommendation.
+
+Historical v1/v2 inputs and saved results, including insufficient-evidence, stay
+readable without rewriting their bytes. The new request digest binds the clarified
+input, while physical/effect snapshots and episode-reset rules remain unchanged.
+An exhausted episode gets no extra call because the input contract changed. The
+original P's three decisions/attention therefore remain exhausted; an explicit
+owner stop cannot be reported retrospectively as automatic acceptance. A later
+actual Q episode uses ordinary ownership, activity, queue and attempt rules.

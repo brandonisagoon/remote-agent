@@ -59,3 +59,7 @@ Selection, delivery reservation and the first claim recheck the same effective
 capacity. Lowering the limit below existing occupancy reports negative headroom
 and refuses new reservations or first claims without deleting existing slots.
 Retries of an already claimed allocation retain their existing start intent.
+
+New server diagnostics carry a failure category without a fabricated model choice.
+Consequently `lastChoice` can be absent when the latest consideration was a server
+diagnostic; historical choices remain visible as originally recorded.

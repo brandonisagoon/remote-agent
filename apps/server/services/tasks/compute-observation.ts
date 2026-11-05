@@ -54,16 +54,55 @@ export async function recordComputeObservation(input: Context & { observation: C
 /** Conversation collection is bounded and strips credential-shaped lines,
  * tool payloads, URLs and code blocks before classification. Original logs are
  * neither rewritten nor copied into the persisted decision. */
+function sanitizedComputeText(text: string, secrets: string[]) {
+  if (text.length > 128_000 || secrets.some(value => value.length > 16_384)) return "";
+  for (const secret of secrets.filter(value => value.length >= 8)) text = text.split(secret).join("[credential omitted]");
+  return text.replace(/```[\s\S]*?(?:```|$)/g, "[code omitted]")
+    .split(/\r?\n/).map(line => /(?:authorization|bearer|password|secret|token|api[_ -]?key|private[_ -]?key|cookie|DATABASE_URL|postgres(?:ql)?:\/\/)/i.test(line) ? "[private configuration omitted]" : line)
+    .join("\n").replace(/https?:\/\/[^\s<>]+/g, "[URL omitted]").replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|(?:sk|pk)_[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|AKIA[A-Z0-9]{16})\b/g, "[credential omitted]").trim();
+}
 export function sanitizeComputeConversation(messages: { role: "user" | "agent"; text: string }[], secrets: string[] = []) {
   return messages.slice(-32).flatMap(message => {
-    if (secrets.some(value => value.length > 16_384)) return [];
-    let text = message.text.slice(0, 32_000);
-    for (const secret of secrets.filter(value => value.length >= 8)) text = text.split(secret).join("[credential omitted]");
-    text = text.replace(/```[\s\S]*?(?:```|$)/g, "[code omitted]")
-      .split(/\r?\n/).map(line => /(?:authorization|bearer|password|secret|token|api[_ -]?key|private[_ -]?key|cookie|DATABASE_URL|postgres(?:ql)?:\/\/)/i.test(line) ? "[private configuration omitted]" : line)
-      .join("\n").replace(/https?:\/\/[^\s<>]+/g, "[URL omitted]").replace(/\b(?:sk-[A-Za-z0-9_-]{8,}|(?:sk|pk)_[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|xox[baprs]-[A-Za-z0-9-]+|AKIA[A-Z0-9]{16})\b/g, "[credential omitted]").slice(0, 4000).trim();
+    const text = sanitizedComputeText(message.text.slice(0, 32_000), secrets).slice(0, 4000).trim();
     return text ? [{ role: message.role === "agent" ? "assistant" as const : "user" as const, text }] : [];
   });
+}
+
+/** Literal ordered excerpts, never an inferred narrative. Keep both ends and
+ * first/last control lines of long messages, including conflicting controls.
+ * Explicit counts disclose every bounded omission/truncation. */
+export function compactComputeConversation(messages: { role: "user" | "agent"; text: string }[], secrets: string[] = []) {
+  const window = messages.slice(-32), conversation: { role: "user" | "assistant"; text: string }[] = [];
+  const messageIndexes: number[] = [];
+  const truncations: { index: number; omittedCharacters: number; omittedControlLines: number }[] = [];
+  for (const [index, message] of window.entries()) {
+    const full = sanitizedComputeText(message.text, secrets); if (!full) continue;
+    const limit = index >= window.length - 8 ? 700 : 240;
+    let text = full;
+    if (full.length > limit) {
+      let offset = 0;
+      const controls = full.split("\n").flatMap(line => {
+        const start = offset; offset += line.length + 1;
+        return /\b(?:hold|release|pause|resume|stop|review|keep.{0,60}(?:running|available))\b/i.test(line) ? [{ start, end: start + line.length }] : [];
+      });
+      const edge = Math.floor(limit * (controls.length ? 0.15 : 0.45)), controlLimit = Math.floor(limit * 0.25);
+      const ranges = [{ start: 0, end: edge }, { start: full.length - edge, end: full.length },
+        ...[controls[0], controls.at(-1)].flatMap(control => !control ? [] : control.end - control.start <= controlLimit ? [control]
+          : [{ start: control.start, end: control.start + Math.floor(controlLimit / 2) }, { start: control.end - Math.floor(controlLimit / 2), end: control.end }])].sort((a,b) => a.start - b.start);
+      const merged: { start: number; end: number }[] = [];
+      for (const range of ranges) { const previous = merged.at(-1); if (previous && range.start <= previous.end) previous.end = Math.max(previous.end, range.end); else merged.push({ ...range }); }
+      text = merged.map(range => full.slice(range.start, range.end)).join("\n[…]\n");
+      truncations.push({ index: messages.length - window.length + index, omittedCharacters: full.length - merged.reduce((sum, range) => sum + range.end - range.start, 0),
+        omittedControlLines: controls.filter(control => !merged.some(range => range.start <= control.start && range.end >= control.end)).length });
+    }
+    messageIndexes.push(messages.length - window.length + index);
+    conversation.push({ role: message.role === "agent" ? "assistant" : "user", text });
+  }
+  return { conversation, totalMessages: messages.length, windowMessages: window.length, omittedMessages: messages.length - conversation.length, messageIndexes, truncations };
+}
+function computeConversationSecrets(config: ServerConfig) {
+  return [config.compute?.decisionApiKey, config.apiKey, config.webhookSecret, ...Object.values(config.webhooks).map(value => value.webhookSecret),
+    ...Object.values(config.connections).map(value => typeof value.apiKey === "string" ? value.apiKey : value.apiKey.clientSecret)].filter((value): value is string => Boolean(value));
 }
 
 export async function computeEvidenceState(input: Context & { allowStopped?: boolean }) {
@@ -121,20 +160,31 @@ export async function computeEvidenceState(input: Context & { allowStopped?: boo
     sessions: sessions.map(value => ({ id: value.id, status: value.status, closedAt: value.closedAt })), instructions: instructions.map(value => ({ id: value.id, state: value.state, updatedAt: value.updatedAt })),
     lifecycle: lifecycle.map(value => ({ sequence: value.sequence, phase: value.phase, requestId: value.requestId })),
     traffic: summaries.map(value => ({ route: value.route, epoch: value.epoch, coverage: stopped || continuingStop ? "complete" : value.coverage, coverageSince: value.coverageSince, lastMeaningfulAt: value.lastMeaningfulAt, lastUnknownAt: value.lastUnknownAt, inFlight: value.inFlight, activeStreams: value.activeStreams })).sort((a,b) => a.route.id.localeCompare(b.route.id)) });
-  const evidence = ComputeDecisionEvidence.parse({ version: 1, task: { id: task.id, primarySessionId: primary.id, environmentId: env.id, purpose: env.purpose, revision: observation.sourceRevision ?? env.revision }, observedAt: now, evidenceDigest: snapshotDigest,
+  const unknownInFlight = rows.reduce((sum, row) => sum + Object.values((row.state as TrafficState).active).filter(value => value.classification === "unknown").length, 0);
+  const evidence = ComputeDecisionEvidence.parse({ version: 2, task: { id: task.id, primarySessionId: primary.id, environmentId: env.id, purpose: env.purpose, revision: observation.sourceRevision ?? env.revision }, observedAt: now, evidenceDigest: snapshotDigest,
     traffic: { coverage: covered ? "complete" : "incomplete", lastMeaningfulAt: last("lastMeaningfulAt"), lastUnknownAt: last("lastUnknownAt"), inFlight: summaries.reduce((sum,value) => sum+value.inFlight,0), activeStreams: summaries.reduce((sum,value) => sum+value.activeStreams,0), quietForMs: summaries.length ? Math.max(0, Math.min(...summaries.map(value => now - Math.max(value.coverageSince, value.lastMeaningfulAt ?? 0, value.lastUnknownAt ?? 0)))) : 0, collectorAgeMs: Math.max(0, now - Math.min(observation.observedAt, ...summaries.map(value => value.observedAt))) },
-    activity: { ownedSessionsSettled: settled, operationsComplete, pendingInstructions: pending, ownerPaused: task.ownerPaused, reviewProtected, latestInstructionAt: instructions.length ? Math.max(...instructions.map(value => value.createdAt.getTime())) : null }, conversation: [] });
+    activity: { ownedSessionsSettled: settled, operationsComplete, pendingInstructions: pending, ownerPaused: task.ownerPaused, reviewProtected, latestInstructionAt: instructions.length ? Math.max(...instructions.map(value => value.createdAt.getTime())) : null }, conversation: [],
+    policy: { quietPeriodSeconds: policy.quietPeriodSeconds, collectorFreshnessSeconds: policy.collectorFreshnessSeconds },
+    measurement: { unknownInFlight, probeConnections: summaries.reduce((sum, value) => sum + value.backgroundConnections, 0),
+      probeStreams: rows.reduce((sum, row) => sum + Object.values((row.state as TrafficState).active).filter(value => value.stream && ["health", "polling", "hot-reload", "tooling-probe"].includes(value.classification)).length, 0), lastUnknownAgeMs: last("lastUnknownAt") === null ? null : Math.max(0, now - last("lastUnknownAt")!),
+      coverageForMs: summaries.length ? Math.max(0, Math.min(...summaries.map(value => now - value.coverageSince))) : 0,
+      operations: { coverage: observation.operations.coverage, active: observation.operations.active } },
+    thread: { name: primary.name ? sanitizeComputeConversation([{ role: "user", text: primary.name }], computeConversationSecrets(input.config))[0]?.text.slice(0, 256) ?? null : null,
+      issueIdentifier: task.issueIdentifier, taskPhase: task.phase, order: "oldest-to-newest", totalMessages: 0, windowMessages: 0, omittedMessages: 0, messageIndexes: [], truncations: [] } });
   return { evidence, snapshotDigest, eligible, physicalState: observation.state, sessionIds: sessions.filter(value => !value.closedAt && value.status !== "closed").map(value => value.id), resource: { id: resource.id, key: resource.key, identityDigest: observation.resourceIdentity } };
 }
 export async function collectComputeEvidence(input: Context & { runtime: Pick<AgentSessionRuntime, "history" | "observeSessionActivity"> }) {
   const result = await computeEvidenceState(input);
   const observedBusy = result.sessionIds.some(id => ["executing", "queued"].includes(input.runtime.observeSessionActivity?.(id)?.state ?? ""));
   if (observedBusy) { result.eligible = false; result.evidence.activity.ownedSessionsSettled = false; }
-  const history = sanitizeComputeConversation(await input.runtime.history(result.evidence.task.primarySessionId), [input.config.compute?.decisionApiKey, input.config.apiKey, input.config.webhookSecret, ...Object.values(input.config.webhooks).map(value => value.webhookSecret), ...Object.values(input.config.connections).map(value => typeof value.apiKey === "string" ? value.apiKey : value.apiKey.clientSecret)].filter((value): value is string => Boolean(value)));
+  const history = compactComputeConversation(await input.runtime.history(result.evidence.task.primarySessionId), computeConversationSecrets(input.config));
   const fresh = await computeEvidenceState(input);
   if (fresh.snapshotDigest !== result.snapshotDigest) throw new Error("Compute evidence changed while reading conversation");
   const stillBusy = fresh.sessionIds.some(id => ["executing", "queued"].includes(input.runtime.observeSessionActivity?.(id)?.state ?? ""));
-  return { ...fresh, eligible: fresh.eligible && !observedBusy && !stillBusy, evidence: { ...fresh.evidence, activity: { ...fresh.evidence.activity, ownedSessionsSettled: fresh.evidence.activity.ownedSessionsSettled && !observedBusy && !stillBusy }, conversation: history } };
+  const eligible = fresh.eligible && !observedBusy && !stillBusy;
+  return { ...fresh, eligible, evidence: { ...fresh.evidence,
+    thread: { ...fresh.evidence.thread, totalMessages: history.totalMessages, windowMessages: history.windowMessages, omittedMessages: history.omittedMessages, messageIndexes: history.messageIndexes, truncations: history.truncations },
+    activity: { ...fresh.evidence.activity, ownedSessionsSettled: fresh.evidence.activity.ownedSessionsSettled && !observedBusy && !stillBusy }, conversation: history.conversation } };
 }
 export async function assertComputeEvidence(input: Context & { snapshotDigest: string; allowStopped?: boolean }) {
   const current = await computeEvidenceState(input);
