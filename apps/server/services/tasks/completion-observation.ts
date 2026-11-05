@@ -1,3 +1,4 @@
+import { fingerprintScan } from "./fingerprint-diagnostics.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
 import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { createHash } from "node:crypto";
@@ -25,8 +26,8 @@ async function run(client: CommandClient, cwd: string, command: string, args: st
 }
 
 /** Read-only facts. No fetch, commit, push, review or merge is performed. */
-export function observeCompletionSnapshot(cwd: string, client: CommandClient = bunCommandClient): Promise<CompletionSnapshot> {
-  return preparationStage("fingerprint", () => readCompletionSnapshot(cwd, client));
+export function observeCompletionSnapshot(cwd: string, client: CommandClient = bunCommandClient, filesystem = { lstat, readlink }): Promise<CompletionSnapshot> {
+  return preparationStage("fingerprint", () => fingerprintScan(step => readCompletionSnapshot(cwd, client, filesystem, step)));
 }
 /** Preserve existing Git configuration semantics while forbidding optional
  * index refresh and filesystem-monitor hooks during a frozen capture proof. */
@@ -35,13 +36,13 @@ export function observeReadonlyCompletionSnapshot(cwd: string): Promise<Completi
     return bunCommandClient.run(command, command === "git" ? ["--no-optional-locks", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args] : args, options);
   } });
 }
-async function readCompletionSnapshot(cwd: string, client: CommandClient): Promise<CompletionSnapshot> {
+async function readCompletionSnapshot(cwd: string, client: CommandClient, filesystem: { lstat: typeof lstat; readlink: typeof readlink }, step: Parameters<Parameters<typeof fingerprintScan>[0]>[0]): Promise<CompletionSnapshot> {
   const git = (...args: string[]) => run(client, cwd, "git", args);
-  const head = await git("rev-parse", "--verify", "HEAD");
-  const branch = await git("symbolic-ref", "--short", "HEAD");
-  const status = await git("status", "--porcelain=v1", "-z", "--untracked-files=all");
-  const deleted = new Set((await git("ls-files", "--deleted", "-z")).split("\0"));
-  const files = [...new Set((await git("ls-files", "--cached", "--others", "--exclude-standard", "-z")).split("\0").filter((file) => file && !deleted.has(file)))].sort();
+  const head = await step("head", {}, () => git("rev-parse", "--verify", "HEAD"));
+  const branch = await step("branch", {}, () => git("symbolic-ref", "--short", "HEAD"));
+  const status = await step("status", {}, () => git("status", "--porcelain=v1", "-z", "--untracked-files=all"));
+  const deleted = new Set((await step("deleted-files", {}, () => git("ls-files", "--deleted", "-z"))).split("\0"));
+  const files = [...new Set((await step("file-list", {}, () => git("ls-files", "--cached", "--others", "--exclude-standard", "-z"))).split("\0").filter((file) => file && !deleted.has(file)))].sort();
   if (files.length > 20_000) throw new Error("Too many files to verify a completion snapshot");
   // Bind acceptance to working content, not the act of committing it. The
   // owner's accepted uncommitted bytes remain accepted after commit/push.
@@ -50,15 +51,18 @@ async function readCompletionSnapshot(cwd: string, client: CommandClient): Promi
     const chunk = files.slice(index, index + 100);
     const regular: string[] = [];
     const entries: Array<{ file: string; mode: string; link?: string }> = [];
-    for (const file of chunk) {
-      const absolute = path.resolve(cwd, file);
-      if (!absolute.startsWith(`${path.resolve(cwd)}${path.sep}`)) throw new Error("Invalid completion snapshot path");
-      const info = await lstat(absolute);
-      if (info.isSymbolicLink()) entries.push({ file, mode: "symlink", link: await readlink(absolute) });
-      else if (info.isFile()) { regular.push(file); entries.push({ file, mode: info.mode & 0o111 ? "executable" : "file" }); }
-      else throw new Error("Completion snapshots require regular files; inspect submodules separately");
-    }
-    const hashes = regular.length ? (await git("hash-object", "--no-filters", "--", ...regular)).split("\n") : [];
+    const counts = { files: files.length, chunk: index / 100 + 1, completedFiles: index };
+    await step("metadata", counts, async () => {
+      for (const file of chunk) {
+        const absolute = path.resolve(cwd, file);
+        if (!absolute.startsWith(`${path.resolve(cwd)}${path.sep}`)) throw new Error("Invalid completion snapshot path");
+        const info = await filesystem.lstat(absolute);
+        if (info.isSymbolicLink()) entries.push({ file, mode: "symlink", link: await filesystem.readlink(absolute) });
+        else if (info.isFile()) { regular.push(file); entries.push({ file, mode: info.mode & 0o111 ? "executable" : "file" }); }
+        else throw new Error("Completion snapshots require regular files; inspect submodules separately");
+      }
+    });
+    const hashes = regular.length ? (await step("hash", counts, () => git("hash-object", "--no-filters", "--", ...regular))).split("\n") : [];
     if (hashes.length !== regular.length) throw new Error("Completion snapshot changed during hashing");
     let offset = 0;
     for (const entry of entries) hash.update("\0").update(entry.file).update("\0").update(entry.mode).update("\0").update(entry.link ?? hashes[offset++]!);

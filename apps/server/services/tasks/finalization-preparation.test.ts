@@ -1,3 +1,5 @@
+import { withRequestLifetime } from "../../request-lifetime.ts";
+import { lstat, readlink } from "node:fs/promises";
 import { acquireRuntimeOwnership } from "../sessions/runtime-owner.ts";
 import { startRuntimeEventProjection } from "../sessions/runtime-events/projection.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -10,7 +12,7 @@ import { createTestDatabase, type TestDatabase } from "../../../../test-support/
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
-import { completionObservation } from "./completion-observation.ts";
+import { observeCompletionSnapshot, completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 import { preparationJournalWorker, requestFinalizationPreparation } from "./finalization-preparation.ts";
 import { contextMiddleware, type AppEnv } from "../../middleware/context.ts";
@@ -516,4 +518,67 @@ test("an existing confirmed revision cannot conceal changed retained bytes at th
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(1);
   expect((await db.prisma.remoteTaskResource.findFirstOrThrow({ where: { key: "retained" } })).state).toBe("ready");
   expect(await Bun.file(path.join(root, "saved.bin")).text()).toBe("changed retained bytes");
+});
+
+
+// Hold a real snapshot's metadata batch, without delaying or replacing the
+// authority/effect checks which follow it. Uses this file's existing fixture.
+async function holdFingerprint(f: Awaited<ReturnType<typeof fixture>>) {
+  let enter!: () => void, release!: () => void, held = false;
+  const entered = new Promise<void>(resolve => enter = resolve), wait = new Promise<void>(resolve => release = resolve);
+  const filesystem = { readlink, lstat: new Proxy(lstat, { async apply(target, receiver, args) {
+    if (!held) { held = true; enter(); await wait; }
+    return Reflect.apply(target, receiver, args);
+  } }) };
+  const snapshot = (cwd: string) => observeCompletionSnapshot(cwd, bunCommandClient, filesystem);
+  f.observer.snapshot = snapshot; f.dependencies.snapshot = snapshot;
+  return { entered, release };
+}
+
+test("a client deadline during a held fingerprint joins the same worker and late settlement commits once", async () => {
+  const f = await fixture(), c = controls(f), request = attempt(), hold = await holdFingerprint(f);
+  const accepted = await (await c.post(request)).json(); let runs = 0;
+  worker = preparationJournalWorker(c.input, value => { runs++; return prepareTaskFinalization(value, f.dependencies); });
+  worker.tick(); await hold.entered;
+  try {
+    // Models the client's bounded wait. The server journal is deliberately
+    // outside this request lifetime and remains the sole owner of the scan.
+    await expect(withRequestLifetime({ timeoutMs: 10 }, async () => {
+      expect((await (await c.post(request)).json()).preparation.state).toBe("running");
+      await new Promise<void>(() => undefined);
+    })).rejects.toMatchObject({ code: "REQUEST_DEADLINE" });
+    const joined = await (await c.post(attempt())).json();
+    expect(joined.preparation.acceptedRevision).toBe(accepted.preparation.acceptedRevision);
+    worker.tick(); worker.tick(); expect(runs).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-preparation-accepted" } })).toBe(1);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-confirmed"] } } })).toBe(0);
+    expect(await Bun.file(path.join(f.worktree, "README.md")).text()).toBe("accepted content\n");
+  } finally { hold.release(); }
+  await worker.idle();
+  const ready = await (await c.post(request)).json(); expect(ready.preparation.state).toBe("ready");
+  worker.tick(); await worker.idle(); expect(runs).toBe(1);
+  const terminal = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status", key: String(accepted.preparation.acceptedRevision) } });
+  expect(terminal.filter(row => ["ready", "failed"].includes(JSON.parse(row.value!).state))).toHaveLength(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+  expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBe(true);
+});
+
+test.each(["file", "branch", "owner"] as const)("a %s change during a held fingerprint cannot authorize cleanup", async change => {
+  const f = await fixture(), c = controls(f), request = attempt(), hold = await holdFingerprint(f);
+  const accepted = await (await c.post(request)).json(); let runs = 0;
+  worker = preparationJournalWorker(c.input, value => { runs++; return prepareTaskFinalization(value, f.dependencies); });
+  worker.tick(); await hold.entered;
+  try {
+    if (change === "file") await writeFile(path.join(f.worktree, "README.md"), "later owner bytes\n");
+    if (change === "branch") git(f.worktree, "switch", "-c", "codex/changed");
+    if (change === "owner") await f.revoke();
+    worker.tick(); expect(runs).toBe(1);
+  } finally { hold.release(); }
+  await worker.idle();
+  const terminal = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "finalization-preparation-status", key: String(accepted.preparation.acceptedRevision) }, orderBy: { sequence: "asc" } });
+  expect(JSON.parse(terminal.at(-1)!.value!).state).toBe("failed");
+  expect(terminal.filter(row => ["ready", "failed"].includes(JSON.parse(row.value!).state))).toHaveLength(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "finalization-confirmed"] } } })).toBe(0);
+  expect(await Bun.file(path.join(f.worktree, "README.md")).exists()).toBe(true);
+  worker.tick(); await worker.idle(); expect(runs).toBe(1);
 });
