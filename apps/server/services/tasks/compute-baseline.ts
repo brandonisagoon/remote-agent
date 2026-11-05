@@ -53,7 +53,7 @@ async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
     && !["executing", "queued"].includes(runtime.observeSessionActivity!(session.id).state)
     && (session.closedAt || lifecycle.find(event => event?.runtimeSessionId === session.id)?.phase !== "started"));
   const environments = await store.computeEnvironment.findMany({ where: { machineId: row.machineId, taskId: task.id, purpose }, orderBy: { id: "asc" }, take: 1001 });
-  const offers = await store.computeOffer.findMany({ where: { environmentId: { in: environments.map(environment => environment.id) }, state: { in: ["queued", "offered", "claimed", "running", "unknown"] } }, orderBy: { id: "asc" }, take: 1001 });
+  const offers = await store.computeOffer.findMany({ where: { environmentId: { in: environments.map(environment => environment.id) }, state: { in: ["queued", "offered", "validating", "claimed", "running", "unknown"] } }, orderBy: { id: "asc" }, take: 1001 });
   const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(offer => offer.id) } }, orderBy: { id: "asc" }, take: 1001 });
   // Conservatively bind global physical ownership claims, but not unrelated
   // offers/slots: normal delivery elsewhere must not invalidate all credit.

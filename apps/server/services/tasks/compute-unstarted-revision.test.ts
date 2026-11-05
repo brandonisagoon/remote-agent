@@ -59,7 +59,7 @@ test.each([false, true])("unclaimed offer delivered=%s is withdrawn without rota
   await expect(claimCompute({ ...context(), taskId: "one", offerId: offer.id, request: next() })).rejects.toThrow("expired or superseded");
 });
 
-test.each(["claimed", "running", "unknown", "stopped", "claimed-history"])("refuses prior or uncertain compute: %s", async state => {
+test.each(["validating", "claimed", "running", "unknown", "stopped", "claimed-history"])("refuses prior or uncertain compute: %s", async state => {
   const environment = await task(); const offer = (await offerNextCompute(context()))!;
   await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: state === "claimed-history" ? "expired" : state, claimedAt: now } });
   await expect(advance()).rejects.toThrow();

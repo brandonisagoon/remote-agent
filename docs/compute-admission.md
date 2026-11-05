@@ -170,3 +170,16 @@ An exhausted episode gets no extra call because the input contract changed. The
 original P's three decisions/attention therefore remain exhausted; an explicit
 owner stop cannot be reported retrospectively as automatic acceptance. A later
 actual Q episode uses ordinary ownership, activity, queue and attempt rules.
+
+A timely claim first persists a `validating` reservation on its existing slot.
+The original 60-second offer deadline is unchanged. Validation has its own
+five-minute deadline; it grants no start or resource-bind authority. Physical
+accounting still runs, followed by fresh ownership, recipe, resource and capacity
+checks in the transaction that changes the offer to `claimed`. Duplicate requests
+share the in-process validation; after restart the persisted token and deadline
+allow the same request to resume. Inspection failure retains the slot until
+retry, explicit decline, owner invalidation or validation expiry. Late first
+requests cannot enter validation. Saved revision/configuration changes refuse a
+validation reservation. An explicit-offer CLI command skips queue selection and
+uses a default 315-second claim request timeout; explicit caller deadlines remain
+authoritative.
