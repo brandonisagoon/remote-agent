@@ -182,7 +182,7 @@ async function withRuntimeManifest(contracts: unknown) {
   return { ...f, revision, hostPin, request };
 }
 
-for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"]]) {
+for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"]]) {
   test(`deployed runtime manifest resolves supported contracts ${contracts.join(",")}`, async () => {
     const f = await withRuntimeManifest(contracts);
     const response = await f.request();

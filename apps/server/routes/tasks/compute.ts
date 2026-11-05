@@ -1,4 +1,5 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
+import { ComputeConfiguration, configureCompute } from "../../services/tasks/compute-configuration.ts";
 import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -9,6 +10,12 @@ import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-atte
 import { developmentProjection } from "../../services/tasks/development-intent.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
+computeRoutes.post("/:taskId/compute-configure", async c => {
+  const request = ComputeConfiguration.safeParse(await c.req.json());
+  if (!request.success) return c.json({ error: "Exact pending configuration and previous allocation are required" }, 400);
+  try { return c.json(await configureCompute({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data })); }
+  catch { return c.json({ error: "Pending runtime configuration could not be verified; preserve the existing claim and evidence" }, 409); }
+});
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
 computeRoutes.get("/:taskId/compute-enroll", async c => {
   const key = ComputeEnrollment.shape.key.safeParse(c.req.query("key"));
