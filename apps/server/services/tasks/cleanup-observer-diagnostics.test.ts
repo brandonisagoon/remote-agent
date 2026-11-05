@@ -1,3 +1,4 @@
+import * as childProcess from "node:child_process";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -95,11 +96,14 @@ test("capability drift after real execution refuses otherwise complete output", 
 
 test("owned process-group observation failure cannot return successful output or leak ps stderr", async () => {
   const f = await realFixture(`const input=JSON.parse(await Bun.stdin.text()); await Bun.write(input.pidFile,String(process.pid)); console.log("{}");`);
-  const pidFile = path.join(f.root, "pid"), spawn = Bun.spawnSync;
-  const mock = spyOn(Bun, "spawnSync").mockImplementation(((...args: Parameters<typeof Bun.spawnSync>) => {
-    const result = spawn(...args);
-    return Array.isArray(args[0]) && args[0][0] === "/bin/ps" && existsSync(pidFile) ? { ...result, exitCode: 1, stderr: Buffer.from("private-process-body") } : result;
-  }) as typeof Bun.spawnSync);
+  const pidFile = path.join(f.root, "pid"), execute = childProcess.execFile;
+  const mock = spyOn(childProcess, "execFile").mockImplementation(((...args: any[]) => {
+    const callback = args.at(-1);
+    return (execute as any)(...args.slice(0, -1), (...result: any[]) => {
+      if (args[0] === "/bin/ps" && existsSync(pidFile)) callback(new Error("inspection failed"), result[1], "private-process-body");
+      else callback(...result);
+    });
+  }) as any);
   try {
     const error = await runCleanupResourceObserver({ capability: f.capability, request: { pidFile } }).catch(error => error);
     if (!(error instanceof CleanupObserverError)) throw new Error("Expected typed failure");
