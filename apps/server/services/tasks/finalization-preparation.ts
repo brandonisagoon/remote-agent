@@ -1,3 +1,4 @@
+import { withFingerprintDiagnostics, fingerprintWorkerTerminal } from "./fingerprint-diagnostics.ts";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
@@ -183,33 +184,37 @@ export function preparationJournalWorker(input: WorkerInput, prepare?: (input: F
         scans.set(key, "journal");
         let stage = "ownership";
         const start = performance.now();
-        try {
-          if ((await epoch(context)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed");
-          if (saved.operation === "confirm") await assertPreparedCleanup(context);
-          await append(input, record, { state: "running", stage, worker });
-          const result = await withPreparationDiagnostics(async diagnostic => {
-            stage = diagnostic.failedStage ?? diagnostic.activeStage ?? diagnostic.stage;
-            await append(input, record, { state: "running", ...diagnostic, worker });
-          }, () => preparationStage("verification", async () => {
-            const actual = saved.operation === "confirm" ? confirm ?? (await import("./finalization.ts")).confirmTaskFinalization : prepare ?? (await import("./finalization.ts")).prepareTaskFinalization;
-            return execution.run({ sessionId: context.sessionId, requestKey: context.requestKey }, () => actual(context));
-          }));
-          stage = "response";
-          await input.prisma.$transaction(async tx => {
-            const local = { ...context, prisma: tx as PrismaClient };
-            if ((await epoch(local)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed during verification");
-            await assertPreparedCleanup(local);
-            if (saved.operation === "confirm") await assertConfirmedResult(local, result);
-            await append({ ...input, prisma: tx as PrismaClient }, record, { state: "ready", stage, worker, elapsedMs: Math.round(performance.now() - start), result });
-          });
-        } catch (error) {
-          const diagnostic = preparationFailure(error);
-          const label = saved.operation === "confirm" ? "Confirmation" : "Preparation";
-          // Keep the released client's strict progress shape: its existing error
-          // field carries exactly the same safe code/reason as the durable row.
-          await append(input, record, { state: "failed", stage, diagnostic, worker, elapsedMs: Math.round(performance.now() - start), error: `${label} failed during ${stage}: [${diagnostic.code}] ${diagnostic.reason} Full verification did not grant cleanup authority.`, retryable: true });
-          console.error(`[preparation] ${record.sequence} failed at ${stage}: [${diagnostic.code}] ${diagnostic.reason}`);
-        } finally { scans.delete(key); }
+        await withFingerprintDiagnostics({ worker, acceptedRevision: record.sequence }, async () => {
+          try {
+            if ((await epoch(context)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed");
+            if (saved.operation === "confirm") await assertPreparedCleanup(context);
+            await append(input, record, { state: "running", stage, worker });
+            const result = await withPreparationDiagnostics(async diagnostic => {
+              stage = diagnostic.failedStage ?? diagnostic.activeStage ?? diagnostic.stage;
+              await append(input, record, { state: "running", ...diagnostic, worker });
+            }, () => preparationStage("verification", async () => {
+              const actual = saved.operation === "confirm" ? confirm ?? (await import("./finalization.ts")).confirmTaskFinalization : prepare ?? (await import("./finalization.ts")).prepareTaskFinalization;
+              return execution.run({ sessionId: context.sessionId, requestKey: context.requestKey }, () => actual(context));
+            }));
+            stage = "response";
+            const terminal = await input.prisma.$transaction(async tx => {
+              const local = { ...context, prisma: tx as PrismaClient };
+              if ((await epoch(local)).digest !== saved.epoch) throw new Error("Preparation original authority or turn changed during verification");
+              await assertPreparedCleanup(local);
+              if (saved.operation === "confirm") await assertConfirmedResult(local, result);
+              return append({ ...input, prisma: tx as PrismaClient }, record, { state: "ready", stage, worker, elapsedMs: Math.round(performance.now() - start), result });
+            });
+            fingerprintWorkerTerminal("ready", terminal.sequence);
+          } catch (error) {
+            const diagnostic = preparationFailure(error);
+            const label = saved.operation === "confirm" ? "Confirmation" : "Preparation";
+            // Keep the released client's strict progress shape: its existing error
+            // field carries exactly the same safe code/reason as the durable row.
+            const terminal = await append(input, record, { state: "failed", stage, diagnostic, worker, elapsedMs: Math.round(performance.now() - start), error: `${label} failed during ${stage}: [${diagnostic.code}] ${diagnostic.reason} Full verification did not grant cleanup authority.`, retryable: true });
+            fingerprintWorkerTerminal("failed", terminal.sequence);
+            console.error(`[preparation] ${record.sequence} failed at ${stage}: [${diagnostic.code}] ${diagnostic.reason}`);
+          } finally { scans.delete(key); }
+        });
         return;
       }
     })().catch(error => { const diagnostic = preparationFailure(error); console.error(`[preparation] journal reconciliation failed: [${diagnostic.code}] ${diagnostic.reason}`); }).finally(() => { running = undefined; });

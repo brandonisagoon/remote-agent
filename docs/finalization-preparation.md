@@ -19,7 +19,7 @@ existing runtime projection tick drains one full preparation at a time while
 continuing normal journal projection and HTTP service. The worker and older
 synchronous requests share a reservation, so acknowledgment races cannot start
 overlapping scans. The server's existing runtime ownership lock remains the
-process ownership boundary; there is no second timer, agent or cleanup executor.
+process ownership boundary; there is no second scheduling timer, agent or cleanup executor.
 
 Retries of a lost acceptance or polling response reuse the same attempt. Another
 request for the same boundary and exact ownership/turn epoch joins its pending
@@ -111,6 +111,30 @@ finalizer whose initial full preparation already carries a confirmed revision
 skips resource and worktree retirement, obtains that exact current confirmation,
 then performs only the existing close/report steps. There is no custom wrapper,
 manual close, extended-deadline requirement, new approval or second executor.
+
+## Private fingerprint progress
+
+The journal worker writes `preparation-fingerprint` records to private server
+stderr. Records correlate the worker UUID, process ID and accepted revision with
+an increasing scan number. Fixed substages identify HEAD, branch, status, deleted
+files, file listing, metadata batches and hash batches. Batch records give the
+file count, one-based chunk number, previously completed file count and elapsed
+milliseconds. No paths, file contents, command arguments or raw errors are logged.
+The existing 20,000-file bound and batches of 100 remain unchanged.
+
+An unreferenced 30-second diagnostic heartbeat reports the current substage and
+its age. It only proves that the process scheduled that heartbeat; it does not
+prove the pending operation progressed. `worker-settled` means the worker scope
+returned or threw. Only `journal-terminal` reports a ready/failed row, with its
+revision, after that write commits. These logs grant no cleanup authority and
+cannot replace the durable journal or current effect checks. A blocked event
+loop may also block heartbeats; their absence alone cannot prove process death.
+
+A client deadline does not stop the accepted server worker. Reconcile its actual
+process and journal before any supported continuation; do not start overlapping
+finalizers. This diagnostic change adds no retry, timeout extension, snapshot
+cache or scan consolidation, and does not establish the cause of a historical
+stall or prove that cleanup will succeed.
 
 ## Verification
 
