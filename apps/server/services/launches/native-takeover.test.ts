@@ -1,3 +1,6 @@
+import { createWorkflowWorker } from "../../workers/product/workflow/worker.ts";
+import { DispatchEventType, type WorkerContext } from "../../../../types/dispatcher/index.ts";
+import type { SourceIssueWithAgentIssues } from "../../integrations/linear/session-store/source-issue/types.ts";
 import { dispatchPlacements } from "../tasks/routing.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
@@ -260,4 +263,42 @@ test("a pending worker from an earlier process remains unverified instead of bei
   expect(state.state).toBe("pending"); expect(state).toMatchObject({ activeWorkerRunIds: [], unverifiedWorkerRunIds: [run.id] });
   await expect(grantNativeLaunch(f.context, f.source, "cannot-infer-death", 1)).rejects.toThrow("not settled");
   expect((await db.prisma.workerRun.findUniqueOrThrow({ where: { id: run.id } })).status).toBe("pending");
+});
+
+
+async function freshActualWorker(f: ReturnType<typeof fixture>, runId: string) {
+  await Bun.sleep(3);
+  const issue = { id: f.source.issueId, identifier: f.source.issueIdentifier, title: "Owner continuation", description: "Continue existing task", branchName: "codex/original", state: { name: "Implementing" }, labels: { nodes: [] }, agentIssues: [] } as unknown as SourceIssueWithAgentIssues;
+  const worker = createWorkflowWorker({ getIssue: async () => issue, react: async () => true, postWorktreeComment: async () => "posted", compose: async () => "Owner requested the existing workflow" });
+  const context: WorkerContext = { prisma: db.prisma, config: f.config, agentRuntime: f.runtime, runId, commandClient: { run: async () => ({ ok: true, stdout: "", stderr: "" }) } };
+  return worker.execute({ type: DispatchEventType.TrackerWorkflowTriggered, workflowId: "plan", webhook: { type: "Reaction", action: "create", webhookTimestamp: Date.now(), data: { id: `reaction-${runId}`, createdAt: new Date().toISOString(), emoji: "🚀", userId: "owner", issueId: f.source.issueId, issue: { id: f.source.issueId, identifier: f.source.issueIdentifier } } } }, context);
+}
+
+test("the actual fresh owner worker does not block its own authenticated grant", async () => {
+  const f = fixture(); await family(f); await takeNativeOwnership(f.context, f.input);
+  expect((await freshActualWorker(f, "actual-fresh-run")).status).toBe("delivered");
+  expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).ownerPaused).toBe(false);
+  expect(await db.prisma.runtimeInstruction.count({ where: { id: "native-reaction:reaction-actual-fresh-run" } })).toBe(1);
+  expect(await db.prisma.runtimeSession.count({ where: { role: "primary" } })).toBe(1);
+});
+
+test.each(["foreign", "duplicate"] as const)("the actual fresh worker cannot ignore a %s active span", async kind => {
+  const f = fixture(); await family(f); await takeNativeOwnership(f.context, f.input);
+  let release!: () => void; const wait = new Promise<void>(resolve => release = resolve);
+  const held = withNativeLaunchWork(db.prisma, { connectionId: f.source.connectionId, repositoryId: f.source.repositoryId, issue: f.source.issueIdentifier }, kind === "duplicate" ? "actual-fresh-run" : "older-worker", () => wait);
+  try {
+    await expect(freshActualWorker(f, "actual-fresh-run")).rejects.toThrow("not settled");
+    expect((await db.prisma.nativeTakeover.findFirstOrThrow()).mode).toBe("native");
+    expect(await db.prisma.runtimeInstruction.count({ where: { id: "native-reaction:reaction-actual-fresh-run" } })).toBe(0);
+  } finally { release(); await held; }
+});
+
+
+test("the actual fresh actor cannot erase its same-ID unverified older-process receipt", async () => {
+  const f = fixture(); await family(f); await takeNativeOwnership(f.context, f.input);
+  const receipt = await db.prisma.webhookReceipt.create({ data: { webhookId: f.config.activeWebhookId, deliveryId: "prior-process-current-id", eventType: "reaction", status: "accepted", connectionId: f.source.connectionId, repositoryId: f.source.repositoryId, resourceId: f.source.issueIdentifier } });
+  await db.prisma.workerRun.create({ data: { id: "actual-fresh-run", receiptId: receipt.id, workerKey: "product.workflow:plan", status: "pending", createdAt: new Date(0) } });
+  await expect(freshActualWorker(f, "actual-fresh-run")).rejects.toThrow("not settled");
+  expect((await db.prisma.nativeTakeover.findFirstOrThrow()).mode).toBe("native");
+  expect((await db.prisma.workerRun.findUniqueOrThrow({ where: { id: "actual-fresh-run" } })).status).toBe("pending");
 });

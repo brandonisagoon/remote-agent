@@ -90,7 +90,11 @@ its instruction is queued durably while its selected pause is released. Multiple
 or unbound original families fail closed. The current revision must have
 completed native reconciliation. `launch-pending` denotes a grant awaiting
 session binding; `managed` is intent disposition, not delivered implementation.
-Old accepted keys cannot consume another launch's grant.
+Old accepted keys cannot consume another launch's grant. For a verified fresh
+owner reaction, the server's async execution context can distinguish its own
+single current workflow invocation from older work. It excludes only that actor
+from grant blockers; foreign invocations, duplicate simultaneous instances of the
+same run ID and pre-process unverified receipts still block.
 
 A configured owner reaction can also provide fresh intent if its signed original
 `data.createdAt` is present, valid, not in the future and strictly later than the
