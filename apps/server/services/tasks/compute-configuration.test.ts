@@ -152,7 +152,7 @@ test.each(["running", "identity", "stale", "manifest"])("invalid independently o
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
 });
 
-test("fresh stopped route evidence replaces old generation without accepting another environment's route", async () => {
+test("fresh stopped route evidence replaces the old generation with the new configuration", async () => {
   const f = await fixture(true);
   const observe: typeof readConfiguredComputeObservation = async (...args) => {
     const output = await f.observe(...args), observation = output.observation;
@@ -167,4 +167,20 @@ test("fresh stopped route evidence replaces old generation without accepting ano
   expect(current.environmentId).toBe(f.environment.id);
   expect((current.state as any).route.configurationDigest).toBe(f.proof.compute.configurationSha256);
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).observation).toMatchObject({ state: "stopped", coverage: "complete" });
+});
+
+test("staged route collision preserves the other environment and rolls back the recipe", async () => {
+  const f = await fixture(true);
+  const other = await db.prisma.computeEnvironment.create({ data: { ...f.environment, id: crypto.randomUUID(), key: "other", configuration: undefined, observation: undefined } });
+  await db.prisma.computeTraffic.create({ data: { routeId: "foreign-route", taskId: "task", environmentId: other.id, epoch: "foreign", state: { preserved: true } } });
+  const observe: typeof readConfiguredComputeObservation = async (...args) => {
+    const output = await f.observe(...args), observation = output.observation;
+    const route = { id: "foreign-route", taskId: "task", primarySessionId: "primary", environmentId: f.environment.id, resourceId: f.resource.id,
+      resourceIdentity: observation.resourceIdentity, purpose: "development" as const, service: "api", revision, proxyId: "original-proxy", configurationDigest: f.proof.compute.configurationSha256 };
+    observation.routes = [route];
+    return { observation, traffic: [beginTraffic(route, "epoch", Date.now(), false)] };
+  };
+  await expect(configureCompute(f.input, f.read, f.head, observe)).rejects.toThrow("already owned");
+  expect((await db.prisma.computeTraffic.findUniqueOrThrow({ where: { routeId: "foreign-route" } })).environmentId).toBe(other.id);
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
 });
