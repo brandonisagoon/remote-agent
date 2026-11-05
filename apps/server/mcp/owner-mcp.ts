@@ -1,3 +1,4 @@
+import { NativeSource, NativeTakeoverInput } from "../services/launches/native-takeover.ts";
 // Owner supervision entry point. Connect over the owner's SSH transport;
 // credentials stay on the host. This server is never injected into task agents.
 import { createInterface } from "node:readline";
@@ -10,6 +11,8 @@ const { values } = parseArgs({ options: { socket: { type: "string" }, config: { 
 if (!values.socket) throw new Error("--socket must name the owner's private control socket");
 const Id = z.string().min(1).max(200);
 const tools = [
+  { name: "inspect_native_takeover", description: "Inspect accepted launch withdrawal and actual managed-family pause for an explicitly native-owned source. Requires owner --config authentication.", schema: z.object({ source: NativeSource }).strict(), method: "GET", route: (a: any) => `/api/launches/native-takeover?${new URLSearchParams(a.source)}` },
+  { name: "take_native_ownership", description: "Reconcile an already-authorized native takeover: fence accepted/delayed managed launches, pause exact original families and verify inactivity while preserving work. Reuse requestKey; pending is not stopped. Requires owner --config.", schema: NativeTakeoverInput, method: "POST", route: () => "/api/launches/native-takeover" },
   { name: "inspect_completion", description: "Inspect the owner's authorized completion boundary and separate implementation, verification, commit, push, PR, review and merge receipts. Unknown authority does not mean delivered.", schema: z.object({ taskId: Id }).strict(), method: "GET", route: (a: any) => `/api/tasks/${encodeURIComponent(a.taskId)}/completion` },
   { name: "set_completion_boundary", description: "Record or revoke the user's explicit delivery boundary; never infer push, review or merge authority. Supply the user's basis and current contract revision (0 if unknown). Requires owner --config authentication. Changing authority invalidates prior verification.", schema: z.object({ taskId: Id, contract: CompletionContractInput }).strict(), method: "PUT", route: (a: any) => `/api/tasks/${encodeURIComponent(a.taskId)}/completion/contract` },
   { name: "record_completion_verification", description: "Record the owner's actual verification evidence, passed or failed, bound to the current worktree and completion contract. Do not invent or infer this from model progress. Requires owner --config authentication.", schema: z.object({ taskId: Id, verification: CompletionVerificationInput }).strict(), method: "POST", route: (a: any) => `/api/tasks/${encodeURIComponent(a.taskId)}/completion/verification` },
@@ -32,8 +35,8 @@ async function call(name: string, raw: unknown) {
   if (!tool) throw new Error("Unknown supervision tool");
   const args = tool.schema.parse(raw);
   const body = "contract" in args ? args.contract : "verification" in args ? args.verification : Object.fromEntries(Object.entries(args).filter(([key]) => !["taskId", "placementId", "instructionId", ...(name === "act_on_placement" ? [] : ["questionId"])].includes(key)));
-  const ownerWrite = name === "set_completion_boundary" || name === "record_completion_verification";
-  if (ownerWrite && !values.config) throw new Error("Owner completion writes require --config pointing to the owner's host config");
+  const ownerWrite = name === "set_completion_boundary" || name === "record_completion_verification" || name === "inspect_native_takeover" || name === "take_native_ownership";
+  if (ownerWrite && !values.config) throw new Error("Owner controls require --config pointing to the owner's host config");
   const instructionCancel = name === "resolve_instruction" && "action" in args && args.action === "cancel";
   const authorization = ownerWrite || (instructionCancel && values.config) ? `Bearer ${readConfig(values.config!).apiKey}` : undefined;
   const response = await fetch(`http://remote-agent${tool.route(args)}`, { unix: values.socket, method: tool.method, headers: { "content-type": "application/json", ...(authorization ? { authorization } : {}) }, ...(tool.method === "GET" ? {} : { body: JSON.stringify(body) }) } as RequestInit & { unix: string });

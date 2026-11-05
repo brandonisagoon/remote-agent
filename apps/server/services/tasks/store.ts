@@ -1,3 +1,4 @@
+import { assertNativeLaunch } from "../launches/native-takeover.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { RepositoryConfig } from "../../../../lib/config.ts";
 
@@ -8,10 +9,14 @@ export async function beginTask(prisma: PrismaClient, input: {
 }) {
   const { repository, ...identity } = input;
   if (!repository.tooling) throw new Error("Managed tasks require a pinned tooling source");
-  const task = await prisma.remoteTask.upsert({
-    where: { requestKey: input.requestKey },
-    update: {},
-    create: { ...identity, repositoryId: repository.id, toolingRoot: repository.tooling.root, toolingRevision: repository.tooling.revision },
+  const tooling = repository.tooling;
+  const task = await prisma.$transaction(async tx => {
+    if (input.connectionId && input.issueIdentifier) await assertNativeLaunch(tx, { connectionId: input.connectionId, repositoryId: repository.id, issueIdentifier: input.issueIdentifier }, input.requestKey);
+    return tx.remoteTask.upsert({
+      where: { requestKey: input.requestKey },
+      update: {},
+      create: { ...identity, repositoryId: repository.id, toolingRoot: tooling.root, toolingRevision: tooling.revision },
+    });
   });
   if (task.repositoryId !== repository.id || task.machineId !== input.machineId || task.branchName !== input.branchName || task.connectionId !== (input.connectionId ?? null) || task.issueIdentifier !== (input.issueIdentifier ?? null)) {
     throw new Error("Task request key already belongs to a different launch");

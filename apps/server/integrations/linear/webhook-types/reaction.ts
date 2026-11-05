@@ -21,6 +21,7 @@ export const LinearReactionWebhookSchema = z.object({
   webhookTimestamp: z.number().int(),
   data: z.object({
     id: z.string(),
+    createdAt: z.string().nullish(),
     emoji: z.string(),
     userId: z.string().nullish(),
     user: LinearReactionUserSchema.nullish(),

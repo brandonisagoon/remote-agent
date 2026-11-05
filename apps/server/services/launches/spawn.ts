@@ -1,3 +1,4 @@
+import { assertNativeLaunch, bindNativeLaunchSession } from "./native-takeover.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
@@ -37,6 +38,10 @@ export interface SpawnAgentThreadInput {
 export async function spawnAgentThread(
   input: SpawnAgentThreadInput,
 ) {
+  const assertLaunch = async () => {
+    if (input.role === "primary" && input.issueIdentifier) await assertNativeLaunch(input.prisma, { connectionId: input.config.activeConnectionId, repositoryId: input.config.activeRepositoryId, issueIdentifier: input.issueIdentifier }, input.launchKey);
+  };
+  await assertLaunch();
   const session = await input.agentRuntime.ensureSession({
     sessionKey: input.launchKey,
     name: input.title ?? `${input.issueIdentifier ?? "Task"} · ${input.role}`,
@@ -67,12 +72,15 @@ export async function spawnAgentThread(
   });
 
   try {
+    await assertLaunch();
+    if (input.role === "primary" && input.issueIdentifier) await bindNativeLaunchSession(input.prisma, { connectionId: input.config.activeConnectionId, repositoryId: input.config.activeRepositoryId, issueIdentifier: input.issueIdentifier }, input.launchKey, session.id);
     if (input.taskId) {
       await input.prisma.remoteTask.update({ where: { id: input.taskId }, data: { primarySessionId: session.id } });
     }
     // Mode must land before the prompt: a plan-capture session that starts
     // its turn outside plan mode never produces an exit-plan approval.
     if (input.mode) await input.agentRuntime.setMode(session.id, input.mode);
+    await assertLaunch();
     await input.agentRuntime.enqueue({
       sessionId: session.id,
       text: input.prompt,

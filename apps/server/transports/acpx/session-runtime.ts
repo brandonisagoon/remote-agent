@@ -1,3 +1,4 @@
+import { assertNativeSession } from "../../services/launches/native-takeover.ts";
 import type { ClosedFamilyReservation, ClosedProviderEvidence } from "../../../../types/runtime/closed-family.ts";
 import { readClosedFamilyOwnership, closedFamilyDigest } from "../../services/sessions/closed-family-ownership.ts";
 import { readClosedSessionMessages } from "./closed-history.ts";
@@ -450,6 +451,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         }
         const session = await this.requireSession(input.sessionId);
         await assertTaskOpen(this.prisma, session.cwd);
+        await assertNativeSession(this.prisma, session.id);
         if (this.capacity.full) {
           queue.push({ kind: "update", id: `${requestId}:queued`, sessionId: session.id, requestId, createdAt: Date.now(), update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Queued — waiting for an available agent slot on this machine.\n" } } });
         }
@@ -457,8 +459,10 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
         await this.requireSession(input.sessionId);
         await assertTaskOpen(this.prisma, session.cwd);
+        await assertNativeSession(this.prisma, session.id);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
         await assertTaskOpen(this.prisma, session.cwd);
+        await assertNativeSession(this.prisma, session.id);
         if (input.beforeStart && !(await input.beforeStart())) {
           completion.resolve({ status: "cancelled", stopReason: "instruction-not-claimed" });
           queue.close();
@@ -472,6 +476,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           recoveryDetail: null,
         });
         await assertTaskOpen(this.prisma, session.cwd);
+        await assertNativeSession(this.prisma, session.id);
+        if (signal.aborted) throw new Error("Waiting turn cancelled");
         current = this.runtimeFor(session.id).startTurn({
           handle,
           text: input.text,
