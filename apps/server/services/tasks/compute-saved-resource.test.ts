@@ -170,7 +170,7 @@ test("stopped saved revision requeues fairly, preserves history and replays a lo
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(f.resource);
 });
 
-test.each(["claimed", "running", "unknown", "unexplained-slot"])("saved revision refuses %s without changing its allocation", async state => {
+test.each(["validating", "claimed", "running", "unknown", "unexplained-slot"])("saved revision refuses %s without changing its allocation", async state => {
   const f = await nextRevision(), offer = (await offerNextCompute(context()))!;
   await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: state === "unexplained-slot" ? "stopped" : state } });
   await db.prisma.computeSlot.upsert({ where: { id: "host:0" }, create: { id: "host:0", machineId: "host", ordinal: 0, allocationId: offer.id }, update: { allocationId: offer.id } });

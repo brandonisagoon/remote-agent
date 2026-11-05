@@ -60,6 +60,8 @@ model ComputeOffer {
   deliveredAt        DateTime?
   expiresAt          DateTime?
   claimedAt          DateTime?
+  validationToken    String?
+  validationExpiresAt DateTime?
   completedAt        DateTime?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

@@ -16,7 +16,8 @@ type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy;
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 export const ComputeRequest = z.object({ key: Key, purpose: z.enum(["development", "review"]), revision: z.string().regex(/^[a-f0-9]{40}$/), recipeDigest: Digest, saved: SavedComputeBinding.optional() }).strict();
-const activeOffers = ["queued", "offered", "claimed", "running", "unknown"];
+export const COMPUTE_VALIDATION_MS = 300_000;
+const activeOffers = ["queued", "offered", "validating", "claimed", "running", "unknown"];
 const computeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const at = (input: Context) => input.now ?? new Date();
 function policy(input: Context) {
@@ -143,7 +144,7 @@ async function rotate(store: Store, environment: ComputeEnvironment, now: Date) 
 }
 async function withdraw(store: Store, offerId: string, reason: "expired" | "declined" | "ineligible", now: Date, options: { preserveQueue?: boolean } = {}) {
   const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: offerId } });
-  if (!["queued", "offered"].includes(offer.state)) return false;
+  if (!["queued", "offered", "validating"].includes(offer.state)) return false;
   await store.computeOffer.update({ where: { id: offer.id }, data: { state: reason, completedAt: now } });
   await store.computeSlot.updateMany({ where: { allocationId: offer.id }, data: { allocationId: null } });
   // Only our undelivered queued message may be cancelled. Dispatching or
@@ -158,7 +159,7 @@ async function withdraw(store: Store, offerId: string, reason: "expired" | "decl
 export async function savedRevisionAllocations(store: Pick<Store, "computeOffer" | "computeSlot">, environmentId: string) {
   const offers = await store.computeOffer.findMany({ where: { environmentId }, orderBy: { id: "asc" }, take: 1001 });
   if (offers.length > 1000) throw new Error("Saved compute revision history exceeds its bound");
-  if (offers.some(value => ["claimed", "running", "unknown"].includes(value.state))) throw new Error("Saved compute revision still has an active or uncertain allocation");
+  if (offers.some(value => ["validating", "claimed", "running", "unknown"].includes(value.state))) throw new Error("Saved compute revision still has an active or uncertain allocation");
   const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(value => value.id) } }, orderBy: { id: "asc" }, take: 1001 });
   if (slots.length > 1000 || slots.some(slot => !offers.some(offer => offer.id === slot.allocationId && offer.state === "offered" && offer.claimedAt === null))) throw new Error("Saved compute revision has an unexplained slot");
   return { offers, slots };
@@ -282,7 +283,7 @@ export async function reconcileComputeOffers(input: Context) {
     }
   }
   return input.prisma.$transaction(async store => {
-    const offers = await store.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "claimed"] } }, take: 1001 });
+    const offers = await store.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "validating", "claimed"] } }, take: 1001 });
     if (offers.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
     for (const offer of offers) {
       if (offer.state === "claimed") {
@@ -296,7 +297,7 @@ export async function reconcileComputeOffers(input: Context) {
       const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
       try { await assertComputeEnvironmentOwner(store, environment); }
       catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; await withdraw(store, offer.id, "ineligible", now); continue; }
-      const deadline = offer.state === "queued" ? offer.dispatchDeadline : offer.expiresAt;
+      const deadline = offer.state === "queued" ? offer.dispatchDeadline : offer.state === "validating" ? offer.validationExpiresAt : offer.expiresAt;
       if (deadline && deadline <= now) await withdraw(store, offer.id, "expired", now);
     }
   });
@@ -357,34 +358,79 @@ export async function confirmComputeDelivery(input: Context & { sessionId: strin
   });
 }
 
-export async function claimCompute(input: Context & { taskId: string; offerId: string; request: z.infer<typeof ComputeRequest> }) {
+const claimValidations = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
+type ClaimInput = Context & { taskId: string; offerId: string; request: z.infer<typeof ComputeRequest> };
+
+export async function claimCompute(input: ClaimInput, refresh = refreshBaseline) {
   policy(input); const request = ComputeRequest.parse(input.request);
-  if (await input.prisma.computeOffer.findFirst({ where: { id: input.offerId, state: "offered" } })) await refreshBaseline(input);
-  return input.prisma.$transaction(async store => {
+  // Persist timely intent and retain the existing slot before slow physical reads.
+  // VALIDATING is never start authority, and never changes the original offer TTL.
+  const reservation = await input.prisma.$transaction(async store => {
     const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);
     const { saved, ...recipe } = request;
     if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim does not match its exact environment");
     assertSavedComputeRequest(environment, saved);
-    if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { offer, environment, resumed: true }; }
+    if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { completed: { offer, environment, resumed: true }, token: null }; }
+    if (offer.state === "validating") {
+      if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
+
+      if (!offer.validationToken || !offer.validationExpiresAt || offer.validationExpiresAt <= at(input)) throw new Error("Compute validation expired");
+      return { completed: null, token: offer.validationToken };
+    }
     if (offer.state !== "offered" || !offer.expiresAt || offer.expiresAt <= at(input)) throw new Error("Compute offer is expired or superseded");
+    if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
     if (saved) {
       const observed = ComputeObservation.safeParse(environment.observation);
       if (!observed.success) throw new Error("Saved compute requires a fresh stopped observation before claiming");
       assertSavedComputeStopped(environment, observed.data, at(input), input.policy.collectorFreshnessSeconds);
     }
-    const slot = await store.computeSlot.findUnique({ where: { allocationId: offer.id } });
-    if (!slot) throw new Error("Compute reservation is unavailable");
-    const capacity = await computeAdmissionCapacity(store, input);
-    if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new Error("Compute reservation is unavailable");
-    const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input) } });
-    await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
-    const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });
-    await supersedeRuntimeSuspension(store, input.taskId, environment.id, offer.id);
-    await assertComputeStartIntent(store, input.taskId, environment.id, offer.id);
-    return { offer: claimed, environment: updated, resumed: false };
+    const token = randomUUID();
+    await store.computeOffer.update({ where: { id: offer.id }, data: { state: "validating", validationToken: token, validationExpiresAt: new Date(at(input).getTime() + COMPUTE_VALIDATION_MS) } });
+    return { completed: null, token };
   });
+  if (reservation.completed) return reservation.completed;
+  let pending = claimValidations.get(input.prisma);
+  if (!pending) { pending = new Map(); claimValidations.set(input.prisma, pending); }
+  const existing = pending.get(input.offerId);
+  if (existing) return existing as ReturnType<typeof finishComputeValidation>;
+  const work = finishComputeValidation(input, request, reservation.token!, refresh);
+  pending.set(input.offerId, work);
+  try { return await work; } finally { if (pending.get(input.offerId) === work) pending.delete(input.offerId); }
+}
+
+async function finishComputeValidation(input: ClaimInput, request: z.infer<typeof ComputeRequest>, token: string, refresh: typeof refreshBaseline) {
+  try {
+    await refresh(input);
+    return await input.prisma.$transaction(async store => {
+      const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
+      const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
+      await assertComputeEnvironmentOwner(store, environment);
+      const { saved, ...recipe } = request;
+      if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim identity changed during validation");
+      assertSavedComputeRequest(environment, saved);
+      if (offer.state !== "validating" || offer.validationToken !== token || !offer.validationExpiresAt || offer.validationExpiresAt <= at(input)) throw new Error("Compute validation expired or superseded");
+      if (saved) {
+        const observed = ComputeObservation.safeParse(environment.observation);
+        if (!observed.success) throw new Error("Saved compute requires a fresh stopped observation before claiming");
+        assertSavedComputeStopped(environment, observed.data, at(input), input.policy.collectorFreshnessSeconds);
+      }
+      if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
+      const capacity = await computeAdmissionCapacity(store, input);
+      if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new Error("Compute reservation is unavailable");
+      const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input), validationToken: null, validationExpiresAt: null } });
+      await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
+      const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });
+      await supersedeRuntimeSuspension(store, input.taskId, environment.id, offer.id);
+      await assertComputeStartIntent(store, input.taskId, environment.id, offer.id);
+      return { offer: claimed, environment: updated, resumed: false };
+    });
+  } catch (error) {
+    // A failed observer does not free a reservation. The durable validation
+    // deadline, explicit decline or owner reconciliation releases it safely.
+    throw error;
+  }
 }
 
 export async function declineCompute(input: Context & { taskId: string; offerId: string }) {

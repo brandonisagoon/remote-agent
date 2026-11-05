@@ -31,7 +31,7 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   const slots = await input.prisma.computeSlot.findMany({ where: { allocationId: { in: offers.map(value => value.id) } }, orderBy: { id: "asc" }, take: 1001 });
   if (offers.length > 1000 || slots.length > 1000) throw new Error("Configuration allocation history exceeds its bound");
   const allocations = { offers, slots };
-  const active = allocations.offers.filter(o => ["queued", "offered", "claimed", "running", "unknown"].includes(o.state));
+  const active = allocations.offers.filter(o => ["queued", "offered", "validating", "claimed", "running", "unknown"].includes(o.state));
   const retained = ["claimed", "running", "unknown"].includes(offer.state) && !offer.completedAt && active.length === 1 && active[0]!.id === offer.id
     && slots.length === 1 && slots[0]!.allocationId === offer.id && slots[0]!.machineId === input.config.machine;
   const lastClaim = offers.filter(value => value.claimedAt).sort((a, b) => b.claimedAt!.getTime() - a.claimedAt!.getTime())[0];
