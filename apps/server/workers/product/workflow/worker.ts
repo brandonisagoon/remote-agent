@@ -1,3 +1,4 @@
+import { assertNativeLaunch, freshReactionNativeLaunch, isFreshNativeReaction, withNativeLaunchWork, NativeLaunchWithdrawnError } from "../../../services/launches/native-takeover.ts";
 import {
   DispatchEventType,
   WorkerRunStatus,
@@ -31,6 +32,7 @@ type WorkflowEvent = Extract<
 >;
 
 export interface WorkflowWorkerDependencies {
+  assertLaunch?: typeof assertNativeLaunch;
   getIssue: (
     config: Parameters<typeof getSourceIssueForWorkflow>[0],
     query: { id: string },
@@ -101,7 +103,7 @@ export function acknowledgementReaction(event: WorkflowEvent): string {
 export function createWorkflowWorker(
   dependencies: WorkflowWorkerDependencies = defaultDependencies,
 ): Worker<WorkflowEvent> {
-  return {
+  const worker: Worker<WorkflowEvent> = {
     key: "product.workflow",
     supports(event): event is WorkflowEvent {
       return event.type === DispatchEventType.TrackerWorkflowTriggered;
@@ -116,6 +118,14 @@ export function createWorkflowWorker(
 
       const issueRef = issueReferenceFromEvent(event);
       if (!issueRef) return result("failed", "event has no issue reference");
+      // A saved withdrawal is local authority: do not make a provider lookup
+      // just to reject an old or unprovably fresh accepted launch.
+      if (workflow.deliver === "start-session" && !dependencies.assertLaunch) {
+        const fence = await context.prisma.nativeTakeover.findFirst({ where: { connectionId: context.config.activeConnectionId, repositoryId: repository.id,
+          OR: [{ issueId: issueRef }, { issueIdentifier: issueRef }] } });
+        if (fence && !(fence.mode === "managed" && fence.grantKey === context.runId)
+          && !(event.webhook.type === "Reaction" && isFreshNativeReaction(context.config, repository.id, fence.decidedAt, event.webhook.data))) return result("ignored", "Launch withdrawn by native ownership", fence.issueIdentifier);
+      }
       const issue = await dependencies.getIssue(context.config, { id: issueRef });
       if (!issue) return result("failed", "source issue not found");
 
@@ -158,6 +168,17 @@ export function createWorkflowWorker(
           },
         });
       }
+
+      if (!dependencies.assertLaunch && event.webhook.type === "Reaction") {
+        const resumed = await freshReactionNativeLaunch({ prisma: context.prisma, config: context.config, runtime: context.agentRuntime! },
+          { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueId: issue.id, issueIdentifier: issue.identifier }, context.runId, event.webhook.data,
+          task => (dependencies.compose ?? composeForPrompt)(task.worktreePath!, buildWorkflowSeedPrompt(workflow, { sourceIssueIdentifier: issue.identifier, sourceIssueTitle: issue.title,
+            sourceIssueDescription: issue.description ?? "(No description)", continuation: "The owner requested this workflow after native takeover. Continue the same original task and pinned tooling.", taskId: task.id }),
+            provider, repository.skillsRoot, task.pinnedToolingRoot!));
+        if (resumed) return result("delivered", `Fresh owner reaction queued on original runtime_session:${resumed}`, issue.identifier);
+      }
+      try { await (dependencies.assertLaunch ?? assertNativeLaunch)(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueIdentifier: issue.identifier }, context.runId); }
+      catch (error) { if (error instanceof NativeLaunchWithdrawnError) return result("ignored", error.message, issue.identifier); throw error; }
 
       // A planning primary is an existing conversation to continue, not a
       // duplicate implementation launch. Resolve it before the generic guard.
@@ -257,6 +278,7 @@ export function createWorkflowWorker(
         const { prompt, toolingRoot } = task
           ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose })
           : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
+        await (dependencies.assertLaunch ?? assertNativeLaunch)(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueIdentifier: issue.identifier }, context.runId);
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma,
@@ -279,6 +301,7 @@ export function createWorkflowWorker(
           ...(workflow.plan?.captureToIssue ? { mode: "plan" } : {}),
         });
       } catch (error) {
+        if (error instanceof NativeLaunchWithdrawnError) return result("ignored", error.message, issue.identifier);
         if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: error instanceof Error ? error.message : String(error) } });
         return result(
           "failed",
@@ -305,6 +328,12 @@ export function createWorkflowWorker(
       );
     },
   };
+  return { ...worker, execute(event, context) {
+    const issue = issueReferenceFromEvent(event);
+    if (!issue || context.config.repository.workflows[event.workflowId]?.deliver !== "start-session") return worker.execute(event, context);
+    return withNativeLaunchWork(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: context.config.repository.id, issue }, context.runId,
+      () => worker.execute(event, context));
+  } };
 }
 
 export const workflowWorker = createWorkflowWorker();

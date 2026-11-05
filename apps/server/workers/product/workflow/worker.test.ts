@@ -1,3 +1,6 @@
+import { createTestDatabase } from "../../../../../test-support/db.ts";
+import { takeNativeOwnership } from "../../../services/launches/native-takeover.ts";
+import { createFakeAgentRuntime } from "../../../../../test-support/agent-runtime.ts";
 import { describe, expect, test } from "bun:test";
 
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
@@ -6,6 +9,8 @@ import type { WorkerContext } from "../../../../../types/dispatcher/index.ts";
 import { testConfig } from "../../../../../test-support/config.ts";
 import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
 import { acknowledgementReaction, buildWorkflowSeedPrompt, createWorkflowWorker, type WorkflowWorkerDependencies } from "./worker.ts";
+
+type WorkflowEvent = Extract<DispatchEvent, { type: typeof DispatchEventType.TrackerWorkflowTriggered }>;
 
 const ISSUE: SourceIssueWithAgentIssues = {
   id: "issue-uuid",
@@ -18,7 +23,7 @@ const ISSUE: SourceIssueWithAgentIssues = {
   agentIssues: [],
 } as unknown as SourceIssueWithAgentIssues;
 
-function issueEvent(workflowId: string): DispatchEvent {
+function issueEvent(workflowId: string): WorkflowEvent {
   return {
     type: DispatchEventType.TrackerWorkflowTriggered,
     workflowId,
@@ -28,10 +33,10 @@ function issueEvent(workflowId: string): DispatchEvent {
       webhookTimestamp: Date.now(),
       data: { id: "issue-uuid", identifier: "CUBE-42", state: { name: "Planning" } },
     },
-  } as DispatchEvent;
+  } as WorkflowEvent;
 }
 
-function reactionEvent(workflowId: string, emoji: string): DispatchEvent {
+function reactionEvent(workflowId: string, emoji: string): WorkflowEvent {
   return {
     type: DispatchEventType.TrackerWorkflowTriggered,
     workflowId,
@@ -39,7 +44,7 @@ function reactionEvent(workflowId: string, emoji: string): DispatchEvent {
       type: "Reaction", action: "create", webhookTimestamp: Date.now(),
       data: { id: "reaction-uuid", emoji, userId: "owner-uuid", issueId: "issue-uuid", issue: { id: "issue-uuid", identifier: "CUBE-42" } },
     },
-  } as DispatchEvent;
+  } as WorkflowEvent;
 }
 
 function context(overrides: {
@@ -68,6 +73,7 @@ interface Recorded {
 
 function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDependencies> = {}): WorkflowWorkerDependencies {
   return {
+    assertLaunch: async () => {},
     getIssue: async () => ISSUE,
     react: (async (_key: string, _issue: string, reaction: string) => {
       record.reactions.push(reaction);
@@ -280,4 +286,40 @@ describe("workflow worker", () => {
     expect(prompt).toContain("{{SKILL:orchestrate+tunnel}}");
     expect(prompt).toContain("- branchName: feature/x");
   });
+});
+
+
+test.each(["provision", "compose"] as const)("native ownership during %s prevents the accepted worker from launching", async stage => {
+  const db = await createTestDatabase(), runtime = createFakeAgentRuntime(), ctx = context(), record = recorded();
+  ctx.prisma = db.prisma; ctx.agentRuntime = runtime;
+  let entered!: () => void, release!: () => void;
+  const waiting = new Promise<void>(resolve => entered = resolve), resume = new Promise<void>(resolve => release = resolve);
+  const base = dependencies(record);
+  const deps = { ...base, assertLaunch: undefined, hasLiveSession: async () => false,
+    provision: async (input: Parameters<NonNullable<WorkflowWorkerDependencies["provision"]>>[0]) => { if (stage === "provision") { entered(); await resume; } return base.provision!(input); },
+    compose: async (...args: Parameters<NonNullable<WorkflowWorkerDependencies["compose"]>>) => { if (stage === "compose") { entered(); await resume; } return base.compose!(...args); },
+  };
+  const work = createWorkflowWorker(deps).execute(issueEvent("plan"), ctx);
+  await waiting;
+  try {
+    const source = { connectionId: ctx.config.activeConnectionId, repositoryId: ctx.config.repository.id, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier };
+    expect((await takeNativeOwnership({ prisma: db.prisma, config: ctx.config, runtime }, { source, expectedRevision: 0, requestKey: "native", nativeChat: { hostId: "local", threadId: "native" } })).state).toBe("pending");
+  } finally { release(); }
+  try { expect((await work).status).toBe("ignored"); expect(record.launched).toHaveLength(0); expect(record.reactions).toHaveLength(0); }
+  finally { await db.cleanup(); }
+});
+
+
+test("a withdrawn accepted workflow acknowledges without a provider lookup, including replay under a new delivery", async () => {
+  const db = await createTestDatabase(), runtime = createFakeAgentRuntime(), ctx = context(), record = recorded();
+  ctx.prisma = db.prisma; ctx.agentRuntime = runtime;
+  try {
+    const source = { connectionId: ctx.config.activeConnectionId, repositoryId: ctx.config.repository.id, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier };
+    await takeNativeOwnership({ prisma: db.prisma, config: ctx.config, runtime }, { source, expectedRevision: 0, requestKey: "native", nativeChat: { hostId: "local", threadId: "native" } });
+    let lookups = 0;
+    const worker = createWorkflowWorker(dependencies(record, { assertLaunch: undefined, getIssue: async () => { lookups++; throw new Error("Provider must not be needed for a saved withdrawal"); } }));
+    expect((await worker.execute(issueEvent("plan"), ctx)).status).toBe("ignored");
+    expect((await worker.execute(reactionEvent("plan", "🚀"), { ...ctx, runId: "new-delivery-same-old-intent" })).status).toBe("ignored");
+    expect(lookups).toBe(0); expect(record.launched).toHaveLength(0);
+  } finally { await db.cleanup(); }
 });

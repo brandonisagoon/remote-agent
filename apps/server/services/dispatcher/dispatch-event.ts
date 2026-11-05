@@ -1,3 +1,4 @@
+import { NativeLaunchWithdrawnError } from "../launches/native-takeover.ts";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime, CommandClient } from "../../../../types/runtime/index.ts";
@@ -78,7 +79,7 @@ export async function dispatchEvent(
       });
     } catch (error) {
       result = {
-        status: "failed",
+        status: error instanceof NativeLaunchWithdrawnError ? "ignored" : "failed",
         detail: error instanceof Error ? error.message : String(error),
         targetResourceId: null,
       };

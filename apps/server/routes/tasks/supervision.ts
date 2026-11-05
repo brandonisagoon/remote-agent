@@ -1,3 +1,4 @@
+import { pauseTaskFamily } from "../../services/tasks/automation-pause.ts";
 import { verifyBearerToken } from "../../security.ts";
 import { ClosedFamilyPrepare, ClosedFamilyCommit, prepareClosedFamily, commitClosedFamily, closedFamilyReceipt } from "../../services/sessions/closed-family.ts";
 import { TASK_READ_DEADLINE_MS, taskRequest } from "../../middleware/request-lifetime.ts";
@@ -121,26 +122,10 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
       // older HTTP continuation must never overwrite a newer owner decision.
       if (!development && task.ownerPaused !== paused) await prisma.remoteTask.update({ where: { id: task.id }, data: { ownerPaused: paused } });
       if (paused) {
-        const liveSessions = async () => task.worktreePath ? (await runtime.listSessions({ cwd: task.worktreePath })).filter(session => {
-          if (session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || session.status === "closed") return false;
-          if (session.status === "active" || session.status === "provisioning") return true;
-          const observed = runtime.observeSessionActivity?.(session.id).state;
-          return observed === "executing" || observed === "queued";
-        }) : [];
-        const sessions = await liveSessions();
-        // Cancellation may fail or wait for a provider receipt. Start every
-        // owned session independently so neither case leaves delegates running.
-        const failures = (await Promise.all(sessions.map(async session => {
-          try {
-            if (development) await assertDevelopmentRequest({ prisma, config: c.get("config"), taskId: task.id, ...development });
-            await runtime.cancel(session.id, "Owner paused task"); return null;
-          }
-          catch (error) { return { sessionId: session.id, error: error instanceof Error ? error.message : String(error) }; }
-        }))).filter(failure => failure !== null);
-        // A successful cancellation request does not prove the turn stopped.
-        // Re-read terminal state; a retry only targets the remaining live work.
-        const pendingSessionIds = (await liveSessions()).map(session => session.id);
-        const pause = { state: pendingSessionIds.length ? "pending" : "paused", attemptedSessionIds: sessions.map(session => session.id), pendingSessionIds, failures };
+        const pause = await pauseTaskFamily(task, runtime, async () => {
+          if (development) await assertDevelopmentRequest({ prisma, config: c.get("config"), taskId: task.id, ...development });
+        });
+        const { failures, pendingSessionIds } = pause;
         const current = await responseTask();
         if (failures.length) return c.json({ task: current, pause,
           error: `Task remains owner-paused. Cancellation failed: ${failures.map(failure => `${failure.sessionId}: ${failure.error}`).join("; ")}. Pending sessions: ${pendingSessionIds.join(", ") || "none"}.`,

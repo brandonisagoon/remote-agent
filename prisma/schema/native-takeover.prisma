@@ -1,0 +1,33 @@
+/// A source-scoped execution fence, independent of any managed session.
+model NativeTakeover {
+  id              String @id @default(cuid())
+  sourceKey       String @unique
+  connectionId    String
+  repositoryId    String
+  machineId       String
+  issueId         String
+  issueIdentifier String
+  revision        Int
+  mode            String
+  grantKey        String?
+  grantedSessionId String?
+  settled         Boolean @default(false)
+  decidedAt       DateTime
+  events          NativeTakeoverEvent[]
+  @@unique([connectionId, repositoryId, issueIdentifier])
+}
+
+/// Decisions and reconciliation receipts are append-only, including withdrawals.
+model NativeTakeoverEvent {
+  sequence    Int @id @default(autoincrement())
+  controlId   String
+  requestKey  String
+  inputDigest String
+  revision    Int
+  kind        String
+  value       Json
+  createdAt   DateTime @default(now())
+  control     NativeTakeover @relation(fields: [controlId], references: [id], onDelete: Restrict)
+  @@unique([controlId, requestKey])
+  @@index([controlId, sequence])
+}
