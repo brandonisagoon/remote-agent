@@ -8,7 +8,7 @@ import { queueInstruction, deliverInstructions } from "../sessions/inbox.ts";
 import { beginTask } from "../tasks/store.ts";
 import { createApp } from "../../app.ts";
 import { spawnAgentThread } from "./spawn.ts";
-import { assertNativeLaunch, assertNativeSession, bindNativeLaunchSession, freshReactionNativeLaunch, grantNativeLaunch, inspectNativeTakeover, takeNativeOwnership } from "./native-takeover.ts";
+import { withNativeLaunchWork, assertNativeLaunch, assertNativeSession, bindNativeLaunchSession, freshReactionNativeLaunch, grantNativeLaunch, inspectNativeTakeover, takeNativeOwnership } from "./native-takeover.ts";
 
 let db: TestDatabase;
 beforeEach(async () => { db = await createTestDatabase(); });
@@ -233,4 +233,31 @@ test("a partially applied fresh reaction grant resumes with the same immutable d
   expect(await freshReactionNativeLaunch(f.context, f.source, "fresh-run", reaction, async () => { throw new Error("Replay must not compose again"); })).toBe("primary");
   expect(await db.prisma.nativeTakeoverEvent.count({ where: { kind: "managed" } })).toBe(1);
   expect(await db.prisma.runtimeInstruction.count({ where: { id: "native-reaction:fresh" } })).toBe(1);
+});
+
+
+test("duplicate live attempts under one durable run stay pending until both existing spans exit", async () => {
+  const f = fixture(); let first!: () => void, second!: () => void;
+  const a = new Promise<void>(resolve => first = resolve), b = new Promise<void>(resolve => second = resolve);
+  const source = { connectionId: f.source.connectionId, repositoryId: f.source.repositoryId, issue: f.source.issueIdentifier };
+  const one = withNativeLaunchWork(db.prisma, source, "same-run", () => a);
+  const two = withNativeLaunchWork(db.prisma, source, "same-run", () => b);
+  try {
+    expect((await takeNativeOwnership(f.context, f.input)).state).toBe("pending");
+    first(); await one;
+    expect((await takeNativeOwnership(f.context, f.input)).state).toBe("pending");
+    second(); await two;
+    expect((await takeNativeOwnership(f.context, f.input)).state).toBe("native");
+  } finally { first(); second(); await Promise.all([one, two]); }
+});
+
+
+test("a pending worker from an earlier process remains unverified instead of being declared dead", async () => {
+  const f = fixture();
+  const receipt = await db.prisma.webhookReceipt.create({ data: { webhookId: f.config.activeWebhookId, deliveryId: "old-process", eventType: "reaction", status: "accepted", connectionId: f.source.connectionId, repositoryId: f.source.repositoryId, resourceId: f.source.issueIdentifier } });
+  const run = await db.prisma.workerRun.create({ data: { receiptId: receipt.id, workerKey: "product.workflow:plan", status: "pending", createdAt: new Date(0) } });
+  const state = await takeNativeOwnership(f.context, f.input);
+  expect(state.state).toBe("pending"); expect(state).toMatchObject({ activeWorkerRunIds: [], unverifiedWorkerRunIds: [run.id] });
+  await expect(grantNativeLaunch(f.context, f.source, "cannot-infer-death", 1)).rejects.toThrow("not settled");
+  expect((await db.prisma.workerRun.findUniqueOrThrow({ where: { id: run.id } })).status).toBe("pending");
 });

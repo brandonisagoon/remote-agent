@@ -303,7 +303,7 @@ test.each(["provision", "compose"] as const)("native ownership during %s prevent
   await waiting;
   try {
     const source = { connectionId: ctx.config.activeConnectionId, repositoryId: ctx.config.repository.id, issueId: ISSUE.id, issueIdentifier: ISSUE.identifier };
-    expect((await takeNativeOwnership({ prisma: db.prisma, config: ctx.config, runtime }, { source, expectedRevision: 0, requestKey: "native", nativeChat: { hostId: "local", threadId: "native" } })).state).toBe("native");
+    expect((await takeNativeOwnership({ prisma: db.prisma, config: ctx.config, runtime }, { source, expectedRevision: 0, requestKey: "native", nativeChat: { hostId: "local", threadId: "native" } })).state).toBe("pending");
   } finally { release(); }
   try { expect((await work).status).toBe("ignored"); expect(record.launched).toHaveLength(0); expect(record.reactions).toHaveLength(0); }
   finally { await db.cleanup(); }

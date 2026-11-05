@@ -25,6 +25,26 @@ function sourceLock<T>(prisma: PrismaClient, source: Pick<Source, "connectionId"
   entries.set(key, running);
   return running.finally(() => { if (entries!.get(key) === running) entries!.delete(key); });
 }
+const activeWork = new WeakMap<PrismaClient, Map<string, Map<string, number>>>();
+const workKey = (connectionId: string, repositoryId: string, issue: string) => hash([connectionId, repositoryId, issue]);
+export async function withNativeLaunchWork<T>(prisma: PrismaClient, source: { connectionId: string; repositoryId: string; issue: string }, runId: string, work: () => Promise<T>) {
+  let entries = activeWork.get(prisma); if (!entries) { entries = new Map(); activeWork.set(prisma, entries); }
+  const key = workKey(source.connectionId, source.repositoryId, source.issue);
+  let runs = entries.get(key); if (!runs) { runs = new Map(); entries.set(key, runs); }
+  runs.set(runId, (runs.get(runId) ?? 0) + 1);
+  try { return await work(); }
+  finally { const remaining = runs.get(runId)! - 1; if (remaining) runs.set(runId, remaining); else runs.delete(runId); if (!runs.size) entries.delete(key); }
+}
+const processStartedAt = new Date();
+async function pendingNativeWork(prisma: PrismaClient, source: Source) {
+  const entries = activeWork.get(prisma);
+  const active = [...new Set([source.issueId, source.issueIdentifier].flatMap(issue => [...entries?.get(workKey(source.connectionId, source.repositoryId, issue))?.keys() ?? []]))];
+  // A pre-process pending receipt cannot prove whether its old preparation
+  // stopped. Never promote missing in-memory state into a liveness receipt.
+  const unverified = await prisma.workerRun.findMany({ where: { status: "pending", workerKey: { startsWith: "product.workflow:" }, createdAt: { lt: processStartedAt },
+    receipt: { connectionId: source.connectionId, repositoryId: source.repositoryId, resourceId: { in: [source.issueId, source.issueIdentifier] } } }, select: { id: true } });
+  return { active, unverified: unverified.map(run => run.id), pending: [...new Set([...active, ...unverified.map(run => run.id)])] };
+}
 export async function nativeLaunchControl(prisma: Pick<PrismaClient, "nativeTakeover">, source: Pick<Source, "connectionId" | "repositoryId" | "issueIdentifier">) {
   return prisma.nativeTakeover.findUnique({ where: identity(source) });
 }
@@ -40,7 +60,8 @@ export async function inspectNativeTakeover({ prisma, config }: Context, source:
   if (!control) return { source, revision: 0, state: "unfenced", control: null, events: [] };
   sameSource(control, source, config);
   const tasks = await prisma.remoteTask.findMany({ where: { connectionId: source.connectionId, repositoryId: source.repositoryId, issueIdentifier: source.issueIdentifier, machineId: config.machine, phase: { not: "closed" } }, select: { id: true, primarySessionId: true, ownerPaused: true } });
-  return { source, revision: control.revision, state: control.mode === "native" ? control.settled ? "native" : "pending" : control.grantedSessionId ? "managed" : "launch-pending", control, tasks,
+  const workerState = await pendingNativeWork(prisma, source), pendingWorkerRunIds = workerState.pending;
+  return { source, revision: control.revision, state: control.mode === "native" ? control.settled && !pendingWorkerRunIds.length && tasks.every(task => task.ownerPaused) ? "native" : "pending" : control.grantedSessionId ? "managed" : "launch-pending", control, tasks, pendingWorkerRunIds, activeWorkerRunIds: workerState.active, unverifiedWorkerRunIds: workerState.unverified,
     events: await prisma.nativeTakeoverEvent.findMany({ where: { controlId: control.id }, orderBy: { sequence: "desc" }, take: 20 }) };
 }
 
@@ -99,11 +120,12 @@ async function performTakeover(context: Context, raw: z.infer<typeof NativeTakeo
   const unresolvedSessionIds = linked.filter(session => !tasks.some(task => task.worktreePath === session.cwd) &&
     (["active", "provisioning"].includes(session.status) || ["executing", "queued"].includes(runtime.observeSessionActivity?.(session.id).state ?? ""))).map(session => session.id);
   const stillPaused = await prisma.remoteTask.count({ where: { id: { in: tasks.map(task => task.id) }, ownerPaused: false } }) === 0;
-  const settled = stillPaused && !unresolvedSessionIds.length && pauses.every(pause => !pause.pendingSessionIds.length && !pause.failures.length);
+  const workerState = await pendingNativeWork(prisma, input.source), pendingWorkerRunIds = workerState.pending;
+  const settled = !pendingWorkerRunIds.length && stillPaused && !unresolvedSessionIds.length && pauses.every(pause => !pause.pendingSessionIds.length && !pause.failures.length);
   await prisma.$transaction(async tx => {
     const changed = await tx.nativeTakeover.updateMany({ where: { id: decision.control.id, revision: decision.appliedRevision, mode: "native" }, data: { settled } });
     if (!changed.count) throw new Error("Native ownership changed during family reconciliation");
-    const value = { pauses, unresolvedSessionIds, settled }, digest = hash(value);
+    const value = { pauses, pendingWorkerRunIds, activeWorkerRunIds: workerState.active, unverifiedWorkerRunIds: workerState.unverified, unresolvedSessionIds, settled }, digest = hash(value);
     await tx.nativeTakeoverEvent.upsert({ where: { controlId_requestKey: { controlId: decision.control.id, requestKey: `reconcile:${decision.appliedRevision}:${digest}` } }, update: {},
       create: { controlId: decision.control.id, requestKey: `reconcile:${decision.appliedRevision}:${digest}`, inputDigest: digest, revision: decision.appliedRevision, kind: "reconciled", value } });
   });
@@ -124,6 +146,7 @@ export function grantNativeLaunch(context: Context, source: Source, launchKey: s
 }
 async function performGrant(context: Context, source: Source, launchKey: string, expectedRevision: number, requestDigest: string) {
   const { prisma, config } = context; sourceConfig(config, source);
+  const workerState = await pendingNativeWork(prisma, source);
   return prisma.$transaction(async tx => {
     const current = await nativeLaunchControl(tx, source);
     if (!current) throw new Error("There is no native ownership decision for this grant");
@@ -134,7 +157,7 @@ async function performGrant(context: Context, source: Source, launchKey: string,
       if (prior.inputDigest !== inputDigest || prior.revision !== current.revision || current.grantKey !== launchKey || current.mode !== "managed") throw new Error("Owner launch grant is changed or superseded");
       return current;
     }
-    if (current.revision !== expectedRevision || !current.settled) throw new Error("Native ownership revision changed or its family has not settled");
+    if (current.revision !== expectedRevision || !current.settled || workerState.pending.length) throw new Error("Native ownership revision changed or its family has not settled");
     const revision = current.revision + 1;
     const granted = await tx.nativeTakeover.update({ where: { id: current.id, revision: expectedRevision }, data: { revision, mode: "managed", grantKey: launchKey, grantedSessionId: null, decidedAt: new Date() } });
     await tx.nativeTakeoverEvent.create({ data: { controlId: current.id, requestKey, inputDigest, revision, kind: "managed", value: { source, launchKey, expectedRevision, requestDigest } } });

@@ -34,7 +34,9 @@ all exact open source tasks in the same transaction as installing its fence.
 It then calls the existing family pause helper, including parallel cancellation
 and actual inactivity rechecks. Pending/failing cancellation, a resumed task or
 live ambiguous/independently owned linked session keeps `state: pending` (202).
-No independent task is cancelled merely from its ancestry. `state: native` is a
+An in-flight workflow provisioning/composition span also keeps takeover pending
+until that existing worker exits through its fence; no second preparation/cancel
+executor is started. No independent task is cancelled merely from its ancestry. `state: native` is a
 verified current disposition; a superseded response is not native authority.
 Queued results, original source, pins and historical receipts are preserved.
 
@@ -70,7 +72,12 @@ Owner takeover and grant requests serialize on the existing process owner while
 an original cancellation is in flight. This is request serialization, not a
 second cancellation executor or background orchestrator. The durable head is
 still authoritative after restart; an incomplete reconciliation remains pending
-and the same owner intent can reconcile it. No old partial progress grants work.
+and the same owner intent can reconcile it. No old partial progress grants work. A pending workflow receipt predating this
+process is reported separately as unverified; absence from in-memory spans does
+not prove its old preparation or child command stopped. It keeps reconciliation
+and a new grant pending until actual supported worker terminal evidence exists.
+This increment does not manufacture a dead-worker receipt or provide a new
+process-kill/recovery executor for such legacy uncertainty.
 
 ## Fresh owner work
 

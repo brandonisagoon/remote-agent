@@ -1,4 +1,4 @@
-import { assertNativeLaunch, freshReactionNativeLaunch, isFreshNativeReaction, NativeLaunchWithdrawnError } from "../../../services/launches/native-takeover.ts";
+import { assertNativeLaunch, freshReactionNativeLaunch, isFreshNativeReaction, withNativeLaunchWork, NativeLaunchWithdrawnError } from "../../../services/launches/native-takeover.ts";
 import {
   DispatchEventType,
   WorkerRunStatus,
@@ -103,7 +103,7 @@ export function acknowledgementReaction(event: WorkflowEvent): string {
 export function createWorkflowWorker(
   dependencies: WorkflowWorkerDependencies = defaultDependencies,
 ): Worker<WorkflowEvent> {
-  return {
+  const worker: Worker<WorkflowEvent> = {
     key: "product.workflow",
     supports(event): event is WorkflowEvent {
       return event.type === DispatchEventType.TrackerWorkflowTriggered;
@@ -328,6 +328,12 @@ export function createWorkflowWorker(
       );
     },
   };
+  return { ...worker, execute(event, context) {
+    const issue = issueReferenceFromEvent(event);
+    if (!issue || context.config.repository.workflows[event.workflowId]?.deliver !== "start-session") return worker.execute(event, context);
+    return withNativeLaunchWork(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: context.config.repository.id, issue }, context.runId,
+      () => worker.execute(event, context));
+  } };
 }
 
 export const workflowWorker = createWorkflowWorker();
