@@ -86,3 +86,30 @@ test.each(["progress", "container", "coverage"])("crash after resource publicati
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
   expect((await db.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
 });
+
+test("verified stopped terminal offer is retained as history; configuration grants no allocation and normal admission queues afresh", async () => {
+  const f = await fixture(true);
+  await db.prisma.computeOffer.update({ where: { id: f.offer.id }, data: { state: "stopped", completedAt: new Date() } });
+  await db.prisma.computeSlot.update({ where: { id: "host:0" }, data: { allocationId: null } });
+  await db.prisma.computeWait.deleteMany({ where: { environmentId: f.environment.id } });
+  await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { state: "suspended" } });
+  const history = await db.prisma.computeOffer.findMany(), slots = await db.prisma.computeSlot.findMany();
+  await configureCompute(f.input, f.read, f.head);
+  await configureCompute(f.input, f.read, f.head);
+  expect(await db.prisma.computeOffer.findMany()).toEqual(history); expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
+  expect(await db.prisma.computeWait.count()).toBe(0);
+  await requestCompute({ ...f.context, taskId: "task", request: { key: f.resource.key, purpose: "development", revision, recipeDigest: nextHash } });
+  expect(await db.prisma.computeWait.count()).toBe(1); expect(await db.prisma.computeOffer.findMany()).toEqual(history);
+  expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
+});
+
+test.each(["unexplained-slot", "another-offer", "not-suspended", "no-completion", "pause"])("terminal reconciliation refuses %s", async fault => {
+  const f = await fixture(true);
+  await db.prisma.computeOffer.update({ where: { id: f.offer.id }, data: { state: "stopped", completedAt: fault === "no-completion" ? null : new Date() } });
+  if (fault !== "unexplained-slot") await db.prisma.computeSlot.update({ where: { id: "host:0" }, data: { allocationId: null } });
+  await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { state: fault === "not-suspended" ? "starting" : "suspended" } });
+  if (fault === "another-offer") await db.prisma.computeOffer.create({ data: { id: crypto.randomUUID(), environmentId: f.environment.id, machineId: "host", instructionId: "other-offer", dispatchDeadline: new Date(), state: "offered" } });
+  if (fault === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  await expect(configureCompute(f.input, f.read, f.head)).rejects.toThrow();
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
+});

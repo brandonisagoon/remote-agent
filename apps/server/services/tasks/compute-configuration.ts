@@ -3,7 +3,7 @@ import { z } from "zod";
 import { Prisma, type PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admission.ts";
-import { assertComputeStartIntent } from "./development-intent.ts";
+import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { verifiedComputeRuntime } from "./compute-observer.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
@@ -22,7 +22,6 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   const offer = await input.prisma.computeOffer.findUniqueOrThrow({ where: { id: input.request.offerId } });
   const environment = await input.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
   await assertComputeEnvironmentOwner(input.prisma, environment);
-  await assertComputeStartIntent(input.prisma, input.taskId, environment.id, offer.id);
   const resource = await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: input.taskId, key: input.request.resourceKey } } });
   const metadata = z.record(z.string(), z.unknown()).parse(resource.metadata);
   const offers = await input.prisma.computeOffer.findMany({ where: { environmentId: environment.id }, orderBy: { id: "asc" }, take: 1001 });
@@ -30,13 +29,20 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   if (offers.length > 1000 || slots.length > 1000) throw new Error("Configuration allocation history exceeds its bound");
   const allocations = { offers, slots };
   const active = allocations.offers.filter(o => ["queued", "offered", "claimed", "running", "unknown"].includes(o.state));
+  const retained = ["claimed", "running", "unknown"].includes(offer.state) && !offer.completedAt && active.length === 1 && active[0]!.id === offer.id
+    && slots.length === 1 && slots[0]!.allocationId === offer.id && slots[0]!.machineId === input.config.machine;
+  const lastClaim = offers.filter(value => value.claimedAt).sort((a, b) => b.claimedAt!.getTime() - a.claimedAt!.getTime())[0];
+  const stopped = offer.state === "stopped" && Boolean(offer.completedAt) && lastClaim?.id === offer.id && environment.state === "suspended" && active.length === 0 && slots.length === 0;
+  const intent = await developmentProjection(input);
+  if (owner.task.phase === "complete" || intent.developmentBlocked || intent.developmentIntent?.blocked
+    || intent.developmentIntent?.action === "stop" && intent.developmentIntent.reason !== "runtime-suspended") throw new Error("Configuration was superseded by a development stop");
+  if (retained) await assertComputeStartIntent(input.prisma, input.taskId, environment.id, offer.id);
   if (environment.taskId !== input.taskId || environment.primarySessionId !== owner.session.id || environment.taskIdentity !== owner.identity || environment.machineId !== input.config.machine
     || environment.purpose !== "development" || environment.configuration !== null || environment.key !== input.request.resourceKey
     || resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.state === "released" || environment.resourceId !== resource.id
     || metadata.revision !== environment.revision || ![input.request.previousRecipeHash, input.request.recipeHash].includes(String(metadata.recipeHash))
     || ![input.request.previousRecipeHash, input.request.recipeHash].includes(environment.recipeDigest) || input.request.previousRecipeHash === input.request.recipeHash
-    || offer.machineId !== input.config.machine || !offer.claimedAt || offer.completedAt || !["claimed", "running", "unknown"].includes(offer.state)
-    || active.length !== 1 || active[0]!.id !== offer.id || allocations.slots.length !== 1 || allocations.slots[0]!.allocationId !== offer.id || allocations.slots[0]!.machineId !== input.config.machine) throw new Error("Configuration requires its exact existing claimed runtime allocation");
+    || offer.machineId !== input.config.machine || !offer.claimedAt || !retained && !stopped) throw new Error("Configuration requires its exact retained claim or independently stopped unallocated runtime");
   const key = finalizationDigest({ environmentId: environment.id, offerId: offer.id, resourceId: resource.id, previousRecipeHash: input.request.previousRecipeHash, recipeHash: input.request.recipeHash });
   const event = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owner.session.id, source: `compute:${input.taskId}`, action: Action, key } });
   if (environment.recipeDigest === input.request.recipeHash && (!event || metadata.recipeHash !== input.request.recipeHash)) throw new Error("Configuration transition has no durable acknowledgment");
@@ -55,7 +61,7 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   }
   const traffic = await input.prisma.computeTraffic.findMany({ where: { environmentId: environment.id }, orderBy: { routeId: "asc" }, take: 33 });
   if (traffic.length > 32) throw new Error("Configuration traffic inventory exceeds its bound");
-  return { owner, offer, environment, resource, allocations, traffic, event, key };
+  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, intent };
 }
 
 async function readConfiguration(input: Input, before: Snapshot) {
@@ -74,7 +80,8 @@ async function readConfiguration(input: Input, before: Snapshot) {
 }
 
 /** Changes only the projection of an already claimed, physically stopped
- * application. No offer, slot, start permission, task pin or provider is created.
+ * application. A terminal stopped offer is history, never revived: ordinary
+ * admission must allocate afresh. No offer, slot, start permission, pin or provider is created.
  * The journal and both hashes commit together; retries still re-observe ownership. */
 export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision) {
   if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
@@ -90,14 +97,15 @@ export async function configureCompute(input: Input, read = readConfiguration, h
     // This fresh snapshot also checks current pause, original primary/source
     // link, intent, slot, active offer and prior transition receipt.
     const current = await snapshot({ ...input, prisma: tx });
-    const stable = (value: Snapshot) => ({ identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment: value.environment, resource: value.resource, offer: value.offer, allocations: value.allocations, traffic: value.traffic, event: value.event });
+    const stable = (value: Snapshot) => ({ identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment: value.environment, resource: value.resource, offer: value.offer, allocations: value.allocations, traffic: value.traffic, event: value.event, intent: value.intent });
     if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
     if (!current.event) {
       const metadata = { ...z.record(z.string(), z.unknown()).parse(current.resource.metadata), recipeHash: input.request.recipeHash };
       const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
       await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
         value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
-          traffic: current.traffic, proof, baselineFile: input.request.baselineFile }) } });
+          traffic: current.traffic, proof, baselineFile: input.request.baselineFile,
+          allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
       await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
         observation: Prisma.DbNull } });
       await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
