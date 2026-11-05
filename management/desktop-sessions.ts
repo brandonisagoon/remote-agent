@@ -58,7 +58,7 @@ export async function desktopRepositorySessions(file: string, reference: Desktop
     return response.json();
   }
   // Older hosts can list sessions without supporting task previews.
-  const tasks = await readSessionApi("/api/tasks").catch(() => null);
+  const tasks = await readSessionApi("/api/tasks?view=session-previews").catch(() => null);
   const results = await Promise.all(repositoryIds.map(async (repositoryId) => {
     const body = await readSessionApi(`/api/sessions?includeClosed=true&repositoryId=${encodeURIComponent(repositoryId)}`);
     const parsed = SessionSummarySchema.array().safeParse((body as { sessions?: unknown })?.sessions);

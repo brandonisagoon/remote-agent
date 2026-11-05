@@ -241,6 +241,15 @@ taskRoutes.post("/", async (c) => {
 
 taskRoutes.get("/", async (c) => {
   const prisma = c.get("prisma");
+  // Session listing needs only owned public-preview links, not historical
+  // finalization/archive proofs. Keep those on the full task/detail views.
+  if (c.req.query("view") === "session-previews") {
+    const tasks = await prisma.remoteTask.findMany({ orderBy: { updatedAt: "desc" }, take: 100,
+      select: { id: true, repositoryId: true, machineId: true, primarySessionId: true,
+        resources: { where: { kind: "local-http", purpose: { in: ["development", "review"] }, state: { in: ["ready", "allocated"] } },
+          select: { kind: true, purpose: true, state: true, metadata: true } } } });
+    return c.json({ tasks });
+  }
   // Preserve the desktop's recent-task view. Maintenance explicitly requests
   // a stable ID order so activity cannot move tasks between cursor pages.
   if (c.req.query("pagination") !== "id") {
