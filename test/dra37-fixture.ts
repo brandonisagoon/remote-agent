@@ -73,7 +73,12 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
   // SYNTHETIC Docker CLI, first on the server's PATH only, for Drafted's
   // actual observer (see dra37-docker.ts). The app it reports is real.
-  await writeFile(path.join(bin, "docker"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} --no-env-file ${JSON.stringify(path.join(import.meta.dir, "dra37-docker.ts"))} ${JSON.stringify(apps)} "$@"\n`, { mode: 0o700 });
+  // Executable Bun/TypeScript shim (no shell): forwards argv unchanged after
+  // this fixture's exact records path; it adds nothing to the observer's
+  // whitelisted environment.
+  await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
+    `process.argv.splice(2, 0, ${JSON.stringify(apps)});`,
+    `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker.ts"))});`, ""].join("\n"), { mode: 0o700 });
   const install = path.join(root, "install");
   const drafted = options.drafted ? await prepareDraftedTooling(root, install, options.drafted.revision, options.drafted.source) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
