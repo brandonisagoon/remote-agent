@@ -6,7 +6,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { assertClosedCleanupFamily, assertSettledClosedFamily } from "./closed-cleanup.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
-  bindRetainedToolingOperation, bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
+  bindRetainedToolingOperation, bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, reconcileUnknownAdmissionChild, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
   type ToolingLegacyConsumerInput, type ToolingLegacyConsumerState, type ToolingLegacyInventory,
 } from "./tooling-releases.ts";
 
@@ -150,7 +150,7 @@ const closedCleanupFence = (binding: Pick<ToolingOperationBinding, "kind" | "exi
 
 type Body = Record<string, unknown>;
 type Store = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent" | "computeOffer" | "computeEnvironment" | "remoteTaskResource">;
-type CallbackContext = { store: Store; task: RemoteTask; latestFinalizationKey: () => Promise<string | null> };
+type CallbackContext = { store: Store; task: RemoteTask; latestFinalizationKey: () => Promise<string | null>; config?: ServerConfig };
 // A bound prepared-finalization callback derives its exact key from the
 // finalization its own command lineage prepared; only unbound (legacy) calls
 // fall back to the latest preparation. The digest is always checked.
@@ -339,7 +339,7 @@ export function boundCode(explicit?: ToolingCodeIdentity | null): ToolingCodeIde
 // producer — intent before the effect, confirmed/failed after. A newest
 // producer intent without an outcome is an unknown effect: fail closed.
 const ASSOCIATION = "tooling-operation-association";
-const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown"]), attemptId: z.string().optional(), evidence: z.string().optional() }).passthrough();
+const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown", "reconciled"]), attemptId: z.string().optional(), evidence: z.string().optional() }).passthrough();
 type Role = z.infer<typeof Association>["role"];
 const associationKey = (role: Role, id: string) => `${role}:${id}`;
 const referenceId = (reference: Pick<ExistingReference, "type" | "id">) => `${reference.type}:${reference.id}`;
@@ -356,20 +356,49 @@ async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataE
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
     value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
 }
+/** One operation's callback attempt records, newest first, bounded (overflow
+ * refuses rather than dropping an older attempt). */
+const AttemptRecord = z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string(), route: z.string().optional(),
+  status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional() }).passthrough();
+async function attemptRecords(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operationId: string) {
+  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operationId) }, orderBy: { sequence: "desc" }, take: 1001 });
+  if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operationId} exceeds its bound`);
+  return events.map(event => ({ sequence: event.sequence, value: AttemptRecord.safeParse(JSON.parse(event.value ?? "null")).data }));
+}
+const REQUEST_ROUTE = "POST /api/tasks/:taskId/compute-request";
+/** A reconciliation record is valid only when it names an earlier unknown
+ * compute-request attempt of this operation and a LATER acknowledged 2xx
+ * compute-request attempt with the same request digest. */
+function validReconciliation(records: Awaited<ReturnType<typeof attemptRecords>>, attemptId: string, operation: { id: string; inputDigest: string }) {
+  const values = records.flatMap(record => record.value ? [{ ...record.value, sequence: record.sequence }] : []);
+  const intentOf = (id: string) => values.find(value => value.attemptId === id && value.state === "intent");
+  const original = intentOf(attemptId);
+  if (!original || original.route !== REQUEST_ROUTE || !values.some(value => value.attemptId === attemptId && value.state === "unknown" && value.route === REQUEST_ROUTE)) return false;
+  return values.some(value => {
+    if (value.state !== "reconciled" || value.attemptId !== attemptId || value.operationId !== operation.id || value.inputDigest !== operation.inputDigest || !value.acknowledgedAttemptId) return false;
+    const replay = intentOf(value.acknowledgedAttemptId);
+    const acknowledged = values.find(entry => entry.attemptId === value.acknowledgedAttemptId && entry.state === "acknowledged");
+    return Boolean(replay && acknowledged && replay.route === REQUEST_ROUTE && acknowledged.route === REQUEST_ROUTE && replay.sequence > original.sequence
+      && typeof acknowledged.status === "number" && acknowledged.status >= 200 && acknowledged.status < 300);
+  });
+}
 /** Settled callback history: every recorded attempt has a definite result
  * (acknowledged or refused) and the latest attempt is acknowledged. An older
  * in-flight or unknown attempt never disappears behind a newer
- * acknowledgment; it needs reconciliation first. */
+ * acknowledgment; it needs reconciliation first. The only accepted
+ * reconciliation is a validated link from an unknown compute-request attempt
+ * to a later exact acknowledged replay; the original attempt is kept. */
 async function latestAttemptAcknowledged(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operation: { id: string; inputDigest: string }) {
-  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operation.id) }, orderBy: { sequence: "desc" }, take: 1001 });
-  if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operation.id} exceeds its bound`);
-  const values = events.flatMap(event => z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string() }).passthrough().safeParse(JSON.parse(event.value ?? "null")).data ?? []);
+  const records = await attemptRecords(store, binding, operation.id);
+  if (records.some(record => !record.value)) return false;
+  const values = records.map(record => record.value!);
   if (values.some(value => value.operationId !== operation.id || value.inputDigest !== operation.inputDigest)) return false;
   const intents = values.filter(value => value.state === "intent");
   if (!intents.length) return false;
   for (const intent of intents) {
-    const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent").map(value => value.state);
-    if (!results.length || results.includes("unknown")) return false;
+    const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
+    if (!results.length) return false;
+    if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, operation)) return false;
   }
   return values.some(value => value.attemptId === intents[0]!.attemptId && value.state === "acknowledged");
 }
@@ -617,7 +646,7 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     if (input.header) throw refuse("operation-ownership", "The operation does not belong to this task");
     return { mode: "pre-protocol" };
   }
-  const context: CallbackContext = { store, task, latestFinalizationKey: async () => (await latestPreparedFinalization(store, task))?.key ?? null };
+  const context: CallbackContext = { store, task, latestFinalizationKey: async () => (await latestPreparedFinalization(store, task))?.key ?? null, config: input.config };
   const active = await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: task.repositoryId });
   if (!input.header) {
     if (!active) return { mode: "pre-protocol" };
@@ -743,6 +772,67 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   return { binding, produced, consumers, ...(admittedKey ? { admitted: admittedKey } : {}) };
 }
 
+/**
+ * Reconcile an unknown command-parented compute-request child from its own
+ * exact acknowledged replay. All six proof rules are checked in ONE
+ * transaction whose first write (the reconciliation records, taking the
+ * write lock) commits or rolls back together with the status change:
+ *  1. the child is an unknown compute-admission whose open adapter-command
+ *     parent has the same task/session/repository and lineage (primitive);
+ *  2. every unknown attempt is an earlier compute-request; no other route's
+ *     unknown, and no attempt without a result, exists;
+ *  3. each has the operation's canonical request digest and precedes this
+ *     acknowledged 2xx replay, which is the latest attempt;
+ *  4. the environment readback exactly matches the task/primary and the
+ *     request's key/purpose/revision/recipe digest;
+ *  5. no producer association or pending reader belongs to the operation, and
+ *     its admission of the key is confirmed and current for its lineage;
+ *  6. current primary, source and pause authority hold (before, and the task
+ *     identity/pause again inside the transaction).
+ * Every original attempt is kept; each record links original and replay.
+ */
+async function reconcileUnknownRequest(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, current: ToolingOperationBinding, acknowledgedAttemptId: string, dependencies: ToolingOperationDependencies) {
+  const body = admission.body, config = admission.context.config;
+  if (!config) throw new Error("Reconciliation needs the server configuration");
+  if (dependencies.digest(body) !== current.inputDigest) throw new Error("The acknowledged replay is not the operation's exact request");
+  await assertBindingAuthority({ prisma, config, binding: current });
+  const before = await attemptRecords(prisma, current, current.operationId);
+  const values = before.flatMap(record => record.value ? [{ ...record.value, sequence: record.sequence }] : []);
+  if (values.length !== before.length) throw new Error("Unreadable attempt record");
+  const unknown = [...new Set(values.filter(value => value.state === "unknown").map(value => value.attemptId))]
+    .filter(id => !values.some(value => value.attemptId === id && value.state === "reconciled"));
+  if (!unknown.length) throw new Error("No unknown attempt to reconcile");
+  await prisma.$transaction(async tx => {
+    for (const attemptId of unknown) {
+      await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.sessionId, source: `tooling-operation:${current.taskId}`, action: ASSOCIATION, key: associationKey("outcome", current.operationId),
+        value: JSON.stringify({ version: 1, operationId: current.operationId, role: "outcome", state: "reconciled", attemptId, acknowledgedAttemptId, route: REQUEST_ROUTE,
+          inputDigest: current.inputDigest, requestKey: current.requestKey, evidence: `idempotent-replay:${acknowledgedAttemptId}` }) } });
+    }
+    // Under the lock: nothing but these records changed since the proof read.
+    const records = await attemptRecords(tx, current, current.operationId);
+    if (records.length !== before.length + unknown.length || records.slice(unknown.length).some((record, index) => record.sequence !== before[index]!.sequence)) throw new Error("Attempt history changed during reconciliation");
+    const intents = values.filter(value => value.state === "intent");
+    if (intents[0]?.attemptId !== acknowledgedAttemptId) throw new Error("The acknowledged replay is not the latest attempt");
+    for (const intent of intents) {
+      const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
+      if (!results.length) throw new Error(`Attempt ${intent.attemptId} has no result`);
+      if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, { id: current.operationId, inputDigest: current.inputDigest })) throw new Error(`Attempt ${intent.attemptId} (${intent.route}) cannot be reconciled by a request replay`);
+    }
+    if (values.some(value => value.operationId !== current.operationId || value.inputDigest !== current.inputDigest)) throw new Error("Attempt records name another operation or request");
+    const task = await tx.remoteTask.findUnique({ where: { id: current.taskId } });
+    if (!task || task.primarySessionId !== current.sessionId || task.repositoryId !== current.repositoryId || task.phase === "closed" || task.ownerPaused) throw new Error("Task ownership, closure or pause changed");
+    const environment = typeof body.key === "string" ? await tx.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: body.key } } }) : null;
+    if (!environment || environment.primarySessionId !== task.primarySessionId || (["purpose", "revision", "recipeDigest"] as const).some(key => environment[key] !== body[key])) throw new Error("Environment readback does not match the request");
+    const admitted = (await admissionHistory(tx, task, environment.key)).find(value => value.operationId === current.operationId);
+    const holder = (await admissionHistory(tx, task, environment.key))[0];
+    if (admitted?.state !== "confirmed" || !holder || !await sameLineage(tx as unknown as PrismaClient, holder.operationId, current, dependencies.read)) throw new Error("The operation's admission is not confirmed and current");
+    const produced = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: current.sessionId, source: `tooling-operation:${current.taskId}`, action: ASSOCIATION, key: { startsWith: "producer:" } }, take: 1001 });
+    if (produced.some(event => Association.safeParse(JSON.parse(event.value ?? "null")).data?.operationId === current.operationId)) throw new Error("The operation has a producer association");
+    if (await tx.toolingRetainedConsumer.count({ where: { operationId: current.operationId, status: "pending" } })) throw new Error("The operation has a pending reader");
+    await reconcileUnknownAdmissionChild(tx, { operationId: current.operationId, acknowledgedAttemptId });
+  });
+}
+
 /** After the handler: success confirms producer intent and may complete the
  * operation with its protocol evidence; a refused (4xx) handler fails the
  * intent; an exception or 5xx leaves it unknown and the operation `unknown`. */
@@ -773,6 +863,13 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   }
   const current = await dependencies.read({ prisma, operationId: state.binding.operationId });
   if (!current) return;
+  // An exact acknowledged replay of an earlier unknown request may reconcile
+  // it, only with full proof; otherwise the operation stays unknown.
+  if (ok && current.status === "unknown" && admission.callback.route === REQUEST_ROUTE && state.attemptId) {
+    await reconcileUnknownRequest(prisma, admission, current, state.attemptId, dependencies)
+      .catch(error => console.warn(`Operation ${current.operationId} stays unknown: ${error instanceof Error ? error.message : String(error)}`));
+    return;
+  }
   if (!ok && !refused && current.status === "running") await dependencies.transition({ prisma, operationId: current.operationId, from: "running", to: "unknown" }).catch(() => undefined);
   const evidence = ok ? admission.callback.completes?.(admission.body) : null;
   // A command-parented callback stays open through its enclosing command

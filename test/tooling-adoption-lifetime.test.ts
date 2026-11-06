@@ -361,3 +361,117 @@ test("H3: after A's group stops and its continuation settles, an independent B c
   expect(refusedC.called?.body.error).toContain(`held by operation ${short(later.bindings[0]!)}`);
   console.log(JSON.stringify({ H3: { a: short(a.fence), continuation: short(continuation), b: short(b.fence), later: short(later.fence), c: short(c.fence), refusedC: refusedC.called?.body.error.split(". Begin")[0], admissions: await f.admissions() } }));
 });
+
+// ---------------------------------------------------------------------------
+// Unknown request reconciliation (promoted from /private/tmp/dra27-unknown-child probe).
+/** Callback attempt records of one operation, in record order. */
+const attempts = async (operationId: string) => (await db.prisma.runtimeMetadataEvent.findMany({ where: { source: "tooling-operation:task", key: `outcome:${operationId}` }, orderBy: { sequence: "asc" } }))
+  .map(event => JSON.parse(event.value!) as { attemptId: string; state: string; route: string; status: number | null; acknowledgedAttemptId?: string });
+const lose = (f: Awaited<ReturnType<typeof fixture>>, route = "compute-request") => f.setDomain(async name => {
+  if (name === "compute-request" && !await db.prisma.computeEnvironment.count()) await f.environment(); // the domain commits...
+  if (name === route) throw new Error("lost response"); // ...and the response is lost
+  return 200;
+});
+async function lostRequest() {
+  const f = await fixture();
+  await f.activate(A, 0);
+  const a = await f.command("a-runtime-up");
+  lose(f);
+  expect((await a.request()).called?.status).toBe(500);
+  f.setDomain(() => 200);
+  const child = a.bindings[0]!;
+  expect((await f.operation(child.operationId)).status).toBe("unknown");
+  return { f, a, child };
+}
+
+test("reconcile: request commits, response lost; the restarted command's exact replay reconciles the same child, then claim/bind and settlement finish with original IDs", async () => {
+  const { f, a, child } = await lostRequest();
+  const restarted = await f.command("a-runtime-up");
+  expect(restarted.fence.operationId).toBe(a.fence.operationId);
+  const replay = await restarted.request();
+  expect(replay.child!.operationId).toBe(child.operationId);
+  expect(replay.called?.status).toBe(200);
+  expect((await f.operation(child.operationId)).status).toBe("running");
+  const records = await attempts(child.operationId);
+  const original = records.find(record => record.state === "unknown")!, acknowledged = records.find(record => record.state === "acknowledged")!;
+  // Every original attempt is kept; the reconciliation links original -> later replay.
+  expect(records.map(record => `${record.route.split("/").at(-1)}:${record.state}`)).toEqual(["compute-request:intent", "compute-request:unknown", "compute-request:intent", "compute-request:acknowledged", "compute-request:reconciled"]);
+  expect(records.at(-1)).toMatchObject({ attemptId: original.attemptId, acknowledgedAttemptId: acknowledged.attemptId });
+  await f.offer("offer-a");
+  const claim = await restarted.claim("offer-a");
+  expect(claim.child!.operationId).toBe(child.operationId);
+  expect(claim.called?.status, JSON.stringify(claim.called?.body)).toBe(200);
+  await f.claimed("offer-a");
+  expect((await restarted.bind("offer-a")).called?.status).toBe(200);
+  const settled = await restarted.settle();
+  expect(settled.status, JSON.stringify(settled.body)).toBe(200);
+  expect((await f.operation(child.operationId)).status).toBe("completed");
+  expect(await producerOperationId(db.prisma, await f.task(), ENV)).toBe(child.operationId);
+  console.log(JSON.stringify({ reconcile: { fence: short(a.fence), child: short(child), records: (await attempts(child.operationId)).map(record => `${record.attemptId.slice(0, 8)}:${record.route.split("/").at(-1)}:${record.state}${record.acknowledgedAttemptId ? `->${record.acknowledgedAttemptId.slice(0, 8)}` : ""}`) } }));
+});
+
+test("reconcile: another route's unknown, a changed environment or a pause between replay and proof keep the child unknown and settlement refused", async () => {
+  // A claim (not a request) whose response was lost is never reconciled by a request replay.
+  {
+    const f = await fixture();
+    await f.activate(A, 0);
+    const a = await f.command("a-runtime-up");
+    expect((await a.request()).called?.status).toBe(200);
+    await f.environment(); await f.offer("offer-a");
+    lose(f, "compute-claim");
+    expect((await a.claim("offer-a")).called?.status).toBe(500);
+    f.setDomain(() => 200);
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(a.bindings[0]!.operationId)).status).toBe("unknown");
+    expect((await attempts(a.bindings[0]!.operationId)).some(record => record.state === "reconciled")).toBe(false);
+    expect((await a.settle()).body.code).toBe("operation-closed");
+  }
+  // Exact readback: the environment no longer matches the request.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a, child } = await lostRequest();
+    await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { recipeDigest: "e".repeat(64) } });
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(child.operationId)).status).toBe("unknown");
+    // A different request under the same child never reaches an attempt.
+    expect((await a.call("compute-request", { ...computeBody, revision: "e".repeat(40) }, child.operationId)).status).toBe(400);
+    expect((await attempts(child.operationId)).filter(record => record.state === "intent")).toHaveLength(2);
+  }
+  // The owner pauses while the replay runs: the proof transaction refuses atomically.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a, child } = await lostRequest();
+    f.setDomain(async () => { await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } }); return 200; });
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(child.operationId)).status).toBe("unknown");
+    expect((await attempts(child.operationId)).some(record => record.state === "reconciled")).toBe(false);
+  }
+});
+
+test("reconcile: an earlier attempt still in flight blocks reconciliation until a later exact replay; concurrent replays reconcile once", async () => {
+  const { f, a, child } = await lostRequest();
+  let open!: () => void;
+  const gate = new Promise<void>(resolve => { open = resolve; });
+  f.setDomain(async () => { await gate; return 200; });
+  const inFlight = a.call("compute-request", computeBody, child.operationId);
+  const deadline = Date.now() + 5_000;
+  while ((await attempts(child.operationId)).filter(record => record.state === "intent").length < 2 && Date.now() < deadline) await Bun.sleep(10);
+  f.setDomain(() => 200);
+  // Replay 3 is acknowledged, but attempt 2 has no result yet: no reconciliation.
+  expect((await a.call("compute-request", computeBody, child.operationId)).status).toBe(200);
+  expect((await f.operation(child.operationId)).status).toBe("unknown");
+  open();
+  // Attempt 2 is now acknowledged, but it is not the latest attempt.
+  expect((await inFlight).status).toBe(200);
+  expect((await f.operation(child.operationId)).status).toBe("unknown");
+  expect((await attempts(child.operationId)).some(record => record.state === "reconciled")).toBe(false);
+  // Two concurrent exact replays: both acknowledged, exactly one reconciliation.
+  const both = await Promise.all([a.call("compute-request", computeBody, child.operationId), a.call("compute-request", computeBody, child.operationId)]);
+  expect(both.map(result => result.status)).toEqual([200, 200]);
+  // Whichever replay is latest may reconcile; at most one set of records exists.
+  let reconciled = (await attempts(child.operationId)).filter(record => record.state === "reconciled");
+  if (!reconciled.length) { expect((await a.call("compute-request", computeBody, child.operationId)).status).toBe(200); reconciled = (await attempts(child.operationId)).filter(record => record.state === "reconciled"); }
+  expect(reconciled).toHaveLength(1);
+  expect((await f.operation(child.operationId)).status).toBe("running");
+  console.log(JSON.stringify({ inflight: (await attempts(child.operationId)).map(record => `${record.attemptId.slice(0, 8)}:${record.state}`) }));
+});

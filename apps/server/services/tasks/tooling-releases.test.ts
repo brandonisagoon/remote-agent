@@ -8,7 +8,7 @@ import { createTestDatabase, type TestDatabase } from "../../../../test-support/
 import { testConfig } from "../../../../test-support/config.ts";
 import { acquirePreparationLock, prepareToolingRelease, verifyPreparedToolingRelease, type PrepareToolingReleaseInput } from "./tooling.ts";
 import { activateToolingRelease, assertBootToolingPolicy, assertToolingStateReadable, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary,
-  readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, registerToolingStateWrite, resolveToolingLegacyConsumer, transitionToolingOperation,
+  readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, reconcileUnknownAdmissionChild, registerToolingStateWrite, resolveToolingLegacyConsumer, transitionToolingOperation,
   bindRetainedToolingOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
   type ToolingLegacyConsumerInput } from "./tooling-releases.ts";
 
@@ -204,6 +204,38 @@ test("operation bindings persist before effects and retries keep their original 
   await ownedTask("task-2");
   await expect(bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: "task-2-primary", turnId: null, request })).rejects.toMatchObject({ code: "ownership" });
   expect(await readToolingOperation({ prisma: db.prisma, operationId: "missing" })).toBeNull();
+});
+
+test("the reconciliation seam returns only an unknown command-parented compute-admission child with an open parent to running", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  const bind = (requestKey: string, kind: string, parentOperationId?: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey, inputDigest: "a".repeat(64), kind, ...(parentOperationId ? { parentOperationId } : {}) } });
+  const unknown = async (operationId: string) => { await transitionToolingOperation({ prisma: db.prisma, operationId, from: "bound", to: "running" }); await transitionToolingOperation({ prisma: db.prisma, operationId, from: "running", to: "unknown" }); };
+  const reconcile = (operationId: string, acknowledgedAttemptId = "attempt-2") => db.prisma.$transaction(tx => reconcileUnknownAdmissionChild(tx, { operationId, acknowledgedAttemptId }));
+  const parent = await bind("command", "adapter-command");
+  const child = await bind("command/compute-admission", "compute-admission", parent.operationId);
+  expect(child).toMatchObject({ parentOperationId: parent.operationId, generation: parent.generation, release: { id: parent.release.id } });
+  // Not unknown yet, or no acknowledged attempt named: refused.
+  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await unknown(child.operationId);
+  await expect(reconcile(child.operationId, " ")).rejects.toMatchObject({ code: "evidence-required" });
+  // A root (unparented) compute-admission, or another kind, never qualifies.
+  const root = await bind("root", "compute-admission"); await unknown(root.operationId);
+  await expect(reconcile(root.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  const command = await bind("other-command", "adapter-command"); await unknown(command.operationId);
+  await expect(reconcile(command.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  // Success is a compare-and-swap to running; a second call is refused.
+  expect((await reconcile(child.operationId)).status).toBe("running");
+  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  // A closed parent: the unknown child stays unknown (rolled back with the caller's transaction).
+  const closing = await bind("closing", "adapter-command");
+  const orphan = await bind("closing/compute-admission", "compute-admission", closing.operationId); await unknown(orphan.operationId);
+  await transitionToolingOperation({ prisma: db.prisma, operationId: closing.operationId, from: "bound", to: "completed", evidence: { kind: "command-completed", reference: "closing" } });
+  await expect(reconcile(orphan.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: orphan.operationId }))!.status).toBe("unknown");
+  // The generic transition contract is unchanged.
+  await expect(transitionToolingOperation({ prisma: db.prisma, operationId: orphan.operationId, from: "unknown", to: "running" })).rejects.toMatchObject({ code: "invalid-transition" });
 });
 
 test("operation lifecycle transitions are explicit compare-and-swap changes", async () => {

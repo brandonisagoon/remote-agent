@@ -380,6 +380,31 @@ async function operationContext(store: Store, operationId: string) {
   return { row, release: record(await store.toolingRelease.findUniqueOrThrow({ where: { id: row.releaseId } })) };
 }
 
+/**
+ * SERVER-ONLY reconciliation seam, not a generic transition (TRANSITIONS is
+ * unchanged): an `unknown` command-parented `compute-admission` child returns
+ * to `running` so its own command can continue. Only for a transaction client:
+ * the caller must, in the SAME transaction, have verified its exact domain
+ * proof and appended the reconciliation evidence naming the acknowledged
+ * attempt, so status and journal commit (or roll back) together. Requires an
+ * open adapter-command parent of the same task, session and repository, with
+ * the child's lineage (release, generation) unchanged. Compare-and-swap.
+ */
+export async function reconcileUnknownAdmissionChild(tx: Prisma.TransactionClient, input: { operationId: string; acknowledgedAttemptId: string }): Promise<ToolingOperationBinding> {
+  if (!input.acknowledgedAttemptId.trim()) throw new ToolingOperationError("evidence-required", "Reconciliation requires the acknowledged attempt it relies on");
+  const row = await tx.toolingOperation.findUnique({ where: { id: input.operationId } });
+  if (!row) throw new ToolingOperationError("not-found", "Tooling operation not found");
+  if (row.status !== "unknown" || row.kind !== "compute-admission" || !row.parentOperationId) throw new ToolingOperationError("invalid-transition", `Operation ${row.id} (${row.kind}, ${row.status}) is not an unknown command-parented compute-admission child`);
+  const parent = await tx.toolingOperation.findUnique({ where: { id: row.parentOperationId } });
+  if (!parent || parent.kind !== "adapter-command" || !["bound", "running"].includes(parent.status) || parent.taskId !== row.taskId || parent.sessionId !== row.sessionId
+    || parent.repositoryId !== row.repositoryId || parent.releaseId !== row.releaseId || parent.generation !== row.generation) {
+    throw new ToolingOperationError("invalid-transition", `Operation ${row.id} has no open adapter-command parent of the same task, session, repository and lineage`);
+  }
+  const updated = await tx.toolingOperation.updateMany({ where: { id: row.id, status: "unknown", kind: "compute-admission", parentOperationId: parent.id }, data: { status: "running" } });
+  if (updated.count !== 1) throw new ToolingOperationError("transition-conflict", `Operation ${row.id} changed during reconciliation`);
+  return binding(tx as unknown as Store, (await tx.toolingOperation.findUniqueOrThrow({ where: { id: row.id } })));
+}
+
 /** Latest actually registered format for one task state, or null. */
 export async function readToolingStateVersion(input: { prisma: PrismaClient; taskId: string; family: string; scopeKey: string }): Promise<ToolingStateVersion | null> {
   const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });
