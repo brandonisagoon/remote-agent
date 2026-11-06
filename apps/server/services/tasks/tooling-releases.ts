@@ -353,15 +353,18 @@ export async function assertToolingStateReadable(input: { prisma: PrismaClient; 
 /** Register a format write BEFORE persisting it. Writes are restricted per
  * affected task state: a version an unfinished consumer of another release
  * (or a retained legacy consumer) of that state cannot read is deferred;
- * unrelated operations and activation are unaffected. Idempotent per
- * operation/family/scope/version; evidence is retained after completion. */
+ * unrelated operations and activation are unaffected. A retry returns its
+ * original receipt only if the write is still eligible now (not superseded by
+ * a newer version, operation still open); history stays readable through
+ * readToolingStateVersion. Writes must equal the release's declared version. */
 export async function registerToolingStateWrite(input: { prisma: PrismaClient; operationId: string; family: string; scopeKey: string; version: number }): Promise<ToolingStateVersion> {
   const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });
   if (!Number.isInteger(input.version) || input.version < 1) throw new ToolingStateFormatError("invalid-request", "State format version must be a positive integer");
   const attempt = () => input.prisma.$transaction(async (tx) => {
     const { row, release } = await operationContext(tx, input.operationId);
+    // A retried registration is revalidated like a new one: an identity replay
+    // never authorizes bytes that the current state has moved past.
     const existing = await tx.toolingStateWrite.findUnique({ where: { operationId_family_scopeKey_version: { operationId: row.id, ...key, version: input.version } } });
-    if (existing) return existing;
     if (row.status !== "bound" && row.status !== "running") throw new ToolingStateFormatError("operation-closed", `Operation ${row.id} is ${row.status}; it cannot register new state writes`);
     const format = release.manifest.stateFormats[key.family];
     if (!format) throw new ToolingStateFormatError("undeclared-format", `Release ${release.revision} does not declare ${key.family}`);
@@ -379,6 +382,7 @@ export async function registerToolingStateWrite(input: { prisma: PrismaClient; o
     const legacyReader = LEGACY_STATE_FORMATS[key.family];
     const legacy = await tx.toolingLegacyConsumer.findFirst({ where: { repositoryId: row.repositoryId, taskId: row.taskId, status: "retained" } });
     if (legacy && (!legacyReader || !legacyReader.read.includes(input.version))) throw new ToolingStateFormatError("deferred", `Retained pre-protocol consumer ${legacy.consumerKind}:${legacy.consumerId} cannot read ${key.family} version ${input.version}`);
+    if (existing) return existing;
     return tx.toolingStateWrite.create({ data: { repositoryId: row.repositoryId, taskId: row.taskId, ...key, version: input.version, preservesUnknown: format.preservesUnknown, operationId: row.id, releaseId: row.releaseId } });
   });
   let written;

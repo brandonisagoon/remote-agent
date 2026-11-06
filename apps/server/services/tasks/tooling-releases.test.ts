@@ -55,6 +55,8 @@ beforeEach(async () => {
   commit("v2only", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [2], write: 2, preservesUnknown: true } }) });
   git(source, "checkout", "-q", revisions.B!);
   commit("noformats", { ".remote-agent-release.json": release({}) });
+  git(source, "checkout", "-q", revisions.B!);
+  commit("w1r12", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1, 2], write: 1, preservesUnknown: true } }) });
   git(source, "checkout", "-q", "main");
   legacy = [];
   const base = testConfig();
@@ -238,6 +240,24 @@ test("actual written formats outlive completed operations and block rollback rea
   expect(await assertToolingStateReadable({ prisma: db.prisma, operationId: later.operationId, family: "drafted.runtime", scopeKey: "runtime:development" })).toEqual({ version: 2, source: "recorded" });
   // Untouched pre-protocol state is assumed legacy v1, which v2only cannot read.
   await expect(assertToolingStateReadable({ prisma: db.prisma, operationId: later.operationId, family: "drafted.runtime", scopeKey: "runtime:review" })).rejects.toMatchObject({ code: "unreadable-state" });
+});
+
+test("a retried older write registration cannot authorize rewinding newer state", async () => {
+  const task = await ownedTask();
+  await activate("k1", "w1r12", 0);
+  const bind = (requestKey: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey, inputDigest: "e".repeat(64), kind: "runtime-up" } });
+  const write = (operationId: string, version: number) => registerToolingStateWrite({ prisma: db.prisma, operationId, family: "drafted.runtime", scopeKey: "runtime:development", version });
+  const old = await bind("old");
+  const first = await write(old.operationId, 1);
+  expect(await write(old.operationId, 1)).toEqual(first);
+  await activate("k2", "v2", 1);
+  const next = await bind("next");
+  await expect(write(next.operationId, 1)).rejects.toMatchObject({ code: "wrong-write-version" });
+  expect((await write(next.operationId, 2)).version).toBe(2);
+  await expect(write(old.operationId, 1)).rejects.toMatchObject({ code: "would-rewind" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: old.operationId, from: "bound", to: "completed", evidence });
+  await expect(write(old.operationId, 1)).rejects.toMatchObject({ code: "operation-closed" });
+  expect(await readToolingStateVersion({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "runtime:development" })).toMatchObject({ version: 2, operationId: next.operationId });
 });
 
 test("incompatible writes are deferred only for the affected task state", async () => {
