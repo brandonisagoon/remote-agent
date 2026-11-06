@@ -2,12 +2,13 @@ import { Hono, type MiddlewareHandler } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import {
   TOOLING_OPERATION_HEADER, ToolingOperationRefused, admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation,
-  isToolingCallbackPath, readOperationStateEvidence, readSessionToolingOperation, registerOperationStateWrite, settleToolingCommand, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
+  StateWriteOutcomeUnknown, isToolingCallbackPath, readOperationStateEvidence, readSessionToolingOperation, registerOperationStateWrite, settleToolingCommand, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
   type ToolingOperationDependencies,
 } from "../../services/tasks/tooling-operations.ts";
 import { ToolingOperationError, ToolingStateFormatError } from "../../services/tasks/tooling-releases.ts";
 
 const failure = (error: unknown) => {
+  if (error instanceof StateWriteOutcomeUnknown) return { body: { error: error.message, code: error.code }, status: 503 as const };
   if (error instanceof ToolingOperationRefused) return { body: { error: error.message, code: error.code }, status: error.code === "operation-required" ? 428 as const : error.code === "operation-input" ? 400 as const : 409 as const };
   if (error instanceof ToolingStateFormatError) return { body: { error: error.message, code: error.code }, status: error.code === "invalid-request" ? 400 as const : error.code === "not-found" ? 404 as const : 409 as const };
   if (error instanceof ToolingOperationError) return { body: { error: error.message, code: error.code }, status: error.code === "invalid-request" ? 400 as const : 409 as const };

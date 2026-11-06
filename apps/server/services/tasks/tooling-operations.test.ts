@@ -11,9 +11,9 @@ import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts"
 import { toolingOperationGuard, toolingOperationRoutes } from "../../routes/tasks/tooling-operations.ts";
 import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
-  bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
+  StateWriteOutcomeUnknown, bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, registerOperationStateWrite, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
-import { canonicalDigest, confirmToolingConsumer, readToolingOperation, retainToolingConsumer, transitionToolingOperation } from "./tooling-releases.ts";
+import { canonicalDigest, confirmToolingConsumer, readToolingOperation, registerToolingStateWrite, retainToolingConsumer, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { cleanupObserverRelease } from "./cleanup-resource-observer.ts";
@@ -459,4 +459,29 @@ test("settlement echoes the exact command, replays the same outcome and never de
   expect(await (await settle(command.operationId, body(command, "completed"))).json()).toMatchObject({ outcome: "completed", binding: { status: "completed" } });
   expect((await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } })).status).toBe("confirmed");
   await expect(begin(config, { requestKey: "configure:late", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: command.operationId })).rejects.toThrow(/completed/);
+});
+
+test("state scopes follow the fence, pause withholds receipts, and post-registration uncertainty is unknown (503), never a refusal", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const { call } = app(config);
+  const fence = async (key: string, resourceKey?: string, session = "primary") => (await begin(config, { requestKey: key, inputDigest: canonicalDigest({ argv: [key] }), kind: "adapter-command", ...(resourceKey ? { resourceKey } : {}) }, session)).binding;
+  const write = (session: string, operationId: string, scopeKey: string) => call(`/api/sessions/${session}/tooling-operations/${operationId}/state-writes`, { family: "drafted.runtime", scopeKey, version: 1 }, operationId);
+  const taskWide = await fence("task-wide");
+  expect((await write("primary", taskWide.operationId, "runtime-development")).status).toBe(200);
+  const review = await fence("review", "review");
+  expect((await write("primary", review.operationId, "runtime-development")).status).toBe(400);
+  expect((await write("primary", review.operationId, "review")).status).toBe(200);
+  const foreign = await fence("foreign", undefined, "other-primary");
+  expect((await write("primary", foreign.operationId, "task")).status).toBe(409);
+  expect((await write("primary", taskWide.operationId, "../runtime")).status).toBe(400); // never a path
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  expect((await write("primary", taskWide.operationId, "runtime-development")).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: false } });
+  // Registration records, then the owner pauses before the receipt: unknown.
+  const records = () => db.prisma.toolingStateWrite.count({ where: { operationId: taskWide.operationId, scopeKey: "runtime-other" } });
+  const outcome = await registerOperationStateWrite({ prisma: db.prisma, config, sessionId: "primary", operationId: taskWide.operationId, header: taskWide.operationId, body: { family: "drafted.runtime", scopeKey: "runtime-other", version: 1 } },
+    { read: readToolingOperation, register: async args => { const receipt = await registerToolingStateWrite(args); await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } }); return receipt; } }).catch(error => error);
+  expect(outcome).toBeInstanceOf(StateWriteOutcomeUnknown);
+  expect(outcome.code).toBe("state-write-outcome-unknown");
+  expect(await records()).toBe(1);
 });

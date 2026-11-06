@@ -53,6 +53,12 @@ export const BeginToolingOperationInput = z.object({
 }).strict().refine(value => value.kind !== ADAPTER_COMMAND_KIND || !value.parentOperationId, "An adapter command is a root binding");
 
 export type ToolingOperationRefusalCode = "operation-required" | "operation-unknown" | "operation-mismatch" | "operation-ownership" | "operation-input" | "operation-closed" | "retained-release-required" | "producer-unknown";
+/** Registration may already be durable: the caller must treat the write as
+ * unknown (HTTP 503), never as a definite refusal, and receives no receipt. */
+export class StateWriteOutcomeUnknown extends Error {
+  readonly code = "state-write-outcome-unknown";
+  constructor(detail: string) { super(`State write registration outcome is unknown: ${detail}. Reconcile before writing; no authorization receipt was returned.`); }
+}
 export class ToolingOperationRefused extends Error {
   constructor(readonly code: ToolingOperationRefusalCode, message: string) { super(message); }
 }
@@ -796,7 +802,8 @@ export async function resolveFinishedLegacyConsumers(input: { prisma: PrismaClie
 // Guarded state evidence for the owning operation (frozen wire shapes in
 // types/tooling-release.ts). Task/repository come from the stored operation;
 // callers cannot choose another task, release or arbitrary path scope.
-export const StateQuery = z.object({ family: z.string().regex(/^[a-z][a-z0-9.-]{0,63}$/), scopeKey: z.string().min(1).max(512) }).strict();
+// A scope is a state key (resource key or `task`), never a file path.
+export const StateQuery = z.object({ family: z.string().regex(/^[a-z][a-z0-9.-]{0,63}$/), scopeKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,179}$/) }).strict();
 export const StateWriteInput = StateQuery.extend({ version: z.number().int().positive() }).strict();
 const LIVE_OPERATION = ["bound", "running", "unknown"];
 
@@ -806,9 +813,19 @@ async function ownedStateOperation(input: { prisma: PrismaClient; config: Server
   const binding = await dependencies.read({ prisma: input.prisma, operationId: input.operationId });
   if (!binding || binding.sessionId !== input.sessionId) throw refuse("operation-unknown", "Unknown tooling operation for this session");
   if (!LIVE_OPERATION.includes(binding.status)) throw refuse("operation-closed", `Operation ${binding.operationId} is ${binding.status}`);
-  if (input.scopeKey !== "task" && input.scopeKey !== binding.resourceKey) throw refuse("operation-input", "State scope must be this operation's resource key or task");
-  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
+  // A task-wide adapter command (null resource key) is already a reader of
+  // every scope of its own task; keyed operations reach their key or task.
+  const taskWide = binding.kind === ADAPTER_COMMAND_KIND && binding.resourceKey === null;
+  if (!taskWide && input.scopeKey !== "task" && input.scopeKey !== binding.resourceKey) throw refuse("operation-input", "State scope must be this operation's resource key or task");
+  await assertStateAuthority(input.prisma, input.config, binding);
   return binding;
+}
+/** Current authority for state evidence/writes: owner pause withholds every
+ * receipt except for the owner's own development intent. */
+async function assertStateAuthority(prisma: PrismaClient, config: ServerConfig, binding: ToolingOperationBinding) {
+  const task = await assertBindingAuthority({ prisma, config, binding });
+  if (task.ownerPaused && binding.kind !== "development-intent") throw refuse("operation-ownership", "Task is paused by its owner; no state receipt is issued");
+  return task;
 }
 
 /** GET .../tooling-operations/:operationId/state?family&scopeKey */
@@ -845,7 +862,7 @@ export async function readOperationStateEvidence(input: { prisma: PrismaClient; 
     if (row.provenance === "unavailable") throw new ToolingOperationRefused("operation-unknown", `Retained ${row.consumerKind} ${row.consumerId} has unresolved executable provenance: ${row.detail ?? "unavailable"}`);
     consumers.set(`legacy:${row.id}`, null);
   }
-  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
+  await assertStateAuthority(input.prisma, input.config, binding);
   return { operationId: binding.operationId, taskId: binding.taskId, family, scopeKey, version: readable.version, source: readable.source,
     consumers: [...consumers].map(([operationId, format]) => ({ operationId, format })) };
 }
@@ -859,10 +876,21 @@ export async function registerOperationStateWrite(input: { prisma: PrismaClient;
   const binding = await ownedStateOperation({ ...input, scopeKey: parsed.data.scopeKey }, dependencies);
   // Finished first-bootstrap readers no longer defer this task's writes.
   await resolveFinishedLegacyConsumers({ prisma: input.prisma, repositoryId: binding.repositoryId, taskId: binding.taskId });
-  const write = await (dependencies.register ?? (await import("./tooling-releases.ts")).registerToolingStateWrite)({ prisma: input.prisma, operationId: binding.operationId, ...parsed.data });
-  // The receipt is not an effect; refuse to hand it out if authority changed.
-  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
-  if (write.operationId !== binding.operationId || write.version !== parsed.data.version) throw new ToolingOperationRefused("operation-mismatch", "State write receipt does not match this operation");
+  const { ToolingStateFormatError } = await import("./tooling-releases.ts");
+  let write: Awaited<ReturnType<typeof import("./tooling-releases.ts").registerToolingStateWrite>>;
+  try { write = await (dependencies.register ?? (await import("./tooling-releases.ts")).registerToolingStateWrite)({ prisma: input.prisma, operationId: binding.operationId, ...parsed.data }); }
+  catch (error) {
+    // The helper's structured refusals precede any record; anything else may
+    // have committed.
+    if (error instanceof ToolingStateFormatError) throw error;
+    throw new StateWriteOutcomeUnknown(error instanceof Error ? error.message : String(error));
+  }
+  // Registration is durable from here: any later failure is unknown, and the
+  // receipt is withheld (preserving a pause or ownership change).
+  try {
+    await assertStateAuthority(input.prisma, input.config, binding);
+    if (write.operationId !== binding.operationId || write.version !== parsed.data.version) throw new Error("receipt does not match this operation");
+  } catch (error) { throw new StateWriteOutcomeUnknown(error instanceof Error ? error.message : String(error)); }
   return { operationId: binding.operationId, taskId: binding.taskId, family: parsed.data.family, scopeKey: parsed.data.scopeKey, write };
 }
 
