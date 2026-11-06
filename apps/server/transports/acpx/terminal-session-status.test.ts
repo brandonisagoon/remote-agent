@@ -21,22 +21,39 @@ const saved = [{ role: "user" as const, text: "Original request" }, { role: "age
 
 function gate<T = void>() { return Promise.withResolvers<T>(); }
 
-async function fixture() {
+async function fixture(options: { cachedHandle?: boolean } = {}) {
   const stateDir = path.join(directory, "state"), cwd = path.join(directory, "checkout"), config = testConfig({ acpxStateDir: stateDir });
-  await db.prisma.runtimeSession.create({ data: { id: ID, scopeKey: ID, repositoryId: "repo", machineId: config.machine, agentCommand: "codex", cwd, name: ID,
+  config.repository = { ...config.repository, root: directory, worktreeRoot: directory }; config.repositories = { [config.repository.id]: config.repository };
+  await db.prisma.runtimeSession.create({ data: { id: ID, scopeKey: ID, repositoryId: config.repository.id, machineId: config.machine, agentCommand: "codex", cwd, name: ID,
     status: "idle", acpxRecordId: "record", acpxSessionId: "backend", agentSessionId: "agent" } });
   const now = new Date().toISOString();
   const record: AcpSessionRecord = { schema: "acpx.session.v1", acpxRecordId: "record", acpSessionId: "backend", agentSessionId: "agent", agentCommand: "codex", cwd, name: ID,
-    createdAt: now, lastUsedAt: now, lastSeq: 0, eventLog: { active_path: path.join(stateDir, "record.events.jsonl"), segment_count: 1, max_segment_bytes: 1048576, max_segments: 1 },
+    createdAt: now, lastUsedAt: now, lastSeq: 0, agentStartedAt: now, lastPromptAt: now, lastAgentExitAt: now, eventLog: { active_path: path.join(stateDir, "record.events.jsonl"), segment_count: 1, max_segment_bytes: 1048576, max_segments: 1 },
     messages: [{ User: { id: "user-0", content: [{ Text: saved[0]!.text }] } }, { Agent: { content: [{ Text: saved[1]!.text }], tool_results: {} } }],
     updated_at: now, cumulative_token_usage: {}, request_token_usage: {} };
-  await createRuntimeStore({ stateDir }).save(record);
+  const store = createRuntimeStore({ stateDir });
+  await store.save(record);
 
   // Provider seams the test holds open.
   const turnStarted = gate(), result = gate<AcpRuntimeTurnResult>(), events = gate<void>();
   const statusEntered = gate(), statusRelease = gate();
   let holdStatus = false, throwFromEvents = false;
+  // Named provider calls the test can hold: ensureSession, setMode, setConfigOption, close.
+  const holds = new Map<string, { entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> }>();
+  const hold = (name: string) => { const value = { entered: gate(), release: gate() }; holds.set(name, value); return value; };
+  const pause = async (name: string) => { const value = holds.get(name); if (value) { holds.delete(name); value.entered.resolve(); await value.release.promise; } };
+  const closes: Array<{ handle: unknown; discardPersistentState?: boolean }> = [];
+  const ensured: unknown[] = [];
+  const handle = { sessionKey: ID, backend: "acpx", runtimeSessionName: ID, acpxRecordId: "record", backendSessionId: "backend", agentSessionId: "agent" };
   const provider = {
+    ensureSession: async (input: { agent: string }) => {
+      await pause("ensureSession");
+      const started = { ...handle, runtimeSessionName: `${ID}:${ensured.length}`, agent: input.agent };
+      ensured.push(started);
+      return started;
+    },
+    setMode: async () => { await pause("setMode"); },
+    setConfigOption: async () => { await pause("setConfigOption"); return { configOptions: CONFIG }; },
     startTurn: (input: { requestId: string }) => {
       turnStarted.resolve();
       return { requestId: input.requestId, promptStarted: Promise.resolve(),
@@ -47,11 +64,16 @@ async function fixture() {
       if (holdStatus) { statusEntered.resolve(); await statusRelease.promise; }
       return { agentSessionId: "agent-late", details: { configOptions: CONFIG } };
     },
-    close: async () => {}, cancel: async () => {},
+    close: async (input: { handle: unknown; discardPersistentState?: boolean }) => {
+      await pause("close");
+      closes.push({ handle: input.handle, discardPersistentState: input.discardPersistentState });
+    },
+    cancel: async () => {},
   };
   const runtime = createAcpxSessionRuntime(db.prisma, config);
   (runtime as any).runtimes.set(ID, provider);
-  (runtime as any).handles.set(ID, { sessionKey: ID, backend: "acpx", runtimeSessionName: ID, acpxRecordId: "record", backendSessionId: "backend", agentSessionId: "agent" });
+  if (options.cachedHandle !== false) (runtime as any).handles.set(ID, handle);
+  const cached = () => ({ handle: (runtime as any).handles.has(ID), runtime: (runtime as any).runtimes.has(ID), executionDirectory: (runtime as any).executionDirectories.has(ID) });
 
   const start = async () => {
     const turn = runtime.startTurn({ sessionId: ID, text: "Do the work", requestId: "turn-1" });
@@ -60,7 +82,7 @@ async function fixture() {
     return { turn, chain };
   };
   const row = () => db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: ID } });
-  return { runtime, provider, start, row, result, events, statusEntered, statusRelease,
+  return { config, runtime, provider, start, row, result, events, statusEntered, statusRelease, hold, closes, ensured, cached, store, record, turnStarted,
     holdStatusWrite: () => { holdStatus = true; }, failStream: () => { throwFromEvents = true; } };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -173,4 +195,132 @@ test("ordinary open-session failures still record error, and a later close recor
   expect(await f.row()).toMatchObject({ status: "error", closedAt: null, recoveryDetail: "provider failed" });
   await f.runtime.close(ID, "Owner closed the task");
   expect(await f.row()).toMatchObject({ status: "closed", recoveryDetail: null, closedAt: expect.any(Date) });
+});
+
+test("a session closed while its provider starts stops that provider, keeps history and leaves nothing cached", async () => {
+  const f = await fixture({ cachedHandle: false }), savedRecord = await f.store.load("record");
+  const starting = f.hold("ensureSession");
+  const turn = f.runtime.startTurn({ sessionId: ID, text: "Do the work" });
+  await starting.entered.promise;
+  await f.runtime.close(ID, "Owner closed the task"); // no cached handle: closes via the recorded stopped provider
+  const closed = await f.row();
+  expect(closed.status).toBe("closed");
+  starting.release.resolve();
+
+  // close() aborts the waiting turn, so it settles as cancelled; the refused attach still stops the provider.
+  expect(await turn.result).toEqual({ status: "cancelled", stopReason: "cancelled" });
+  for await (const _ of turn.events) {}
+  expect(f.ensured).toHaveLength(1);
+  expect(f.closes).toEqual([{ handle: f.ensured[0], discardPersistentState: false }]);
+  expect(f.cached()).toEqual({ handle: false, runtime: false, executionDirectory: false });
+  expect(await f.row()).toEqual(closed);
+  expect(await f.store.load("record")).toEqual(savedRecord!);
+  expect(await f.runtime.history(ID)).toEqual(saved);
+});
+
+test("a refused attach whose provider stop fails reports the failure and keeps the handle owned", async () => {
+  const f = await fixture({ cachedHandle: false });
+  const starting = f.hold("ensureSession");
+  f.provider.close = async () => { throw new Error("provider did not stop"); };
+  const turn = f.runtime.startTurn({ sessionId: ID, text: "Do the work" });
+  await starting.entered.promise;
+  await db.prisma.runtimeSession.update({ where: { id: ID }, data: { status: "closed", closedAt: new Date("2026-11-01T00:00:00.000Z") } });
+  const closed = await f.row();
+  starting.release.resolve();
+  const result = await turn.result;
+  expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("provider did not stop") });
+  expect(f.cached()).toMatchObject({ handle: true, runtime: true });
+  expect(await f.row()).toEqual(closed);
+});
+
+test("ensureSession refuses and stops the provider when its session closes during startup", async () => {
+  const f = await fixture({ cachedHandle: false });
+  let createdId = "";
+  (f.runtime as any).runtimeFor = (id: string) => { createdId = id; (f.runtime as any).runtimes.set(id, f.provider); return f.provider; };
+  const starting = f.hold("ensureSession");
+  const cwd = (await f.row()).cwd;
+  const ensuring = f.runtime.ensureSession({ sessionKey: "fresh", agent: "codex", cwd, repositoryId: f.config.repository.id }).catch((error: Error) => error);
+  await starting.entered.promise;
+  await db.prisma.runtimeSession.update({ where: { id: createdId }, data: { status: "closed", closedAt: new Date("2026-11-01T00:00:00.000Z") } });
+  const closed = await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: createdId } });
+  starting.release.resolve();
+  expect(String(await ensuring)).toContain("closed");
+  expect(f.closes).toEqual([{ handle: f.ensured[0], discardPersistentState: false }]);
+  expect((f.runtime as any).handles.has(createdId)).toBe(false);
+  expect((f.runtime as any).runtimes.has(createdId)).toBe(false);
+  expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: createdId } })).toEqual(closed);
+});
+
+for (const legacy of [false, true]) {
+  test(`a provider switch racing ${legacy ? "a legacy idle closure" : "closure"} is refused and keeps the original closedAt`, async () => {
+    const f = await fixture();
+    const stopping = f.hold("close"); // old provider stop precedes the switch write
+    const switching = f.runtime.switchAgent(ID, "claude").catch((error: Error) => error);
+    await stopping.entered.promise;
+    const closedAt = new Date("2026-10-01T12:00:00.000Z");
+    await db.prisma.runtimeSession.update({ where: { id: ID }, data: { status: legacy ? "idle" : "closed", closedAt } });
+    const closed = await f.row();
+    stopping.release.resolve();
+    expect(String(await switching)).toContain("closed");
+    expect(await f.row()).toEqual(closed);
+    expect(f.ensured).toHaveLength(0);
+  });
+}
+
+test("a session closed after the switch write stops the new provider and stays closed", async () => {
+  const f = await fixture();
+  const starting = f.hold("ensureSession");
+  const switching = f.runtime.switchAgent(ID, "claude").catch((error: Error) => error);
+  await starting.entered.promise;
+  await db.prisma.runtimeSession.update({ where: { id: ID }, data: { status: "closed", closedAt: new Date("2026-11-01T00:00:00.000Z") } });
+  const closed = await f.row();
+  starting.release.resolve();
+  expect(String(await switching)).toContain("closed");
+  expect(f.closes.at(-1)).toEqual({ handle: f.ensured[0], discardPersistentState: false });
+  expect(f.cached()).toEqual({ handle: false, runtime: false, executionDirectory: false });
+  expect(await f.row()).toEqual(closed);
+});
+
+test("an open provider switch still restarts the session on the new provider", async () => {
+  const f = await fixture();
+  const switched = await f.runtime.switchAgent(ID, "claude");
+  expect(switched).toMatchObject({ agent: "claude", status: "idle", closedAt: null });
+  expect(f.ensured).toHaveLength(1);
+});
+
+for (const control of ["setMode", "setConfigOption"] as const) {
+  test(`a late ${control} result after close leaves the session closed`, async () => {
+    const f = await fixture();
+    const held = f.hold(control);
+    const call = (control === "setMode" ? f.runtime.setMode(ID, "plan") : f.runtime.setConfigOption(ID, "mode", "late")).catch((error: Error) => error);
+    await held.entered.promise;
+    await f.runtime.close(ID, "Owner closed the task");
+    const closed = await f.row();
+    held.release.resolve();
+    await call;
+    expect(await f.row()).toEqual(closed);
+  });
+}
+
+test("legacy idle rows with closedAt refuse new delivery before any provider work", async () => {
+  const f = await fixture({ cachedHandle: false });
+  const legacyClosedAt = new Date("2026-10-01T12:00:00.000Z");
+  await db.prisma.runtimeSession.update({ where: { id: ID }, data: { status: "idle", closedAt: legacyClosedAt } });
+  const legacy = await f.row();
+  await expect(f.runtime.enqueue({ sessionId: ID, text: "More work" })).rejects.toThrow("closed");
+  const turn = f.runtime.startTurn({ sessionId: ID, text: "More work" });
+  expect(await turn.result).toMatchObject({ status: "failed", error: expect.stringContaining("closed") });
+  for await (const _ of turn.events) {}
+  expect(f.ensured).toHaveLength(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await f.row()).toEqual(legacy);
+  expect(await f.runtime.history(ID)).toEqual(saved);
+});
+
+test("interrupted-session reconciliation refuses a legacy row with closedAt", async () => {
+  const f = await fixture({ cachedHandle: false });
+  await db.prisma.runtimeSession.update({ where: { id: ID }, data: { status: "active", closedAt: new Date("2026-10-01T12:00:00.000Z") } });
+  const legacy = await f.row();
+  await expect(f.runtime.reconcileInterruptedSession!(ID)).rejects.toThrow("closed");
+  expect(await f.row()).toEqual(legacy);
 });

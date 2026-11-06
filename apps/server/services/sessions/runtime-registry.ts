@@ -169,6 +169,15 @@ export async function beginRuntimeSession(
  * `closedAt` set are still closed. */
 const OPEN_SESSION = { status: { not: "closed" }, closedAt: null } as const;
 
+/** A conditional write found the session already closed (status or
+ * closure timestamp). Callers that started a provider must release it. */
+export class RuntimeSessionClosedError extends Error {
+  constructor(id: string) {
+    super(`runtime session is closed: ${id}`);
+    this.name = "RuntimeSessionClosedError";
+  }
+}
+
 export async function attachRuntimeSession(
   prisma: PrismaClient,
   input: {
@@ -196,7 +205,7 @@ export async function attachRuntimeSession(
   });
   if (!changed.count) {
     await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } });
-    throw new Error(`runtime session is closed: ${input.id}`);
+    throw new RuntimeSessionClosedError(input.id);
   }
   return toAgentRuntimeSession(
     await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } }),
@@ -263,8 +272,10 @@ export async function prepareRuntimeAgentSwitch(
   prisma: PrismaClient,
   input: { id: string; agent: "codex" | "claude" },
 ): Promise<AgentRuntimeSession> {
-  const row = await prisma.runtimeSession.update({
-    where: { id: input.id },
+  // Switching providers restarts an open session only. A closure (including
+  // a legacy idle row with closedAt) is never cleared here.
+  const changed = await prisma.runtimeSession.updateMany({
+    where: { id: input.id, ...OPEN_SESSION },
     data: {
       agentCommand: input.agent,
       acpxRecordId: null,
@@ -274,10 +285,15 @@ export async function prepareRuntimeAgentSwitch(
       latestConfigOptions: Prisma.JsonNull,
       latestUsage: Prisma.JsonNull,
       recoveryDetail: null,
-      closedAt: null,
     },
   });
-  return toAgentRuntimeSession(row);
+  if (!changed.count) {
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } });
+    throw new RuntimeSessionClosedError(input.id);
+  }
+  return toAgentRuntimeSession(
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } }),
+  );
 }
 
 export async function findRuntimeSession(

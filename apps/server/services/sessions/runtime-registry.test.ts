@@ -9,6 +9,7 @@ import {
   findRuntimeSession,
   getRuntimeEventCursor,
   listRuntimeLifecycleEvents,
+  prepareRuntimeAgentSwitch,
   pruneRuntimeLifecycleEvents,
   runtimeScopeKey,
   updateRuntimeSessionState,
@@ -195,6 +196,7 @@ describe("runtime session registry", () => {
         ]) expect(await updateRuntimeSessionState(database!.prisma, "s", write)).toBe(false);
         expect(await row()).toEqual(before);
         await expect(attachRuntimeSession(database!.prisma, { id: "s", acpxRecordId: "late" })).rejects.toThrow("closed");
+        await expect(prepareRuntimeAgentSwitch(database!.prisma, { id: "s", agent: "claude" })).rejects.toThrow("closed");
         expect(await row()).toEqual(before);
       });
     }
@@ -212,6 +214,7 @@ describe("runtime session registry", () => {
         expect((await row()).status).toBe(status);
       }
       await expect(updateRuntimeSessionState(database!.prisma, "s", { status: "idle", closedAt: null })).rejects.toThrow("closing status");
+      expect(await prepareRuntimeAgentSwitch(database!.prisma, { id: "s", agent: "claude" })).toMatchObject({ agent: "claude", status: "provisioning", closedAt: null });
       const closedAt = new Date();
       expect(await updateRuntimeSessionState(database!.prisma, "s", { status: "closed", closedAt })).toBe(true);
       expect(await row()).toMatchObject({ status: "closed", closedAt });
