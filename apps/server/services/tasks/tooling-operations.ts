@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Prisma, PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
-import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
+import { assertClosedCleanupFamily, assertSettledClosedFamily } from "./closed-cleanup.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
   bindRetainedToolingOperation, bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
@@ -44,14 +44,20 @@ const EXISTING_TYPE: Record<ToolingOperationKind, ExistingReference["type"]> = {
  * (including effects with no server callback). Callback bindings name it as
  * `parentOperationId` and inherit its release; it is never a callback kind. */
 export const ADAPTER_COMMAND_KIND = "adapter-command";
+/** One already-owned legacy resource's cleanup on a closed task (contract
+ * 7a6fe03). Digest of ClosedResourceReleaseInput {key, action}; cannot parent
+ * callbacks or authorize starts, resumes, finalization or migration. */
+export const CLOSED_RESOURCE_RELEASE_KIND = "closed-resource-release";
+const CLOSED_RELEASE_ACTIONS = ["reconcile", "stop", "release"] as const;
 export const BeginToolingOperationInput = z.object({
   requestKey: z.string().trim().min(1).max(256),
   inputDigest: z.string().regex(/^[a-f0-9]{64}$/),
-  kind: z.enum([...TOOLING_OPERATION_KINDS, ADAPTER_COMMAND_KIND]),
+  kind: z.enum([...TOOLING_OPERATION_KINDS, ADAPTER_COMMAND_KIND, CLOSED_RESOURCE_RELEASE_KIND]),
   existingOperationId: z.string().min(1).max(512).optional(),
   resourceKey: z.string().min(1).max(512).optional(),
   parentOperationId: z.string().min(1).max(256).optional(),
-}).strict().refine(value => value.kind !== ADAPTER_COMMAND_KIND || !value.parentOperationId, "An adapter command is a root binding");
+}).strict().refine(value => value.kind !== ADAPTER_COMMAND_KIND || !value.parentOperationId, "An adapter command is a root binding")
+  .refine(value => value.kind !== CLOSED_RESOURCE_RELEASE_KIND || (value.resourceKey && !value.parentOperationId && !value.existingOperationId), "A closed resource release names exactly its resourceKey, with no parent or existing operation");
 
 export type ToolingOperationRefusalCode = "operation-required" | "operation-unknown" | "operation-mismatch" | "operation-ownership" | "operation-input" | "operation-closed" | "retained-release-required" | "producer-unknown";
 /** Registration may already be durable: the caller must treat the write as
@@ -92,25 +98,48 @@ const CLOSED_CLEANUP_KINDS: readonly string[] = [ADAPTER_COMMAND_KIND, "finaliza
  * (`finalize:<taskId>`, recorded before settled primary closure, family
  * stopped) — the same authority finalization's assertPreparedCleanup uses.
  * Grants no new work; handlers still check the full prepared cleanup. */
+/** Shared ownership still binds after closure (cleanup-lifecycle's closed
+ * rule): configured repository/connection and the original source link, which
+ * closure may have ended but revocation removes. */
+async function assertClosedOwnership(prisma: PrismaClient, config: ServerConfig, task: RemoteTask, session: { id: string }) {
+  const repository = config.repositories[task.repositoryId];
+  if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
+  if ((task.connectionId === null) !== (task.issueIdentifier === null)) throw new Error("Closed cleanup source identity is incomplete");
+  if (task.issueIdentifier) {
+    if (!task.connectionId || !config.connections[task.connectionId]) throw new Error("Task connection is no longer configured");
+    const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles" } });
+    if (!link) throw new Error("Task source ownership was revoked");
+  }
+}
 export async function assertClosedCleanupPrimary(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
   const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
   const session = await input.prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
   if (!task || !session || task.phase !== "closed" || session.role !== "primary" || !task.worktreePath || session.cwd !== task.worktreePath
     || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.ownerPaused) throw new Error("Only the closed task's original primary may continue its existing cleanup");
-  // Shared ownership still binds after closure (cleanup-lifecycle's closed
-  // rule): configured repository/connection and the original source link,
-  // which closure may have ended but revocation removes.
-  const repository = input.config.repositories[task.repositoryId];
-  if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
-  if ((task.connectionId === null) !== (task.issueIdentifier === null)) throw new Error("Closed cleanup source identity is incomplete");
-  if (task.issueIdentifier) {
-    if (!task.connectionId || !input.config.connections[task.connectionId]) throw new Error("Task connection is no longer configured");
-    const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles" } });
-    if (!link) throw new Error("Task source ownership was revoked");
-  }
+  await assertClosedOwnership(input.prisma, input.config, task, session);
   const operation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: "finalization-cleanup-started", key: `finalize:${task.id}` } });
   await assertClosedCleanupFamily(input.prisma, task, session, operation, input.runtime);
   return { task, session, cleanupKey: `finalize:${task.id}` };
+}
+/** Closed legacy resource cleanup (contract 7a6fe03): the closed, unpaused,
+ * settled original task with shared ownership intact, no finalization history
+ * (prepared, cleanup, v2, confirmation) and no non-reference retention, and
+ * the exact existing unreleased receipt. Closure alone grants nothing. */
+export async function assertClosedLegacyRelease(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; resourceKey: string; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity">; admission?: boolean }) {
+  const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
+  const session = await input.prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
+  if (!task || !session || task.phase !== "closed" || session.role !== "primary" || !task.worktreePath || session.cwd !== task.worktreePath
+    || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine) throw new Error("Only a closed task's original primary may release its legacy resources");
+  if (task.ownerPaused) throw new Error("Task is paused by its owner; no resource is released");
+  await assertClosedOwnership(input.prisma, input.config, task, session);
+  await assertSettledClosedFamily(input.prisma, task, session, input.runtime);
+  if (await input.prisma.runtimeMetadataEvent.count({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}` } })) throw new Error("This task has finalization history; its resources are released only through finalize:" + task.id);
+  if (await input.prisma.runtimeMetadataEvent.count({ where: { runtimeSessionId: session.id, action: { in: ["finalization-archive-retention", "legacy-evidence-retained"] } } })) throw new Error("This task retains resources; they are released only through its finalization");
+  const resource = await input.prisma.remoteTaskResource.findUnique({ where: { taskId_key: { taskId: task.id, key: input.resourceKey } } });
+  // Admission needs an unreleased receipt; the bound operation's own release
+  // must not revoke its later state record or settlement.
+  if (!resource || (input.admission !== false && resource.state === "released")) throw new Error(`Closed task ${task.id} has no unreleased resource ${input.resourceKey}`);
+  return { task, session, resource };
 }
 /** The exact closed-cleanup lineage: a fence naming the task's own cleanup
  * operation as its existing operation. No other command crosses closure. */
@@ -452,6 +481,11 @@ const PAUSE_BLOCKED: readonly string[] = ["compute-admission", "compute-configur
 async function assertBindingAuthority(input: { prisma: PrismaClient; config: ServerConfig; binding: ToolingOperationBinding }) {
   const task = await input.prisma.remoteTask.findUnique({ where: { id: input.binding.taskId } });
   if (!task || task.primarySessionId !== input.binding.sessionId || task.repositoryId !== input.binding.repositoryId) throw refuse("operation-ownership", "The operation no longer belongs to this task's primary session");
+  if (input.binding.kind === CLOSED_RESOURCE_RELEASE_KIND) {
+    try { await assertClosedLegacyRelease({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId, resourceKey: input.binding.resourceKey ?? "", admission: false }); }
+    catch (error) { throw refuse("operation-ownership", error instanceof Error ? error.message : String(error)); }
+    return task;
+  }
   if (input.binding.kind !== "finalization") {
     try {
       if (task.phase === "closed" && input.binding.kind === ADAPTER_COMMAND_KIND) {
@@ -478,6 +512,9 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     const sessionId = decodeURIComponent(RESOURCE_REGISTRATION.exec(input.pathname)![1]!);
     const binding = await dependencies.read({ prisma: input.prisma, operationId: input.header });
     if (!binding || binding.sessionId !== sessionId) throw refuse("operation-ownership", "Resource evidence names an operation of another session");
+    // A closed resource release updates only its own exact existing receipt;
+    // identity and cleanup transitions are rechecked by the handler.
+    if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND && (input.body.key !== binding.resourceKey || ["bound", "running", "unknown"].indexOf(binding.status) < 0)) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
     await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
     return null;
   }
@@ -649,7 +686,12 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   const owned = async () => {
     const closed = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId }, select: { phase: true } });
     let value;
-    if (closed?.phase === "closed" && CLOSED_CLEANUP_KINDS.includes(request.kind)) {
+    if (request.kind === CLOSED_RESOURCE_RELEASE_KIND) {
+      const eligible = await assertClosedLegacyRelease({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, resourceKey: request.resourceKey!, ...(input.runtime ? { runtime: input.runtime } : {}) });
+      // The digest must be exactly one allowed action for this stored key.
+      if (!CLOSED_RELEASE_ACTIONS.some(action => dependencies.digest({ key: eligible.resource.key, action }) === request.inputDigest)) throw new ToolingOperationRefused("operation-input", `inputDigest is not a reconcile, stop or release of resource ${eligible.resource.key}`);
+      value = eligible;
+    } else if (closed?.phase === "closed" && CLOSED_CLEANUP_KINDS.includes(request.kind)) {
       value = await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, ...(input.runtime ? { runtime: input.runtime } : {}) });
       // Exact cleanup lineage only: the fence names the cleanup operation, and
       // its finalization children continue exactly that request key.
@@ -744,7 +786,7 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
   if (!input.header || input.header !== input.operationId) throw refuse("operation-required", "Settlement requires the matching operation header");
   const { requestKey, inputDigest, outcome } = parsed.data;
   const binding = await dependencies.read({ prisma: input.prisma, operationId: input.operationId });
-  if (!binding || binding.sessionId !== input.sessionId || binding.kind !== ADAPTER_COMMAND_KIND) throw refuse("operation-unknown", "No such adapter command for this session");
+  if (!binding || binding.sessionId !== input.sessionId || ![ADAPTER_COMMAND_KIND, CLOSED_RESOURCE_RELEASE_KIND].includes(binding.kind)) throw refuse("operation-unknown", "No such adapter command for this session");
   if (binding.requestKey !== requestKey || binding.inputDigest !== inputDigest) throw refuse("operation-mismatch", "Settlement identity differs from the stored command");
   // Ownership of the recorded command: settlement records an outcome, so a
   // later closure of the task does not strand its retry journal.
@@ -763,7 +805,7 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
   // below) or reads a completed parent afterwards and is refused.
   try {
     await input.prisma.$transaction(async tx => {
-      const swapped = await tx.toolingOperation.updateMany({ where: { id: binding.operationId, status: binding.status, kind: ADAPTER_COMMAND_KIND }, data: { status: "completed", completionEvidence: evidence } });
+      const swapped = await tx.toolingOperation.updateMany({ where: { id: binding.operationId, status: binding.status, kind: binding.kind }, data: { status: "completed", completionEvidence: evidence } });
       if (swapped.count !== 1) throw new ToolingOperationRefused("operation-closed", "Command state changed during settlement");
       const task = await tx.remoteTask.findUnique({ where: { id: binding.taskId } });
       if (!task || task.primarySessionId !== binding.sessionId || task.repositoryId !== binding.repositoryId) throw refuse("operation-ownership", "The command no longer belongs to this task's primary session");
@@ -942,6 +984,7 @@ async function ownedStateOperation(input: { prisma: PrismaClient; config: Server
   // A task-wide adapter command (null resource key) is already a reader of
   // every scope of its own task; keyed operations reach their key or task.
   const taskWide = binding.kind === ADAPTER_COMMAND_KIND && binding.resourceKey === null;
+  if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND && input.scopeKey !== binding.resourceKey) throw refuse("operation-input", "A closed resource release reaches only its own resource's state");
   if (!taskWide && input.scopeKey !== "task" && input.scopeKey !== binding.resourceKey) throw refuse("operation-input", "State scope must be this operation's resource key or task");
   await assertStateAuthority(input.prisma, input.config, binding);
   return binding;
@@ -1000,6 +1043,13 @@ export async function registerOperationStateWrite(input: { prisma: PrismaClient;
   const parsed = StateWriteInput.safeParse(input.body);
   if (!parsed.success) throw refuse("operation-input", "A state family, scopeKey and positive version are required");
   const binding = await ownedStateOperation({ ...input, scopeKey: parsed.data.scopeKey }, dependencies);
+  if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND) {
+    // Cleanup keeps the recorded format version (legacy-assumed v1 when none):
+    // never a migration, raise or rewind.
+    const { readToolingStateVersion, LEGACY_STATE_FORMATS } = await import("./tooling-releases.ts");
+    const recorded = (await readToolingStateVersion({ prisma: input.prisma, taskId: binding.taskId, family: parsed.data.family, scopeKey: parsed.data.scopeKey }))?.version ?? LEGACY_STATE_FORMATS[parsed.data.family]?.write ?? 1;
+    if (parsed.data.version !== recorded) throw refuse("operation-input", `A closed resource release keeps ${parsed.data.family} version ${recorded}; it cannot change it to ${parsed.data.version}`);
+  }
   // Finished first-bootstrap readers no longer defer this task's writes.
   await resolveFinishedLegacyConsumers({ prisma: input.prisma, repositoryId: binding.repositoryId, taskId: binding.taskId });
   const { ToolingStateFormatError } = await import("./tooling-releases.ts");

@@ -728,3 +728,61 @@ test("closed-task sweep callbacks keep their pre-protocol outcomes after activat
   // The command fence itself is what a closed sweep without cleanup lineage lacks.
   await expect(begin(config, { requestKey: "upkeep-closed", inputDigest: canonicalDigest({ argv: ["upkeep", "closed"] }), kind: "adapter-command" })).rejects.toThrow(/original operation recorded before settled primary closure/);
 });
+
+describe("closed legacy resource release (contract 7a6fe03)", () => {
+  async function closedLegacyTask() {
+    const { config } = await fixture(); await bootstrap([]);
+    await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt: new Date() } });
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+    const runtime = { key: "runtime-development", kind: "task-runtime", purpose: "development", externalId: "/fixture/runtime.json", metadata: { recipeHash: "b".repeat(64), revision: "a".repeat(40) } };
+    await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", ...runtime } });
+    await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", key: "container", kind: "docker-container", purpose: "development", externalId: "c".repeat(64) } });
+    const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+    const send = (method: string, route: string, body: unknown, operationId?: string) => server.request(`http://localhost${route}`, { method,
+      headers: { "content-type": "application/json", ...(operationId ? { [TOOLING_OPERATION_HEADER]: operationId } : {}) }, ...(method === "GET" ? {} : { body: JSON.stringify(body) }) });
+    const release = (action: string, key = runtime.key, extra: Record<string, unknown> = {}) =>
+      begin(config, { requestKey: `release:${key}:${action}`, inputDigest: canonicalDigest({ key, action }), kind: "closed-resource-release", resourceKey: key, ...extra });
+    return { config, runtime, send, release };
+  }
+
+  test("an eligible closed legacy task releases exactly one existing resource at its recorded format, then settles", async () => {
+    const { runtime, send, release } = await closedLegacyTask();
+    const binding = (await release("release")).binding;
+    expect(binding).toMatchObject({ kind: "closed-resource-release", resourceKey: runtime.key, release: { revision: A }, parentOperationId: null, existingOperationId: null });
+    expect((await send("PUT", "/api/sessions/primary/task/resources", { ...runtime, state: "released" }, binding.operationId)).status).toBe(200);
+    const base = `/api/sessions/primary/tooling-operations/${binding.operationId}`;
+    expect(await (await send("GET", `${base}/state?family=drafted.runtime&scopeKey=${runtime.key}`, undefined, binding.operationId)).json()).toMatchObject({ version: 1, source: "legacy-assumed" });
+    expect((await send("POST", `${base}/state-writes`, { family: "drafted.runtime", scopeKey: runtime.key, version: 1 }, binding.operationId)).status).toBe(200);
+    expect((await send("POST", `${base}/state-writes`, { family: "drafted.runtime", scopeKey: runtime.key, version: 2 }, binding.operationId)).status).toBe(400); // never raised
+    expect((await send("GET", `${base}/state?family=drafted.runtime&scopeKey=task`, undefined, binding.operationId)).status).toBe(400); // no task scope
+    expect(await (await send("POST", `${base}/settlement`, { requestKey: binding.requestKey, inputDigest: binding.inputDigest, outcome: "completed" }, binding.operationId)).json()).toMatchObject({ outcome: "completed", binding: { status: "completed" } });
+  });
+
+  test("it grants nothing beyond its own receipt: other resources, actions, parents, children and new work are refused", async () => {
+    const { config, runtime, send, release } = await closedLegacyTask();
+    const binding = (await release("stop")).binding;
+    expect((await send("PUT", "/api/sessions/primary/task/resources", { key: "container", kind: "docker-container", purpose: "development", externalId: "c".repeat(64), state: "released" }, binding.operationId)).status).toBe(409);
+    await expect(release("resume")).rejects.toThrow(/not a reconcile, stop or release/);
+    await expect(release("release", runtime.key, { parentOperationId: binding.operationId })).rejects.toThrow();
+    await expect(release("release", runtime.key, { existingOperationId: "finalize:task" })).rejects.toThrow();
+    await expect(begin(config, { requestKey: "child", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: binding.operationId })).rejects.toThrow();
+    await expect(begin(config, { requestKey: "new-work", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).rejects.toThrow(/Task is closed/);
+    expect((await send("POST", "/api/sessions/primary/browser-stop-authority", { key: runtime.key }, binding.operationId)).status).toBe(409);
+    await expect(release("release", "missing")).rejects.toThrow(/no unreleased resource/);
+  });
+
+  test("pause, an unsettled family, finalization history and retention keep it finalize-only or refused", async () => {
+    const { release } = await closedLegacyTask();
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    await expect(release("release")).rejects.toThrow(/paused/);
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: false } });
+    const pending = await db.prisma.runtimeInstruction.create({ data: { id: "pending", sessionId: "primary", text: "queued work" } });
+    await expect(release("release")).rejects.toThrow(/unresolved task-family instructions/);
+    await db.prisma.runtimeInstruction.update({ where: { id: pending.id }, data: { state: "completed" } });
+    const retention = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "archive:task", action: "finalization-archive-retention", key: "archive", value: "{}" } });
+    await expect(release("release")).rejects.toThrow(/retains resources/);
+    await db.prisma.runtimeMetadataEvent.delete({ where: { sequence: retention.sequence } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: FINALIZATION_PREPARED, key: "finalize:task", value: "{}" } });
+    await expect(release("release")).rejects.toThrow(/finalization history/);
+  });
+});
