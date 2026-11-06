@@ -268,7 +268,7 @@ export function boundCode(explicit?: ToolingCodeIdentity | null): ToolingCodeIde
 // producer — intent before the effect, confirmed/failed after. A newest
 // producer intent without an outcome is an unknown effect: fail closed.
 const ASSOCIATION = "tooling-operation-association";
-const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion"]), state: z.enum(["intent", "confirmed", "failed"]), evidence: z.string().optional() }).passthrough();
+const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown"]), evidence: z.string().optional() }).passthrough();
 type Role = z.infer<typeof Association>["role"];
 const associationKey = (role: Role, id: string) => `${role}:${id}`;
 const referenceId = (reference: Pick<ExistingReference, "type" | "id">) => `${reference.type}:${reference.id}`;
@@ -276,6 +276,10 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
   if (!task.primarySessionId) return [];
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION, key: associationKey(role, id) }, orderBy: { sequence: "desc" }, take: 64 });
   return events.map(event => Association.parse(JSON.parse(event.value ?? "null")));
+}
+async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, state: "acknowledged" | "refused" | "unknown", status: number | null) {
+  await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
 }
 async function recordAssociation(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId" | "kind" | "generation">, role: Role, id: string, state: "intent" | "confirmed" | "failed", evidence?: string) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey(role, id),
@@ -503,6 +507,9 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
 export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[] }, status: number | "exception",
   dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
   const ok = typeof status === "number" && status >= 200 && status < 300, refused = typeof status === "number" && status >= 400 && status < 500;
+  // Exact per-callback outcome for command settlement: an acknowledgment of
+  // this operation's route and request digest, distinct from physical proof.
+  await recordCallbackOutcome(prisma, state.binding, admission.callback.route, ok ? "acknowledged" : refused ? "refused" : "unknown", typeof status === "number" ? status : null);
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
   // An HTTP status never proves absence: a bind/configure follows the
   // physical start, and a handler may commit before refusing. Readers are
@@ -646,34 +653,51 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
   const task = await input.prisma.remoteTask.findUnique({ where: { id: binding.taskId } });
   if (!task || task.primarySessionId !== binding.sessionId || task.repositoryId !== binding.repositoryId || task.machineId !== input.config.machine) throw refuse("operation-ownership", "The command no longer belongs to this task's primary session");
   const evidence = settlementEvidence(outcome, requestKey);
-  const recorded = async () => (await input.prisma.toolingOperation.findUnique({ where: { id: binding.operationId } }))?.completionEvidence as { kind?: string; reference?: string } | null | undefined;
+  const recorded = async (store: Pick<PrismaClient, "toolingOperation"> = input.prisma) => (await store.toolingOperation.findUnique({ where: { id: binding.operationId } }))?.completionEvidence as { kind?: string; reference?: string } | null | undefined;
+  const same = (prior: { kind?: string; reference?: string } | null | undefined) => prior?.kind === evidence.kind && prior?.reference === evidence.reference;
   if (binding.status === "completed") {
-    const prior = await recorded();
-    if (prior?.kind === evidence.kind && prior.reference === evidence.reference) return { binding, outcome };
+    if (same(await recorded())) return { binding, outcome };
     throw refuse("operation-closed", `Command ${binding.operationId} was already settled with a different outcome`);
   }
   if (binding.status === "unknown") throw refuse("operation-closed", `Command ${binding.operationId} has an unknown outcome; reconcile it before settling`);
-  const children = await input.prisma.toolingOperation.findMany({ where: { parentOperationId: binding.operationId }, take: 1001 });
-  if (children.length > 1000) throw refuse("operation-input", "Command child inventory exceeds its bound");
-  const ids = [binding.operationId, ...children.map(child => child.id)];
-  const consumers = await input.prisma.toolingRetainedConsumer.findMany({ where: { operationId: { in: ids } }, take: 1001 });
-  const writes = await input.prisma.toolingStateWrite.count({ where: { operationId: { in: ids } } });
-  if (outcome === "no-effect") {
-    if (binding.status !== "bound" || children.length || consumers.length || writes) throw refuse("operation-input", "A no-effect settlement requires a bound command with no children, state writes or retained consumers");
-  } else {
-    const unknown = children.find(child => child.status === "unknown");
-    if (unknown) throw refuse("operation-closed", `Child operation ${unknown.id} has an unknown outcome; the command cannot be declared successful`);
-    const pending = consumers.find(consumer => consumer.status === "pending");
-    if (pending) throw refuse("operation-closed", `Retained ${pending.consumerKind} ${pending.consumerId} has an unconfirmed producing effect; the command cannot be declared successful`);
-  }
-  try { await dependencies.transition({ prisma: input.prisma, operationId: binding.operationId, from: binding.status, to: "completed", evidence }); }
-  catch (error) {
+  // One transaction, parent compare-and-swap FIRST: it takes the write lock, so
+  // a concurrent child begin either committed before (and is inventoried
+  // below) or reads a completed parent afterwards and is refused.
+  try {
+    await input.prisma.$transaction(async tx => {
+      const swapped = await tx.toolingOperation.updateMany({ where: { id: binding.operationId, status: binding.status, kind: ADAPTER_COMMAND_KIND }, data: { status: "completed", completionEvidence: evidence } });
+      if (swapped.count !== 1) throw new ToolingOperationRefused("operation-closed", "Command state changed during settlement");
+      const task = await tx.remoteTask.findUnique({ where: { id: binding.taskId } });
+      if (!task || task.primarySessionId !== binding.sessionId || task.repositoryId !== binding.repositoryId) throw refuse("operation-ownership", "The command no longer belongs to this task's primary session");
+      const children = await tx.toolingOperation.findMany({ where: { parentOperationId: binding.operationId }, take: 1001 });
+      if (children.length > 1000) throw refuse("operation-input", "Command child inventory exceeds its bound");
+      const ids = [binding.operationId, ...children.map(child => child.id)];
+      const consumers = await tx.toolingRetainedConsumer.findMany({ where: { operationId: { in: ids } }, take: 1001 });
+      if (consumers.length > 1000) throw refuse("operation-input", "Command consumer inventory exceeds its bound");
+      const writes = await tx.toolingStateWrite.count({ where: { operationId: { in: ids } } });
+      if (outcome === "no-effect") {
+        if (binding.status !== "bound" || children.length || consumers.length || writes) throw refuse("operation-input", "A no-effect settlement requires a bound command with no children, state writes or retained consumers");
+        return;
+      }
+      const pending = consumers.find(consumer => consumer.status === "pending");
+      if (pending) throw refuse("operation-closed", `Retained ${pending.consumerKind} ${pending.consumerId} has an unconfirmed producing effect; the command cannot be declared successful`);
+      for (const child of children) {
+        if (child.status === "completed") continue;
+        // Finite callback lifetimes end only on their exact durable outcome.
+        const latest = child.status === "running" ? await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", child.id) }, orderBy: { sequence: "desc" } }) : null;
+        const value = latest ? Association.safeParse(JSON.parse(latest.value ?? "null")).data as (z.infer<typeof Association> & { inputDigest?: string }) | undefined : undefined;
+        if (!value || value.state !== "acknowledged" || value.operationId !== child.id || value.inputDigest !== child.inputDigest)
+          throw refuse("operation-closed", `Child operation ${child.id} is ${child.status} without a confirmed callback outcome; the command cannot be declared successful`);
+        const done = await tx.toolingOperation.updateMany({ where: { id: child.id, status: "running" }, data: { status: "completed", completionEvidence: { kind: "callback-acknowledged", reference: binding.operationId } } });
+        if (done.count !== 1) throw refuse("operation-closed", `Child operation ${child.id} changed during settlement`);
+      }
+    });
+  } catch (error) {
     // Lost acknowledgment or concurrent settlement: replay only the same outcome.
-    const prior = await recorded();
-    if (!(prior?.kind === evidence.kind && prior.reference === evidence.reference)) throw error;
+    if (!same(await recorded())) throw error;
   }
   const settled = await dependencies.read({ prisma: input.prisma, operationId: binding.operationId });
-  if (!settled || settled.status !== "completed") throw refuse("operation-closed", "Command settlement did not complete");
+  if (!settled || settled.status !== "completed" || !same(await recorded())) throw refuse("operation-closed", "Command settlement did not complete");
   return { binding: settled, outcome };
 }
 

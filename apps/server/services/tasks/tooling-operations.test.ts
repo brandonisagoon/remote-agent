@@ -524,3 +524,40 @@ test("an HTTP refusal never resolves a producing reader; only exact never-claime
   await transitionToolingOperation({ prisma: db.prisma, operationId: refused.operationId, from: "running", to: "completed", evidence: { kind: "compute-decline", reference: "withdrawn" } });
   expect((await migrate()).status).toBe(200);
 });
+
+test("settlement completes only acknowledged callbacks atomically and cannot race a new child", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  let status = 200;
+  const { call } = app(config, () => ({ status }));
+  const fence = async (key: string) => (await begin(config, { requestKey: key, inputDigest: canonicalDigest({ argv: [key] }), kind: "adapter-command" })).binding;
+  const child = (parent: string, key: string) => begin(config, { requestKey: key, inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: parent });
+  const settle = (binding: { operationId: string; requestKey: string; inputDigest: string }, outcome: string) => call(`/api/sessions/primary/tooling-operations/${binding.operationId}/settlement`,
+    { requestKey: binding.requestKey, inputDigest: binding.inputDigest, outcome }, binding.operationId);
+  const read = (id: string) => readToolingOperation({ prisma: db.prisma, operationId: id });
+  // Race: a no-effect settlement and a child begin never both succeed.
+  const racing = await fence("race");
+  const [settled, begun] = await Promise.allSettled([settle(racing, "no-effect"), child(racing.operationId, "race:child")]);
+  const settledOk = settled.status === "fulfilled" && settled.value.status === 200, childOk = begun.status === "fulfilled";
+  expect(settledOk && childOk).toBe(false);
+  expect(settledOk || childOk).toBe(true);
+  // A running child whose callback was refused has no confirmed outcome: success is refused and nothing commits.
+  const refused = await fence("refused");
+  const noAck = (await child(refused.operationId, "refused:request")).binding;
+  status = 409;
+  expect((await call("/api/tasks/task/compute-request", computeBody, noAck.operationId)).status).toBe(409);
+  expect((await read(noAck.operationId))!.status).toBe("running");
+  expect((await settle(refused, "completed")).status).toBe(409);
+  expect((await read(refused.operationId))!.status).toBe("bound");
+  expect((await read(noAck.operationId))!.status).toBe("running");
+  // An acknowledged callback completes with the command; its reader survives.
+  const done = await fence("done");
+  const acked = (await child(done.operationId, "done:request")).binding;
+  status = 200;
+  expect((await call("/api/tasks/task/compute-request", computeBody, acked.operationId)).status).toBe(200);
+  await environment("env-r");
+  const reader = await retainToolingConsumer({ prisma: db.prisma, operationId: acked.operationId, consumerKind: "compute-environment", consumerId: "env-r", scopeKey: "task" });
+  await confirmToolingConsumer({ prisma: db.prisma, id: reader.id, evidence: { kind: "compute-bind", reference: "offer-r" } });
+  expect(await (await settle(done, "completed")).json()).toMatchObject({ outcome: "completed", binding: { operationId: done.operationId, status: "completed" } });
+  expect((await read(acked.operationId))!.status).toBe("completed");
+  expect((await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } })).status).toBe("confirmed");
+});

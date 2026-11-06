@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
@@ -24,10 +25,14 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   // A command fence derived from the group's retained reader; the adapter's
   // child callbacks (development intent, resources) inherit its release.
   const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
-    inputDigest: canonicalDigest({ command: "compute continue", environmentId: input.environmentId, ...reference }) } });
+    // Mirrors the adapter's cliInputDigest for the exact spawned command.
+    inputDigest: canonicalDigest({ operation: "compute continue", taskId: input.taskId, positionals: ["compute", "continue"], options: { task: input.taskId }, files: {},
+      stdin: createHash("sha256").update(JSON.stringify({ ...reference, environmentId: input.environmentId })).digest("hex") }) } });
   const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
-    cwd: runtime.receipt.checkout, env: operationEnvironment(binding), timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
+    // Bound process context the release-aware adapter reads for its callbacks.
+    cwd: runtime.receipt.checkout, env: { ...operationEnvironment(binding), ...(binding ? { REMOTE_AGENT_SOCKET: input.config.controlIpcPath, REMOTE_AGENT_TASK_ID: input.taskId, REMOTE_AGENT_SESSION_ID: input.primarySessionId } : {}) },
+    timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
   });
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
