@@ -241,7 +241,7 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
         const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" });
           const entry = { args, code: result.exitCode, stdout: result.stdout.toString().trim().slice(0, 4_000), stderr: result.stderr.toString().trim().slice(0, 300) }; results.push(entry); return entry; };
         const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        const missing = (kind: "container" | "network" | "volume", id: string) => kind === "container" ? new RegExp(`no such object: ${escape(id)}`, "i")
+        const missing = (kind: "container" | "network" | "volume", id: string) => kind === "container" ? new RegExp(`no such container: ${escape(id)}`, "i")
           : kind === "network" ? new RegExp(`network ${escape(id)} not found`, "i") : new RegExp(`${escape(id)}: no such volume`, "i");
         const inspect = (kind: "container" | "network" | "volume", id: string) => kind === "volume" ? run(["volume", "inspect", "--format", "{{.Name}}", id])
           : run([kind === "container" ? "container" : "network", "inspect", "--format", "{{.Id}} {{.Name}}", id]);
