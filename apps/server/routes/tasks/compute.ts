@@ -1,5 +1,6 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
 import { ComputeConfiguration, configureCompute } from "../../services/tasks/compute-configuration.ts";
+import { ComputeNeonRecovery, recoverComputeNeon } from "../../services/tasks/compute-neon-recovery.ts";
 import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -12,6 +13,17 @@ import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "../..
 import { readSessionToolingOperation } from "../../services/tasks/tooling-operations.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
+// The callback guard supplies the operation scope. Neither the body nor this
+// route may select a release or manufacture an admitted binding.
+computeRoutes.post("/:taskId/compute-neon-recovery", async c => {
+  const request = ComputeNeonRecovery.safeParse(await c.req.json().catch(() => null));
+  if (!request.success) return c.json({ error: "Exact allocation, operation, recipe transition, baseline, lock and reconciliation outcome are required" }, 400);
+  try {
+    return c.json(await recoverComputeNeon({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data }));
+  } catch {
+    return c.json({ error: "Neon recovery could not be verified; preserve the receipt, allocation and provider resources" }, 409);
+  }
+});
 /** Reading an already committed result grants no effect authority. In
  * particular, pause and completed commands must not hide a lost response. */
 computeRoutes.get("/:taskId/compute-neon-recovery/:operationId", async c => {
