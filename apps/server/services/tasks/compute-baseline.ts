@@ -6,7 +6,7 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
-import { CleanupObserverError } from "./cleanup-observer-diagnostics.ts";
+import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
 
 export const countedComputeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const Purpose = z.enum(["development", "review"]);
@@ -75,18 +75,25 @@ function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: C
       && current.identities.some(identity => identity.id === resource.resourceId && identity.identityDigest === resource.resourceIdentity));
 }
 
-/** Durable, non-sensitive outcome of a group's latest refresh: a fixed phase
- * and code with the time it began. Diagnostic only: never proof, never
- * credit, never raw observer/provider output. Written only on a change of
- * outcome/phase/code (bounded), outside every credit transaction. */
+/** Durable, non-sensitive outcome of a group's latest COMPLETED refresh: a
+ * fixed phase and finite code with the time that state began. Diagnostic only:
+ * never proof, never credit, never raw observer/provider output. "proof-recorded"
+ * means only that an observation was persisted as the group's proof; credit is
+ * decided solely by computeBaselineCredits (stopped, current, fresh). Each
+ * record names the refresh (token) that produced it and is written only while
+ * that refresh is still the group's current one, so a slower superseded
+ * refresh can never append over a newer one. Written only on a change of
+ * outcome/phase/code (bounded), outside every proof/credit transaction. */
 export const BaselineRefreshPhase = z.enum(["snapshot", "observe", "validate", "credit"]);
-const RefreshRecord = z.object({ version: z.literal(1), groupId: Sha, outcome: z.enum(["credited", "failed", "deferred"]),
-  phase: BaselineRefreshPhase.optional(), code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).optional(), since: z.number().int().nonnegative() }).strict();
-export type BaselineRefresh = Omit<z.infer<typeof RefreshRecord>, "version" | "groupId">;
+const PHASE_CODES = { snapshot: "SNAPSHOT_UNAVAILABLE", observe: "OBSERVER_UNVERIFIED", validate: "OBSERVATION_INVALID", credit: "PROOF_REJECTED" } as const;
+export const BaselineRefreshCode = z.enum([...Object.keys(cleanupObserverReasons) as [keyof typeof cleanupObserverReasons, ...Array<keyof typeof cleanupObserverReasons>],
+  ...Object.values(PHASE_CODES), "FAMILY_ACTIVE"]);
+const RefreshRecord = z.object({ version: z.literal(1), groupId: Sha, refreshToken: z.string().uuid(), outcome: z.enum(["proof-recorded", "failed", "deferred"]),
+  phase: BaselineRefreshPhase.optional(), code: BaselineRefreshCode.optional(), since: z.number().int().nonnegative() }).strict();
+export type BaselineRefresh = Omit<z.infer<typeof RefreshRecord>, "version" | "groupId" | "refreshToken">;
 const REFRESH_ACTION = "compute-baseline-refresh";
 const refreshSource = (machineId: string) => `compute-baseline:${machineId}`;
-const PHASE_CODES: Record<z.infer<typeof BaselineRefreshPhase>, string> = { snapshot: "SNAPSHOT_UNAVAILABLE", observe: "OBSERVER_UNVERIFIED", validate: "OBSERVATION_INVALID", credit: "PROOF_REJECTED" };
-const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown) => error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
+const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown): z.infer<typeof BaselineRefreshCode> => error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
 const parseJson = (text: string | null | undefined) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
 async function latestRefresh(store: Pick<Store, "remoteTask" | "runtimeMetadataEvent">, machineId: string, taskId: string, groupId: string) {
   const task = await store.remoteTask.findUnique({ where: { id: taskId }, select: { primarySessionId: true } });
@@ -94,17 +101,25 @@ async function latestRefresh(store: Pick<Store, "remoteTask" | "runtimeMetadataE
   const where = { runtimeSessionId: task.primarySessionId, source: refreshSource(machineId), action: REFRESH_ACTION, key: groupId };
   const event = await store.runtimeMetadataEvent.findFirst({ where, orderBy: { sequence: "desc" } });
   const parsed = RefreshRecord.safeParse(parseJson(event?.value));
-  return { where, record: parsed.success && parsed.data.groupId === groupId ? parsed.data : null };
+  const record = parsed.success && parsed.data.groupId === groupId ? parsed.data : null;
+  return { where, record, unreadable: Boolean(event) && !record };
 }
-async function recordRefresh(input: Context, taskId: string, groupId: string, value: Omit<BaselineRefresh, "since">) {
+class SupersededRefresh extends Error {}
+async function recordRefresh(input: Context, taskId: string, groupId: string, token: string, value: Omit<BaselineRefresh, "since">) {
   try {
     const latest = await latestRefresh(input.prisma, input.config.machine, taskId, groupId);
     if (!latest) return;
     const prior = latest.record;
     if (prior && prior.outcome === value.outcome && prior.phase === value.phase && prior.code === value.code) return;
-    await input.prisma.runtimeMetadataEvent.create({ data: { ...latest.where,
-      value: JSON.stringify(RefreshRecord.parse({ version: 1, groupId, ...value, since: (input.now ?? new Date()).getTime() })) } });
-  } catch { /* Diagnostic only: never affects accounting. */ }
+    const record = RefreshRecord.parse({ version: 1, groupId, refreshToken: token, ...value, since: (input.now ?? new Date()).getTime() });
+    // The append (first write, taking the lock) commits only while this
+    // refresh is still the group's current one; otherwise it rolls back.
+    await input.prisma.$transaction(async tx => {
+      await tx.runtimeMetadataEvent.create({ data: { ...latest.where, value: JSON.stringify(record) } });
+      const row = await tx.computeBaseline.findUnique({ where: { id: groupId }, select: { refreshToken: true } });
+      if (row?.refreshToken !== token) throw new SupersededRefresh();
+    });
+  } catch { /* Diagnostic only (superseded or unavailable): never affects accounting. */ }
 }
 
 const readInstalled: Read = async (input, task, request) => (await import("./compute-observer.ts")).readInstalledComputeBaseline(input, task, request);
@@ -149,7 +164,7 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
         });
         const before = await snapshot(input.prisma, row, input.runtime);
-        if (!before.settled) { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
+        if (!before.settled) { unavailable++; await recordRefresh(input, group.taskId, id, token, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
         phase = "observe";
         const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
           purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
@@ -165,9 +180,11 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
           return saved.count === 1;
         });
-        if (credited) { observed++; await recordRefresh(input, group.taskId, id, { outcome: "credited" }); }
-        else { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
-      } catch (error) { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
+        // Persisted as proof only; whether it credits (stopped, current, fresh)
+        // is decided solely by computeBaselineCredits.
+        if (credited) { observed++; await recordRefresh(input, group.taskId, id, token, { outcome: "proof-recorded" }); }
+        else { unavailable++; await recordRefresh(input, group.taskId, id, token, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
+      } catch (error) { unavailable++; await recordRefresh(input, group.taskId, id, token, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
     }
   }));
   return { observed, unavailable };
@@ -181,13 +198,14 @@ export async function computeBaselineCredits(store: Store, input: { machineId: s
   const rows = await store.computeBaseline.findMany({ where: { machineId: input.machineId }, take: 1001 });
   if (rows.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
   return Promise.all(rows.map(async row => {
-    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined, refresh: BaselineRefresh | undefined;
+    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined, refresh: BaselineRefresh | undefined, refreshUnreadable = false;
     const proof = Proof.safeParse(row.proof);
     if (!proof.success) {
       // No current proof: the latest recorded refresh distinguishes a failed or
       // deferred observation from one never made. It never credits.
-      const latest = (await latestRefresh(store, row.machineId, row.taskId, row.id).catch(() => null))?.record;
-      if (latest) { const { version: _version, groupId: _group, ...summary } = latest; refresh = summary; }
+      const read = await latestRefresh(store, row.machineId, row.taskId, row.id).catch(() => null), latest = read?.record;
+      if (latest) { const { version: _version, groupId: _group, refreshToken: _token, ...summary } = latest; refresh = summary; }
+      else if (read?.unreadable) refreshUnreadable = true;
       reason = latest?.outcome === "failed" ? "refresh-failed" : latest?.outcome === "deferred" ? "family-active" : "missing-proof";
     }
     else if (!input.runtime) { reason = "unobservable"; observedAt = proof.data.observation.observedAt; }
@@ -200,6 +218,6 @@ export async function computeBaselineCredits(store: Store, input: { machineId: s
         if (!credited) reason = !current.settled ? "family-active" : current.digest !== proof.data.snapshotDigest ? "membership-changed" : !fresh ? "proof-stale" : "not-proven-stopped";
       } catch { reason = "inventory-unavailable"; /* Unknown original claims remain reserved. */ }
     }
-    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }), ...(refresh ? { refresh } : {}) };
+    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }), ...(refresh ? { refresh } : {}), ...(refreshUnreadable ? { refreshUnreadable } : {}) };
   }));
 }

@@ -58,7 +58,7 @@ export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Sto
 /** Exact evidence for a group that consumes the explicit budget. */
 export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[]; detail: string; action: string;
   /** Uncredited baseline only: why, and the latest recorded refresh outcome (diagnostic, never proof). */
-  baseline?: { reason?: string; observedAt?: number; refresh?: { outcome: string; phase?: string; code?: string; since: number } } };
+  baseline?: { reason?: string; observedAt?: number; refresh?: { outcome: string; phase?: string; code?: string; since: number }; refreshUnreadable?: boolean } };
 const BLOCKER_ACTION: Record<ComputeBlocker["reason"], string> = {
   "unrecorded-resource": "No fresh stopped observation accounts for these resources; the collector must observe them stopped or their owner must release them.",
   "uncredited-baseline": "The original group has no current stopped proof; the next settled baseline refresh can credit it.",
@@ -108,8 +108,9 @@ async function unaccounted(store: Store, input: Context): Promise<{ count: numbe
   for (const group of originalClaims) for (const id of group.resourceIds.filter(id => !recorded.has(id)))
     add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id, `baseline ${group.reason ?? "uncredited"}${group.observedAt === undefined ? "" : ` (last proof observed ${new Date(group.observedAt).toISOString()})`}${
       group.refresh ? ` (last refresh ${group.refresh.outcome}${group.refresh.phase ? ` at ${group.refresh.phase}` : ""}${group.refresh.code ? ` ${group.refresh.code}` : ""} since ${new Date(group.refresh.since).toISOString()})`
-        : group.reason === "missing-proof" ? " (never observed)" : ""}`,
-      { ...(group.reason ? { reason: group.reason } : {}), ...(group.observedAt === undefined ? {} : { observedAt: group.observedAt }), ...(group.refresh ? { refresh: group.refresh } : {}) });
+        : group.refreshUnreadable ? " (last refresh record unreadable)" : group.reason === "missing-proof" ? " (never observed)" : ""}`,
+      { ...(group.reason ? { reason: group.reason } : {}), ...(group.observedAt === undefined ? {} : { observedAt: group.observedAt }), ...(group.refresh ? { refresh: group.refresh } : {}),
+        ...(group.refreshUnreadable ? { refreshUnreadable: true } : {}) });
   for (const resource of resources) if (!recorded.has(resource.id)) add(`${resource.taskId}:${resource.purpose}`, "unrecorded-resource", resource.id, `resource ${resource.key} (${resource.kind}, ${resource.state})`);
   for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id, `environment ${environment.id} is ${environment.state} without an allocation`);
   return { count: groups.size, blockers: [...groups.values()] };

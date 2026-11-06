@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase } from "../../../../test-support/db.ts";
+import { Prisma } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
@@ -270,8 +271,8 @@ test("DRA-36: a long refresh of one group never clears another group's fresh pro
   expect(during).toMatchObject({ unaccounted: 1 });
   // In flight after an earlier credit: no proof now, last recorded outcome credited.
   expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"],
-    detail: `baseline missing-proof (last refresh credited since ${f.now.toISOString()})`, action: expect.stringContaining("baseline refresh"),
-    baseline: { reason: "missing-proof", refresh: { outcome: "credited", since: f.now.getTime() } } }]);
+    detail: `baseline missing-proof (last refresh proof-recorded since ${f.now.toISOString()})`, action: expect.stringContaining("baseline refresh"),
+    baseline: { reason: "missing-proof", refresh: { outcome: "proof-recorded", since: f.now.getTime() } } }]);
   release();
   expect(await pass).toEqual({ observed: 2, unavailable: 0 });
   expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
@@ -310,9 +311,44 @@ test("each group's refresh outcome is diagnosed by phase and fixed code, never a
   expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
   expect(await blocker()).toBeUndefined();
   expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, headroom: 1 });
-  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "credited" });
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
   // A later failure invalidates that credit again: the charge returns with its cause.
   await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
   expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "observe", code: "OBSERVER_TIMEOUT" });
   expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+});
+
+test("a recorded refresh outcome never stands in for credit, and a superseded refresh cannot append over a newer one", async () => {
+  const f = await fixture();
+  const blocker = async (now = f.now) => (await readComputeCapacity({ ...f.admission, now, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  const events = () => f.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" }, orderBy: { sequence: "asc" } });
+  // A valid observation that says running is never recorded as proof.
+  await refreshComputeBaselines(f.context, async (...args) => { const result = await f.read(...args) as any; result.resources[0].state = "running"; return result; });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { outcome: "failed", phase: "credit", code: "PROOF_REJECTED" } });
+  // "proof-recorded" is not credit: once that proof is stale, credit is refused for its own reason.
+  await refreshComputeBaselines(f.context, f.read);
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
+  expect(await blocker()).toBeUndefined();
+  const later = new Date(f.now.getTime() + 60 * 60_000);
+  expect(await blocker(later)).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "proof-stale" } });
+  expect(await readComputeCapacity({ ...f.admission, now: later, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  // An older, slower refresh that fails after a newer one completed cannot append.
+  let entered!: () => void, release!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const older = refreshComputeBaselines(f.context, async () => { entered(); await gate; throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  await reading;
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  const count = (await events()).length;
+  release();
+  expect(await older).toEqual({ observed: 0, unavailable: 1 });
+  expect((await events()).length).toBe(count);
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
+  expect(await blocker()).toBeUndefined();
+  // A record outside the finite writer vocabulary is never reported.
+  await f.prisma.computeBaseline.updateMany({ data: { proof: Prisma.DbNull } });
+  const group = (await f.prisma.computeBaseline.findFirstOrThrow()).id;
+  await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "old", source: "compute-baseline:host", action: "compute-baseline-refresh", key: group,
+    value: JSON.stringify({ version: 1, groupId: group, refreshToken: crypto.randomUUID(), outcome: "failed", phase: "observe", code: "RAW_PROVIDER_SECRET_TEXT", since: f.now.getTime() }) } });
+  expect((await blocker())?.baseline).toEqual({ reason: "missing-proof", refreshUnreadable: true });
+  expect((await blocker())?.detail).toBe("baseline missing-proof (last refresh record unreadable)");
 });
