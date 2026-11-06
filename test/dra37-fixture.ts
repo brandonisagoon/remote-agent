@@ -12,7 +12,7 @@ import path from "node:path";
 import { createTestDatabase } from "../test-support/db.ts";
 import { parseServiceFile } from "../lib/config.ts";
 import { prepareToolingRelease, verifyPreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
-import { drainGuards } from "./dra37-drain.ts";
+import { drainGuards, guardShimSource } from "./dra37-drain.ts";
 
 const sourceRoot = path.resolve(import.meta.dir, "..");
 export const MACHINE = "dra37-machine", REPOSITORY = "dra37-repo";
@@ -108,7 +108,9 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
 
 /** Real-Docker mode inputs, recorded before any effect. */
 export const REAL_IMAGES = { app: "oven/bun:1.3.14", proxy: "nginx:1.28-alpine" } as const;
-type RealDocker = { docker: string; prefix: string; images: { app: string; proxy: string }; ledger: string; policy: string };
+type RealDocker = { docker: string; prefix: string; images: { app: string; proxy: string }; ledger: string; policy: string;
+  /** The guard shim; its exact path is the process identity visible to ps. */
+  shim: string };
 
 export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string; additionalRevisions?: string[] }; relay?: boolean; docker?: "synthetic" | "real";
   /** Committed-CLI mode: the primary runs the exact capability checkout's
@@ -149,7 +151,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       return result.stdout.toString().trim();
     };
     real = { docker, prefix: `dra37fx-${path.basename(root).replace(/^dra37-/, "").toLowerCase()}`, images: { app: imageId(REAL_IMAGES.app), proxy: imageId(REAL_IMAGES.proxy) },
-      ledger: path.join(root, "docker-ledger.jsonl"), policy: path.join(root, "docker-policy.json") };
+      ledger: path.join(root, "docker-ledger.jsonl"), policy: path.join(root, "docker-policy.json"), shim: path.join(bin, "docker") };
     // Read once, read-only: each recorded image's declared volumes and the OS
     // ephemeral port range, so a guarded create spawns nothing extra.
     const imageVolumes = Object.fromEntries(Object.values(real.images).map(id => {
@@ -163,9 +165,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       : readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/).map(Number);
     await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), imageVolumes, ephemeral, ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl"), tasks: tasksFile,
       holdFile: observerHoldFile, holdCwd: path.join(root, "install", "tooling"), holdMaxMs: 300_000, delayFile: collectorDelayFile }), { mode: 0o600 });
-    await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
-      `process.argv.splice(2, 0, ${JSON.stringify(real.policy)});`,
-      `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker-guard.ts"))});`, ""].join("\n"), { mode: 0o700 });
+    await writeFile(real.shim, guardShimSource(real.policy), { mode: 0o700 });
   } else {
     await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
       `process.argv.splice(2, 0, ${JSON.stringify(apps)});`,
@@ -364,7 +364,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       if (real) {
         const calls = existsSync(path.join(apps, "docker-calls.jsonl")) ? readFileSync(path.join(apps, "docker-calls.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
         const barrierPids = [...new Set(calls.filter(call => call.hold === "start" || call.delay === "start").map(call => Number(call.pid)))];
-        const result = await drainGuards({ policyPath: real.policy, barrierPids, boundMs: 60_000 });
+        const result = await drainGuards({ shimPath: real.shim, barrierPids, boundMs: 60_000 });
         drainProblems = result.problems; drain = result;
       }
       let preserve = !!options.keepEvidence;

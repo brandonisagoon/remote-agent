@@ -28,6 +28,7 @@ else if (command === "volume" && sub === "create") console.log(stub.volumeOutput
 else if (command === "create") { if (stub.createDelayMs) Bun.sleepSync(stub.createDelayMs); console.log(stub.createOutput); }
 else if (command === "container" && sub === "ls") console.log(stub.listing ?? "");
 else if (command === "stop") console.log(args.at(-1));
+else if (command === "info") console.log("stub-engine");
 else { console.error("stub: unmodelled " + args.join(" ")); process.exit(3); }
 `;
 
@@ -262,7 +263,7 @@ test("fixture subnet selection uses true IPv4 CIDR overlap and fails closed on i
 
 test("cleanup drain fails closed: ps failure, undrained guard, unreadable identity; only ESRCH proves a barrier gone", async () => {
   const { drainGuards, guardInventory, recordedBarriers } = await import("./dra37-drain.ts");
-  const POLICY = "/private/fixture/docker-policy.json";
+  const POLICY = "/private/fixture/bin/docker";
   type State = "gone" | "exists" | "unknown";
   const probe = (inventory: { code: number | null; stdout: string }, states: Record<number, State>, identities: Record<number, { code: number | null; stdout: string }> = {}) => ({
     ps: (args: string[]) => args[0] === "-axo" ? inventory : identities[Number(args.at(-1))] ?? { code: 1, stdout: "" },
@@ -272,10 +273,10 @@ test("cleanup drain fails closed: ps failure, undrained guard, unreadable identi
   const fast = { sleep: async () => { clock.t += 250; }, now: () => clock.t };
   // ps failure is never absence.
   expect(guardInventory(POLICY, probe({ code: 1, stdout: "" }, {}))).toBeNull();
-  const psFailed = await drainGuards({ policyPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 1, stdout: "" }, {}), ...fast });
+  const psFailed = await drainGuards({ shimPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 1, stdout: "" }, {}), ...fast });
   expect(psFailed.problems).toEqual(["guard process inventory (ps) failed; exact cleanup cannot be claimed"]);
   // A guard that never drains within the bound blocks exact cleanup.
-  const undrained = await drainGuards({ policyPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 0, stdout: `4242 bun ${POLICY} create\n` }, {}), ...fast });
+  const undrained = await drainGuards({ shimPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 0, stdout: `4242 bun ${POLICY} create\n` }, {}), ...fast });
   expect(undrained.problems[0]).toMatch(/guard processes still running after the drain bound.*4242/);
   // Recorded barrier PIDs: ESRCH -> gone; reused PID (not our argv) -> not ours;
   // still ours -> live; identity read failed and not provably gone -> unknown.
@@ -283,9 +284,43 @@ test("cleanup drain fails closed: ps failure, undrained guard, unreadable identi
     2: { code: 0, stdout: "/usr/bin/some-other-process" }, 3: { code: 0, stdout: `bun ${POLICY} inspect` }, 4: { code: 1, stdout: "" }, 5: { code: 1, stdout: "" } }));
   expect(barriers.live).toEqual([`3: bun ${POLICY} inspect`]);
   expect(barriers.unknown.map(entry => entry.split(":")[0])).toEqual(["4", "5"]);
-  const blocked = await drainGuards({ policyPath: POLICY, barrierPids: [3, 4], boundMs: 1_000, probe: probe(ok, { 3: "exists", 4: "unknown" }, { 3: { code: 0, stdout: `bun ${POLICY}` } }), ...fast });
+  const blocked = await drainGuards({ shimPath: POLICY, barrierPids: [3, 4], boundMs: 1_000, probe: probe(ok, { 3: "exists", 4: "unknown" }, { 3: { code: 0, stdout: `bun ${POLICY}` } }), ...fast });
   expect(blocked.problems.map(problem => problem.split(":")[0])).toEqual(["recorded barrier processes still alive", "recorded barrier processes in an unknown state"]);
   // All provably gone and nothing running: no problem.
-  const clean = await drainGuards({ policyPath: POLICY, barrierPids: [7, 8], boundMs: 1_000, probe: probe(ok, { 7: "gone", 8: "gone" }), ...fast });
+  const clean = await drainGuards({ shimPath: POLICY, barrierPids: [7, 8], boundMs: 1_000, probe: probe(ok, { 7: "gone", 8: "gone" }), ...fast });
   expect(clean.problems).toEqual([]);
 });
+
+test("positive control: a real held guard is visible by its exact shim path before release and provably absent after", async () => {
+  const { drainGuards, guardInventory, guardShimSource, recordedBarriers } = await import("./dra37-drain.ts");
+  const { root } = fixture();
+  const policyFile = path.join(root, "policy.json"), shim = path.join(root, "bin", "docker"), holdFile = path.join(root, "observer-hold");
+  const observerCwd = path.join(root, "install", "tooling", "release");
+  mkdirSync(observerCwd, { recursive: true }); mkdirSync(path.dirname(shim), { recursive: true });
+  writeFileSync(policyFile, JSON.stringify({ ...JSON.parse(readFileSync(policyFile, "utf8")), holdFile, holdCwd: path.join(root, "install", "tooling"), holdMaxMs: 30_000 }));
+  writeFileSync(shim, guardShimSource(policyFile), { mode: 0o700 });
+  writeFileSync(holdFile, "held");
+  // Launched exactly as Drafted's observer does: exec of the shim on PATH.
+  const child = Bun.spawn([shim, "info", "--format", "{{.ServerVersion}}"], { cwd: observerCwd, stdout: "pipe", stderr: "pipe" });
+  const log = () => existsSync(path.join(root, "calls.jsonl")) ? readFileSync(path.join(root, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>) : [];
+  const deadline = Date.now() + 20_000;
+  while (!log().some(entry => entry.hold === "start")) { if (Date.now() > deadline) throw new Error("guard never held"); await Bun.sleep(25); }
+  const pid = Number(log().find(entry => entry.hold === "start")!.pid);
+  expect(pid).toBe(child.pid);
+  // BEFORE release: visible by the exact shim path in the OS argv ...
+  const held = guardInventory(shim);
+  expect(held?.some(line => line.trim().startsWith(`${pid} `)), JSON.stringify(held)).toBe(true);
+  expect(recordedBarriers([pid], shim).live).toHaveLength(1);
+  // ... and NOT by the policy path, which exists only inside the JS process.
+  expect(guardInventory(policyFile)).toEqual([]);
+  const undrained = await drainGuards({ shimPath: shim, barrierPids: [pid], boundMs: 500 });
+  expect(undrained.problems.length).toBeGreaterThan(0);
+  // AFTER release: forwarded, exited, and provably absent.
+  rmSync(holdFile);
+  expect(await child.exited).toBe(0);
+  expect(log().some(entry => entry.hold === "released" && entry.pid === pid)).toBe(true);
+  const drained = await drainGuards({ shimPath: shim, barrierPids: [pid], boundMs: 10_000 });
+  expect(drained.problems).toEqual([]);
+  expect(drained.live).toEqual([]);
+  expect(drained.unknown).toEqual([]);
+}, 60_000);

@@ -35,6 +35,14 @@
  *  - offer-turn hold (synthetic primary): a delivered compute-offer turn stays
  *    in progress without a claim or answer until released.
  * Production timeouts are unchanged.
+ *
+ * Limitation of receipts before 277a495+ (including the accepted c6fff5e run):
+ * their barrier-absence step matched the POLICY path in `ps` output, which the
+ * OS argv never contains (the shim splices it into process.argv in-process),
+ * so that check was vacuous. For those runs, barrier exit is proven only by
+ * the guards' own terminal log lines (each "abandoned" exit) and inferred for
+ * a "released" call that was then forwarded; ps absence is NOT proven. Checks
+ * now match the exact shim path (dra37-drain.ts, with a real positive control).
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -111,7 +119,7 @@ function harness(server: Server, evidence: Record<string, any>) {
    * treated as absence; only ESRCH proves a recorded PID gone. */
   const recordedPids = () => [...new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => Number(entry.pid)))];
   const barrierState = () => {
-    const guards = guardInventory(real.policy), recorded = recordedBarriers(recordedPids(), real.policy);
+    const guards = guardInventory(real.shim), recorded = recordedBarriers(recordedPids(), real.shim);
     return { absent: guards !== null && guards.length === 0 && recorded.live.length === 0 && recorded.unknown.length === 0, guards, ...recorded };
   };
   const noBarrierProcesses = async (label: string) => {
