@@ -23,7 +23,7 @@ const RELEVANT_CHANGE = /^(apps\/|lib\/|management\/|types\/|prisma\/|bin\/|scri
 
 export type DeployOutcome = "deployed" | "up-to-date" | "skipped" | "already-running" | "failed";
 
-interface DeployContext {
+export interface DeployContext {
   config: ServerConfig;
   layout: InstallLayout;
   definition: ServiceDefinition;
@@ -32,8 +32,23 @@ interface DeployContext {
   health: string;
   databasePath: string | null;
   snapshot: string | null | "absent";
+  /** Set before requesting restart: even a failed start may admit effects. */
+  serverStartedSinceSnapshot: boolean;
+  effects: DeployEffects;
   log: (line: string) => void;
 }
+
+export interface DeployEffects {
+  run: typeof runOrThrow;
+  sync: typeof syncTree;
+  supervisor: typeof supervisor;
+  health: typeof waitForHealth;
+  settle: () => Promise<void>;
+}
+const deployEffects: DeployEffects = {
+  run: runOrThrow, sync: syncTree, supervisor, health: waitForHealth,
+  settle: () => new Promise(resolve => setTimeout(resolve, 2_000)),
+};
 
 export async function deploy(options: { force?: boolean } = {}): Promise<DeployOutcome> {
   const config = readConfig();
@@ -64,6 +79,8 @@ export async function deploy(options: { force?: boolean } = {}): Promise<DeployO
       health: `http://127.0.0.1:${config.port}/health`,
       databasePath: config.databaseUrl.startsWith("file:") ? config.databaseUrl.slice(5) : null,
       snapshot: null,
+      serverStartedSinceSnapshot: false,
+      effects: deployEffects,
       log,
     }, options.force ?? false);
   } finally {
@@ -101,11 +118,11 @@ function acquireLock(layout: InstallLayout, log: (line: string) => void): boolea
   }
 }
 
-async function deployLocked(context: DeployContext, force: boolean): Promise<DeployOutcome> {
+export async function deployLocked(context: DeployContext, force: boolean): Promise<DeployOutcome> {
   const { layout, branch, log } = context;
-  await runOrThrow("git", ["-C", layout.repo, "fetch", "--quiet", "origin", `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
-  const previous = (await runOrThrow("git", ["-C", layout.repo, "rev-parse", "HEAD"])).trim();
-  const target = (await runOrThrow("git", ["-C", layout.repo, "rev-parse", `origin/${branch}`])).trim();
+  await context.effects.run("git", ["-C", layout.repo, "fetch", "--quiet", "origin", `refs/heads/${branch}:refs/remotes/origin/${branch}`]);
+  const previous = (await context.effects.run("git", ["-C", layout.repo, "rev-parse", "HEAD"])).trim();
+  const target = (await context.effects.run("git", ["-C", layout.repo, "rev-parse", `origin/${branch}`])).trim();
 
   if (previous === target && !force) return "up-to-date";
 
@@ -114,10 +131,10 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
   await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: target });
 
   if (!force && previous !== target) {
-    const changed = await runOrThrow("git", ["-C", layout.repo, "diff", "--name-only", previous, target]);
+    const changed = await context.effects.run("git", ["-C", layout.repo, "diff", "--name-only", previous, target]);
     if (!RELEVANT_CHANGE.test(changed)) {
       log(`no relevant changes (${previous} -> ${target}), fast-forwarding without rebuild`);
-      await runOrThrow("git", ["-C", layout.repo, "reset", "--hard", "--quiet", target]);
+      await context.effects.run("git", ["-C", layout.repo, "reset", "--hard", "--quiet", target]);
       return "skipped";
     }
   }
@@ -130,8 +147,7 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
     // resetting git alone leaves the app copy populated with the new,
     // unbuildable code, and the supervisor restarts the service into it.
     // The service must come back regardless — build() stopped it to migrate.
-    await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: previous });
-    await restoreDatabaseSnapshot(context);
+    if (!(await prepareRollback(context, previous))) return "failed";
     if ((await tryBuild(context, previous)) && (await restartAndCheck(context))) {
       log(`restored ${previous}`);
     } else if (!(await restartAndCheck(context))) {
@@ -149,8 +165,7 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
   // after an intentionally destructive migration, old code cannot safely run
   // against the new schema.
   log(`HEALTH CHECK FAILED after deploying ${target} — rolling back to ${previous}`);
-  await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: previous });
-  await restoreDatabaseSnapshot(context);
+  if (!(await prepareRollback(context, previous))) return "failed";
   if ((await tryBuild(context, previous)) && (await restartAndCheck(context))) {
     log(`rolled back to ${previous} OK`);
   } else {
@@ -169,15 +184,15 @@ async function tryBuild(context: DeployContext, commit: string): Promise<boolean
   const env = { REMOTE_AGENT_CONFIG: configFilePath() };
   try {
     await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: commit });
-    await runOrThrow("git", ["-C", layout.repo, "reset", "--hard", "--quiet", commit]);
-    syncTree(layout.repo, layout.app);
-    await runOrThrow(bun, ["install", "--silent"], { cwd: layout.app, env });
-    await runOrThrow(bun, ["x", "prisma", "generate"], { cwd: layout.app, env });
-    await supervisor().stop(serviceLabel(context.config.serviceName));
-    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    await context.effects.run("git", ["-C", layout.repo, "reset", "--hard", "--quiet", commit]);
+    context.effects.sync(layout.repo, layout.app);
+    await context.effects.run(bun, ["install", "--silent"], { cwd: layout.app, env });
+    await context.effects.run(bun, ["x", "prisma", "generate"], { cwd: layout.app, env });
+    await context.effects.supervisor().stop(serviceLabel(context.config.serviceName));
+    await context.effects.settle();
     snapshotDatabase(context, commit);
-    await runOrThrow(bun, ["x", "prisma", "migrate", "deploy"], { cwd: layout.app, env });
-    await runOrThrow(bun, ["x", "tsc", "--noEmit", "-p", "tsconfig.deploy.json"], { cwd: layout.app, env });
+    await context.effects.run(bun, ["x", "prisma", "migrate", "deploy"], { cwd: layout.app, env });
+    await context.effects.run(bun, ["x", "tsc", "--noEmit", "-p", "tsconfig.deploy.json"], { cwd: layout.app, env });
     return true;
   } catch (error) {
     log(error instanceof Error ? error.message : String(error));
@@ -186,8 +201,16 @@ async function tryBuild(context: DeployContext, commit: string): Promise<boolean
 }
 
 async function restartAndCheck(context: DeployContext): Promise<boolean> {
-  await supervisor().restart(context.definition);
-  return waitForHealth(context.health, 30);
+  // Persist in the deployment context before calling the supervisor. A thrown
+  // restart or failed health response does not prove that no server ran.
+  context.serverStartedSinceSnapshot = true;
+  try {
+    await context.effects.supervisor().restart(context.definition);
+    return await context.effects.health(context.health, 30);
+  } catch (error) {
+    context.log(error instanceof Error ? error.message : String(error));
+    return false;
+  }
 }
 
 function snapshotDatabase(context: DeployContext, commit: string): void {
@@ -207,12 +230,25 @@ function snapshotDatabase(context: DeployContext, commit: string): void {
   log(`snapshotted SQLite database to ${snapshot}`);
 }
 
+/** Recovery refusals are an explicit failed deployment, never an uncaught
+ * exception that hides which candidate and database were left in place. */
+async function prepareRollback(context: DeployContext, previous: string): Promise<boolean> {
+  try {
+    await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: context.layout.repo, revision: previous });
+    await restoreDatabaseSnapshot(context);
+    return true;
+  } catch (error) {
+    context.log(`ROLLBACK REFUSED — preserving current code and database; manual coordinated recovery required: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
 async function restoreDatabaseSnapshot(context: DeployContext): Promise<void> {
   if (context.snapshot === null || context.snapshot === "absent") return;
   const { databasePath, log } = context;
   if (!databasePath) return;
-  await assertToolingSnapshotRestoreSafe(context.config.databaseUrl);
-  await supervisor().stop(serviceLabel(context.config.serviceName));
+  if (context.serverStartedSinceSnapshot) await assertToolingSnapshotRestoreSafe(context.config.databaseUrl);
+  await context.effects.supervisor().stop(serviceLabel(context.config.serviceName));
   copyFileSync(context.snapshot, databasePath);
   if (process.platform !== "win32") chmodSync(databasePath, 0o600);
   log(`restored SQLite database from ${context.snapshot}`);
