@@ -8,7 +8,7 @@ import {
 } from "../../../../../types/dispatcher/index.ts";
 import type { WorkflowConfig } from "../../../../../lib/config.ts";
 import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
-import { getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
+import { getSourceIssueForUpdate, getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
 import { TrackerReaction, reactToIssue } from "../../../integrations/linear/reactions.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
 import {
@@ -25,6 +25,10 @@ import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 import { continuePlanningSession } from "./continue-plan.ts";
 import { deliverManagedMerge } from "./merge-delivery.ts";
+import { buildWorkflowLaunchPrompt, executionConflict, launchIntentRecord, launchOrdering, quotedSourceDescription, resolveLaunchIntent, type LaunchIntent, type SourceComment } from "./launch-intent.ts";
+import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
+import { fetchIssueCommentTimeline } from "../../../integrations/linear/comments.ts";
+import { nativeLaunchControl } from "../../../services/launches/native-takeover.ts";
 
 type WorkflowEvent = Extract<
   DispatchEvent,
@@ -36,7 +40,9 @@ export interface WorkflowWorkerDependencies {
   getIssue: (
     config: Parameters<typeof getSourceIssueForWorkflow>[0],
     query: { id: string },
-  ) => Promise<SourceIssueWithAgentIssues | null>;
+  ) => Promise<WorkflowSourceIssue | null>;
+  /** Full comment timeline, or null when it cannot be read completely. */
+  readComments?: (config: Parameters<typeof getSourceIssueForWorkflow>[0], issueId: string) => Promise<SourceComment[] | null>;
   react: typeof reactToIssue;
   postWorktreeComment: typeof postWorktreeLinkComment;
   compose?: typeof composeForPrompt;
@@ -47,8 +53,15 @@ export interface WorkflowWorkerDependencies {
   continuePlan?: typeof continuePlanningSession;
 }
 
+/** The fetched issue; its change time and state type order the trigger. */
+export type WorkflowSourceIssue = SourceIssueWithAgentIssues & {
+  updatedAt?: string | null;
+  state: { name: string; type?: string | null };
+};
+
 const defaultDependencies: WorkflowWorkerDependencies = {
-  getIssue: getSourceIssueForWorkflow,
+  // Same workflow query, typed with the change time and state type it reads.
+  getIssue: getSourceIssueForUpdate,
   react: reactToIssue,
   postWorktreeComment: postWorktreeLinkComment,
 };
@@ -71,10 +84,12 @@ function commandFailure(
 
 /** The seed prompt embeds the workflow's skill token; the compose pipeline
     later swaps it for the provider-specific invocation of the composed skill,
-    which carries the actual instructions. */
+    which carries the actual instructions. A source description is always
+    quoted as untrusted task data after the context, never inlined. */
 export function buildWorkflowSeedPrompt(
   workflow: WorkflowConfig,
   context: Record<string, string>,
+  sourceDescription?: string | null,
 ): string {
   const details = Object.entries(context).map(([name, value]) => `- ${name}: ${value}`);
   return [
@@ -83,6 +98,7 @@ export function buildWorkflowSeedPrompt(
     "Workflow context",
     `- workflow: ${workflow.id}`,
     ...details,
+    ...(sourceDescription !== undefined ? ["", quotedSourceDescription(sourceDescription)] : []),
   ].join("\n");
 }
 
@@ -92,6 +108,46 @@ function issueReferenceFromEvent(event: WorkflowEvent): string | null {
     return data.issue?.identifier ?? data.issueId ?? data.issue?.id ?? null;
   }
   return data.identifier;
+}
+
+/** Persisted owner pause or closure outranks any trigger. Another family's
+ * pause blocks a new family for the same issue; resuming stays explicit. */
+async function taskLaunchBlocker(prisma: PrismaClient, scope: {
+  connectionId: string; repositoryId: string; machineId: string; issueIdentifier: string; requestKey: string;
+}): Promise<string | null> {
+  const { requestKey, ...family } = scope;
+  const tasks = await prisma.remoteTask.findMany({ where: { ...family, OR: [{ phase: { not: "closed" } }, { requestKey }] },
+    select: { id: true, requestKey: true, phase: true, ownerPaused: true } });
+  const own = tasks.find((task) => task.requestKey === requestKey);
+  if (own?.phase === "closed") return `Task ${own.id} for this launch request is closed; preserving it`;
+  const paused = tasks.find((task) => task.ownerPaused);
+  if (paused) return `Owner paused task ${paused.id} for ${scope.issueIdentifier}; resume it explicitly before launching work`;
+  return null;
+}
+
+const launching = new Set<string>();
+
+/** A later owner trigger retries a launch that failed before dispatch: the
+ * same issue, scope, workflow and branch, a recorded worktree, no primary,
+ * and an original worker run that ended failed. It never adopts paused,
+ * closed, running or native-owned work, or picks between several. */
+async function failedLaunchForRetry(prisma: PrismaClient, scope: {
+  connectionId: string; repositoryId: string; machineId: string; issueIdentifier: string; requestKey: string;
+}, workflowId: string, branchName: string): Promise<{ task: { id: string; requestKey: string }; originalTrigger?: string } | { conflict: string } | null> {
+  const { requestKey, ...family } = scope;
+  const candidates = await prisma.remoteTask.findMany({ where: { ...family, branchName, requestKey: { not: requestKey },
+    phase: "blocked", ownerPaused: false, primarySessionId: null, worktreePath: { not: null } } });
+  const runs = await prisma.workerRun.findMany({ where: { id: { in: candidates.map((task) => task.requestKey) }, workerKey: `product.workflow:${workflowId}`, status: "failed" } });
+  const failed = candidates.filter((task) => runs.some((run) => run.id === task.requestKey));
+  if (!failed.length) return null;
+  if (failed.length > 1) return { conflict: `Multiple failed launches for ${scope.issueIdentifier} need reconciliation; nothing was retried` };
+  if (await nativeLaunchControl(prisma, scope)) return null;
+  const task = failed[0]!;
+  const detail = runs.find((run) => run.id === task.requestKey)?.detail ?? "";
+  const recorded = /launch intent (\{.*\})$/.exec(detail)?.[1];
+  let originalTrigger: string | undefined;
+  try { if (recorded) { const intent = JSON.parse(recorded); originalTrigger = `${intent.trigger} by ${intent.actorId ?? "an unknown actor"} at ${intent.occurredAt ?? "an unknown time"}`; } } catch { /* provenance is optional */ }
+  return { task: { id: task.id, requestKey: task.requestKey }, ...(originalTrigger ? { originalTrigger } : {}) };
 }
 
 /** Acknowledge the owner's actual trigger, not the workflow's display name. */
@@ -134,7 +190,7 @@ export function createWorkflowWorker(
           if (event.webhook.type !== "Issue" || event.webhook.data.state?.name !== "Merge") return result("failed", "Merge requires an owner-selected Merge state transition");
           return deliverManagedMerge({ context, workflow, issueIdentifier: issue.identifier, webhook: event.webhook,
             read: dependencies.getIssue, compose: dependencies.compose,
-            seed: buildWorkflowSeedPrompt(workflow, { sourceIssueIdentifier: issue.identifier, sourceIssueState: issue.state.name, sourceIssueDescription: issue.description ?? "(No description)" }) });
+            seed: buildWorkflowSeedPrompt(workflow, { sourceIssueIdentifier: issue.identifier, sourceIssueState: issue.state.name }, issue.description) });
         }
         return (dependencies.forward ?? forwardMessage)({
           requestId: `worker:${context.runId}`,
@@ -156,8 +212,7 @@ export function createWorkflowWorker(
             const seed = buildWorkflowSeedPrompt(workflow, {
               sourceIssueIdentifier: issue.identifier,
               sourceIssueState: issue.state.name,
-              sourceIssueDescription: issue.description ?? "(No description)",
-            });
+            }, issue.description);
             return (dependencies.compose ?? composeForPrompt)(
               target.runtime.worktreePath,
               seed,
@@ -169,11 +224,23 @@ export function createWorkflowWorker(
         });
       }
 
+      let intent: LaunchIntent = resolveLaunchIntent({ config: context.config, workflow, webhook: event.webhook, requestKey: context.runId });
+      const launchIssue = { identifier: issue.identifier, title: issue.title, description: issue.description ?? null,
+        updatedAt: issue.updatedAt ?? null, state: issue.state };
+      // Unverified execution, a closed source or a newer state never reaches
+      // native resume, plan continuation or a fresh launch.
+      const conflict = executionConflict(intent, launchIssue, event.webhook);
+      if (conflict) return result("ignored", conflict, issue.identifier);
+      const intentSummary = `${intent.mode}; owner authority ${intent.authority.verified ? "verified" : "not established"}`;
+      const ordering = launchOrdering(context.config, intent, launchIssue, intent.mode === "execution"
+        ? await (dependencies.readComments ?? ((config, id) => fetchIssueCommentTimeline(config.linearApiKey, id)))(context.config, issue.id)
+        : []);
+
       if (!dependencies.assertLaunch && event.webhook.type === "Reaction") {
         const resumed = await freshReactionNativeLaunch({ prisma: context.prisma, config: context.config, runtime: context.agentRuntime! },
           { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueId: issue.id, issueIdentifier: issue.identifier }, context.runId, event.webhook.data,
-          task => (dependencies.compose ?? composeForPrompt)(task.worktreePath!, buildWorkflowSeedPrompt(workflow, { sourceIssueIdentifier: issue.identifier, sourceIssueTitle: issue.title,
-            sourceIssueDescription: issue.description ?? "(No description)", continuation: "The owner requested this workflow after native takeover. Continue the same original task and pinned tooling.", taskId: task.id }),
+          task => (dependencies.compose ?? composeForPrompt)(task.worktreePath!, buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
+            details: { taskId: task.id }, continuation: { kind: "native-resume" } }),
             provider, repository.skillsRoot, task.pinnedToolingRoot!));
         if (resumed) return result("delivered", `Fresh owner reaction queued on original runtime_session:${resumed}`, issue.identifier);
       }
@@ -184,11 +251,9 @@ export function createWorkflowWorker(
       // duplicate implementation launch. Resolve it before the generic guard.
       const continuation = await (dependencies.continuePlan ?? continuePlanningSession)({
         context, workflow, issueIdentifier: issue.identifier, compose: dependencies.compose,
-        seed: buildWorkflowSeedPrompt(workflow, {
-          sourceIssueIdentifier: issue.identifier,
-          sourceIssueTitle: issue.title,
-          sourceIssueDescription: issue.description ?? "(No description)",
-        }),
+        intent: launchIntentRecord(intent),
+        seed: ({ previousWorkflowId, ...details }) => buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
+          details, continuation: { kind: "plan", previousWorkflowId } }),
       });
       if (continuation) {
         if (continuation.status === "delivered") await dependencies.react(context.config.linearApiKey, issue.id, acknowledgementReaction(event));
@@ -196,6 +261,12 @@ export function createWorkflowWorker(
       }
 
       // Otherwise start a fresh worktree and persistent primary.
+      let taskScope = { connectionId: context.config.activeConnectionId, repositoryId: repository.id,
+        machineId: context.config.machine, issueIdentifier: issue.identifier, requestKey: context.runId };
+      if (repository.tooling) {
+        const blocker = await taskLaunchBlocker(context.prisma, taskScope);
+        if (blocker) return result("ignored", blocker, issue.identifier);
+      }
       if (await (dependencies.hasLiveSession ?? hasLivePersistentSessionForResource)(context.prisma, {
         repositoryId: repository.id,
         provider: "linear",
@@ -226,8 +297,20 @@ export function createWorkflowWorker(
       if (!isSafeBranchName(branchName)) {
         return result("failed", `unsafe branch name: ${branchName}`);
       }
+      if (repository.tooling) {
+        const retry = await failedLaunchForRetry(context.prisma, taskScope, workflow.id, branchName);
+        if (retry && "conflict" in retry) return result("ignored", retry.conflict, issue.identifier);
+        if (retry) {
+          taskScope = { ...taskScope, requestKey: retry.task.requestKey };
+          intent = { ...intent, requestKey: retry.task.requestKey, retryKey: context.runId, ...(retry.originalTrigger ? { originalTrigger: retry.originalTrigger } : {}) };
+        }
+      }
+      const lock = `${context.config.controlIpcPath}:${taskScope.requestKey}`;
+      if (launching.has(lock)) return result(WorkerRunStatus.Existing, `launch request ${taskScope.requestKey} is already launching in this process`, issue.identifier);
+      launching.add(lock);
+      try {
       const task = repository.tooling ? await beginTask(context.prisma, {
-        requestKey: context.runId,
+        requestKey: taskScope.requestKey,
         repository,
         machineId: context.config.machine,
         connectionId: context.config.activeConnectionId,
@@ -244,7 +327,9 @@ export function createWorkflowWorker(
         `refs/heads/${branchName}`,
       ]);
       if (branchResult.ok && !task?.worktreePath) {
-        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: `Branch already exists outside this task: ${branchName}` } });
+        // Never overwrite an owner pause or closure saved since the blocker check.
+        if (task) await context.prisma.remoteTask.updateMany({ where: { id: task.id, ownerPaused: false, phase: { not: "closed" } },
+          data: { phase: "blocked", recoveryDetail: `Branch already exists outside this task: ${branchName}` } });
         return result(WorkerRunStatus.Existing, `branch already exists: ${branchName}`);
       }
       if (branchResult.stderr.trim()) {
@@ -268,22 +353,26 @@ export function createWorkflowWorker(
         worktreePath = task
           ? await provisionTaskWorktree(context.prisma, task.id, repository, directoryName)
           : await (dependencies.provision ?? provisionWorktree)({ repository, branchName, directoryName });
-        const seed = buildWorkflowSeedPrompt(workflow, {
-          sourceIssueIdentifier: issue.identifier,
-          sourceIssueTitle: issue.title,
-          sourceIssueDescription: issue.description ?? "(No description)",
-          branchName,
-          ...(task ? { taskId: task.id, preparation: "Prepare and verify this environment before implementing. Report failures and resource ownership through the remote-agent task tools." } : {}),
-        });
+        const seed = buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
+          details: { branchName, ...(task ? { taskId: task.id } : {}) }, preparation: Boolean(task) });
         const { prompt, toolingRoot } = task
-          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose })
+          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose, planning: intent.mode === "planning" })
           : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
         await (dependencies.assertLaunch ?? assertNativeLaunch)(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueIdentifier: issue.identifier }, context.runId);
+        // Composition can take a while: an owner pause or closure saved
+        // meanwhile wins over this trigger. The runtime rechecks at dispatch.
+        if (task) {
+          const blocker = await taskLaunchBlocker(context.prisma, taskScope);
+          if (blocker) return result("ignored", blocker, issue.identifier);
+          // Durable intent before the uncertain launch; a later retry reads it.
+          await context.prisma.workerRun.updateMany({ where: { id: context.runId, status: "pending" },
+            data: { detail: `launching task ${task.id}; launch intent ${JSON.stringify(launchIntentRecord(intent))}` } });
+        }
         launched = await (dependencies.launch ?? spawnAgentThread)({
           config: context.config,
           prisma: context.prisma,
           agentRuntime: context.agentRuntime!,
-          launchKey: context.runId,
+          launchKey: taskScope.requestKey,
           machine: context.config.machine,
           worktreePath,
           issueIdentifier: issue.identifier,
@@ -302,10 +391,15 @@ export function createWorkflowWorker(
         });
       } catch (error) {
         if (error instanceof NativeLaunchWithdrawnError) return result("ignored", error.message, issue.identifier);
-        if (task) await context.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "blocked", recoveryDetail: error instanceof Error ? error.message : String(error) } });
+        if (task) {
+          const blocker = await taskLaunchBlocker(context.prisma, taskScope);
+          if (blocker) return result("ignored", blocker, issue.identifier);
+          await context.prisma.remoteTask.updateMany({ where: { id: task.id, phase: { not: "closed" }, ownerPaused: false },
+            data: { phase: "blocked", recoveryDetail: error instanceof Error ? error.message : String(error) } });
+        }
         return result(
           "failed",
-          `workflow launch failed: ${error instanceof Error ? error.message : String(error)}`,
+          `workflow launch failed: ${error instanceof Error ? error.message : String(error)}${task ? `; launch intent ${JSON.stringify(launchIntentRecord(intent))}` : ""}`,
         );
       }
 
@@ -323,9 +417,10 @@ export function createWorkflowWorker(
       });
       return result(
         "delivered",
-        `runtime_session:${launched.session.id} started by workflow ${workflow.id}; reaction ${reacted ? "posted" : "failed"}; worktree link comment ${commentOutcome}`,
+        `runtime_session:${launched.session.id} started by workflow ${workflow.id} (${intentSummary}${intent.retryKey ? `; retried failed launch ${intent.requestKey}` : ""}); reaction ${reacted ? "posted" : "failed"}; worktree link comment ${commentOutcome}`,
         issue.identifier,
       );
+      } finally { launching.delete(lock); }
     },
   };
   return { ...worker, execute(event, context) {

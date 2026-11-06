@@ -11,6 +11,26 @@ export async function fetchQualifiedIssueComment(apiKey: LinearCredential, comme
     createdAt: z.iso.datetime(), updatedAt: z.iso.datetime(), user: z.object({ id: z.string() }), issue: z.object({ id: z.string(), identifier: z.string() }) }) }).parse(result);
 }
 
+const IssueCommentTimeline = z.object({ issue: z.object({ comments: z.object({
+  nodes: z.array(z.object({ id: z.string(), body: z.string(), createdAt: z.string(), updatedAt: z.string().nullish(), user: z.object({ id: z.string() }).nullable() })),
+  pageInfo: z.object({ hasNextPage: z.boolean() }),
+}) }).nullable() });
+
+/** The issue's comment timeline with author and times, for ordering a launch
+ * trigger against later owner instructions. Returns null unless every
+ * comment was read; callers must then treat ordering as unknown. */
+export async function fetchIssueCommentTimeline(apiKey: LinearCredential, issueId: string) {
+  try {
+    const data = IssueCommentTimeline.parse(await linearGraphql<unknown>(apiKey,
+      "query IssueCommentTimeline($issueId: String!) { issue(id: $issueId) { comments(first: 250) { nodes { id body createdAt updatedAt user { id } } pageInfo { hasNextPage } } } }", { issueId }));
+    if (!data.issue || data.issue.comments.pageInfo.hasNextPage) return null;
+    return data.issue.comments.nodes;
+  } catch (error) {
+    console.error(`Failed to read the comment timeline of issue ${issueId}:`, error);
+    return null;
+  }
+}
+
 const CREATE_ISSUE_COMMENT = `
   mutation CreateIssueComment($issueId: String!, $body: String!) {
     commentCreate(input: { issueId: $issueId, body: $body }) {
