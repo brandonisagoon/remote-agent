@@ -9,9 +9,11 @@ import { testConfig } from "../../../../test-support/config.ts";
 import type { AppEnv } from "../../middleware/context.ts";
 import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../../routes/tasks/tooling-operations.ts";
+import { createApp } from "../../app.ts";
+import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
-  StateWriteOutcomeUnknown, bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, registerOperationStateWrite, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
+  StateWriteOutcomeUnknown, currentToolingOperation, runWithToolingOperation, toolingProcessContext, bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, registerOperationStateWrite, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
 import { canonicalDigest, confirmToolingConsumer, readToolingOperation, registerToolingStateWrite, retainToolingConsumer, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
@@ -560,4 +562,63 @@ test("settlement completes only acknowledged callbacks atomically and cannot rac
   expect(await (await settle(done, "completed")).json()).toMatchObject({ outcome: "completed", binding: { operationId: done.operationId, status: "completed" } });
   expect((await read(acked.operationId))!.status).toBe("completed");
   expect((await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } })).status).toBe("confirmed");
+});
+
+describe("review of 5eb3b2c", () => {
+  test("runtime renewals repeat claim and bind within one command; settlement completes the child and later replays are refused", async () => {
+    const { config } = await fixture(); await environment("env-1", computeBody.key); await bootstrap([]);
+    const { call } = app(config);
+    const fence = (await begin(config, { requestKey: "runtime-up", inputDigest: canonicalDigest({ argv: ["runtime", "up"] }), kind: "adapter-command" })).binding;
+    const admissionChild = (await begin(config, { requestKey: "runtime-up/compute-admission", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).binding;
+    expect((await call("/api/tasks/task/compute-request", computeBody, admissionChild.operationId)).status).toBe(200);
+    await offer("offer-1", "env-1");
+    for (let save = 0; save < 2; save++) {
+      expect((await call("/api/tasks/task/compute-claim", { ...computeBody, offerId: "offer-1" }, admissionChild.operationId)).status).toBe(200);
+      expect((await call("/api/tasks/task/compute-bind", { offerId: "offer-1", resourceKey: "runtime" }, admissionChild.operationId)).status).toBe(200);
+      expect((await readToolingOperation({ prisma: db.prisma, operationId: admissionChild.operationId }))!.status).toBe("running");
+    }
+    expect(await producerOperationId(db.prisma, await task(), "env-1")).toBe(admissionChild.operationId);
+    expect(await db.prisma.toolingRetainedConsumer.count({ where: { consumerId: "env-1", status: "confirmed" } })).toBe(1);
+    const settled = await call(`/api/sessions/primary/tooling-operations/${fence.operationId}/settlement`, { requestKey: fence.requestKey, inputDigest: fence.inputDigest, outcome: "completed" }, fence.operationId);
+    expect(settled.status).toBe(200);
+    expect((await readToolingOperation({ prisma: db.prisma, operationId: admissionChild.operationId }))!.status).toBe("completed");
+    expect((await call("/api/tasks/task/compute-bind", { offerId: "offer-1", resourceKey: "runtime" }, admissionChild.operationId)).status).toBe(409);
+    expect(await db.prisma.toolingRetainedConsumer.count({ where: { consumerId: "env-1", status: "confirmed" } })).toBe(1);
+  });
+
+  test("bound observers receive operation, socket, task and session context; unbound ones receive none", async () => {
+    const { config } = await fixture(); await bootstrap([]);
+    const binding = (await begin(config, { requestKey: "observe", inputDigest: canonicalDigest({}), kind: "adapter-command" })).binding;
+    const expected = { REMOTE_AGENT_TOOLING_OPERATION: binding.operationId, REMOTE_AGENT_SOCKET: "/tmp/control.sock", REMOTE_AGENT_TASK_ID: "task", REMOTE_AGENT_SESSION_ID: "primary" };
+    expect(toolingProcessContext(binding, "/tmp/control.sock")).toEqual(expected);
+    expect(await runWithToolingOperation(binding, async () => toolingProcessContext(currentToolingOperation()), "/tmp/control.sock")).toEqual(expected);
+    expect(() => toolingProcessContext(binding)).toThrow("no control socket");
+    expect(toolingProcessContext(null)).toEqual({});
+  });
+
+  test("a closed task continues only its own existing cleanup operation", async () => {
+    const { config } = await fixture(); await bootstrap([]);
+    const closedAt = new Date();
+    await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt } });
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+    const destroy = () => begin(config, { requestKey: "destroy", inputDigest: canonicalDigest({ argv: ["task", "destroy"] }), kind: "adapter-command" });
+    await expect(destroy()).rejects.toThrow(/original operation recorded before settled primary closure/);
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: "finalization-cleanup-started", key: "finalize:task", value: "{}", occurredAt: new Date(closedAt.getTime() - 1000) } });
+    const fence = (await destroy()).binding;
+    expect(fence.kind).toBe("adapter-command");
+    expect((await begin(config, { requestKey: "destroy/finalization", inputDigest: canonicalDigest({ requestKey: "finalize:task" }), kind: "finalization", parentOperationId: fence.operationId })).binding.kind).toBe("finalization");
+    await expect(begin(config, { requestKey: "new-compute", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).rejects.toThrow(/Task is closed/);
+    const { call } = app(config);
+    expect((await call(`/api/sessions/primary/tooling-operations/${fence.operationId}/state?family=drafted.runtime&scopeKey=task`, undefined, fence.operationId, "GET")).status).toBe(200);
+  });
+
+  test("the task read names its exact latest prepared finalization key", async () => {
+    const { config } = await fixture();
+    const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+    const read = async () => (await (await server.request("http://localhost/api/tasks/task")).json() as { task: { latestFinalizationKey: string | null } }).task.latestFinalizationKey;
+    expect(await read()).toBeNull();
+    for (const key of ["finalize:task", "finalize:task:2"]) await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: FINALIZATION_PREPARED, key, value: "{}" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "other-primary", source: "finalizer:other", action: FINALIZATION_PREPARED, key: "finalize:other", value: "{}" } });
+    expect(await read()).toBe("finalize:task:2");
+  });
 });

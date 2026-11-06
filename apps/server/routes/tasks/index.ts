@@ -268,7 +268,10 @@ taskRoutes.get("/", async (c) => {
 });
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
-  return task ? c.json({ task: { ...taskResponse(task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
+  // The exact task-owned prepared finalization key (null when none), read by
+  // separately invoked finalization evidence callbacks.
+  const prepared = task?.primarySessionId ? await c.get("prisma").runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: "finalization-prepared" }, orderBy: { sequence: "desc" } }) : null;
+  return task ? c.json({ task: { ...taskResponse(task), latestFinalizationKey: prepared?.key ?? null, ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
 });
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {

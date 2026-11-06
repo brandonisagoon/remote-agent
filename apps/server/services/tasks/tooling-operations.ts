@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { Prisma, PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
+import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
   bindRetainedToolingOperation, bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
@@ -84,6 +85,21 @@ export async function assertOpenTaskPrimary(input: { prisma: OwnershipStore; con
     if (!link) throw new Error("Task source ownership was revoked");
   }
   return { task, session, repository };
+}
+
+const CLOSED_CLEANUP_KINDS: readonly string[] = [ADAPTER_COMMAND_KIND, "finalization"];
+/** The only path across closure: the task's own existing cleanup operation
+ * (`finalize:<taskId>`, recorded before settled primary closure, family
+ * stopped) — the same authority finalization's assertPreparedCleanup uses.
+ * Grants no new work; handlers still check the full prepared cleanup. */
+export async function assertClosedCleanupPrimary(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
+  const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
+  const session = await input.prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
+  if (!task || !session || task.phase !== "closed" || session.role !== "primary" || !task.worktreePath || session.cwd !== task.worktreePath
+    || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.ownerPaused) throw new Error("Only the closed task's original primary may continue its existing cleanup");
+  const operation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: "finalization-cleanup-started", key: `finalize:${task.id}` } });
+  await assertClosedCleanupFamily(input.prisma, task, session, operation, input.runtime);
+  return { task, session };
 }
 
 type Body = Record<string, unknown>;
@@ -247,9 +263,18 @@ export const toolingOperationDependencies: ToolingOperationDependencies = {
 
 /** Request scope set only by the guarded callback boundary. A legacy
  * continuation carries its exact first-bootstrap snapshot. */
-type Scope = { binding: ToolingOperationBinding } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
+type Scope = { binding: ToolingOperationBinding; socket?: string } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
 const scope = new AsyncLocalStorage<Scope>();
-export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>) => scope.run({ binding }, operation);
+export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>, socket?: string) => scope.run({ binding, ...(socket ? { socket } : {}) }, operation);
+/** Complete bound process context for a release-aware adapter or observer:
+ * the operation plus the control socket, task and primary session it must
+ * call back with. Empty for unbound (legacy) processes. */
+export function toolingProcessContext(binding: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId"> | null | undefined, socket?: string): Record<string, string> {
+  if (!binding) return {};
+  const scoped = scope.getStore(), controlSocket = socket ?? (scoped && "binding" in scoped ? scoped.socket : undefined);
+  if (!controlSocket) throw new Error(`Bound process for operation ${binding.operationId} has no control socket`);
+  return { [TOOLING_OPERATION_ENV]: binding.operationId, REMOTE_AGENT_SOCKET: controlSocket, REMOTE_AGENT_TASK_ID: binding.taskId, REMOTE_AGENT_SESSION_ID: binding.sessionId };
+}
 export const runAsLegacyContinuation = <T>(reference: ExistingReference, code: ToolingCodeIdentity | null, operation: () => Promise<T>) => scope.run({ legacy: reference, code }, operation);
 export const currentToolingOperation = (): ToolingOperationBinding | undefined => { const value = scope.getStore(); return value && "binding" in value ? value.binding : undefined; };
 export const inLegacyContinuation = () => { const value = scope.getStore(); return Boolean(value && "legacy" in value); };
@@ -393,7 +418,10 @@ async function assertBindingAuthority(input: { prisma: PrismaClient; config: Ser
   const task = await input.prisma.remoteTask.findUnique({ where: { id: input.binding.taskId } });
   if (!task || task.primarySessionId !== input.binding.sessionId || task.repositoryId !== input.binding.repositoryId) throw refuse("operation-ownership", "The operation no longer belongs to this task's primary session");
   if (input.binding.kind !== "finalization") {
-    try { await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId }); }
+    try {
+      if (task.phase === "closed" && input.binding.kind === ADAPTER_COMMAND_KIND) await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId });
+      else await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId });
+    }
     catch (error) { throw refuse("operation-ownership", error instanceof Error ? error.message : String(error)); }
   }
   if (task.ownerPaused && PAUSE_BLOCKED.includes(input.binding.kind)) throw refuse("operation-ownership", "Task is paused by its owner; no tooling effect starts");
@@ -525,7 +553,11 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   if (!current) return;
   if (!ok && !refused && current.status === "running") await dependencies.transition({ prisma, operationId: current.operationId, from: "running", to: "unknown" }).catch(() => undefined);
   const evidence = ok ? admission.callback.completes?.(admission.body) : null;
-  if (evidence && (current.status === "running" || current.status === "unknown")) {
+  // A command-parented callback stays open through its enclosing command
+  // (runtime renewals repeat claim/bind); its acknowledgment above is the
+  // durable outcome settlement completes it from. Standalone operations keep
+  // completing on their own protocol evidence.
+  if (evidence && !current.parentOperationId && (current.status === "running" || current.status === "unknown")) {
     await dependencies.transition({ prisma, operationId: current.operationId, from: current.status, to: "completed", evidence });
     await recordAssociation(prisma, current, "completion", current.operationId, "confirmed", `${evidence.kind}:${evidence.reference}`);
   }
@@ -561,7 +593,10 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   if (!parsed.success) throw new ToolingOperationRefused("operation-input", "A requestKey, canonical inputDigest and known operation kind are required");
   const request = parsed.data;
   const owned = async () => {
-    const value = await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId });
+    const closed = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId }, select: { phase: true } });
+    const value = closed?.phase === "closed" && CLOSED_CLEANUP_KINDS.includes(request.kind)
+      ? await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, ...(input.runtime ? { runtime: input.runtime } : {}) })
+      : await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId });
     if (value.task.ownerPaused && PAUSE_BLOCKED.includes(request.kind)) throw new ToolingOperationRefused("operation-ownership", "Task is paused by its owner; no new tooling operation starts");
     return value;
   };

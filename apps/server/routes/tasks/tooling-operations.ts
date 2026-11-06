@@ -73,7 +73,7 @@ export function toolingOperationGuard(dependencies: ToolingOperationDependencies
     // handler's first effect; a lost response stays reconcilable.
     try { state = await beforeBoundCallback(prisma, c.get("config"), admission, dependencies); }
     catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
-    try { await runWithToolingOperation(state.binding, () => next()); }
+    try { await runWithToolingOperation(state.binding, () => next(), c.get("config").controlIpcPath); }
     catch (error) { await afterBoundCallback(prisma, admission, state, "exception", dependencies).catch(() => undefined); throw error; }
     // A settlement failure leaves the producer intent unknown (fail closed,
     // reconciled by retrying this operation); it never masks the response.

@@ -31,7 +31,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
     // Bound process context the release-aware adapter reads for its callbacks.
-    cwd: runtime.receipt.checkout, env: { ...operationEnvironment(binding), ...(binding ? { REMOTE_AGENT_SOCKET: input.config.controlIpcPath, REMOTE_AGENT_TASK_ID: input.taskId, REMOTE_AGENT_SESSION_ID: input.primarySessionId } : {}) },
+    cwd: runtime.receipt.checkout, env: operationEnvironment(binding, input.config.controlIpcPath),
     timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
   });
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");

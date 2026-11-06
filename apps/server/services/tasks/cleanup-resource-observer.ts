@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
-import { TOOLING_OPERATION_ENV, boundCode, currentToolingOperation, latestFinalizationReference, resourceGroupCode, toolingOperationDependencies, type ToolingCodeIdentity } from "./tooling-operations.ts";
+import { boundCode, currentToolingOperation, toolingProcessContext, latestFinalizationReference, resourceGroupCode, toolingOperationDependencies, type ToolingCodeIdentity } from "./tooling-operations.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { CleanupObservationContracts, resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { CleanupObserverBatchInput } from "./cleanup-observer-schema.ts";
@@ -173,7 +173,7 @@ export async function resolveCleanupObserver(input: { task: RemoteTask; config: 
 /** Private stdin and bounded JSON output only. The CLI action must use the
  * tooling's read-only inspectors; no control socket or primary-session identity
  * is inherited, and calling ordinary reconciliation is not this protocol. */
-export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability; operation?: Pick<ToolingOperationBinding, "operationId"> | null }) {
+export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability; operation?: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId"> | null; socket?: string }) {
   const timeoutMs = input.timeoutMs ?? 60_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure("OBSERVER_INPUT");
   let bytes: string, request: unknown;
@@ -194,7 +194,7 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
   // The strict version-1 observer envelope is unchanged; an operation binding
   // travels only as process context.
   const operation = input.operation === undefined ? currentToolingOperation() : input.operation;
-  if (operation) env[TOOLING_OPERATION_ENV] = operation.operationId;
+  Object.assign(env, toolingProcessContext(operation, input.socket));
   let output: string;
   try { output = await executeOwnedObserver([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
   catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }

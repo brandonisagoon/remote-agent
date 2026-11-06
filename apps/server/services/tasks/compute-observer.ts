@@ -11,13 +11,14 @@ import { ComputeObservation, recordComputeObservation } from "./compute-observat
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { TrafficStateSchema } from "../../../../lib/compute-telemetry.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
-import { TOOLING_OPERATION_ENV, currentToolingOperation, resourceGroupCode, toolingOperationDependencies, type ToolingCodeIdentity } from "./tooling-operations.ts";
+import { currentToolingOperation, resourceGroupCode, toolingOperationDependencies, toolingProcessContext, type ToolingCodeIdentity } from "./tooling-operations.ts";
 const Output = z.object({ observation: ComputeObservation, traffic: z.array(TrafficStateSchema).max(32) }).strict();
 
 const processEnvironment = () => Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
 /** Binding metadata for an old strict envelope travels only in process
- * context, never as a new stdin field. */
-export const operationEnvironment = (binding: Pick<ToolingOperationBinding, "operationId"> | null | undefined) => ({ ...processEnvironment(), ...(binding ? { [TOOLING_OPERATION_ENV]: binding.operationId } : {}) });
+ * context, never as a new stdin field: operation, socket, task and session. */
+export const operationEnvironment = (binding: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId"> | null | undefined, socket?: string) =>
+  ({ ...processEnvironment(), ...toolingProcessContext(binding, socket) });
 
 /** Code observing a resource group: its confirmed producer's release, else
  * its retained first-bootstrap snapshot. Only a never-started group uses the
@@ -58,7 +59,7 @@ export async function readConfiguredComputeObservation(input: { prisma: PrismaCl
   const identity = finalizationResourceIdentity(resource);
   const { code, binding } = await environmentCode(input.prisma, task, environment);
   const { receipt, adapterPath, checked, before } = await verifiedComputeRuntime({ ...input, sessionId: task.primarySessionId, release: code, install: false }, dependencies);
-  const env = operationEnvironment(binding);
+  const env = operationEnvironment(binding, input.config.controlIpcPath);
   const previous = ComputeObservation.safeParse(environment.observation).data;
   const previousOperations = previous?.environmentId === environment.id && previous.resourceIdentity === identity.identityDigest ? previous.operations : undefined;
   const previousSourceRevision = previousOperations ? previous?.sourceRevision : undefined;
@@ -137,7 +138,7 @@ async function readInstalledComputeAccounting(input: { config: ServerConfig; pri
     capabilityRevision: revision, checkout, instructions: "", adapter: path.join(checkout, relative) }, execute);
   const payload = JSON.stringify(request);
   if (Buffer.byteLength(payload) > 2*1024*1024) throw new Error("Compute reclamation input exceeds its bound");
-  const result = JSON.parse(await execute([process.execPath, "--no-env-file", verified.adapterPath, "compute", mode], { cwd: checkout, env: operationEnvironment(binding), timeoutMs: mode === "baseline-observe" ? 60_000 : 10_000, input: payload }));
+  const result = JSON.parse(await execute([process.execPath, "--no-env-file", verified.adapterPath, "compute", mode], { cwd: checkout, env: operationEnvironment(binding, input.config.controlIpcPath), timeoutMs: mode === "baseline-observe" ? 60_000 : 10_000, input: payload }));
   if (verified.before !== await verified.checked()) throw new Error("Compute reclamation observer changed during observation");
   return result;
 }
