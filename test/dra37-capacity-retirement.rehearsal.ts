@@ -149,7 +149,10 @@ export async function rehearseCapacityRetirement() {
     assert([200, 202].includes(paused3.status), JSON.stringify(paused3.body));
     let state = await snapshot("held-with-closed-and-paused-waiters");
     assert.equal(state.tasks.find(task => task.id === t2.id)?.phase, "closed");
-    assert(state.waits.some(wait => wait.environmentId === environments[t2.id]), "The closed waiter is retired by selection, not by the close itself");
+    // Retirement belongs to selection (any scheduler tick, possibly within a
+    // second of the close), proven below by its durable receipt, never by the
+    // close route itself; whether a tick already ran is recorded, not assumed.
+    steps.push({ action: "closed-waiter-wait-at-close", stillWaiting: state.waits.some(wait => wait.environmentId === environments[t2.id]) });
     await end(o1);
     const o4 = await nextOffer(t4.id, "the next eligible original primary after the closed and paused waiters");
     state = await snapshot("closed-retired-paused-kept-next-offered");
