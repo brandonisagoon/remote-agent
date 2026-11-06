@@ -352,3 +352,30 @@ test("a recorded refresh outcome never stands in for credit, and a superseded re
   expect((await blocker())?.baseline).toEqual({ reason: "missing-proof", refreshUnreadable: true });
   expect((await blocker())?.detail).toBe("baseline missing-proof (last refresh record unreadable)");
 });
+
+test("a refresh diagnostic is the current cause only for the group's current membership; a saved proof is still not credit while the family runs", async () => {
+  const f = await fixture();
+  const blocker = async () => (await readComputeCapacity({ ...f.admission, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  // Saved proof, then the family becomes active: credit is refused as family-active.
+  await refreshComputeBaselines(f.context, f.read);
+  expect(await blocker()).toBeUndefined();
+  const idle = f.runtime.observeSessionActivity;
+  f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: f.now.getTime() });
+  expect(await blocker()).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "family-active" } });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  f.runtime.observeSessionActivity = idle;
+  // A failure for the CURRENT membership is the current cause.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT" } });
+  // The same group ID gains a member: that failure is now an earlier membership's attempt.
+  await f.prisma.remoteTaskResource.create({ data: { id: "cache", taskId: "old", key: "cache", kind: "docker-container", purpose: "development", externalId: "cache".repeat(13), state: "ready", metadata: { original: true } } });
+  const changed = await blocker();
+  expect(changed?.baseline).toMatchObject({ reason: "missing-proof", previousRefresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT" } });
+  expect(changed?.baseline?.refresh).toBeUndefined();
+  expect(changed?.detail).toContain("no refresh yet for the current membership; an earlier membership's last refresh failed at observe OBSERVER_EXIT");
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ headroom: 0 });
+  // A refresh of the new membership makes its own outcome current again.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { code: "OBSERVER_TIMEOUT" } });
+  expect((await blocker())?.baseline?.previousRefresh).toBeUndefined();
+});
