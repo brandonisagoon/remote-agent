@@ -212,10 +212,13 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await writeFile(path.join(planetscale, "planetscale-state.json"), JSON.stringify(planetscaleState), { mode: 0o600 });
       const credentialsFile = path.join(specs, "runtime.credentials.json");
       const [tokenId, tokenSecret] = authorization.split(":");
-      await writeFile(credentialsFile, JSON.stringify({ CLERK_SECRET_KEY: "sk_test_fixture", NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fixture",
-        STUDIO_PLANETSCALE_SERVICE_TOKEN_ID: tokenId, STUDIO_PLANETSCALE_SERVICE_TOKEN: tokenSecret }), { mode: 0o600 });
+      // The synthetic product (`bun app.ts`) has no authentication, so its
+      // recipe carries no Clerk keys: committed Drafted treats any CLERK_*
+      // service environment key as an auth app and loads the trusted backup
+      // from HOME. Only the synthetic PlanetScale management token remains.
+      await writeFile(credentialsFile, JSON.stringify({ STUDIO_PLANETSCALE_SERVICE_TOKEN_ID: tokenId, STUDIO_PLANETSCALE_SERVICE_TOKEN: tokenSecret }), { mode: 0o600 });
       await writeFile(cliRecipe, JSON.stringify({ version: 1, profile: "platform", image: real ? REAL_IMAGES.app : "dra37-synthetic:1", credentialsFile,
-        runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"],
+        runtimeSecrets: [],
         planetscale: { organization: planetscaleState.organization, database: planetscaleState.database, baseBranch: planetscaleState.baseBranch, baseBranchId: planetscaleState.baseBranchId },
         ...(real ? { setup: [["bun", "install", "--frozen-lockfile"]] } : {}),
         services: { api: { command: ["bun", "app.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], traffic: { operations: "none" }, readyTimeoutSeconds: 15 }), { mode: 0o600 });

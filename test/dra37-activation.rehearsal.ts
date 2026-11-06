@@ -146,6 +146,54 @@ test("transport: committed A/B PlanetScale provider calls are answered only by t
   const product = await server.prepareCliProduct();
   const credentials = JSON.parse(readFileSync(product.credentialsFile, "utf8")) as Record<string, string>;
   const recipe = JSON.parse(readFileSync(product.recipe, "utf8"));
+  // The auth-free synthetic product carries no Clerk fields: only the
+  // synthetic PlanetScale management token, and no runtime secrets.
+  expect(Object.keys(credentials).sort()).toEqual(["STUDIO_PLANETSCALE_SERVICE_TOKEN", "STUDIO_PLANETSCALE_SERVICE_TOKEN_ID"]);
+  expect(recipe.runtimeSecrets).toEqual([]);
+  // Credential-free committed-code check, per release, with an EMPTY private
+  // HOME: Drafted's own readRecipe accepts the recipe, and its own
+  // nativeClerkPublicKey (the gate in front of runtimeClerk's trusted-backup
+  // loader) finds no auth entrypoint for the exact service environment
+  // runtimeValues would build (fixed keys read from that checkout's committed
+  // runtime.ts, recipe/service environment, runtime secrets, provider URL).
+  // Counter-check: the previous Clerk fields alone select an auth entrypoint.
+  const clerkProbe = path.join(server.root, "clerk-probe.ts");
+  writeFileSync(clerkProbe, `const [checkout, recipeFile] = process.argv.slice(2);
+const { readRecipe } = await import(checkout + "/src/runtime-config.ts");
+const { nativeClerkPublicKey } = await import(checkout + "/src/clerk-startup.ts");
+const source = await Bun.file(checkout + "/src/runtime.ts").text();
+const literal = /function runtimeValues\\([^)]*\\)[^{]*\\{\\s*const values: RuntimeSecrets = \\{([\\s\\S]*?)\\};/.exec(source);
+if (!literal) throw new Error("runtimeValues fixed keys not found in committed runtime.ts");
+const fixed = [...literal[1].matchAll(/([A-Z][A-Z0-9_]*):/g)].map(match => match[1]);
+const recipe = await readRecipe(recipeFile);
+const out = { fixed, services: {} };
+for (const [name, service] of Object.entries(recipe.services)) {
+  const environment = Object.fromEntries([...fixed, ...recipe.runtimeSecrets, ...Object.keys(recipe.environment), ...Object.keys(service.environment ?? {}), "DATABASE_URL"].map(key => [key, "synthetic"]));
+  out.services[name] = { keys: Object.keys(environment).sort(), clerk: nativeClerkPublicKey(service.cwd ?? ".", service.command, environment) ?? null,
+    previousFieldsClerk: nativeClerkPublicKey(service.cwd ?? ".", service.command, { ...environment, CLERK_SECRET_KEY: "sk_test_fixture", NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fixture" }) ?? null };
+}
+console.log(JSON.stringify(out));
+`, { mode: 0o600 });
+  const clerk: Record<string, unknown> = {};
+  for (const release of server.drafted!.releases) {
+    const home = (await import("node:fs")).mkdtempSync(path.join(server.root, "empty-home-"));
+    const child = Bun.spawnSync([process.execPath, "--no-env-file", clerkProbe, release.checkout, product.recipe], { cwd: server.root, stdout: "pipe", stderr: "pipe",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, TMPDIR: process.env.TMPDIR ?? "/tmp" } });
+    expect(child.exitCode, child.stderr.toString().slice(-2_000)).toBe(0);
+    const out = JSON.parse(child.stdout.toString().trim().split("\n").at(-1)!);
+    expect(out.fixed).toEqual(["NODE_ENV", "ENVIRONMENT", "DRAFTED_CONTAINER", "TZ", "STUDIO_ENVIRONMENT_ID", "STUDIO_RELEASE_COMMIT"]);
+    for (const service of Object.values(out.services) as Array<{ keys: string[]; clerk: string | null; previousFieldsClerk: string | null }>) {
+      expect(service.keys.filter(key => /^(?:NEXT_PUBLIC_|VITE_)?CLERK_/.test(key))).toEqual([]);
+      expect(service.clerk).toBeNull();
+      expect(service.previousFieldsClerk).toBe("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY");
+    }
+    // Nothing but Bun's own transpiler cache was created; no .config (where
+    // Drafted's trusted credential key and backup live) was ever made.
+    const created = (readdirSync(home, { recursive: true }) as string[]).map(entry => entry.split(path.sep).join("/"));
+    expect(created.filter(entry => !["Library", "Library/Caches", "Library/Caches/bun"].includes(entry) && !entry.startsWith("Library/Caches/bun/"))).toEqual([]);
+    expect(existsSync(path.join(home, ".config"))).toBe(false);
+    clerk[release.revision] = out;
+  }
   const probe = path.join(server.root, "transport-probe.ts");
   // Runs inside one Bun process per release, exactly like a CLI process:
   // `bun --no-env-file --preload <preload> <probe>` importing the checkout's module.
@@ -211,7 +259,7 @@ console.log(JSON.stringify(out));
   expect(raw.includes(credentials.STUDIO_PLANETSCALE_SERVICE_TOKEN!)).toBe(false);
   const transportEnd = provenance(server), transportStability = provenanceStability(transportStart, transportEnd);
   expect(transportStability.stable, JSON.stringify(transportStability)).toBe(true);
-  writeFileSync(path.join(server.root, "transport-evidence.json"), JSON.stringify({ start: transportStart, end: transportEnd, stability: transportStability, recipe: { ...recipe, credentialsFile: "<private synthetic>" }, results, requests }, null, 2) + "\n", { mode: 0o600 });
+  writeFileSync(path.join(server.root, "transport-evidence.json"), JSON.stringify({ start: transportStart, end: transportEnd, stability: transportStability, clerk, recipe: { ...recipe, credentialsFile: "<private synthetic>" }, results, requests }, null, 2) + "\n", { mode: 0o600 });
   console.log(JSON.stringify({ transport: { root: server.root, releases: server.drafted!.releases.map(release => release.revision), answered: requests.filter(entry => entry.outcome === "answered").length, refusals: refusals.length } }));
   passed = true;
 });
