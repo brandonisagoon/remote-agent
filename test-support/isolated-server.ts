@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -23,8 +23,16 @@ async function unusedLoopbackPort(): Promise<number> {
  * provider credentials or source connections. This fixture supplies its own
  * migrated SQLite database and acpx namespace; restart reuses only those.
  * The default provider command refuses execution until a test explicitly
- * supplies its synthetic provider. Never point this fixture at a live DB. */
-export async function isolatedServer() {
+ * supplies its synthetic provider. An explicit test-only preload can replace
+ * external transports inside the child; it never changes production startup
+ * or inherits additional environment. Never point this fixture at a live DB. */
+export async function isolatedServer(options: { preload?: string } = {}) {
+  let preload: string | undefined;
+  if (options.preload !== undefined) {
+    if (!path.isAbsolute(options.preload)) throw new Error("Isolated server preload must be an absolute file path");
+    preload = await realpath(options.preload);
+    if (!(await stat(preload)).isFile()) throw new Error("Isolated server preload must be a file");
+  }
   // Fail before creating a database if the host cannot bind loopback ports.
   const port = await unusedLoopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "ra-server-")));
@@ -59,7 +67,7 @@ export async function isolatedServer() {
       boots++;
       // Explicit environment: do not spread a source-work session's live
       // REMOTE_AGENT_CONFIG/SOCKET/SESSION_ID or provider account secrets.
-      child = Bun.spawn([process.execPath, "apps/server/server.ts"], {
+      child = Bun.spawn([process.execPath, "--no-env-file", ...(preload ? ["--preload", preload] : []), "apps/server/server.ts"], {
         cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), LANG: "en_US.UTF-8", REMOTE_AGENT_CONFIG: configFile },
       });
