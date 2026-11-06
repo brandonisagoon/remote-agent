@@ -104,7 +104,7 @@ export async function refreshComputeObservation(input: { prisma: PrismaClient; c
  * its snapshot; a group whose every member was registered after the
  * boundary has frozen post-boundary provenance and is an independently bound
  * observation of the active release; anything else fails closed. */
-async function accountingCode(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", dependencies = toolingOperationDependencies)
+export async function accountingCode(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", dependencies = toolingOperationDependencies)
   : Promise<{ code: ToolingCodeIdentity | null; binding: ToolingOperationBinding | null }> {
   if (!input.prisma) return { code: null, binding: null };
   if (mode === "reclaim-observe") {
@@ -115,6 +115,12 @@ async function accountingCode(input: { config: ServerConfig; prisma?: PrismaClie
   const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: task.repositoryId, consumerKind: "compute-baseline", consumerId: `${task.id}:${purpose}` });
   if (consumer.status === "no-boundary") return { code: null, binding: null };
   if (consumer.status === "legacy" && consumer.taskId === task.id) return { code: { repositoryId: task.repositoryId, revision: consumer.revision, checkout: consumer.checkout }, binding: null };
+  // A baseline handed off with exactly its recovered resource (DRA-24) is
+  // observed by that committed recovery's release, strictly validated.
+  if (consumer.status === "resolved") {
+    const handedOff = await (await import("./tooling-neon-recovery.ts")).neonRecoveryHandoffCode(input.prisma, { task, reference: { type: "compute-baseline", id: `${task.id}:${purpose}` } }, dependencies.read);
+    if (handedOff) return handedOff;
+  }
   const boundary = await dependencies.boundary({ prisma: input.prisma, repositoryId: task.repositoryId });
   const members = await input.prisma.remoteTaskResource.findMany({ where: { taskId: task.id, purpose }, select: { createdAt: true }, take: 10001 });
   if (consumer.status !== "not-legacy" || !boundary || !members.length || members.some(member => member.createdAt.getTime() <= boundary.recordedAt.getTime())) throw new Error(`Compute baseline ${task.id}:${purpose} has no frozen provenance (${consumer.status})`);
