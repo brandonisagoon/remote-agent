@@ -232,36 +232,58 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
       let preserve = !!options.keepEvidence;
       if (real) {
         // Exact ledger objects only, through normal stop/rm, newest first.
-        // Each ID is then inspected: it must be gone. A nonzero stop/rm is
-        // acceptable only when that object is confirmed absent afterwards.
-        const results: Array<{ args: string[]; code: number | null; stderr: string }> = [], problems: string[] = [];
-        const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" }); const entry = { args, code: result.exitCode, stderr: result.stderr.toString().trim().slice(0, 300) }; results.push(entry); return entry; };
-        // Exact per-kind absence wording from the engine, naming this exact ID.
-        const absent = (kind: "container" | "network" | "volume", id: string) => {
-          const probe = run(kind === "container" ? ["inspect", id] : [kind, "inspect", id]);
-          const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-          const missing = kind === "container" ? new RegExp(`no such object: ${escaped}`, "i")
-            : kind === "network" ? new RegExp(`network ${escaped} not found`, "i") : new RegExp(`${escaped}: no such volume`, "i");
-          return probe.code !== 0 && missing.test(probe.stderr);
+        // Before anything destructive, the exact ID is inspected and must
+        // still carry its unique fixture-prefixed ledger name: the ledger
+        // alone never authorizes touching an object. Afterwards each ID must
+        // be gone, and read-only prefix inventories must be empty. Objects
+        // discovered there are reported, never deleted.
+        const results: Array<{ args: string[]; code: number | null; stdout?: string; stderr: string }> = [], problems: string[] = [];
+        const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" });
+          const entry = { args, code: result.exitCode, stdout: result.stdout.toString().trim().slice(0, 4_000), stderr: result.stderr.toString().trim().slice(0, 300) }; results.push(entry); return entry; };
+        const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const missing = (kind: "container" | "network" | "volume", id: string) => kind === "container" ? new RegExp(`no such object: ${escape(id)}`, "i")
+          : kind === "network" ? new RegExp(`network ${escape(id)} not found`, "i") : new RegExp(`${escape(id)}: no such volume`, "i");
+        const inspect = (kind: "container" | "network" | "volume", id: string) => kind === "volume" ? run(["volume", "inspect", "--format", "{{.Name}}", id])
+          : run([kind === "container" ? "container" : "network", "inspect", "--format", "{{.Id}} {{.Name}}", id]);
+        /** "match" | "absent" | a mismatch description. */
+        const identity = (entry: { kind: "container" | "network" | "volume"; id: string; name?: string }) => {
+          if (!entry.name?.startsWith(`${real!.prefix}-`)) return `ledger name ${entry.name} is not fixture-prefixed`;
+          const probe = inspect(entry.kind, entry.id);
+          if (probe.code !== 0) return missing(entry.kind, entry.id).test(probe.stderr) ? "absent" : `inspect failed: ${probe.stderr}`;
+          const expected = entry.kind === "volume" ? entry.name : `${entry.id} ${entry.kind === "container" ? "/" : ""}${entry.name}`;
+          return probe.stdout === expected ? "match" : `engine reports ${JSON.stringify(probe.stdout)}, ledger expects ${JSON.stringify(expected)}`;
         };
-        const entries = fixture.dockerLedger().reverse();
-        for (const entry of entries.filter(value => value.kind === "container")) {
-          const stopped = run(["stop", entry.id]), removed = run(["rm", entry.id]);
-          if (!absent("container", entry.id)) problems.push(`container ${entry.id} remains`);
-          else if (stopped.code !== 0 && !/no such/i.test(stopped.stderr) || removed.code !== 0 && !/no such/i.test(removed.stderr)) problems.push(`container ${entry.id} removal had an unexplained failure`);
+        const remove: Record<"container" | "network" | "volume", string[][]> = { container: [["stop"], ["rm"]], network: [["network", "rm"]], volume: [["volume", "rm"]] };
+        const entries = fixture.dockerLedger().reverse(), removed: string[] = [];
+        for (const kind of ["container", "network", "volume"] as const) {
+          for (const entry of entries.filter(value => value.kind === kind)) {
+            const before = identity(entry);
+            if (before === "absent") { problems.push(`${kind} ${entry.id} was already absent before cleanup`); continue; }
+            if (before !== "match") { problems.push(`${kind} ${entry.id} identity mismatch, not touched: ${before}`); continue; }
+            const steps = remove[kind].map(verb => run([...verb, entry.id]));
+            const after = identity(entry);
+            if (after !== "absent") problems.push(`${kind} ${entry.id} remains after cleanup (${after})`);
+            else if (steps.some(step => step.code !== 0)) problems.push(`${kind} ${entry.id} removal had an unexplained nonzero result`);
+            else removed.push(entry.id);
+          }
         }
-        for (const entry of entries.filter(value => value.kind === "network")) {
-          const removed = run(["network", "rm", entry.id]);
-          if (!absent("network", entry.id)) problems.push(`network ${entry.id} remains`);
-          else if (removed.code !== 0 && !/not found|no such/i.test(removed.stderr)) problems.push(`network ${entry.id} removal had an unexplained failure`);
-        }
-        for (const entry of entries.filter(value => value.kind === "volume")) {
-          const removed = run(["volume", "rm", entry.id]);
-          if (!absent("volume", entry.id)) problems.push(`volume ${entry.id} remains`);
-          else if (removed.code !== 0 && !/no such/i.test(removed.stderr)) problems.push(`volume ${entry.id} removal had an unexplained failure`);
-        }
-        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ ledger: fixture.dockerLedger(), results, problems }, null, 2), { mode: 0o600 });
-        console.log(JSON.stringify({ dockerCleanup: { removed: entries.length, problems } }));
+        // Read-only unique-prefix inventories (substring filter, then exact prefix).
+        const listing = (args: string[]) => {
+          const result = run(args);
+          if (result.code !== 0) { problems.push(`inventory ${args.join(" ")} failed`); return []; }
+          return result.stdout.split("\n").filter(Boolean).filter(line => line.split(" ").at(-1)!.replace(/^\//, "").startsWith(`${real!.prefix}-`));
+        };
+        const inventory = {
+          containers: listing(["container", "ls", "-a", "--no-trunc", "--filter", `name=${real.prefix}-`, "--format", "{{.ID}} {{.Names}}"]),
+          networks: listing(["network", "ls", "--no-trunc", "--filter", `name=${real.prefix}-`, "--format", "{{.ID}} {{.Name}}"]),
+          volumes: listing(["volume", "ls", "--filter", `name=${real.prefix}-`, "--format", "{{.Name}}"]),
+        };
+        for (const [kind, lines] of Object.entries(inventory)) for (const line of lines) problems.push(`${kind} inventory still contains ${line} (reported, not deleted)`);
+        const calls = existsSync(path.join(apps, "docker-calls.jsonl")) ? readFileSync(path.join(apps, "docker-calls.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
+        for (const call of calls.filter(value => value.unrecognizedCreateOutput !== undefined)) problems.push(`unrecognized create output for ${String(call.name)}: ${String(call.unrecognizedCreateOutput)}`);
+        const refusals = calls.filter(value => value.refused).map(value => value.refused);
+        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ prefix: real.prefix, ledger: fixture.dockerLedger(), removed, inventory, refusals, results, problems }, null, 2), { mode: 0o600 });
+        console.log(JSON.stringify({ dockerCleanup: { ledger: entries.length, removed: removed.length, inventory, refusals: refusals.length, problems } }));
         if (problems.length) {
           // Never delete the evidence of an incomplete cleanup.
           preserve = true;
@@ -288,5 +310,5 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
     });
     await writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     return fixture;
-  } catch (error) { await fixture.cleanup(); throw error; }
+  } catch (error) { await fixture.cleanup({ keepEvidence: true }); throw error; }
 }

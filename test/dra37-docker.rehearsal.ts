@@ -18,9 +18,33 @@
  *     bun test ./test/dra37-docker.rehearsal.ts
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { dra37Server } from "./dra37-fixture.ts";
+
+const sourceRoot = path.resolve(import.meta.dir, "..");
+const sha256 = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+const gitOut = (cwd: string, ...args: string[]) => {
+  const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+  if (result.exitCode) throw new Error(`git ${args.join(" ")} failed: ${result.stderr.toString().slice(0, 300)}`);
+  return result.stdout.toString();
+};
+/** Exact Remote Agent source provenance plus digests of every DRA-37 runner,
+ * helper and guard file, and the exact prepared Drafted release receipt. */
+function provenance(server: Awaited<ReturnType<typeof dra37Server>>) {
+  const status = gitOut(sourceRoot, "status", "--porcelain=v1", "--untracked-files=all");
+  const files = Object.fromEntries(readdirSync(import.meta.dir).filter(name => name.startsWith("dra37-") && name.endsWith(".ts")).sort()
+    .map(name => [`test/${name}`, sha256(readFileSync(path.join(import.meta.dir, name)))]));
+  const drafted = server.drafted!;
+  const receiptFile = `${drafted.root}.install.json`;
+  return { at: new Date().toISOString(), remoteAgent: { head: gitOut(sourceRoot, "rev-parse", "HEAD").trim(), status, statusDigest: sha256(status),
+      trackedDiffDigest: sha256(gitOut(sourceRoot, "diff", "HEAD", "--binary")), files },
+    drafted: { pairedSource: DRAFTED.source, requestedRevision: DRAFTED.revision, preparedRelease: drafted.release, preparation: drafted.preparation,
+      checkoutHead: gitOut(drafted.root, "rev-parse", "HEAD").trim(), checkoutTree: gitOut(drafted.root, "rev-parse", "HEAD^{tree}").trim(),
+      checkoutStatus: gitOut(drafted.root, "status", "--porcelain", "--untracked-files=normal"),
+      installReceipt: existsSync(receiptFile) ? JSON.parse(readFileSync(receiptFile, "utf8")) : null } };
+}
 
 const HOLD_SECONDS = process.env.DRA37_HOLD_SECONDS === undefined ? 0 : Number(process.env.DRA37_HOLD_SECONDS);
 if (!Number.isInteger(HOLD_SECONDS) || HOLD_SECONDS < 0 || HOLD_SECONDS > 3_600) throw new Error("DRA37_HOLD_SECONDS must be an integer from 1 to 3600 (bounded hold)");
@@ -63,7 +87,24 @@ async function observerDiagnosis(server: Awaited<ReturnType<typeof dra37Server>>
 
 test("real containers: verified stop releases the only slot to the next original primary, which claims and starts its own app", async () => {
   const server = await dra37Server({ slots: 1, drafted: DRAFTED, docker: "real" });
-  cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE }));
+  // Failed evidence is always preserved.
+  let passed = false;
+  cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE || !passed }));
+  const evidenceFile = path.join(server.root, "physical-evidence.json");
+  const evidence: Record<string, unknown> = { scope: "real isolated Remote Agent server + supported frozen Drafted preparation + Drafted runtime/observer against real local containers; synthetic provider transports; no release-aware activation or command binding",
+    serverRoot: server.root, start: provenance(server) };
+  try {
+    await physicalHandoff(server, evidence);
+    passed = true;
+  } finally {
+    evidence.passed = passed;
+    evidence.end = provenance(server);
+    writeFileSync(evidenceFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
+    console.log(JSON.stringify({ physicalEvidence: evidenceFile, passed }));
+  }
+});
+
+async function physicalHandoff(server: Awaited<ReturnType<typeof dra37Server>>, evidence: Record<string, unknown>) {
   const real = server.real!;
   const docker = (...args: string[]) => Bun.spawnSync([real.docker, ...args], { stdout: "pipe", stderr: "pipe" }).stdout.toString().trim();
   const preexisting = new Set(docker("container", "ls", "-aq", "--no-trunc").split("\n").filter(Boolean));
@@ -104,6 +145,27 @@ test("real containers: verified stop releases the only slot to the next original
   const secondEnvironment = await prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: second.id } });
   expect((await prisma.computeOffer.findUniqueOrThrow({ where: { id: allocations[0]!.allocationId! } })).environmentId).toBe(secondEnvironment.id);
 
+  // Exact engine state of BOTH first-task containers at handoff. Drafted's
+  // normal stop stops the app; its nginx proxy keeps running until cleanup.
+  const engineState = (taskId: string) => server.dockerLedger().filter(entry => entry.kind === "container").flatMap(entry => {
+    const [row] = JSON.parse(docker("inspect", entry.id)) as Array<{ Id: string; Name: string; Config: { Labels: Record<string, string> }; State: { Status: string; Running: boolean; ExitCode: number; Pid: number } }>;
+    if (row!.Config.Labels["dev.drafted.task"] !== taskId) return [];
+    const role = row!.Name.endsWith("-proxy") ? "proxy" : row!.Name.endsWith("-app") ? "app" : "other";
+    return [{ role, id: row!.Id, name: row!.Name, status: row!.State.Status, running: row!.State.Running, exitCode: row!.State.ExitCode, pid: row!.State.Pid }];
+  });
+  const firstContainers = engineState(first.id);
+  expect(firstContainers.map(value => value.role).sort()).toEqual(["app", "proxy"]);
+  const firstApp = firstContainers.find(value => value.role === "app")!, firstProxy = firstContainers.find(value => value.role === "proxy")!;
+  expect(firstApp).toMatchObject({ status: "exited", running: false, pid: 0 });
+  expect(firstProxy).toMatchObject({ status: "running", running: true });
+  const firstObservation = (await prisma.computeEnvironment.findUniqueOrThrow({ where: { id: firstEnvironment.id } })).observation;
+  evidence.handoff = {
+    proof: "first app stopped and observed stopped; the only slot then went to the second original primary, which claimed it and started its app",
+    firstEngine: firstContainers, secondEngine: engineState(second.id),
+    firstObservation,
+    capacityBasis: "The slot was released on Remote Agent's recorded observation state=stopped for the first environment (verbatim above, produced by Drafted's observer). At handoff the engine reports the first app container exited and the first nginx proxy container still running; the proxy is stopped only by fixture cleanup. This rehearsal makes no claim that proxy resources are charged or freed by the handoff.",
+    firstEnvironment: firstEnvironment.id, secondEnvironment: secondEnvironment.id, allocation: allocations[0]!.allocationId };
+
   // Every created engine object is fixture-prefixed, labelled and ledgered;
   // no pre-existing container was touched.
   const ledger = server.dockerLedger();
@@ -115,6 +177,7 @@ test("real containers: verified stop releases the only slot to the next original
     expect(row!.HostConfig.NetworkMode).not.toBe("host");
     expect(preexisting.has(entry.id)).toBe(false);
   }
+  evidence.secondUrl = secondUrl;
   console.log(JSON.stringify({ realDocker: { serverRoot: server.root, prefix: real.prefix, images: real.images, tooling: server.drafted!.release, preparation: server.drafted!.preparation,
     ledger, firstEnvironment: firstEnvironment.id, secondEnvironment: secondEnvironment.id, allocation: allocations[0]!.allocationId, secondUrl } }));
 
@@ -136,4 +199,6 @@ test("real containers: verified stop releases the only slot to the next original
     console.log(JSON.stringify({ holdResumed: { by: resumedBy, at: new Date().toISOString() } }));
   }
   expect((await server.runtimeTurn(second.id, "stop")).code).toBe(0);
-});
+  evidence.finalStop = { secondEngine: engineState(second.id) };
+  evidence.ledger = server.dockerLedger();
+}

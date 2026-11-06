@@ -11,9 +11,14 @@
  * - Every command is parsed with an exact option grammar (allowlist). Any
  *   unknown option, command or target is refused.
  * - create: unique prefixed --name, a ledger --network, only recorded image
- *   IDs in image position, only --pull=never, bind sources whose realpath stays inside the fixture root, and volume
- *   mounts naming an already-ledgered volume (so Docker cannot implicitly
- *   create an unrecorded one).
+ *   IDs in image position, only --pull=never. --mount is split like Docker
+ *   (comma fields, first "="), with only type/source/target/readonly, no
+ *   duplicates and no quoting. A bind source must be exactly canonical and
+ *   inside worktrees/ or state/runtimes/ of the private fixture root (never
+ *   the root, config, sockets, policy or ledger); a volume source must be an
+ *   already-ledgered fixture volume. The image's declared Config.Volumes must
+ *   all be covered by owned mounts, so Docker never creates an untracked
+ *   anonymous volume (read-only image inspect; nothing is pulled or changed).
  * - Publication is optional and never added: internal app containers stay
  *   unpublished on their private ledger network. A container that does
  *   publish (Drafted's proxy) must name an explicit 127.0.0.1 host port
@@ -64,6 +69,33 @@ function parse(tokens: string[], values: string[], flags: string[], stopAtPositi
     else refuse(`option ${token} is not allowed`);
   }
   return { options, positionals };
+}
+
+/** Private bind subtrees only: never the fixture root, config, sockets,
+ * policy or ledger. */
+const BIND_ROOTS = [`${root}/worktrees`, `${root}/state/runtimes`];
+type Mount = { type: "bind" | "volume"; source: string; target: string; readonly: boolean };
+/** Docker splits --mount into comma fields and each field at its FIRST "=".
+ * Quoted CSV fields are refused rather than re-implemented. */
+function parseMount(value: string): Mount {
+  if (value.includes('"') || value.includes("'")) refuse("quoted mount fields are not allowed");
+  const fields = new Map<string, string | true>();
+  for (const field of value.split(",")) {
+    const at = field.indexOf("=");
+    const key = at < 0 ? field : field.slice(0, at), fieldValue = at < 0 ? true : field.slice(at + 1);
+    if (!["type", "source", "target", "readonly"].includes(key)) refuse(`mount option ${JSON.stringify(key)} is not allowed`);
+    if (fields.has(key)) refuse(`duplicate mount option ${key}`);
+    if (fieldValue === "") refuse(`mount option ${key} has an empty value`);
+    fields.set(key, fieldValue);
+  }
+  const type = fields.get("type"), source = fields.get("source"), target = fields.get("target"), readonly = fields.get("readonly") ?? "false";
+  if (type !== "bind" && type !== "volume") refuse(`mount type ${String(type)} is not allowed`);
+  if (typeof source !== "string" || typeof target !== "string") refuse("mounts need an explicit source and target");
+  if (!target.startsWith("/") || target.split("/").some(part => part === ".." || part === ".")) refuse(`mount target ${target} must be an absolute normalized container path`);
+  if (type === "bind" && (!source.startsWith("/") || source.split("/").slice(1).some(part => part === "" || part === "." || part === ".."))) refuse(`bind source ${source} must be an absolute normalized path`);
+  if (type === "volume" && !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(source)) refuse(`volume source ${source} is malformed`);
+  if (readonly !== true && !["true", "false", "1", "0"].includes(readonly as string)) refuse(`mount readonly value ${String(readonly)} is malformed`);
+  return { type, source, target, readonly: readonly === true || readonly === "true" || readonly === "1" };
 }
 
 let args = raw.map(inbound);
@@ -143,20 +175,35 @@ else if (command === "exec") {
       createdPublished.push(host);
     }
   }
+  const targets: string[] = [];
   for (const value of values("--mount")) {
-    const mount = Object.fromEntries(value.split(",").map(pair => [pair.split("=")[0]!, pair.split("=")[1] ?? true])) as Record<string, string | true>;
-    const keys = Object.keys(mount).filter(key => !["type", "source", "target", "readonly"].includes(key));
-    if (keys.length) refuse(`mount option ${keys[0]} is not allowed`);
-    if (typeof mount.source !== "string" || typeof mount.target !== "string") refuse("mounts need an explicit source and target");
+    const mount = parseMount(value);
+    targets.push(mount.target);
     if (mount.type === "bind") {
+      // The exact transmitted source must already be canonical (no symlink
+      // or relative component) and lie inside a private fixture subtree.
       let real = "";
       try { real = realpathSync(mount.source); } catch { refuse(`bind source ${mount.source} does not exist`); }
-      if (real !== root && !real.startsWith(`${root}/`)) refuse(`bind source ${mount.source} resolves outside the fixture root`);
+      if (real !== mount.source) refuse(`bind source ${mount.source} is not canonical (resolves to ${real})`);
+      if (!BIND_ROOTS.some(base => real.startsWith(`${base}/`))) refuse(`bind source ${mount.source} is outside the private worktrees/ and state/runtimes/ subtrees`);
       if (/docker\.sock|orbstack/i.test(real)) refuse("host control sockets are never mounted");
-    } else if (mount.type === "volume") {
-      if (!owned(mount.source, ["volume"])) refuse(`volume ${mount.source} is not an already-ledgered fixture volume`);
-    } else refuse(`mount type ${String(mount.type)} is not allowed`);
+    } else if (!ledger().some(entry => entry.kind === "volume" && entry.id === mount.source && entry.name === mount.source)) {
+      refuse(`volume ${mount.source} is not an already-ledgered fixture volume`);
+    }
   }
+  if (new Set(targets).size !== targets.length) refuse("duplicate mount targets are not allowed");
+  // The immutable image must not make Docker create an anonymous volume:
+  // every declared image volume must be covered by an owned mount above.
+  const image = Bun.spawnSync([policy.docker, "image", "inspect", "--format", "{{json .Config}}", positionals[0]!], { stdout: "pipe", stderr: "pipe" });
+  if (image.exitCode !== 0) refuse(`image inspect of ${positionals[0]} failed; anonymous volumes cannot be ruled out`);
+  let declared: string[] = [];
+  try {
+    const config = JSON.parse(image.stdout.toString()) as { Volumes?: Record<string, unknown> | null };
+    if (config === null || typeof config !== "object") throw new Error("not an object");
+    declared = Object.keys(config.Volumes ?? {});
+  } catch { refuse(`image config for ${positionals[0]} is malformed; anonymous volumes cannot be ruled out`); }
+  const uncovered = declared.filter(volume => !targets.includes(volume));
+  if (uncovered.length) refuse(`image ${positionals[0]} would create untracked anonymous volume(s) ${uncovered.join(", ")}`);
   // Keep Drafted's original name as an alias on the private fixture network.
   const at = args.indexOf("--name");
   args = [...args.slice(0, at + 2), "--network-alias", name!.slice(`${policy.prefix}-`.length), ...args.slice(at + 2)];
@@ -169,7 +216,8 @@ const [code, stdout, stderr] = await Promise.all([child.exited, new Response(chi
 if (code !== 0) log({ exit: code, command: args.slice(0, 3), stderr: stderr.slice(-1_500) });
 if (code === 0 && created) {
   const id = stdout.trim();
-  if (created !== "volume" && !/^[a-f0-9]{64}$/.test(id)) { log({ unrecognizedCreateOutput: id.slice(0, 200) }); refuse("create output is not an exact object ID; the object needs manual reconciliation"); }
+  const exact = created === "volume" ? id === createdName : /^[a-f0-9]{64}$/.test(id);
+  if (!exact) { log({ unrecognizedCreateOutput: id.slice(0, 200), kind: created, name: createdName }); refuse(`${created} create output is not the exact expected ID; ${createdName} needs manual reconciliation`); }
   // Durable before the caller can act on the new object.
   record({ kind: created, id, name: createdName, ...(createdPublished.length ? { published: createdPublished } : {}) });
 }
