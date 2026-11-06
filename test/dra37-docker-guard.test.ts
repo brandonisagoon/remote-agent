@@ -25,6 +25,7 @@ else if (command === "network" && sub === "create") console.log(stub.networkId);
 else if (command === "volume" && sub === "create") console.log(stub.volumeOutput ?? args.at(-1));
 else if (command === "create") console.log(stub.createOutput);
 else if (command === "container" && sub === "ls") console.log(stub.listing ?? "");
+else if (command === "stop") console.log(args.at(-1));
 else { console.error("stub: unmodelled " + args.join(" ")); process.exit(3); }
 `;
 
@@ -90,6 +91,15 @@ test("the guard refuses everything outside the fixture policy before reaching Do
   refused(guard("create", "--name", DRAFTED_APP, "--network", "b".repeat(64), "--label", "dev.drafted.task=dra37-first", IMAGE), /ledger --network/);
   refused(guard("create", "--name", DRAFTED_APP, "--network", NETWORK, "--label", "dev.drafted.task=dra37-first", "nginx:latest"), /recorded immutable fixture image/);
   refused(guard("stop", "--time", "5", "c".repeat(64)), /stop of non-fixture container/);
+  // A hex prefix of a ledger ID is never accepted (Docker would resolve an
+  // exactly-named foreign object first); the exact full ID still is.
+  for (const prefix of ["d".repeat(12), "d".repeat(63)]) {
+    refused(guard("stop", prefix), /stop of non-fixture container/);
+    refused(guard("inspect", prefix), /inspect of non-fixture object/);
+    refused(guard("exec", "-i", prefix, "sh"), /exec into non-fixture container/);
+    refused(guard("logs", "--tail", "5", prefix), /logs of non-fixture container/);
+  }
+  refused(guard("network", "inspect", NETWORK.slice(0, 12)), /network inspect of non-fixture object/);
   refused(guard("rm", "-f", "c".repeat(64)), /option -f is not allowed/);
   refused(guard("exec", "-i", "c".repeat(64), "sh"), /exec into non-fixture container/);
   refused(guard("network", "create", "--label", "dev.drafted.task=dra37-first", "--subnet", "10.0.0.0/8", "drafted-d-111111111111111111111111-app"), /callers may not choose a subnet/);
@@ -123,6 +133,14 @@ test("accepted creates forward the exact rewritten argv and durably ledger the e
   expect(proxy.code, proxy.stderr).toBe(0);
   expect(proxy.stubCalls[1]!.filter(value => value === "--publish")).toHaveLength(1);
   expect(ledger().at(-1)).toMatchObject({ kind: "container", id: "f".repeat(64), published: [55010] });
+
+  // The exact full ledger ID (and exact ledger name) is forwarded unchanged.
+  const stopped = guard("stop", "--time", "15", "d".repeat(64));
+  expect(stopped.code, stopped.stderr).toBe(0);
+  expect(stopped.stubCalls).toEqual([["stop", "--time", "15", "d".repeat(64)]]);
+  const byName = guard("stop", "drafted-d-000000000000000000000000-proxy");
+  expect(byName.code, byName.stderr).toBe(0);
+  expect(byName.stubCalls).toEqual([["stop", `${PREFIX}-drafted-d-000000000000000000000000-proxy`]]);
 
   // Outbound names are un-prefixed for Drafted.
   setStub({ listing: `${PREFIX}-${DRAFTED_APP}\nunrelated` });

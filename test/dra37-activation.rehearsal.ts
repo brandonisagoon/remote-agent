@@ -73,19 +73,49 @@ const gitOut = (cwd: string, ...args: string[]) => {
   return result.stdout.toString();
 };
 type Server = Awaited<ReturnType<typeof dra37Server>>;
-/** Exact source provenance: Remote Agent head/status/diff, every DRA-37
- * runner/helper/guard/preload digest, and each prepared release receipt. */
+/** Helpers outside test/dra37-* that this runner and its fixture import
+ * directly (the server process itself is covered by HEAD + tracked diff +
+ * relevant untracked files). */
+const IMPORTED_HELPERS = ["test-support/db.ts", "apps/server/prisma.ts", "lib/config.ts", "lib/tooling-source.ts", "apps/server/services/tasks/tooling.ts", "types/tooling-release.ts",
+  "apps/server/server.ts", "package.json", "bun.lock"];
+/** Paths whose change could alter what this rehearsal executes. Anything
+ * else (for example another lane's test/dra31-* files) is unrelated. */
+const RELEVANT = /^(apps\/|lib\/|management\/|types\/|prisma\/|generated\/|test-support\/|test\/dra37-|package\.json$|bun\.lock$|tsconfig[^/]*\.json$|bunfig\.toml$)/;
+const statusPath = (line: string) => line.slice(3).split(" -> ").at(-1)!.replace(/^"|"$/g, "");
+/** Exact source provenance: Remote Agent head/status/tracked diff, every
+ * DRA-37 runner/helper/guard/preload digest, imported helper digests,
+ * relevant untracked file digests and each prepared release receipt. */
 function provenance(server: Server) {
   const status = gitOut(sourceRoot, "status", "--porcelain=v1", "--untracked-files=all");
-  const files = Object.fromEntries(readdirSync(import.meta.dir).filter(name => name.startsWith("dra37-") && name.endsWith(".ts")).sort()
-    .map(name => [`test/${name}`, sha256(readFileSync(path.join(import.meta.dir, name)))]));
+  const digest = (relative: string) => existsSync(path.join(sourceRoot, relative)) ? sha256(readFileSync(path.join(sourceRoot, relative))) : null;
+  const files = Object.fromEntries(readdirSync(import.meta.dir).filter(name => name.startsWith("dra37-") && name.endsWith(".ts")).sort().map(name => [`test/${name}`, digest(`test/${name}`)]));
+  const helpers = Object.fromEntries(IMPORTED_HELPERS.map(relative => [relative, digest(relative)]));
+  const relevantUntracked = Object.fromEntries(status.split("\n").filter(line => line.startsWith("?? ")).map(statusPath).filter(relative => RELEVANT.test(relative)).sort()
+    .map(relative => [relative, digest(relative)]));
   const drafted = server.drafted!;
   return { at: new Date().toISOString(), remoteAgent: { head: gitOut(sourceRoot, "rev-parse", "HEAD").trim(), status, statusDigest: sha256(status),
-      trackedDiffDigest: sha256(gitOut(sourceRoot, "diff", "HEAD", "--binary")), files },
+      trackedDiffDigest: sha256(gitOut(sourceRoot, "diff", "HEAD", "--binary")), files, helpers, relevantUntracked },
     drafted: { pairedSource: SOURCE, releases: drafted.releases.map(release => ({ ...release,
       checkoutHead: gitOut(release.checkout, "rev-parse", "HEAD").trim(), checkoutTree: gitOut(release.checkout, "rev-parse", "HEAD^{tree}").trim(),
       checkoutStatus: gitOut(release.checkout, "status", "--porcelain", "--untracked-files=normal"),
       installReceipt: existsSync(`${release.checkout}.install.json`) ? JSON.parse(readFileSync(`${release.checkout}.install.json`, "utf8")) : null })) } };
+}
+type Provenance = ReturnType<typeof provenance>;
+/** Relevant source must be identical at start and end; any status change
+ * must be confined to unrelated paths and is recorded with that reason. */
+function provenanceStability(start: Provenance, end: Provenance) {
+  const lines = (value: Provenance) => new Set(value.remoteAgent.status.split("\n").filter(Boolean));
+  const before = lines(start), after = lines(end);
+  const delta = [...[...after].filter(line => !before.has(line)).map(line => ({ change: "appeared", line })), ...[...before].filter(line => !after.has(line)).map(line => ({ change: "disappeared", line }))];
+  const relevantDelta = delta.filter(entry => RELEVANT.test(statusPath(entry.line)));
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const checks = { head: same(start.remoteAgent.head, end.remoteAgent.head), trackedDiff: same(start.remoteAgent.trackedDiffDigest, end.remoteAgent.trackedDiffDigest),
+    dra37Files: same(start.remoteAgent.files, end.remoteAgent.files), importedHelpers: same(start.remoteAgent.helpers, end.remoteAgent.helpers),
+    relevantUntracked: same(start.remoteAgent.relevantUntracked, end.remoteAgent.relevantUntracked), draftedReleases: same(start.drafted, end.drafted),
+    noRelevantStatusDelta: relevantDelta.length === 0 };
+  return { stable: Object.values(checks).every(Boolean), checks, relevantDelta,
+    unrelatedStatusDelta: delta.filter(entry => !RELEVANT.test(statusPath(entry.line))).map(entry => ({ ...entry,
+      explanation: "Outside every path this rehearsal or its server can load (not under apps/, lib/, management/, types/, prisma/, generated/, test-support/, test/dra37-* or the package/lock/config files); another writer's lane, recorded but not part of this evidence." })) };
 }
 const readJsonl = (file: string) => existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, any>) : [];
 async function until<T>(label: string, read: () => Promise<T | null | undefined | false>, ms = 300_000): Promise<T> {
@@ -102,7 +132,7 @@ test("transport: committed A/B PlanetScale provider calls are answered only by t
   const server = await dra37Server({ slots: 1, drafted: { source: SOURCE, revision: RELEASE_A, additionalRevisions: [RELEASE_B] }, cli: { preload: PRELOAD } });
   let passed = false;
   cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE || !passed }));
-  await server.db.prisma.$queryRaw`SELECT 1`;
+  const transportStart = provenance(server);
   const product = await server.prepareCliProduct();
   const credentials = JSON.parse(readFileSync(product.credentialsFile, "utf8")) as Record<string, string>;
   const recipe = JSON.parse(readFileSync(product.recipe, "utf8"));
@@ -169,7 +199,9 @@ console.log(JSON.stringify(out));
   // No request or credential value is ever logged.
   const raw = readFileSync(path.join(product.planetscale, "planetscale-requests.jsonl"), "utf8");
   expect(raw.includes(credentials.STUDIO_PLANETSCALE_SERVICE_TOKEN!)).toBe(false);
-  writeFileSync(path.join(server.root, "transport-evidence.json"), JSON.stringify({ provenance: provenance(server), recipe: { ...recipe, credentialsFile: "<private synthetic>" }, results, requests }, null, 2) + "\n", { mode: 0o600 });
+  const transportEnd = provenance(server), transportStability = provenanceStability(transportStart, transportEnd);
+  expect(transportStability.stable, JSON.stringify(transportStability)).toBe(true);
+  writeFileSync(path.join(server.root, "transport-evidence.json"), JSON.stringify({ start: transportStart, end: transportEnd, stability: transportStability, recipe: { ...recipe, credentialsFile: "<private synthetic>" }, results, requests }, null, 2) + "\n", { mode: 0o600 });
   console.log(JSON.stringify({ transport: { root: server.root, releases: server.drafted!.releases.map(release => release.revision), answered: requests.filter(entry => entry.outcome === "answered").length, refusals: refusals.length } }));
   passed = true;
 });
@@ -344,10 +376,13 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     expect((await ownerPaused())["dra37-control"]).toBe(true);
     const providerRequests = readJsonl(path.join(product.planetscale, "planetscale-requests.jsonl"));
     expect(providerRequests.filter(entry => entry.outcome === "refused" || entry.outcome === "external-passthrough"), JSON.stringify(providerRequests).slice(0, 3_000)).toEqual([]);
+    const stability = provenanceStability(evidence.start, provenance(server));
+    expect(stability.stable, JSON.stringify(stability)).toBe(true);
     passed = true;
   } finally {
     evidence.passed = passed;
     evidence.end = provenance(server);
+    evidence.stability = provenanceStability(evidence.start, evidence.end);
     const prismaRows = async () => ({ selection: await prisma.toolingSelection.findMany(), activations: await prisma.toolingActivation.findMany(), releases: await prisma.toolingRelease.findMany(),
       operations: await prisma.toolingOperation.findMany(), consumers: await prisma.toolingRetainedConsumer.findMany(), environments: await prisma.computeEnvironment.findMany(),
       offers: await prisma.computeOffer.findMany(), slots: await prisma.computeSlot.findMany(), instructions: await prisma.runtimeInstruction.findMany(),

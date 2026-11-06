@@ -24,7 +24,8 @@
  *   publish (Drafted's proxy) must name an explicit 127.0.0.1 host port
  *   inside the OS ephemeral range that no other ledger container owns; the
  *   port is recorded with the container in the ledger.
- * - Every destructive/exec target must be a ledger object.
+ * - Every destructive/exec/inspect target must be an exact full ledger ID or
+ *   exact ledger name (never an ID prefix).
  * - Every created object (ID and name) is durably appended (fsync) to the
  *   ledger BEFORE its ID is written to the caller.
  * - Fixture networks get an explicit /28 in 10.249.0.0/16 whose numeric CIDR
@@ -50,7 +51,10 @@ const inbound = (value: string) => value.replace(NAME, `${policy.prefix}-$1`);
 const outbound = (text: string) => text.split(`${policy.prefix}-drafted-`).join("drafted-");
 type Entry = { kind: "container" | "network" | "volume"; id: string; name: string; published?: number[] };
 const ledger = (): Entry[] => existsSync(policy.ledger) ? readFileSync(policy.ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
-const owned = (value: string, kinds: Entry["kind"][]) => ledger().some(entry => kinds.includes(entry.kind) && (entry.id === value || entry.name === value || (/^[a-f0-9]{12,}$/.test(value) && entry.id.startsWith(value))));
+/** Exact full ledger ID or exact ledger name only. Never an ID prefix: Docker
+ * resolves exact names before ID prefixes, so a foreign object NAMED like a
+ * hex prefix could otherwise be targeted. */
+const owned = (value: string, kinds: Entry["kind"][]) => ledger().some(entry => kinds.includes(entry.kind) && (entry.id === value || entry.name === value));
 function record(entry: Entry) {
   const descriptor = openSync(policy.ledger, "a", 0o600);
   try { writeSync(descriptor, JSON.stringify({ ...entry, at: new Date().toISOString() }) + "\n"); fsyncSync(descriptor); } finally { closeSync(descriptor); }
