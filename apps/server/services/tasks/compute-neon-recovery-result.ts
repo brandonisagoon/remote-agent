@@ -7,14 +7,22 @@ import { finalizationDigest } from "./finalization-resources.ts";
 /**
  * Exact committed result of one Neon recovery operation, read only from the
  * server's own durable recovery event (the single atomic effect of
- * `recoverComputeNeon`). Internal and authority-free: the caller has already
- * validated the stored operation binding under its own read authority.
+ * `recoverComputeNeon`: projection, event, legacy handoff, drafted.runtime/2
+ * registration and operation completion). Internal and authority-free: the
+ * caller has already validated the stored operation binding under its own
+ * read authority.
  *
- * Pure apart from one bounded database read. It never executes an observer,
- * calls a provider, replays a handler or writes anything. `null` means only
- * that this task's complete, fully readable recovery history holds no event
- * of this operation. Anything unreadable, ambiguous, oversized or
- * inconsistent throws `NeonRecoveryResultUnverifiable`, never `null`.
+ * Pure apart from bounded database reads (the task's recovery events, the
+ * registered state write and the handed-off legacy rows). It never executes
+ * an observer, calls a provider, replays a handler, repairs status or writes
+ * anything. `null` means only that this task's complete, fully readable
+ * recovery history holds no event of this operation. Anything unreadable,
+ * ambiguous, oversized or inconsistent throws
+ * `NeonRecoveryResultUnverifiable`, never `null`.
+ *
+ * Staged-handoff wire fields (design 551400d9 §3/§7) are REQUIRED here:
+ * proof candidateSha256/candidateVersion/canonical, event handoff and
+ * stateWrite, result stateWrite. There is no fallback for older events.
  */
 
 /** Fixed reasons a stored recovery result cannot be verified. */
@@ -26,26 +34,37 @@ export class NeonRecoveryResultUnverifiable extends Error {
 }
 
 // Mirrors of private identities in compute-neon-recovery.ts (its event
-// action, `journalKey` and `evidence`). Pinned by this module's test against
-// the real writer; replace with that module's exports once provided.
+// action, `journalKey` and `evidence`, the latter with the staged design's
+// candidateSha256). Replace with that module's exports once provided; until
+// then the key is pinned by this module's test against the real writer.
 const EVENT_ACTION = "compute-neon-recovery";
 const journalKey = (environmentId: string, resourceId: string, request: z.infer<typeof ComputeNeonRecovery>) =>
   finalizationDigest({ environmentId, resourceId, offerId: request.offerId, operationId: request.operationId, previousRecipeHash: request.previousRecipeHash, recipeHash: request.recipeHash });
-function evidence(proof: ComputeNeonRecoveryProof) {
-  const { baselineSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision } = proof;
-  return finalizationDigest({ baselineSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
+function evidence(proof: Proof) {
+  const { baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision } = proof;
+  return finalizationDigest({ baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
 }
-const HISTORY_BOUND = 1000;
+const HISTORY_BOUND = 1000, HANDOFF_BOUND = 1000;
+/** The one state write a recovery registers (design 551400d9 S6). */
+export const NeonRecoveryStateFamily = "drafted.runtime", NeonRecoveryStateScope = "runtime-development", NeonRecoveryStateVersion = 2;
+const HANDOFF_EVIDENCE_KIND = "compute-neon-recovery";
 
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
 const Revision = z.string().regex(/^[a-f0-9]{40}$/);
 const Id = z.string().min(1).max(256);
 const ObserverIdentity = z.strictObject({ operationId: Id, releaseId: Id, revision: Revision, tree: Revision, adapterSha256: Sha });
+/** The proof with the staged candidate (strict; no fallback). The stored
+ * proof is the first commit's, observed while canonical == baseline. */
+const Proof = ComputeNeonRecoveryProof.extend({ candidateSha256: Sha, candidateVersion: z.literal(2), canonical: z.enum(["baseline", "candidate"]) }).strict();
+type Proof = z.infer<typeof Proof>;
+const StateWrite = z.strictObject({ family: z.literal(NeonRecoveryStateFamily), scopeKey: z.literal(NeonRecoveryStateScope), version: z.literal(NeonRecoveryStateVersion),
+  operationId: Id, releaseId: Id, sequence: z.number().int().positive() });
+const Handoff = z.strictObject({ legacyRows: z.array(z.strictObject({ id: Id, consumerKind: Id, consumerId: Id, revision: z.string().min(1).nullable(), checkout: z.string().min(1).nullable() })).max(HANDOFF_BOUND) });
 /** The server response shape (`ComputeNeonRecoveryResult`), strictly. */
 const Result = z.strictObject({
   environmentId: Id, resourceId: Id, resourceIdentity: Sha, offerId: z.uuid(), operationId: z.uuid(), previousRecipeHash: Sha, recipeHash: Sha, sourceRevision: Revision,
   outcome: z.enum(["absent", "owned"]), basis: z.enum(["provider-rejection", "complete-inventory", "legacy-provider-rejection", "exact-owned-child"]), reconciliationSha256: Sha,
-  observer: ObserverIdentity, allocation: z.enum(["retained-existing-claim", "previously-stopped-await-normal-admission"]),
+  observer: ObserverIdentity, allocation: z.enum(["retained-existing-claim", "previously-stopped-await-normal-admission"]), stateWrite: StateWrite,
 });
 /** The binding as the route admitted it (it may carry more server fields). */
 const StoredOperation = z.object({
@@ -58,7 +77,7 @@ const Row = z.object({ id: Id }).passthrough();
 const StoredEvent = z.strictObject({
   version: z.literal(1), contract: z.literal(NeonRecoveryContract), transition: z.literal(NeonRecoveryTransition), taskIdentity: z.string().min(1),
   request: ComputeNeonRecovery, environment: Row, resource: Row, offer: Row, allocations: z.unknown(), operation: StoredOperation,
-  proof: ComputeNeonRecoveryProof, observer: ObserverIdentity, evidence: Sha, projectionIdentity: Sha, result: Result,
+  proof: Proof, observer: ObserverIdentity, evidence: Sha, projectionIdentity: Sha, handoff: Handoff, stateWrite: StateWrite, result: Result,
 });
 type StoredEvent = z.infer<typeof StoredEvent>;
 
@@ -75,7 +94,7 @@ export type NeonCommittedResult = {
   result: z.infer<typeof Result>;
 };
 
-export async function readCommittedNeonRecovery(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: NeonRecoveryResultBinding): Promise<{ sequence: number; committed: NeonCommittedResult } | null> {
+export async function readCommittedNeonRecovery(store: Pick<PrismaClient, "runtimeMetadataEvent" | "toolingStateWrite" | "toolingLegacyConsumer">, binding: NeonRecoveryResultBinding): Promise<{ sequence: number; committed: NeonCommittedResult } | null> {
   if (binding.kind !== NeonRecoveryOperationKind || binding.contract !== "remote-agent.tooling-operation/v1" || !binding.existingOperationId || !binding.resourceKey) {
     throw new NeonRecoveryResultUnverifiable("binding-invalid", `operation ${binding.operationId} is not a bound Neon recovery operation`);
   }
@@ -101,6 +120,7 @@ export async function readCommittedNeonRecovery(store: Pick<PrismaClient, "runti
   const event = mine[0]!;
   if (parsed.some(row => row !== event && row.key === event.key)) throw new NeonRecoveryResultUnverifiable("event-ambiguous", `another recovery event shares transition key ${event.key}`);
   verify(event, binding);
+  await verifyStoredRows(store, event, binding);
   const { value } = event, { lockPid: _pid, ...request } = value.request;
   return { sequence: event.sequence, committed: {
     operation: { operationId: binding.operationId, requestKey: binding.requestKey, inputDigest: binding.inputDigest, taskId: binding.taskId, sessionId: binding.sessionId, kind: NeonRecoveryOperationKind,
@@ -125,9 +145,34 @@ function verify(event: { sequence: number; key: string; value: StoredEvent }, bi
     || proof.previousRecipeHash !== request.previousRecipeHash || proof.recipeHash !== request.recipeHash || proof.lockPid !== request.lockPid || proof.reconciliation.outcome !== request.outcome) fail("proof is not this request's");
   if (proof.operation.operationId !== binding.operationId || proof.operation.releaseId !== binding.release.id || proof.operation.revision !== binding.release.revision || proof.operation.tree !== binding.release.tree) fail("proof was not observed by the bound release");
   if (evidence(proof) !== value.evidence) fail("recorded evidence does not derive from its proof");
+  if (proof.canonical !== "baseline" || proof.candidateSha256 === proof.baselineSha256) fail("proof was not observed over the staged candidate with the canonical receipt at its baseline");
   if (observer.operationId !== binding.operationId || observer.releaseId !== binding.release.id || observer.revision !== binding.release.revision || observer.tree !== binding.release.tree
     || finalizationDigest(result.observer) !== finalizationDigest(observer)) fail("observer is not the bound release's");
   if (result.environmentId !== value.environment.id || result.resourceId !== value.resource.id || result.offerId !== value.offer.id || result.offerId !== request.offerId
     || result.operationId !== request.operationId || result.previousRecipeHash !== request.previousRecipeHash || result.recipeHash !== request.recipeHash || result.sourceRevision !== request.sourceRevision
     || result.outcome !== request.outcome || result.basis !== (proof.reconciliation.absence?.basis ?? "exact-owned-child") || result.reconciliationSha256 !== finalizationDigest(proof.reconciliation)) fail("result is not the committed transition's");
+  if (finalizationDigest(result.stateWrite) !== finalizationDigest(value.stateWrite) || value.stateWrite.operationId !== binding.operationId || value.stateWrite.releaseId !== binding.release.id) fail("state write is not this operation's");
+}
+
+/** The exact rows the transaction wrote beside the event: the registered
+ * drafted.runtime/2 write, and each handed-off legacy row resolved by this
+ * operation with its snapshot unchanged. Bounded, read-only. */
+async function verifyStoredRows(store: Pick<PrismaClient, "toolingStateWrite" | "toolingLegacyConsumer">, event: { sequence: number; value: StoredEvent }, binding: NeonRecoveryResultBinding) {
+  const fail = (detail: string): never => { throw new NeonRecoveryResultUnverifiable("event-mismatch", `event ${event.sequence}: ${detail}`); };
+  const { stateWrite, handoff } = event.value;
+  const write = await store.toolingStateWrite.findUnique({ where: { sequence: stateWrite.sequence } });
+  if (!write || write.repositoryId !== binding.repositoryId || write.taskId !== binding.taskId || write.family !== stateWrite.family || write.scopeKey !== stateWrite.scopeKey
+    || write.version !== stateWrite.version || write.operationId !== binding.operationId || write.releaseId !== binding.release.id) fail(`state write ${stateWrite.sequence} is not the registered drafted.runtime/2 write of this operation`);
+  const ids = handoff.legacyRows.map(row => row.id);
+  if (new Set(ids).size !== ids.length) fail("handoff names a legacy row twice");
+  if (!ids.length) return;
+  const rows = await store.toolingLegacyConsumer.findMany({ where: { id: { in: ids } }, take: HANDOFF_BOUND + 1 });
+  for (const entry of handoff.legacyRows) {
+    const row = rows.find(value => value.id === entry.id);
+    const resolution = z.object({ kind: z.string(), reference: z.string() }).passthrough().safeParse(row?.resolution).data;
+    if (!row || row.repositoryId !== binding.repositoryId || row.taskId !== binding.taskId || row.consumerKind !== entry.consumerKind || row.consumerId !== entry.consumerId
+      || row.revision !== entry.revision || row.checkout !== entry.checkout || row.status !== "resolved" || resolution?.kind !== HANDOFF_EVIDENCE_KIND || resolution.reference !== binding.operationId) {
+      fail(`legacy row ${entry.id} is not resolved by this operation's handoff with its recorded snapshot`);
+    }
+  }
 }
