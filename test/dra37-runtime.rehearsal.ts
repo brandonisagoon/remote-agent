@@ -21,7 +21,7 @@
  * removes only this fixture's own temporary root.
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { dra37Server } from "./dra37-fixture.ts";
 
@@ -41,6 +41,7 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, lab
   throw new Error(`Timed out waiting for ${label}: ${text.slice(0, 800)} … ${text.slice(-2_000)}`);
 }
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
 
 test("the original primary's delivered offer runs the actual Drafted runtime to a healthy task-owned app, and a normal stop ends exactly that process", async () => {
   const server = await dra37Server({ slots: 1, drafted: DRAFTED });
@@ -76,6 +77,12 @@ test("the original primary's delivered offer runs the actual Drafted runtime to 
   expect(alive(identity.pid)).toBe(true);
   const health = await (await fetch(new URL("/health", url))).json() as Record<string, unknown>;
   expect(health).toMatchObject({ ready: true, taskId: task.id, pid: identity.pid, token: identity.token });
+  // Health went through Drafted's own relay bundle, which wrote its real
+  // traffic journal and operations file into the runtime's traffic directory.
+  expect((identity as { relayed?: boolean }).relayed).toBe(true);
+  const traffic = path.join(server.state, "runtimes", task.id, "development", "traffic");
+  expect(readdirSync(traffic).some(name => name.endsWith(".traffic.json"))).toBe(true);
+  expect(existsSync(path.join(traffic, "operations.json"))).toBe(true);
   const evidence = { serverRoot: server.root, serverPid: server.pid, drafted: server.drafted, task: task.id, environment: environment.id, offer: offer.id, app: { url, ...identity } };
   console.log(JSON.stringify({ evidence }));
 
@@ -98,14 +105,13 @@ test("the original primary's delivered offer runs the actual Drafted runtime to 
 
 /**
  * Physical evidence boundary. Drafted's actual `compute observe` requires the
- * traffic journal its traffic daemon writes from the proxy's access log. The
- * synthetic proxy writes none, so observation is unavailable; the server must
- * then keep the stopped app's allocation charged and offer nothing to the
- * next waiter. (Verified handoff needs the real traffic daemon fed by the
- * fixture proxy: the next DRA-37 transport step.)
+ * traffic journal its relay writes. With the relay withheld, observation is
+ * unavailable; the server must then keep the stopped app's allocation
+ * charged and offer nothing to the next waiter.
  */
 test("without physical observer evidence a stopped app's allocation stays charged and the next waiter gets no offer", async () => {
-  const server = await dra37Server({ slots: 1, drafted: DRAFTED });
+  // The relay is deliberately withheld: no traffic journal exists.
+  const server = await dra37Server({ slots: 1, drafted: DRAFTED, relay: false });
   cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE }));
   const first = await server.seedTask("first"), second = await server.seedTask("second");
   await server.start();

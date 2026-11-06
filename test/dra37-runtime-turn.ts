@@ -12,7 +12,7 @@
  *
  * Usage: bun test/dra37-runtime-turn.ts up|stop [compute-offer-id]
  */
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const [action, offer] = process.argv.slice(2) as ["up" | "stop" | "status", string | undefined];
@@ -58,7 +58,7 @@ const computeDocker = async (args: string[]) => {
       State: { Running: false, Status: "created", StartedAt: "0001-01-01T00:00:00Z" },
       Config: { Labels: Object.fromEntries(options("--label").map(value => value.split("="))) },
       HostConfig: { NetworkMode: options("--network")[0], PortBindings: Object.fromEntries(options("--publish").map(value => { const [HostIp, HostPort, port] = value.split(":"); return [`${port}/tcp`, [{ HostIp, HostPort }]]; })) },
-      Mounts: mount.map(value => ({ Source: value.source, Destination: value.target, RW: value.readonly === undefined && !options("--mount").some(raw => raw.includes(`target=${value.target},readonly`)) })),
+      Mounts: mount.map(value => ({ Type: value.type, Source: value.source, Destination: value.target, RW: value.readonly === undefined && !options("--mount").some(raw => raw.includes(`target=${value.target},readonly`)) })),
       NetworkSettings: { Networks: { [network.name]: { NetworkID: "", EndpointID: "" } } } };
     writeFileSync(proxyFile, JSON.stringify(created)); effect("create-proxy");
     return created.Id;
@@ -75,6 +75,12 @@ const docker = {
     await savePrivate(path.join(directory, "app", "environment.json"), environment);
     created = state;
     state.network = { id: network.id, createdAt: network.createdAt };
+    // As Drafted's real Docker transport does at create: the traffic mount
+    // directory and the launcher's traffic-enabled marker.
+    if (state.recipe.traffic) {
+      mkdirSync(path.join(directory, "traffic"), { recursive: true, mode: 0o700 });
+      writeFileSync(path.join(directory, "app", "traffic-enabled"), "1", { mode: 0o600 });
+    }
     writeFileSync(path.join(apps, `${taskId}.network.json`), JSON.stringify(network), { mode: 0o600 });
     const container: Container = { id: Bun.CryptoHasher.hash("sha256", `${taskId}:${state.purpose}`, "hex") as string, image: `sha256:${"a".repeat(64)}`,
       createdAt: new Date().toISOString(), running: false, labels: { "dev.drafted.task": taskId, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } };
@@ -91,10 +97,11 @@ const docker = {
     const container = read();
     if (!container || container.id !== id) throw new Error("Unknown synthetic container");
     if (liveIdentity(container)) return;
-    const url = created?.urls?.api ?? JSON.parse(readFileSync(path.join(stateDirectory, "runtimes", taskId, "development", "runtime.json"), "utf8")).urls.api;
+    const runtimeDirectory = path.join(stateDirectory, "runtimes", taskId, "development");
+    const url = created?.urls?.api ?? JSON.parse(readFileSync(path.join(runtimeDirectory, "runtime.json"), "utf8")).urls.api;
     const port = Number(new URL(url).port);
-    const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "dra37-app.ts"), String(port), identityFile, taskId],
-      { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+    const child = Bun.spawn([process.execPath, path.join(import.meta.dir, "dra37-app.ts"), String(port), identityFile, taskId, path.join(runtimeDirectory, "app"), path.join(runtimeDirectory, "traffic")],
+      { stdin: "ignore", stdout: "ignore", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(process.env.DRA37_RELAY ? { DRA37_RELAY: process.env.DRA37_RELAY } : {}) } });
     child.unref();
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {

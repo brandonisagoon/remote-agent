@@ -62,7 +62,7 @@ async function prepareDraftedTooling(root: string, install: string, revision: st
     preparation: "dependency-injected partial rehearsal: symlinked paired node_modules and fixture-written .ready; not frozen install verification" };
 }
 
-export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string } }) {
+export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string }; relay?: boolean }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
@@ -83,7 +83,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     runtimeEnv(taskId: string) {
       if (!drafted) throw new Error("This fixture has no pinned Drafted checkout");
       return { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), HOME: root, DRA37_DRAFTED_ROOT: drafted.root, DRA37_SOCKET: controlSocket,
-        DRA37_TASK: taskId, DRA37_STATE: state, DRA37_RECIPE: path.join(specs, `${taskId}.recipe.json`), DRA37_APPS: apps };
+        DRA37_TASK: taskId, DRA37_STATE: state, DRA37_RECIPE: path.join(specs, `${taskId}.recipe.json`), DRA37_APPS: apps, ...(options.relay === false ? { DRA37_RELAY: "0" } : {}) };
     },
     async runtimeTurn(taskId: string, action: "up" | "stop" | "status", offer?: string) {
       const child = Bun.spawn([process.execPath, "--no-env-file", path.join(import.meta.dir, "dra37-runtime-turn.ts"), action, ...(offer ? [offer] : [])],
@@ -134,7 +134,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       // Explicit environment: no inherited REMOTE_AGENT_* or provider secrets.
       child = Bun.spawn([process.execPath, "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
-          ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}) } });
+          ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}), ...(options.relay === false ? { DRA37_RELAY: "0" } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
         for (;;) { const part = await reader.read(); if (part.done) break; log += decoder.decode(part.value, { stream: true }); }
