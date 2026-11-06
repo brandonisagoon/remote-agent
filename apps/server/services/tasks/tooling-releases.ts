@@ -432,6 +432,15 @@ export async function reconcileUnknownAdmissionChild(tx: Prisma.TransactionClien
   return binding(tx as unknown as Store, (await tx.toolingOperation.findUniqueOrThrow({ where: { id: row.id } })));
 }
 
+/** Boot recovery only, for a transaction client: an operation whose callback
+ * was interrupted by its server process's exit moves `running -> unknown`
+ * (compare-and-swap), in the same transaction that recorded the attempt's
+ * unknown result. Never touches bound or completed operations. */
+export async function markToolingOperationInterrupted(tx: Prisma.TransactionClient, input: { operationId: string }): Promise<void> {
+  const updated = await tx.toolingOperation.updateMany({ where: { id: input.operationId, status: "running" }, data: { status: "unknown" } });
+  if (updated.count !== 1) throw new ToolingOperationError("transition-conflict", `Operation ${input.operationId} is no longer running`);
+}
+
 /** Latest actually registered format for one task state, or null. */
 export async function readToolingStateVersion(input: { prisma: PrismaClient; taskId: string; family: string; scopeKey: string }): Promise<ToolingStateVersion | null> {
   const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });

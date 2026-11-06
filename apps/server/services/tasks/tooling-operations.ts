@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { hostname } from "node:os";
 import { z } from "zod";
 import type { Prisma, PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -352,18 +353,33 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
  * own definite outcome. Settlement trusts only the latest attempt's own
  * acknowledgment, so an older slow acknowledgment never covers a newer
  * in-flight or unknown attempt. */
+/** This server process: a random per-boot nonce, its PID and local host.
+ * Server-only metadata stamped on every new callback intent, so a later boot
+ * can prove an orphaned attempt belonged to an exited process. */
+export const SERVER_INSTANCE: Readonly<{ instance: string; pid: number; host: string }> = Object.freeze({ instance: crypto.randomUUID(), pid: process.pid, host: hostname() });
 async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, attemptId: string, state: "intent" | "acknowledged" | "refused" | "unknown", status: number | null) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
-    value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status,
+      ...(state === "intent" ? { server: SERVER_INSTANCE } : {}) }) } });
+}
+/** Boot recovery only: the missing `unknown` result of an attempt whose
+ * server process provably exited, copying the intent's exact identity. */
+export async function recordInterruptedAttempt(tx: Prisma.TransactionClient, operation: { id: string; sessionId: string; taskId: string },
+  intent: { attemptId: string; route?: string; inputDigest: string; requestKey?: unknown; operationId: string }, evidence: string) {
+  return tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: operation.sessionId, source: `tooling-operation:${operation.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operation.id),
+    value: JSON.stringify({ version: 1, operationId: intent.operationId, role: "outcome", state: "unknown", attemptId: intent.attemptId, route: intent.route, inputDigest: intent.inputDigest,
+      requestKey: intent.requestKey, status: null, evidence }) } });
 }
 /** One operation's callback attempt records, newest first, bounded (overflow
  * refuses rather than dropping an older attempt). */
 const AttemptRecord = z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string(), route: z.string().optional(),
   status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional() }).passthrough();
-async function attemptRecords(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operationId: string) {
+export async function attemptRecords(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operationId: string) {
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operationId) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operationId} exceeds its bound`);
-  return events.map(event => ({ sequence: event.sequence, value: AttemptRecord.safeParse(JSON.parse(event.value ?? "null")).data }));
+  // Unparseable or invalid records are returned without a value: every caller refuses on them.
+  const parse = (text: string | null) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
+  return events.map(event => ({ sequence: event.sequence, value: AttemptRecord.safeParse(parse(event.value)).data }));
 }
 const REQUEST_ROUTE = "POST /api/tasks/:taskId/compute-request";
 /** A reconciliation record is valid only when it names an earlier unknown
