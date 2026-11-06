@@ -86,7 +86,7 @@ async function fixture(failure: "build" | "health" | "restart", hooks: { beforeB
 test("a pre-start build failure restores a selected database and restarts the previous compatible server", async () => {
   const f = await fixture("build");
   expect(await deployLocked(f.context, true)).toBe("failed");
-  expect(f.events.filter(event => !event.startsWith("sqlite:"))).toEqual(["stop", "migrate:target", "stop", "stop", "migrate:previous", "restart:previous"]);
+  expect(f.events.filter(event => !event.startsWith("sqlite:")), `deploy log:\n${f.logs.join("\n")}`).toEqual(["stop", "migrate:target", "stop", "stop", "migrate:previous", "restart:previous"]);
   expect(f.git("rev-parse", "HEAD")).toBe(f.previous);
   expect((await readToolingDeploymentState(f.db.databaseUrl)).selections[0]?.generation).toBe(1);
   expect(f.logs.some(line => line.includes(`restored ${f.previous}`))).toBe(true);
@@ -95,7 +95,7 @@ test("a pre-start build failure restores a selected database and restarts the pr
 for (const failure of ["health", "restart"] as const) test(`${failure} failure after startup preserves admitted history and reports rollback refusal`, async () => {
   const f = await fixture(failure);
   expect(await deployLocked(f.context, true)).toBe("failed");
-  expect(f.events.filter(event => !event.startsWith("sqlite:"))).toEqual(["stop", "migrate:target", "restart:target"]);
+  expect(f.events.filter(event => !event.startsWith("sqlite:")), `deploy log:\n${f.logs.join("\n")}`).toEqual(["stop", "migrate:target", "restart:target"]);
   expect(f.git("rev-parse", "HEAD")).toBe(f.target);
   expect((await readToolingDeploymentState(f.db.databaseUrl)).selections[0]?.generation).toBe(2);
   expect((await f.sql("SELECT name FROM sqlite_master WHERE name = 'CandidateMigration'")).rows).toHaveLength(1);
@@ -130,7 +130,7 @@ test("a pre-start failure restores a snapshot that includes committed WAL data a
   const f = await fixture("build");
   const file = await commitInWal(f);
   expect(await deployLocked(f.context, true)).toBe("failed");
-  expect(f.events.filter(event => !event.startsWith("sqlite:"))).toEqual(["stop", "migrate:target", "stop", "stop", "migrate:previous", "restart:previous"]);
+  expect(f.events.filter(event => !event.startsWith("sqlite:")), `deploy log:\n${f.logs.join("\n")}`).toEqual(["stop", "migrate:target", "stop", "stop", "migrate:previous", "restart:previous"]);
   expect(f.events.filter(event => event.startsWith("sqlite:"))).toEqual(["sqlite:snapshot", "sqlite:restore"]);
   expect(tablesIn(file)).toContain("WalEvidence");
   expect(tablesIn(file)).not.toContain("CandidateMigration");
@@ -177,7 +177,7 @@ test("a restore with an active writer is refused and reports the stopped service
   const f = await fixture("build", { beforeBuildFailure: async () => { await holdOpen(f, "writing"); } });
   await commitInWal(f); // The server's WAL mode, where an idle connection is provable.
   expect(await deployLocked(f.context, true)).toBe("failed");
-  expect(f.events.filter(event => !event.startsWith("sqlite:"))).toEqual(["stop", "migrate:target", "stop"]);
+  expect(f.events.filter(event => !event.startsWith("sqlite:")), `deploy log:\n${f.logs.join("\n")}`).toEqual(["stop", "migrate:target", "stop"]);
   expect(f.logs.some(line => line.includes("ROLLBACK REFUSED — the service is STOPPED") && line.includes("not proven stopped"))).toBe(true);
   expect(tablesIn(f.context.databasePath!)).toContain("CandidateMigration");
   expect(readdirSync(f.layout.backups).filter(name => name.endsWith("-pre-restore.sqlite") || name.includes(".restore-"))).toEqual([]);
