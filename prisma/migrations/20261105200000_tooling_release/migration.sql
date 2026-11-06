@@ -1,3 +1,4 @@
+BEGIN;
 -- CreateTable
 CREATE TABLE "ToolingRelease" (
     "id" TEXT NOT NULL PRIMARY KEY,
@@ -172,3 +173,5 @@ CREATE INDEX "ToolingRetainedConsumer_repositoryId_status_idx" ON "ToolingRetain
 -- CreateIndex
 CREATE UNIQUE INDEX "ToolingRetainedConsumer_operationId_consumerKind_consumerId_key" ON "ToolingRetainedConsumer"("operationId", "consumerKind", "consumerId");
 
+
+COMMIT;
