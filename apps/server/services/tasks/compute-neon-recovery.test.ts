@@ -1339,7 +1339,7 @@ async function observerRelease(): Promise<ObserverRelease> {
   const adapter = path.join(checkout, JSON.parse(manifest).capabilities.runtime.adapter);
   const identity: ObserverRelease = { source: prepared ? "drafted" : "fixture", checkout, revision, tree: git("rev-parse", "HEAD^{tree}"), adapter,
     adapterSha256: sha(await readFile(adapter)), manifestSha256: sha(manifest),
-    cleanup: async () => { if (!prepared) await rm(checkout, { recursive: true, force: true }); await rm(`${checkout}.state`, { force: true }); },
+    cleanup: async () => { if (!prepared) { await rm(checkout, { recursive: true, force: true }); await rm(`${checkout}.state`, { force: true }); } },
     report: async state => { if (prepared) throw new Error("A prepared observer reports its own physical state"); await writeFile(`${checkout}.state`, state); } };
   // Recorded in the run log: the exact observer code this acceptance executed.
   console.log("DRA24_OBSERVER_IDENTITY", JSON.stringify({ ...identity, cleanup: undefined, report: undefined }));
