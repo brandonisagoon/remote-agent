@@ -297,7 +297,7 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
   const containers = (taskId: string) => server.dockerLedger().filter(entry => entry.kind === "container").flatMap(entry => {
     const [row] = JSON.parse(docker("inspect", entry.id) || "[]") as Array<{ Id: string; Name: string; Config: { Labels: Record<string, string> }; State: { Status: string; Running: boolean; ExitCode: number; Pid: number } }>;
     if (!row || row.Config.Labels["dev.drafted.task"] !== taskId) return [];
-    return [{ role: row.Name.endsWith("-proxy") ? "proxy" : row.Name.endsWith("-app") ? "app" : "other", id: row.Id, name: row.Name, status: row.State.Status, running: row.State.Running, exitCode: row.State.ExitCode }];
+    return [{ role: row.Name.endsWith("-proxy") ? "proxy" : row.Name.endsWith("-app") ? "app" : "other", id: row.Id, name: row.Name, status: row.State.Status, running: row.State.Running, exitCode: row.State.ExitCode, pid: row.State.Pid }];
   });
   const activate = async (revision: string, expectedGeneration: number, requestKey: string) => {
     const before = server.pid;
@@ -313,6 +313,28 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     if (failed) throw new Error(`${label}: committed CLI run failed: ${JSON.stringify(failed).slice(0, 4_000)}`);
     return runs.find(done) ?? null;
   });
+  /** Waits until no operation in scope is bound/running, then requires every
+   * one to be `completed`. `unknown` (or anything else) fails with the exact
+   * rows as diagnosis, as does a timeout. */
+  const requireCompleted = async (label: string, where: Parameters<typeof prisma.toolingOperation.findMany>[0], ms = 180_000) => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      const rows = await prisma.toolingOperation.findMany({ ...where, orderBy: { createdAt: "asc" } });
+      const open = rows.filter(row => ["bound", "running"].includes(row.status));
+      if (!open.length) {
+        const incomplete = rows.filter(row => row.status !== "completed");
+        if (!rows.length || incomplete.length) throw new Error(`${label}: ${rows.length ? "operations did not complete" : "no operations in scope"}: ${JSON.stringify(incomplete.length ? incomplete : rows).slice(0, 6_000)}`);
+        return rows;
+      }
+      if (Date.now() > deadline) throw new Error(`${label}: operations still open after ${ms} ms: ${JSON.stringify(open).slice(0, 6_000)}`);
+      await Bun.sleep(250);
+    }
+  };
+  const newestConfirmed = (rows: Array<{ status: string; createdAt: Date }>) => {
+    const confirmed = rows.filter(row => row.status === "confirmed").sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    if (confirmed.length !== 1) throw new Error(`Expected exactly one confirmed retained consumer (supersession leaves older rows non-confirmed): ${JSON.stringify(rows).slice(0, 4_000)}`);
+    return confirmed[0]!;
+  };
   const hold = async (point: string, url: string, detail: object) => {
     if (HOLD_SECONDS <= 0 || HOLD_AT !== point) return;
     // Released ONLY by the release file or the bound: no health watcher.
@@ -359,7 +381,7 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     expect(await (await fetch(new URL("/health", urlA))).json()).toMatchObject({ ready: true });
     const releaseRowA = await prisma.toolingRelease.findFirstOrThrow({ where: { repositoryId: REPOSITORY, revision: RELEASE_A } });
     const consumersA = await prisma.toolingRetainedConsumer.findMany({ where: { consumerId: environment.id } });
-    const confirmedA = consumersA.find(row => row.status === "confirmed");
+    const confirmedA = newestConfirmed(consumersA) as (typeof consumersA)[number];
     expect(confirmedA, JSON.stringify(consumersA)).toMatchObject({ releaseId: releaseRowA.id, generation: 1, consumerKind: "compute-environment" });
     const operationsA = await prisma.toolingOperation.findMany({ where: { taskId } });
     expect(operationsA.every(row => row.releaseId === releaseRowA.id), JSON.stringify(operationsA)).toBe(true);
@@ -436,20 +458,19 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
       const row = await prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: confirmedA!.id } });
       return row.status === "resolved" ? row : null;
     });
-    const settledContinuation = await until("the continuation settled", async () => {
-      const row = await prisma.toolingOperation.findUniqueOrThrow({ where: { id: continuation.id } });
-      return ["bound", "running"].includes(row.status) ? null : row;
-    });
-    const openAfterStop = (await prisma.toolingOperation.findMany({ where: { taskId } })).filter(row => ["bound", "running"].includes(row.status));
-    expect(openAfterStop, JSON.stringify(openAfterStop)).toEqual([]);
+    // Settlement proof (separate from the consumer resolution above): the
+    // continuation and every A command/child of this task completed.
+    const [settledContinuation] = await requireCompleted("A continuation", { where: { id: continuation.id } });
+    const completedA = await requireCompleted("A commands and children through the continuation", { where: { taskId, releaseId: releaseRowA.id } });
     expect((await cliRuns()).filter(run => run.label === "runtime-stop")).toEqual([]);
-    step("idle-continuation-on-a", { proof: "app stopped by the server-derived idle continuation bound to A's retained consumer, executed from A's checkout, and observed stopped; every operation settled; A's retained consumer resolved",
+    step("idle-continuation-on-a", { proof: "app stopped by the server-derived idle continuation bound to A's retained consumer, executed from A's checkout, and observed stopped; the continuation and every A command/child completed; A's retained consumer resolved (separately proven)",
+      completedA: completedA.map(row => ({ id: row.id, kind: row.kind, requestKey: row.requestKey, parentOperationId: row.parentOperationId, retainedConsumerId: row.retainedConsumerId, status: row.status })),
       decision: { requestAt: suspendAnswer.receivedAt, respondedAt: suspendAnswer.respondedAt, requestSchema: suspendAnswer.requestSchema, idleProof: suspendAnswer.idleProof, response: suspendAnswer.response },
       decisionReceipt, continuation: settledContinuation, continuationCalls: continuationCalls.slice(0, 8), engine: containers(taskId), resolvedA,
       offers: await prisma.computeOffer.findMany({ where: { environmentId: environment.id } }), slots: await prisma.computeSlot.findMany() });
 
     // --- 7. Owner instruction: B's committed runtime up adopts the same environment/resource/container.
-    const beforeResume = (await cliRuns()).length;
+    const beforeResume = (await cliRuns()).length, resumeStartedAt = new Date();
     const ledgerBefore = server.dockerLedger().length;
     await instruct(taskId, "dra37-ab-resume", "DRA37-RUNTIME: up");
     const readyB = await runAfter(beforeResume, "B runtime ready", run => run.result?.phase === "ready");
@@ -464,16 +485,34 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     expect(await (await fetch(new URL("/health", urlB))).json()).toMatchObject({ ready: true });
     const releaseRowB = await prisma.toolingRelease.findFirstOrThrow({ where: { repositoryId: REPOSITORY, revision: RELEASE_B } });
     const consumersB = await prisma.toolingRetainedConsumer.findMany({ where: { consumerId: environment.id } });
-    expect(consumersB.find(row => row.status === "confirmed"), JSON.stringify(consumersB)).toMatchObject({ releaseId: releaseRowB.id, generation: 2 });
-    step("b-adopted", { cliRuns: runsB, environment: environmentAfter, app: appB, url: urlB, consumers: consumersB, operations: await prisma.toolingOperation.findMany({ where: { taskId } }) });
+    expect(newestConfirmed(consumersB), JSON.stringify(consumersB)).toMatchObject({ releaseId: releaseRowB.id, generation: 2 });
+    expect(consumersB.find(row => row.id === confirmedA.id)?.status).toBe("resolved");
+    const completedResume = await requireCompleted("B resume commands and children", { where: { taskId, releaseId: releaseRowB.id, createdAt: { gte: resumeStartedAt } } });
+    step("b-adopted", { completedResume: completedResume.map(row => ({ id: row.id, kind: row.kind, requestKey: row.requestKey, status: row.status })), cliRuns: runsB, environment: environmentAfter, app: appB, url: urlB, consumers: consumersB, operations: await prisma.toolingOperation.findMany({ where: { taskId } }) });
     await hold("after-b-resume", urlB, { taskId, environmentId: environment.id, activeRelease: RELEASE_B, servingRelease: RELEASE_B });
 
     // --- 8. Final normal stop through B, then exact cleanup (afterEach).
-    const beforeFinal = (await cliRuns()).length;
+    const beforeFinal = (await cliRuns()).length, finalStartedAt = new Date();
     await instruct(taskId, "dra37-ab-final-stop", "DRA37-RUNTIME: stop");
     const finalStop = await runAfter(beforeFinal, "final runtime stop", run => run.label === "runtime-stop");
     expect(finalStop.capability.checkout).toBe(releaseB.checkout);
-    step("final-stop", { finalStop, engine: containers(taskId) });
+    // The exact adopted app container is stopped (pid 0) ...
+    const finalEngine = containers(taskId);
+    expect(finalEngine.find(value => value.id === appA.id), JSON.stringify(finalEngine)).toMatchObject({ role: "app", status: "exited", running: false, pid: 0 });
+    // ... a FRESH observation (after the stop began) reports it stopped ...
+    const finalObservation = await until("fresh stopped observation after the final stop", async () => {
+      const observation = (await prisma.computeEnvironment.findUniqueOrThrow({ where: { id: environment.id } })).observation as { state?: string; observedAt?: number } | null;
+      return observation && observation.state === "stopped" && (observation.observedAt ?? 0) > finalStartedAt.getTime() ? observation : null;
+    });
+    // ... and B's terminal stop command (and any children) completed on B.
+    const completedFinal = await requireCompleted("final B stop command", { where: { taskId, createdAt: { gte: finalStartedAt } } });
+    expect(completedFinal.every(row => row.releaseId === releaseRowB.id), JSON.stringify(completedFinal)).toBe(true);
+    expect(completedFinal.some(row => row.parentOperationId === null), "a root (command) operation for the final stop").toBe(true);
+    const finalProxy = finalEngine.find(value => value.role === "proxy");
+    step("final-stop", { proof: "the exact adopted app container exited (pid 0), a fresh observation reports stopped, and B's terminal stop command completed",
+      finalStop, engine: finalEngine, observation: finalObservation,
+      completedFinal: completedFinal.map(row => ({ id: row.id, kind: row.kind, requestKey: row.requestKey, parentOperationId: row.parentOperationId, status: row.status })),
+      proxy: { ...finalProxy, note: "Drafted's normal stop stops the app only; the nginx proxy container keeps running until the fixture's exact-ID cleanup. No claim is made that it is stopped or uncharged before cleanup." } });
     expect(server.pid).toBe(pid);
     expect((await ownerPaused())["dra37-control"]).toBe(true);
     const providerRequests = readJsonl(path.join(product.planetscale, "planetscale-requests.jsonl"));
