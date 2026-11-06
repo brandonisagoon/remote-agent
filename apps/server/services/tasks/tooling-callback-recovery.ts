@@ -1,0 +1,117 @@
+import { z } from "zod";
+import type { PrismaClient } from "../../../../generated/prisma/client.ts";
+import { SERVER_INSTANCE, attemptRecords, recordInterruptedAttempt, validReconciliation } from "./tooling-operations.ts";
+import { markToolingOperationInterrupted } from "./tooling-releases.ts";
+
+/**
+ * Boot recovery of tooling callbacks interrupted by a server process's exit.
+ * Runs once after runtime ownership is acquired and before any runtime,
+ * worker or listener starts.
+ *
+ * A crash leaves an attempt in one of two windows: (1) its `intent` without
+ * any result while the operation is `running`, or (2) its `unknown` result
+ * recorded but the operation still `running`. Either blocks reconciliation and
+ * settlement forever. An attempt is repaired only when its intent's stamp
+ * names a DIFFERENT server instance on THIS host whose PID provably exited
+ * (ESRCH). Unstamped, current-instance, other-host, live, reused or uncertain
+ * PIDs, and malformed or truncated history, leave the operation blocked with
+ * a diagnosis. Repair is one transaction: the attempt's exact `unknown`
+ * result is appended (window 1), then `running -> unknown` (both windows).
+ * Nothing is replayed, no success is inferred, and admission, producer,
+ * consumer, offer, slot and instruction records are never touched; an
+ * unknown operation recovers only through its existing reconciliation.
+ *
+ * Limitations (blocked with a diagnosis, never "recovered"): process identity
+ * is the per-boot random nonce plus PID and os.hostname(). A PID that is live
+ * again (reused), equal to this process's PID, or uncertain (e.g. EPERM)
+ * stays blocked, since the start time is not stamped; a renamed or different
+ * host stays blocked. No platform boot ID or configured machine label is used
+ * as host proof. Intents written before stamping have no stamp and stay
+ * blocked.
+ */
+export type PidState = "exited" | "alive" | "uncertain";
+export const probePid = (pid: number): PidState => {
+  try { process.kill(pid, 0); return "alive"; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH" ? "exited" : "uncertain"; }
+};
+const Stamp = z.strictObject({ instance: z.string().uuid(), pid: z.number().int().positive(), host: z.string().min(1) });
+type Instance = { instance: string; pid: number; host: string };
+export type CallbackRecoveryReport = {
+  repaired: Array<{ operationId: string; attempts: string[]; status: "unknown" }>;
+  blocked: Array<{ operationId: string; reason: string }>;
+};
+const PAGE = 200, OPERATION_BOUND = 10_000;
+
+/** Test seam only (the server never passes it): runs after an operation's
+ * proof and before its repair transaction, to exercise racing changes. */
+type RecoveryHooks = { beforeRepair?: (operationId: string) => Promise<void> };
+export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient; current?: Instance; probe?: (pid: number) => PidState; hooks?: RecoveryHooks }): Promise<CallbackRecoveryReport> {
+  const current = input.current ?? SERVER_INSTANCE, probe = input.probe ?? probePid;
+  const report: CallbackRecoveryReport = { repaired: [], blocked: [] };
+  let cursor: string | undefined, seen = 0;
+  for (;;) {
+    const page = await input.prisma.toolingOperation.findMany({ where: { status: { in: ["running", "unknown"] } }, orderBy: { id: "asc" }, take: PAGE, ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}) });
+    for (const operation of page) {
+      if (++seen > OPERATION_BOUND) { report.blocked.push({ operationId: operation.id, reason: `more than ${OPERATION_BOUND} open operations; recovery stopped here` }); return report; }
+      try {
+        const outcome = await recoverOperation(input.prisma, operation, current, probe, input.hooks ?? {});
+        if (outcome && "reason" in outcome) report.blocked.push({ operationId: operation.id, reason: outcome.reason });
+        else if (outcome) report.repaired.push({ operationId: operation.id, attempts: outcome.attempts, status: "unknown" });
+      } catch (error) { report.blocked.push({ operationId: operation.id, reason: error instanceof Error ? error.message : String(error) }); }
+    }
+    if (page.length < PAGE) return report;
+    cursor = page.at(-1)!.id;
+  }
+}
+
+type Operation = { id: string; status: string; sessionId: string; taskId: string; inputDigest: string };
+async function recoverOperation(prisma: PrismaClient, operation: Operation, current: Instance, probe: (pid: number) => PidState, hooks: RecoveryHooks): Promise<{ reason: string } | { attempts: string[] } | null> {
+  const records = await attemptRecords(prisma, operation, operation.id); // overflow throws: blocked
+  const malformed = records.find(record => !record.value);
+  if (malformed) return { reason: `malformed attempt record ${malformed.sequence}` };
+  const values = records.map(record => ({ ...record.value!, sequence: record.sequence }));
+  if (values.some(value => value.operationId !== operation.id)) return { reason: "attempt records name another operation" };
+  const intents = values.filter(value => value.state === "intent");
+  const results = (attemptId: string) => values.filter(value => value.attemptId === attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
+  // Window 1: an intent without any result. Window 2: an unknown result while still running.
+  const resultless = intents.filter(intent => !results(intent.attemptId).length);
+  // Window 2 counts only UNRECONCILED unknown attempts, judged by the same
+  // strict stored-link validation as settlement. An attempt already
+  // reconciled by its exact acknowledged replay (the operation then returned
+  // to running, and may have produced) is history, never swept again. A
+  // reconciliation record that does not validate is never credited and never
+  // swept: the operation stays blocked.
+  const unknownWhileRunning: typeof intents = [];
+  if (operation.status === "running") for (const intent of intents.filter(value => results(value.attemptId).includes("unknown"))) {
+    if (validReconciliation(records, intent.attemptId, operation)) continue;
+    if (values.some(value => value.attemptId === intent.attemptId && value.state === "reconciled")) return { reason: `attempt ${intent.attemptId} has a reconciliation record that does not validate` };
+    unknownWhileRunning.push(intent);
+  }
+  const candidates = [...resultless, ...unknownWhileRunning];
+  if (!candidates.length) return null;
+  const evidence: string[] = [];
+  for (const intent of candidates) {
+    const stamp = Stamp.safeParse((intent as { server?: unknown }).server);
+    if (!stamp.success) return { reason: `attempt ${intent.attemptId} has no server instance stamp` };
+    if (stamp.data.instance === current.instance) return { reason: `attempt ${intent.attemptId} belongs to this running server instance` };
+    if (stamp.data.host !== current.host) return { reason: `attempt ${intent.attemptId} ran on another host (${stamp.data.host})` };
+    if (stamp.data.pid === current.pid) return { reason: `attempt ${intent.attemptId} names this process's PID ${stamp.data.pid} (reused)` };
+    const state = probe(stamp.data.pid);
+    if (state !== "exited") return { reason: `attempt ${intent.attemptId} server PID ${stamp.data.pid} is ${state}` };
+    evidence.push(`interrupted-by-restart:${stamp.data.instance}:${stamp.data.pid}:recovered-by:${current.instance}:${current.pid}`);
+  }
+  await hooks.beforeRepair?.(operation.id);
+  await prisma.$transaction(async tx => {
+    // FIRST statement: a compare-and-swap write guarding the observed status
+    // (running or unknown). It takes the write lock before anything is
+    // checked, so a row that became bound/completed (or changed at all) is
+    // never appended to; then the history must be exactly what was proven.
+    const guarded = await tx.toolingOperation.updateMany({ where: { id: operation.id, status: operation.status }, data: { status: operation.status } });
+    if (guarded.count !== 1) throw new Error(`operation is no longer ${operation.status}`);
+    const again = await attemptRecords(tx, operation, operation.id);
+    if (again.length !== records.length || again.some((record, index) => record.sequence !== records[index]!.sequence)) throw new Error("attempt history changed during recovery");
+    for (const [index, intent] of resultless.entries()) await recordInterruptedAttempt(tx, operation, intent, evidence[index]!);
+    if (operation.status === "running") await markToolingOperationInterrupted(tx, { operationId: operation.id });
+  });
+  return { attempts: candidates.map(intent => intent.attemptId) };
+}

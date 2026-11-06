@@ -35,6 +35,7 @@ import { CleanupReportRequest, publishCleanupReport, cleanupProjection } from ".
 import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
 
 import { taskResponse } from "./response.ts";
+import { assertClosedReleaseResourceUpdate } from "../../services/tasks/tooling-operations.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
@@ -268,7 +269,10 @@ taskRoutes.get("/", async (c) => {
 });
 taskRoutes.get("/:taskId", async (c) => {
   const task = await c.get("prisma").remoteTask.findUnique({ where: { id: c.req.param("taskId") }, include: { resources: true } });
-  return task ? c.json({ task: { ...taskResponse(task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
+  // The exact task-owned prepared finalization key (null when none), read by
+  // separately invoked finalization evidence callbacks.
+  const prepared = task?.primarySessionId ? await c.get("prisma").runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: "finalization-prepared" }, orderBy: { sequence: "desc" } }) : null;
+  return task ? c.json({ task: { ...taskResponse(task), latestFinalizationKey: prepared?.key ?? null, ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Task not found" }, 404);
 });
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {
@@ -320,6 +324,8 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
       if (!await developmentResourceUpdate({ prisma: tx, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values, development)) {
         await assertCleanupResourceUpdate({ prisma: tx, config: c.get("config"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values);
       }
+      // A closed legacy resource release's limits, atomic with the write.
+      await assertClosedReleaseResourceUpdate(existing, values, tx);
       return tx.remoteTaskResource.update({ where: { id: existing.id }, data: { state: values.state, metadata: values.metadata, expiresAt: values.expiresAt } });
     });
     return c.json({ resource });

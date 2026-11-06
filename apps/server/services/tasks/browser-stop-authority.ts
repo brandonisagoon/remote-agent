@@ -70,7 +70,7 @@ export async function resolveBrowserStopAuthority(input: Context, resolve = reso
     return { task, identity, turn, stable };
   };
   const before = await inspect();
-  const capability = await resolve({ task: before.task, config: input.config });
+  const capability = await resolve({ task: before.task, config: input.config, prisma: input.prisma });
   const after = await inspect();
   if (before.stable !== after.stable) throw new Error("Browser stop task, resource or execution changed during capability resolution");
   return BrowserStopAuthority.parse({ version: 1, task: { id: after.task.id, primarySessionId: after.task.primarySessionId,

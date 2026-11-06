@@ -152,6 +152,10 @@ model RuntimeMetadataEvent {
   runtimeSession RuntimeSession @relation(fields: [runtimeSessionId], references: [id], onDelete: Cascade)
 
   @@index([runtimeSessionId, sequence])
+  @@index([action, source, key, sequence])
+  // The partial JSON-expression index finalization_preparation_terminal_state
+  // is preserved in 20261105203000_metadata_polling_indexes/migration.sql.
+  // Review generated migrations so they do not drop this SQL-only index.
 }
 
 /// Durable low-volume lifecycle journal shared by ACP and HTTP processes.

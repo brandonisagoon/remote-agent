@@ -25,31 +25,38 @@ async function finishTurn(offer: NonNullable<Awaited<ReturnType<typeof offerNext
   const instruction = await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "completed" } });
   await db.prisma.runtimeSession.update({ where: { id: instruction.sessionId }, data: { status: "idle" } });
 }
-test("queueing and dispatching do not reserve; confirmed executing delivery starts exactly sixty seconds", async () => {
+test("selection reserves before dispatch; confirmed delivery records progress without a capacity decision", async () => {
   await task("one");
   const offer = (await offerNextCompute(context()))!;
-  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
-  await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "dispatching", executionRequestId: offer.instructionId } });
-  expect(await confirmComputeDelivery({ ...context(10_000), sessionId: "primary-one", requestId: offer.instructionId })).toBeNull();
-  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
-  const delivered = (await started(offer, 20_000))!;
-  expect(delivered.deliveredAt).toEqual(context(20_000).now);
-  expect(delivered.expiresAt).toEqual(context(80_000).now);
+  // The notification names a durable assignment: its slot is already held.
   expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+  await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "dispatching", executionRequestId: offer.instructionId } });
+  expect(await confirmComputeDelivery({ ...context(10_000), sessionId: "primary-one", requestId: offer.instructionId })).toBeNull(); // no start record yet
+  const delivered = (await started(offer, 20_000))!;
+  expect(delivered.state).toBe("offered");
+  expect(delivered.deliveredAt).toEqual(context(20_000).now);
+  expect(delivered.expiresAt).toBeNull(); // no claim timer can free started work
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
 });
-test("expiry advances fairly to the next existing primary and rejects the old offer", async () => {
+
+test("an unclaimed reservation is released only after its turn ends, then advances fairly", async () => {
   await task("one"); await task("two");
-  const first = (await offerNextCompute(context()))!; await started(first); await finishTurn(first);
-  expect(await offerNextCompute(context(59_999))).toBeNull();
-  const next = (await offerNextCompute(context(60_000)))!;
+  const first = (await offerNextCompute(context()))!; await started(first);
+  // Still running long after any former timer: the reservation stays.
+  expect(await offerNextCompute(context(3_600_000))).toBeNull();
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: first.id } })).toBe(1);
+  await finishTurn(first);
+  const next = (await offerNextCompute(context(3_600_001)))!;
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: next.instructionId } })).sessionId).toBe("primary-two");
-  await expect(claimCompute({ ...context(60_000), taskId: "one", offerId: first.id, request })).rejects.toThrow("expired or superseded");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("expired");
+  await expect(claimCompute({ ...context(3_600_002), taskId: "one", offerId: first.id, request })).rejects.toThrow("expired or superseded");
   expect(await db.prisma.runtimeSession.count()).toBe(2);
   expect(await db.prisma.computeWait.count()).toBe(2);
 });
+
 test("a conversational reply is not a claim; duplicate command claims reuse one allocation", async () => {
   const env = await task("one"); const offer = (await offerNextCompute(context()))!;
-  await started(offer); await finishTurn(offer);
+  await started(offer);
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).claimedAt).toBeNull();
   const first = await claimCompute({ ...context(1), taskId: "one", offerId: offer.id, request });
   const again = await claimCompute({ ...context(2), taskId: "one", offerId: offer.id, request });
@@ -58,6 +65,7 @@ test("a conversational reply is not a claim; duplicate command claims reuse one 
   expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
   expect(await db.prisma.computeWait.count()).toBe(0);
 });
+
 test("a claimed partial startup survives offer expiry and startup timeout without reallocating", async () => {
   await task("one"); await task("two"); const offer = (await offerNextCompute(context()))!; await started(offer);
   await claimCompute({ ...context(1), taskId: "one", offerId: offer.id, request });
@@ -78,25 +86,33 @@ test("owner pause releases unclaimed offers but cannot pretend claimed compute s
   await reconcileComputeOffers(context(5));
   expect(await db.prisma.computeSlot.count({ where: { allocationId: next.id } })).toBe(1);
 });
-test("undelivered offer timeout does not block another task or start the claim clock", async () => {
+test("a never-dispatched assignment is released only by cancelling its queued instruction", async () => {
   await task("one"); await task("two"); const first = (await offerNextCompute(context()))!;
+  expect(await offerNextCompute(context(29_999))).toBeNull();
   const next = (await offerNextCompute(context(30_000)))!;
   expect(next.id).not.toBe(first.id);
   expect(next.deliveredAt).toBeNull(); expect(next.expiresAt).toBeNull();
-  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: next.id } })).toBe(1);
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: first.instructionId } })).state).toBe("cancelled");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("expired");
 });
+
 test("durable prompt-start can reconcile after restart with its original delivery timestamp", async () => {
   await task("one"); const offer = (await offerNextCompute(context()))!;
   await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "dispatching", executionRequestId: offer.instructionId } });
   await db.prisma.runtimeLifecycleEvent.create({ data: { id: `${offer.id}:started`, runtimeSessionId: "primary-one", requestId: offer.instructionId, phase: "started", occurredAt: context(5_000).now } });
   await db.prisma.$disconnect();
-  const recovered = await confirmComputeDelivery({ ...context(10_000), sessionId: "primary-one", requestId: offer.instructionId });
-  expect(recovered?.expiresAt).toEqual(context(65_000).now);
-  const replay = await confirmComputeDelivery({ ...context(11_000), sessionId: "primary-one", requestId: offer.instructionId });
+  // Lost acknowledgment: the deadline passed, but the exact start is recovered.
+  await reconcileComputeOffers(context(120_000));
+  const recovered = await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } });
+  expect(recovered).toMatchObject({ state: "offered", deliveredAt: context(5_000).now, expiresAt: null });
+  const replay = await confirmComputeDelivery({ ...context(121_000), sessionId: "primary-one", requestId: offer.instructionId });
   expect(replay).toEqual(recovered);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
   expect(await db.prisma.runtimeInstruction.count()).toBe(1);
 });
+
 test("changed task pin and wrong recipe, purpose or primary cannot claim", async () => {
   await task("one"); await task("other"); const offer = (await offerNextCompute(context()))!; await started(offer);
   for (const changed of [{ ...request, purpose: "review" as const }, { ...request, recipeDigest: "d".repeat(64) }, { ...request, revision: "e".repeat(40) }]) {
@@ -141,7 +157,10 @@ test("a pause after durable start withdraws that queued recovery without blockin
   const next = (await offerNextCompute(context(1)))!;
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("ineligible");
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: next.instructionId } })).sessionId).toBe("primary-two");
-  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+  // Only the new assignment holds capacity; the paused task keeps its wait.
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: next.id } })).toBe(1);
+  expect(await db.prisma.computeWait.count({ where: { environmentId: first.environmentId } })).toBe(1);
 });
 
 test("first claim refuses a reserved low slot when the full occupied budget shrank", async () => {
@@ -193,12 +212,15 @@ test("an inspection failure cannot revoke a queued offer or free reserved capaci
 });
 
 const capped = (limit = 1) => ({ ...context(), policy: ComputePolicy.parse({ enabled: true, slots: 19, maxManagedAllocations: limit }) });
-test("lowering the managed cap after selection refuses delivery without reserving a slot", async () => {
+test("lowering the managed cap after selection is enforced at claim, never by releasing started work", async () => {
   await task("one"); const queued = (await offerNextCompute(capped()))!;
-  expect(await started(queued, 0, capped(0).policy)).toBeNull();
-  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: queued.id } })).state).toBe("expired");
-  expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+  const delivered = (await started(queued, 0, capped(0).policy))!;
+  expect(delivered.state).toBe("offered");
+  await expect(claimCompute({ ...capped(0), taskId: "one", offerId: queued.id, request })).rejects.toThrow("reservation is unavailable");
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: queued.id } })).claimedAt).toBeNull();
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: queued.id } })).toBe(1);
 });
+
 test("first claim rechecks the managed cap against every offered or unknown ordinal", async () => {
   await task("one"); const queued = (await offerNextCompute(capped()))!; await started(queued, 0, capped().policy);
   await db.prisma.computeSlot.create({ data: { id: "host:99", machineId: "host", ordinal: 99, allocationId: "unknown-old-allocation" } });

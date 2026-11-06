@@ -85,7 +85,7 @@ export async function resolveLocalServiceStopAuthority(input: Context, resolve =
     return { task, identity, resources, turn, stable };
   };
   const before = await inspect();
-  const capability = await resolve({ task: before.task, config: input.config });
+  const capability = await resolve({ task: before.task, config: input.config, prisma: input.prisma });
   const after = await inspect();
   if (before.stable !== after.stable) throw new Error("Local service stop task, resource or execution changed during capability resolution");
   return LocalServiceStopAuthority.parse({ version: 1, authorityDigest: after.stable, task: { id: after.task.id, primarySessionId: after.task.primarySessionId,

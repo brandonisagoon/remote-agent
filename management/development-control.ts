@@ -26,8 +26,12 @@ export async function controlDevelopmentCompute(config: ServerConfig, taskId: st
   const development = { intentRevision: intent.revision, intentDigest: intent.digest };
   const { receipt: raw } = await control<{ receipt: unknown }>(`/api/sessions/${encodeURIComponent(saved.primarySessionId)}/tooling-capability`, "POST", { capability: "runtime", development });
   const receipt = Receipt.parse(raw), configured = config.repositories[saved.repositoryId]?.tooling;
-  if (!configured || receipt.capabilityRevision !== configured.revision || receipt.taskToolingRevision !== saved.toolingRevision) throw new Error("Development runtime capability does not match the configured host and original task");
-  const expected = realpathSync(path.join(config.installRoot, "tooling", saved.repositoryId, configured.revision));
+  // The host selects the release (its active generation can change without a
+  // desktop restart). Never compare with this process's boot-time revision;
+  // verify instead that the host's receipt names an immutable prepared
+  // checkout of exactly that revision under the host install root.
+  if (!configured || receipt.taskToolingRevision !== saved.toolingRevision) throw new Error("Development runtime capability does not match the configured host and original task");
+  const expected = realpathSync(path.join(config.installRoot, "tooling", saved.repositoryId, receipt.capabilityRevision));
   const root = realpathSync(receipt.checkout), adapter = realpathSync(receipt.adapter);
   if (root !== expected || !adapter.startsWith(`${root}${path.sep}`) || adapter !== receipt.adapter) throw new Error("Development runtime adapter escapes its immutable checkout");
   const revision = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8", timeout: 5000 }).trim();

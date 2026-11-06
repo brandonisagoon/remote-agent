@@ -6,7 +6,7 @@ import { scopedConfigFile } from "./config-scope.ts";
 import { z } from "zod";
 import { ComputePolicy } from "./compute-policy.ts";
 import { LinearCredentialSchema, type LinearCredential } from "./linear-auth.ts";
-import { readToolingSource } from "./tooling-source.ts";
+import { readToolingSource, readToolingSourceAt } from "./tooling-source.ts";
 import { RoutingConfigSchema, type RoutingConfig } from "./routing-config.ts";
 
 import { sshLinkSupported } from "./machines/editor-link.ts";
@@ -384,7 +384,9 @@ export interface RepositoryConfig {
   name: string;
   root: string;
   worktreeRoot: string;
-  tooling?: { root: string; revision: string };
+  /** `policyBlob` is the committed team-policy blob at `revision`; it is
+   * absent only in hand-built fixtures. */
+  tooling?: { root: string; revision: string; policyBlob?: string };
   baseBranch?: string;
   preparation?: "command" | "agent";
   bootstrapCommand: string[];
@@ -531,7 +533,21 @@ function resolveDatabaseUrl(value: string | undefined, stateRoot: string): strin
   return `file:${absolute(file, stateRoot)}`;
 }
 
-export function readConfig(filePath: string = configFilePath()): ServerConfig {
+export interface ReadConfigOptions {
+  /** Server-only durable release selections keyed by repository ID. A selected
+   * repository resolves policy from that exact commit and never consults its
+   * moving configured ref, so restart cannot silently reselect tooling. */
+  toolingRevisions?: Readonly<Record<string, string>>;
+}
+
+/** The database location without resolving any tooling source, so the server
+ * can read durable selections before policy resolution. */
+export function readConfigDatabaseUrl(filePath: string = configFilePath()): string {
+  const configFile = absolute(filePath);
+  return resolveDatabaseUrl(readServiceFile(configFile).machine.server.databaseUrl, path.dirname(configFile));
+}
+
+export function readConfig(filePath: string = configFilePath(), options: ReadConfigOptions = {}): ServerConfig {
   const configFile = absolute(filePath);
   const file = readServiceFile(configFile);
   const machine = file.machine.id;
@@ -554,14 +570,16 @@ export function readConfig(filePath: string = configFilePath()): ServerConfig {
       const toolingRoot = repository.tooling
         ? absolute(repository.tooling.root, path.dirname(configFile))
         : null;
-      const source = toolingRoot ? readToolingSource(toolingRoot, repository.tooling!.ref) : null;
+      const selected = options.toolingRevisions?.[id];
+      if (selected && !toolingRoot) throw new Error(`Repository ${id} has a durable tooling selection but no configured tooling source`);
+      const source = toolingRoot ? (selected ? readToolingSourceAt(toolingRoot, selected) : readToolingSource(toolingRoot, repository.tooling!.ref)) : null;
       const settings = source ? parseRepoConfig(source.settings) : readRepoConfig(root);
       return [id, {
         id,
         name: repository.name ?? id,
         root,
         worktreeRoot,
-        ...(source && toolingRoot ? { tooling: { root: toolingRoot, revision: source.revision } } : {}),
+        ...(source && toolingRoot ? { tooling: { root: toolingRoot, revision: source.revision, policyBlob: source.policyBlob } } : {}),
         baseBranch: settings.baseBranch,
         preparation: settings.preparation,
         bootstrapCommand: [...settings.bootstrapCommand],

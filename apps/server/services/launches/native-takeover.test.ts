@@ -19,6 +19,9 @@ afterEach(async () => { await db.cleanup(); });
 function fixture() {
   const config = testConfig();
   config.webhooks[config.activeWebhookId]!.repositoryRouting[config.repository.id] = { when: [{ "linear.userId": ["owner"] }] };
+  // The owner's rocket selects an execution workflow configured for that reaction.
+  config.repository = { ...config.repository, workflows: { ...config.repository.workflows, implement: { ...config.repository.workflows.plan!, id: "implement", on: "issue.reaction", when: [{ "reaction.emoji": ["rocket"] }] } } };
+  config.repositories = { ...config.repositories, [config.repository.id]: config.repository };
   const runtime = createFakeAgentRuntime();
   runtime.getSession = id => findRuntimeSession(db.prisma, id);
   runtime.listSessions = () => listRuntimeSessions(db.prisma);
@@ -269,9 +272,9 @@ test("a pending worker from an earlier process remains unverified instead of bei
 async function freshActualWorker(f: ReturnType<typeof fixture>, runId: string) {
   await Bun.sleep(3);
   const issue = { id: f.source.issueId, identifier: f.source.issueIdentifier, title: "Owner continuation", description: "Continue existing task", branchName: "codex/original", state: { name: "Implementing" }, labels: { nodes: [] }, agentIssues: [] } as unknown as SourceIssueWithAgentIssues;
-  const worker = createWorkflowWorker({ getIssue: async () => issue, react: async () => true, postWorktreeComment: async () => "posted", compose: async () => "Owner requested the existing workflow" });
+  const worker = createWorkflowWorker({ getIssue: async () => issue, react: async () => true, postWorktreeComment: async () => "posted", compose: async () => "Owner requested the existing workflow", readComments: async () => [] });
   const context: WorkerContext = { prisma: db.prisma, config: f.config, agentRuntime: f.runtime, runId, commandClient: { run: async () => ({ ok: true, stdout: "", stderr: "" }) } };
-  return worker.execute({ type: DispatchEventType.TrackerWorkflowTriggered, workflowId: "plan", webhook: { type: "Reaction", action: "create", webhookTimestamp: Date.now(), data: { id: `reaction-${runId}`, createdAt: new Date().toISOString(), emoji: "🚀", userId: "owner", issueId: f.source.issueId, issue: { id: f.source.issueId, identifier: f.source.issueIdentifier } } } }, context);
+  return worker.execute({ type: DispatchEventType.TrackerWorkflowTriggered, workflowId: "implement", webhook: { type: "Reaction", action: "create", webhookTimestamp: Date.now(), data: { id: `reaction-${runId}`, createdAt: new Date().toISOString(), emoji: "🚀", userId: "owner", issueId: f.source.issueId, issue: { id: f.source.issueId, identifier: f.source.issueIdentifier } } } }, context);
 }
 
 test("the actual fresh owner worker does not block its own authenticated grant", async () => {

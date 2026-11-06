@@ -401,7 +401,7 @@ test("visible cleanup uses the real API, preserves original proof, and reports D
   try {
     expect((await post("cleanup-status")).status).toBe(409); expect(f.writes).toEqual([]);
     await f.prepare();
-    const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } } });
+    const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } });
     expect((await post("cleanup-status")).status).toBe(200); expect(f.issue.state.name).toBe("Cleanup");
     expect((await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).status).toBe("idle");
     expect(runtime.closedSessionIds).toEqual([]);
@@ -420,7 +420,7 @@ test("visible cleanup uses the real API, preserves original proof, and reports D
     expect((await post("cleanup-report")).status).toBe(200); expect(f.writes).toEqual(["Cleanup", "Done"]);
     expect((await post("cleanup-status")).status).toBe(200); expect(await (await post("cleanup-status")).json()).toEqual({ state: "superseded" });
     expect(await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { id: start.id } })).toEqual(start);
-    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(proof => proof.sequence) } } })).toEqual(proofs);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(proof => proof.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(proofs);
   } finally { Object.assign(issueUpdateDelivery, saved); Object.assign(cleanupReportDelivery, savedReport); }
 });
 
@@ -596,11 +596,11 @@ test("actual child publisher cannot borrow the parent's prepared Cleanup handoff
 test("ordinary child completion from owner Cleanup does not require parent environment teardown", async () => {
   const f = await childStatusFixture(); f.child.state = f.states.find(state => state.name === "Cleanup")!;
   const before = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
-  const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } } });
+  const proofs = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: [FINALIZATION_PREPARED, CLEANUP_OPERATION] } }, orderBy: { sequence: "asc" } });
   expect(await publishChildIssueUpdate({ ...f.input, childIssueId: f.child.id, requestKey: "child-done", body: "Child work meets its accepted boundary; parent environment remains in use.", state: "Done", expectedState: "Cleanup", evidence: [] }, f.client)).toMatchObject({ published: true, state: "Done" });
   expect(f.child.state.name).toBe("Done"); expect(f.issue.state.name).toBe("Merge");
   expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(before);
-  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(row => row.sequence) } } })).toEqual(proofs);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: proofs.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(proofs);
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
   expect(git(f.worktree, "rev-parse", "HEAD")).toBe(f.remote.remoteHead);
 });

@@ -1,21 +1,36 @@
+import { createHash } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
-import { reconcileObservedCompute, offerNextCompute } from "./compute-admission.ts";
+import { reconcileObservedCompute, scheduleComputeOffers } from "./compute-admission.ts";
 import { refreshComputeObservation, computeEvidenceState } from "./compute-observation.ts";
 import { considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
-import { verifiedComputeRuntime } from "./compute-observer.ts";
+import { operationEnvironment, verifiedComputeRuntime } from "./compute-observer.ts";
+import { bindServerContinuation } from "./tooling-operations.ts";
+import { canonicalDigest } from "./tooling-releases.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
-async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }) {
+/** Executing a recorded suspension continues the existing group with its own
+ * code: the producer's release (bound once per environment/intent, so a retry
+ * or unknown outcome reuses it), or the group's retained first-bootstrap
+ * snapshot without a binding. Pre-protocol repositories keep the configured
+ * revision. Nothing here installs tooling or selects a newer release. */
+async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }, bind = bindServerContinuation) {
   const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
-  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference });
-  const env = Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
+  const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
+  if (task.primarySessionId !== input.primarySessionId) throw new Error("Compute continuation primary changed");
+  // A command fence derived from the group's retained reader; the adapter's
+  // child callbacks (development intent, resources) inherit its release.
+  const command = computeContinueInput(input.taskId, reference, input.environmentId);
+  const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`, inputDigest: command.inputDigest } });
+  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
-    cwd: runtime.receipt.checkout, env, timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
+    // Bound process context the release-aware adapter reads for its callbacks.
+    cwd: runtime.receipt.checkout, env: operationEnvironment(binding, input.config.controlIpcPath),
+    timeoutMs: 60_000, input: command.stdin,
   });
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
@@ -25,6 +40,15 @@ const defaults = { refresh: refreshComputeObservation, evidence: computeEvidence
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
  * idle. Every adapter effect renews the existing scoped development intent. */
+/** The exact spawned `compute continue` input and the digest the adapter's
+ * cliInputDigest computes for it, including the CLI's effective parser
+ * defaults; a retained continuation fence must carry this exact digest. */
+export function computeContinueInput(taskId: string, reference: { intentRevision: number; intentDigest: string }, environmentId: string) {
+  const stdin = JSON.stringify({ ...reference, environmentId });
+  return { stdin, inputDigest: canonicalDigest({ operation: "compute continue", taskId, positionals: ["compute", "continue"], options: { purpose: "development", task: taskId }, files: {},
+    stdin: createHash("sha256").update(stdin).digest("hex") }) };
+}
+export { continueSuspension as continueComputeSuspension };
 export async function tickCompute(input: Context, dependencies: Partial<typeof defaults> = {}) {
   if (!input.config.compute?.enabled) return { observed: 0, unavailable: 0 };
   const deps = { ...defaults, ...dependencies };
@@ -75,7 +99,7 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       }
     }
   }));
-  await offerNextCompute({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute, config: input.config, runtime: input.runtime });
+  await scheduleComputeOffers({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute, config: input.config, runtime: input.runtime });
   return { observed, unavailable };
 }
 

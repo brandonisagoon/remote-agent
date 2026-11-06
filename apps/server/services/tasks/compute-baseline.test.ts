@@ -3,11 +3,13 @@ import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase } from "../../../../test-support/db.ts";
+import { Prisma } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { claimCompute, confirmComputeDelivery, offerNextCompute, readComputeCapacity, reconcileComputeOffers, requestCompute } from "./compute-admission.ts";
 import { refreshComputeBaselines } from "./compute-baseline.ts";
+import { CleanupObserverError } from "./cleanup-observer-diagnostics.ts";
 
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
@@ -189,18 +191,24 @@ console.log(JSON.stringify({version:1,kind:'compute-baseline',machineId:input.ma
   if (mode === "restart-before-delivery") await writeFile(state, JSON.stringify("running"));
   if (mode === "broken-capability") await writeFile(path.join(checkout, "observer.ts"), "throw new Error('changed');");
   const delivered = await confirmComputeDelivery({ ...admission, sessionId: "waiting", requestId: offer!.instructionId });
-  if (mode === "restart-before-delivery" || mode === "broken-capability") {
-    expect(delivered).toBeNull(); expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
-  } else {
-    expect(delivered?.state).toBe("offered");
-    if (mode === "restart-before-claim") {
-      await writeFile(state, JSON.stringify("running"));
-      await expect(claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).rejects.toThrow("reservation is unavailable");
-    } else expect((await claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).offer.state).toBe("claimed");
-    expect((await readFile(calls, "utf8")).trim().split("\n")).toHaveLength(3);
+  // DRA-34: selection reserved after a fresh refresh; delivery only records
+  // progress and never re-scans. The claim makes the next fresh decision.
+  expect(delivered?.state).toBe("offered");
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: offer!.id } })).toBe(1);
+  if (mode === "restart-before-claim") await writeFile(state, JSON.stringify("running"));
+  if (mode === "normal") expect((await claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).offer.state).toBe("claimed");
+  else {
+    await expect(claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).rejects.toThrow("reservation is unavailable");
+    // A refused claim never frees the running turn's reservation.
+    expect(await f.prisma.computeSlot.count({ where: { allocationId: offer!.id } })).toBe(1);
   }
+  // Selection's fresh read always happened; the claim reads again only when the
+  // family is settled and the capability verifies.
+  const reads = (await readFile(calls, "utf8")).trim().split("\n").length;
+  if (mode === "normal") expect(reads).toBe(2); else { expect(reads).toBeGreaterThanOrEqual(1); expect(reads).toBeLessThanOrEqual(2); }
   expect(await f.prisma.computeEnvironment.count({ where: { taskId: "old" } })).toBe(0);
-  expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
+  // Refresh writes only its own diagnostic outcome records, never other facts.
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: { not: "compute-baseline-refresh" } } })).toBe(0);
 });
 
 test.each(["stale", "missing-runtime", "executing", "queued"])("diagnostic cannot turn %s activity/proof into free credit", async kind => {
@@ -244,4 +252,130 @@ test("changing original credit with two eligible waiters never exceeds one manag
   expect(await offerNextCompute({ ...admission, now: new Date(f.now.getTime() + 600001) })).toBeNull();
   expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
   expect(await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" } })).toEqual(originals);
+});
+
+test("DRA-36: a long refresh of one group never clears another group's fresh proof, and names the exact pending group", async () => {
+  const f = await fixture();
+  await f.prisma.runtimeSession.create({ data: { id: "old-2", scopeKey: "old-2", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/old-2", status: "closed", closedAt: f.now } });
+  await f.prisma.remoteTask.create({ data: { id: "old-2", requestKey: "old-2", repositoryId: "repo", machineId: "host", branchName: "codex/old-2", worktreePath: "/old-2", toolingRoot: "/old/tooling", toolingRevision: "a".repeat(40), primarySessionId: "old-2", phase: "closed" } });
+  await f.prisma.remoteTaskResource.create({ data: { id: "old-2-app", taskId: "old-2", key: "app", kind: "docker-container", purpose: "development", externalId: "old-2-container", state: "ready" } });
+  const policy = ComputePolicy.parse({ enabled: true, slots: 2 }), input = { ...f.admission, policy, taskId: "waiting" };
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 2, unavailable: 0 });
+  expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
+  let entered!: () => void, release!: () => void;
+  const held = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const pass = refreshComputeBaselines(f.context, async (input, task, raw) => { if (task.id === "old-2") { entered(); await gate; } return f.read(input, task, raw); });
+  await held;
+  // Only the group whose own refresh is in progress loses credit.
+  const during = await readComputeCapacity(input);
+  expect(during).toMatchObject({ unaccounted: 1 });
+  // In flight after an earlier credit: no proof now, last recorded outcome credited.
+  expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"],
+    detail: `baseline missing-proof (last refresh proof-recorded since ${f.now.toISOString()})`, action: expect.stringContaining("baseline refresh"),
+    baseline: { reason: "missing-proof", refresh: { outcome: "proof-recorded", since: f.now.getTime() } } }]);
+  release();
+  expect(await pass).toEqual({ observed: 2, unavailable: 0 });
+  expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
+});
+
+// DRA-37 real-server finding: an observer failure left only "missing-proof".
+test("each group's refresh outcome is diagnosed by phase and fixed code, never as proof, credit or raw output", async () => {
+  const f = await fixture();
+  const blocker = async () => (await readComputeCapacity({ ...f.admission, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  const events = () => f.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" }, orderBy: { sequence: "asc" } });
+  // Never observed: no baseline group exists yet.
+  expect(await blocker()).toMatchObject({ reason: "unrecorded-resource" });
+  // An observer failure: its fixed code and phase, still charged.
+  expect(await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); })).toEqual({ observed: 0, unavailable: 1 });
+  let value = await blocker();
+  expect(value).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "refresh-failed", refresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT", since: f.now.getTime() } } });
+  expect(value!.detail).toContain("last refresh failed at observe OBSERVER_EXIT");
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  expect(await offerNextCompute(f.admission)).toBeNull();
+  // A repeated identical failure records nothing new (bounded history).
+  const count = (await events()).length;
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); });
+  expect((await events()).length).toBe(count);
+  // A non-observer failure carrying sensitive text: a fixed phase code only.
+  await refreshComputeBaselines(f.context, async () => { throw new Error("stderr: token=sk-live-SECRET-VALUE at /private/path"); });
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "observe", code: "OBSERVER_UNVERIFIED" });
+  // Invalid observer output fails validation, not credit.
+  await refreshComputeBaselines(f.context, async () => ({ version: 1, kind: "compute-baseline", secret: "sk-live-SECRET-VALUE" }));
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "validate", code: "OBSERVATION_INVALID" });
+  for (const event of await events()) {
+    expect(event.value).not.toContain("SECRET");
+    expect(event.value).not.toContain("/private/path");
+    expect(Object.keys(JSON.parse(event.value!)).sort()).toEqual(expect.arrayContaining(["groupId", "outcome", "since", "version"]));
+  }
+  // Recovery only through a valid stopped proof.
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  expect(await blocker()).toBeUndefined();
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, headroom: 1 });
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
+  // A later failure invalidates that credit again: the charge returns with its cause.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "observe", code: "OBSERVER_TIMEOUT" });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+});
+
+test("a recorded refresh outcome never stands in for credit, and a superseded refresh cannot append over a newer one", async () => {
+  const f = await fixture();
+  const blocker = async (now = f.now) => (await readComputeCapacity({ ...f.admission, now, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  const events = () => f.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" }, orderBy: { sequence: "asc" } });
+  // A valid observation that says running is never recorded as proof.
+  await refreshComputeBaselines(f.context, async (...args) => { const result = await f.read(...args) as any; result.resources[0].state = "running"; return result; });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { outcome: "failed", phase: "credit", code: "PROOF_REJECTED" } });
+  // "proof-recorded" is not credit: once that proof is stale, credit is refused for its own reason.
+  await refreshComputeBaselines(f.context, f.read);
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
+  expect(await blocker()).toBeUndefined();
+  const later = new Date(f.now.getTime() + 60 * 60_000);
+  expect(await blocker(later)).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "proof-stale" } });
+  expect(await readComputeCapacity({ ...f.admission, now: later, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  // An older, slower refresh that fails after a newer one completed cannot append.
+  let entered!: () => void, release!: () => void;
+  const reading = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const older = refreshComputeBaselines(f.context, async () => { entered(); await gate; throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  await reading;
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  const count = (await events()).length;
+  release();
+  expect(await older).toEqual({ observed: 0, unavailable: 1 });
+  expect((await events()).length).toBe(count);
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "proof-recorded" });
+  expect(await blocker()).toBeUndefined();
+  // A record outside the finite writer vocabulary is never reported.
+  await f.prisma.computeBaseline.updateMany({ data: { proof: Prisma.DbNull } });
+  const group = (await f.prisma.computeBaseline.findFirstOrThrow()).id;
+  await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "old", source: "compute-baseline:host", action: "compute-baseline-refresh", key: group,
+    value: JSON.stringify({ version: 1, groupId: group, refreshToken: crypto.randomUUID(), outcome: "failed", phase: "observe", code: "RAW_PROVIDER_SECRET_TEXT", since: f.now.getTime() }) } });
+  expect((await blocker())?.baseline).toEqual({ reason: "missing-proof", refreshUnreadable: true });
+  expect((await blocker())?.detail).toBe("baseline missing-proof (last refresh record unreadable)");
+});
+
+test("a refresh diagnostic is the current cause only for the group's current membership; a saved proof is still not credit while the family runs", async () => {
+  const f = await fixture();
+  const blocker = async () => (await readComputeCapacity({ ...f.admission, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  // Saved proof, then the family becomes active: credit is refused as family-active.
+  await refreshComputeBaselines(f.context, f.read);
+  expect(await blocker()).toBeUndefined();
+  const idle = f.runtime.observeSessionActivity;
+  f.runtime.observeSessionActivity = () => ({ state: "executing", observedAt: f.now.getTime() });
+  expect(await blocker()).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "family-active" } });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  f.runtime.observeSessionActivity = idle;
+  // A failure for the CURRENT membership is the current cause.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT" } });
+  // The same group ID gains a member: that failure is now an earlier membership's attempt.
+  await f.prisma.remoteTaskResource.create({ data: { id: "cache", taskId: "old", key: "cache", kind: "docker-container", purpose: "development", externalId: "cache".repeat(13), state: "ready", metadata: { original: true } } });
+  const changed = await blocker();
+  expect(changed?.baseline).toMatchObject({ reason: "missing-proof", previousRefresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT" } });
+  expect(changed?.baseline?.refresh).toBeUndefined();
+  expect(changed?.detail).toContain("no refresh yet for the current membership; an earlier membership's last refresh failed at observe OBSERVER_EXIT");
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ headroom: 0 });
+  // A refresh of the new membership makes its own outcome current again.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { code: "OBSERVER_TIMEOUT" } });
+  expect((await blocker())?.baseline?.previousRefresh).toBeUndefined();
 });

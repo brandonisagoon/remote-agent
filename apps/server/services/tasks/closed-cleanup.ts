@@ -14,6 +14,16 @@ export async function assertClosedCleanupFamily(prisma: Store, task: RemoteTask,
     || operation.occurredAt.getTime() > closedAt! || primary.id !== task.primarySessionId || !["closed", "idle"].includes(primary.status)) {
     throw new Error("Closed cleanup requires the original operation recorded before settled primary closure");
   }
+  await assertSettledClosedFamily(prisma, task, primary, runtime);
+}
+
+/** The settled-closure half of the check, shared with closed legacy resource
+ * release (which has no cleanup operation): the original primary closed, its
+ * family stopped executing and no task-family instruction is unresolved. */
+export async function assertSettledClosedFamily(prisma: Store, task: RemoteTask, primary: RuntimeSession, runtime?: Pick<AgentSessionRuntime, "observeSessionActivity">) {
+  if (task.phase !== "closed" || !Number.isFinite(primary.closedAt?.getTime()) || primary.id !== task.primarySessionId || !["closed", "idle"].includes(primary.status)) {
+    throw new Error("Closed cleanup requires the original primary's settled closure");
+  }
   const family = await cleanupFamily(prisma, task, primary.id);
   if (family.some(session => !["idle", "closed"].includes(session.status)
     || runtime?.observeSessionActivity && runtime.observeSessionActivity(session.id).state !== "unknown")) {

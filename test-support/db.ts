@@ -20,6 +20,8 @@ const MIGRATIONS_DIR = path.join(import.meta.dir, "..", "prisma", "migrations");
  */
 export interface TestDatabase {
   prisma: PrismaClient;
+  /** Disposable database identity for a real child server in integration tests. */
+  databaseUrl: string;
   cleanup: () => Promise<void>;
 }
 
@@ -59,6 +61,7 @@ export async function createTestDatabase(): Promise<TestDatabase> {
 
   return {
     prisma,
+    databaseUrl: `file:${file}`,
     cleanup: async () => {
       await prisma.$disconnect();
       rmSync(dir, { recursive: true, force: true });

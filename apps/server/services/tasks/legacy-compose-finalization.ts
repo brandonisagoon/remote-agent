@@ -102,7 +102,7 @@ export async function ensureLegacyComposeRetention(input: FinalizationContext, a
     const present = await lstat(file).catch((error: NodeJS.ErrnoException) => { if (error.code === "ENOENT") return null; throw error; });
     if (!present) return;
   }
-  const capability = prior?.proof.capability ?? await dependencies.resolve({ task: active.task, config: input.config });
+  const capability = prior?.proof.capability ?? await dependencies.resolve({ task: active.task, config: input.config, prisma: input.prisma });
   const resources: z.infer<typeof Entry>[] = [];
   for (const resource of selected) {
     const previous = prior?.proof.resources.find(entry => entry.id === resource.id);

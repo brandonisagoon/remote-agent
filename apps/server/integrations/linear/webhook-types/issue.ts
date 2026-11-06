@@ -9,6 +9,8 @@ export const LinearIssueWebhookSchema = z.object({
   data: z.object({
     id: z.string(),
     identifier: z.string(),
+    /** Original change time; launch intent orders the trigger by it, never by delivery time. */
+    updatedAt: z.string().nullish(),
     assigneeId: z.string().nullish(),
     state: z.object({ id: z.string().optional(), name: z.string(), type: z.string() }).nullish(),
     team: z.object({ key: z.string() }).nullish(),

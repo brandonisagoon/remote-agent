@@ -8,7 +8,7 @@ import { controlDevelopmentCompute } from "../../management/development-control.
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-async function fixture(action: "pause" | "resume", change: "none" | "bytes" | "intent" = "none") {
+async function fixture(action: "pause" | "resume", change: "none" | "bytes" | "intent" | "revision" = "none") {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), "development-desktop-"))); roots.push(root);
   const config = testConfig({ installRoot: path.join(root, "install"), controlIpcPath: path.join(root, "control.sock") });
   const temporary = path.join(root, "capability"), marker = path.join(root, "executed.json"), saved = path.join(root, "intent.json"); mkdirSync(temporary);
@@ -29,7 +29,7 @@ async function fixture(action: "pause" | "resume", change: "none" | "bytes" | "i
     }
     if (url.pathname.endsWith("/tooling-capability")) {
       if (change === "bytes") writeFileSync(adapter, "throw new Error('Mutable adapter must never execute')");
-      return Response.json({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "runtime", source: "configured-host", taskToolingRevision: "a".repeat(40), capabilityRevision: revision, checkout, adapter, instructions: adapter } });
+      return Response.json({ receipt: { contract: "remote-agent.tooling-capability/v1", capability: "runtime", source: "configured-host", taskToolingRevision: "a".repeat(40), capabilityRevision: change === "revision" ? "d".repeat(40) : revision, checkout, adapter, instructions: adapter } });
     }
     if (change === "intent" && !reads++) intent = { ...intent, revision: 18, digest: "c".repeat(64) };
     return Response.json({ task: task() });
@@ -61,4 +61,22 @@ test("the local Electron context selects the installed Bun executable for the ac
     await controlDevelopmentCompute(f.config, "task", "pause");
     expect(JSON.parse(readFileSync(f.marker, "utf8"))[0]).toBe("upkeep");
   } finally { Object.defineProperty(process, "execPath", descriptor); f.server.stop(true); }
+});
+
+test("desktop accepts the host's newly active release after activation without a desktop restart", async () => {
+  const f = await fixture("pause");
+  try {
+    // The desktop's boot-time configured revision is stale after live activation.
+    f.config.repositories[f.config.repository.id]!.tooling = { ...f.config.repositories[f.config.repository.id]!.tooling!, revision: "0".repeat(40) };
+    await controlDevelopmentCompute(f.config, "task", "pause");
+    expect(JSON.parse(readFileSync(f.marker, "utf8"))).toEqual(["upkeep", "pause", "--socket", f.config.controlIpcPath, "--task", "task", "--request-key", f.key()]);
+  } finally { f.server.stop(true); }
+});
+
+test("desktop refuses a host receipt whose checkout is not the immutable checkout of its revision", async () => {
+  const f = await fixture("pause", "revision");
+  try {
+    await expect(controlDevelopmentCompute(f.config, "task", "pause")).rejects.toThrow();
+    expect(existsSync(f.marker)).toBeFalse();
+  } finally { f.server.stop(true); }
 });

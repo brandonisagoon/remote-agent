@@ -1,10 +1,12 @@
 import { startComputeCollection } from "./services/tasks/compute-worker.ts";
 import { createApp } from "./app.ts";
-import { readConfig } from "../../lib/config.ts";
+import { configFilePath, readConfig, readConfigDatabaseUrl, readServiceFile } from "../../lib/config.ts";
+import { assertBootToolingPolicy, bootToolingSelections } from "./services/tasks/tooling-releases.ts";
 import { applyPragmas, createPrismaClient } from "./prisma.ts";
 import { createAcpxSessionRuntime } from "./transports/acpx/index.ts";
 import { startAcpIpcServer } from "./acp/ipc-server.ts";
 import { acquireRuntimeOwnership } from "./services/sessions/runtime-owner.ts";
+import { recoverInterruptedCallbacks } from "./services/tasks/tooling-callback-recovery.ts";
 import { createPlanCaptureInterceptor } from "./services/sessions/plan-capture.ts";
 import { startRuntimeEventProjection } from "./services/sessions/runtime-events/projection.ts";
 import { remoteAgentMcpServer } from "./mcp/register.ts";
@@ -12,10 +14,19 @@ import { startControlSocket } from "./control-socket.ts";
 import { startInstructionDelivery } from "./services/sessions/inbox.ts";
 import { startPlacementDelivery, routingRequest } from "./services/tasks/routing.ts";
 
-const config = readConfig();
-const runtimeOwnership = acquireRuntimeOwnership(config);
-const prisma = createPrismaClient(config.databaseUrl);
+// Durable tooling selections are read before policy resolution, so restart
+// uses each repository's exact selected commit instead of its moving ref.
+const configFile = configFilePath();
+const prisma = createPrismaClient(readConfigDatabaseUrl(configFile));
 await applyPragmas(prisma);
+const toolingRevisions = await bootToolingSelections({ prisma, configuredRepositoryIds: Object.keys(readServiceFile(configFile).repositories) });
+const config = readConfig(configFile, { toolingRevisions });
+await assertBootToolingPolicy({ prisma, config });
+const runtimeOwnership = acquireRuntimeOwnership(config);
+// Before any runtime, worker or listener: repair only callbacks whose server
+// process provably exited; everything else stays blocked with a diagnosis.
+const callbackRecovery = await recoverInterruptedCallbacks({ prisma }).catch(error => ({ repaired: [], blocked: [{ operationId: "*", reason: error instanceof Error ? error.message : String(error) }] }));
+if (callbackRecovery.repaired.length || callbackRecovery.blocked.length) console.warn(`Tooling callback recovery: ${JSON.stringify(callbackRecovery)}`);
 const agentRuntime = createAcpxSessionRuntime(prisma, config, {
   onPermissionRequest: createPlanCaptureInterceptor({ prisma, config }),
   // Every session discovers remote-agent's own tools (delegate_session,

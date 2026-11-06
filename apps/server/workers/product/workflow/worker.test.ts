@@ -18,10 +18,21 @@ const ISSUE: SourceIssueWithAgentIssues = {
   title: "Fix the flaky test",
   description: "Reproduce the intermittent failure and preserve the public API.",
   branchName: "feature/fix-cube-42",
-  state: { name: "Planning" },
+  state: { name: "Planning", type: "started" },
+  updatedAt: new Date(Date.now() - 600_000).toISOString(),
   labels: { nodes: [] },
   agentIssues: [],
 } as unknown as SourceIssueWithAgentIssues;
+
+const OWNER = "owner-uuid";
+const recently = () => new Date(Date.now() - 60_000).toISOString();
+
+/** Owner-routed config: only configured owners can start execution. */
+function ownerConfig() {
+  const config = testConfig();
+  config.webhooks[config.activeWebhookId]!.repositoryRouting[config.repository.id] = { when: [{ "linear.userId": [OWNER] }] };
+  return config;
+}
 
 function issueEvent(workflowId: string): WorkflowEvent {
   return {
@@ -31,7 +42,8 @@ function issueEvent(workflowId: string): WorkflowEvent {
       type: "Issue",
       action: "update",
       webhookTimestamp: Date.now(),
-      data: { id: "issue-uuid", identifier: "CUBE-42", state: { name: "Planning" } },
+      actor: { id: OWNER },
+      data: { id: "issue-uuid", identifier: "CUBE-42", updatedAt: recently(), state: { name: "Planning", type: "started" } },
     },
   } as WorkflowEvent;
 }
@@ -42,7 +54,7 @@ function reactionEvent(workflowId: string, emoji: string): WorkflowEvent {
     workflowId,
     webhook: {
       type: "Reaction", action: "create", webhookTimestamp: Date.now(),
-      data: { id: "reaction-uuid", emoji, userId: "owner-uuid", issueId: "issue-uuid", issue: { id: "issue-uuid", identifier: "CUBE-42" } },
+      data: { id: "reaction-uuid", emoji, userId: OWNER, createdAt: recently(), issueId: "issue-uuid", issue: { id: "issue-uuid", identifier: "CUBE-42" } },
     },
   } as WorkflowEvent;
 }
@@ -52,7 +64,7 @@ function context(overrides: {
 } = {}): WorkerContext {
   return {
     prisma: {} as PrismaClient,
-    config: testConfig(),
+    config: ownerConfig(),
     agentRuntime: {} as WorkerContext["agentRuntime"],
     runId: "run-1",
     commandClient: {
@@ -75,6 +87,7 @@ function dependencies(record: Recorded, overrides: Partial<WorkflowWorkerDepende
   return {
     assertLaunch: async () => {},
     getIssue: async () => ISSUE,
+    readComments: async () => [],
     react: (async (_key: string, _issue: string, reaction: string) => {
       record.reactions.push(reaction);
       return true;
@@ -131,7 +144,10 @@ describe("workflow worker", () => {
   test.each(["pencil2", "rocket", "eyes"])("reaction-triggered workflows acknowledge with the triggering %s reaction", async (emoji) => {
     const record = recorded();
     const worker = createWorkflowWorker(dependencies(record));
-    await worker.execute(reactionEvent("describe", emoji) as never, context());
+    const ctx = context();
+    const repository = { ...ctx.config.repository, workflows: { ...ctx.config.repository.workflows,
+      describe: { ...ctx.config.repository.workflows.describe!, when: [{ "reaction.emoji": ["pencil2", "rocket", "eyes"] }] } } };
+    await worker.execute(reactionEvent("describe", emoji) as never, { ...ctx, config: { ...ctx.config, repository } });
     expect(record.reactions).toEqual([emoji]);
   });
 
@@ -203,7 +219,7 @@ describe("workflow worker", () => {
   test("the repository's branch template overrides the provider's name", async () => {
     const record = recorded();
     const worker = createWorkflowWorker(dependencies(record));
-    const base = testConfig();
+    const base = ownerConfig();
     const repository = {
       ...base.repository,
       branchNaming: { "*": "{branch}", linear: "agent/{issue}-{title}" },
@@ -217,7 +233,7 @@ describe("workflow worker", () => {
   test("per-connection worktree templates shape the directory", async () => {
     const record = recorded();
     const worker = createWorkflowWorker(dependencies(record));
-    const base = testConfig();
+    const base = ownerConfig();
     const repository = {
       ...base.repository,
       worktreeNaming: { "*": "{branch}", [base.activeConnectionId]: "{issue}" },
@@ -230,7 +246,7 @@ describe("workflow worker", () => {
   test("launches carry workflow provenance and plan mode when capture is on", async () => {
     const record = recorded();
     const worker = createWorkflowWorker(dependencies(record));
-    const base = testConfig();
+    const base = ownerConfig();
     const repository = {
       ...base.repository,
       workflows: {

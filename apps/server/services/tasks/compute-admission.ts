@@ -2,7 +2,7 @@ import { assertComputeStartIntent, assertDevelopmentWork, DevelopmentWorkUnavail
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { Prisma, PrismaClient, ComputeEnvironment } from "../../../../generated/prisma/client.ts";
-import { COMPUTE_CLAIM_MS, ComputePolicy } from "../../../../lib/compute-policy.ts";
+import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { ComputeObservation } from "./compute-observation.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -55,9 +55,20 @@ export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Sto
   }
   return owned;
 }
+/** Exact evidence for a group that consumes the explicit budget. */
+export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[]; detail: string; action: string;
+  /** Uncredited baseline only: why, and the latest recorded refresh outcome (diagnostic, never proof). */
+  baseline?: { reason?: string; observedAt?: number; refresh?: { outcome: string; phase?: string; code?: string; since: number };
+    /** An earlier membership's last refresh: history, never the current cause. */ previousRefresh?: { outcome: string; phase?: string; code?: string; since: number }; refreshUnreadable?: boolean } };
+const BLOCKER_ACTION: Record<ComputeBlocker["reason"], string> = {
+  "unrecorded-resource": "No fresh stopped observation accounts for these resources; the collector must observe them stopped or their owner must release them.",
+  "uncredited-baseline": "The original group has no current stopped proof; the next settled baseline refresh can credit it.",
+  "uncertain-environment": "This environment may still be running; only a fresh physical reclamation releases its charge.",
+};
 /** Unknown existing environments consume the explicit budget conservatively.
- * A stale Ready/Allocated receipt is not proof that physical compute is free. */
-async function unaccounted(store: Store, input: Context) {
+ * A stale Ready/Allocated receipt is not proof that physical compute is free.
+ * Every debited group is returned with the exact rows that caused it. */
+async function unaccounted(store: Store, input: Context): Promise<{ count: number; blockers: ComputeBlocker[] }> {
   const machineId = input.machineId;
   const resources = await store.remoteTaskResource.findMany({ where: { task: { machineId }, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: computeKinds } }, take: 10001 });
   if (resources.length > 10000) throw new Error("Host compute inventory exceeds the observation bound");
@@ -89,10 +100,33 @@ async function unaccounted(store: Store, input: Context) {
   const baselines = await (await import("./compute-baseline.ts")).computeBaselineCredits(store, input);
   for (const baseline of baselines) if (baseline.credited) for (const id of baseline.resourceIds) recorded.add(id);
   const originalClaims = baselines.filter(baseline => !baseline.credited && baseline.resourceIds.some(id => !recorded.has(id)));
-  return new Set([...resources.filter(resource => !recorded.has(resource.id)).map(resource => `${resource.taskId}:${resource.purpose}`),
-    ...originalClaims.map(group => `${group.taskId}:${group.purpose}`),
-    ...uncertain.map(environment => `${environment.taskId}:${environment.purpose}`)]).size;
+  const groups = new Map<string, ComputeBlocker>();
+  const add = (group: string, reason: ComputeBlocker["reason"], id: string, detail: string, baseline?: ComputeBlocker["baseline"]) => {
+    const value = groups.get(group) ?? groups.set(group, { group, reason, ids: [], detail, action: BLOCKER_ACTION[reason], ...(baseline ? { baseline } : {}) }).get(group)!;
+    if (!value.ids.includes(id)) value.ids.push(id);
+  };
+  // Baseline groups first: their exact credit reason explains their members.
+  for (const group of originalClaims) for (const id of group.resourceIds.filter(id => !recorded.has(id)))
+    add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id, `baseline ${group.reason ?? "uncredited"}${group.observedAt === undefined ? "" : ` (last proof observed ${new Date(group.observedAt).toISOString()})`}${
+      group.refresh ? ` (last refresh ${group.refresh.outcome}${group.refresh.phase ? ` at ${group.refresh.phase}` : ""}${group.refresh.code ? ` ${group.refresh.code}` : ""} since ${new Date(group.refresh.since).toISOString()})`
+        : group.previousRefresh ? ` (no refresh yet for the current membership; an earlier membership's last refresh ${group.previousRefresh.outcome}${group.previousRefresh.phase ? ` at ${group.previousRefresh.phase}` : ""}${group.previousRefresh.code ? ` ${group.previousRefresh.code}` : ""} since ${new Date(group.previousRefresh.since).toISOString()})`
+        : group.refreshUnreadable ? " (last refresh record unreadable)" : group.reason === "missing-proof" ? " (never observed)" : ""}`,
+      { ...(group.reason ? { reason: group.reason } : {}), ...(group.observedAt === undefined ? {} : { observedAt: group.observedAt }), ...(group.refresh ? { refresh: group.refresh } : {}),
+        ...(group.previousRefresh ? { previousRefresh: group.previousRefresh } : {}), ...(group.refreshUnreadable ? { refreshUnreadable: true } : {}) });
+  for (const resource of resources) if (!recorded.has(resource.id)) add(`${resource.taskId}:${resource.purpose}`, "unrecorded-resource", resource.id, `resource ${resource.key} (${resource.kind}, ${resource.state})`);
+  for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id, `environment ${environment.id} is ${environment.state} without an allocation`);
+  return { count: groups.size, blockers: [...groups.values()] };
 }
+/** Accounting, not offer expiry, refused this reservation. Carries the exact
+ * debited groups and held allocations; the reservation itself is retained. */
+export class ComputeCapacityBlocked extends Error {
+  readonly blockers: ComputeCapacity["blockers"];
+  constructor(readonly capacity: Pick<ComputeCapacity, "slots" | "unaccounted" | "occupied" | "usable" | "blockers">) {
+    super(`Compute reservation is unavailable: capacity accounting blocks this claim (${capacity.occupied} held of ${capacity.usable} usable, ${capacity.slots} slots, ${capacity.unaccounted} unaccounted group(s)${capacity.blockers.unaccounted.length ? `: ${capacity.blockers.unaccounted.map(blocker => `${blocker.group} ${blocker.detail}`).join("; ")}` : ""})`);
+    this.blockers = capacity.blockers;
+  }
+}
+type ComputeCapacity = Awaited<ReturnType<typeof computeAdmissionCapacity>>;
 const baselineRefreshes = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
 async function refreshBaseline(input: Context) {
   if (!input.config || !input.runtime) return; // Internal callers without a live observer cannot create baseline credit.
@@ -106,14 +140,20 @@ async function refreshBaseline(input: Context) {
   try { return await work; } finally { if (pending.get(input.machineId) === work) pending.delete(input.machineId); }
 }
 /** The same conservative budget used by selection, claim and diagnostics.
- * Reads only: stale/missing proof retains its existing reservation. */
+ * Reads only: stale/missing proof retains its existing reservation. Blocked
+ * capacity is explained by exact debited groups and held allocations, never
+ * inferred from an empty slot count. */
 export async function computeAdmissionCapacity(store: Store, input: Context) {
-  const settings = policy(input), unaccountedGroups = await unaccounted(store, input);
+  const settings = policy(input), accounting = await unaccounted(store, input), unaccountedGroups = accounting.count;
   // Count every occupied ordinal, including slots above a reduced budget.
-  const occupied = await store.computeSlot.count({ where: { machineId: input.machineId, allocationId: { not: null } } });
+  const held = await store.computeSlot.findMany({ where: { machineId: input.machineId, allocationId: { not: null } }, orderBy: { ordinal: "asc" }, take: 10001 });
+  const offers = held.length ? await store.computeOffer.findMany({ where: { id: { in: held.map(slot => slot.allocationId!) } }, take: 10001 }) : [];
+  const occupied = held.length;
   const budgetUsable = Math.max(0, settings.slots - unaccountedGroups);
   const usable = Math.min(budgetUsable, settings.maxManagedAllocations ?? budgetUsable);
-  return { slots: settings.slots, unaccounted: unaccountedGroups, occupied, usable, headroom: usable - occupied,
+  const blockers = { unaccounted: accounting.blockers, allocations: held.map(slot => ({ slot: slot.id, ordinal: slot.ordinal, allocationId: slot.allocationId!,
+    state: offers.find(offer => offer.id === slot.allocationId)?.state ?? "unrecorded", environmentId: offers.find(offer => offer.id === slot.allocationId)?.environmentId ?? null })) };
+  return { slots: settings.slots, unaccounted: unaccountedGroups, occupied, usable, headroom: usable - occupied, blockers,
     ...(settings.maxManagedAllocations === undefined ? {} : { maxManagedAllocations: settings.maxManagedAllocations, budgetUsable }) };
 }
 
@@ -161,7 +201,9 @@ export async function savedRevisionAllocations(store: Pick<Store, "computeOffer"
   if (offers.length > 1000) throw new Error("Saved compute revision history exceeds its bound");
   if (offers.some(value => ["validating", "claimed", "running", "unknown"].includes(value.state))) throw new Error("Saved compute revision still has an active or uncertain allocation");
   const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(value => value.id) } }, orderBy: { id: "asc" }, take: 1001 });
-  if (slots.length > 1000 || slots.some(slot => !offers.some(offer => offer.id === slot.allocationId && offer.state === "offered" && offer.claimedAt === null))) throw new Error("Saved compute revision has an unexplained slot");
+  // Selection reserves before dispatch: queued and delivered unclaimed offers
+  // each explain exactly their own reserved slot.
+  if (slots.length > 1000 || slots.some(slot => !offers.some(offer => offer.id === slot.allocationId && ["queued", "offered"].includes(offer.state) && offer.claimedAt === null))) throw new Error("Saved compute revision has an unexplained slot");
   return { offers, slots };
 }
 
@@ -261,100 +303,197 @@ export async function requestCompute(input: Context & { taskId: string; request:
   });
 }
 
+const terminalInstruction = ["completed", "failed", "cancelled"];
+async function startedEvent(store: Pick<Store, "runtimeLifecycleEvent">, sessionId: string, requestId: string | null) {
+  return requestId ? store.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: sessionId, requestId, phase: "started" }, orderBy: { sequence: "asc" } }) : null;
+}
+/** Progress only: the slot was reserved at selection. Idempotent. */
+async function recordDelivery(store: Store, offerId: string, requestId: string, occurredAt: Date) {
+  const updated = await store.computeOffer.updateMany({ where: { id: offerId, state: "queued" }, data: { state: "offered", executionRequestId: requestId, deliveredAt: occurredAt, expiresAt: null } });
+  return { recorded: updated.count === 1, offer: await store.computeOffer.findUniqueOrThrow({ where: { id: offerId } }) };
+}
+/** A legacy queued offer (created before selection-time reservation) may
+ * reserve conservatively when delivered; never by refreshing accounting. */
+async function reserveLegacyDelivery(store: Store, input: Context, offerId: string) {
+  if (await store.computeSlot.findUnique({ where: { allocationId: offerId } })) return true;
+  const slot = await freeSlot(store, input);
+  if (!slot) return false;
+  return (await store.computeSlot.updateMany({ where: { id: slot.id, allocationId: null }, data: { allocationId: offerId } })).count === 1;
+}
+async function sessionQuiescent(store: Pick<Store, "runtimeSession">, sessionId: string, runtime?: Context["runtime"]) {
+  const session = await store.runtimeSession.findUnique({ where: { id: sessionId } });
+  return Boolean(session && (session.closedAt || ["idle", "closed"].includes(session.status)) && !["executing", "queued"].includes(runtime?.observeSessionActivity?.(sessionId)?.state ?? ""));
+}
+
+/** Release only with proof. Owner ineligibility withdraws unclaimed offers
+ * (claims recheck ownership atomically). Otherwise: a never-dispatched
+ * assignment is withdrawn only by cancelling its still-queued instruction
+ * (compare-and-set); a delivered assignment is released only after its turn
+ * ended without claiming and the primary is quiescent; dispatching/unknown
+ * turns keep their reservation regardless of any timer. Validation never
+ * authorizes a start, so an expired validation not running in this process
+ * is reclaimed. */
 export async function reconcileComputeOffers(input: Context) {
   policy(input); const now = at(input);
-  // A server may exit after persisting prompt-start but before reserving the
-  // offer. Recover that exact event before considering dispatch expiry.
-  const pending = await input.prisma.computeOffer.findMany({ where: { machineId: input.machineId, state: "queued" }, take: 1001 });
-  if (pending.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
-  for (const offer of pending) {
-    const instruction = await input.prisma.runtimeInstruction.findUnique({ where: { id: offer.instructionId } });
-    if (instruction?.executionRequestId) {
-      // Recheck this queued offer's ownership locally. A pause/revocation after
-      // durable prompt-start must not strand all subsequent waiting tasks.
-      const eligible = await input.prisma.$transaction(async store => {
-        const current = await store.computeOffer.findUniqueOrThrow({ where: { id: offer.id } });
-        if (current.state !== "queued") return false;
-        const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: current.environmentId } });
-        try { await assertComputeEnvironmentOwner(store, environment); return true; }
-        catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; await withdraw(store, current.id, "ineligible", now); return false; }
-      });
-      if (eligible) await confirmComputeDelivery({ ...input, sessionId: instruction.sessionId, requestId: instruction.executionRequestId });
-    }
-  }
-  return input.prisma.$transaction(async store => {
-    const offers = await store.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "validating", "claimed"] } }, take: 1001 });
-    if (offers.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
-    for (const offer of offers) {
+  const offers = await input.prisma.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "validating", "claimed"] } }, take: 1001 });
+  if (offers.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
+  await settleUndispatchableRetries(input);
+  for (const listed of offers) {
+    await input.prisma.$transaction(async store => {
+      const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: listed.id } });
       if (offer.state === "claimed") {
         // A timeout does not prove a partial startup absent and never frees it.
         if (offer.claimedAt && now.getTime() - offer.claimedAt.getTime() >= input.policy.startupTimeoutSeconds * 1000) {
           await store.computeOffer.update({ where: { id: offer.id }, data: { state: "unknown" } });
           await store.computeEnvironment.update({ where: { id: offer.environmentId }, data: { state: "unknown" } });
         }
-        continue;
+        return;
       }
+      if (!["queued", "offered", "validating"].includes(offer.state)) return;
       const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
       try { await assertComputeEnvironmentOwner(store, environment); }
-      catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; await withdraw(store, offer.id, "ineligible", now); continue; }
-      const deadline = offer.state === "queued" ? offer.dispatchDeadline : offer.state === "validating" ? offer.validationExpiresAt : offer.expiresAt;
-      if (deadline && deadline <= now) await withdraw(store, offer.id, "expired", now);
-    }
-  });
+      catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; await withdraw(store, offer.id, "ineligible", now); return; }
+      if (offer.state === "validating") {
+        if (offer.validationExpiresAt && offer.validationExpiresAt <= now && !claimValidations.get(input.prisma)?.has(offer.id)) await withdraw(store, offer.id, "expired", now);
+        return;
+      }
+      const instruction = await store.runtimeInstruction.findUnique({ where: { id: offer.instructionId } });
+      if (!instruction) { await withdraw(store, offer.id, "ineligible", now); return; }
+      const started = await startedEvent(store, instruction.sessionId, instruction.executionRequestId);
+      if (offer.state === "queued") {
+        if (started) {
+          // Lost delivery acknowledgment: recover the exact persisted start.
+          if (await reserveLegacyDelivery(store, input, offer.id)) await recordDelivery(store, offer.id, instruction.executionRequestId!, started.occurredAt);
+          else if (terminalInstruction.includes(instruction.state) && await sessionQuiescent(store, instruction.sessionId, input.runtime)) await withdraw(store, offer.id, "expired", now);
+          return;
+        }
+        if (instruction.state === "queued") {
+          if (offer.dispatchDeadline > now) return;
+          // Never-started proof: the still-queued message is cancelled first.
+          const cancelled = await store.runtimeInstruction.updateMany({ where: { id: instruction.id, state: "queued" }, data: { state: "cancelled", detail: "Compute assignment was not dispatched in time; its reservation was released" } });
+          if (cancelled.count === 1) await withdraw(store, offer.id, "expired", now);
+          return;
+        }
+        if (terminalInstruction.includes(instruction.state)) await withdraw(store, offer.id, "expired", now);
+        return; // dispatching/unknown without a start record: uncertain, keep.
+      }
+      // Delivered and unclaimed: held while the delivering turn runs.
+      if (terminalInstruction.includes(instruction.state) && await sessionQuiescent(store, instruction.sessionId, input.runtime)) await withdraw(store, offer.id, "expired", now);
+    });
+  }
 }
 
-/** Selection creates only a durable message. It reserves no capacity until
- * an exact persisted prompt-start event confirms delivery to the executing turn. */
+/** An owner retry re-queues a previously dispatched offer turn. If its
+ * assignment was meanwhile claimed (startup intent: only the adapter's own
+ * idempotent claim continues it) or withdrawn, the retry can never dispatch;
+ * cancel it (compare-and-set on the still-queued instruction) with the reason
+ * instead of leaving it queued. Nothing here frees or changes a slot. */
+async function settleUndispatchableRetries(input: Context) {
+  const retried = await input.prisma.runtimeInstruction.findMany({ where: { id: { startsWith: "compute-offer:" }, state: "queued", executionRequestId: { not: null } }, take: 1001 });
+  if (retried.length > 1000) throw new Error("Compute retry reconciliation exceeds its bound");
+  for (const instruction of retried) {
+    const offer = await input.prisma.computeOffer.findUnique({ where: { instructionId: instruction.id } });
+    if (!offer || offer.machineId !== input.machineId || ["queued", "offered", "validating"].includes(offer.state)) continue;
+    const detail = ["claimed", "running", "unknown"].includes(offer.state)
+      ? `Compute assignment ${offer.id} is already ${offer.state}; its start continues only through the adapter's own claim, not a redelivered offer turn`
+      : `Compute assignment ${offer.id} was ${offer.state}; a retried offer turn cannot redeem it`;
+    await input.prisma.runtimeInstruction.updateMany({ where: { id: instruction.id, state: "queued", updatedAt: instruction.updatedAt }, data: { state: "cancelled", detail } });
+  }
+}
+
+type WaiterStore = Pick<Store, "computeWait" | "computeEnvironment" | "computeOffer" | "runtimeInstruction" | "runtimeMetadataEvent" | "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "remoteTaskResource">;
+/** Cheap eligibility filter, run before any physical accounting scan. A
+ * closed task/primary retires its wait with a durable receipt; paused or
+ * otherwise temporarily ineligible waiters are kept for later resumption. */
+export async function eligibleComputeWaiters(store: WaiterStore, input: Context) {
+  const queue = await store.computeWait.findMany({ where: { machineId: input.machineId, eligibleAt: { lte: at(input) } }, orderBy: { sequence: "asc" }, take: 1001 });
+  if (queue.length > 1000) throw new Error("Compute waiting queue exceeds its bound");
+  const eligible: Array<{ wait: typeof queue[number]; environment: ComputeEnvironment; owned: Awaited<ReturnType<typeof assertComputeEnvironmentOwner>> }> = [];
+  for (const wait of queue) {
+    const environment = await store.computeEnvironment.findUnique({ where: { id: wait.environmentId } });
+    const task = environment && await store.remoteTask.findUnique({ where: { id: environment.taskId } });
+    const primary = task?.primarySessionId ? await store.runtimeSession.findUnique({ where: { id: task.primarySessionId } }) : null;
+    if (!environment || !task || task.phase === "closed" || !primary || primary.closedAt || primary.status === "closed") {
+      // Terminal only: remove exactly this wait row and audit what proved it.
+      const removed = await store.computeWait.deleteMany({ where: { environmentId: wait.environmentId, sequence: wait.sequence, machineId: wait.machineId } });
+      if (removed.count === 1 && environment) await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: environment.primarySessionId, source: `compute:${environment.taskId}`, action: "compute-wait-retired", key: `${environment.id}:${wait.sequence}`,
+        value: JSON.stringify({ version: 1, environmentId: environment.id, taskId: environment.taskId, primarySessionId: environment.primarySessionId, machineId: wait.machineId,
+          wait: { sequence: wait.sequence, eligibleAt: wait.eligibleAt.toISOString() },
+          reason: !task ? "task-missing" : task.phase === "closed" ? "task-closed" : "primary-closed",
+          evidence: { taskPhase: task?.phase ?? null, primarySessionId: task?.primarySessionId ?? null, primaryStatus: primary?.status ?? null, primaryClosedAt: primary?.closedAt?.toISOString() ?? null } }) } });
+      continue;
+    }
+    let owned;
+    try { owned = await assertComputeEnvironmentOwner(store as Store, environment); } catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; continue; }
+    if (owned.session.status !== "idle" || await store.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: activeOffers } } })
+      || await store.runtimeInstruction.count({ where: { sessionId: owned.session.id, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } })) continue;
+    eligible.push({ wait, environment, owned });
+  }
+  return eligible;
+}
+
+/** Selection reserves before dispatch: after exact eligibility and a fresh
+ * conservative accounting decision, one transaction creates the offer, its
+ * notification and the slot reservation. The notification therefore names a
+ * durable assignment; delivery only records progress. */
 export async function offerNextCompute(input: Context) {
   const settings = policy(input); await reconcileComputeOffers(input);
-  if (!await input.prisma.computeWait.findFirst({ where: { machineId: input.machineId, eligibleAt: { lte: at(input) } } })) return null;
+  // One pending assignment per host avoids a burst of messages.
+  if (await input.prisma.computeOffer.findFirst({ where: { machineId: input.machineId, state: "queued" } })) return null;
+  if (!(await input.prisma.$transaction(store => eligibleComputeWaiters(store, input))).length) return null;
   await refreshBaseline(input);
   return input.prisma.$transaction(async store => {
-    if (!(await freeSlot(store, input))) return null;
-    // One pending delivery per host avoids a burst of messages for one slot.
     if (await store.computeOffer.findFirst({ where: { machineId: input.machineId, state: "queued" } })) return null;
-    const queue = await store.computeWait.findMany({ where: { machineId: input.machineId, eligibleAt: { lte: at(input) } }, orderBy: { sequence: "asc" }, take: 1001 });
-    if (queue.length > 1000) throw new Error("Compute waiting queue exceeds its bound");
-    for (const entry of queue) {
-      const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: entry.environmentId } });
-      let owned;
-      try { owned = await assertComputeEnvironmentOwner(store, environment); } catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; continue; }
-      if (owned.session.status !== "idle" || await store.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: activeOffers } } })
-        || await store.runtimeInstruction.count({ where: { sessionId: owned.session.id, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } })) continue;
+    const slot = await freeSlot(store, input);
+    if (!slot) return null;
+    for (const { environment, owned } of await eligibleComputeWaiters(store, input)) {
       const id = randomUUID(), instructionId = `compute-offer:${id}`;
       const command = isSavedComputeEnvironment(environment) ? `resource resume --key ${environment.key} --compute-offer ${id}` : `normal runtime start command with --compute-offer ${id}`;
       const offer = await store.computeOffer.create({ data: { id, environmentId: environment.id, machineId: input.machineId, instructionId, dispatchDeadline: new Date(at(input).getTime() + settings.deliveryTimeoutSeconds * 1000) } });
+      const reserved = await store.computeSlot.updateMany({ where: { id: slot.id, allocationId: null }, data: { allocationId: offer.id } });
+      if (reserved.count !== 1) throw new Error("Compute capacity changed before reservation");
+      await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "offered" } });
       await store.runtimeInstruction.create({ data: { id: instructionId, sessionId: owned.session.id, text:
-        `Compute may be available for environment ${environment.id}. This offer is reserved only when this turn starts and expires 60 seconds after confirmed delivery. First resolve_tooling_capability with capability runtime, then use that returned immutable adapter for the ${command}. Preserve the original task tooling pin. A conversational reply does not claim it. If the command reports expired or superseded, continue useful work without compute; the service will offer again fairly. Preserve the task's existing work and data.` } });
-      return offer;
+        `Compute capacity is reserved for environment ${environment.id} (offer ${id}). The reservation is held while this turn runs and is released if this turn ends without claiming it. First resolve_tooling_capability with capability runtime, then use that returned immutable adapter for the ${command}. Preserve the original task tooling pin. A conversational reply does not claim it. If the command reports the offer superseded, continue useful work without compute; the service will offer again fairly. Preserve the task's existing work and data.` } });
+      return store.computeOffer.findUniqueOrThrow({ where: { id: offer.id } });
     }
     return null;
   });
 }
 
+const schedulers = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
+/** Coalesced, bounded scheduler tick: at most one selection per host runs at
+ * a time, off the inbox delivery path. Errors are retained as diagnostics. */
+export function scheduleComputeOffers(input: Context): Promise<unknown> {
+  let running = schedulers.get(input.prisma);
+  if (!running) { running = new Map(); schedulers.set(input.prisma, running); }
+  const active = running.get(input.machineId);
+  if (active) return active;
+  const work = offerNextCompute(input).catch(error => { console.error(`Compute admission requires reconciliation: ${error instanceof Error ? error.message : String(error)}`); return null; })
+    .finally(() => { if (running!.get(input.machineId) === work) running!.delete(input.machineId); });
+  running.set(input.machineId, work);
+  return work;
+}
+
+/** Turn-start progress for an already reserved assignment. No accounting
+ * refresh or capacity decision happens here, so a slow scan cannot expire it. */
 export async function confirmComputeDelivery(input: Context & { sessionId: string; requestId: string }) {
   policy(input);
-  const candidate = await input.prisma.runtimeInstruction.findFirst({ where: { sessionId: input.sessionId, executionRequestId: input.requestId }, select: { id: true } });
-  if (candidate && await input.prisma.computeOffer.findFirst({ where: { instructionId: candidate.id, state: "queued" } })) await refreshBaseline(input);
   return input.prisma.$transaction(async store => {
     const instruction = await store.runtimeInstruction.findFirst({ where: { sessionId: input.sessionId, executionRequestId: input.requestId } });
     if (!instruction) return null;
     const offer = await store.computeOffer.findUnique({ where: { instructionId: instruction.id } });
     if (!offer || offer.state !== "queued") return offer;
-    const started = await store.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: input.sessionId, requestId: input.requestId, phase: "started" }, orderBy: { sequence: "asc" } });
+    const started = await startedEvent(store, input.sessionId, input.requestId);
     if (!started || !["dispatching", "completed", "failed", "cancelled", "unknown"].includes(instruction.state)) return null;
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
     try { await assertComputeEnvironmentOwner(store, environment); }
     catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; await withdraw(store, offer.id, "ineligible", at(input)); return null; }
     if (environment.primarySessionId !== input.sessionId || offer.machineId !== input.machineId) throw new Error("Compute offer delivery ownership changed");
-    const expiresAt = new Date(started.occurredAt.getTime() + COMPUTE_CLAIM_MS);
-    if (expiresAt <= at(input) || started.occurredAt > offer.dispatchDeadline) { await withdraw(store, offer.id, "expired", at(input)); return null; }
-    const slot = await freeSlot(store, input);
-    if (!slot) { await withdraw(store, offer.id, "expired", at(input)); return null; }
-    const claimed = await store.computeSlot.updateMany({ where: { id: slot.id, allocationId: null }, data: { allocationId: offer.id } });
-    if (!claimed.count) throw new Error("Compute capacity changed before delivery");
-    await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "offered" } });
-    return store.computeOffer.update({ where: { id: offer.id }, data: { state: "offered", executionRequestId: input.requestId, deliveredAt: started.occurredAt, expiresAt } });
+    // Started work is never expired by a timer; an unreserved legacy offer
+    // stays queued until its turn ends, then reconciliation releases it.
+    if (!await reserveLegacyDelivery(store, input, offer.id)) return offer;
+    return (await recordDelivery(store, offer.id, input.requestId, started.occurredAt)).offer;
   });
 }
 
@@ -363,24 +502,39 @@ type ClaimInput = Context & { taskId: string; offerId: string; request: z.infer<
 
 export async function claimCompute(input: ClaimInput, refresh = refreshBaseline) {
   policy(input); const request = ComputeRequest.parse(input.request);
-  // Persist timely intent and retain the existing slot before slow physical reads.
-  // VALIDATING is never start authority, and never changes the original offer TTL.
+  let pending = claimValidations.get(input.prisma);
+  if (!pending) { pending = new Map(); claimValidations.set(input.prisma, pending); }
+  // Persist timely intent and retain the existing slot before slow physical
+  // reads. VALIDATING is never start authority; redeeming the same
+  // reservation after a lost acknowledgment or restart is idempotent.
   const reservation = await input.prisma.$transaction(async store => {
-    const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
+    let offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);
     const { saved, ...recipe } = request;
     if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim does not match its exact environment");
     assertSavedComputeRequest(environment, saved);
     if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { completed: { offer, environment, resumed: true }, token: null }; }
-    if (offer.state === "validating") {
-      if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
-
-      if (!offer.validationToken || !offer.validationExpiresAt || offer.validationExpiresAt <= at(input)) throw new Error("Compute validation expired");
-      return { completed: null, token: offer.validationToken };
-    }
-    if (offer.state !== "offered" || !offer.expiresAt || offer.expiresAt <= at(input)) throw new Error("Compute offer is expired or superseded");
+    if (!["queued", "offered", "validating"].includes(offer.state)) throw new Error("Compute offer is expired or superseded");
+    // Join an in-flight redemption only after this caller's exact owner, task
+    // and recipe were verified above; never touch its token.
+    if (offer.state === "validating" && pending!.has(offer.id)) return { completed: null, token: null, join: true };
     if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
+    if (offer.state === "validating") {
+      // Redeem the same reservation and token; a concurrent redeemer of the
+      // same identity shares it rather than superseding it.
+      const token = offer.validationToken ?? randomUUID();
+      await store.computeOffer.update({ where: { id: offer.id }, data: { validationToken: token, validationExpiresAt: new Date(at(input).getTime() + COMPUTE_VALIDATION_MS) } });
+      return { completed: null, token };
+    }
+    const instruction = await store.runtimeInstruction.findUnique({ where: { id: offer.instructionId } });
+    if (offer.state === "queued" && instruction) {
+      // A start whose delivery acknowledgment was lost is recovered exactly.
+      const started = await startedEvent(store, instruction.sessionId, instruction.executionRequestId);
+      if (started) offer = (await recordDelivery(store, offer.id, instruction.executionRequestId!, started.occurredAt)).offer;
+    }
+    // Only the delivering turn (running or uncertain) may redeem it.
+    if (offer.state !== "offered" || !instruction || !["dispatching", "unknown"].includes(instruction.state)) throw new Error("Compute offer is expired or superseded");
     if (saved) {
       const observed = ComputeObservation.safeParse(environment.observation);
       if (!observed.success) throw new Error("Saved compute requires a fresh stopped observation before claiming");
@@ -391,10 +545,11 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
     return { completed: null, token };
   });
   if (reservation.completed) return reservation.completed;
-  let pending = claimValidations.get(input.prisma);
-  if (!pending) { pending = new Map(); claimValidations.set(input.prisma, pending); }
   const existing = pending.get(input.offerId);
+  // Every caller reaching here passed its own exact identity checks.
   if (existing) return existing as ReturnType<typeof finishComputeValidation>;
+  // The joined validation finished in between: re-read its durable outcome.
+  if ("join" in reservation) return claimCompute(input, refresh);
   const work = finishComputeValidation(input, request, reservation.token!, refresh);
   pending.set(input.offerId, work);
   try { return await work; } finally { if (pending.get(input.offerId) === work) pending.delete(input.offerId); }
@@ -410,7 +565,11 @@ async function finishComputeValidation(input: ClaimInput, request: z.infer<typeo
       const { saved, ...recipe } = request;
       if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim identity changed during validation");
       assertSavedComputeRequest(environment, saved);
-      if (offer.state !== "validating" || offer.validationToken !== token || !offer.validationExpiresAt || offer.validationExpiresAt <= at(input)) throw new Error("Compute validation expired or superseded");
+      // A same-identity redeemer already completed this reservation.
+      if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { offer, environment, resumed: true }; }
+      // The token is the reservation's redemption identity; its deadline only
+      // lets reconciliation reclaim a validation no longer running here.
+      if (offer.state !== "validating" || offer.validationToken !== token) throw new Error("Compute validation expired or superseded");
       if (saved) {
         const observed = ComputeObservation.safeParse(environment.observation);
         if (!observed.success) throw new Error("Saved compute requires a fresh stopped observation before claiming");
@@ -418,7 +577,7 @@ async function finishComputeValidation(input: ClaimInput, request: z.infer<typeo
       }
       if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
       const capacity = await computeAdmissionCapacity(store, input);
-      if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new Error("Compute reservation is unavailable");
+      if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new ComputeCapacityBlocked(capacity);
       const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input), validationToken: null, validationExpiresAt: null } });
       await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
       const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });
@@ -449,10 +608,34 @@ export async function declineCompute(input: Context & { taskId: string; offerId:
 export async function computeInstructionAllows(store: Store, receipt: { id: string; sessionId: string }, now = new Date()) {
   if (!receipt.id.startsWith("compute-offer:")) return true;
   const offer = await store.computeOffer.findUnique({ where: { instructionId: receipt.id } });
-  if (!offer || offer.state !== "queued" || offer.dispatchDeadline <= now) return false;
+  if (!offer) return false;
   const environment = await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } });
   if (!environment || environment.primarySessionId !== receipt.sessionId) return false;
+  // A queued assignment dispatches before its deadline. A delivered,
+  // unclaimed one redispatches only for the owner's explicit retry of its
+  // interrupted turn, on its same still-reserved slot.
+  if (offer.state === "queued" ? offer.dispatchDeadline <= now : !(await ownerRetriesDeliveredOffer(store, offer, environment, receipt))) return false;
   try { await assertComputeEnvironmentOwner(store, environment); return true; } catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; return false; }
+}
+
+const RetryDecision = z.object({ action: z.literal("retry") }).passthrough();
+/** Durable proof that the owner retried THIS delivered, unclaimed
+ * assignment's interrupted turn (resolveTaskInstruction verified the
+ * provider was not alive and recorded the decision): the same instruction is
+ * queued again after a real delivery, its latest supervisor decision is a
+ * retry made after that delivery, and the same slot is still reserved. A
+ * claimed, validating or withdrawn assignment is never redispatched. */
+async function ownerRetriesDeliveredOffer(store: Store, offer: { id: string; state: string; deliveredAt: Date | null; executionRequestId: string | null; machineId: string },
+  environment: ComputeEnvironment, receipt: { id: string; sessionId: string }) {
+  if (offer.state !== "offered" || !offer.deliveredAt || !offer.executionRequestId || offer.machineId !== environment.machineId) return false;
+  const instruction = await store.runtimeInstruction.findUnique({ where: { id: receipt.id } });
+  if (!instruction || instruction.sessionId !== receipt.sessionId || instruction.state !== "queued" || !instruction.executionRequestId) return false;
+  const decision = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: receipt.sessionId, source: `task-supervisor:${environment.taskId}`,
+    action: "instruction-resolved", key: receipt.id }, orderBy: { sequence: "desc" } });
+  let retry = false;
+  try { retry = RetryDecision.safeParse(JSON.parse(decision?.value ?? "null")).success; } catch { retry = false; }
+  if (!decision || !retry || decision.occurredAt < offer.deliveredAt) return false;
+  return Boolean(await store.computeSlot.findFirst({ where: { allocationId: offer.id, machineId: offer.machineId } }));
 }
 
 /** Binds the claimed slot to its first exact runtime receipt before any Docker
@@ -478,6 +661,12 @@ export async function bindComputeResource(input: Context & { taskId: string; off
 /** Only a fresh independently observed exact lifetime can release a claimed
  * slot. Timeouts, receipt states and absence of a provider turn are not proof. */
 export async function reconcileObservedCompute(input: Context & { environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
+  const result = await reconcileObservedComputeOnce(input);
+  if (result.released) await (await import("./tooling-operations.ts")).resolveEnvironmentConsumers(input.prisma, input.environmentId, { kind: "stopped", reference: input.environmentId })
+    .catch(error => console.warn(`Retained readers of ${input.environmentId} remain until reconciled: ${error instanceof Error ? error.message : String(error)}`));
+  return result;
+}
+async function reconcileObservedComputeOnce(input: Context & { environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
   return input.prisma.$transaction(async store => {
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);

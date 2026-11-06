@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type { RemoteTask } from "../../../../generated/prisma/client.ts";
+import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
+import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
+import { boundCode, currentToolingOperation, toolingProcessContext, latestFinalizationReference, resourceGroupCode, toolingOperationDependencies, type ToolingCodeIdentity } from "./tooling-operations.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { CleanupObservationContracts, resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { CleanupObserverBatchInput } from "./cleanup-observer-schema.ts";
@@ -132,13 +134,35 @@ export async function verifyCleanupObserver(capability: CleanupObserverCapabilit
   try { return await checkedCapability(capability, retainedPreview); } catch (error) { throw error instanceof CleanupObserverError ? error : failure(); }
 }
 
-export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig }, resolve = resolveToolingCompatibility) {
+/** Cleanup proofs keep the accepted finalization's code: an explicit
+ * identity, the guarded callback's binding or legacy snapshot, else the
+ * operation owning the task's latest prepared finalization or its retained
+ * first-bootstrap snapshot. Exact prepared observer paths/hashes already in
+ * receipts are reused by their callers and never re-resolved here. With no
+ * finalization at all this is an independent resolution of the active
+ * release. A finalization with neither owner nor snapshot fails closed. */
+export async function cleanupObserverRelease(input: { task: RemoteTask; config?: ServerConfig; prisma?: PrismaClient; release?: ToolingCodeIdentity | null }, dependencies = toolingOperationDependencies): Promise<ToolingCodeIdentity | null> {
+  const scoped = boundCode(input.release);
+  if (scoped !== undefined || !input.prisma) return scoped ?? null;
+  const finalization = await latestFinalizationReference(input.prisma, input.task);
+  if (finalization) return (await resourceGroupCode({ prisma: input.prisma, task: input.task, reference: finalization }, dependencies)).code;
+  if (!input.config) return null;
+  return (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: input.task.repositoryId }))?.release ?? null;
+}
+
+// Callers pass the server client or an interactive transaction (all models);
+// the narrow store type reflects only what they declare.
+export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingCodeIdentity | null }, resolve = resolveToolingCompatibility) {
   try {
     if (!input.task.worktreePath) throw failure();
+    const release = await cleanupObserverRelease({ task: input.task, config: input.config, ...(input.release !== undefined ? { release: input.release } : {}),
+      ...(input.prisma ? { prisma: input.prisma as PrismaClient } : {}) });
     const selected = await resolve({ task: input.task, repository: getRepositoryConfig(input.config, input.task.repositoryId), installRoot: input.config.installRoot,
-      capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}) });
+      capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}),
+      ...(release ? { release } : {}) });
     const receipt = selected.receipt;
-    if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision) throw failure();
+    if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision
+      || release && receipt.capabilityRevision !== release.revision) throw failure();
     const value = CleanupObserverCapability.parse({ version: 1, source: receipt.source, checkout: receipt.checkout, revision: receipt.capabilityRevision,
       adapter: receipt.adapter, adapterSha256: hash(await readFile(receipt.adapter)) });
     if (value.checkout === input.task.worktreePath || inside(input.task.worktreePath, value.checkout)) throw failure();
@@ -149,7 +173,7 @@ export async function resolveCleanupObserver(input: { task: RemoteTask; config: 
 /** Private stdin and bounded JSON output only. The CLI action must use the
  * tooling's read-only inspectors; no control socket or primary-session identity
  * is inherited, and calling ordinary reconciliation is not this protocol. */
-export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability }) {
+export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability; operation?: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId"> | null; socket?: string }) {
   const timeoutMs = input.timeoutMs ?? 60_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure("OBSERVER_INPUT");
   let bytes: string, request: unknown;
@@ -167,6 +191,10 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
   const capability = input.compatibleCapability ? await verifyCleanupObserver(input.compatibleCapability, true) : original;
   const env: Record<string, string> = {};
   for (const name of ["PATH", "HOME", "TMPDIR", "USER", "CLOUDFLARE_API_TOKEN", "DRAFTED_CLOUDFLARE_CREDENTIALS"]) if (process.env[name] !== undefined) env[name] = process.env[name]!;
+  // The strict version-1 observer envelope is unchanged; an operation binding
+  // travels only as process context.
+  const operation = input.operation === undefined ? currentToolingOperation() : input.operation;
+  Object.assign(env, toolingProcessContext(operation, input.socket));
   let output: string;
   try { output = await executeOwnedObserver([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
   catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }

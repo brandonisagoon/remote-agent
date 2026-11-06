@@ -6,6 +6,7 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
 
 export const countedComputeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const Purpose = z.enum(["development", "review"]);
@@ -74,17 +75,77 @@ function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: C
       && current.identities.some(identity => identity.id === resource.resourceId && identity.identityDigest === resource.resourceIdentity));
 }
 
+/** Durable, non-sensitive outcome of a group's latest COMPLETED refresh: a
+ * fixed phase and finite code with the time that state began. Diagnostic only:
+ * never proof, never credit, never raw observer/provider output. "proof-recorded"
+ * means only that an observation was persisted as the group's proof; credit is
+ * decided solely by computeBaselineCredits (stopped, current, fresh). Each
+ * record names the refresh (token) that produced it and is written only while
+ * that refresh is still the group's current one, so a slower superseded
+ * refresh can never append over a newer one. Each record also names the
+ * group MEMBERSHIP it was made for (the group ID is stable across membership
+ * changes): it is reported as the current cause only for the same current
+ * membership, otherwise explicitly as an earlier membership's attempt.
+ * Appended only on a change of outcome/phase/code/membership: that bounds the
+ * write rate of repeated identical outcomes, not total history, which grows
+ * append-only as outcomes change. Outside every proof/credit transaction. */
+export const BaselineRefreshPhase = z.enum(["snapshot", "observe", "validate", "credit"]);
+const PHASE_CODES = { snapshot: "SNAPSHOT_UNAVAILABLE", observe: "OBSERVER_UNVERIFIED", validate: "OBSERVATION_INVALID", credit: "PROOF_REJECTED" } as const;
+export const BaselineRefreshCode = z.enum([...Object.keys(cleanupObserverReasons) as [keyof typeof cleanupObserverReasons, ...Array<keyof typeof cleanupObserverReasons>],
+  ...Object.values(PHASE_CODES), "FAMILY_ACTIVE"]);
+const RefreshRecord = z.object({ version: z.literal(1), groupId: Sha, refreshToken: z.string().uuid(), membership: Sha, outcome: z.enum(["proof-recorded", "failed", "deferred"]),
+  phase: BaselineRefreshPhase.optional(), code: BaselineRefreshCode.optional(), since: z.number().int().nonnegative() }).strict();
+export type BaselineRefresh = Omit<z.infer<typeof RefreshRecord>, "version" | "groupId" | "refreshToken" | "membership">;
+const membershipOf = (ids: readonly string[]) => finalizationDigest([...new Set(ids)].sort());
+const REFRESH_ACTION = "compute-baseline-refresh";
+const refreshSource = (machineId: string) => `compute-baseline:${machineId}`;
+const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown): z.infer<typeof BaselineRefreshCode> => error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
+const parseJson = (text: string | null | undefined) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
+async function latestRefresh(store: Pick<Store, "remoteTask" | "runtimeMetadataEvent">, machineId: string, taskId: string, groupId: string) {
+  const task = await store.remoteTask.findUnique({ where: { id: taskId }, select: { primarySessionId: true } });
+  if (!task?.primarySessionId) return null;
+  const where = { runtimeSessionId: task.primarySessionId, source: refreshSource(machineId), action: REFRESH_ACTION, key: groupId };
+  const event = await store.runtimeMetadataEvent.findFirst({ where, orderBy: { sequence: "desc" } });
+  const parsed = RefreshRecord.safeParse(parseJson(event?.value));
+  const record = parsed.success && parsed.data.groupId === groupId ? parsed.data : null;
+  return { where, record, unreadable: Boolean(event) && !record };
+}
+class SupersededRefresh extends Error {}
+async function recordRefresh(input: Context, taskId: string, groupId: string, token: string, membership: string, value: Omit<BaselineRefresh, "since">) {
+  try {
+    const latest = await latestRefresh(input.prisma, input.config.machine, taskId, groupId);
+    if (!latest) return;
+    const prior = latest.record;
+    if (prior && prior.membership === membership && prior.outcome === value.outcome && prior.phase === value.phase && prior.code === value.code) return;
+    const record = RefreshRecord.parse({ version: 1, groupId, refreshToken: token, membership, ...value, since: (input.now ?? new Date()).getTime() });
+    // The append (first write, taking the lock) commits only while this
+    // refresh is still the group's current one; otherwise it rolls back.
+    await input.prisma.$transaction(async tx => {
+      await tx.runtimeMetadataEvent.create({ data: { ...latest.where, value: JSON.stringify(record) } });
+      const row = await tx.computeBaseline.findUnique({ where: { id: groupId }, select: { refreshToken: true } });
+      if (row?.refreshToken !== token) throw new SupersededRefresh();
+    });
+  } catch { /* Diagnostic only (superseded or unavailable): never affects accounting. */ }
+}
+
 const readInstalled: Read = async (input, task, request) => (await import("./compute-observer.ts")).readInstalledComputeBaseline(input, task, request);
 
-/** Accounting only, also usable before policy activation. Invalidate every old
- * free cache before even the first fallible inventory/adapter read. */
+/** Accounting only, also usable before policy activation. Each group's proof
+ * is invalidated when that group's own refresh begins (before its fallible
+ * read), so a long pass never clears unrelated fresh proof. A failure of the
+ * host-wide inventory is evidence against every group and invalidates all. */
 export async function refreshComputeBaselines(input: Context, read: Read = readInstalled) {
   const machineId = input.config.machine, token = randomUUID();
-  await input.prisma.computeBaseline.updateMany({ where: { machineId }, data: { refreshToken: token, proof: Prisma.DbNull } });
-  const existing = await input.prisma.computeBaseline.findMany({ where: { machineId }, take: 1001 });
-  const resources = await input.prisma.remoteTaskResource.findMany({ where: { task: { machineId }, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: countedComputeKinds } }, orderBy: { id: "asc" }, take: 10001 });
-  const environments = await input.prisma.computeEnvironment.findMany({ where: { machineId }, take: 1001 });
-  if (existing.length > 1000 || resources.length > 10000 || environments.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
+  let existing: ComputeBaseline[], resources: Awaited<ReturnType<Store["remoteTaskResource"]["findMany"]>>, environments: Awaited<ReturnType<Store["computeEnvironment"]["findMany"]>>;
+  try {
+    existing = await input.prisma.computeBaseline.findMany({ where: { machineId }, take: 1001 });
+    resources = await input.prisma.remoteTaskResource.findMany({ where: { task: { machineId }, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: countedComputeKinds } }, orderBy: { id: "asc" }, take: 10001 });
+    environments = await input.prisma.computeEnvironment.findMany({ where: { machineId }, take: 1001 });
+    if (existing.length > 1000 || resources.length > 10000 || environments.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
+  } catch (error) {
+    await input.prisma.computeBaseline.updateMany({ where: { machineId }, data: { refreshToken: token, proof: Prisma.DbNull } });
+    throw error;
+  }
   const groups = new Map(existing.map(row => [row.id, { taskId: row.taskId, purpose: row.purpose, ids: Ids.parse(row.resourceIds) }]));
   for (const resource of resources) {
     const id = key(machineId, resource.taskId, resource.purpose);
@@ -97,6 +158,9 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
     for (;;) {
       const entry = entries[index++]; if (!entry) return;
       const [id, group] = entry;
+      let phase: z.infer<typeof BaselineRefreshPhase> = "snapshot";
+      // The membership this refresh is for: what it upserts (planned until then).
+      let membership = membershipOf([...group.ids, ...resources.filter(resource => resource.taskId === group.taskId && resource.purpose === group.purpose).map(resource => resource.id)]);
       try {
         const row = await input.prisma.$transaction(async tx => {
           // Another process may have discovered a member after this inventory,
@@ -107,11 +171,16 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           Ids.parse(resourceIds);
           return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
         });
+        membership = membershipOf(Ids.parse(row.resourceIds));
         const before = await snapshot(input.prisma, row, input.runtime);
-        if (!before.settled) { unavailable++; continue; }
+        if (!before.settled) { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
+        phase = "observe";
         const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
           purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
-        const observation = ComputeBaselineObservation.parse(await read(input, before.task, request));
+        const raw = await read(input, before.task, request);
+        phase = "validate";
+        const observation = ComputeBaselineObservation.parse(raw);
+        phase = "credit";
         const credited = await input.prisma.$transaction(async tx => {
           const held = await tx.computeBaseline.findUniqueOrThrow({ where: { id } });
           if (held.refreshToken !== token) return false;
@@ -120,27 +189,48 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
           return saved.count === 1;
         });
-        if (credited) observed++; else unavailable++;
-      } catch { unavailable++; }
+        // Persisted as proof only; whether it credits (stopped, current, fresh)
+        // is decided solely by computeBaselineCredits.
+        if (credited) { observed++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "proof-recorded" }); }
+        else { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
+      } catch (error) { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
     }
   }));
   return { observed, unavailable };
 }
 
+/** Why a group is not credited; each names the evidence that is missing. */
+export type BaselineCreditReason = "missing-proof" | "refresh-failed" | "unobservable" | "inventory-unavailable" | "family-active" | "membership-changed" | "proof-stale" | "not-proven-stopped";
 /** Recheck inside the existing admission transaction. A stale/missing cache
  * only retains reservation; it can never turn into an environment or claim. */
 export async function computeBaselineCredits(store: Store, input: { machineId: string; policy: ComputePolicy; runtime?: Runtime; now?: Date }) {
   const rows = await store.computeBaseline.findMany({ where: { machineId: input.machineId }, take: 1001 });
   if (rows.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
   return Promise.all(rows.map(async row => {
-    let credited = false;
-    try {
-      const proof = Proof.parse(row.proof);
-      if (input.runtime) {
-        const current = await snapshot(store, row, input.runtime);
-        credited = current.settled && current.digest === proof.snapshotDigest && matches(proof.observation, row, current, input.now ?? new Date(), input.policy.collectorFreshnessSeconds);
-      }
-    } catch { /* Unknown original claims remain reserved. */ }
-    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited };
+    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined, refresh: BaselineRefresh | undefined, previousRefresh: BaselineRefresh | undefined, refreshUnreadable = false;
+    const proof = Proof.safeParse(row.proof);
+    if (!proof.success) {
+      // No current proof: the latest recorded refresh distinguishes a failed or
+      // deferred observation from one never made. It never credits.
+      const read = await latestRefresh(store, row.machineId, row.taskId, row.id).catch(() => null), latest = read?.record;
+      // Current membership: the recorded members plus every current counted
+      // member of the group (what the next refresh would observe).
+      const members = latest ? await store.remoteTaskResource.findMany({ where: { taskId: row.taskId, purpose: row.purpose, state: { not: "released" }, kind: { in: countedComputeKinds } }, select: { id: true }, take: 1001 }) : [];
+      const current = latest && members.length <= 1000 && latest.membership === membershipOf([...Ids.parse(row.resourceIds), ...members.map(member => member.id)]);
+      if (latest) { const { version: _version, groupId: _group, refreshToken: _token, membership: _membership, ...summary } = latest; if (current) refresh = summary; else previousRefresh = summary; }
+      else if (read?.unreadable) refreshUnreadable = true;
+      reason = refresh?.outcome === "failed" ? "refresh-failed" : refresh?.outcome === "deferred" ? "family-active" : "missing-proof";
+    }
+    else if (!input.runtime) { reason = "unobservable"; observedAt = proof.data.observation.observedAt; }
+    else {
+      observedAt = proof.data.observation.observedAt;
+      try {
+        const current = await snapshot(store, row, input.runtime), now = input.now ?? new Date();
+        const fresh = observedAt <= now.getTime() && now.getTime() - observedAt <= input.policy.collectorFreshnessSeconds * 1000;
+        credited = current.settled && current.digest === proof.data.snapshotDigest && matches(proof.data.observation, row, current, now, input.policy.collectorFreshnessSeconds);
+        if (!credited) reason = !current.settled ? "family-active" : current.digest !== proof.data.snapshotDigest ? "membership-changed" : !fresh ? "proof-stale" : "not-proven-stopped";
+      } catch { reason = "inventory-unavailable"; /* Unknown original claims remain reserved. */ }
+    }
+    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }), ...(refresh ? { refresh } : {}), ...(previousRefresh ? { previousRefresh } : {}), ...(refreshUnreadable ? { refreshUnreadable } : {}) };
   }));
 }

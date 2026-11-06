@@ -7,7 +7,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { queueInstruction } from "../sessions/inbox.ts";
 import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { externalOwnerHistory, latestExternalBinding } from "./external-deliveries.ts";
-import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
+import { resolveSessionToolingCapability, selectCapabilityRelease } from "./tooling-capabilities.ts";
 import { cleanupRetryEligibility, recordCleanupRetryInput } from "./cleanup-retry.ts";
 import { readLocalCompletion } from "./local-completion.ts";
 
@@ -28,7 +28,7 @@ const Marker = z.union([
 ]);
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 const quote = (text: string) => "'" + text.replaceAll("'", "'\\''") + "'";
-export const cleanupInboxDependencies = { capability: resolveSessionToolingCapability };
+export const cleanupInboxDependencies: { capability: typeof resolveSessionToolingCapability; release?: typeof selectCapabilityRelease } = { capability: resolveSessionToolingCapability };
 type EnqueueDependencies = typeof cleanupInboxDependencies & { now?: () => number };
 
 async function marker(store: CleanupInboxStore, instructionId: string, sessionId: string) {
@@ -89,11 +89,16 @@ export async function refreshQueuedCleanupInstruction(input: { prisma: PrismaCli
     return task;
   }
   await currentMarker(input.prisma, saved);
-  const resolved = structuredClone(await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: saved.sessionId, capability: "cleanup" }));
+  // A queued, undelivered turn is the next independent operation: refresh
+  // selects the current generation once, then compares against that exact
+  // selection rather than this process's boot-time configured revision.
+  const release = await (dependencies.release ?? selectCapabilityRelease)({ prisma: input.prisma, config: input.config, repositoryId: saved.repositoryId });
+  const expectedRevision = release?.revision ?? input.config.repositories[saved.repositoryId]?.tooling?.revision;
+  const resolved = structuredClone(await dependencies.capability({ prisma: input.prisma, config: input.config, sessionId: saved.sessionId, capability: "cleanup", release }));
   const capability = resolved.receipt;
   if (!capability.adapter || capability.contract !== "remote-agent.tooling-capability/v1" || capability.capability !== "cleanup"
     || capability.source !== "configured-host" || capability.taskToolingRevision !== saved.toolingRevision
-    || capability.capabilityRevision !== input.config.repositories[saved.repositoryId]?.tooling?.revision || configured() !== configurationDigest) throw new Error("Configured cleanup capability changed during resolution");
+    || capability.capabilityRevision !== expectedRevision || configured() !== configurationDigest) throw new Error("Configured cleanup capability changed during resolution");
   const capabilityDigest = hash(JSON.stringify(capability));
   async function unchanged(store: CleanupInboxStore) {
     const current = await store.runtimeInstruction.findUniqueOrThrow({ where: { id: instruction.id } });
