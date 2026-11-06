@@ -23,7 +23,7 @@ import { testConfig } from "../test-support/config.ts";
 import type { AppEnv } from "../apps/server/middleware/context.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/routes/tasks/tooling-operations.ts";
 import { TOOLING_OPERATION_HEADER, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
-import { activateToolingRelease, canonicalDigest } from "../apps/server/services/tasks/tooling-releases.ts";
+import { activateToolingRelease, canonicalDigest, registerToolingStateWrite, retainToolingConsumer } from "../apps/server/services/tasks/tooling-releases.ts";
 import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
@@ -572,6 +572,20 @@ test("never-attempted: a bound child with any attempt or effect record, or an un
     expect((await f.operation(orphanId)).status).toBe("bound");
     expect((await f.operation(restarted.fence.operationId)).status).not.toBe("completed"); // the parent swap rolled back
   }
+  // A state write or a retained reader recorded by the real services on the
+  // bound orphan (both accept a bound operation) also keeps it blocking.
+  for (const effect of ["state write", "retained readers"] as const) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted, orphanId } = await orphaned();
+    if (effect === "state write") await registerToolingStateWrite({ prisma: db.prisma, operationId: orphanId, family: "drafted.runtime", scopeKey: KEY, version: 1 });
+    else await retainToolingConsumer({ prisma: db.prisma, operationId: orphanId, consumerKind: "compute-environment", consumerId: ENV, scopeKey: KEY });
+    expect((await f.operation(orphanId)).status).toBe("bound");
+    const settled = await restarted.settle();
+    expect(settled.status).toBe(409);
+    // A pending reader is refused by the earlier consumer rule; a write by this proof.
+    expect(settled.body.error).toMatch(effect === "state write" ? /bound with state writes/ : /bound with retained readers|unconfirmed producing effect/);
+    expect((await f.operation(orphanId)).status).toBe("bound");
+  }
   // An unknown child (lost callback response) is unchanged by this rule.
   await db.cleanup(); db = await createTestDatabase();
   const { f, restarted, orphanId } = await orphaned();
@@ -583,7 +597,7 @@ test("never-attempted: a bound child with any attempt or effect record, or an un
   expect(refusedUnknown.status).toBe(409);
   expect(refusedUnknown.body.error).toMatch(/unconfirmed producing effect|is unknown/);
   expect((await f.operation(orphanId)).status).toBe("unknown");
-});
+}, 60_000);
 
 test("never-attempted: settlement racing the orphan's callback or a new child's begin yields a refused settlement or a refused callback, never both effects", async () => {
   for (let round = 0; round < 3; round++) {
@@ -604,17 +618,48 @@ test("never-attempted: settlement racing the orphan's callback or a new child's 
   }
   // A new child begun concurrently with settlement: refused, or completed never-attempted and then unusable.
   await db.cleanup(); db = await createTestDatabase();
-  const { f, restarted } = await orphaned();
-  const [settled, begun] = await Promise.all([restarted.settle(), beginConfigure(f, restarted.fence, "offer-3")]);
-  expect(settled.status).toBe(200);
-  if (begun.status === 200) {
-    const late = begun.body.binding.operationId as string;
-    expect((await f.operation(late)).completionEvidence).toMatchObject({ kind: "never-attempted" });
-    expect((await restarted.call("compute-configure", configureBody("offer-3"), late)).status).toBe(409);
-  } else {
-    // Begun after the parent's swap: refused, no child row.
-    expect(begun.status).toBeGreaterThanOrEqual(400); expect(begun.status).toBeLessThan(500);
-    expect(await db.prisma.toolingOperation.count({ where: { parentOperationId: restarted.fence.operationId, existingOperationId: "offer-3" } })).toBe(0);
+  // Rounds of a VALID new child (a real third offer of this task's environment)
+  // begun concurrently with settlement.
+  // Control (its own database): with the parent open, this exact begin is valid.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted } = await orphaned();
+    await f.offer("offer-3");
+    const control = await beginConfigure(f, restarted.fence, "offer-3");
+    expect(control.status, JSON.stringify(control.body)).toBe(200);
+    expect(control.body.binding).toMatchObject({ existingOperationId: "offer-3", parentOperationId: restarted.fence.operationId, status: "bound" });
   }
-  console.log(JSON.stringify({ concurrentBegin: { settle: settled.status, begin: begun.status, refusal: begun.body.code ?? null } }));
-});
+  const outcomes: string[] = [];
+  for (let round = 0; round < 3; round++) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted } = await orphaned();
+    await f.offer("offer-3");
+    const [settled, begun] = await Promise.all([restarted.settle(), beginConfigure(f, restarted.fence, "offer-3")]);
+    expect(settled.status, JSON.stringify(settled.body)).toBe(200);
+    if (begun.status === 200) {
+      // Begun before the parent's swap: settlement completed it as never-attempted; it can never run.
+      const late = begun.body.binding.operationId as string;
+      expect(await f.operation(late)).toMatchObject({ status: "completed", completionEvidence: { kind: "never-attempted", reference: restarted.fence.operationId } });
+      expect((await restarted.call("compute-configure", configureBody("offer-3"), late)).status).toBe(409);
+      outcomes.push("begun-then-completed");
+    } else {
+      // Begun after the swap: refused because the parent completed, not a missing record or input.
+      expect(begun.body.error).toMatch(/Parent command is completed/);
+      expect(await db.prisma.toolingOperation.count({ where: { parentOperationId: restarted.fence.operationId, existingOperationId: "offer-3" } })).toBe(0);
+      outcomes.push(`refused:${begun.body.code}`);
+    }
+  }
+  // The other ordering, made deterministic: the valid begin commits first, then settlement.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted } = await orphaned();
+    await f.offer("offer-3");
+    const early = await beginConfigure(f, restarted.fence, "offer-3");
+    expect(early.status).toBe(200);
+    expect((await restarted.settle()).status).toBe(200);
+    expect(await f.operation(early.body.binding.operationId)).toMatchObject({ status: "completed", completionEvidence: { kind: "never-attempted", reference: restarted.fence.operationId } });
+    expect((await restarted.call("compute-configure", configureBody("offer-3"), early.body.binding.operationId)).status).toBe(409);
+    outcomes.push("ordered:begun-then-completed");
+  }
+  console.log(JSON.stringify({ concurrentBegin: outcomes }));
+}, 60_000);
