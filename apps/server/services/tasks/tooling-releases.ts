@@ -441,6 +441,41 @@ export async function markToolingOperationInterrupted(tx: Prisma.TransactionClie
   if (updated.count !== 1) throw new ToolingOperationError("transition-conflict", `Operation ${input.operationId} is no longer running`);
 }
 
+/** Domain-only completion in the recovery projection's transaction. The
+ * supplied sequence must be the exact, independently readable committed
+ * result, including its registered state write. This is not a generic
+ * unknown-outcome acknowledgment: no event means no completion. The caller
+ * holds the operation write lock and commits projection, legacy handoff,
+ * state registration, event and completion together.
+ */
+export async function completeNeonRecoveryOperation(tx: Prisma.TransactionClient, input: { operationId: string; eventSequence: number }): Promise<void> {
+  const row = await tx.toolingOperation.findUnique({ where: { id: input.operationId } });
+  if (!row || row.kind !== "compute-neon-recovery" || !["running", "completed"].includes(row.status)) {
+    throw new ToolingOperationError("invalid-transition", "Only a verified running Neon recovery can complete");
+  }
+  const operation = await binding(tx, row);
+  const { readCommittedNeonRecovery } = await import("./compute-neon-recovery-result.ts");
+  const result = await readCommittedNeonRecovery(tx, operation);
+  if (!result || result.sequence !== input.eventSequence) throw new ToolingOperationError("evidence-required", "Neon recovery completion requires its exact stored result");
+  const evidence = { kind: "compute-neon-recovery-committed", reference: String(result.sequence) };
+  if (row.status === "completed") {
+    if (canonicalDigest(row.completionEvidence) !== canonicalDigest(evidence)) throw new ToolingOperationError("evidence-required", "Neon recovery completed with different evidence");
+    return;
+  }
+  if (row.parentOperationId) {
+    const parent = await tx.toolingOperation.findUnique({ where: { id: row.parentOperationId } });
+    if (!parent || parent.kind !== ADAPTER_COMMAND_KIND || !["bound", "running"].includes(parent.status)
+      || parent.taskId !== row.taskId || parent.sessionId !== row.sessionId || parent.repositoryId !== row.repositoryId
+      || parent.releaseId !== row.releaseId || parent.generation !== row.generation) {
+      throw new ToolingOperationError("parent-unavailable", "Neon recovery requires its open command and unchanged lineage");
+    }
+  }
+  const changed = await tx.toolingOperation.updateMany({ where: { id: row.id, kind: row.kind, status: "running", parentOperationId: row.parentOperationId,
+    taskId: row.taskId, sessionId: row.sessionId, repositoryId: row.repositoryId, releaseId: row.releaseId, generation: row.generation, inputDigest: row.inputDigest },
+    data: { status: "completed", completionEvidence: evidence } });
+  if (changed.count !== 1) throw new ToolingOperationError("transition-conflict", "Neon recovery changed before completion");
+}
+
 /** Latest actually registered format for one task state, or null. */
 export async function readToolingStateVersion(input: { prisma: PrismaClient; taskId: string; family: string; scopeKey: string }): Promise<ToolingStateVersion | null> {
   const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });

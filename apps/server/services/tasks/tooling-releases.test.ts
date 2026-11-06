@@ -9,7 +9,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { acquirePreparationLock, prepareToolingRelease, verifyPreparedToolingRelease, type PrepareToolingReleaseInput } from "./tooling.ts";
 import { activateToolingRelease, assertBootToolingPolicy, assertToolingStateReadable, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary,
   readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, reconcileUnknownAdmissionChild, registerToolingStateWrite, registerToolingStateWriteInTransaction, resolveToolingLegacyConsumer, transitionToolingOperation,
-  bindRetainedToolingOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
+  bindRetainedToolingOperation, completeNeonRecoveryOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
   type ToolingLegacyConsumerInput } from "./tooling-releases.ts";
 
 // Real Git repositories and SQLite fixtures; keep hooks reliable on a loaded host.
@@ -284,6 +284,24 @@ test("operation lifecycle transitions are explicit compare-and-swap changes", as
   await expect(move("completed", "running")).rejects.toMatchObject({ code: "invalid-transition" });
   expect(await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: op.operationId } })).toMatchObject({ status: "completed", completionEvidence: evidence });
   await expect(transitionToolingOperation({ prisma: db.prisma, operationId: "missing", from: "bound", to: "running" })).rejects.toMatchObject({ code: "not-found" });
+});
+
+test("Neon completion cannot turn an unproven operation into success", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  const bind = (key: string, kind: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey: key, inputDigest: "a".repeat(64), kind, existingOperationId: "offer", resourceKey: "runtime-development" } });
+  const operation = await bind("recovery", "compute-neon-recovery"), other = await bind("other", "compute-admission");
+  const complete = (operationId: string) => db.prisma.$transaction(tx => completeNeonRecoveryOperation(tx, { operationId, eventSequence: 1 }));
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "bound", to: "running" });
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "evidence-required" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: other.operationId, from: "bound", to: "running" });
+  await expect(complete(other.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "running", to: "unknown" });
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.operationId } })).status).toBe("unknown");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-neon-recovery" } })).toBe(0);
 });
 
 test("actual written formats outlive completed operations and block rollback readers", async () => {
