@@ -5,7 +5,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import * as baseline from "./compute-baseline.ts";
-import { claimCompute, computeAdmissionCapacity, confirmComputeDelivery, offerNextCompute, reconcileComputeOffers, requestCompute, scheduleComputeOffers } from "./compute-admission.ts";
+import { ComputeCapacityBlocked, claimCompute, computeAdmissionCapacity, confirmComputeDelivery, offerNextCompute, reconcileComputeOffers, requestCompute, scheduleComputeOffers } from "./compute-admission.ts";
 import { createInstructionTick } from "../sessions/inbox.ts";
 
 /** DRA-34: assignments are reserved before dispatch, delivery is progress
@@ -243,4 +243,18 @@ test("closed waiters are retired with a receipt before any physical scan; paused
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-wait-retired" } })).toBe(1); // exactly the terminal wait
   const paused = await db.prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: "paused" } });
   expect(await db.prisma.computeWait.count({ where: { environmentId: paused.id } })).toBe(1);
+});
+
+test("a claim refused by accounting reports the exact blocking groups, distinct from an expired offer, and keeps its reservation", async () => {
+  await task("one");
+  const offer = (await offerNextCompute(context()))!; await start(offer.instructionId, began);
+  // A historical group appears after selection (cf. DRA-17's 19 unaccounted groups).
+  await db.prisma.remoteTaskResource.create({ data: { id: "historical", taskId: "one", key: "old-app", kind: "docker-container", purpose: "review", externalId: "old-container", state: "ready" } });
+  const refused = await claimCompute({ ...context(1), taskId: "one", offerId: offer.id, request }, async () => undefined).catch(error => error);
+  expect(refused).toBeInstanceOf(ComputeCapacityBlocked);
+  expect(refused.message).toContain("capacity accounting blocks this claim");
+  expect(refused.blockers.unaccounted).toEqual([expect.objectContaining({ group: "one:review", reason: "unrecorded-resource", ids: ["historical"] })]);
+  expect(refused.blockers.allocations).toEqual([expect.objectContaining({ allocationId: offer.id })]);
+  expect(await offerState(offer.id)).toBe("validating");
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
 });

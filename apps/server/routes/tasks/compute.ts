@@ -4,7 +4,7 @@ import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../..
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
-import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, readComputeCapacity, requestCompute, scheduleComputeOffers } from "../../services/tasks/compute-admission.ts";
+import { bindComputeResource, claimCompute, ComputeCapacityBlocked, ComputeRequest, declineCompute, readComputeCapacity, requestCompute, scheduleComputeOffers } from "../../services/tasks/compute-admission.ts";
 import { computeEvidenceState } from "../../services/tasks/compute-observation.ts";
 import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-attempt.ts";
 import { developmentProjection } from "../../services/tasks/development-intent.ts";
@@ -70,7 +70,12 @@ computeRoutes.post("/:taskId/compute-claim", async c => {
   try {
     const { offerId, ...request } = parsed.data;
     return c.json(await claimCompute({ prisma: c.get("prisma"), machineId: config.machine, policy: config.compute, config, runtime: c.get("agentRuntime"), taskId: c.req.param("taskId"), offerId, request }));
-  } catch { return c.json({ error: "Compute offer expired, changed or is unavailable; no compute was started", code: "compute_offer_unavailable" }, 409); }
+  } catch (error) {
+    // Accounting is reported with its exact evidence, distinct from an
+    // expired or superseded offer; the reservation itself is retained.
+    if (error instanceof ComputeCapacityBlocked) return c.json({ error: error.message, code: "compute_capacity_blocked", capacity: { slots: error.capacity.slots, usable: error.capacity.usable, occupied: error.capacity.occupied, unaccounted: error.capacity.unaccounted }, blockers: error.blockers }, 409);
+    return c.json({ error: "Compute offer expired, changed or is unavailable; no compute was started", code: "compute_offer_unavailable" }, 409);
+  }
 });
 computeRoutes.post("/:taskId/compute-decline", async c => {
   const parsed = z.object({ offerId: z.string().uuid() }).strict().safeParse(await c.req.json());

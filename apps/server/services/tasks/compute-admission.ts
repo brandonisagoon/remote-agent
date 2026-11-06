@@ -109,6 +109,16 @@ async function unaccounted(store: Store, input: Context): Promise<{ count: numbe
   for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id, `environment ${environment.id} is ${environment.state} without an allocation`);
   return { count: groups.size, blockers: [...groups.values()] };
 }
+/** Accounting, not offer expiry, refused this reservation. Carries the exact
+ * debited groups and held allocations; the reservation itself is retained. */
+export class ComputeCapacityBlocked extends Error {
+  readonly blockers: ComputeCapacity["blockers"];
+  constructor(readonly capacity: Pick<ComputeCapacity, "slots" | "unaccounted" | "occupied" | "usable" | "blockers">) {
+    super(`Compute reservation is unavailable: capacity accounting blocks this claim (${capacity.occupied} held of ${capacity.usable} usable, ${capacity.slots} slots, ${capacity.unaccounted} unaccounted group(s)${capacity.blockers.unaccounted.length ? `: ${capacity.blockers.unaccounted.map(blocker => `${blocker.group} ${blocker.detail}`).join("; ")}` : ""})`);
+    this.blockers = capacity.blockers;
+  }
+}
+type ComputeCapacity = Awaited<ReturnType<typeof computeAdmissionCapacity>>;
 const baselineRefreshes = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
 async function refreshBaseline(input: Context) {
   if (!input.config || !input.runtime) return; // Internal callers without a live observer cannot create baseline credit.
@@ -540,7 +550,7 @@ async function finishComputeValidation(input: ClaimInput, request: z.infer<typeo
       }
       if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
       const capacity = await computeAdmissionCapacity(store, input);
-      if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new Error("Compute reservation is unavailable");
+      if (capacity.occupied + capacity.unaccounted > capacity.slots || capacity.occupied > capacity.usable) throw new ComputeCapacityBlocked(capacity);
       const claimed = await store.computeOffer.update({ where: { id: offer.id }, data: { state: "claimed", claimedAt: at(input), validationToken: null, validationExpiresAt: null } });
       await store.computeWait.deleteMany({ where: { environmentId: environment.id } });
       const updated = await store.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting" } });
