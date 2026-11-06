@@ -19,7 +19,7 @@ import { testConfig } from "../test-support/config.ts";
 import type { AppEnv } from "../apps/server/middleware/context.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/routes/tasks/tooling-operations.ts";
 import { SERVER_INSTANCE, TOOLING_OPERATION_HEADER } from "../apps/server/services/tasks/tooling-operations.ts";
-import { activateToolingRelease, canonicalDigest } from "../apps/server/services/tasks/tooling-releases.ts";
+import { activateToolingRelease, canonicalDigest, transitionToolingOperation } from "../apps/server/services/tasks/tooling-releases.ts";
 import { recoverInterruptedCallbacks } from "../apps/server/services/tasks/tooling-callback-recovery.ts";
 import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
@@ -234,3 +234,45 @@ test("an interrupted claim (another route) becomes unknown at boot but is NOT re
   // Offers, admissions and readers are untouched by recovery.
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: "offer-a" } })).state).toBe("offered");
 });
+
+test("a status or history change racing the repair is refused under the write lock: nothing is appended to a changed, bound or completed row", async () => {
+  const complete = (operationId: string, from: "running" | "unknown") => transitionToolingOperation({ prisma: db.prisma, operationId, from, to: "completed", evidence: { kind: "racing-settlement", reference: "race" } });
+  // (a) running -> completed between proof and repair.
+  {
+    const f = await fixture();
+    await crashingServer(f.child.operationId, "compute-request", computeBody, "intent");
+    const history = await f.records();
+    const report = await recoverInterruptedCallbacks({ prisma: db.prisma, hooks: { beforeRepair: async id => { await complete(id, "running"); } } });
+    expect(report).toEqual({ repaired: [], blocked: [{ operationId: f.child.operationId, reason: "operation is no longer running" }] });
+    expect(await f.status()).toBe("completed");
+    expect(await f.records()).toEqual(history);
+  }
+  // (b) a new attempt record appears between proof and repair (simulated concurrent attempt).
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const f = await fixture();
+    await crashingServer(f.child.operationId, "compute-request", computeBody, "intent");
+    const report = await recoverInterruptedCallbacks({ prisma: db.prisma, hooks: { beforeRepair: async id => {
+      await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `outcome:${id}`,
+        value: JSON.stringify({ version: 1, operationId: id, role: "outcome", state: "intent", attemptId: crypto.randomUUID(), route: "POST /api/tasks/:taskId/compute-request", inputDigest: canonicalDigest(computeBody), requestKey: "racing", status: null, server: SERVER_INSTANCE }) } });
+    } } });
+    expect(report.blocked).toEqual([{ operationId: f.child.operationId, reason: "attempt history changed during recovery" }]);
+    expect(await f.status()).toBe("running");
+    expect((await f.records()).filter(value => value.state === "unknown")).toHaveLength(0);
+  }
+  // (c) unknown + a missing result: the row completes between proof and repair; no result is appended to it.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const f = await fixture();
+    await crashingServer(f.child.operationId, "compute-request", computeBody, "unknown-result");
+    expect((await recoverInterruptedCallbacks({ prisma: db.prisma })).repaired).toHaveLength(1);
+    expect(await f.status()).toBe("unknown");
+    await crashingServer(f.child.operationId, "compute-request", computeBody, "intent"); // a second server dies on the unknown operation
+    expect(await f.status()).toBe("unknown");
+    const history = await f.records();
+    const report = await recoverInterruptedCallbacks({ prisma: db.prisma, hooks: { beforeRepair: async id => { await complete(id, "unknown"); } } });
+    expect(report).toEqual({ repaired: [], blocked: [{ operationId: f.child.operationId, reason: "operation is no longer unknown" }] });
+    expect(await f.status()).toBe("completed");
+    expect(await f.records()).toEqual(history);
+  }
+}, 60_000);

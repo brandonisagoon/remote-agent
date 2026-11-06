@@ -20,6 +20,14 @@ import { markToolingOperationInterrupted } from "./tooling-releases.ts";
  * Nothing is replayed, no success is inferred, and admission, producer,
  * consumer, offer, slot and instruction records are never touched; an
  * unknown operation recovers only through its existing reconciliation.
+ *
+ * Limitations (blocked with a diagnosis, never "recovered"): process identity
+ * is the per-boot random nonce plus PID and os.hostname(). A PID that is live
+ * again (reused), equal to this process's PID, or uncertain (e.g. EPERM)
+ * stays blocked, since the start time is not stamped; a renamed or different
+ * host stays blocked. No platform boot ID or configured machine label is used
+ * as host proof. Intents written before stamping have no stamp and stay
+ * blocked.
  */
 export type PidState = "exited" | "alive" | "uncertain";
 export const probePid = (pid: number): PidState => {
@@ -34,7 +42,10 @@ export type CallbackRecoveryReport = {
 };
 const PAGE = 200, OPERATION_BOUND = 10_000;
 
-export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient; current?: Instance; probe?: (pid: number) => PidState }): Promise<CallbackRecoveryReport> {
+/** Test seam only (the server never passes it): runs after an operation's
+ * proof and before its repair transaction, to exercise racing changes. */
+type RecoveryHooks = { beforeRepair?: (operationId: string) => Promise<void> };
+export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient; current?: Instance; probe?: (pid: number) => PidState; hooks?: RecoveryHooks }): Promise<CallbackRecoveryReport> {
   const current = input.current ?? SERVER_INSTANCE, probe = input.probe ?? probePid;
   const report: CallbackRecoveryReport = { repaired: [], blocked: [] };
   let cursor: string | undefined, seen = 0;
@@ -43,7 +54,7 @@ export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient;
     for (const operation of page) {
       if (++seen > OPERATION_BOUND) { report.blocked.push({ operationId: operation.id, reason: `more than ${OPERATION_BOUND} open operations; recovery stopped here` }); return report; }
       try {
-        const outcome = await recoverOperation(input.prisma, operation, current, probe);
+        const outcome = await recoverOperation(input.prisma, operation, current, probe, input.hooks ?? {});
         if (outcome && "reason" in outcome) report.blocked.push({ operationId: operation.id, reason: outcome.reason });
         else if (outcome) report.repaired.push({ operationId: operation.id, attempts: outcome.attempts, status: "unknown" });
       } catch (error) { report.blocked.push({ operationId: operation.id, reason: error instanceof Error ? error.message : String(error) }); }
@@ -54,7 +65,7 @@ export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient;
 }
 
 type Operation = { id: string; status: string; sessionId: string; taskId: string; inputDigest: string };
-async function recoverOperation(prisma: PrismaClient, operation: Operation, current: Instance, probe: (pid: number) => PidState): Promise<{ reason: string } | { attempts: string[] } | null> {
+async function recoverOperation(prisma: PrismaClient, operation: Operation, current: Instance, probe: (pid: number) => PidState, hooks: RecoveryHooks): Promise<{ reason: string } | { attempts: string[] } | null> {
   const records = await attemptRecords(prisma, operation, operation.id); // overflow throws: blocked
   const malformed = records.find(record => !record.value);
   if (malformed) return { reason: `malformed attempt record ${malformed.sequence}` };
@@ -89,14 +100,17 @@ async function recoverOperation(prisma: PrismaClient, operation: Operation, curr
     if (state !== "exited") return { reason: `attempt ${intent.attemptId} server PID ${stamp.data.pid} is ${state}` };
     evidence.push(`interrupted-by-restart:${stamp.data.instance}:${stamp.data.pid}:recovered-by:${current.instance}:${current.pid}`);
   }
+  await hooks.beforeRepair?.(operation.id);
   await prisma.$transaction(async tx => {
-    // Under the write lock (first write below): the history and status must be
-    // exactly what was proven; anything else rolls back.
-    const latest = await tx.toolingOperation.findUnique({ where: { id: operation.id } });
-    if (!latest || latest.status !== operation.status) throw new Error(`operation is now ${latest?.status ?? "missing"}`);
-    for (const [index, intent] of resultless.entries()) await recordInterruptedAttempt(tx, operation, intent, evidence[index]!);
+    // FIRST statement: a compare-and-swap write guarding the observed status
+    // (running or unknown). It takes the write lock before anything is
+    // checked, so a row that became bound/completed (or changed at all) is
+    // never appended to; then the history must be exactly what was proven.
+    const guarded = await tx.toolingOperation.updateMany({ where: { id: operation.id, status: operation.status }, data: { status: operation.status } });
+    if (guarded.count !== 1) throw new Error(`operation is no longer ${operation.status}`);
     const again = await attemptRecords(tx, operation, operation.id);
-    if (again.length !== records.length + resultless.length || again.slice(resultless.length).some((record, index) => record.sequence !== records[index]!.sequence)) throw new Error("attempt history changed during recovery");
+    if (again.length !== records.length || again.some((record, index) => record.sequence !== records[index]!.sequence)) throw new Error("attempt history changed during recovery");
+    for (const [index, intent] of resultless.entries()) await recordInterruptedAttempt(tx, operation, intent, evidence[index]!);
     if (operation.status === "running") await markToolingOperationInterrupted(tx, { operationId: operation.id });
   });
   return { attempts: candidates.map(intent => intent.attemptId) };
