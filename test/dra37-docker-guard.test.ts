@@ -25,7 +25,7 @@ else if (command === "network" && sub === "ls") console.log(Object.keys(stub.net
 else if (command === "network" && sub === "inspect") for (const id of args.slice(4)) console.log(JSON.stringify(id) + "\\t" + JSON.stringify((stub.networks ?? {})[id] ?? null));
 else if (command === "network" && sub === "create") console.log(stub.networkId);
 else if (command === "volume" && sub === "create") console.log(stub.volumeOutput ?? args.at(-1));
-else if (command === "create") console.log(stub.createOutput);
+else if (command === "create") { if (stub.createDelayMs) Bun.sleepSync(stub.createDelayMs); console.log(stub.createOutput); }
 else if (command === "container" && sub === "ls") console.log(stub.listing ?? "");
 else if (command === "stop") console.log(args.at(-1));
 else { console.error("stub: unmodelled " + args.join(" ")); process.exit(3); }
@@ -186,6 +186,22 @@ test("create labels: exactly one registered fixture task (opaque generated IDs i
   refused(guard("volume", "create", "--label", "dev.drafted.task=someone-else", "drafted-d-222222222222222222222222-dependencies"), /is not a registered fixture task/);
   refused(guard("create", "--name", "drafted-d-333333333333333333333333-app", "--network", NETWORK, "--label", "dev.drafted.task=someone-else", IMAGE), /is not a registered fixture task/);
   refused(guard("create", "--name", "drafted-d-333333333333333333333333-app", "--network", NETWORK, "--label", `dev.drafted.task=${GENERATED}`, "--label", "dev.drafted.task=dra37-first", IMAGE), /got 2/);
+}, 60_000);
+
+test("a create abandoned by its caller (SIGTERM, as Drafted's 5 s deadline does) is still ledgered with its exact ID", async () => {
+  const { root, worktree, ledger, setStub } = fixture();
+  setStub({ createOutput: "e".repeat(64), createDelayMs: 1_500 });
+  const policy = path.join(root, "policy.json");
+  const child = Bun.spawn([process.execPath, "--no-env-file", path.join(import.meta.dir, "dra37-docker-guard.ts"), policy, "create", "--name", DRAFTED_APP, "--network", NETWORK,
+    "--label", "dev.drafted.task=dra37-first", "--mount", `type=bind,source=${worktree},target=/workspace`, IMAGE, "bun"], { stdout: "pipe", stderr: "pipe" });
+  const calls = () => readFileSync(path.join(root, "calls.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line) as Record<string, unknown>);
+  const deadline = Date.now() + 20_000;
+  while (!existsSync(path.join(root, "calls.jsonl")) || !calls().some(call => call.args)) { if (Date.now() > deadline) throw new Error("guard never forwarded"); await Bun.sleep(25); }
+  child.kill("SIGTERM");
+  expect(await child.exited).toBe(0);
+  expect(ledger().at(-1)).toMatchObject({ kind: "container", id: "e".repeat(64), name: `${PREFIX}-${DRAFTED_APP}`, task: "dra37-first" });
+  expect(calls().some(call => call.signal === "SIGTERM-deferred-until-ledgered")).toBe(true);
+  expect(calls().find(call => call.done)).toMatchObject({ code: 0, abandonedByCaller: true });
 }, 60_000);
 
 test("malformed create output and implicit image volumes fail closed without ledgering", () => {

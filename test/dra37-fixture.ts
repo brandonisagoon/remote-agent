@@ -125,6 +125,9 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   const apps = path.join(root, "apps"), state = path.join(root, "state"), bin = path.join(root, "bin");
   // Fixture-owned task IDs the Docker guard accepts in dev.drafted.task labels.
   const tasksFile = path.join(root, "docker-tasks.jsonl");
+  // Test-only barriers (absent = no effect): the observer's Docker calls and
+  // the synthetic primary's compute-offer turns.
+  const observerHoldFile = path.join(root, "observer-hold"), agentBarrierFile = path.join(apps, "agent-offer-barrier");
   await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
   // SYNTHETIC Docker CLI, first on the server's PATH only, for Drafted's
   // actual observer (see dra37-docker.ts). The app it reports is real.
@@ -144,7 +147,19 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     };
     real = { docker, prefix: `dra37fx-${path.basename(root).replace(/^dra37-/, "").toLowerCase()}`, images: { app: imageId(REAL_IMAGES.app), proxy: imageId(REAL_IMAGES.proxy) },
       ledger: path.join(root, "docker-ledger.jsonl"), policy: path.join(root, "docker-policy.json") };
-    await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl"), tasks: tasksFile }), { mode: 0o600 });
+    // Read once, read-only: each recorded image's declared volumes and the OS
+    // ephemeral port range, so a guarded create spawns nothing extra.
+    const imageVolumes = Object.fromEntries(Object.values(real.images).map(id => {
+      const result = Bun.spawnSync([docker, "image", "inspect", "--format", "{{json .Config}}", id], { stdout: "pipe", stderr: "pipe" });
+      if (result.exitCode) throw new Error(`Cannot read the recorded image ${id}`);
+      const config = JSON.parse(result.stdout.toString()) as { Volumes?: Record<string, unknown> | null };
+      return [id, Object.keys(config.Volumes ?? {})];
+    }));
+    const sysctl = (key: string) => Number(Bun.spawnSync(["/usr/sbin/sysctl", "-n", key], { stdout: "pipe" }).stdout.toString().trim());
+    const ephemeral = process.platform === "darwin" ? [sysctl("net.inet.ip.portrange.first"), sysctl("net.inet.ip.portrange.last")]
+      : readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/).map(Number);
+    await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), imageVolumes, ephemeral, ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl"), tasks: tasksFile,
+      holdFile: observerHoldFile, holdCwd: path.join(root, "install", "tooling"), holdMaxMs: 300_000 }), { mode: 0o600 });
     await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
       `process.argv.splice(2, 0, ${JSON.stringify(real.policy)});`,
       `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker-guard.ts"))});`, ""].join("\n"), { mode: 0o700 });
@@ -205,6 +220,10 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     registeredTasks(): string[] {
       return existsSync(tasksFile) ? readFileSync(tasksFile, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { taskId: string }).taskId) : [];
     },
+    /** Block (or release) the server-spawned observer's Docker calls. */
+    async holdObserver(on: boolean) { if (on) await writeFile(observerHoldFile, new Date().toISOString(), { mode: 0o600, flag: "wx" }); else await rm(observerHoldFile); },
+    /** Hold (or release) the synthetic primary's compute-offer turns. */
+    async holdAgentOffers(on: boolean) { if (on) await writeFile(agentBarrierFile, new Date().toISOString(), { mode: 0o600, flag: "wx" }); else await rm(agentBarrierFile); },
     /** Owner request over the isolated loopback TCP listener (bearer). */
     async request(route: string, init: RequestInit = {}) {
       return fetch(`${url}${route}`, { ...init, redirect: "error", signal: init.signal ?? AbortSignal.timeout(120_000),
@@ -279,7 +298,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       child = Bun.spawn([process.execPath, ...(options.decision ? ["--preload", options.decision.preload] : []), "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
           ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}), ...(options.relay === false ? { DRA37_RELAY: "0" } : {}),
-          ...(real ? { DRA37_DOCKER_MODE: "real" } : {}),
+          ...(real ? { DRA37_DOCKER_MODE: "real" } : {}), DRA37_AGENT_BARRIER: agentBarrierFile,
           ...(options.decision ? { DRA37_DECISION_DIRECTORY: decision } : {}),
           ...(options.cli ? { DRA37_AGENT_MODE: "cli", DRA37_PRELOAD: options.cli.preload, DRA37_BIN: bin, DRA37_STATE: state, DRA37_PLANETSCALE_DIRECTORY: planetscale, DRA37_RECIPE_FILE: cliRecipe, DRA37_TASKS_FILE: tasksFile } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {

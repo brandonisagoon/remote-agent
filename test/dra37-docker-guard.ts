@@ -10,6 +10,8 @@
  *   private fixture network (Drafted's NGINX reaches the app by name).
  * - Every command is parsed with an exact option grammar (allowlist). Any
  *   unknown option, command or target is refused.
+ * - Optional test-only collection barrier (policy.holdFile/holdCwd): blocks
+ *   the server-spawned observer's Docker calls, bounded, without answering.
  * - Every create carries exactly one dev.drafted.task label naming a task the
  *   fixture registered (policy.tasks), at most one valid purpose label and
  *   at most one operation label; task and operation labels are ledgered.
@@ -42,10 +44,20 @@
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
 import { readEngineSubnets, selectFixtureSubnet } from "./dra37-subnet.ts";
 
-type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string; tasks: string };
+type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string; tasks: string;
+  /** Test-only collection barrier: while `holdFile` exists, calls whose cwd is
+   * inside `holdCwd` (the server-spawned observer runs from the prepared
+   * tooling checkout) wait, bounded by `holdMaxMs`, before reaching Docker. */
+  holdFile?: string; holdCwd?: string; holdMaxMs?: number;
+  /** Read once by the fixture at setup (read-only): each recorded image's
+   * declared Config.Volumes and the OS ephemeral port range, so a create
+   * needs no extra engine/OS spawn (callers such as Drafted's computeDocker
+   * kill a command after 5 s). Absent = read per call. */
+  imageVolumes?: Record<string, string[]>; ephemeral?: [number, number] };
 const policy = JSON.parse(readFileSync(process.argv[2]!, "utf8")) as Policy;
 const root = realpathSync(policy.root);
 const raw = process.argv.slice(3);
+const guardStartedAt = Date.now();
 const log = (entry: object) => appendFileSync(policy.log, JSON.stringify({ at: Date.now(), ...entry }) + "\n");
 function refuse(reason: string): never { log({ refused: reason, args: raw }); console.error(`dra37 docker guard refused: ${reason}`); process.exit(125); }
 
@@ -128,6 +140,7 @@ const rest = args.slice(isContainerVerb ? 2 : 1);
 let created: Entry["kind"] | null = null, createdName = "", createdPublished: number[] = [], createdLabels: { task?: string; operation?: string } = {};
 /** The OS ephemeral port range (macOS sysctl, Linux procfs); unknown means refuse. */
 function ephemeralRange(): [number, number] {
+  if (policy.ephemeral) return policy.ephemeral;
   if (process.platform === "darwin") {
     const read = (key: string) => Number(Bun.spawnSync(["/usr/sbin/sysctl", "-n", key], { stdout: "pipe" }).stdout.toString().trim());
     return [read("net.inet.ip.portrange.first"), read("net.inet.ip.portrange.last")];
@@ -216,14 +229,18 @@ else if (command === "exec") {
   if (new Set(targets).size !== targets.length) refuse("duplicate mount targets are not allowed");
   // The immutable image must not make Docker create an anonymous volume:
   // every declared image volume must be covered by an owned mount above.
-  const image = Bun.spawnSync([policy.docker, "image", "inspect", "--format", "{{json .Config}}", positionals[0]!], { stdout: "pipe", stderr: "pipe" });
-  if (image.exitCode !== 0) refuse(`image inspect of ${positionals[0]} failed; anonymous volumes cannot be ruled out`);
   let declared: string[] = [];
-  try {
-    const config = JSON.parse(image.stdout.toString()) as { Volumes?: Record<string, unknown> | null };
-    if (config === null || typeof config !== "object") throw new Error("not an object");
-    declared = Object.keys(config.Volumes ?? {});
-  } catch { refuse(`image config for ${positionals[0]} is malformed; anonymous volumes cannot be ruled out`); }
+  const recorded = policy.imageVolumes?.[positionals[0]!];
+  if (recorded) declared = recorded;
+  else {
+    const image = Bun.spawnSync([policy.docker, "image", "inspect", "--format", "{{json .Config}}", positionals[0]!], { stdout: "pipe", stderr: "pipe" });
+    if (image.exitCode !== 0) refuse(`image inspect of ${positionals[0]} failed; anonymous volumes cannot be ruled out`);
+    try {
+      const config = JSON.parse(image.stdout.toString()) as { Volumes?: Record<string, unknown> | null };
+      if (config === null || typeof config !== "object") throw new Error("not an object");
+      declared = Object.keys(config.Volumes ?? {});
+    } catch { refuse(`image config for ${positionals[0]} is malformed; anonymous volumes cannot be ruled out`); }
+  }
   const uncovered = declared.filter(volume => !targets.includes(volume));
   if (uncovered.length) refuse(`image ${positionals[0]} would create untracked anonymous volume(s) ${uncovered.join(", ")}`);
   // Keep Drafted's original name as an alias on the private fixture network.
@@ -232,11 +249,28 @@ else if (command === "exec") {
   created = "container"; createdName = name!;
 } else refuse(`unmodelled command ${command} ${sub ?? ""}`);
 
+if (policy.holdFile && policy.holdCwd && process.cwd().startsWith(`${policy.holdCwd}/`) && existsSync(policy.holdFile)) {
+  // Blocks the actual observer process (it waits on this Docker call); this
+  // never answers for Docker and never fabricates a result.
+  const heldAt = Date.now(), bound = heldAt + (policy.holdMaxMs ?? 300_000);
+  log({ hold: "start", pid: process.pid, ppid: process.ppid, args: args.slice(0, 3), cwd: process.cwd() });
+  // The caller may abandon a held call (Drafted kills Docker commands after
+  // 5 s): record that exactly and exit without reaching Docker.
+  process.on("SIGTERM", () => { log({ hold: "abandoned", pid: process.pid, waitedMs: Date.now() - heldAt }); process.exit(143); });
+  while (existsSync(policy.holdFile) && Date.now() < bound) await Bun.sleep(200);
+  process.removeAllListeners("SIGTERM");
+  log({ hold: existsSync(policy.holdFile) ? "bound-expired" : "released", pid: process.pid, waitedMs: Date.now() - heldAt });
+}
 // The caller's checkout (cwd) and bound tooling operation, so evidence shows
 // which release a server-run observer or CLI command executed from.
-log({ args, cwd: process.cwd(), operation: process.env.REMOTE_AGENT_TOOLING_OPERATION ?? null, ...(created ? { labels: createdLabels } : {}) });
+log({ args, cwd: process.cwd(), operation: process.env.REMOTE_AGENT_TOOLING_OPERATION ?? null, ...(created ? { labels: createdLabels } : {}), guardMs: Date.now() - guardStartedAt });
+// A forwarded create must reach the ledger even if the caller gives up on
+// this process (SIGTERM): defer termination until the ID is durably recorded.
+let abandoned = false;
+if (created) process.on("SIGTERM", () => { abandoned = true; log({ signal: "SIGTERM-deferred-until-ledgered", name: createdName }); });
 const child = Bun.spawn([policy.docker, ...args], { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
 const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+log({ done: args.slice(0, 2), code, totalMs: Date.now() - guardStartedAt, ...(abandoned ? { abandonedByCaller: true } : {}) });
 if (code !== 0) log({ exit: code, command: args.slice(0, 3), stderr: stderr.slice(-1_500) });
 if (code === 0 && created) {
   const id = stdout.trim();
@@ -245,6 +279,6 @@ if (code === 0 && created) {
   // Durable before the caller can act on the new object.
   record({ kind: created, id, name: createdName, ...createdLabels, ...(createdPublished.length ? { published: createdPublished } : {}) });
 }
-process.stderr.write(stderr);
-process.stdout.write(outbound(stdout));
+// The caller may have gone away; the ledger write above is what matters.
+try { process.stderr.write(stderr); process.stdout.write(outbound(stdout)); } catch { /* caller closed its pipes */ }
 process.exit(code);

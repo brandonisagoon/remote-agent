@@ -106,6 +106,14 @@ for await (const line of createInterface({ input: process.stdin })) {
     const text: string = params.prompt?.map((part: { text?: string }) => part.text ?? "").join("") ?? "";
     audit({ event: "prompt", text: text.slice(0, 400) });
     const offer = /--compute-offer ([0-9a-f-]{36})/.exec(text)?.[1] ?? /\(offer ([0-9a-f-]{36})\)/.exec(text)?.[1];
+    if (offer && process.env.DRA37_AGENT_BARRIER && existsSync(process.env.DRA37_AGENT_BARRIER)) {
+      // Test-only delayed response: this delivered offer turn stays in
+      // progress (no claim, no answer) until the fixture releases it.
+      const heldAt = Date.now();
+      audit({ event: "offer-held", offerId: offer });
+      while (existsSync(process.env.DRA37_AGENT_BARRIER) && Date.now() - heldAt < 600_000) await Bun.sleep(200);
+      audit({ event: "offer-released", offerId: offer, waitedMs: Date.now() - heldAt });
+    }
     if (process.env.DRA37_AGENT_MODE === "cli") await cliTurn(text).catch(error => audit({ event: "cli-error", error: String(error).slice(0, 2_000) }));
     else if (offer && process.env.DRA37_DRAFTED_ROOT) await runtimeTurn(offer).catch(error => audit({ event: "runtime-error", offerId: offer, error: String(error) }));
     else if (offer) await claim(offer).catch(error => audit({ event: "claim-error", offerId: offer, error: String(error) }));
