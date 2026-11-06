@@ -21,6 +21,9 @@ computeRoutes.get("/:taskId/compute-neon-recovery/:operationId", async c => {
     const owned = await readSessionToolingOperation({ prisma, sessionId: task.primarySessionId, operationId: c.req.param("operationId") });
     if (!owned || owned.binding.taskId !== task.id || owned.binding.kind !== "compute-neon-recovery") return c.json({ error: "No such recovery operation for this task" }, 404);
     const result = await readCommittedNeonRecovery(prisma, owned.binding);
+    // The internal verifier also runs before completion inside the writer's
+    // transaction. A public read must see the atomic commit's completed row.
+    if (result && owned.binding.status !== "completed") throw new NeonRecoveryResultUnverifiable("event-mismatch", "Committed recovery has no completed operation");
     return c.json(result?.committed ?? null);
   } catch (error) {
     return c.json({ error: "The stored recovery result could not be verified", code: "neon-recovery-result-unverifiable",
