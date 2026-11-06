@@ -485,3 +485,42 @@ test("state scopes follow the fence, pause withholds receipts, and post-registra
   expect(outcome.code).toBe("state-write-outcome-unknown");
   expect(await records()).toBe(1);
 });
+
+test("an HTTP refusal never resolves a producing reader; only exact never-claimed proof does", async () => {
+  const { config } = await fixture();
+  await environment("env-1", computeBody.key); await bootstrap([]);
+  await db.prisma.toolingRelease.create({ data: { id: "release-v2", repositoryId: "repo", revision: "2".repeat(40), tree: "3".repeat(40), policyBlob: "f".repeat(40), checkout: "/install/v2",
+    manifest: { ...manifest, stateFormats: { "drafted.runtime": { read: [1, 2], write: 2, preservesUnknown: true } } }, lockfileDigest: "0".repeat(64), bunVersion: "1.3.0" } });
+  const readers = (status?: string) => db.prisma.toolingRetainedConsumer.findMany({ where: { consumerId: "env-1", ...(status ? { status } : {}) } });
+  let bindStatus = 409;
+  const { call } = app(config, pathname => pathname.endsWith("compute-bind") ? { status: bindStatus } : pathname.endsWith("compute-claim") ? { status: 409 } : {});
+  // A claim refused while its offer was never claimed and is withdrawn: no start authority existed.
+  const refused = (await begin(config, { requestKey: "refused", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).binding;
+  expect((await call("/api/tasks/task/compute-request", computeBody, refused.operationId)).status).toBe(200);
+  await offer("withdrawn", "env-1"); await db.prisma.computeOffer.update({ where: { id: "withdrawn" }, data: { state: "expired" } });
+  expect((await call("/api/tasks/task/compute-claim", { ...computeBody, offerId: "withdrawn" }, refused.operationId)).status).toBe(409);
+  expect((await readers()).map(row => [row.status, (row.resolution as { kind?: string } | null)?.kind])).toEqual([["resolved", "claim-not-granted"]]);
+  // A real start: the claim's reader is pending before the physical effect.
+  const producer = (await begin(config, { requestKey: "start", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).binding;
+  expect((await call("/api/tasks/task/compute-request", computeBody, producer.operationId)).status).toBe(200);
+  await offer("offer-1", "env-1");
+  await call("/api/tasks/task/compute-claim", { ...computeBody, offerId: "offer-1" }, producer.operationId); // handler refused after its claim committed
+  await db.prisma.computeOffer.update({ where: { id: "offer-1" }, data: { state: "claimed", claimedAt: new Date() } });
+  // The adapter started the resource; bind then returns 409 (or its reply is lost).
+  expect((await call("/api/tasks/task/compute-bind", { offerId: "offer-1", resourceKey: "runtime" }, producer.operationId)).status).toBe(409);
+  expect((await readers("pending")).map(row => row.operationId)).toEqual([producer.operationId]);
+  await activate("release-v2", 2);
+  const migration = (await begin(config, { requestKey: "migrate", inputDigest: canonicalDigest({ argv: ["migrate"] }), kind: "adapter-command" })).binding;
+  const migrate = () => call(`/api/sessions/primary/tooling-operations/${migration.operationId}/state-writes`, { family: "drafted.runtime", scopeKey: "task", version: 2 }, migration.operationId);
+  expect(await (await migrate()).json()).toMatchObject({ code: "deferred" });
+  // A verified bind retry confirms; only stopped proof releases the migration.
+  bindStatus = 200;
+  expect((await call("/api/tasks/task/compute-bind", { offerId: "offer-1", resourceKey: "runtime" }, producer.operationId)).status).toBe(200);
+  expect((await readers("confirmed")).map(row => row.operationId)).toEqual([producer.operationId]);
+  expect((await migrate()).status).toBe(409);
+  await resolveEnvironmentConsumers(db.prisma, "env-1", { kind: "stopped", reference: "env-1" });
+  // The refused claim's own operation is still an unfinished A reader.
+  expect(await (await migrate()).json()).toMatchObject({ code: "deferred", error: expect.stringContaining(refused.operationId) });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: refused.operationId, from: "running", to: "completed", evidence: { kind: "compute-decline", reference: "withdrawn" } });
+  expect((await migrate()).status).toBe(200);
+});

@@ -114,6 +114,9 @@ export interface ToolingCallback {
   admits?: (body: Body) => string | null;
   /** Environments whose producer becomes this operation once confirmed. */
   produces?: (body: Body, context: CallbackContext) => Promise<string[]>;
+  /** Environments that may gain a physical reader through this callback's
+   * authority: a pending retained reader is recorded before it runs. */
+  retains?: (body: Body, context: CallbackContext) => Promise<string[]>;
   /** Existing protocol evidence that completes the operation on success. */
   completes?: (body: Body) => { kind: string; reference: string } | null;
 }
@@ -156,7 +159,7 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
   { route: "POST /api/tasks/:taskId/compute-request", method: "POST", path: taskPath("compute-request"), scope: "task", kind: "compute-admission",
     input: body => body, admits: body => text(body.key) },
   { route: "POST /api/tasks/:taskId/compute-claim", method: "POST", path: taskPath("compute-claim"), scope: "task", kind: "compute-admission",
-    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "offerId")), reference: offer, referenceRule: "admission" },
+    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "offerId")), reference: offer, referenceRule: "admission", retains: offerProducer },
   { route: "POST /api/tasks/:taskId/compute-decline", method: "POST", path: taskPath("compute-decline"), scope: "task", kind: "compute-admission",
     input: () => undefined, reference: offer, referenceRule: "admission", completes: body => text(body.offerId) ? { kind: "compute-decline", reference: body.offerId as string } : null },
   // A bound resource is the confirmed start: only now does the producer move.
@@ -486,10 +489,10 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
   // callback completion: DRA-28 registration defers incompatible writes while
   // it is live, until replacement, no-effect, stopped or absent evidence.
   const consumers: string[] = [];
-  for (const environmentId of produced) {
-    await recordAssociation(prisma, binding, "producer", `compute-environment:${environmentId}`, "intent");
+  for (const environmentId of produced) await recordAssociation(prisma, binding, "producer", `compute-environment:${environmentId}`, "intent");
+  const retained = binding.status === "completed" ? [] : [...new Set([...produced, ...await callback.retains?.(body, context) ?? []])];
+  for (const environmentId of retained)
     consumers.push((await retainToolingConsumer({ prisma, operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId, scopeKey: binding.resourceKey ?? "task" })).id);
-  }
   await assertBindingAuthority({ prisma, config, binding });
   return { binding, produced, consumers };
 }
@@ -501,13 +504,15 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
   const ok = typeof status === "number" && status >= 200 && status < 300, refused = typeof status === "number" && status >= 400 && status < 500;
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
-  // Confirm with the callback's own protocol evidence (superseding an older
-  // producer's reader); a refused callback had no effect; an unknown outcome
-  // keeps the reader pending.
-  const proof = admission.callback.completes?.(admission.body);
+  // An HTTP status never proves absence: a bind/configure follows the
+  // physical start, and a handler may commit before refusing. Readers are
+  // confirmed only by the producing callback's verified result (which also
+  // replaces this lineage's earlier pending reader), resolved only by exact
+  // domain proof, and otherwise stay pending.
+  const proof = admission.callback.produces ? admission.callback.completes?.(admission.body) : null;
   for (const id of state.consumers ?? []) {
-    if (ok && proof) await confirmToolingConsumer({ prisma, id, evidence: proof });
-    else if (refused) await resolveToolingConsumer({ prisma, id, evidence: { kind: "no-effect", reference: `http-${status}` } });
+    if (ok && proof) await confirmProducingReader(prisma, id, proof, state.binding, dependencies.read);
+    else if (admission.callback.retains) await resolveIfClaimNotGranted(prisma, id, admission.body);
   }
   const current = await dependencies.read({ prisma, operationId: state.binding.operationId });
   if (!current) return;
@@ -901,4 +906,22 @@ export async function resolveEnvironmentConsumers(prisma: PrismaClient, environm
   if (live.length > 100) throw new Error(`Retained readers of environment ${environmentId} exceed their bound`);
   for (const row of live) await resolveToolingConsumer({ prisma, id: row.id, evidence });
   return live.length;
+}
+
+/** Confirm a producing reader and replace this lineage's earlier pending
+ * readers of the same environment (e.g. its claim's), which it supersedes. */
+async function confirmProducingReader(prisma: PrismaClient, id: string, evidence: { kind: string; reference: string }, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) {
+  const confirmed = await confirmToolingConsumer({ prisma, id, evidence });
+  const pending = await prisma.toolingRetainedConsumer.findMany({ where: { taskId: confirmed.taskId, consumerKind: confirmed.consumerKind, consumerId: confirmed.consumerId, status: "pending", id: { not: id } }, take: 101 });
+  for (const row of pending) if (await sameLineage(prisma, row.operationId, binding, read)) await resolveToolingConsumer({ prisma, id: row.id, evidence: { kind: "replaced", reference: id } });
+}
+/** Exact pre-effect domain proof: the claimed offer is durably withdrawn and
+ * was never claimed, so no start authority existed. Anything else (claimed,
+ * validating, uncertain) keeps the reader pending. */
+async function resolveIfClaimNotGranted(prisma: PrismaClient, id: string, body: Body) {
+  const offerId = text(body.offerId);
+  const row = offerId ? await prisma.computeOffer.findUnique({ where: { id: offerId } }) : null;
+  if (!row || row.claimedAt !== null || !["expired", "declined", "ineligible"].includes(row.state)) return;
+  // Start authority is exactly a durable claim (assertComputeStartIntent).
+  await resolveToolingConsumer({ prisma, id, evidence: { kind: "claim-not-granted", reference: offerId! } });
 }
