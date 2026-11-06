@@ -471,10 +471,12 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         const executionCwd = await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id, requestId });
         const handle = await this.handleFor(session, executionCwd);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
-        await updateRuntimeSessionState(this.prisma, session.id, {
+        // Conditional on the row still being open: a close that landed after
+        // the checks above refuses the turn instead of reviving the session.
+        if (!(await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
-        });
+        }))) throw new Error(`runtime session is closed: ${session.id}`);
         await assertTaskOpen(this.prisma, session.cwd);
         await assertNativeSession(this.prisma, session.id);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
@@ -598,7 +600,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
       queue.close();
       if (!signal.aborted && !(error instanceof CleanupTransportBlockedError)) await this.prisma.runtimeSession.updateMany({
-        where: { id: input.sessionId, status: { not: "closed" } },
+        where: { id: input.sessionId, status: { not: "closed" }, closedAt: null },
         data: { status: "error", recoveryDetail: message },
       }).catch(() => undefined);
     }).finally(() => {

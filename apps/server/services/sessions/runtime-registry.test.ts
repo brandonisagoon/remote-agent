@@ -175,4 +175,48 @@ describe("runtime session registry", () => {
     });
     expect(await listRuntimeLifecycleEvents(database.prisma)).toEqual([]);
   });
+
+  describe("terminal closure", () => {
+    async function session(data: { status: string; closedAt: Date | null }) {
+      database = await createTestDatabase();
+      return database.prisma.runtimeSession.create({ data: { id: "s", scopeKey: "s", agentCommand: "codex", cwd: "/tmp/closure", recoveryDetail: "kept", ...data } });
+    }
+    const row = () => database!.prisma.runtimeSession.findUniqueOrThrow({ where: { id: "s" } });
+    const original = new Date("2026-10-01T12:00:00.000Z");
+
+    for (const [name, data] of [["closed", { status: "closed", closedAt: original }], ["legacy idle with closedAt", { status: "idle", closedAt: original }]] as const) {
+      test(`late nonterminal writes are zero-row no-ops on a ${name} row`, async () => {
+        const before = await session({ ...data });
+        for (const write of [
+          { status: "idle" as const, recoveryDetail: null, agentSessionId: "late" },
+          { status: "error" as const, recoveryDetail: "late failure" },
+          { status: "active" as const },
+          { usage: { used: 1, size: 2 } },
+        ]) expect(await updateRuntimeSessionState(database!.prisma, "s", write)).toBe(false);
+        expect(await row()).toEqual(before);
+        await expect(attachRuntimeSession(database!.prisma, { id: "s", acpxRecordId: "late" })).rejects.toThrow("closed");
+        expect(await row()).toEqual(before);
+      });
+    }
+
+    test("closing again keeps the original closure timestamp", async () => {
+      await session({ status: "idle", closedAt: original });
+      expect(await updateRuntimeSessionState(database!.prisma, "s", { status: "closed", closedAt: new Date(), recoveryDetail: null })).toBe(true);
+      expect(await row()).toMatchObject({ status: "closed", closedAt: original, recoveryDetail: null });
+    });
+
+    test("open rows still accept every transition; reopening and missing rows are refused", async () => {
+      await session({ status: "provisioning", closedAt: null });
+      for (const status of ["idle", "active", "error", "idle"] as const) {
+        expect(await updateRuntimeSessionState(database!.prisma, "s", { status })).toBe(true);
+        expect((await row()).status).toBe(status);
+      }
+      await expect(updateRuntimeSessionState(database!.prisma, "s", { status: "idle", closedAt: null })).rejects.toThrow("closing status");
+      const closedAt = new Date();
+      expect(await updateRuntimeSessionState(database!.prisma, "s", { status: "closed", closedAt })).toBe(true);
+      expect(await row()).toMatchObject({ status: "closed", closedAt });
+      await expect(updateRuntimeSessionState(database!.prisma, "missing", { status: "idle" })).rejects.toThrow();
+      await expect(updateRuntimeSessionState(database!.prisma, "missing", { status: "closed", closedAt })).rejects.toThrow("not found");
+    });
+  });
 });
