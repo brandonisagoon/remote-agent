@@ -61,6 +61,14 @@ export interface BeginToolingOperationRequest {
   resourceKey?: string;
 }
 
+/** Canonical input for one already-owned legacy resource's closed-task
+ * cleanup. The begin request carries its digest and resourceKey=key; this
+ * operation cannot parent callbacks or authorize starts, resumes or migration. */
+export interface ClosedResourceReleaseInput {
+  key: string;
+  action: "reconcile" | "stop" | "release";
+}
+
 /** State API values are evidence for the owning operation and task only.
  * Unknown retained provenance is a 409 refusal, never an empty consumer list. */
 export interface ToolingStateEvidenceResponse {

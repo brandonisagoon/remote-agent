@@ -429,3 +429,45 @@ reconciles using the same operation; it must not withdraw intent on that result.
 
 These seams are under implementation; activation remains disabled until their
 real-route lifecycle and migration acceptance pass.
+
+### Closed legacy resource cleanup compatibility
+
+Baseline comparison confirms a distinct supported path: a closed, unpaused
+legacy task without prepared finalization, cleanupRequired, finalization v2 or
+non-reference retention may still reconcile, stop and release eligible existing
+resources. Its adapter performed those effects and recorded resource receipts;
+closed browser/local-service stop authority and new work were already refused.
+The release protocol must preserve this path without granting a task-wide fence
+or treating closure alone as cleanup permission.
+
+Use operation kind `closed-resource-release` for exactly one existing resource.
+The public begin shape is unchanged: `resourceKey` is required and `inputDigest`
+is the canonical digest of `ClosedResourceReleaseInput {key,action}`. The server
+matches that digest against the three allowed actions for the stored key,
+validates the exact original task/session/repository/source ownership, settled
+family, owner pause, existing receipt and baseline retention restrictions, and
+selects the active immutable release. No parent or existing-operation override
+is accepted. Original resource ownership and all physical cleanup checks remain
+binding; this code selection creates no provider authority.
+
+The client binds immediately before each eligible resource action, including
+manual stop/release/reconcile commands and sequential upkeep. It may use the
+existing settlement endpoint with the same request key/digest and durable
+outcome rules. This operation cannot parent callback operations, start compute,
+resume resources, obtain browser/local-service execution authority, or enter
+finalization. Its only resource update is for the same exact existing key and
+identity. Runtime receipt reads/writes remain format-checked for that resource's
+scope; task-global access and format migration are refused. A cleanup write may
+retain the recorded format version, never raise or rewind it. Unknown effects
+keep their operation and journal for reconciliation.
+
+Prepared-finalization resources retain their existing `finalize:<taskId>`
+lineage. An already-finalized sweep with no eligible effects may return its
+read-only result without opening a fence. It must recheck eligibility before
+any effect rather than turn a stale empty inventory into permission.
+
+DRA-29 owns server kind/admission/receipt/state/settlement enforcement and focused
+real-route regressions; DRA-30 owns the paired per-resource wrapper and client
+regressions. No schema migration or new wire field is required. Root owns this
+contract and independent integration review. Activation remains disabled while
+this compatibility correction and isolated lifecycle acceptance are incomplete.
