@@ -15,7 +15,8 @@ model ToolingRelease {
   @@unique([repositoryId, revision])
 }
 
-/// The active release per repository. `generation` only increases.
+/// The active release per repository. `generation` only increases and only a
+/// successful owner activation changes it; boot never writes it.
 model ToolingSelection {
   repositoryId String   @id
   generation   Int
@@ -24,18 +25,10 @@ model ToolingSelection {
   updatedAt    DateTime @updatedAt
 }
 
-/// A policy-changing (restart-required) activation. At most one per
-/// repository; it blocks other activations and only server boot promotes it.
-model ToolingPendingActivation {
-  repositoryId       String   @id
-  requestKey         String   @unique
-  releaseId          String
-  expectedGeneration Int
-  createdAt          DateTime @default(now())
-}
-
 /// Idempotent owner activation receipts. A key is bound to its complete
 /// request digest and its exact recorded result, even after newer activations.
+/// `outcome` is `activated` or `restart-required` (a rejection that never
+/// changes the selection and is never promoted later).
 model ToolingActivation {
   requestKey         String   @id
   repositoryId       String
@@ -46,7 +39,6 @@ model ToolingActivation {
   outcome            String
   generation         Int
   createdAt          DateTime @default(now())
-  promotedAt         DateTime?
 
   @@index([repositoryId, generation])
 }
@@ -68,10 +60,64 @@ model ToolingOperation {
   releaseId           String
   protocol            Int
   status              String   @default("bound")
+  /// Caller-supplied existing protocol receipt for a completed operation.
+  completionEvidence  Json?
   createdAt           DateTime @default(now())
   updatedAt           DateTime @updatedAt
 
   @@unique([taskId, requestKey])
   @@index([releaseId, status])
+  @@index([repositoryId, status])
+}
+
+/// Actual persisted-state format evidence, registered before the write and
+/// retained after its operation completes. The latest row per task/family/
+/// scope is the version any later reader (including a rollback) must read.
+model ToolingStateWrite {
+  sequence         Int      @id @default(autoincrement())
+  repositoryId     String
+  taskId           String
+  family           String
+  scopeKey         String
+  version          Int
+  preservesUnknown Boolean
+  operationId      String
+  releaseId        String
+  createdAt        DateTime @default(now())
+
+  @@unique([operationId, family, scopeKey, version])
+  @@index([taskId, family, scopeKey, sequence])
+  @@index([repositoryId, family])
+}
+
+/// The first release-aware activation per repository. Written once, inside the
+/// generation-1 activation transaction; later activations never move it.
+model ToolingLegacyBoundary {
+  repositoryId         String   @id
+  activationRequestKey String   @unique
+  legacyRevision       String?
+  recordedAt           DateTime
+}
+
+/// Pre-boundary consumers with their exact original executable/receipt
+/// snapshot, or an explicit `unavailable` provenance. Never inferred later.
+model ToolingLegacyConsumer {
+  id           String   @id
+  repositoryId String
+  taskId       String
+  consumerKind String
+  consumerId   String
+  provenance   String
+  revision     String?
+  checkout     String?
+  receipt      Json?
+  detail       String?
+  status       String   @default("retained")
+  resolution   Json?
+  createdAt    DateTime @default(now())
+  resolvedAt   DateTime?
+
+  @@unique([repositoryId, consumerKind, consumerId])
+  @@index([taskId, status])
   @@index([repositoryId, status])
 }

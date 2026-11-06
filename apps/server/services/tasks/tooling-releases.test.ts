@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -7,10 +7,14 @@ import { readConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { acquirePreparationLock, prepareToolingRelease, verifyPreparedToolingRelease, type PrepareToolingReleaseInput } from "./tooling.ts";
-import { activateToolingRelease, assertBootToolingPolicy, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingOperation } from "./tooling-releases.ts";
+import { activateToolingRelease, assertBootToolingPolicy, assertToolingStateReadable, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary,
+  readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, registerToolingStateWrite, resolveToolingLegacyConsumer, transitionToolingOperation,
+  type ToolingLegacyConsumerInput } from "./tooling-releases.ts";
 
+// Real Git repositories and SQLite fixtures; keep hooks reliable on a loaded host.
+setDefaultTimeout(120_000);
 const REPO = "your-repository";
-let db: TestDatabase, root: string, source: string, config: ServerConfig;
+let db: TestDatabase, root: string, source: string, config: ServerConfig, legacy: ToolingLegacyConsumerInput[];
 const revisions: Record<string, string> = {};
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 const fakeInstall = async (checkout: string) => {
@@ -49,7 +53,10 @@ beforeEach(async () => {
   commit("v2", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1, 2], write: 2, preservesUnknown: true } }) });
   git(source, "checkout", "-q", revisions.B!);
   commit("v2only", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [2], write: 2, preservesUnknown: true } }) });
+  git(source, "checkout", "-q", revisions.B!);
+  commit("noformats", { ".remote-agent-release.json": release({}) });
   git(source, "checkout", "-q", "main");
+  legacy = [];
   const base = testConfig();
   const repository = { ...base.repositories[base.activeRepositoryId]!, id: REPO, tooling: { root: source, revision: revisions.A!, policyBlob: git(source, "rev-parse", `${revisions.A}:.remote-agent.config.json`) } };
   config = testConfig({ installRoot: path.join(root, "install"), repository, repositories: { [REPO]: repository }, activeRepositoryId: REPO });
@@ -57,7 +64,8 @@ beforeEach(async () => {
 afterEach(async () => { await db.cleanup(); rmSync(root, { recursive: true, force: true }); });
 
 const activate = (requestKey: string, name: string, expectedGeneration: number) =>
-  activateToolingRelease({ prisma: db.prisma, config, repositoryId: REPO, requestKey, revision: revisions[name]!, expectedGeneration }, { prepare });
+  activateToolingRelease({ prisma: db.prisma, config, repositoryId: REPO, requestKey, revision: revisions[name]!, expectedGeneration }, { prepare, inventoryLegacyConsumers: async () => legacy });
+const evidence = { kind: "compute-claim", reference: "offer-1" };
 
 async function ownedTask(id = "task-1") {
   await db.prisma.runtimeSession.create({ data: { id: `${id}-primary`, scopeKey: `${id}-scope`, agentCommand: "codex", repositoryId: REPO, machineId: config.machine, role: "primary", cwd: `/tmp/${id}`, status: "idle" } });
@@ -109,37 +117,64 @@ test("install integrity is verified against its receipt", async () => {
   await expect(prepare({ repositoryId: REPO, toolingRoot: source, installRoot: config.installRoot, revision: revisions.A! })).rejects.toThrow("dependencies changed");
 });
 
-test("policy changes require restart and boot promotes them from the exact commit, not the moving ref", async () => {
+test("a policy change is rejected without queuing, and restart never activates it", async () => {
   await activate("k1", "A", 0);
-  await expect(activate("policy", "C", 1)).rejects.toMatchObject({ code: "restart-required", detail: { generation: 2 } });
+  await expect(activate("policy", "C", 1)).rejects.toMatchObject({ code: "restart-required", detail: { generation: 1 } });
   await expect(activate("policy", "C", 1)).rejects.toMatchObject({ code: "restart-required" });
-  await expect(activate("other", "B", 1)).rejects.toMatchObject({ code: "pending-restart" });
-  expect((await getActiveToolingRelease({ prisma: db.prisma, config, repositoryId: REPO }))?.release.revision).toBe(revisions.A!);
-
+  await expect(activate("policy", "B", 1)).rejects.toMatchObject({ code: "request-conflict" });
+  expect((await activate("k2", "B", 1)).generation).toBe(2);
+  const before = await db.prisma.toolingSelection.findMany();
   const selected = await bootToolingSelections({ prisma: db.prisma, configuredRepositoryIds: [REPO] });
-  expect(selected).toEqual({ [REPO]: revisions.C! });
-  expect((await activate("policy", "C", 1)).generation).toBe(2);
+  expect(selected).toEqual({ [REPO]: revisions.B! });
+  expect(await db.prisma.toolingSelection.findMany()).toEqual(before);
 
-  // Restart: the configured ref no longer resolves, yet policy comes from C.
+  // Restart: the configured ref no longer resolves; policy comes from B.
   const file = path.join(root, "remote-agent.config.json");
   const example = JSON.parse(readFileSync(path.join(import.meta.dir, "../../../../remote-agent.config.example.json"), "utf8"));
   example.repositories[REPO] = { ...example.repositories[REPO], root: path.join(root, "product"), tooling: { root: source, ref: "refs/heads/does-not-exist" } };
   writeFileSync(file, JSON.stringify(example));
   const restarted = readConfig(file, { toolingRevisions: selected });
-  expect(restarted.repositories[REPO]!.tooling?.revision).toBe(revisions.C!);
-  expect(restarted.repositories[REPO]!.preparation).toBe("agent");
+  expect(restarted.repositories[REPO]!.tooling?.revision).toBe(revisions.B!);
+  expect(restarted.repositories[REPO]!.preparation).not.toBe("agent");
   await assertBootToolingPolicy({ prisma: db.prisma, config: restarted });
   expect(() => readConfig(file)).toThrow();
+  await expect(activate("policy", "C", 1)).rejects.toMatchObject({ code: "restart-required" });
 });
 
-test("a pending activation whose checkout no longer verifies stays pending", async () => {
+test("boot is read-only and refuses a selected checkout that no longer verifies", async () => {
   await activate("k1", "A", 0);
-  await expect(activate("policy", "C", 1)).rejects.toMatchObject({ code: "restart-required" });
-  writeFileSync(path.join(config.installRoot, "tooling", REPO, revisions.C!, "runtime.md"), "tampered\n");
-  const logs: string[] = [];
-  expect(await bootToolingSelections({ prisma: db.prisma, configuredRepositoryIds: [REPO], log: message => logs.push(message) })).toEqual({ [REPO]: revisions.A! });
-  expect(logs.join("\n")).toContain("remains pending");
-  expect(await db.prisma.toolingPendingActivation.count()).toBe(1);
+  writeFileSync(path.join(config.installRoot, "tooling", REPO, revisions.A!, "runtime.md"), "tampered\n");
+  const before = await db.prisma.toolingSelection.findMany();
+  await expect(bootToolingSelections({ prisma: db.prisma, configuredRepositoryIds: [REPO] })).rejects.toThrow("failed verification");
+  expect(await db.prisma.toolingSelection.findMany()).toEqual(before);
+  expect(await bootToolingSelections({ prisma: db.prisma, configuredRepositoryIds: [] })).toEqual({});
+});
+
+test("first activation atomically records a stable boundary and exact legacy inventory", async () => {
+  await expect(activateToolingRelease({ prisma: db.prisma, config, repositoryId: REPO, requestKey: "k0", revision: revisions.A!, expectedGeneration: 0 }, { prepare }))
+    .rejects.toMatchObject({ code: "legacy-inventory-unavailable" });
+  legacy = [{ taskId: "task-1", consumerKind: "compute-environment", consumerId: "env-1", provenance: { revision: revisions.A!, checkout: "/old/checkout", receipt: { adapterSha256: "x" } } },
+    { taskId: "task-1", consumerKind: "compute-environment", consumerId: "env-1", provenance: { unavailable: "dup" } }];
+  await expect(activate("k0", "A", 0)).rejects.toMatchObject({ code: "invalid-request" });
+  expect(await db.prisma.toolingLegacyBoundary.count() + await db.prisma.toolingLegacyConsumer.count() + await db.prisma.toolingSelection.count()).toBe(0);
+  legacy = [legacy[0]!, { taskId: "task-2", consumerKind: "cleanup-instruction", consumerId: "cleanup:1", provenance: { unavailable: "No recorded executable receipt" } }];
+  await activate("k1", "A", 0);
+  const boundary = await readToolingLegacyBoundary({ prisma: db.prisma, repositoryId: REPO });
+  expect(boundary).toMatchObject({ activationRequestKey: "k1", legacyRevision: revisions.A });
+  legacy = [{ taskId: "task-3", consumerKind: "compute-environment", consumerId: "env-late", provenance: { unavailable: "must not be recorded" } }];
+  await activate("k2", "B", 1);
+  await activate("k3", "A", 2);
+  expect(await readToolingLegacyBoundary({ prisma: db.prisma, repositoryId: REPO })).toEqual(boundary);
+  const read = (consumerKind: string, consumerId: string) => readToolingLegacyConsumer({ prisma: db.prisma, repositoryId: REPO, consumerKind, consumerId });
+  const exact = await read("compute-environment", "env-1");
+  expect(exact).toMatchObject({ status: "legacy", taskId: "task-1", revision: revisions.A, checkout: "/old/checkout", receipt: { adapterSha256: "x" } });
+  expect(await read("cleanup-instruction", "cleanup:1")).toMatchObject({ status: "unavailable", detail: "No recorded executable receipt" });
+  expect(await read("compute-environment", "env-late")).toEqual({ status: "not-legacy", boundaryRequestKey: "k1" });
+  expect(await readToolingLegacyConsumer({ prisma: db.prisma, repositoryId: "other", consumerKind: "compute-environment", consumerId: "env-1" })).toEqual({ status: "no-boundary" });
+  await expect(resolveToolingLegacyConsumer({ prisma: db.prisma, id: (exact as { id: string }).id, evidence: { kind: "", reference: "" } })).rejects.toMatchObject({ code: "evidence-required" });
+  await resolveToolingLegacyConsumer({ prisma: db.prisma, id: (exact as { id: string }).id, evidence });
+  expect(await read("compute-environment", "env-1")).toMatchObject({ status: "resolved", resolution: evidence });
+  await expect(resolveToolingLegacyConsumer({ prisma: db.prisma, id: (exact as { id: string }).id, evidence })).rejects.toMatchObject({ code: "transition-conflict" });
 });
 
 test("operation bindings persist before effects and retries keep their original release", async () => {
@@ -164,15 +199,65 @@ test("operation bindings persist before effects and retries keep their original 
   expect(await readToolingOperation({ prisma: db.prisma, operationId: "missing" })).toBeNull();
 });
 
-test("state formats are checked against durable retained consumers", async () => {
+test("operation lifecycle transitions are explicit compare-and-swap changes", async () => {
   const task = await ownedTask();
   await activate("k1", "A", 0);
-  const operation = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "op", inputDigest: "a".repeat(64), kind: "runtime-up" } });
+  const op = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "op", inputDigest: "a".repeat(64), kind: "runtime-up" } });
+  const move = (from: "bound" | "running" | "unknown" | "completed", to: "bound" | "running" | "unknown" | "completed", proof?: typeof evidence) => transitionToolingOperation({ prisma: db.prisma, operationId: op.operationId, from, to, ...(proof ? { evidence: proof } : {}) });
+  await expect(move("bound", "unknown")).rejects.toMatchObject({ code: "invalid-transition" });
+  expect((await move("bound", "running")).status).toBe("running");
+  await expect(move("bound", "running")).rejects.toMatchObject({ code: "transition-conflict" });
+  expect((await move("running", "unknown")).status).toBe("unknown");
+  await expect(move("unknown", "running")).rejects.toMatchObject({ code: "invalid-transition" });
+  await expect(move("unknown", "completed")).rejects.toMatchObject({ code: "evidence-required" });
+  expect((await move("unknown", "completed", evidence)).status).toBe("completed");
+  await expect(move("completed", "running")).rejects.toMatchObject({ code: "invalid-transition" });
+  expect(await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: op.operationId } })).toMatchObject({ status: "completed", completionEvidence: evidence });
+  await expect(transitionToolingOperation({ prisma: db.prisma, operationId: "missing", from: "bound", to: "running" })).rejects.toMatchObject({ code: "not-found" });
+});
+
+test("actual written formats outlive completed operations and block rollback readers", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  expect((await activate("k2", "v2", 1)).generation).toBe(2);
+  const op = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "op", inputDigest: "a".repeat(64), kind: "runtime-up" } });
+  const write = (version: number, operationId = op.operationId, scopeKey = "runtime:development") => registerToolingStateWrite({ prisma: db.prisma, operationId, family: "drafted.runtime", scopeKey, version });
+  await expect(write(1)).rejects.toMatchObject({ code: "wrong-write-version" });
+  await expect(registerToolingStateWrite({ prisma: db.prisma, operationId: op.operationId, family: "drafted.other", scopeKey: "x", version: 1 })).rejects.toMatchObject({ code: "undeclared-format" });
+  const written = await write(2);
+  expect(await write(2)).toEqual(written);
+  expect(await readToolingStateVersion({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "runtime:development" })).toMatchObject({ version: 2, preservesUnknown: true });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: op.operationId, from: "bound", to: "completed", evidence });
+  await expect(write(2, op.operationId, "runtime:review")).rejects.toMatchObject({ code: "operation-closed" });
+  // A(v1) -> v2 writes -> B(v1 only) must not roll back after the writer completed.
+  await expect(activate("rollback", "B", 2)).rejects.toMatchObject({ code: "state-format-incompatible" });
+  await expect(activate("missing", "noformats", 2)).rejects.toMatchObject({ code: "state-format-incompatible" });
+  expect((await getActiveToolingRelease({ prisma: db.prisma, config, repositoryId: REPO }))?.release.revision).toBe(revisions.v2!);
+  expect((await activate("forward", "v2only", 2)).generation).toBe(3);
+  const later = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "later", inputDigest: "b".repeat(64), kind: "runtime-up" } });
+  expect(await assertToolingStateReadable({ prisma: db.prisma, operationId: later.operationId, family: "drafted.runtime", scopeKey: "runtime:development" })).toEqual({ version: 2, source: "recorded" });
+  // Untouched pre-protocol state is assumed legacy v1, which v2only cannot read.
+  await expect(assertToolingStateReadable({ prisma: db.prisma, operationId: later.operationId, family: "drafted.runtime", scopeKey: "runtime:review" })).rejects.toMatchObject({ code: "unreadable-state" });
+});
+
+test("incompatible writes are deferred only for the affected task state", async () => {
+  const first = await ownedTask(), second = await ownedTask("task-2");
+  legacy = [{ taskId: first.id, consumerKind: "compute-environment", consumerId: "env-1", provenance: { revision: revisions.A!, checkout: "/old", receipt: null } }];
+  await activate("k1", "A", 0);
+  const old = await bindToolingOperation({ prisma: db.prisma, config, taskId: second.id, sessionId: second.primarySessionId!, turnId: null, request: { requestKey: "old", inputDigest: "c".repeat(64), kind: "runtime-up", resourceKey: "runtime:review" } });
   await expect(activate("v2only", "v2only", 1)).rejects.toMatchObject({ code: "state-format-incompatible" });
-  await expect(activate("v2", "v2", 1)).rejects.toMatchObject({ code: "state-format-incompatible" });
-  await db.prisma.toolingOperation.update({ where: { id: operation.operationId }, data: { status: "completed" } });
-  await expect(activate("v2only-again", "v2only", 1)).rejects.toMatchObject({ code: "state-format-incompatible" });
-  expect((await activate("v2-again", "v2", 1)).generation).toBe(2);
+  expect((await activate("k2", "v2", 1)).generation).toBe(2);
+  const bind = (task: typeof first, requestKey: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey, inputDigest: "d".repeat(64), kind: "runtime-up" } });
+  const onFirst = await bind(first, "new"), onSecond = await bind(second, "new");
+  const write = (operationId: string, scopeKey: string) => registerToolingStateWrite({ prisma: db.prisma, operationId, family: "drafted.runtime", scopeKey, version: 2 });
+  await expect(write(onFirst.operationId, "runtime:development")).rejects.toMatchObject({ code: "deferred" });
+  expect((await write(onSecond.operationId, "runtime:development")).version).toBe(2);
+  await expect(write(onSecond.operationId, "runtime:review")).rejects.toMatchObject({ code: "deferred" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: old.operationId, from: "bound", to: "completed", evidence });
+  expect((await write(onSecond.operationId, "runtime:review")).version).toBe(2);
+  const consumer = await readToolingLegacyConsumer({ prisma: db.prisma, repositoryId: REPO, consumerKind: "compute-environment", consumerId: "env-1" });
+  await resolveToolingLegacyConsumer({ prisma: db.prisma, id: (consumer as { id: string }).id, evidence });
+  expect((await write(onFirst.operationId, "runtime:development")).version).toBe(2);
 });
 
 test("preparation locks are recovered only from provably exited owners", () => {

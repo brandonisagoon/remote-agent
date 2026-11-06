@@ -5,9 +5,9 @@ import { verifyBearerToken } from "../../security.ts";
 import { ToolingActivationError, activateToolingRelease, getActiveToolingRelease, type ToolingActivationErrorCode } from "../../services/tasks/tooling-releases.ts";
 
 const ActivationBody = z.strictObject({ requestKey: z.string(), revision: z.string(), expectedGeneration: z.number() });
-const STATUS: Record<ToolingActivationErrorCode, 400 | 409 | 422 | 202> = {
+const STATUS: Record<ToolingActivationErrorCode, 400 | 409 | 422> = {
   "invalid-request": 400, "repository-unavailable": 422, "request-conflict": 409, "generation-conflict": 409,
-  "pending-restart": 409, "restart-required": 202, "preparation-failed": 422, "state-format-incompatible": 409,
+  "restart-required": 409, "preparation-failed": 422, "state-format-incompatible": 409, "legacy-inventory-unavailable": 409,
 };
 
 /** Owner release activation. Mounted only on the bearer-authenticated TCP
@@ -33,7 +33,6 @@ export function toolingReleaseRoutes(options: { enabled: boolean; activate?: typ
       return c.json({ status: "activated", selection });
     } catch (error) {
       if (!(error instanceof ToolingActivationError)) throw error;
-      if (error.code === "restart-required") return c.json({ status: "restart-required", generation: error.detail?.generation, release: error.detail?.release }, 202);
       return c.json({ error: error.message, code: error.code }, STATUS[error.code]);
     }
   });
