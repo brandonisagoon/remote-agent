@@ -5,6 +5,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { readEngineSubnets, selectFixtureSubnet } from "./dra37-subnet.ts";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -53,7 +54,7 @@ test("the guard refuses everything outside the fixture policy before reaching Do
   refused(guard("network", "create", "--label", "dev.drafted.task=dra37-first", "--subnet", "10.0.0.0/8", "drafted-d-111111111111111111111111-app"), /callers may not choose a subnet/);
   refused(guard("volume", "rm", "anything"), /unmodelled command volume rm/);
   refused(guard("system", "prune", "-f"), /unmodelled command system prune/);
-});
+}, 30_000);
 
 test("publication is optional: internal and loopback-ephemeral creates pass the policy unchanged", () => {
   const { create } = fixture();
@@ -69,4 +70,34 @@ test("publication is optional: internal and loopback-ephemeral creates pass the 
   const proxy = forwarded(create("--publish", "127.0.0.1:55010:8080"));
   expect(proxy.filter(value => value === "--publish")).toHaveLength(1);
   expect(proxy[proxy.indexOf("--publish") + 1]).toBe("127.0.0.1:55010:8080");
+}, 30_000);
+
+test("fixture subnet selection uses true IPv4 CIDR overlap and fails closed on inventory", () => {
+  // Overlap is numeric, not textual: wider or offset prefixes block candidates.
+  expect(selectFixtureSubnet([])).toBe("10.249.0.0/28");
+  expect(selectFixtureSubnet(["10.0.0.0/8"])).toBeNull();
+  expect(selectFixtureSubnet(["10.248.0.0/15"])).toBeNull();
+  expect(selectFixtureSubnet(["10.249.0.0/17"])).toBe("10.249.128.0/28");
+  expect(selectFixtureSubnet(["10.249.0.0/28", "10.249.0.16/29"])).toBe("10.249.0.32/28");
+  expect(selectFixtureSubnet(["10.249.0.5/30"])).toBe("10.249.0.16/28");
+  expect(selectFixtureSubnet(["192.168.0.0/16", "fd00:dead:beef::/48", "172.16.0.0/12"])).toBe("10.249.0.0/28");
+  expect(selectFixtureSubnet(["0.0.0.0/0"])).toBeNull();
+  for (const malformed of ["10.249.0.0/33", "10.249.0.256/28", "10.249.0/24", "10.249.0.0", "fd00::/129", "x"]) expect(() => selectFixtureSubnet([malformed])).toThrow(/Malformed/);
+
+  const id = (digit: string) => digit.repeat(64);
+  const engine = (listing: { code: number; stdout: string }, inspection: { code: number; stdout: string }) =>
+    (args: string[]) => args[1] === "ls" ? { ...listing, stderr: "list failure" } : { ...inspection, stderr: "inspect failure" };
+  const line = (network: string, config: unknown) => `${JSON.stringify(network)}\t${JSON.stringify(config)}`;
+  const listed = { code: 0, stdout: `${id("a")}\n${id("b")}\n` };
+  expect(readEngineSubnets(engine(listed, { code: 0, stdout: [line(id("a"), [{ Subnet: "10.0.0.0/8", Gateway: "10.0.0.1" }]), line(id("b"), null)].join("\n") }))).toEqual(["10.0.0.0/8"]);
+  const refused = (listing: { code: number; stdout: string }, inspection: { code: number; stdout: string }, reason: RegExp) => expect(() => readEngineSubnets(engine(listing, inspection))).toThrow(reason);
+  refused({ code: 1, stdout: "" }, { code: 0, stdout: "" }, /network ls failed/);
+  refused({ code: 0, stdout: "" }, { code: 0, stdout: "" }, /no networks/);
+  refused({ code: 0, stdout: "abc\n" }, { code: 0, stdout: "" }, /malformed ID/);
+  refused(listed, { code: 1, stdout: "" }, /network inspect failed/);
+  refused(listed, { code: 0, stdout: line(id("a"), null) }, /described 1 of 2/);
+  refused(listed, { code: 0, stdout: [line(id("a"), null), line(id("c"), null)].join("\n") }, /Unexpected network inspect ID/);
+  refused(listed, { code: 0, stdout: [line(id("a"), null), `${JSON.stringify(id("b"))} not-json`].join("\n") }, /Malformed network inspect line/);
+  refused(listed, { code: 0, stdout: [line(id("a"), [{ Subnet: "10.249.0.0/40" }]), line(id("b"), null)].join("\n") }, /Malformed IPv4 subnet/);
+  refused(listed, { code: 0, stdout: [line(id("a"), { Subnet: "10.0.0.0/8" }), line(id("b"), null)].join("\n") }, /Malformed IPAM config/);
 });

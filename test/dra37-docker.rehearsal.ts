@@ -3,18 +3,28 @@
  * default gate). Real Remote Agent server, Drafted's actual runtime, Docker
  * transports, relay and observer against REAL local containers (images
  * already present, recorded by ID, never pulled), behind the fixture policy
- * guard. Provider transports stay synthetic; tooling preparation is the
- * dependency-injected partial rehearsal (not frozen install acceptance).
+ * guard. Provider transports stay synthetic. Tooling is prepared by the
+ * supported frozen helper (prepareToolingRelease + verifyPreparedToolingRelease);
+ * this runner has NO release-aware activation or command binding.
+ *
+ * Optional bounded hold for an external browser check after the second task
+ * is healthy: DRA37_HOLD_SECONDS=<1..3600> [DRA37_HOLD_FILE=<path>]. The
+ * runner writes the hold record (second URL, exact IDs, ledger) to the hold
+ * file (default <server root>/hold.json) and waits until "<hold file>.release"
+ * exists or the bound expires, then re-checks health and resumes the normal
+ * exact stop and ledger cleanup.
  *
  *   DRA37_REAL_DOCKER=1 DRA37_DRAFTED_SOURCE=<drafted checkout> DRA37_DRAFTED_REVISION=<sha> \
  *     bun test ./test/dra37-docker.rehearsal.ts
  */
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { dra37Server } from "./dra37-fixture.ts";
 
-setDefaultTimeout(600_000);
+const HOLD_SECONDS = process.env.DRA37_HOLD_SECONDS === undefined ? 0 : Number(process.env.DRA37_HOLD_SECONDS);
+if (!Number.isInteger(HOLD_SECONDS) || HOLD_SECONDS < 0 || HOLD_SECONDS > 3_600) throw new Error("DRA37_HOLD_SECONDS must be an integer from 1 to 3600 (bounded hold)");
+setDefaultTimeout(600_000 + HOLD_SECONDS * 1_000);
 const DRAFTED = { source: process.env.DRA37_DRAFTED_SOURCE ?? "", revision: process.env.DRA37_DRAFTED_REVISION ?? "" };
 if (process.env.DRA37_REAL_DOCKER !== "1" || !DRAFTED.source || !/^[a-f0-9]{40}$/.test(DRAFTED.revision)) {
   throw new Error("The DRA-37 real-Docker rehearsal requires DRA37_REAL_DOCKER=1, DRA37_DRAFTED_SOURCE and an exact DRA37_DRAFTED_REVISION; it is not part of the default test gate");
@@ -105,6 +115,25 @@ test("real containers: verified stop releases the only slot to the next original
     expect(row!.HostConfig.NetworkMode).not.toBe("host");
     expect(preexisting.has(entry.id)).toBe(false);
   }
-  console.log(JSON.stringify({ realDocker: { serverRoot: server.root, prefix: real.prefix, images: real.images, ledger, firstEnvironment: firstEnvironment.id, secondEnvironment: secondEnvironment.id, allocation: allocations[0]!.allocationId, secondUrl } }));
+  console.log(JSON.stringify({ realDocker: { serverRoot: server.root, prefix: real.prefix, images: real.images, tooling: server.drafted!.release, preparation: server.drafted!.preparation,
+    ledger, firstEnvironment: firstEnvironment.id, secondEnvironment: secondEnvironment.id, allocation: allocations[0]!.allocationId, secondUrl } }));
+
+  if (HOLD_SECONDS > 0) {
+    // Bounded hold for root's external browser wrapper. Nothing is changed
+    // while held; the release file (or the bound) resumes the normal path.
+    const holdFile = process.env.DRA37_HOLD_FILE ? path.resolve(process.env.DRA37_HOLD_FILE) : path.join(server.root, "hold.json");
+    const releaseFile = `${holdFile}.release`, deadline = new Date(Date.now() + HOLD_SECONDS * 1_000);
+    if (existsSync(releaseFile)) throw new Error(`Stale hold release file ${releaseFile}; remove it before holding`);
+    const record = { secondUrl, taskId: second.id, sessionId: second.sessionId, environmentId: secondEnvironment.id, allocationId: allocations[0]!.allocationId,
+      serverRoot: server.root, prefix: real.prefix, ledger, tooling: server.drafted!.release, heldAt: new Date().toISOString(), until: deadline.toISOString(), resume: `touch ${JSON.stringify(releaseFile)}` };
+    writeFileSync(holdFile, JSON.stringify(record, null, 2) + "\n", { mode: 0o600, flag: "wx" });
+    console.log(JSON.stringify({ hold: { file: holdFile, secondUrl, until: record.until, resume: record.resume } }));
+    while (!existsSync(releaseFile) && Date.now() < deadline.getTime()) await Bun.sleep(500);
+    const resumedBy = existsSync(releaseFile) ? "release-file" : "bound";
+    // Still the same healthy second task after the external check.
+    expect(await (await fetch(new URL("/health", secondUrl))).json()).toMatchObject({ ready: true, taskId: second.id });
+    expect(server.dockerLedger()).toEqual(ledger);
+    console.log(JSON.stringify({ holdResumed: { by: resumedBy, at: new Date().toISOString() } }));
+  }
   expect((await server.runtimeTurn(second.id, "stop")).code).toBe(0);
 });

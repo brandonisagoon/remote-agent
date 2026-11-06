@@ -22,13 +22,16 @@
  * - Every destructive/exec target must be a ledger object.
  * - Every created object (ID and name) is durably appended (fsync) to the
  *   ledger BEFORE its ID is written to the caller.
- * - Fixture networks get an explicit /28 in 10.249.0.0/16 that a read-only
- *   inspection shows overlaps no existing network (the shared engine's
- *   default pools can be exhausted). Nothing is ever cleared or pruned.
+ * - Fixture networks get an explicit /28 in 10.249.0.0/16 whose numeric CIDR
+ *   interval overlaps no subnet of any engine network (dra37-subnet.ts; a
+ *   failed or malformed read-only inventory refuses the create). The shared
+ *   engine's default pools can be exhausted; nothing is ever cleared or
+ *   pruned and engine configuration is never changed.
  *
  * Usage (via the generated bin/docker shim): docker-guard <policy.json> <args...>
  */
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
+import { readEngineSubnets, selectFixtureSubnet } from "./dra37-subnet.ts";
 
 type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string };
 const policy = JSON.parse(readFileSync(process.argv[2]!, "utf8")) as Policy;
@@ -100,11 +103,15 @@ else if (command === "exec") {
   if (!options.some(([name, value]) => name === "--label" && typeof value === "string" && /^dev\.drafted\.task=dra37-/.test(value))) refuse("missing DRA-37 task label");
   if (options.some(([name]) => name === "--subnet")) refuse("callers may not choose a subnet; the guard assigns fixture subnets");
   if (command === "network") {
-    const ids = Bun.spawnSync([policy.docker, "network", "ls", "-q"], { stdout: "pipe" }).stdout.toString().split("\n").filter(Boolean);
-    const used = ids.length ? Bun.spawnSync([policy.docker, "network", "inspect", ...ids, "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}"], { stdout: "pipe" }).stdout.toString().split(/\s+/).filter(Boolean) : [];
-    const third = Array.from({ length: 256 }, (_, index) => index).find(index => !used.some(subnet => subnet.startsWith(`10.249.${index}.`) || subnet.startsWith("10.249.0.0/16") || subnet.startsWith("10.0.0.0/8")));
-    if (third === undefined) refuse("no unused fixture subnet is available; nothing was cleared");
-    const subnet = `10.249.${third}.0/28`;
+    // Read-only, fail-closed inventory and true CIDR interval overlap.
+    let subnet: string | null;
+    try {
+      subnet = selectFixtureSubnet(readEngineSubnets(engineArgs => {
+        const result = Bun.spawnSync([policy.docker, ...engineArgs], { stdout: "pipe", stderr: "pipe" });
+        return { code: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() };
+      }));
+    } catch (error) { refuse(`network inventory is unavailable or malformed (${error instanceof Error ? error.message : String(error)}); nothing was cleared`); }
+    if (!subnet) refuse("no fixture subnet in 10.249.0.0/16 is free of overlap; nothing was cleared");
     args = [...args.slice(0, -1), "--subnet", subnet, args.at(-1)!];
     log({ assignedSubnet: subnet });
   }

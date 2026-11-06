@@ -4,9 +4,9 @@
  * Remote Agent server routes/scheduler/inbox and Drafted's manageRuntime
  * together; it is NOT production Docker or PlanetScale acceptance.
  *
- * Tooling preparation here is a DEPENDENCY-INJECTED PARTIAL REHEARSAL (see
- * dra37-fixture.ts): symlinked paired node_modules and a fixture-written
- * readiness receipt, not frozen install or release acceptance.
+ * Tooling is prepared by the supported frozen helper (see dra37-fixture.ts:
+ * prepareToolingRelease + verifyPreparedToolingRelease). This runner has no
+ * release-aware activation, selection or command binding.
  *
  * EXPLICIT cross-repository rehearsal, never part of the default `bun test`
  * gate (the file name is deliberately not *.test.ts). It requires the paired
@@ -28,7 +28,7 @@ import { dra37Server } from "./dra37-fixture.ts";
 setDefaultTimeout(Number(process.env.DRA37_HOLD_SECONDS ?? 0) * 1000 + 300_000);
 const DRAFTED = { source: process.env.DRA37_DRAFTED_SOURCE ?? "", revision: process.env.DRA37_DRAFTED_REVISION ?? "" };
 if (!DRAFTED.source || !/^[a-f0-9]{40}$/.test(DRAFTED.revision)) {
-  throw new Error("DRA-37 runtime rehearsal requires DRA37_DRAFTED_SOURCE (paired Drafted checkout with node_modules) and DRA37_DRAFTED_REVISION (exact 40-character commit); it is not part of the default test gate");
+  throw new Error("DRA-37 runtime rehearsal requires DRA37_DRAFTED_SOURCE (paired Drafted git checkout) and DRA37_DRAFTED_REVISION (exact 40-character commit); it is not part of the default test gate");
 }
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });

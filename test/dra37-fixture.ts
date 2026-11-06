@@ -4,13 +4,14 @@
  * and compute admission enabled. Seeds write task/session IDENTITY only;
  * every request, offer, reservation, claim and delivery goes through the
  * server's normal routes and workers. Never points at live config or data. */
-import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase } from "../test-support/db.ts";
 import { parseServiceFile } from "../lib/config.ts";
+import { prepareToolingRelease, verifyPreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
 const sourceRoot = path.resolve(import.meta.dir, "..");
 export const MACHINE = "dra37-machine", REPOSITORY = "dra37-repo";
@@ -32,34 +33,31 @@ function git(cwd: string, ...args: string[]) {
 export type Dra37Task = { id: string; sessionId: string; worktree: string; revision: string; recipe: { key: string; purpose: "development"; revision: string; recipeDigest: string } };
 
 /**
- * DEPENDENCY-INJECTED PARTIAL REHEARSAL of tooling preparation, not release
- * acceptance. The configured source is a `--shared` clone of the paired
- * Drafted repository (it only reads the paired objects) at the exact commit,
- * and the checkout at the server's install path is a detached worktree of
- * that commit. Its dependencies are a SYMLINK to the paired checkout's
- * mutable node_modules and its legacy `.ready` receipt is written here: no
- * frozen install, install receipt, worktree lock or prepareToolingRelease
- * verification happens. Final real-release acceptance must use the
- * supported preparation against an isolated clone with frozen dependencies.
+ * Real frozen tooling preparation through the SUPPORTED helpers. The
+ * configured source is a private `--shared` clone of the paired Drafted
+ * repository (it only reads the paired objects; nothing is written there).
+ * `prepareToolingRelease` validates the exact committed release (release and
+ * capability manifests, server protocol range, committed bun.lock), creates
+ * and locks the detached install worktree, runs `bun install
+ * --frozen-lockfile` and writes its install receipt; `verifyPreparedToolingRelease`
+ * then re-checks commit, tree, cleanliness, receipt and installed-package
+ * digest read-only. The fixture writes no receipt, link or dependency itself.
+ * This proves preparation and verification only, NOT release-aware
+ * activation (no selection, generation or command binding).
  */
 async function prepareDraftedTooling(root: string, install: string, revision: string, paired: string) {
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("The DRA-37 runtime rehearsal requires an exact 40-character Drafted commit");
-  if (!existsSync(path.join(paired, ".git")) || !existsSync(path.join(paired, "node_modules"))) throw new Error(`Paired Drafted source ${paired} must be a git checkout with installed node_modules`);
+  if (!existsSync(path.join(paired, ".git"))) throw new Error(`Paired Drafted source ${paired} must be a git checkout`);
   const source = path.join(root, "tooling-source");
   const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-checkout", "--shared", paired, source], { stdout: "pipe", stderr: "pipe" });
   if (clone.exitCode) throw new Error(`Cannot clone Drafted: ${clone.stderr.toString()}`);
-  const full = git(source, "rev-parse", "--verify", `${revision}^{commit}`), tree = git(source, "rev-parse", `${full}^{tree}`);
-  // The dependency link is a symlink; Drafted ignores only a node_modules
-  // directory. Exclude it in this temporary clone's own metadata.
-  await writeFile(path.join(source, ".git", "info", "exclude"), "node_modules\n", { flag: "a" });
-  const checkout = path.join(install, "tooling", REPOSITORY, full);
-  await mkdir(path.dirname(checkout), { recursive: true });
-  git(source, "worktree", "add", "--detach", checkout, full);
-  await symlink(path.join(paired, "node_modules"), path.join(checkout, "node_modules"));
-  if (git(checkout, "status", "--porcelain", "--untracked-files=normal")) throw new Error("Prepared Drafted checkout is not clean");
-  await writeFile(`${checkout}.ready`, `${full}\n`, { mode: 0o600 });
-  return { source, root: checkout, revision: full, tree,
-    preparation: "dependency-injected partial rehearsal: symlinked paired node_modules and fixture-written .ready; not frozen install verification" };
+  const release = await prepareToolingRelease({ repositoryId: REPOSITORY, toolingRoot: source, installRoot: install, revision });
+  await verifyPreparedToolingRelease(release);
+  if (release.revision !== revision) throw new Error(`Prepared release ${release.revision} is not the requested ${revision}`);
+  return { source, root: release.checkout, revision: release.revision, tree: release.tree,
+    release: { repositoryId: release.repositoryId, revision: release.revision, tree: release.tree, policyBlob: release.policyBlob, checkout: release.checkout,
+      lockfileDigest: release.lockfileDigest, bunVersion: release.bunVersion, serverProtocol: release.manifest.serverProtocol, stateFormats: Object.keys(release.manifest.stateFormats) },
+    preparation: "supported prepareToolingRelease (frozen install + install receipt + locked worktree) verified by verifyPreparedToolingRelease; no release-aware activation" };
 }
 
 /** Real-Docker mode inputs, recorded before any effect. */
