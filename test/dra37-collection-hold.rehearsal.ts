@@ -68,11 +68,15 @@ const gitOut = (cwd: string, ...args: string[]) => {
   return result.stdout.toString();
 };
 const HELPERS = ["test-support/db.ts", "apps/server/prisma.ts", "lib/config.ts", "lib/tooling-source.ts", "apps/server/services/tasks/tooling.ts", "apps/server/server.ts", "package.json", "bun.lock"];
+/** Paths whose change could alter what this rehearsal or its server loads. */
+const RELEVANT_PATHS = ["apps", "lib", "management", "types", "prisma", "generated", "test-support", "package.json", "bun.lock", "tsconfig.json", "bunfig.toml"];
+const RELEVANT = /^(apps\/|lib\/|management\/|types\/|prisma\/|generated\/|test-support\/|test\/dra37-|package\.json$|bun\.lock$|tsconfig[^/]*\.json$|bunfig\.toml$)/;
 function provenance(server: Awaited<ReturnType<typeof dra37Server>>) {
   const digest = (relative: string) => existsSync(path.join(sourceRoot, relative)) ? sha256(readFileSync(path.join(sourceRoot, relative))) : null;
   const drafted = server.drafted!;
   return { at: new Date().toISOString(), head: gitOut(sourceRoot, "rev-parse", "HEAD").trim(), status: gitOut(sourceRoot, "status", "--porcelain=v1", "--untracked-files=all"),
     trackedDiffDigest: sha256(gitOut(sourceRoot, "diff", "HEAD", "--binary")),
+    relevantTrackedDiffDigest: sha256(gitOut(sourceRoot, "diff", "HEAD", "--binary", "--", ...RELEVANT_PATHS, ...readdirSync(import.meta.dir).filter(name => name.startsWith("dra37-")).map(name => `test/${name}`))),
     files: Object.fromEntries(readdirSync(import.meta.dir).filter(name => name.startsWith("dra37-") && name.endsWith(".ts")).sort().map(name => [`test/${name}`, digest(`test/${name}`)])),
     helpers: Object.fromEntries(HELPERS.map(relative => [relative, digest(relative)])),
     drafted: { pairedSource: DRAFTED.source, release: drafted.release, checkoutHead: gitOut(drafted.root, "rev-parse", "HEAD").trim(),
@@ -158,8 +162,16 @@ async function finish(server: Server, evidence: Record<string, any>, evidenceFil
   writeFileSync(evidenceFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
   console.log(JSON.stringify({ evidence: evidenceFile, passed }));
 }
-const stable = (start: ReturnType<typeof provenance>, end: ReturnType<typeof provenance>) => {
-  for (const key of ["head", "trackedDiffDigest", "files", "helpers", "drafted"] as const) expect(JSON.stringify(end[key]), key).toBe(JSON.stringify(start[key]));
+/** Relevant source identical at start and end; any status change confined
+ * to unrelated paths (recorded with that classification, not failing). */
+const stable = (start: ReturnType<typeof provenance>, end: ReturnType<typeof provenance>, evidence?: Record<string, any>) => {
+  for (const key of ["head", "relevantTrackedDiffDigest", "files", "helpers", "drafted"] as const) expect(JSON.stringify(end[key]), key).toBe(JSON.stringify(start[key]));
+  const lines = (value: string) => new Set(value.split("\n").filter(Boolean));
+  const before = lines(start.status), after = lines(end.status);
+  const delta = [...[...after].filter(line => !before.has(line)), ...[...before].filter(line => !after.has(line))];
+  const pathOf = (line: string) => line.slice(3).split(" -> ").at(-1)!;
+  expect(delta.filter(line => RELEVANT.test(pathOf(line))), "no relevant status change").toEqual([]);
+  if (evidence) evidence.unrelatedStatusDelta = delta.map(line => ({ line, classification: "outside every path this rehearsal or its server loads (another writer's lane)" }));
 };
 
 test("observation unavailable > 60 s through bounded abandoned observer attempts; held offer turn > 60 s keeps its reservation while another primary progresses", async () => {
@@ -253,7 +265,7 @@ test("observation unavailable > 60 s through bounded abandoned observer attempts
     await until("fresh stopped observation of the second app", async () => { const value = await h.observation(env2.id); return (value?.state === "stopped" && (value.observedAt ?? 0) > finalStartedAt) || null; }, 120_000);
     expect(server.pid).toBe(pid);
     await h.noBarrierProcesses("at completion");
-    stable(evidence.start, provenance(server));
+    stable(evidence.start, provenance(server), evidence);
     h.step("completed", { claimed: await prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } }), guardHold: h.calls().filter(entry => entry.hold) });
     passed = true;
   } finally { await finish(server, evidence, evidenceFile, passed); }
@@ -380,7 +392,7 @@ test("slow baseline: one real refresh cycle > 60 s over twelve historical groups
     await until("fresh stopped observation of the waiter app", async () => { const value = await h.observation(envW.id); return (value?.state === "stopped" && (value.observedAt ?? 0) > finalStartedAt) || null; }, 120_000);
     expect(server.pid).toBe(pid);
     await h.noBarrierProcesses("at completion");
-    stable(evidence.start, provenance(server));
+    stable(evidence.start, provenance(server), evidence);
     h.step("completed", { claimed: await prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } }) });
     passed = true;
   } finally { await finish(server, evidence, evidenceFile, passed); }
