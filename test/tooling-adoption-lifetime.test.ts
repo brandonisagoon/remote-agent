@@ -339,8 +339,25 @@ test("H3: after A's group stops and its continuation settles, an independent B c
   expect((await b.claim("offer-b")).called?.status).toBe(200);
   await f.claimed("offer-b");
   expect((await b.bind("offer-b")).called?.status).toBe(200);
+  // Review of 3df63a0: B is now producer with a live offer. B's SAME operation
+  // retrying its request is the current holder's own retry, not a conflict
+  // with historical A (no second admission is written).
+  const before = await f.admissions();
+  const ownRetry = await b.request();
+  expect(ownRetry.child!.operationId).toBe(b.bindings[0]!.operationId);
+  expect(ownRetry.called?.status, JSON.stringify(ownRetry.called?.body)).toBe(200);
+  expect(await f.admissions()).toEqual(before);
   expect((await b.settle()).status).toBe(200);
   expect((await resourceGroupCode({ prisma: db.prisma, task: await f.task(), reference: { type: "compute-environment", id: ENV } })).code!.revision).toBe(B);
   expect(await db.prisma.computeEnvironment.count()).toBe(1);
-  console.log(JSON.stringify({ H3: { a: short(a.fence), continuation: short(continuation), b: short(b.fence), admissions: await f.admissions() } }));
+  // A later independent B command (same release) still re-admits as before.
+  const later = await f.command("b-runtime-configure");
+  expect((await later.request()).called?.status).toBe(200);
+  // Exclusion is not weakened: a third release C cannot take the key B holds.
+  expect(await f.activate("c".repeat(40), 2)).toBe(3);
+  const c = await f.command("c-runtime-up");
+  const refusedC = await c.request();
+  expect(refusedC.called?.body).toMatchObject({ code: "retained-release-required" });
+  expect(refusedC.called?.body.error).toContain(`held by operation ${short(later.bindings[0]!)}`);
+  console.log(JSON.stringify({ H3: { a: short(a.fence), continuation: short(continuation), b: short(b.fence), later: short(later.fence), c: short(c.fence), refusedC: refusedC.called?.body.error.split(". Begin")[0], admissions: await f.admissions() } }));
 });

@@ -441,11 +441,17 @@ const commandOf = async (store: AdmissionStore, operation: ToolingOperationBindi
  * another lineage still genuinely holds: its admitting command is not settled,
  * an offer is live, or a producer is unknown or still has a live reader.
  * Returns the refusal reason, or null. Same-release re-admission is unchanged. */
-async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmentKey: string, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) {
-  // The prior admission is checked even before any environment row exists:
-  // a first request whose domain create has not happened yet still holds it.
-  const prior = await priorAdmission(store, task, environmentKey, binding, read);
-  if (!prior) return null;
+async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmentKey: string, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"], ownIntentWritten = false) {
+  // The CURRENT holder decides: the newest admission, or (once this
+  // operation's own intent is written, holding the write lock) the one it
+  // supersedes. The caller's own lineage holding it is its own retry or
+  // sibling, never a conflict; an older holder it already superseded is
+  // history. Checked even before any environment row exists: a first request
+  // whose domain create has not happened yet still holds the key.
+  const history = await admissionHistory(store, task, environmentKey);
+  if (ownIntentWritten && history[0]?.operationId !== binding.operationId) return `Admission of environment key ${environmentKey} changed while it was recorded`;
+  const prior = history[ownIntentWritten ? 1 : 0];
+  if (!prior || await sameLineage(store as PrismaClient, prior.operationId, binding, read)) return null;
   const original = await read({ prisma: store as PrismaClient, operationId: prior.operationId });
   if (!original) return `Environment key ${environmentKey} was admitted by unknown operation ${prior.operationId}`;
   if (original.release.id === binding.release.id) return null;
@@ -719,7 +725,7 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   else if (admitted && current?.operationId !== binding.operationId) {
     await prisma.$transaction(async tx => {
       await recordAssociation(tx, binding, "admission", `environment-key:${admitted}`, "intent");
-      const refused = admission.adopt ? await adoptionRefused(tx, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read);
+      const refused = admission.adopt ? await adoptionRefused(tx, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read, true);
       if (refused) throw refuse("retained-release-required", refused);
     });
     admittedKey = admitted;
