@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { verifyBearerToken } from "../../security.ts";
 import { ToolingActivationError, activateToolingRelease, getActiveToolingRelease, type ToolingActivationErrorCode } from "../../services/tasks/tooling-releases.ts";
+import { inventoryLegacyToolingConsumers } from "../../services/tasks/tooling-operations.ts";
 
 const ActivationBody = z.strictObject({ requestKey: z.string(), revision: z.string(), expectedGeneration: z.number() });
 const STATUS: Record<ToolingActivationErrorCode, 400 | 409 | 422> = {
@@ -29,7 +30,8 @@ export function toolingReleaseRoutes(options: { enabled: boolean; activate?: typ
     const body = ActivationBody.safeParse(await c.req.json().catch(() => null));
     if (!body.success) return c.json({ error: "Activation requires requestKey, revision and expectedGeneration", code: "invalid-request" }, 400);
     try {
-      const selection = await (options.activate ?? activateToolingRelease)({ prisma: c.get("prisma"), config: c.get("config"), repositoryId: c.req.param("repositoryId"), ...body.data });
+      const selection = await (options.activate ?? activateToolingRelease)({ prisma: c.get("prisma"), config: c.get("config"), repositoryId: c.req.param("repositoryId"), ...body.data },
+        { inventoryLegacyConsumers: inventoryLegacyToolingConsumers });
       return c.json({ status: "activated", selection });
     } catch (error) {
       if (!(error instanceof ToolingActivationError)) throw error;
