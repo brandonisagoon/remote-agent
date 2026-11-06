@@ -206,34 +206,65 @@ test("operation bindings persist before effects and retries keep their original 
   expect(await readToolingOperation({ prisma: db.prisma, operationId: "missing" })).toBeNull();
 });
 
-test("the reconciliation seam returns only an unknown command-parented compute-admission child with an open parent to running", async () => {
+test("the validated-proof seam returns only an unknown command-parented compute-admission child, with its stored evidence link, open parent, same lineage and protocol, to running", async () => {
   const task = await ownedTask();
   await activate("k1", "A", 0);
   const bind = (requestKey: string, kind: string, parentOperationId?: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
     request: { requestKey, inputDigest: "a".repeat(64), kind, ...(parentOperationId ? { parentOperationId } : {}) } });
   const unknown = async (operationId: string) => { await transitionToolingOperation({ prisma: db.prisma, operationId, from: "bound", to: "running" }); await transitionToolingOperation({ prisma: db.prisma, operationId, from: "running", to: "unknown" }); };
-  const reconcile = (operationId: string, acknowledgedAttemptId = "attempt-2") => db.prisma.$transaction(tx => reconcileUnknownAdmissionChild(tx, { operationId, acknowledgedAttemptId }));
+  // The caller's records (this unit plays the operations layer): one acknowledgment, then the reconciliation link.
+  const outcome = (tx: { runtimeMetadataEvent: typeof db.prisma.runtimeMetadataEvent }, operationId: string, value: Record<string, unknown>) => tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: task.primarySessionId!,
+    source: `tooling-operation:${task.id}`, action: "tooling-operation-association", key: `outcome:${operationId}`,
+    value: JSON.stringify({ version: 1, role: "outcome", operationId, inputDigest: "a".repeat(64), route: "POST /api/tasks/:taskId/compute-request", ...value }) } });
+  const acknowledge = (operationId: string, attemptId = "replay") => outcome(db.prisma, operationId, { state: "acknowledged", attemptId, status: 200 });
+  const reconcile = (operationId: string, options: { link?: boolean; acknowledgedAttemptId?: string; events?: number[] } = {}) => db.prisma.$transaction(async tx => {
+    const events = options.events ?? (options.link === false ? [] : [(await outcome(tx, operationId, { state: "reconciled", attemptId: "lost", acknowledgedAttemptId: "replay" })).sequence]);
+    return reconcileUnknownAdmissionChild(tx, { operationId, acknowledgedAttemptId: options.acknowledgedAttemptId ?? "replay", reconciliationEvents: events });
+  });
+  const status = async (operationId: string) => (await readToolingOperation({ prisma: db.prisma, operationId }))!.status;
   const parent = await bind("command", "adapter-command");
   const child = await bind("command/compute-admission", "compute-admission", parent.operationId);
   expect(child).toMatchObject({ parentOperationId: parent.operationId, generation: parent.generation, release: { id: parent.release.id } });
-  // Not unknown yet, or no acknowledged attempt named: refused.
-  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await acknowledge(child.operationId);
+  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" }); // not unknown yet
   await unknown(child.operationId);
-  await expect(reconcile(child.operationId, " ")).rejects.toMatchObject({ code: "evidence-required" });
+  // Evidence link: none, a blank or another acknowledgment, or a record from before the acknowledgment.
+  await expect(reconcile(child.operationId, { link: false })).rejects.toMatchObject({ code: "evidence-required" });
+  await expect(reconcile(child.operationId, { acknowledgedAttemptId: " " })).rejects.toMatchObject({ code: "evidence-required" });
+  await expect(reconcile(child.operationId, { acknowledgedAttemptId: "other" })).rejects.toMatchObject({ code: "evidence-required" });
+  const early = await outcome(db.prisma, child.operationId, { state: "reconciled", attemptId: "lost", acknowledgedAttemptId: "replay" });
+  const lateAck = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { key: `outcome:${child.operationId}` }, orderBy: { sequence: "asc" } });
+  expect(early.sequence).toBeGreaterThan(lateAck.sequence);
+  const stale = await bind("stale", "adapter-command"), staleChild = await bind("stale/compute-admission", "compute-admission", stale.operationId); await unknown(staleChild.operationId);
+  const staleLink = await outcome(db.prisma, staleChild.operationId, { state: "reconciled", attemptId: "lost", acknowledgedAttemptId: "replay" }); // written before its acknowledgment
+  await acknowledge(staleChild.operationId);
+  await expect(reconcile(staleChild.operationId, { events: [staleLink.sequence] })).rejects.toMatchObject({ code: "evidence-required" });
+  await expect(reconcile(child.operationId, { events: [staleLink.sequence] })).rejects.toMatchObject({ code: "evidence-required" }); // another operation's record
+  expect(await status(child.operationId)).toBe("unknown"); // every refusal rolled back
   // A root (unparented) compute-admission, or another kind, never qualifies.
-  const root = await bind("root", "compute-admission"); await unknown(root.operationId);
+  const root = await bind("root", "compute-admission"); await unknown(root.operationId); await acknowledge(root.operationId);
   await expect(reconcile(root.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
   const command = await bind("other-command", "adapter-command"); await unknown(command.operationId);
   await expect(reconcile(command.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
-  // Success is a compare-and-swap to running; a second call is refused.
-  expect((await reconcile(child.operationId)).status).toBe("running");
-  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
-  // A closed parent: the unknown child stays unknown (rolled back with the caller's transaction).
+  // Mismatched lineage (adversarially corrupted row): refused.
+  const drift = await bind("drift", "adapter-command"), drifted = await bind("drift/compute-admission", "compute-admission", drift.operationId);
+  await unknown(drifted.operationId); await acknowledge(drifted.operationId);
+  await db.prisma.toolingOperation.update({ where: { id: drifted.operationId }, data: { generation: drift.generation + 1 } });
+  await expect(reconcile(drifted.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  // A closed parent: refused, the child stays unknown.
   const closing = await bind("closing", "adapter-command");
-  const orphan = await bind("closing/compute-admission", "compute-admission", closing.operationId); await unknown(orphan.operationId);
+  const orphan = await bind("closing/compute-admission", "compute-admission", closing.operationId); await unknown(orphan.operationId); await acknowledge(orphan.operationId);
   await transitionToolingOperation({ prisma: db.prisma, operationId: closing.operationId, from: "bound", to: "completed", evidence: { kind: "command-completed", reference: "closing" } });
   await expect(reconcile(orphan.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
-  expect((await readToolingOperation({ prisma: db.prisma, operationId: orphan.operationId }))!.status).toBe("unknown");
+  expect(await status(orphan.operationId)).toBe("unknown");
+  // Success: compare-and-swap to running with its stored link; a second call is refused.
+  expect((await reconcile(child.operationId)).status).toBe("running");
+  await expect(reconcile(child.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  // A release whose protocol this server no longer speaks: refused (adversarially changed manifest).
+  const late = await bind("late", "adapter-command"), lateChild = await bind("late/compute-admission", "compute-admission", late.operationId); await unknown(lateChild.operationId); await acknowledge(lateChild.operationId);
+  const row = await db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: late.release.id } });
+  await db.prisma.toolingRelease.update({ where: { id: row.id }, data: { manifest: { ...(row.manifest as object), serverProtocol: { min: 2, max: 2 } } } });
+  await expect(reconcile(lateChild.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
   // The generic transition contract is unchanged.
   await expect(transitionToolingOperation({ prisma: db.prisma, operationId: orphan.operationId, from: "unknown", to: "running" })).rejects.toMatchObject({ code: "invalid-transition" });
 });

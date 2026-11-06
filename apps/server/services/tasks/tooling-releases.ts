@@ -381,17 +381,22 @@ async function operationContext(store: Store, operationId: string) {
 }
 
 /**
- * SERVER-ONLY reconciliation seam, not a generic transition (TRANSITIONS is
+ * SERVER-ONLY validated-proof seam, not a generic transition (TRANSITIONS is
  * unchanged): an `unknown` command-parented `compute-admission` child returns
  * to `running` so its own command can continue. Only for a transaction client:
  * the caller must, in the SAME transaction, have verified its exact domain
- * proof and appended the reconciliation evidence naming the acknowledged
- * attempt, so status and journal commit (or roll back) together. Requires an
- * open adapter-command parent of the same task, session and repository, with
- * the child's lineage (release, generation) unchanged. Compare-and-swap.
+ * proof and appended the reconciliation records it names here by sequence, so
+ * status and journal commit (or roll back) together. This seam re-reads those
+ * stored records and requires: each is this operation's `reconciled` outcome
+ * linking to `acknowledgedAttemptId` with the operation's request digest, and
+ * was written after that acknowledgment; an open adapter-command parent of
+ * the same task, session and repository; identical lineage (release,
+ * generation) and a release whose protocol this server still speaks.
  */
-export async function reconcileUnknownAdmissionChild(tx: Prisma.TransactionClient, input: { operationId: string; acknowledgedAttemptId: string }): Promise<ToolingOperationBinding> {
-  if (!input.acknowledgedAttemptId.trim()) throw new ToolingOperationError("evidence-required", "Reconciliation requires the acknowledged attempt it relies on");
+const RECONCILED_OUTCOME = z.object({ version: z.literal(1), role: z.literal("outcome"), state: z.enum(["acknowledged", "reconciled"]), operationId: z.string(), attemptId: z.string(),
+  inputDigest: z.string(), route: z.string(), status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional() }).passthrough();
+export async function reconcileUnknownAdmissionChild(tx: Prisma.TransactionClient, input: { operationId: string; acknowledgedAttemptId: string; reconciliationEvents: readonly number[] }): Promise<ToolingOperationBinding> {
+  if (!input.acknowledgedAttemptId.trim() || !input.reconciliationEvents.length) throw new ToolingOperationError("evidence-required", "Reconciliation requires its stored records and the acknowledged attempt they rely on");
   const row = await tx.toolingOperation.findUnique({ where: { id: input.operationId } });
   if (!row) throw new ToolingOperationError("not-found", "Tooling operation not found");
   if (row.status !== "unknown" || row.kind !== "compute-admission" || !row.parentOperationId) throw new ToolingOperationError("invalid-transition", `Operation ${row.id} (${row.kind}, ${row.status}) is not an unknown command-parented compute-admission child`);
@@ -400,7 +405,29 @@ export async function reconcileUnknownAdmissionChild(tx: Prisma.TransactionClien
     || parent.repositoryId !== row.repositoryId || parent.releaseId !== row.releaseId || parent.generation !== row.generation) {
     throw new ToolingOperationError("invalid-transition", `Operation ${row.id} has no open adapter-command parent of the same task, session, repository and lineage`);
   }
-  const updated = await tx.toolingOperation.updateMany({ where: { id: row.id, status: "unknown", kind: "compute-admission", parentOperationId: parent.id }, data: { status: "running" } });
+  const release = await tx.toolingRelease.findUnique({ where: { id: row.releaseId } });
+  const manifest = release ? ToolingReleaseManifestSchema.safeParse(release.manifest) : null;
+  if (!release || release.repositoryId !== row.repositoryId || !manifest?.success
+    || Math.min(SERVER_TOOLING_PROTOCOL.max, manifest.data.serverProtocol.max) < Math.max(SERVER_TOOLING_PROTOCOL.min, manifest.data.serverProtocol.min)) {
+    throw new ToolingOperationError("invalid-transition", `Operation ${row.id} lineage has no release this server's protocol supports`);
+  }
+  // The stored evidence link, read back in this transaction.
+  const where = { runtimeSessionId: row.sessionId, source: `tooling-operation:${row.taskId}`, action: "tooling-operation-association", key: `outcome:${row.id}` };
+  const acknowledged = (await tx.runtimeMetadataEvent.findMany({ where, orderBy: { sequence: "desc" }, take: 1001 }))
+    .flatMap(event => { const value = RECONCILED_OUTCOME.safeParse(JSON.parse(event.value ?? "null")).data; return value?.state === "acknowledged" && value.attemptId === input.acknowledgedAttemptId ? [{ ...value, sequence: event.sequence }] : []; });
+  const ack = acknowledged[0];
+  if (acknowledged.length !== 1 || !ack || ack.operationId !== row.id || ack.inputDigest !== row.inputDigest || typeof ack.status !== "number" || ack.status < 200 || ack.status >= 300) {
+    throw new ToolingOperationError("evidence-required", `Operation ${row.id} has no single exact acknowledgment ${input.acknowledgedAttemptId}`);
+  }
+  for (const sequence of new Set(input.reconciliationEvents)) {
+    const event = await tx.runtimeMetadataEvent.findUnique({ where: { sequence } });
+    const value = event ? RECONCILED_OUTCOME.safeParse(JSON.parse(event.value ?? "null")).data : undefined;
+    if (!event || event.runtimeSessionId !== where.runtimeSessionId || event.source !== where.source || event.action !== where.action || event.key !== where.key || event.sequence <= ack.sequence
+      || !value || value.state !== "reconciled" || value.operationId !== row.id || value.inputDigest !== row.inputDigest || value.acknowledgedAttemptId !== input.acknowledgedAttemptId) {
+      throw new ToolingOperationError("evidence-required", `Reconciliation record ${sequence} is not this operation's stored link to acknowledgment ${input.acknowledgedAttemptId}`);
+    }
+  }
+  const updated = await tx.toolingOperation.updateMany({ where: { id: row.id, status: "unknown", kind: "compute-admission", parentOperationId: parent.id, releaseId: parent.releaseId, generation: parent.generation }, data: { status: "running" } });
   if (updated.count !== 1) throw new ToolingOperationError("transition-conflict", `Operation ${row.id} changed during reconciliation`);
   return binding(tx as unknown as Store, (await tx.toolingOperation.findUniqueOrThrow({ where: { id: row.id } })));
 }

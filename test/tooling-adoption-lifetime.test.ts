@@ -24,6 +24,7 @@ import type { AppEnv } from "../apps/server/middleware/context.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/routes/tasks/tooling-operations.ts";
 import { TOOLING_OPERATION_HEADER, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
 import { activateToolingRelease, canonicalDigest } from "../apps/server/services/tasks/tooling-releases.ts";
+import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
 for (const name of Object.keys(process.env)) if (name.startsWith("REMOTE_AGENT_")) delete process.env[name];
@@ -102,8 +103,10 @@ async function fixture() {
       settle: () => post(`/api/sessions/primary/tooling-operations/${fence.operationId}/settlement`, { requestKey: fence.requestKey, inputDigest: fence.inputDigest, outcome: "completed" }, fence.operationId),
     };
   };
-  const environment = () => db.prisma.computeEnvironment.create({ data: { id: ENV, taskId: "task", primarySessionId: "primary", machineId: "host", key: KEY,
-    purpose: "development", revision: computeBody.revision, recipeDigest: computeBody.recipeDigest, taskIdentity: "9".repeat(64), state: "waiting" } });
+  // Synthetic domain row carrying the task's real compute-owner identity.
+  const environment = async () => db.prisma.computeEnvironment.create({ data: { id: ENV, taskId: "task", primarySessionId: "primary", machineId: "host", key: KEY,
+    purpose: "development", revision: computeBody.revision, recipeDigest: computeBody.recipeDigest, state: "waiting",
+    taskIdentity: computeTaskIdentity(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } }), "primary", "host", null) } });
   const offer = (id: string, state = "offered") => db.prisma.computeOffer.create({ data: { id, environmentId: ENV, machineId: "host", instructionId: `instruction-${id}`, state, dispatchDeadline: new Date(Date.now() + 60_000) } });
   const claimed = (id: string) => db.prisma.computeOffer.update({ where: { id }, data: { state: "running", claimedAt: new Date() } });
   /** Admission receipts for the key: [operation prefix, state] in record order. */
@@ -436,6 +439,36 @@ test("reconcile: another route's unknown, a changed environment or a pause betwe
     // A different request under the same child never reaches an attempt.
     expect((await a.call("compute-request", { ...computeBody, revision: "e".repeat(40) }, child.operationId)).status).toBe(400);
     expect((await attempts(child.operationId)).filter(record => record.state === "intent")).toHaveLength(2);
+  }
+  // The primary's authority is revoked while the replay runs (its session
+  // closes): the proof transaction rechecks full authority and rolls back.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a, child } = await lostRequest();
+    f.setDomain(async () => { await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed" } }); return 200; });
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(child.operationId)).status).toBe("unknown");
+    expect((await attempts(child.operationId)).some(record => record.state === "reconciled")).toBe(false);
+  }
+  // The environment's owner identity no longer matches the task.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a, child } = await lostRequest();
+    await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { taskIdentity: "9".repeat(64) } });
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(child.operationId)).status).toBe("unknown");
+  }
+  // Producer evidence that is truncated (over its bound) or unreadable is never
+  // read as "no producer". ADVERSARIAL seeded rows, used only to prove refusal.
+  for (const seed of ["overflow", "unreadable"] as const) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a, child } = await lostRequest();
+    const row = (index: number, value: string) => ({ runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `producer:compute-environment:other-${index}`, value });
+    if (seed === "overflow") await db.prisma.runtimeMetadataEvent.createMany({ data: Array.from({ length: 1001 }, (_, index) => row(index, JSON.stringify({ version: 1, operationId: "other", role: "producer", state: "confirmed" }))) });
+    else await db.prisma.runtimeMetadataEvent.create({ data: row(0, "{not json") });
+    expect((await a.request()).called?.status).toBe(200);
+    expect((await f.operation(child.operationId)).status).toBe("unknown");
+    expect((await attempts(child.operationId)).some(record => record.state === "reconciled")).toBe(false);
   }
   // The owner pauses while the replay runs: the proof transaction refuses atomically.
   {

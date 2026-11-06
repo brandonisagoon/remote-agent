@@ -372,14 +372,16 @@ const REQUEST_ROUTE = "POST /api/tasks/:taskId/compute-request";
 function validReconciliation(records: Awaited<ReturnType<typeof attemptRecords>>, attemptId: string, operation: { id: string; inputDigest: string }) {
   const values = records.flatMap(record => record.value ? [{ ...record.value, sequence: record.sequence }] : []);
   const intentOf = (id: string) => values.find(value => value.attemptId === id && value.state === "intent");
-  const original = intentOf(attemptId);
-  if (!original || original.route !== REQUEST_ROUTE || !values.some(value => value.attemptId === attemptId && value.state === "unknown" && value.route === REQUEST_ROUTE)) return false;
+  const exact = (value: { operationId: string; inputDigest: string; route?: string } | undefined) => Boolean(value && value.operationId === operation.id && value.inputDigest === operation.inputDigest && value.route === REQUEST_ROUTE);
+  const original = intentOf(attemptId), lost = values.find(value => value.attemptId === attemptId && value.state === "unknown");
+  if (!exact(original) || !exact(lost)) return false;
   return values.some(value => {
-    if (value.state !== "reconciled" || value.attemptId !== attemptId || value.operationId !== operation.id || value.inputDigest !== operation.inputDigest || !value.acknowledgedAttemptId) return false;
+    if (value.state !== "reconciled" || value.attemptId !== attemptId || !exact(value) || !value.acknowledgedAttemptId) return false;
     const replay = intentOf(value.acknowledgedAttemptId);
-    const acknowledged = values.find(entry => entry.attemptId === value.acknowledgedAttemptId && entry.state === "acknowledged");
-    return Boolean(replay && acknowledged && replay.route === REQUEST_ROUTE && acknowledged.route === REQUEST_ROUTE && replay.sequence > original.sequence
-      && typeof acknowledged.status === "number" && acknowledged.status >= 200 && acknowledged.status < 300);
+    const acknowledged = values.filter(entry => entry.attemptId === value.acknowledgedAttemptId && entry.state === "acknowledged");
+    // The replay began after the original, and the link was written after its acknowledgment.
+    return Boolean(exact(replay) && acknowledged.length === 1 && exact(acknowledged[0]) && replay!.sequence > original!.sequence && value.sequence > acknowledged[0]!.sequence
+      && typeof acknowledged[0]!.status === "number" && acknowledged[0]!.status >= 200 && acknowledged[0]!.status < 300);
   });
 }
 /** Settled callback history: every recorded attempt has a definite result
@@ -803,10 +805,11 @@ async function reconcileUnknownRequest(prisma: PrismaClient, admission: Extract<
     .filter(id => !values.some(value => value.attemptId === id && value.state === "reconciled"));
   if (!unknown.length) throw new Error("No unknown attempt to reconcile");
   await prisma.$transaction(async tx => {
+    const written: number[] = [];
     for (const attemptId of unknown) {
-      await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.sessionId, source: `tooling-operation:${current.taskId}`, action: ASSOCIATION, key: associationKey("outcome", current.operationId),
+      written.push((await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.sessionId, source: `tooling-operation:${current.taskId}`, action: ASSOCIATION, key: associationKey("outcome", current.operationId),
         value: JSON.stringify({ version: 1, operationId: current.operationId, role: "outcome", state: "reconciled", attemptId, acknowledgedAttemptId, route: REQUEST_ROUTE,
-          inputDigest: current.inputDigest, requestKey: current.requestKey, evidence: `idempotent-replay:${acknowledgedAttemptId}` }) } });
+          inputDigest: current.inputDigest, requestKey: current.requestKey, evidence: `idempotent-replay:${acknowledgedAttemptId}` }) } })).sequence);
     }
     // Under the lock: nothing but these records changed since the proof read.
     const records = await attemptRecords(tx, current, current.operationId);
@@ -819,17 +822,28 @@ async function reconcileUnknownRequest(prisma: PrismaClient, admission: Extract<
       if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, { id: current.operationId, inputDigest: current.inputDigest })) throw new Error(`Attempt ${intent.attemptId} (${intent.route}) cannot be reconciled by a request replay`);
     }
     if (values.some(value => value.operationId !== current.operationId || value.inputDigest !== current.inputDigest)) throw new Error("Attempt records name another operation or request");
-    const task = await tx.remoteTask.findUnique({ where: { id: current.taskId } });
-    if (!task || task.primarySessionId !== current.sessionId || task.repositoryId !== current.repositoryId || task.phase === "closed" || task.ownerPaused) throw new Error("Task ownership, closure or pause changed");
+    // Full current authority under the write lock: open primary, session,
+    // cwd, machine and source link; then the compute owner's identity.
+    const { task } = await assertOpenTaskPrimary({ prisma: tx as unknown as PrismaClient, config, sessionId: current.sessionId });
+    if (task.id !== current.taskId || task.repositoryId !== current.repositoryId || task.ownerPaused) throw new Error("Task ownership or pause changed");
+    const { computeTaskOwner } = await import("./compute-admission.ts");
+    const owner = await computeTaskOwner(tx as unknown as PrismaClient, task.id, config.machine);
     const environment = typeof body.key === "string" ? await tx.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: body.key } } }) : null;
-    if (!environment || environment.primarySessionId !== task.primarySessionId || (["purpose", "revision", "recipeDigest"] as const).some(key => environment[key] !== body[key])) throw new Error("Environment readback does not match the request");
+    if (!environment || environment.taskId !== owner.task.id || environment.primarySessionId !== owner.session.id || environment.machineId !== config.machine || environment.taskIdentity !== owner.identity
+      || (["purpose", "revision", "recipeDigest"] as const).some(key => environment[key] !== body[key])) throw new Error("Environment readback does not match the request and its current owner");
     const admitted = (await admissionHistory(tx, task, environment.key)).find(value => value.operationId === current.operationId);
     const holder = (await admissionHistory(tx, task, environment.key))[0];
     if (admitted?.state !== "confirmed" || !holder || !await sameLineage(tx as unknown as PrismaClient, holder.operationId, current, dependencies.read)) throw new Error("The operation's admission is not confirmed and current");
+    // Bounded, strictly read producer evidence: never infer "no producer" from a truncated or unreadable history.
     const produced = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: current.sessionId, source: `tooling-operation:${current.taskId}`, action: ASSOCIATION, key: { startsWith: "producer:" } }, take: 1001 });
-    if (produced.some(event => Association.safeParse(JSON.parse(event.value ?? "null")).data?.operationId === current.operationId)) throw new Error("The operation has a producer association");
+    if (produced.length > 1000) throw new Error("Producer evidence exceeds its bound");
+    for (const event of produced) {
+      const value = Association.safeParse((() => { try { return JSON.parse(event.value ?? "null"); } catch { return null; } })());
+      if (!value.success || value.data.role !== "producer") throw new Error(`Producer evidence ${event.sequence} is unreadable`);
+      if (value.data.operationId === current.operationId) throw new Error("The operation has a producer association");
+    }
     if (await tx.toolingRetainedConsumer.count({ where: { operationId: current.operationId, status: "pending" } })) throw new Error("The operation has a pending reader");
-    await reconcileUnknownAdmissionChild(tx, { operationId: current.operationId, acknowledgedAttemptId });
+    await reconcileUnknownAdmissionChild(tx, { operationId: current.operationId, acknowledgedAttemptId, reconciliationEvents: written });
   });
 }
 
