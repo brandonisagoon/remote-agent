@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, copyFileSync, existsSync, mkdirSync, rmdirSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, rmdirSync, statSync } from "node:fs";
 import path from "node:path";
 
 import { configFilePath, readConfig, type ServerConfig } from "../lib/config.ts";
@@ -8,6 +8,7 @@ import { serverDefinition, serviceLabel, supervisor, type ServiceDefinition } fr
 import { syncTree } from "./sync-tree.ts";
 import { waitForHealth } from "./provision.ts";
 import { assertToolingServerCompatibility, assertToolingSnapshotRestoreSafe } from "./tooling-deployment.ts";
+import { restoreStoppedDatabase, snapshotStoppedDatabase } from "./sqlite-snapshot.ts";
 
 /** Pull origin/<branch>, rebuild, migrate, restart, verify — roll back on
     failure (TS port of the retired deploy.sh).
@@ -34,6 +35,9 @@ export interface DeployContext {
   snapshot: string | null | "absent";
   /** Set before requesting restart: even a failed start may admit effects. */
   serverStartedSinceSnapshot: boolean;
+  /** How long a snapshot/restore waits for other connections to close
+   * before refusing (default 5s). The lock, not the wait, is the proof. */
+  databaseBusyTimeoutMs?: number;
   effects: DeployEffects;
   log: (line: string) => void;
 }
@@ -189,8 +193,10 @@ async function tryBuild(context: DeployContext, commit: string): Promise<boolean
     await context.effects.run(bun, ["install", "--silent"], { cwd: layout.app, env });
     await context.effects.run(bun, ["x", "prisma", "generate"], { cwd: layout.app, env });
     await context.effects.supervisor().stop(serviceLabel(context.config.serviceName));
+    // The pause only gives shutdown time; the snapshot itself proves that no
+    // connection remains before reading the database.
     await context.effects.settle();
-    snapshotDatabase(context, commit);
+    await snapshotDatabase(context, commit);
     await context.effects.run(bun, ["x", "prisma", "migrate", "deploy"], { cwd: layout.app, env });
     await context.effects.run(bun, ["x", "tsc", "--noEmit", "-p", "tsconfig.deploy.json"], { cwd: layout.app, env });
     return true;
@@ -213,7 +219,12 @@ async function restartAndCheck(context: DeployContext): Promise<boolean> {
   }
 }
 
-function snapshotDatabase(context: DeployContext, commit: string): void {
+const backupStamp = () => new Date().toISOString().replaceAll(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+
+/** A consistent SQLite backup (VACUUM INTO), including committed WAL frames
+ * a stopped server may not have checkpointed. Refused while any connection
+ * still has the database open; then migration never runs. */
+async function snapshotDatabase(context: DeployContext, commit: string): Promise<void> {
   if (context.snapshot !== null) return;
   const { databasePath, layout, log } = context;
   if (!databasePath || !existsSync(databasePath)) {
@@ -222,10 +233,8 @@ function snapshotDatabase(context: DeployContext, commit: string): void {
     return;
   }
   mkdirSync(layout.backups, { recursive: true });
-  const stamp = new Date().toISOString().replaceAll(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
-  const snapshot = path.join(layout.backups, `remote-agent-${stamp}-${commit}.sqlite`);
-  copyFileSync(databasePath, snapshot);
-  if (process.platform !== "win32") chmodSync(snapshot, 0o600);
+  const snapshot = path.join(layout.backups, `remote-agent-${backupStamp()}-${commit}.sqlite`);
+  await snapshotStoppedDatabase(databasePath, snapshot, { ...(context.databaseBusyTimeoutMs !== undefined ? { busyTimeoutMs: context.databaseBusyTimeoutMs } : {}) });
   context.snapshot = snapshot;
   log(`snapshotted SQLite database to ${snapshot}`);
 }
@@ -238,7 +247,10 @@ async function prepareRollback(context: DeployContext, previous: string): Promis
     await restoreDatabaseSnapshot(context);
     return true;
   } catch (error) {
-    context.log(`ROLLBACK REFUSED — preserving current code and database; manual coordinated recovery required: ${error instanceof Error ? error.message : String(error)}`);
+    const state = context.serverStartedSinceSnapshot
+      ? "a candidate server was started and may have admitted work"
+      : "the service is STOPPED (stopped for migration, not restarted)";
+    context.log(`ROLLBACK REFUSED — ${state}; preserving current code and database; manual coordinated recovery required: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }
@@ -249,9 +261,11 @@ async function restoreDatabaseSnapshot(context: DeployContext): Promise<void> {
   if (!databasePath) return;
   if (context.serverStartedSinceSnapshot) await assertToolingSnapshotRestoreSafe(context.config.databaseUrl);
   await context.effects.supervisor().stop(serviceLabel(context.config.serviceName));
-  copyFileSync(context.snapshot, databasePath);
-  if (process.platform !== "win32") chmodSync(databasePath, 0o600);
-  log(`restored SQLite database from ${context.snapshot}`);
+  await context.effects.settle();
+  // The replaced database is kept, self-contained, beside the snapshot.
+  const evidence = path.join(context.layout.backups, `remote-agent-${backupStamp()}-pre-restore.sqlite`);
+  await restoreStoppedDatabase(databasePath, context.snapshot, evidence, { ...(context.databaseBusyTimeoutMs !== undefined ? { busyTimeoutMs: context.databaseBusyTimeoutMs } : {}) });
+  log(`restored SQLite database from ${context.snapshot}; previous database preserved at ${evidence}`);
 }
 
 // `bun management/deploy.ts [--force]` — invoked by the CLI/GUI update
