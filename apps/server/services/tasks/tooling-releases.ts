@@ -5,10 +5,10 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import { SERVER_TOOLING_PROTOCOL, ToolingReleaseManifestSchema, prepareToolingRelease, verifyPreparedToolingRelease, type PreparedToolingRelease } from "./tooling.ts";
 
-/** Internal implementation-completeness guard. Externally callable activation
- * stays unavailable until integration verifies every DRA-29/30 consumer binds
- * operations. This is not configuration and not a per-task capability. */
-export const TOOLING_ACTIVATION_ENABLED = false;
+/** Integrated operation consumers now support owner activation. The route is
+ * bearer TCP only; enabling this source feature neither deploys a server nor
+ * changes any selection. Deployment remains a separate owner action. */
+export const TOOLING_ACTIVATION_ENABLED = true;
 
 export type ToolingActivationErrorCode = "invalid-request" | "repository-unavailable" | "request-conflict" | "generation-conflict"
   | "restart-required" | "preparation-failed" | "state-format-incompatible" | "legacy-inventory-unavailable";
