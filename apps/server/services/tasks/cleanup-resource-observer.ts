@@ -4,8 +4,8 @@ import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
 import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
-import type { ToolingOperationBinding, ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
-import { FINALIZATION_PREPARED_ACTION, TOOLING_OPERATION_ENV, boundRelease, currentToolingOperation, producingToolingOperation } from "./tooling-operations.ts";
+import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
+import { TOOLING_OPERATION_ENV, boundCode, currentToolingOperation, latestFinalizationReference, resourceGroupCode, toolingOperationDependencies, type ToolingCodeIdentity } from "./tooling-operations.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { CleanupObservationContracts, resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { CleanupObserverBatchInput } from "./cleanup-observer-schema.ts";
@@ -134,22 +134,29 @@ export async function verifyCleanupObserver(capability: CleanupObserverCapabilit
   try { return await checkedCapability(capability, retainedPreview); } catch (error) { throw error instanceof CleanupObserverError ? error : failure(); }
 }
 
-/** Cleanup proofs keep the accepted finalization's operation binding: an
- * explicit release, the guarded callback's binding, else the operation that
- * prepared the task's latest finalization. None is a pre-protocol
- * finalization and keeps the legacy configured-host revision. */
-export async function cleanupObserverRelease(input: { task: RemoteTask; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingReleaseRecord | null }) {
-  const bound = boundRelease(input.release);
-  if (bound !== undefined || !input.prisma || !input.task.primarySessionId) return bound ?? null;
-  const prepared = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.task.primarySessionId, source: `finalizer:${input.task.id}`, action: FINALIZATION_PREPARED_ACTION }, orderBy: { sequence: "desc" } });
-  if (!prepared) return null;
-  return (await producingToolingOperation({ prisma: input.prisma, task: input.task, reference: { type: "finalization", id: prepared.key } }))?.release ?? null;
+/** Cleanup proofs keep the accepted finalization's code: an explicit
+ * identity, the guarded callback's binding or legacy snapshot, else the
+ * operation owning the task's latest prepared finalization or its retained
+ * first-bootstrap snapshot. Exact prepared observer paths/hashes already in
+ * receipts are reused by their callers and never re-resolved here. With no
+ * finalization at all this is an independent resolution of the active
+ * release. A finalization with neither owner nor snapshot fails closed. */
+export async function cleanupObserverRelease(input: { task: RemoteTask; config?: ServerConfig; prisma?: PrismaClient; release?: ToolingCodeIdentity | null }, dependencies = toolingOperationDependencies): Promise<ToolingCodeIdentity | null> {
+  const scoped = boundCode(input.release);
+  if (scoped !== undefined || !input.prisma) return scoped ?? null;
+  const finalization = await latestFinalizationReference(input.prisma, input.task);
+  if (finalization) return (await resourceGroupCode({ prisma: input.prisma, task: input.task, reference: finalization }, dependencies)).code;
+  if (!input.config) return null;
+  return (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: input.task.repositoryId }))?.release ?? null;
 }
 
-export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingReleaseRecord | null }, resolve = resolveToolingCompatibility) {
+// Callers pass the server client or an interactive transaction (all models);
+// the narrow store type reflects only what they declare.
+export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingCodeIdentity | null }, resolve = resolveToolingCompatibility) {
   try {
     if (!input.task.worktreePath) throw failure();
-    const release = await cleanupObserverRelease(input);
+    const release = await cleanupObserverRelease({ task: input.task, config: input.config, ...(input.release !== undefined ? { release: input.release } : {}),
+      ...(input.prisma ? { prisma: input.prisma as PrismaClient } : {}) });
     const selected = await resolve({ task: input.task, repository: getRepositoryConfig(input.config, input.task.repositoryId), installRoot: input.config.installRoot,
       capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}),
       ...(release ? { release } : {}) });

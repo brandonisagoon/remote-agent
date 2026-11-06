@@ -6,23 +6,24 @@ import { refreshComputeObservation, computeEvidenceState } from "./compute-obser
 import { considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
 import { operationEnvironment, verifiedComputeRuntime } from "./compute-observer.ts";
-import { bindServerToolingOperation } from "./tooling-operations.ts";
+import { bindServerContinuation } from "./tooling-operations.ts";
 import { canonicalDigest } from "./tooling-releases.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
-/** Executing a recorded suspension is its own server-initiated operation:
- * bound once per environment/intent, so a retry or unknown outcome reuses the
- * original release even after a later activation. Pre-protocol repositories
- * keep the legacy configured revision; neither path installs tooling. */
-async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }, bind = bindServerToolingOperation) {
+/** Executing a recorded suspension continues the existing group with its own
+ * code: the producer's release (bound once per environment/intent, so a retry
+ * or unknown outcome reuses it), or the group's retained first-bootstrap
+ * snapshot without a binding. Pre-protocol repositories keep the configured
+ * revision. Nothing here installs tooling or selects a newer release. */
+async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }, bind = bindServerContinuation) {
   const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
   if (task.primarySessionId !== input.primarySessionId) throw new Error("Compute continuation primary changed");
-  const binding = await bind({ prisma: input.prisma, config: input.config, task, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
+  const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
     inputDigest: canonicalDigest(reference), kind: "development-intent", existingOperationId: String(input.intentRevision) } });
-  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: binding?.release ?? null, install: false });
+  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
     cwd: runtime.receipt.checkout, env: operationEnvironment(binding), timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
   });

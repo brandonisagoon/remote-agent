@@ -2,10 +2,10 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
-import type { ToolingReleaseRecord, ToolingReleaseSelection } from "../../../../types/tooling-release.ts";
+import type { ToolingReleaseSelection } from "../../../../types/tooling-release.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { DevelopmentReference, assertDevelopmentRequest } from "./development-intent.ts";
-import { assertOpenTaskPrimary, currentToolingOperation, inLegacyContinuation } from "./tooling-operations.ts";
+import { assertOpenTaskPrimary, boundCode, type ToolingCodeIdentity } from "./tooling-operations.ts";
 import { getActiveToolingRelease } from "./tooling-releases.ts";
 
 export { assertOpenTaskPrimary };
@@ -17,23 +17,21 @@ export const ToolingCapabilityInput = z.union([
   z.object({ capability: z.literal("runtime"), development: DevelopmentReference }).strict(),
 ]);
 type Context = { prisma: PrismaClient; config: ServerConfig; sessionId: string };
-/** Release for this capability: an explicit binding/selection from the outer
- * boundary, else the guarded callback's request-scoped binding, else (a new
+/** Code for this capability: an explicit identity from the outer boundary,
+ * else the guarded callback's binding or legacy snapshot, else (a new
  * independent resolution) the current active generation. Null keeps the
- * pre-protocol configured-host behavior. */
-export async function selectCapabilityRelease(input: { prisma: PrismaClient; config: ServerConfig; repositoryId: string; release?: ToolingReleaseRecord | null },
-  active: (input: { prisma: PrismaClient; config: ServerConfig; repositoryId: string }) => Promise<ToolingReleaseSelection | null> = getActiveToolingRelease): Promise<ToolingReleaseRecord | null> {
-  if (input.release !== undefined) return input.release;
-  if (inLegacyContinuation()) return null;
-  const bound = currentToolingOperation();
-  if (bound) {
-    if (bound.repositoryId !== input.repositoryId) throw new Error("Bound tooling operation belongs to another repository");
-    return bound.release;
+ * pre-protocol configured-host behavior of a repository never activated. */
+export async function selectCapabilityRelease(input: { prisma: PrismaClient; config: ServerConfig; repositoryId: string; release?: ToolingCodeIdentity | null },
+  active: (input: { prisma: PrismaClient; config: ServerConfig; repositoryId: string }) => Promise<ToolingReleaseSelection | null> = getActiveToolingRelease): Promise<ToolingCodeIdentity | null> {
+  const scoped = boundCode(input.release);
+  if (scoped !== undefined) {
+    if (scoped && scoped.repositoryId !== input.repositoryId) throw new Error("Bound tooling code belongs to another repository");
+    return scoped;
   }
   return (await active(input))?.release ?? null;
 }
 
-export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput> & { release?: ToolingReleaseRecord | null; install?: boolean },
+export async function resolveSessionToolingCapability(input: Context & z.infer<typeof ToolingCapabilityInput> & { release?: ToolingCodeIdentity | null; install?: boolean },
   resolve = resolveToolingCompatibility, active: Parameters<typeof selectCapabilityRelease>[1] = getActiveToolingRelease) {
   const parsed = ToolingCapabilityInput.parse({ capability: input.capability, ...("development" in input ? { development: input.development } : {}) });
   const { capability } = parsed;

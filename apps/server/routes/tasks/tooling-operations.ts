@@ -1,7 +1,7 @@
 import { Hono, type MiddlewareHandler } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import {
-  TOOLING_OPERATION_HEADER, ToolingOperationRefused, admitToolingCallback, associateToolingOperation, beginSessionToolingOperation,
+  TOOLING_OPERATION_HEADER, ToolingOperationRefused, admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation,
   isToolingCallbackPath, readSessionToolingOperation, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
   type ToolingOperationDependencies,
 } from "../../services/tasks/tooling-operations.ts";
@@ -43,18 +43,18 @@ export function toolingOperationGuard(dependencies: ToolingOperationDependencies
         header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, body }, dependencies);
     } catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
     if (!admission || admission.mode === "pre-protocol") return next();
-    if (admission.mode === "legacy-continuation") return runAsLegacyContinuation(admission.reference, () => next());
-    const { binding, callback } = admission;
-    await runWithToolingOperation(binding, () => next());
-    // Record which durable operations this binding produced only after the
-    // handler succeeded; a failed or unknown effect keeps no association.
-    // The continued existing receipt becomes this operation's, closing its
-    // legacy path and pointing observers at this binding.
-    if (c.res.status >= 200 && c.res.status < 300) {
-      const response: unknown = callback.associate ? await c.res.clone().json().catch(() => ({})) : {};
-      const references = [...(admission.reference ? [admission.reference] : []),
-        ...(callback.associate?.(body, response && typeof response === "object" ? response as Record<string, unknown> : {}) ?? [])];
-      if (references.length) await associateToolingOperation(c.get("prisma"), binding, references);
-    }
+    if (admission.mode === "legacy-continuation") return runAsLegacyContinuation(admission.reference, admission.code, () => next());
+    const prisma = c.get("prisma");
+    let state: Awaited<ReturnType<typeof beforeBoundCallback>>;
+    // Ownership, admission and producer intent are durable before the
+    // handler's first effect; a lost response stays reconcilable.
+    try { state = await beforeBoundCallback(prisma, c.get("config"), admission, dependencies); }
+    catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
+    try { await runWithToolingOperation(state.binding, () => next()); }
+    catch (error) { await afterBoundCallback(prisma, admission, state, "exception", dependencies).catch(() => undefined); throw error; }
+    // A settlement failure leaves the producer intent unknown (fail closed,
+    // reconciled by retrying this operation); it never masks the response.
+    await afterBoundCallback(prisma, admission, state, c.res.status, dependencies)
+      .catch(error => console.warn(`Tooling operation ${state.binding.operationId} outcome remains unsettled: ${error instanceof Error ? error.message : String(error)}`));
   };
 }

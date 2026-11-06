@@ -4,7 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { RepositoryConfig } from "../../../../lib/config.ts";
-import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
+import type { ToolingCodeIdentity } from "./tooling-operations.ts";
 import { withToolingInstructions } from "../../../../lib/skills/compose.ts";
 import { prepareTooling } from "./tooling.ts";
 
@@ -56,13 +56,13 @@ function preparedCheckout(root: string, revision: string): string {
 
 /** Compatibility is a separate, named capability. It never replaces the task's
  * policy/tooling pin or treats the mutable source checkout as a capability.
- * `release` is the caller's explicit operation/selection binding; this inner
+ * `release` is the caller's explicit binding/selection/legacy snapshot; this inner
  * consumer never reads the active selection itself. Without a release the
  * pre-protocol configured-host revision is used (installing only when
  * `install` is not false). */
 export async function resolveToolingCompatibility(input: {
   task: RemoteTask; repository: RepositoryConfig; installRoot: string; capability: ToolingCapability;
-  worktreePath: string; seed: string; pinnedToolingRoot?: string; release?: ToolingReleaseRecord; install?: boolean;
+  worktreePath: string; seed: string; pinnedToolingRoot?: string; release?: ToolingCodeIdentity; install?: boolean;
 }): Promise<{ prompt: string; receipt: CompatibilityReceipt }> {
   const { task, capability } = input;
   let root = input.pinnedToolingRoot;
@@ -74,7 +74,7 @@ export async function resolveToolingCompatibility(input: {
   if (!instructions) {
     if (!input.repository.tooling) throw new Error(`No owner-configured host capability supplies ${capability}`);
     if (input.release) {
-      if (input.release.repositoryId !== input.repository.id) throw new Error("Bound tooling release belongs to another repository");
+      if (input.release.repositoryId !== input.repository.id) throw new Error("Bound tooling code belongs to another repository");
       revision = input.release.revision;
       root = preparedCheckout(input.release.checkout, revision);
     } else {
