@@ -84,10 +84,15 @@ async function fixture() {
       let begun: Reply | undefined;
       if (!child) {
         const digest = inputDigest ?? canonicalDigest({ existingOperationId: existing });
-        begun = await begin({ requestKey: `${requestKey}/${rule.kind}/${canonicalDigest({ existing, digest }).slice(0, 24)}`, inputDigest: digest, kind: rule.kind,
-          ...(rule.reference !== "none" && existing ? { existingOperationId: existing } : {}), parentOperationId: fence.operationId });
+        const sent = { requestKey: `${requestKey}/${rule.kind}/${canonicalDigest({ existing, digest }).slice(0, 24)}`, inputDigest: digest, kind: rule.kind,
+          ...(rule.reference !== "none" && existing ? { existingOperationId: existing } : {}), parentOperationId: fence.operationId };
+        begun = await begin(sent);
         if (begun.status !== 200) return { begun, called: null as Reply | null };
-        child = begun.body.binding as Binding; bindings.push(child);
+        // Drafted's client (66a14f4 assertBindingExecutable) accepts only an exact echo of its request.
+        const echo = begun.body.binding as Binding & { resourceKey: string | null };
+        if (echo.requestKey !== sent.requestKey || echo.inputDigest !== sent.inputDigest || echo.kind !== sent.kind || echo.resourceKey !== null
+          || echo.existingOperationId !== (sent.existingOperationId ?? null) || echo.parentOperationId !== sent.parentOperationId) return { begun, rejected: `bound for a different request (${echo.operationId})`, called: null as Reply | null };
+        child = echo; bindings.push(child);
       }
       return { begun, child, called: await post(`/api/tasks/task/${route}`, body, child.operationId) as Reply | null };
     };
@@ -146,11 +151,12 @@ test("H1: a cross-release request is refused before any effect while A's command
   expect(restarted.fence.operationId).toBe(a.fence.operationId);
   const retry = await restarted.claim("offer-a");
   expect(retry.begun?.status, JSON.stringify(retry.begun?.body)).toBe(200);
-  expect(retry.child!.operationId).toBe(a.bindings[0]!.operationId);
-  expect(retry.child!.release.revision).toBe(A);
+  // A sibling under the same open command gets its own child (exact echo), never another child's binding.
+  expect(retry.child).toMatchObject({ parentOperationId: a.fence.operationId, existingOperationId: "offer-a", release: { revision: A } });
+  expect(retry.child!.operationId).not.toBe(a.bindings[0]!.operationId);
   expect(retry.called?.status).toBe(200);
   expect((await restarted.bind("offer-a")).called?.status).toBe(200);
-  expect(await producerOperationId(db.prisma, await f.task(), ENV)).toBe(a.bindings[0]!.operationId);
+  expect(await producerOperationId(db.prisma, await f.task(), ENV)).toBe(retry.child!.operationId);
   expect((await restarted.settle()).status).toBe(200);
   console.log(JSON.stringify({ H1: { a: short(a.fence), aChild: short(a.bindings[0]!), b: short(b.fence), bChild: short(refused.child!), refusal: refused.called?.body, admissions: await f.admissions(), handled: f.handled } }));
 });
@@ -691,5 +697,105 @@ test("never-attempted: unrelated task association volume or malformation never b
     expect(settled.status).toBe(409);
     expect(settled.body.error).toMatch(/bound with unreadable association \d+ naming it/);
     expect((await f.operation(orphanId)).status).toBe("bound");
+  }
+}, 60_000);
+
+test("same release: a waiting request's command settles, the delivered offer's FRESH command binds its own claim child (exact echo) and adopts the never-produced work", async () => {
+  const f = await fixture();
+  await f.activate(A, 0);
+  // First runtime up: request, waiting for compute; the command settles.
+  const first = await f.command("a-runtime-up");
+  expect((await first.request()).called?.status).toBe(200);
+  await f.environment();
+  expect((await first.settle()).status).toBe(200);
+  const original = first.bindings[0]!;
+  expect((await f.operation(original.operationId)).status).toBe("completed");
+  // The scheduler delivers an offer; the SAME release's CLI runs a new `runtime up --compute-offer`.
+  await f.offer("offer-delivered");
+  const second = await f.command("a-runtime-up-offer");
+  expect(second.fence.release.revision).toBe(A);
+  const claim = await second.claim("offer-delivered");
+  console.log(JSON.stringify({ sameRelease: { firstFence: short(first.fence), original: short(original), secondFence: short(second.fence), begin: claim.begun?.status, returned: claim.begun?.body.binding?.operationId?.slice(0, 8), rejected: (claim as { rejected?: string }).rejected ?? null, claim: claim.called?.status ?? null } }));
+  expect((claim as { rejected?: string }).rejected).toBeUndefined();
+  expect(claim.child).toMatchObject({ parentOperationId: second.fence.operationId, existingOperationId: "offer-delivered", release: { revision: A } });
+  expect(claim.child!.operationId).not.toBe(original.operationId);
+  expect(claim.called?.status, JSON.stringify(claim.called?.body)).toBe(200);
+  await f.claimed("offer-delivered");
+  expect((await second.bind("offer-delivered")).called?.status).toBe(200);
+  expect((await second.settle()).status).toBe(200);
+  expect(await producerOperationId(db.prisma, await f.task(), ENV)).toBe(claim.child!.operationId);
+  // The original completed child kept its identity and status.
+  expect(await f.operation(original.operationId)).toMatchObject({ status: "completed", parentOperationId: first.fence.operationId, requestKey: original.requestKey });
+});
+
+test("same release: an open old command, produced work or another recipe is refused; an exact retry keeps its own child; competing fresh commands yield one winner", async () => {
+  // The old command is still open (not settled): a fresh command is refused at begin, never handed its binding.
+  {
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment(); await f.offer("offer-delivered");
+    const fresh = await f.command("a-runtime-up-offer");
+    const refused = await fresh.claim("offer-delivered");
+    expect(refused.begun?.status).toBe(409);
+    expect(refused.begun?.body).toMatchObject({ code: "retained-release-required" });
+    expect(refused.begun?.body.error).toContain(`belongs to operation ${first.bindings[0]!.operationId}`);
+  }
+  // Produced work (claimed and bound, then settled): a fresh command's claim of a new offer is refused.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment(); await f.offer("offer-1");
+    expect((await first.claim("offer-1")).called?.status).toBe(200);
+    await f.claimed("offer-1");
+    expect((await first.bind("offer-1")).called?.status).toBe(200);
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-2");
+    const fresh = await f.command("a-runtime-up-offer");
+    expect((await fresh.claim("offer-2")).begun?.body).toMatchObject({ code: "retained-release-required" });
+  }
+  // Waiting work: another recipe/revision is refused; an exact retry returns its own child.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment();
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-delivered");
+    const other = await f.command("a-other-recipe");
+    expect((await other.beginChild("offer-delivered", { ...computeBody, revision: "e".repeat(40) })).body).toMatchObject({ code: "retained-release-required" });
+    const fresh = await f.command("a-runtime-up-offer");
+    const begun = await fresh.beginChild("offer-delivered");
+    expect(begun.status).toBe(200);
+    const again = await fresh.beginChild("offer-delivered");
+    expect(again.body.binding).toEqual(begun.body.binding);
+    expect(begun.body.binding).toMatchObject({ parentOperationId: fresh.fence.operationId, existingOperationId: "offer-delivered", release: { revision: A } });
+  }
+  // Two fresh same-release commands both begun while the settled admission is newest: one claim wins atomically.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment();
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-delivered");
+    const x = await f.command("a-one"), y = await f.command("a-two");
+    const [bx, by] = [await x.beginChild("offer-delivered"), await y.beginChild("offer-delivered")];
+    expect([bx.status, by.status]).toEqual([200, 200]);
+    const results = await Promise.all([x.call("compute-claim", { ...computeBody, offerId: "offer-delivered" }, bx.body.binding.operationId),
+      y.call("compute-claim", { ...computeBody, offerId: "offer-delivered" }, by.body.binding.operationId)]);
+    expect(results.map(result => result.status).sort()).toEqual([200, 409]);
+    expect(f.handled.filter(entry => entry.endsWith("compute-claim:200"))).toHaveLength(1);
+    // After the winner adopted, a third fresh command is refused at begin (the winner's command is open).
+    const late = await f.command("a-three");
+    expect((await late.beginChild("offer-delivered")).body).toMatchObject({ code: "retained-release-required" });
   }
 }, 60_000);

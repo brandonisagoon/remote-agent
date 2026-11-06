@@ -142,8 +142,10 @@ test("a binding is stable across activation, and continuing an existing operatio
   await environment("env-1", computeBody.key); await offer("offer-1", "env-1");
   await activate("release-b", 2);
   expect((await begin(config, { requestKey: "op-1", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).binding).toMatchObject({ operationId: first.operationId, generation: 1, release: { revision: A } });
-  // Uncertain claim retried by a caller that minted a new key: original A binding.
-  expect((await begin(config, { requestKey: "fresh-key", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", existingOperationId: "offer-1" })).binding.operationId).toBe(first.operationId);
+  // Only the exact request returns its stored binding: a caller that minted a
+  // new key for A's live, unsettled admission is refused, never handed A's
+  // binding under another identity.
+  await expect(begin(config, { requestKey: "fresh-key", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", existingOperationId: "offer-1" })).rejects.toThrow(/continue that operation/);
   await expect(begin(config, { requestKey: "fresh-2", inputDigest: canonicalDigest({ other: 1 }), kind: "compute-admission", existingOperationId: "offer-1" })).rejects.toThrow(/continue that operation/);
   expect((await begin(config, { requestKey: "op-2", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).binding).toMatchObject({ generation: 2, release: { revision: B } });
   await expect(begin(config, { requestKey: "op-3", inputDigest: canonicalDigest(computeBody), kind: "anything" })).rejects.toThrow();
