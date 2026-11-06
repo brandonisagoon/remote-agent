@@ -408,8 +408,76 @@ async function claimOwnership(prisma: PrismaClient, binding: ToolingOperationBin
   const owner = await owningOperationId(prisma, task, reference);
   if (!owner || !await sameLineage(prisma, owner, binding, read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
 }
+/** Admissions in newest-first order of each operation's latest record. A
+ * refused (`failed`) admission never admitted anything; an `intent` without
+ * an outcome may have, so it still counts (fail closed). */
+async function admissionHistory(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, environmentKey: string) {
+  const latest = new Map<string, z.infer<typeof Association>["state"]>();
+  for (const value of await associations(store, task, "admission", `environment-key:${environmentKey}`)) if (!latest.has(value.operationId)) latest.set(value.operationId, value.state);
+  return [...latest].filter(([, state]) => state !== "failed").map(([operationId, state]) => ({ operationId, state }));
+}
 async function admittingOperationId(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, environmentKey: string) {
-  return (await associations(store, task, "admission", `environment-key:${environmentKey}`))[0]?.operationId ?? null;
+  return (await admissionHistory(store, task, environmentKey))[0]?.operationId ?? null;
+}
+type AdmissionStore = PrismaClient | Prisma.TransactionClient;
+/** The newest admission of another command lineage: what this binding's
+ * admission would supersede. */
+async function priorAdmission(store: AdmissionStore, task: RemoteTask, environmentKey: string, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) {
+  for (const value of await admissionHistory(store, task, environmentKey)) {
+    if (!await sameLineage(store as PrismaClient, value.operationId, binding, read)) return value;
+  }
+  return null;
+}
+const commandOf = async (store: AdmissionStore, operation: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) =>
+  operation.parentOperationId ? read({ prisma: store as PrismaClient, operationId: operation.parentOperationId }) : operation;
+/** A cross-release compute-request may not take over an environment key that
+ * another lineage still genuinely holds: its admitting command is not settled,
+ * an offer is live, or a producer is unknown or still has a live reader.
+ * Returns the refusal reason, or null. Same-release re-admission is unchanged. */
+async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmentKey: string, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) {
+  const environment = await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: environmentKey } } });
+  if (!environment) return null;
+  const prior = await priorAdmission(store, task, environmentKey, binding, read);
+  if (!prior) return null;
+  const original = await read({ prisma: store as PrismaClient, operationId: prior.operationId });
+  if (!original) return `Environment key ${environmentKey} was admitted by unknown operation ${prior.operationId}`;
+  if (original.release.id === binding.release.id) return null;
+  const held = `Environment ${environment.id} is held by operation ${original.operationId} (release ${original.release.revision})`;
+  const command = await commandOf(store, original, read);
+  if (!command || command.status !== "completed") return `${held}: its command is ${command?.status ?? "missing"}`;
+  if (await store.computeOffer.count({ where: { environmentId: environment.id, state: { in: ACTIVE_OFFERS } } })) return `${held}: an offer is live`;
+  try { await producerOperationId(store, task, environment.id); } catch { return `${held}: its producer outcome is unknown`; }
+  if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `${held}: a reader is retained`;
+  return null;
+}
+/** Eligibility of a never-produced waiting offer for adoption by another
+ * release's lineage (offers delivered after an activation tell the primary to
+ * use the active release). Only exact waiting work that never started and
+ * whose admitting command definitively settled. Returns the refusal, or null. */
+async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest">,
+  dependencies: Pick<ToolingOperationDependencies, "read" | "legacy">, body?: Body) {
+  const offer = await store.computeOffer.findUnique({ where: { id: offerId } });
+  const environment = offer ? await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } }) : null;
+  const current = await store.remoteTask.findUnique({ where: { id: task.id } });
+  if (!offer || !environment || !current || environment.taskId !== current.id || environment.primarySessionId !== current.primarySessionId || current.primarySessionId !== task.primarySessionId) return "The offer's environment does not belong to this task's primary";
+  if (current.ownerPaused || current.phase === "closed") return "Task is paused or closed";
+  if (body && (["key", "purpose", "revision", "recipeDigest"] as const).some(key => body[key] !== environment[key])) return "The claim does not match the waiting environment's recipe and revision";
+  const prior = await priorAdmission(store, current, environment.key, binding as ToolingOperationBinding, dependencies.read);
+  if (!prior) return "The offer has no admitting operation to adopt";
+  const original = await dependencies.read({ prisma: store as PrismaClient, operationId: prior.operationId });
+  if (!original || prior.state !== "confirmed" || original.release.id === binding.release.id || original.inputDigest !== binding.inputDigest) return `Offer ${offerId} belongs to operation ${prior.operationId}`;
+  const command = await commandOf(store, original, dependencies.read);
+  if (!command || command.status !== "completed") return `Admitting command ${command?.operationId ?? prior.operationId} has not settled`;
+  if (offer.claimedAt !== null || !["queued", "offered"].includes(offer.state)) return `Offer ${offerId} is ${offer.state}`;
+  if (await store.computeOffer.count({ where: { environmentId: environment.id, OR: [{ claimedAt: { not: null } }, { state: { in: ["validating", "claimed", "running", "unknown"] } }] } })) return `Environment ${environment.id} has a claimed effect`;
+  for (const reference of [{ type: "compute-offer", id: offerId }, { type: "compute-environment", id: environment.id }] as const) {
+    if (await owningOperationId(store, current, reference)) return `${reference.type} ${reference.id} has an owner`;
+    const legacy = await dependencies.legacy({ prisma: store as PrismaClient, repositoryId: current.repositoryId, consumerKind: reference.type, consumerId: reference.id });
+    if (legacy.status === "legacy" || legacy.status === "unavailable") return `${reference.type} ${reference.id} is a retained first-bootstrap legacy consumer`;
+  }
+  if ((await associations(store, current, "producer", `compute-environment:${environment.id}`)).length) return `Environment ${environment.id} has a producer`;
+  if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
+  return null;
 }
 /** Confirmed producer of a resource group, or null if none. Throws on a
  * newest producer change without an outcome; retrying that exact operation
@@ -473,7 +541,9 @@ export type CallbackAdmission =
   | { mode: "pre-protocol" }
   | { mode: "evidence"; binding: ToolingOperationBinding }
   | { mode: "legacy-continuation"; reference: ExistingReference; code: ToolingCodeIdentity }
-  | { mode: "bound"; binding: ToolingOperationBinding; callback: ToolingCallback; body: Body; context: CallbackContext; reference?: ExistingReference };
+  | { mode: "bound"; binding: ToolingOperationBinding; callback: ToolingCallback; body: Body; context: CallbackContext; reference?: ExistingReference;
+    /** A claim adopting a never-produced waiting environment admitted by another settled release lineage. */
+    adopt?: { environmentKey: string; offerId: string } };
 
 async function callbackTask(store: Store, callback: Pick<ToolingCallback, "scope">, param: string) {
   return callback.scope === "task" ? store.remoteTask.findUnique({ where: { id: param } }) : store.remoteTask.findUnique({ where: { primarySessionId: param } });
@@ -557,10 +627,20 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
   if (projection !== undefined && dependencies.digest(projection) !== binding.inputDigest) throw refuse("operation-input", `${callback.route} input differs from the bound operation`);
   const reference = callback.reference ? await callback.reference(input.body, context) : null;
   if (callback.reference && !reference) throw refuse("operation-input", `${callback.route} names no existing operation`);
+  let adopt: { environmentKey: string; offerId: string } | undefined;
   if (reference && callback.referenceRule === "admission") {
     const environment = await offerEnvironment(context, reference.id);
     const admitting = environment ? await admittingOperationId(store, task, environment.key) : null;
-    if (binding.existingOperationId !== reference.id && (!admitting || !await sameLineage(input.prisma, admitting, binding, dependencies.read))) throw refuse("operation-mismatch", `${reference.type} ${reference.id} was not admitted by this operation`);
+    if (!admitting || !await sameLineage(input.prisma, admitting, binding, dependencies.read)) {
+      if (binding.existingOperationId !== reference.id) throw refuse("operation-mismatch", `${reference.type} ${reference.id} was not admitted by this operation`);
+      // Admitted by another lineage: only a claim may adopt exact,
+      // never-produced waiting work, rechecked atomically before effects.
+      if (admitting && environment) {
+        const refused = callback.route === "POST /api/tasks/:taskId/compute-claim" ? await adoptionRefused(input.prisma, task, reference.id, binding, dependencies, input.body) : `${callback.route} cannot adopt another lineage's offer`;
+        if (refused) throw refuse("retained-release-required", `${reference.type} ${reference.id} was admitted by operation ${admitting}: ${refused}`);
+        adopt = { environmentKey: environment.key, offerId: reference.id };
+      }
+    }
   } else if (reference) {
     const owner = await owningOperationId(store, task, reference);
     if (owner && !await sameLineage(input.prisma, owner, binding, dependencies.read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
@@ -579,8 +659,14 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     const replay = evidence && (await associations(store, task, "completion", binding.operationId)).some(value => value.evidence === `${evidence.kind}:${evidence.reference}`);
     if (!replay) throw refuse("operation-closed", `Operation ${binding.operationId} is completed`);
   }
+  // A cross-release request never takes over a key another lineage holds.
+  const admits = callback.admits?.(input.body);
+  if (admits) {
+    const held = await admissionHeld(input.prisma, task, admits, binding, dependencies.read);
+    if (held) throw refuse("retained-release-required", held);
+  }
   await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
-  return { mode: "bound", binding, callback, body: input.body, context, ...(reference ? { reference } : {}) };
+  return { mode: "bound", binding, callback, body: input.body, context, ...(reference ? { reference } : {}), ...(adopt ? { adopt } : {}) };
 }
 
 /** Before effects: mark running and persist ownership/admission/producer
@@ -610,8 +696,20 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
 async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, admission: Extract<CallbackAdmission, { mode: "bound" }>, binding: ToolingOperationBinding, dependencies: ToolingOperationDependencies) {
   const { callback, body, context, reference } = admission;
   if (reference && callback.referenceRule !== "admission") await claimOwnership(prisma, binding, context.task, reference, dependencies.read);
-  const admitted = callback.admits?.(body);
-  if (admitted && await admittingOperationId(prisma, context.task, admitted) !== binding.operationId) await recordAssociation(prisma, binding, "admission", `environment-key:${admitted}`, "confirmed");
+  // Admission (a request, or a claim adopting waiting work): the intent is
+  // written FIRST, taking the write lock, then eligibility is rechecked with
+  // it visible, so of two competing lineages exactly one proceeds. The
+  // handler's own outcome later confirms or fails it.
+  const admitted = callback.admits?.(body) ?? admission.adopt?.environmentKey;
+  let admittedKey: string | undefined;
+  if (admitted && await admittingOperationId(prisma, context.task, admitted) !== binding.operationId) {
+    await prisma.$transaction(async tx => {
+      await recordAssociation(tx, binding, "admission", `environment-key:${admitted}`, "intent");
+      const refused = admission.adopt ? await adoptionRefused(tx, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read);
+      if (refused) throw refuse("retained-release-required", refused);
+    });
+    admittedKey = admitted;
+  }
   const produced = binding.status === "completed" ? [] : await callback.produces?.(body, context) ?? [];
   // A durable reader for each producing consumer, independent of command or
   // callback completion: DRA-28 registration defers incompatible writes while
@@ -622,19 +720,21 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   for (const environmentId of retained)
     consumers.push((await retainToolingConsumer({ prisma, operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId, scopeKey: binding.resourceKey ?? "task" })).id);
   await assertBindingAuthority({ prisma, config, binding });
-  return { binding, produced, consumers };
+  return { binding, produced, consumers, ...(admittedKey ? { admitted: admittedKey } : {}) };
 }
 
 /** After the handler: success confirms producer intent and may complete the
  * operation with its protocol evidence; a refused (4xx) handler fails the
  * intent; an exception or 5xx leaves it unknown and the operation `unknown`. */
-export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[]; attemptId?: string }, status: number | "exception",
+export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[]; attemptId?: string; admitted?: string }, status: number | "exception",
   dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
   const ok = typeof status === "number" && status >= 200 && status < 300, refused = typeof status === "number" && status >= 400 && status < 500;
   // Exact per-callback outcome for command settlement: an acknowledgment of
   // this operation's route and request digest, distinct from physical proof.
   await recordCallbackOutcome(prisma, state.binding, admission.callback.route, state.attemptId ?? "legacy-attempt", ok ? "acknowledged" : refused ? "refused" : "unknown", typeof status === "number" ? status : null);
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
+  // A refused request never admitted anything; an unknown outcome stays an intent.
+  if (state.admitted && (ok || refused)) await recordAssociation(prisma, state.binding, "admission", `environment-key:${state.admitted}`, ok ? "confirmed" : "failed");
   // An HTTP status never proves absence: a bind/configure follows the
   // physical start, and a handler may commit before refusing. Readers are
   // confirmed only by the producing callback's verified result (which also
@@ -728,10 +828,11 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     const type = EXISTING_TYPE[request.kind];
     const reference: ExistingReference = { type, id: type === "finalization" || type === "cleanup-request" ? `${before.task.id}:${request.existingOperationId}` : request.existingOperationId };
     if (!await existingReceipt(input.prisma, before.task, reference)) throw new ToolingOperationRefused("operation-input", `Existing ${type} ${request.existingOperationId} does not belong to this task`);
-    let ownerId = await owningOperationId(input.prisma, before.task, reference);
+    let ownerId = await owningOperationId(input.prisma, before.task, reference), admitted = false;
     if (!ownerId && request.kind === "compute-admission") {
       const environment = await offerEnvironment({ store: input.prisma as unknown as Store, task: before.task }, reference.id);
       ownerId = environment ? await admittingOperationId(input.prisma, before.task, environment.key) : null;
+      admitted = Boolean(ownerId);
     }
     if (ownerId) {
       const original = await dependencies.read({ prisma: input.prisma, operationId: ownerId });
@@ -741,7 +842,11 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
       const requested = parent?.release ?? (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId }))?.release;
       if (original.kind === request.kind && original.inputDigest === request.inputDigest && original.resourceKey === (request.resourceKey ?? null)
         && ((original.parentOperationId ?? null) === (request.parentOperationId ?? null) || requested?.id === original.release.id)) return { binding: original };
-      throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release`);
+      // Never-produced waiting work whose admitting command settled may be
+      // adopted by the requested release; the claim rechecks atomically.
+      const adoptable = admitted && requested && requested.id !== original.release.id && !await adoptionRefused(input.prisma, before.task, request.existingOperationId,
+        { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest }, dependencies);
+      if (!adoptable) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release`);
     }
     const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: before.task.repositoryId, consumerKind: type, consumerId: reference.id });
     if (consumer.status === "legacy" || consumer.status === "unavailable") throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} is a retained first-bootstrap legacy consumer; only its legacy path may continue it until reconciled`);
