@@ -53,6 +53,10 @@ export async function continuePlanningSession(input: {
   let reserved = false;
   try {
     const previous = await prisma.runtimeInstruction.findUnique({ where: { id: instructionId } });
+    // A crashed attempt already owns a reservation. Fail that reservation
+    // with a diagnosis even when retry validation throws before the upsert,
+    // so an unavailable retained release cannot hold the entire inbox.
+    reserved = previous?.state === "preparing";
     if (previous && !["preparing", "preparation-failed"].includes(previous.state)) {
       return result("existing", `runtime_session:${session.id} already received workflow ${workflow.id}; instruction ${previous.state}`);
     }

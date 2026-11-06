@@ -337,21 +337,28 @@ test("a new plan continuation adopts the selected release and retries its record
   expect(retained.pinnedToolingRoot).toBe(f.originalTask.pinnedToolingRoot);
 });
 
-test("a prepared continuation refuses a damaged retained release without provider changes or recomposition", async () => {
+test.each(["preparing", "preparation-failed"])("a %s continuation diagnoses a damaged retained release and releases unrelated inbox delivery", async (state) => {
   const f = await fixture();
   const repositoryId = f.input.context.config.repository.id;
   const release = await db.prisma.toolingRelease.create({ data: { id: "retained-preparation", repositoryId,
     revision: "b".repeat(40), tree: "c".repeat(40), policyBlob: "d".repeat(40), checkout: "/missing/dra27-retained-fixture",
     manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
   const instructionId = `workflow:${f.session.id}:plan:implement`;
-  await db.prisma.runtimeInstruction.create({ data: { id: instructionId, sessionId: f.session.id, text: "Retained prompt", state: "preparation-failed" } });
+  await db.prisma.runtimeInstruction.create({ data: { id: instructionId, sessionId: f.session.id, text: "Retained prompt", state } });
+  await queueInstruction(db.prisma, { sessionId: f.session.id, requestId: "after-damaged-preparation", text: "Owner follow-up" });
   await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, action: "workflow-continuation", key: instructionId,
     value: JSON.stringify({ provider: "codex", model: null, tooling: { releaseId: release.id, revision: release.revision, generation: 1 } }), source: "test" } });
-  expect((await continuePlanningSession(f.input))?.status).toBe("failed");
+  const result = await continuePlanningSession(f.input);
+  expect(result?.status).toBe("failed");
+  expect(result?.detail).toContain(release.checkout);
   expect(f.calls).toHaveLength(0);
   expect(f.compositions).toHaveLength(0);
   expect(f.runtime.sentMessages).toHaveLength(0);
   expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: instructionId } })).toMatchObject({ state: "preparation-failed", text: "Retained prompt" });
+  if (state === "preparing") expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: instructionId } })).detail).toContain(release.checkout);
+  await deliverInstructions(db.prisma, f.runtime, f.input.context.config);
+  await f.settle();
+  expect(f.runtime.sentMessages.map(message => message.text)).toEqual(["Owner follow-up"]);
 });
 
 
