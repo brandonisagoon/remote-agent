@@ -139,6 +139,9 @@ const providers = {
   release: async () => { throw new Error("DRA-37 never releases provider data"); },
 };
 const credentials = JSON.parse(readFileSync(JSON.parse(readFileSync(recipe, "utf8")).credentialsFile, "utf8"));
-const result = await runtime.manageRuntime({ registry: control.taskRegistry(socket, taskId), stateDirectory, docker, computeDocker, providers: () => providers,
+// REAL mode: Drafted's own Docker transports (runtimeDocker/computeDocker),
+// reaching the engine only through the fixture policy guard on PATH.
+const realDocker = process.env.DRA37_DOCKER_MODE === "real";
+const result = await runtime.manageRuntime({ registry: control.taskRegistry(socket, taskId), stateDirectory, ...(realDocker ? {} : { docker, computeDocker }), providers: () => providers,
   clerkCredentials: async () => credentials, action, purpose: "development", ...(action === "up" ? { configFile: recipe } : {}), ...(offer ? { computeOffer: offer } : {}) });
 console.log(JSON.stringify(result));
