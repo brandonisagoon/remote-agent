@@ -21,8 +21,10 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
   if (task.primarySessionId !== input.primarySessionId) throw new Error("Compute continuation primary changed");
+  // A command fence derived from the group's retained reader; the adapter's
+  // child callbacks (development intent, resources) inherit its release.
   const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
-    inputDigest: canonicalDigest(reference), kind: "development-intent", existingOperationId: String(input.intentRevision) } });
+    inputDigest: canonicalDigest({ command: "compute continue", environmentId: input.environmentId, ...reference }) } });
   const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
     cwd: runtime.receipt.checkout, env: operationEnvironment(binding), timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),

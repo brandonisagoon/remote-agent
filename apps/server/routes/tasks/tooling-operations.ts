@@ -2,7 +2,7 @@ import { Hono, type MiddlewareHandler } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import {
   TOOLING_OPERATION_HEADER, ToolingOperationRefused, admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation,
-  isToolingCallbackPath, readOperationStateEvidence, readSessionToolingOperation, registerOperationStateWrite, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
+  isToolingCallbackPath, readOperationStateEvidence, readSessionToolingOperation, registerOperationStateWrite, settleToolingCommand, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
   type ToolingOperationDependencies,
 } from "../../services/tasks/tooling-operations.ts";
 import { ToolingOperationError, ToolingStateFormatError } from "../../services/tasks/tooling-releases.ts";
@@ -37,6 +37,14 @@ toolingOperationRoutes.post("/:sessionId/tooling-operations/:operationId/state-w
   let body: unknown;
   try { body = await c.req.json(); } catch { return c.json({ error: "A JSON state write request is required", code: "operation-input" }, 400); }
   try { return c.json(await registerOperationStateWrite({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId"), operationId: c.req.param("operationId"),
+    header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, body })); }
+  catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
+});
+
+toolingOperationRoutes.post("/:sessionId/tooling-operations/:operationId/settlement", async c => {
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: "A JSON settlement is required", code: "operation-input" }, 400); }
+  try { return c.json(await settleToolingCommand({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId"), operationId: c.req.param("operationId"),
     header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, body })); }
   catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
 });

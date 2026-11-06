@@ -5,7 +5,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
-  bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
+  bindRetainedToolingOperation, bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
   type ToolingLegacyConsumerInput, type ToolingLegacyConsumerState, type ToolingLegacyInventory,
 } from "./tooling-releases.ts";
 
@@ -594,28 +594,76 @@ export async function readSessionToolingOperation(input: { prisma: PrismaClient;
   return { binding };
 }
 
-/** Server-initiated continuation of an existing group (idle suspension). Runs
- * the group's own code: its producer's release (only when that is also the
- * active release, until DRA-28 offers retained-release binding), or its
- * retained legacy snapshot without a binding. */
-export async function bindServerContinuation(input: { prisma: PrismaClient; config: ServerConfig; task: RemoteTask; environmentId: string; request: z.input<typeof BeginToolingOperationInput> },
-  dependencies: ToolingOperationDependencies = toolingOperationDependencies): Promise<{ binding: ToolingOperationBinding | null; code: ToolingCodeIdentity | null }> {
+/** Server-initiated continuation of an existing group (idle suspension). The
+ * command fence is derived from the group's confirmed retained reader, so it
+ * and every child callback run that reader's release even after a newer
+ * activation; it never selects the active release. A retained first-bootstrap
+ * group runs its legacy snapshot without a binding. */
+export async function bindServerContinuation(input: { prisma: PrismaClient; config: ServerConfig; task: RemoteTask; environmentId: string; request: { requestKey: string; inputDigest: string } },
+  dependencies: Pick<ToolingOperationDependencies, "read" | "legacy"> & { bindRetained?: typeof bindRetainedToolingOperation } = toolingOperationDependencies): Promise<{ binding: ToolingOperationBinding | null; code: ToolingCodeIdentity | null }> {
   if (!input.task.primarySessionId) throw new Error("Tooling operation requires the task's original primary");
   const group = await resourceGroupCode({ prisma: input.prisma, task: input.task, reference: { type: "compute-environment", id: input.environmentId } }, dependencies);
   if (!group.binding) return { binding: null, code: group.code };
-  const request = BeginToolingOperationInput.parse(input.request);
-  const ownerId = request.existingOperationId ? await owningOperationId(input.prisma, input.task, { type: "development-intent", id: request.existingOperationId }) : null;
-  const prior = ownerId ? await dependencies.read({ prisma: input.prisma, operationId: ownerId }) : null;
-  if (prior) {
-    if (prior.kind === request.kind && prior.inputDigest === request.inputDigest && prior.release.id === group.binding.release.id) return { binding: prior, code: prior.release };
-    throw new ToolingOperationRefused("retained-release-required", `Development intent ${request.existingOperationId} belongs to operation ${prior.operationId}`);
+  const consumer = await input.prisma.toolingRetainedConsumer.findFirst({ where: { taskId: input.task.id, consumerKind: "compute-environment", consumerId: input.environmentId, status: "confirmed" }, orderBy: { createdAt: "desc" } });
+  if (!consumer) throw new ToolingOperationRefused("retained-release-required", `Compute environment ${input.environmentId} has no confirmed retained reader to continue from`);
+  const fence = await (dependencies.bindRetained ?? bindRetainedToolingOperation)({ prisma: input.prisma, config: input.config, taskId: input.task.id, sessionId: input.task.primarySessionId, turnId: null,
+    request: { requestKey: input.request.requestKey, inputDigest: input.request.inputDigest, kind: ADAPTER_COMMAND_KIND }, retainedConsumerId: consumer.id });
+  if (fence.kind !== ADAPTER_COMMAND_KIND || fence.taskId !== input.task.id || fence.release.id !== consumer.releaseId || fence.inputDigest !== input.request.inputDigest) throw new Error("Server continuation fence identity changed");
+  return { binding: fence, code: fence.release };
+}
+
+// ---------------------------------------------------------------------------
+// Command settlement (frozen in docs/tooling-release-contract.md b6bd147).
+export const SettlementInput = z.object({ requestKey: z.string().min(1).max(256), inputDigest: z.string().regex(/^[a-f0-9]{64}$/), outcome: z.enum(["completed", "no-effect"]) }).strict();
+const settlementEvidence = (outcome: "completed" | "no-effect", requestKey: string) => ({ kind: outcome === "completed" ? "command-completed" : "command-no-effect", reference: requestKey });
+
+/** POST .../tooling-operations/:operationId/settlement. Records a finished
+ * adapter command after checking its stored identity, current ownership and
+ * every child/consumer outcome. Unknown effects are never declared
+ * successful; completion never resolves retained readers or children. */
+export async function settleToolingCommand(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operationId: string; header: string | undefined; body: unknown },
+  dependencies: Pick<ToolingOperationDependencies, "read" | "transition"> = toolingOperationDependencies): Promise<{ binding: ToolingOperationBinding; outcome: "completed" | "no-effect" }> {
+  const parsed = SettlementInput.safeParse(input.body);
+  if (!parsed.success) throw refuse("operation-input", "Settlement requires the command's requestKey, inputDigest and an outcome");
+  if (!input.header || input.header !== input.operationId) throw refuse("operation-required", "Settlement requires the matching operation header");
+  const { requestKey, inputDigest, outcome } = parsed.data;
+  const binding = await dependencies.read({ prisma: input.prisma, operationId: input.operationId });
+  if (!binding || binding.sessionId !== input.sessionId || binding.kind !== ADAPTER_COMMAND_KIND) throw refuse("operation-unknown", "No such adapter command for this session");
+  if (binding.requestKey !== requestKey || binding.inputDigest !== inputDigest) throw refuse("operation-mismatch", "Settlement identity differs from the stored command");
+  // Ownership of the recorded command: settlement records an outcome, so a
+  // later closure of the task does not strand its retry journal.
+  const task = await input.prisma.remoteTask.findUnique({ where: { id: binding.taskId } });
+  if (!task || task.primarySessionId !== binding.sessionId || task.repositoryId !== binding.repositoryId || task.machineId !== input.config.machine) throw refuse("operation-ownership", "The command no longer belongs to this task's primary session");
+  const evidence = settlementEvidence(outcome, requestKey);
+  const recorded = async () => (await input.prisma.toolingOperation.findUnique({ where: { id: binding.operationId } }))?.completionEvidence as { kind?: string; reference?: string } | null | undefined;
+  if (binding.status === "completed") {
+    const prior = await recorded();
+    if (prior?.kind === evidence.kind && prior.reference === evidence.reference) return { binding, outcome };
+    throw refuse("operation-closed", `Command ${binding.operationId} was already settled with a different outcome`);
   }
-  const active = await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: input.task.repositoryId });
-  if (!active || active.release.id !== group.binding.release.id) throw new ToolingOperationRefused("retained-release-required", `Compute environment ${input.environmentId} runs release ${group.binding.release.revision}; continuation requires a retained-release binding`);
-  const binding = await dependencies.bind({ prisma: input.prisma, config: input.config, taskId: input.task.id, sessionId: input.task.primarySessionId, turnId: null, request });
-  if (binding.taskId !== input.task.id || binding.kind !== request.kind || binding.inputDigest !== request.inputDigest || binding.release.id !== group.binding.release.id) throw new Error("Server tooling operation identity changed");
-  if (request.existingOperationId) await claimOwnership(input.prisma, binding, input.task, { type: "development-intent", id: request.existingOperationId }, dependencies.read);
-  return { binding, code: binding.release };
+  if (binding.status === "unknown") throw refuse("operation-closed", `Command ${binding.operationId} has an unknown outcome; reconcile it before settling`);
+  const children = await input.prisma.toolingOperation.findMany({ where: { parentOperationId: binding.operationId }, take: 1001 });
+  if (children.length > 1000) throw refuse("operation-input", "Command child inventory exceeds its bound");
+  const ids = [binding.operationId, ...children.map(child => child.id)];
+  const consumers = await input.prisma.toolingRetainedConsumer.findMany({ where: { operationId: { in: ids } }, take: 1001 });
+  const writes = await input.prisma.toolingStateWrite.count({ where: { operationId: { in: ids } } });
+  if (outcome === "no-effect") {
+    if (binding.status !== "bound" || children.length || consumers.length || writes) throw refuse("operation-input", "A no-effect settlement requires a bound command with no children, state writes or retained consumers");
+  } else {
+    const unknown = children.find(child => child.status === "unknown");
+    if (unknown) throw refuse("operation-closed", `Child operation ${unknown.id} has an unknown outcome; the command cannot be declared successful`);
+    const pending = consumers.find(consumer => consumer.status === "pending");
+    if (pending) throw refuse("operation-closed", `Retained ${pending.consumerKind} ${pending.consumerId} has an unconfirmed producing effect; the command cannot be declared successful`);
+  }
+  try { await dependencies.transition({ prisma: input.prisma, operationId: binding.operationId, from: binding.status, to: "completed", evidence }); }
+  catch (error) {
+    // Lost acknowledgment or concurrent settlement: replay only the same outcome.
+    const prior = await recorded();
+    if (!(prior?.kind === evidence.kind && prior.reference === evidence.reference)) throw error;
+  }
+  const settled = await dependencies.read({ prisma: input.prisma, operationId: binding.operationId });
+  if (!settled || settled.status !== "completed") throw refuse("operation-closed", "Command settlement did not complete");
+  return { binding: settled, outcome };
 }
 
 const CapabilityReceipt = z.object({ capability: z.string(), source: z.literal("configured-host"), capabilityRevision: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/), checkout: z.string().startsWith("/") }).passthrough();
