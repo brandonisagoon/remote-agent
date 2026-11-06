@@ -35,6 +35,13 @@ test("the original primary's delivered offer runs the actual Drafted runtime to 
   const task = await server.seedTask("app");
   await server.start();
   const prisma = server.db.prisma;
+  // The configured tooling source and task pin make the normal capability
+  // route resolvable (pre-protocol: no release-aware selection exists).
+  const capability = await server.socket(`/api/sessions/${encodeURIComponent(task.sessionId)}/tooling-capability`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ capability: "browser" }) });
+  const browser = await capability.json() as { receipt?: Record<string, unknown>; error?: string };
+  expect(capability.status, JSON.stringify(browser)).toBe(200);
+  expect(browser.receipt).toMatchObject({ capability: "browser", source: "configured-host", capabilityRevision: server.drafted!.revision, checkout: server.drafted!.root, taskToolingRevision: server.drafted!.revision });
+  expect(await prisma.toolingSelection.count()).toBe(0);
 
   // The adapter's first `runtime up` requests compute through the real routes.
   const first = await server.runtimeTurn(task.id, "up");

@@ -30,18 +30,30 @@ function git(cwd: string, ...args: string[]) {
 
 export type Dra37Task = { id: string; sessionId: string; worktree: string; revision: string; recipe: { key: string; purpose: "development"; revision: string; recipeDigest: string } };
 
-/** Pinned Drafted source: `git archive` of one commit into this fixture's own
- * temp root. The paired worktree is only read (objects + node_modules link). */
+/** Paired Drafted repository: read only (objects and node_modules). */
 export const DRAFTED_WORKTREE = "/Users/brandon/Desktop/.worktrees/drafted-workflow/dra-27-live-tooling-release";
-async function materializeDrafted(root: string, revision: string) {
-  const target = path.join(root, `drafted-${revision.slice(0, 12)}`);
-  await mkdir(target);
-  const archive = Bun.spawnSync(["git", "-C", DRAFTED_WORKTREE, "archive", "--format=tar", revision], { stdout: "pipe", stderr: "pipe" });
-  if (archive.exitCode) throw new Error(`Cannot archive Drafted ${revision}: ${archive.stderr.toString()}`);
-  const extract = Bun.spawnSync(["tar", "-x", "-C", target], { stdin: archive.stdout, stderr: "pipe" });
-  if (extract.exitCode) throw new Error(`Cannot extract Drafted ${revision}: ${extract.stderr.toString()}`);
-  await symlink(path.join(DRAFTED_WORKTREE, "node_modules"), path.join(target, "node_modules"));
-  return { root: target, revision: git(DRAFTED_WORKTREE, "rev-parse", `${revision}^{commit}`), tree: git(DRAFTED_WORKTREE, "rev-parse", `${revision}^{tree}`) };
+/**
+ * The configured tooling source and its prepared checkout, exactly as a
+ * deployed server sees them: a `--shared` clone of the paired Drafted
+ * repository (it only reads the paired objects) is the source, and a
+ * detached worktree of the pinned commit at the server's install path, with
+ * its readiness receipt, is the prepared checkout. Nothing is committed.
+ */
+async function prepareDraftedTooling(root: string, install: string, revision: string) {
+  const source = path.join(root, "tooling-source");
+  const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-checkout", "--shared", DRAFTED_WORKTREE, source], { stdout: "pipe", stderr: "pipe" });
+  if (clone.exitCode) throw new Error(`Cannot clone Drafted: ${clone.stderr.toString()}`);
+  const full = git(source, "rev-parse", "--verify", `${revision}^{commit}`), tree = git(source, "rev-parse", `${full}^{tree}`);
+  // The dependency link is a symlink; Drafted ignores only a node_modules
+  // directory. Exclude it in this temporary clone's own metadata.
+  await writeFile(path.join(source, ".git", "info", "exclude"), "node_modules\n", { flag: "a" });
+  const checkout = path.join(install, "tooling", REPOSITORY, full);
+  await mkdir(path.dirname(checkout), { recursive: true });
+  git(source, "worktree", "add", "--detach", checkout, full);
+  await symlink(path.join(DRAFTED_WORKTREE, "node_modules"), path.join(checkout, "node_modules"));
+  if (git(checkout, "status", "--porcelain", "--untracked-files=normal")) throw new Error("Prepared Drafted checkout is not clean");
+  await writeFile(`${checkout}.ready`, `${full}\n`, { mode: 0o600 });
+  return { source, root: checkout, revision: full, tree };
 }
 
 export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; draftedRevision?: string }) {
@@ -53,7 +65,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   const repo = path.join(root, "repo"), worktrees = path.join(root, "worktrees"), specs = path.join(root, "specs"), agentLog = path.join(root, "agent.jsonl");
   const apps = path.join(root, "apps"), state = path.join(root, "state");
   await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 });
-  const drafted = options.draftedRevision ? await materializeDrafted(root, options.draftedRevision) : null;
+  const install = path.join(root, "install");
+  const drafted = options.draftedRevision ? await prepareDraftedTooling(root, install, options.draftedRevision) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
   const fixture = {
     root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted,
@@ -88,7 +101,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await db.prisma.runtimeSession.create({ data: { id: sessionId, scopeKey: `dra37:${name}`, agentCommand: "codex", repositoryId: REPOSITORY, machineId: MACHINE,
         role: "primary", lifecycle: "persistent", cwd: worktree, worktreePath: worktree, status: "idle", name: `DRA-37 ${name}` } });
       await db.prisma.remoteTask.create({ data: { id, requestKey: `dra37:${name}`, repositoryId: REPOSITORY, machineId: MACHINE, branchName: `dra37/${name}`, worktreePath: worktree,
-        toolingRoot: repo, toolingRevision: "0".repeat(40), primarySessionId: sessionId, phase: state.phase ?? "working", ownerPaused: state.ownerPaused ?? false } });
+        toolingRoot: drafted?.source ?? repo, toolingRevision: drafted?.revision ?? "0".repeat(40), ...(drafted ? { pinnedToolingRoot: drafted.root } : {}),
+        primarySessionId: sessionId, phase: state.phase ?? "working", ownerPaused: state.ownerPaused ?? false } });
       const recipe = { key: `app-${name}`, purpose: "development" as const, revision, recipeDigest: Bun.CryptoHasher.hash("sha256", `recipe:${name}`, "hex") as string };
       await mkdir(specs, { recursive: true });
       await writeFile(path.join(specs, `${id}.json`), JSON.stringify(recipe));
@@ -149,10 +163,10 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       machine: { id: MACHINE, name: "DRA-37 isolated rehearsal",
         server: { publicUrl: url, apiKey: token, listen: { host: "127.0.0.1", port }, databaseUrl: db.databaseUrl,
           acpSocketPath: path.join(root, "acp.sock"), controlSocketPath: controlSocket },
-        acpx: { stateDir: path.join(root, "acpx"), maxConcurrentTurns: 4 }, installation: { root: path.join(root, "install") },
+        acpx: { stateDir: path.join(root, "acpx"), maxConcurrentTurns: 4 }, installation: { root: install },
         compute: { enabled: true, slots: options.slots, deliveryTimeoutSeconds: options.deliveryTimeoutSeconds ?? 30, collectorFreshnessSeconds: 15 } },
       providers: { codex: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] }, claude: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] } },
-      connections: {}, repositories: { [REPOSITORY]: { root: repo, worktreeRoot: worktrees } },
+      connections: {}, repositories: { [REPOSITORY]: { root: repo, worktreeRoot: worktrees, ...(drafted ? { tooling: { root: drafted.source, ref: drafted.revision } } : {}) } },
     });
     await writeFile(configFile, JSON.stringify(config), { mode: 0o600 });
     return fixture;
