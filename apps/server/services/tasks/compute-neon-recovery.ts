@@ -4,11 +4,15 @@ import path from "node:path";
 import { z } from "zod";
 import type { Prisma, PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
+import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admission.ts";
 import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { currentToolingOperation, toolingProcessContext } from "./tooling-operations.ts";
+import { completeNeonRecoveryOperation, readToolingOperation, registerToolingStateWriteInTransaction } from "./tooling-releases.ts";
+import { assertNeonRecoveryRelease, neonRecoveryObservationContracts, readNeonRecoveryLegacyGroup, resolveNeonRecoveryLegacyGroup, type NeonRecoveryHandoff } from "./tooling-neon-recovery.ts";
 
 /**
  * DRA-16 / DRA-24: a development runtime that failed before any application
@@ -26,6 +30,15 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
  * rejection of the exact request or a complete settled inventory; a create
  * with no pre-request journal remains pending (unknown), never absent. No offer, slot, wait, start instruction,
  * pin, provider or traffic is created, revived or released.
+ *
+ * Staged handoff (design 551400d9 with root qualifications v6): the canonical
+ * receipt stays the original bytes until the host commits; the bound
+ * operation privately stages the exact baseline and a v2 candidate, and ONE
+ * server transaction verifies the observer's proof over them, commits the
+ * projection and its durable event, hands off the group's first-bootstrap
+ * readers, registers drafted.runtime/2 under this operation and completes it.
+ * The client publishes the candidate only after that commit. No retained
+ * reader, producer, owner, admission, claim or allocation is created.
  */
 export const NeonRecoveryContract = "runtime-neon-recovery/v1";
 export const NeonRecoveryTransition = "neon-template-child";
@@ -136,39 +149,59 @@ export const ComputeNeonRecoveryProof = z.object({
   // The release the observer derived from its own checkout (git HEAD/tree),
   // which must be the bound operation's release.
   operation: z.object({ operationId: Id, releaseId: Id, revision: Revision, tree: Revision }).strict(),
+  // Staged candidate: the exact v2 receipt the client will publish after the
+  // commit, and which file the canonical receipt currently equals.
+  candidateSha256: Sha, candidateVersion: z.literal(2), canonical: z.enum(["baseline", "candidate"]),
 }).strict();
 export type ComputeNeonRecoveryProof = z.infer<typeof ComputeNeonRecoveryProof>;
 
 type Request = z.infer<typeof ComputeNeonRecovery>;
-type Input = { prisma: PrismaClient; config: ServerConfig; taskId: string; request: Request; operation: BoundToolingOperation };
+/** Caller input. The operation binding is NOT part of it: it is taken only
+ * from the guarded callback scope (`currentToolingOperation`). */
+export type NeonRecoveryInput = { prisma: PrismaClient; config: ServerConfig; taskId: string; request: Request };
+/** Internal: the scoped binding, and the observation contracts the exact
+ * recovered group requires of its committed capability manifest (C434). */
+type Input = NeonRecoveryInput & { operation: BoundToolingOperation; observationContracts: string[] };
 type Snapshot = Awaited<ReturnType<typeof snapshot>>;
-/** Structural subset of DRA-28's `ToolingOperationBinding`
- * (types/tooling-release.ts). The route supplies the binding admitted for
- * this exact request; the request body never names a release or path. */
+/** The binding the guarded callback boundary admitted for this exact request
+ * (DRA-28 `ToolingOperationBinding`); the request body never names a release
+ * or path, and no header or caller value selects it. */
 export const NeonRecoveryOperationKind = "compute-neon-recovery";
 export type BoundToolingRelease = { id: string; repositoryId: string; revision: string; tree: string; checkout: string };
-export type BoundToolingOperation = { contract: "remote-agent.tooling-operation/v1"; operationId: string; requestKey: string; inputDigest: string; repositoryId: string;
-  taskId: string; sessionId: string; kind: string; existingOperationId: string | null; resourceKey: string | null; generation: number; release: BoundToolingRelease };
+export type BoundToolingOperation = ToolingOperationBinding;
 /** Identity of the observer the server actually executed. */
 const ObserverIdentity = z.object({ operationId: Id, releaseId: Id, revision: Revision, tree: Revision, adapterSha256: Sha }).strict();
 type ObserverIdentity = z.infer<typeof ObserverIdentity>;
 export type NeonRecoveryReader = (input: Input, before: Snapshot) => Promise<{ proof: unknown; observer: ObserverIdentity }>;
 const Metadata = z.record(z.string(), z.json());
+/** The one state write a recovery registers (design S6 / T4). */
+export const NeonRecoveryStateWrite = { family: "drafted.runtime", scopeKey: "runtime-development", version: 2 } as const;
+export type NeonRecoveryStateWriteReceipt = { family: "drafted.runtime"; scopeKey: "runtime-development"; version: 2; operationId: string; releaseId: string; sequence: number };
 export type ComputeNeonRecoveryResult = { environmentId: string; resourceId: string; resourceIdentity: string; offerId: string; operationId: string;
   previousRecipeHash: string; recipeHash: string; sourceRevision: string; outcome: "absent" | "owned"; basis: "provider-rejection" | "complete-inventory" | "legacy-provider-rejection" | "exact-owned-child";
   reconciliationSha256: string; observer: ObserverIdentity;
-  allocation: "retained-existing-claim" | "previously-stopped-await-normal-admission" };
+  allocation: "retained-existing-claim" | "previously-stopped-await-normal-admission"; stateWrite: NeonRecoveryStateWriteReceipt };
 const allocation = (stopped: boolean) => stopped ? "previously-stopped-await-normal-admission" as const : "retained-existing-claim" as const;
 
-function journalKey(environmentId: string, resourceId: string, request: Request) {
+/** Durable recovery event action (source `compute:<taskId>`). */
+export const NeonRecoveryEventAction = Action;
+/** The event's transition key. Exported so readers never re-derive it. */
+export function neonRecoveryJournalKey(environmentId: string, resourceId: string, request: Request) {
   return finalizationDigest({ environmentId, resourceId, offerId: request.offerId, operationId: request.operationId, previousRecipeHash: request.previousRecipeHash, recipeHash: request.recipeHash });
 }
+const journalKey = neonRecoveryJournalKey;
 /** The evidence a lost acknowledgment must reproduce exactly. The receipt and
- * lock bytes are excluded: a retry may hold a new lock or have saved progress. */
-function evidence(proof: ComputeNeonRecoveryProof) {
-  const { baselineSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision } = proof;
-  return finalizationDigest({ baselineSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
+ * lock bytes, and which file is canonical, are excluded: a retry may hold a
+ * new lock, have saved progress, or follow the candidate's publication. */
+export function neonRecoveryEvidence(proof: ComputeNeonRecoveryProof) {
+  const { baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision } = proof;
+  return finalizationDigest({ baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
 }
+const evidence = neonRecoveryEvidence;
+/** Stored as the event's `handoff`: C426's canonical `NeonRecoveryHandoff`
+ * verbatim (full identity and each resolved row's exact snapshot), which the
+ * committed-result verifier and the code selector both read. */
+const storedHandoff = (handoff: NeonRecoveryHandoff) => handoff;
 /** A retry after a lost acknowledgment may hold a new runtime lock. */
 const retryable = ({ lockPid: _pid, ...request }: Request) => request;
 function canonical(value: unknown): unknown {
@@ -188,7 +221,7 @@ function projectionIdentity(resource: Parameters<typeof finalizationResourceIden
   return finalizationResourceIdentity({ ...resource, metadata: { ...fields, providers: same(providers) ? proof.baselineProviders : providers } }).identityDigest;
 }
 
-async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.TransactionClient }) {
+async function snapshot(input: Omit<Input, "prisma" | "observationContracts"> & { prisma: Prisma.TransactionClient }) {
   const { request } = input;
   const owner = await computeTaskOwner(input.prisma, input.taskId, input.config.machine);
   const offer = await input.prisma.computeOffer.findUniqueOrThrow({ where: { id: request.offerId } });
@@ -233,14 +266,6 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   return { owner, offer, environment, resource, allocations: { offers, slots, wait }, event, key, stopped, intent };
 }
 
-/** Integration seam for DRA-29: return the binding that callback admission
- * accepted for this exact request (mode "bound" only; never a legacy
- * continuation or pre-protocol fallback, because this is a new effect kind).
- * This isolated candidate has no binding store, so recovery cannot run. */
-export async function admittedNeonRecoveryOperation(_input: { prisma: PrismaClient; header: string | undefined }): Promise<BoundToolingOperation | null> {
-  return null;
-}
-
 type Execute = typeof executeOwnedObserver;
 export type RecoverySourceReader = (task: { worktreePath: string; branchName: string }, baseRevision: string) => Promise<string>;
 /** Current source of the exact trusted task worktree: its own top level, on
@@ -259,14 +284,21 @@ export async function readRecoverySource(task: { worktreePath: string; branchNam
   return head;
 }
 /** The bound release's already prepared checkout, verified at its exact
- * revision and tree. Never installs, never reads the active selection or the
- * task pin, and never resolves a session capability (no grant is recorded). */
-export async function verifyBoundObserver(release: BoundToolingRelease, execute: Execute = executeOwnedObserver) {
+ * revision and tree, whose committed capability manifest must declare every
+ * observation contract the exact recovered group requires (never inferred
+ * from state formats or the active release). Never installs, never reads the
+ * active selection or the task pin, and never resolves a session capability. */
+export async function verifyBoundObserver(release: BoundToolingRelease, contracts: readonly string[], execute: Execute = executeOwnedObserver) {
   const git = (...args: string[]) => execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", ...args], { cwd: release.checkout, timeoutMs: 10_000 });
   const manifest = JSON.parse(await git("show", `${release.revision}:.remote-agent-capabilities.json`));
   const relative = z.string().min(1).max(512).parse(manifest.capabilities?.runtime?.adapter);
   if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes("..")) throw new Error("Recovery observer path escapes its release");
-  if (!manifest.capabilities?.runtime?.observationContracts?.includes(NeonRecoveryContract)) throw new Error("Bound release cannot verify Neon recovery transitions");
+  if (!contracts.includes(NeonRecoveryContract)) throw new Error("Recovery observation requires the runtime-neon-recovery/v1 contract");
+  const declared = z.array(z.string()).max(64).safeParse(manifest.capabilities?.runtime?.observationContracts ?? []);
+  if (!declared.success) throw new Error("Bound release capability manifest is unreadable");
+  const missing = contracts.filter(contract => !declared.data.includes(contract));
+  if (missing.includes(NeonRecoveryContract)) throw new Error("Bound release cannot verify Neon recovery transitions");
+  if (missing.length) throw new Error(`Bound release does not declare the group's required observation contracts: ${missing.join(", ")}`);
   const adapterPath = path.join(release.checkout, relative);
   const check = async () => {
     const root = await realpath(release.checkout), adapter = await realpath(adapterPath), stat = await lstat(adapterPath);
@@ -285,7 +317,9 @@ export async function verifyBoundObserver(release: BoundToolingRelease, execute:
 export async function readNeonRecovery(input: Input, before: Snapshot, dependencies: { verify?: typeof verifyBoundObserver; execute?: Execute } = {}) {
   const execute = dependencies.execute ?? executeOwnedObserver, verify = dependencies.verify ?? verifyBoundObserver;
   const { operation } = input, { release } = operation;
-  const observer = await verify(release, execute);
+  // The exact group's requirements must reach the production observer path.
+  if (!Array.isArray(input.observationContracts) || !input.observationContracts.includes(NeonRecoveryContract)) throw new Error("Recovery observation requires the group's observation contracts");
+  const observer = await verify(release, input.observationContracts, execute);
   const request = { version: 1, contract: NeonRecoveryContract, request: input.request,
     operation: { contract: operation.contract, operationId: operation.operationId, kind: operation.kind, generation: operation.generation, inputDigest: operation.inputDigest,
       release: { id: release.id, revision: release.revision, tree: release.tree } },
@@ -295,10 +329,10 @@ export async function readNeonRecovery(input: Input, before: Snapshot, dependenc
     allocation: { offerId: before.offer.id, state: before.offer.state, mode: allocation(before.stopped) } };
   const payload = JSON.stringify(request);
   if (Buffer.byteLength(payload) > 1024 * 1024) throw new Error("Recovery observation input exceeds its bound");
-  // Same process context as DRA-29's toolingProcessContext: the Drafted
-  // observer guard reads its binding back over the control socket.
+  // DRA-29 toolingProcessContext: the Drafted observer guard reads its exact
+  // binding back over the server's control socket.
   const env = { ...Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]])),
-    REMOTE_AGENT_TOOLING_OPERATION: operation.operationId, REMOTE_AGENT_SOCKET: input.config.controlIpcPath, REMOTE_AGENT_TASK_ID: operation.taskId, REMOTE_AGENT_SESSION_ID: operation.sessionId };
+    ...toolingProcessContext(operation, input.config.controlIpcPath) };
   const output = await execute([process.execPath, "--no-env-file", observer.adapterPath, "compute", "neon-recovery-observe"], { cwd: release.checkout, timeoutMs: 60_000, env, input: payload });
   if (observer.adapterSha256 !== await observer.check()) throw new Error("Recovery observer changed");
   return { proof: JSON.parse(output), observer: { operationId: operation.operationId, releaseId: release.id, revision: release.revision, tree: release.tree, adapterSha256: observer.adapterSha256 } };
@@ -342,9 +376,11 @@ function assertLegacyFreshness(proof: ComputeNeonRecoveryProof, nowMs: number) {
   if (nowMs - listed > LEGACY_INVENTORY_FRESHNESS_MS) throw new Error("Legacy Neon rejection evidence is insufficient: the corroborating inventory is older than 15 minutes at the server's evaluation; list again");
 }
 
-async function assertLegacyRejection(proof: ComputeNeonRecoveryProof, input: Input, before: Snapshot, blobs: typeof readReleaseBlobs) {
+/** Verifies the legacy basis and returns the proof-derived start of the
+ * original failed request (undefined for other bases). */
+async function assertLegacyRejection(proof: ComputeNeonRecoveryProof, input: Input, before: Snapshot, blobs: typeof readReleaseBlobs): Promise<number | undefined> {
   const { reconciliation } = proof, legacy = reconciliation.absence;
-  if (legacy?.basis !== "legacy-provider-rejection") return;
+  if (legacy?.basis !== "legacy-provider-rejection") return undefined;
   const fail = (reason: string): never => { throw new Error(`Legacy Neon rejection evidence is insufficient: ${reason}`); };
   type Record = { step: string; detail: string; state: string; updatedAt: string };
   const rejection = (record: Record) => {
@@ -403,6 +439,7 @@ async function assertLegacyRejection(proof: ComputeNeonRecoveryProof, input: Inp
   // turn across the whole request window.
   const turn = await input.prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: before.owner.session.id, occurredAt: { lte: new Date(startedAt) } }, orderBy: [{ occurredAt: "desc" }, { sequence: "desc" }] });
   if (turn?.phase !== "started" || await input.prisma.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: before.owner.session.id, requestId: turn.requestId, phase: { not: "started" }, occurredAt: { lt: new Date(failedAt) } } })) fail("no original primary turn spans the request");
+  return startedAt;
 }
 
 function assertProof(proof: ComputeNeonRecoveryProof, input: Input, before: Snapshot) {
@@ -414,6 +451,10 @@ function assertProof(proof: ComputeNeonRecoveryProof, input: Input, before: Snap
   const { operation } = input;
   if (proof.operation.operationId !== operation.operationId || proof.operation.releaseId !== operation.release.id || proof.operation.revision !== operation.release.revision
     || proof.operation.tree !== operation.release.tree) throw new Error("Recovery observer is not the bound operation's release");
+  // The staged candidate is distinct from the baseline, and the canonical
+  // receipt the observer read is exactly one of the two.
+  if (proof.candidateSha256 === proof.baselineSha256
+    || proof.receiptSha256 !== (proof.canonical === "baseline" ? proof.baselineSha256 : proof.candidateSha256)) throw new Error("Recovery proof is not over the staged baseline and candidate");
   const legacy = reconciliation.absence?.basis === "legacy-provider-rejection";
   if (legacy ? request.outcome !== "absent" || reconciliation.attempt || proof.baselineNeonCreateSha256 !== null
     : !reconciliation.attempt || proof.baselineNeonCreateSha256 !== canonicalSha256(reconciliation.attempt)) throw new Error("Neon reconciliation is not the baseline's journaled request");
@@ -445,53 +486,120 @@ function assertProof(proof: ComputeNeonRecoveryProof, input: Input, before: Snap
   if (![proof.baselineProviders, proof.providers].some(value => finalizationDigest(value) === finalizationDigest(registered))) throw new Error("Registered provider receipts changed");
 }
 
-/** Atomic projection of the verified child recipe. Lost acknowledgments
- * re-observe and must reproduce the original evidence; they never write. */
-export async function recoverComputeNeon(input: Input, read: NeonRecoveryReader = readNeonRecovery, head: RecoverySourceReader = readRecoverySource,
+/** Identity of a stored binding, without its lifecycle status. */
+const bindingIdentity = (value: ToolingOperationBinding) => ({ contract: value.contract, operationId: value.operationId, requestKey: value.requestKey, inputDigest: value.inputDigest,
+  repositoryId: value.repositoryId, taskId: value.taskId, sessionId: value.sessionId, turnId: value.turnId, kind: value.kind, existingOperationId: value.existingOperationId,
+  parentOperationId: value.parentOperationId ?? null, retainedConsumerId: value.retainedConsumerId ?? null, resourceKey: value.resourceKey, generation: value.generation, release: value.release });
+
+/**
+ * Atomic projection of the verified child recipe (design S1–S7). The binding
+ * is only the guarded callback scope's. Lost acknowledgments re-observe and
+ * must reproduce the original evidence exactly; a completed operation is
+ * answered read-only from its own verified committed result.
+ */
+export async function recoverComputeNeon(caller: NeonRecoveryInput, read: NeonRecoveryReader = readNeonRecovery, head: RecoverySourceReader = readRecoverySource,
   blobs: typeof readReleaseBlobs = readReleaseBlobs, clock: () => number = Date.now): Promise<ComputeNeonRecoveryResult> {
-  if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
-  input = { ...input, request: ComputeNeonRecovery.parse(input.request) };
-  const before = await snapshot(input);
+  if (!caller.config.compute?.enabled) throw new Error("Compute admission is disabled");
+  const scoped = currentToolingOperation();
+  if (!scoped || scoped.kind !== NeonRecoveryOperationKind) throw new Error("Recovery requires its exact bound tooling operation from the guarded callback scope");
+  const bound = { prisma: caller.prisma, config: caller.config, taskId: caller.taskId, request: ComputeNeonRecovery.parse(caller.request), operation: scoped };
+  const before = await snapshot(bound);
+  // C426 eligibility (G0–G6) and the release's state formats, read-only
+  // before any observation; the group digest pins the under-lock re-read, so
+  // the group (and the contracts it requires) cannot change before commit.
+  assertNeonRecoveryRelease(scoped.release);
+  const group = await readNeonRecoveryLegacyGroup(bound.prisma, { taskId: bound.taskId, offerId: bound.request.offerId, resourceKey: bound.request.resourceKey, operationId: scoped.operationId });
+  const input: Input = { ...bound, observationContracts: neonRecoveryObservationContracts(group) };
   const source = { worktreePath: before.owner.task.worktreePath!, branchName: before.owner.task.branchName };
   if (await head(source, before.environment.revision) !== input.request.sourceRevision) throw new Error("Recovery source is not the operation's recorded worktree revision");
   const first = await read(input, before), proof = ComputeNeonRecoveryProof.parse(first.proof), observer = ObserverIdentity.parse(first.observer);
-  if (observer.operationId !== input.operation.operationId || observer.releaseId !== input.operation.release.id || observer.revision !== input.operation.release.revision
-    || observer.tree !== input.operation.release.tree) throw new Error("Recovery observer is not the bound operation's release");
+  if (observer.operationId !== scoped.operationId || observer.releaseId !== scoped.release.id || observer.revision !== scoped.release.revision
+    || observer.tree !== scoped.release.tree) throw new Error("Recovery observer is not the bound operation's release");
   assertProof(proof, input, before);
-  await assertLegacyRejection(proof, input, before, blobs);
-  // First commit only: the trusted server clock, never a request or proof value.
-  if (!before.event) assertLegacyFreshness(proof, clock());
+  const legacyStartedAt = await assertLegacyRejection(proof, input, before, blobs);
+  // C426's authoritative capability cutoff: the proof-derived start of the
+  // ORIGINAL failed provider request (the journaled attempt, or the legacy
+  // basis's derived start); only capabilities granted by then could execute.
+  const legacyBasis = proof.reconciliation.absence?.basis === "legacy-provider-rejection" ? proof.reconciliation.absence : undefined;
+  const cutoff = new Date(legacyBasis ? legacyStartedAt! : Date.parse(proof.reconciliation.attempt!.requestedAt));
+  if (!Number.isFinite(cutoff.getTime())) throw new Error("Recovery cannot derive the original request's capability cutoff");
+  const groupInput = { taskId: input.taskId, offerId: input.request.offerId, resourceKey: input.request.resourceKey, operationId: scoped.operationId, grantedAtOrBefore: cutoff,
+    ...(legacyBasis ? { legacySourceRevision: legacyBasis.source.revision } : {}) };
+  // First commit only: the canonical receipt is still the original baseline,
+  // and the trusted server clock, never a request or proof value, ages it.
+  if (!before.event) {
+    if (proof.canonical !== "baseline") throw new Error("First recovery commit requires the canonical receipt at its baseline");
+    assertLegacyFreshness(proof, clock());
+  }
   const second = await read(input, before);
   if (finalizationDigest(ComputeNeonRecoveryProof.parse(second.proof)) !== finalizationDigest(proof)
     || finalizationDigest(ObserverIdentity.parse(second.observer)) !== finalizationDigest(observer)) throw new Error("Recovery evidence changed during observation");
   if (await head(source, before.environment.revision) !== input.request.sourceRevision) throw new Error("Recovery source changed during observation");
   return input.prisma.$transaction(async tx => {
-    // Fresh snapshot: pause, primary/source link, pin, intent, allocation
+    // S1 FIRST statement, taking the write lock: the exact stored operation,
+    // running|unknown -> running. unknown -> running is transient: any later
+    // failure rolls back to unknown; success completes it in this commit.
+    const cas = await tx.toolingOperation.updateMany({ where: { id: scoped.operationId, kind: NeonRecoveryOperationKind, status: { in: ["running", "unknown"] },
+      taskId: scoped.taskId, sessionId: scoped.sessionId, repositoryId: scoped.repositoryId, releaseId: scoped.release.id, generation: scoped.generation, inputDigest: scoped.inputDigest,
+      existingOperationId: scoped.existingOperationId, resourceKey: scoped.resourceKey, parentOperationId: scoped.parentOperationId ?? null, retainedConsumerId: null }, data: { status: "running" } });
+    // Re-read the complete binding and its authority under the lock.
+    const stored = await readToolingOperation({ prisma: tx as unknown as PrismaClient, operationId: scoped.operationId });
+    if (!stored || finalizationDigest(bindingIdentity(stored)) !== finalizationDigest(bindingIdentity(scoped))) throw new Error("Recovery operation binding changed");
+    if (cas.count !== 1 && stored.status !== "completed") throw new Error(`Recovery operation is ${stored.status}, not running or unknown`);
+    if (stored.parentOperationId) {
+      const parent = await tx.toolingOperation.findUnique({ where: { id: stored.parentOperationId } });
+      if (!parent || parent.kind !== "adapter-command" || !["bound", "running"].includes(parent.status) || parent.taskId !== stored.taskId || parent.sessionId !== stored.sessionId
+        || parent.repositoryId !== stored.repositoryId || parent.releaseId !== stored.release.id || parent.generation !== stored.generation) throw new Error("Recovery requires its open command and unchanged lineage");
+    }
+    // S2 fresh snapshot: pause, primary/source link, pin, intent, allocation
     // family, wait entry, resource and prior journal must all be unchanged.
     const current = await snapshot({ ...input, prisma: tx });
     const stable = (value: Snapshot) => ({ identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, phase: value.owner.task.phase, environment: value.environment,
       resource: value.resource, offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent });
     if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Recovery authority changed during observation");
     if (current.event) {
+      // S3 strict exact replay: no event means no success, and an event only
+      // ever returns its own original result.
       const prior = JSON.parse(current.event.value!);
       if (prior.evidence !== evidence(proof) || finalizationDigest(retryable(prior.request)) !== finalizationDigest(retryable(input.request))
         || finalizationDigest(prior.observer) !== finalizationDigest(observer)) throw new Error("Recovery evidence, operation or observer release changed after acknowledgment");
       if (projectionIdentity(current.resource, proof) !== prior.projectionIdentity) throw new Error("Recovery projection changed its physical or configuration identity");
+      // Event and completion commit atomically, so an existing event with a
+      // non-completed operation is a broken invariant, never a crash window:
+      // refuse it (the transaction rolls back the CAS, preserving the original
+      // status). A completed operation's exact record is verified only.
+      if (stored.status !== "completed") throw new Error(`Recovery event exists but operation ${stored.operationId} is ${stored.status}; refusing a broken commit invariant`);
+      await completeNeonRecoveryOperation(tx, { operationId: stored.operationId, eventSequence: current.event.sequence });
       return prior.result as ComputeNeonRecoveryResult;
     }
-    // Again immediately before the first write: a slow observation cannot age past the bound.
+    if (stored.status === "completed") throw new Error("Recovery operation is completed without its committed event");
+    // S4 first commit: freshness again immediately before the first write.
+    if (proof.canonical !== "baseline") throw new Error("First recovery commit requires the canonical receipt at its baseline");
     assertLegacyFreshness(proof, clock());
+    // S5/S5b C426 handoff under the lock: the exact group read before
+    // observation, its retained legacy readers resolved by this operation
+    // (snapshots kept), and no retained legacy reader left on the task.
+    assertNeonRecoveryRelease(stored.release);
+    const handoff = await resolveNeonRecoveryLegacyGroup(tx, { ...groupInput, expectedDigest: group.digest });
+    // S6 drafted.runtime/2 for the canonical scope under THIS operation, with
+    // every ordinary format and reader check (root ee6e8bb).
+    const registered = await registerToolingStateWriteInTransaction(tx, { operationId: stored.operationId, ...NeonRecoveryStateWrite });
+    const stateWrite: NeonRecoveryStateWriteReceipt = { ...NeonRecoveryStateWrite, operationId: registered.operationId, releaseId: registered.releaseId, sequence: registered.sequence };
+    if (registered.version !== NeonRecoveryStateWrite.version || stateWrite.operationId !== stored.operationId || stateWrite.releaseId !== stored.release.id) throw new Error("Recovery state write is not this operation's drafted.runtime/2");
+    // S6b projection, event (with handoff and state write), environment.
     const metadata = { ...Metadata.parse(current.resource.metadata), recipeHash: input.request.recipeHash };
     const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
     const identity = finalizationResourceIdentity(resource).identityDigest;
     const result: ComputeNeonRecoveryResult = { environmentId: current.environment.id, resourceId: resource.id, resourceIdentity: identity, offerId: current.offer.id, operationId: input.request.operationId,
       previousRecipeHash: input.request.previousRecipeHash, recipeHash: input.request.recipeHash, sourceRevision: input.request.sourceRevision, outcome: input.request.outcome,
-      basis: proof.reconciliation.absence?.basis ?? "exact-owned-child", reconciliationSha256: finalizationDigest(proof.reconciliation), observer, allocation: allocation(current.stopped) };
-    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
+      basis: proof.reconciliation.absence?.basis ?? "exact-owned-child", reconciliationSha256: finalizationDigest(proof.reconciliation), observer, allocation: allocation(current.stopped), stateWrite };
+    const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
       value: JSON.stringify({ version: 1, contract: NeonRecoveryContract, transition: NeonRecoveryTransition, taskIdentity: current.owner.identity, request: input.request,
-        environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations, operation: input.operation, proof, observer, evidence: evidence(proof),
-        projectionIdentity: projectionIdentity(resource, proof), result }) } });
+        environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations, operation: stored, proof, observer, evidence: evidence(proof),
+        projectionIdentity: projectionIdentity(resource, proof), handoff: storedHandoff(handoff), stateWrite, result }) } });
     await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: identity } });
+    // S7 in the same commit: verifies the exact stored result, then CAS completes.
+    await completeNeonRecoveryOperation(tx, { operationId: stored.operationId, eventSequence: event.sequence });
     return result;
   });
 }

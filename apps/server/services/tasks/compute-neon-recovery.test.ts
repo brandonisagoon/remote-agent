@@ -5,11 +5,14 @@ import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
+import { Prisma } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { bindComputeResource, requestCompute } from "./compute-admission.ts";
 import { configureCompute } from "./compute-configuration.ts";
-import { canonicalSha256, ComputeNeonRecoveryProof, ReviewedLegacyNeonSources, neonRecoveryInputDigest, readNeonRecovery, readRecoverySource, readReleaseBlobs, recoverComputeNeon, verifyBoundObserver, type BoundToolingOperation } from "./compute-neon-recovery.ts";
+import { canonicalSha256, ComputeNeonRecoveryProof, ReviewedLegacyNeonSources, neonRecoveryInputDigest, readNeonRecovery, readRecoverySource, readReleaseBlobs, recoverComputeNeon, verifyBoundObserver, type BoundToolingOperation, type NeonRecoveryInput } from "./compute-neon-recovery.ts";
+import { runWithToolingOperation } from "./tooling-operations.ts";
+import { readToolingOperation } from "./tooling-releases.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
@@ -25,6 +28,16 @@ const planetscale = { provider: "planetscale" as const, id: "fjoeit1mmtrd", name
 const childName = "drafted-d-8f9be1ae3e70da71c349dcb3";
 const release = { id: "tr_release_b", repositoryId: "repo", revision: "9".repeat(40), tree: "6".repeat(40), checkout: "/install/tooling/repo/release-b" };
 const observer = { operationId: "op-recovery", releaseId: release.id, revision: release.revision, tree: release.tree, adapterSha256: "8".repeat(64) };
+// The bound release reads the original drafted.runtime/1 and writes /2 (G4).
+const releaseManifest = { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 },
+  stateFormats: { "drafted.runtime": { read: [1, 2], write: 2, writeVersions: [2], preservesUnknown: false } } };
+const candidateSha256 = "4".repeat(64);
+/** A test's binding: the stored operation the guarded callback scope admits. */
+type TestInput = NeonRecoveryInput & { operation: BoundToolingOperation };
+/** Runs the service exactly as the guarded callback boundary does: the
+ * binding is the scope's, never an argument. */
+const recover = (input: TestInput, ...rest: Parameters<typeof recoverComputeNeon> extends [unknown, ...infer R] ? R : never) =>
+  runWithToolingOperation(input.operation, () => recoverComputeNeon(input, ...rest), config.controlIpcPath);
 beforeEach(async () => { db = await createTestDatabase(); });
 afterEach(async () => { await db.cleanup(); });
 
@@ -50,22 +63,31 @@ async function fixture(options: { allocation?: "unknown" | "claimed" | "stopped"
   await db.prisma.computeEnvironment.update({ where: { id: environment.id }, data: { state: stopped ? "suspended" : "unknown", resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest } });
   const operationId = ids.operationId ?? crypto.randomUUID();
   const request = { offerId: offer.id, operationId, resourceKey: environment.key, previousRecipeHash: oldHash, recipeHash: nextHash, baselineFile: "/private/runtime/neon-recovery-baseline.json", lockPid: 4242, outcome, sourceRevision: currentHead };
-  const operation: BoundToolingOperation = { contract: "remote-agent.tooling-operation/v1", operationId: "op-recovery", requestKey: "dra16-neon-recovery", inputDigest: neonRecoveryInputDigest(request),
-    repositoryId: "repo", taskId: ids.task, sessionId: ids.primary, kind: "compute-neon-recovery", existingOperationId: offer.id, resourceKey: environment.key, generation: 5, release: { ...release } };
+  // Real bound state (not a structural stand-in): the release, the
+  // repository's first-bootstrap boundary and the running recovery operation.
+  const bindingId = ids.task === defaultIds.task ? "op-recovery" : `op-recovery-${ids.task}`;
+  await db.prisma.toolingRelease.upsert({ where: { id: release.id }, update: {}, create: { ...release, policyBlob: "e".repeat(40), manifest: releaseManifest, lockfileDigest: "f".repeat(64), bunVersion: "1.3.14" } });
+  await db.prisma.toolingLegacyBoundary.upsert({ where: { repositoryId: "repo" }, update: {}, create: { repositoryId: "repo", activationRequestKey: "dra24-boundary", legacyRevision: pin, recordedAt: new Date("2026-11-01T00:00:00.000Z") } });
+  await db.prisma.toolingOperation.create({ data: { id: bindingId, taskId: ids.task, requestKey: "dra16-neon-recovery", inputDigest: neonRecoveryInputDigest(request), kind: "compute-neon-recovery",
+    repositoryId: "repo", sessionId: ids.primary, existingOperationId: offer.id, resourceKey: environment.key, generation: 5, releaseId: release.id, protocol: 1, status: "running" } });
+  const operation: BoundToolingOperation = (await readToolingOperation({ prisma: db.prisma, operationId: bindingId }))!;
+  const bound = { ...observer, operationId: bindingId };
   const attempt = { version: 1 as const, name: childName, projectId: "spatial-project", templateBranchId: "br-template", parentLsn: "0/1A2B3C4", requestedAt: "2026-11-04T10:01:00.000Z", expiresAt: "2026-11-11T10:01:00.000Z" };
   const rejected = { ...attempt, rejection: { status: 422, code: "BRANCHES_LIMIT_EXCEEDED", observedAt: "2026-11-04T10:01:01.000Z" } };
   const child = { provider: "neon" as const, id: "br-child", name: childName, parentId: "br-template", parentLsn: "0/1A2B3C4", templateBranchId: "br-template" };
   const proof: ComputeNeonRecoveryProof = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskId: ids.task, primarySessionId: ids.primary, toolingRevision: pin,
     environmentId: environment.id, resourceId: resource.id, resourceKey: environment.key, offerId: offer.id, operationId, revision, sourceRevision: currentHead,
-    previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "1".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), lockPid: 4242,
+    previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "2".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), lockPid: 4242,
     stage: { phase: "failed", pending: outcome === "owned" ? "create-neon" : null, setupComplete: false, schemaApplied: false, fixturesComplete: false, spatialSchema: false, container: false, containerOperation: false, configuration: false, coverage: false, startBundle: false },
     baselineProviders: [saved], providers: outcome === "owned" ? [saved, child] : [saved],
     reconciliation: outcome === "owned" ? { operation: "create-neon", outcome, name: childName, projectId: "spatial-project", observedAt: "2026-11-05T09:00:00.000Z", branchId: "br-child", attempt }
       : { operation: "create-neon", outcome, name: childName, projectId: "spatial-project", observedAt: "2026-11-05T09:00:00.000Z", attempt: rejected, absence: { basis: "provider-rejection" } },
     baselineNeonCreateSha256: canonicalSha256(outcome === "owned" ? attempt : rejected),
-    operation: { operationId: "op-recovery", releaseId: release.id, revision: release.revision, tree: release.tree } };
-  const input = { prisma: db.prisma, config, taskId: ids.task, request, operation };
-  return { context, input, proof, environment, resource, offer, read: async () => ({ proof: structuredClone(proof), observer: { ...observer } }), head: async () => currentHead };
+    operation: { operationId: bindingId, releaseId: release.id, revision: release.revision, tree: release.tree },
+    // Staged design: the canonical receipt is still the original baseline.
+    candidateSha256, candidateVersion: 2, canonical: "baseline" };
+  const input: TestInput = { prisma: db.prisma, config, taskId: ids.task, request, operation };
+  return { context, input, proof, environment, resource, offer, observer: bound, read: async () => ({ proof: structuredClone(proof), observer: { ...bound } }), head: async () => currentHead };
 }
 const rows = async () => ({ offers: await db.prisma.computeOffer.findMany({ orderBy: { id: "asc" } }), slots: await db.prisma.computeSlot.findMany({ orderBy: { id: "asc" } }),
   waits: await db.prisma.computeWait.findMany(), traffic: await db.prisma.computeTraffic.findMany(), task: await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } }),
@@ -75,7 +97,7 @@ const events = () => db.prisma.runtimeMetadataEvent.count({ where: { action: "co
 test.each(["unknown", "claimed"] as const)("absent outcome advances only the recipe projection and preserves the retained %s claim", async state => {
   const f = await fixture({ allocation: state }), before = await rows();
   const environmentBefore = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
+  const result = await recover(f.input, f.read, f.head);
   expect(result).toMatchObject({ environmentId: f.environment.id, resourceId: f.resource.id, offerId: f.offer.id, recipeHash: nextHash, outcome: "absent", allocation: "retained-existing-claim" });
   const environment = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
   const resource = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } });
@@ -87,7 +109,7 @@ test.each(["unknown", "claimed"] as const)("absent outcome advances only the rec
   expect(await rows()).toEqual(before);
   expect(await events()).toBe(1);
   // Lost acknowledgment: re-observes, reproduces the original result, writes nothing.
-  expect(await recoverComputeNeon(f.input, f.read, f.head)).toEqual(result);
+  expect(await recover(f.input, f.read, f.head)).toEqual(result);
   expect(await events()).toBe(1); expect(await rows()).toEqual(before);
   // The ordinary bind now accepts the retained claim under the child recipe.
   await bindComputeResource({ ...f.context, taskId: "task", offerId: f.offer.id, resourceKey: f.resource.key });
@@ -95,7 +117,7 @@ test.each(["unknown", "claimed"] as const)("absent outcome advances only the rec
 
 test("terminal allocation stays history; recovery grants nothing and normal admission queues afresh", async () => {
   const f = await fixture({ allocation: "stopped" }), before = await rows();
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
+  const result = await recover(f.input, f.read, f.head);
   expect(result.allocation).toBe("previously-stopped-await-normal-admission");
   expect(await rows()).toEqual(before);
   expect(before.waits).toHaveLength(0); expect(before.slots).toHaveLength(0);
@@ -108,7 +130,7 @@ test("terminal allocation stays history; recovery grants nothing and normal admi
 
 test("exact owned outcome is accepted without publishing the receipt on the owner's behalf", async () => {
   const f = await fixture({ outcome: "owned" });
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
+  const result = await recover(f.input, f.read, f.head);
   expect(result.outcome).toBe("owned");
   expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).metadata).toEqual({ ...(f.resource.metadata as object), recipeHash: nextHash });
 });
@@ -146,7 +168,7 @@ test.each(["pause", "pin", "primary", "source", "slot", "offer", "wait", "intent
     await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { taskIdentity: computeTaskIdentity(task, "primary", "host", "link") } });
   }
   const head = async () => fault === "head" && ++heads === 2 ? "e".repeat(40) : currentHead;
-  await expect(recoverComputeNeon(f.input, read, head)).rejects.toThrow();
+  await expect(recover(f.input, read, head)).rejects.toThrow();
   // The original snapshot was valid: each fault was observed only after it.
   expect(calls).toBeGreaterThan(0);
   const environment = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
@@ -178,7 +200,7 @@ const proofFaults: Record<string, (proof: ComputeNeonRecoveryProof) => void> = {
 test.each(Object.keys(proofFaults))("refuses inconsistent proof: %s", async fault => {
   const f = await fixture();
   const read = async () => { const proof = structuredClone(f.proof); proofFaults[fault]!(proof); return { proof, observer }; };
-  await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow();
+  await expect(recover(f.input, read, f.head)).rejects.toThrow();
   expect(await events()).toBe(0);
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
 });
@@ -196,7 +218,7 @@ const ownedFaults: Record<string, (proof: ComputeNeonRecoveryProof) => void> = {
 test.each(Object.keys(ownedFaults))("refuses inexact owned outcome: %s", async fault => {
   const f = await fixture({ outcome: "owned" });
   const read = async () => { const proof = structuredClone(f.proof); ownedFaults[fault]!(proof); return { proof, observer }; };
-  await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow();
+  await expect(recover(f.input, read, f.head)).rejects.toThrow();
   expect(await events()).toBe(0);
 });
 
@@ -220,28 +242,28 @@ test.each(["container", "coverage", "configuration", "traffic", "metadata-ahead"
   }
   const input = fault === "disabled" ? { ...f.input, config: testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: false, slots: 1 }) }) } : f.input;
   let reads = 0;
-  await expect(recoverComputeNeon(input, async () => { reads++; return { proof: f.proof, observer }; }, f.head)).rejects.toThrow();
+  await expect(recover(input, async () => { reads++; return { proof: f.proof, observer }; }, f.head)).rejects.toThrow();
   expect(reads).toBe(0);
   expect(await events()).toBe(0);
 });
 
 test("request validation refuses an unchanged digest and unknown fields", async () => {
   const f = await fixture();
-  await expect(recoverComputeNeon({ ...f.input, request: { ...f.input.request, recipeHash: oldHash } }, f.read, f.head)).rejects.toThrow();
-  await expect(recoverComputeNeon({ ...f.input, request: { ...f.input.request, recipe: {} } as any }, f.read, f.head)).rejects.toThrow();
-  await expect(recoverComputeNeon({ ...f.input, request: { ...f.input.request, baselineFile: "relative.json" } }, f.read, f.head)).rejects.toThrow();
+  await expect(recover({ ...f.input, request: { ...f.input.request, recipeHash: oldHash } }, f.read, f.head)).rejects.toThrow();
+  await expect(recover({ ...f.input, request: { ...f.input.request, recipe: {} } as any }, f.read, f.head)).rejects.toThrow();
+  await expect(recover({ ...f.input, request: { ...f.input.request, baselineFile: "relative.json" } }, f.read, f.head)).rejects.toThrow();
 });
 
 test("a matching new digest without the durable journal cannot authorize a retry", async () => {
   const f = await fixture();
   await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { recipeDigest: nextHash } });
   await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { metadata: { ...(f.resource.metadata as object), recipeHash: nextHash } } });
-  await expect(recoverComputeNeon(f.input, f.read, f.head)).rejects.toThrow();
+  await expect(recover(f.input, f.read, f.head)).rejects.toThrow();
 });
 
 test.each(["baseline", "reconciliation", "outcome-request", "baseline-file", "observer", "adapter"])("lost acknowledgment refuses changed %s evidence without writing", async changed => {
   const f = await fixture({ outcome: changed === "outcome-request" ? "owned" : "absent" });
-  await recoverComputeNeon(f.input, f.read, f.head);
+  await recover(f.input, f.read, f.head);
   const after = { environment: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }), resource: await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }) };
   const read = async () => {
     const proof = structuredClone(f.proof);
@@ -257,7 +279,7 @@ test.each(["baseline", "reconciliation", "outcome-request", "baseline-file", "ob
     : f.input.request;
   // A retry must reuse its durable operation; a second binding of the same input cannot replay.
   const operation = changed === "observer" ? { ...f.input.operation, operationId: "op-other" } : { ...f.input.operation, inputDigest: neonRecoveryInputDigest(request) };
-  await expect(recoverComputeNeon({ ...f.input, request, operation }, read, f.head)).rejects.toThrow();
+  await expect(recover({ ...f.input, request, operation }, read, f.head)).rejects.toThrow();
   expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toEqual(after.environment);
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } })).toEqual(after.resource);
   expect(await events()).toBe(1);
@@ -265,7 +287,7 @@ test.each(["baseline", "reconciliation", "outcome-request", "baseline-file", "ob
 
 test.each(["progress", "owned-providers", "container", "pause"])("replay after later registry publication: %s", async changed => {
   const f = await fixture({ outcome: changed === "owned-providers" ? "owned" : "absent" });
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
+  const result = await recover(f.input, f.read, f.head);
   const saved = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } });
   const meta = saved.metadata as Record<string, unknown>;
   if (changed === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
@@ -274,9 +296,9 @@ test.each(["progress", "owned-providers", "container", "pause"])("replay after l
       : changed === "owned-providers" ? { providers: f.proof.providers } : { containerId: "c".repeat(64) }) } } });
   const environment = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
   if (changed === "progress" || changed === "owned-providers") {
-    expect(await recoverComputeNeon(f.input, f.read, f.head)).toEqual(result);
+    expect(await recover(f.input, f.read, f.head)).toEqual(result);
     expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toEqual(environment);
-  } else await expect(recoverComputeNeon(f.input, f.read, f.head)).rejects.toThrow();
+  } else await expect(recover(f.input, f.read, f.head)).rejects.toThrow();
   expect(await events()).toBe(1);
 });
 
@@ -302,14 +324,17 @@ async function releaseCheckout(contracts: string[]) {
 // Real git, but not the process-group supervisor (its /bin/ps probe is
 // unavailable in sandboxed test hosts); the logic under test is the checkout check.
 const plainExecute = (async (argv: string[], options: { cwd: string }) => execFileSync(argv[0]!, argv.slice(1), { cwd: options.cwd, encoding: "utf8" })) as any;
+/** C434: what neonRecoveryObservationContracts returns for a group without
+ * (and with) a handed-off baseline reader. */
+const recoveryContracts = ["runtime-neon-recovery/v1", "compute-traffic/v1"], baselineContracts = [...recoveryContracts, "compute-baseline/v1"];
 test("bound observer runs only from the exact prepared release checkout, never the active selection or pin", async () => {
   const fixtureRelease = await releaseCheckout(["compute-traffic/v1", "runtime-neon-recovery/v1"]);
   try {
-    const verified = await verifyBoundObserver(fixtureRelease.release, plainExecute);
+    const verified = await verifyBoundObserver(fixtureRelease.release, recoveryContracts, plainExecute);
     expect(verified.adapterPath).toBe(path.join(fixtureRelease.checkout, "src", "cli.ts"));
     expect(verified.adapterSha256).toMatch(/^[a-f0-9]{64}$/);
-    await expect(verifyBoundObserver({ ...fixtureRelease.release, tree: "0".repeat(40) }, plainExecute)).rejects.toThrow("bound release");
-    await expect(verifyBoundObserver({ ...fixtureRelease.release, revision: "0".repeat(40) }, plainExecute)).rejects.toThrow();
+    await expect(verifyBoundObserver({ ...fixtureRelease.release, tree: "0".repeat(40) }, recoveryContracts, plainExecute)).rejects.toThrow("bound release");
+    await expect(verifyBoundObserver({ ...fixtureRelease.release, revision: "0".repeat(40) }, recoveryContracts, plainExecute)).rejects.toThrow();
     await writeFile(path.join(fixtureRelease.checkout, "src", "cli.ts"), "console.log('changed');\n");
     await expect(verified.check()).rejects.toThrow();
     fixtureRelease.git("checkout", "--", "src/cli.ts");
@@ -318,17 +343,19 @@ test("bound observer runs only from the exact prepared release checkout, never t
     await expect(verified.check()).rejects.toThrow("bound release");
   } finally { await rm(fixtureRelease.checkout, { recursive: true, force: true }); }
   const legacy = await releaseCheckout(["compute-traffic/v1", "runtime-configuration/v1"]);
-  try { await expect(verifyBoundObserver(legacy.release, plainExecute)).rejects.toThrow("cannot verify Neon recovery"); }
+  try { await expect(verifyBoundObserver(legacy.release, recoveryContracts, plainExecute)).rejects.toThrow("cannot verify Neon recovery"); }
   finally { await rm(legacy.checkout, { recursive: true, force: true }); }
 });
 
 test("production reader sends the declared operation envelope to the bound release's adapter", async () => {
   const f = await fixture(), calls: { argv: string[]; options: any }[] = [];
   let hash = "8".repeat(64);
-  const verify = async (bound: any) => { expect(bound).toEqual(f.input.operation.release); return { adapterPath: path.join(release.checkout, "src", "cli.ts"), adapterSha256: "8".repeat(64), check: async () => hash }; };
+  const verify = async (bound: any, contracts: string[]) => { expect(bound).toEqual(f.input.operation.release); expect(contracts).toEqual(recoveryContracts);
+    return { adapterPath: path.join(release.checkout, "src", "cli.ts"), adapterSha256: "8".repeat(64), check: async () => hash }; };
+  const observed = { ...f.input, observationContracts: recoveryContracts };
   const execute = async (argv: string[], options: any) => { calls.push({ argv, options }); return JSON.stringify(f.proof); };
   const before = { owner: { session: { id: "primary" }, task: { worktreePath: "/fixture/task", toolingRevision: pin } }, environment: f.environment, resource: f.resource, offer: f.offer, stopped: false } as any;
-  expect(await readNeonRecovery(f.input, before, { verify: verify as any, execute: execute as any })).toEqual({ proof: f.proof, observer });
+  expect(await readNeonRecovery(observed, before, { verify: verify as any, execute: execute as any })).toEqual({ proof: f.proof, observer });
   expect(calls).toHaveLength(1);
   expect(calls[0]!.argv).toEqual([process.execPath, "--no-env-file", path.join(release.checkout, "src", "cli.ts"), "compute", "neon-recovery-observe"]);
   expect(calls[0]!.options.cwd).toBe(release.checkout);
@@ -342,7 +369,9 @@ test("production reader sends the declared operation envelope to the bound relea
     task: { id: "task", primarySessionId: "primary", toolingRevision: pin }, allocation: { offerId: f.offer.id, mode: "retained-existing-claim" } });
   expect(JSON.stringify(payload)).not.toContain(release.checkout);
   hash = "7".repeat(64);
-  await expect(readNeonRecovery(f.input, before, { verify: verify as any, execute: execute as any })).rejects.toThrow("observer changed");
+  await expect(readNeonRecovery(observed, before, { verify: verify as any, execute: execute as any })).rejects.toThrow("observer changed");
+  // Without the group's contracts the production reader never runs an observer.
+  await expect(readNeonRecovery(f.input as any, before, { verify: verify as any, execute: execute as any })).rejects.toThrow("group's observation contracts");
 });
 
 const bindingFaults: Record<string, (operation: BoundToolingOperation) => void> = {
@@ -358,7 +387,7 @@ const bindingFaults: Record<string, (operation: BoundToolingOperation) => void> 
 test.each(Object.keys(bindingFaults))("refuses a mismatched operation binding before observing: %s", async fault => {
   const f = await fixture(); const operation = structuredClone(f.input.operation); bindingFaults[fault]!(operation);
   let reads = 0;
-  await expect(recoverComputeNeon({ ...f.input, operation }, async () => { reads++; return { proof: f.proof, observer }; }, f.head)).rejects.toThrow("bound tooling operation");
+  await expect(recover({ ...f.input, operation }, async () => { reads++; return { proof: f.proof, observer }; }, f.head)).rejects.toThrow("bound tooling operation");
   expect(reads).toBe(0); expect(await events()).toBe(0);
 });
 
@@ -370,7 +399,7 @@ test.each(["operation", "release", "revision", "tree"])("refuses a proof from an
     if (fault === "revision") proof.operation.revision = "7".repeat(40);
     if (fault === "tree") proof.operation.tree = "7".repeat(40);
     return { proof, observer }; };
-  await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow("bound operation's release");
+  await expect(recover(f.input, read, f.head)).rejects.toThrow("bound operation's release");
   expect(await events()).toBe(0);
 });
 
@@ -403,11 +432,13 @@ test("route is not exposed in this foundation port: the exact request reaches no
   expect(unauthenticated.status).toBe(401);
 });
 
-test("lost acknowledgment from a new lock holder reproduces the original result", async () => {
+test("lost acknowledgment from a new lock holder after publication reproduces the original result", async () => {
   const f = await fixture();
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
-  const read = async () => ({ proof: { ...structuredClone(f.proof), lockPid: 5151, lockSha256: "4".repeat(64), receiptSha256: "5".repeat(64) }, observer });
-  expect(await recoverComputeNeon({ ...f.input, request: { ...f.input.request, lockPid: 5151 } }, read, f.head)).toEqual(result);
+  const result = await recover(f.input, f.read, f.head);
+  // Staged design: after the client published the candidate, the canonical
+  // receipt IS the candidate; nothing else may differ but the lock.
+  const read = async () => ({ proof: { ...structuredClone(f.proof), lockPid: 5151, lockSha256: "5".repeat(64), canonical: "candidate" as const, receiptSha256: candidateSha256 }, observer });
+  expect(await recover({ ...f.input, request: { ...f.input.request, lockPid: 5151 } }, read, f.head)).toEqual(result);
   expect(result).toMatchObject({ basis: "provider-rejection", observer });
   expect(await events()).toBe(1);
 });
@@ -415,7 +446,7 @@ test("lost acknowledgment from a new lock holder reproduces the original result"
 test.each(["revision", "between-reads"])("refuses an observer that is not the bound operation's release: %s", async fault => {
   const f = await fixture(); let calls = 0;
   const read = async () => ({ proof: structuredClone(f.proof), observer: fault === "revision" || ++calls === 2 ? { ...observer, ...(fault === "revision" ? { revision: "7".repeat(40) } : { adapterSha256: "7".repeat(64) }) } : observer });
-  await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow(fault === "revision" ? "bound operation's release" : "changed during observation");
+  await expect(recover(f.input, read, f.head)).rejects.toThrow(fault === "revision" ? "bound operation's release" : "changed during observation");
   expect(await events()).toBe(0);
 });
 
@@ -452,10 +483,10 @@ test.each(Object.keys(absenceCases))("absence evidence basis: %s", async name =>
   const read = async () => { const proof = structuredClone(f.proof); entry.edit(proof); return { proof, observer }; };
   // A timer plus a listing is not provider settlement evidence: every
   // complete-inventory absence is refused and the create stays pending.
-  if (entry.ok && !name.startsWith("inventory")) expect((await recoverComputeNeon(f.input, read, f.head)).basis).toBe("provider-rejection");
-  else if (entry.ok) { await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow("pending create is preserved"); expect(await events()).toBe(0); }
+  if (entry.ok && !name.startsWith("inventory")) expect((await recover(f.input, read, f.head)).basis).toBe("provider-rejection");
+  else if (entry.ok) { await expect(recover(f.input, read, f.head)).rejects.toThrow("pending create is preserved"); expect(await events()).toBe(0); }
   else {
-    await expect(recoverComputeNeon(f.input, read, f.head)).rejects.toThrow();
+    await expect(recover(f.input, read, f.head)).rejects.toThrow();
     expect(await events()).toBe(0);
     expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
   }
@@ -509,19 +540,19 @@ async function legacyFixture(options: { allocation?: "unknown" | "stopped"; cons
   // Deterministic trusted server clock: five minutes after the inventory listing.
   let now = Date.parse(legacyInventory.listedAt) + 5 * 60_000;
   const clock = Object.assign(() => now, { set: (value: number) => { now = value; } });
-  return { ...f, resource: published, ids, proof, blobs, clock, read: async () => ({ proof: structuredClone(proof), observer: { ...observer } }) };
+  return { ...f, resource: published, ids, proof, blobs, clock, read: async () => ({ proof: structuredClone(proof), observer: { ...f.observer } }) };
 }
 type Legacy = Extract<NonNullable<ComputeNeonRecoveryProof["reconciliation"]["absence"]>, { basis: "legacy-provider-rejection" }>;
 const legacyOf = (proof: ComputeNeonRecoveryProof) => proof.reconciliation.absence as Legacy;
 
 test.each(["unknown", "stopped"] as const)("DRA-16 retained 422 evidence with settled inventory supports absence (%s allocation)", async allocation => {
   const f = await legacyFixture({ allocation }), before = await rows();
-  const result = await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock);
+  const result = await recover(f.input, f.read, f.head, f.blobs, f.clock);
   expect(result).toMatchObject({ outcome: "absent", basis: "legacy-provider-rejection", recipeHash: nextHash });
   expect(await rows()).toEqual(before);
   const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } });
   expect(JSON.parse(event.value!).proof.reconciliation.absence.log.sha256).toBe(dra16Log.sha256);
-  expect(await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
+  expect(await recover(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
   expect(await events()).toBe(1);
 });
 
@@ -531,7 +562,7 @@ test("legacy basis may use a server-granted runtime capability revision recorded
   await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", action: "tooling-capability", key: "grant", source: "task:task", occurredAt: new Date("2026-11-05T23:16:00.000Z"),
     value: JSON.stringify({ contract: "remote-agent.tooling-capability/v1", capability: "runtime", capabilityRevision: executed }) } });
   let asked = "";
-  expect((await recoverComputeNeon(f.input, f.read, f.head, async (_release, revision) => { asked = revision; return { ...reviewedBlobs }; }, f.clock)).basis).toBe("legacy-provider-rejection");
+  expect((await recover(f.input, f.read, f.head, async (_release, revision) => { asked = revision; return { ...reviewedBlobs }; }, f.clock)).basis).toBe("legacy-provider-rejection");
   expect(asked).toBe(executed);
 });
 
@@ -577,8 +608,8 @@ const legacyFaults: Record<string, (f: Awaited<ReturnType<typeof legacyFixture>>
 test.each(Object.keys(legacyFaults))("legacy rejection basis refuses: %s", async fault => {
   const f = await legacyFixture();
   await legacyFaults[fault]!(f);
-  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...observer } });
-  const error = await recoverComputeNeon(f.input, read, f.head, f.blobs, f.clock).then(() => null, (value: Error) => value);
+  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...f.observer } });
+  const error = await recover(f.input, read, f.head, f.blobs, f.clock).then(() => null, (value: Error) => value);
   if (process.env.NEON_RECOVERY_REASONS) console.log(`REASON ${fault}: ${error?.message.slice(0, 140)}`);
   expect(error).toBeInstanceOf(Error);
   expect(await events()).toBe(0);
@@ -603,12 +634,12 @@ test.each(["journaled", "legacy", "legacy-replay"] as const)("owner pause refuse
   const f = mode === "journaled" ? await fixture() : await legacyFixture();
   const blobs: typeof readReleaseBlobs = "blobs" in f ? f.blobs as typeof readReleaseBlobs : async () => ({ ...reviewedBlobs });
   const clock = "clock" in f ? (f as { clock: () => number }).clock : Date.now;
-  if (mode === "legacy-replay") await recoverComputeNeon(f.input, f.read, f.head, blobs, clock);
+  if (mode === "legacy-replay") await recover(f.input, f.read, f.head, blobs, clock);
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
   const before = { ...await rows(), environment: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }),
     resource: await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }), events: await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }) };
   let reads = 0, sourceReads = 0, heads = 0;
-  await expect(recoverComputeNeon(f.input, async () => { reads++; return f.read(); }, async () => { heads++; return currentHead; },
+  await expect(recover(f.input, async () => { reads++; return f.read(); }, async () => { heads++; return currentHead; },
     async (...args: Parameters<typeof readReleaseBlobs>) => { sourceReads++; return blobs(...args); })).rejects.toThrow();
   expect({ reads, sourceReads, heads }).toEqual({ reads: 0, sourceReads: 0, heads: 0 });
   expect({ ...await rows(), environment: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }),
@@ -620,9 +651,9 @@ test.each(["journaled", "legacy", "legacy-replay"] as const)("owner pause refuse
 test.each(["unknown", "stopped"] as const)("DRA-18 receipt-retained 422 with settled inventory supports absence without a CLI log (%s)", async allocation => {
   const f = await legacyFixture({ consumer: "dra18", allocation });
   expect(legacyOf(f.proof).log).toBeUndefined();
-  const result = await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock);
+  const result = await recover(f.input, f.read, f.head, f.blobs, f.clock);
   expect(result).toMatchObject({ outcome: "absent", basis: "legacy-provider-rejection", environmentId: f.environment.id });
-  expect(await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
+  expect(await recover(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
   expect(await events()).toBe(1);
 });
 
@@ -642,7 +673,7 @@ const dra18Logs: Record<string, { ok: boolean; events: ReturnType<typeof dra18Ev
 test.each(Object.keys(dra18Logs))("DRA-18 optional log must agree with the receipt: %s", async name => {
   const f = await legacyFixture({ consumer: "dra18" }), entry = dra18Logs[name]!;
   legacyOf(f.proof).log = { file: `/state/drafted/task-private/${consumers.dra18.ids.task}/development/runtime-up-2.err`, bytes: 900, sha256: "a".repeat(64), events: entry.events, stderr: entry.stderr ?? "Remote dependency POST failed (422)\n" };
-  const run = recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock);
+  const run = recover(f.input, f.read, f.head, f.blobs, f.clock);
   if (entry.ok) expect((await run).basis).toBe("legacy-provider-rejection"); else { await expect(run).rejects.toThrow("Legacy Neon rejection"); expect(await events()).toBe(0); }
 });
 
@@ -657,14 +688,14 @@ const receiptFaults: Record<string, (proof: ComputeNeonRecoveryProof) => void> =
 test.each(Object.keys(receiptFaults))("DRA-18 receipt-borne evidence refuses: %s", async name => {
   const f = await legacyFixture({ consumer: "dra18" });
   receiptFaults[name]!(f.proof);
-  await expect(recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow("Legacy Neon rejection");
+  await expect(recover(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow("Legacy Neon rejection");
   expect(await events()).toBe(0);
 });
 
 test("DRA-16 without its retained log has no record of the provider response", async () => {
   const f = await legacyFixture();
   delete legacyOf(f.proof).log;
-  await expect(recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow("no retained record of the original provider response");
+  await expect(recover(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow("no retained record of the original provider response");
 });
 
 // Both consumers in one control plane: one shared inventory, independent
@@ -677,15 +708,15 @@ async function both() {
 const recipeOf = async (id: string) => (await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id } })).recipeDigest;
 test("both consumers recover independently from the same inventory and journal only their own task", async () => {
   const { dra16, dra18 } = await both();
-  await recoverComputeNeon(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock);
+  await recover(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock);
   expect(await recipeOf(dra18.environment.id)).toBe(nextHash); expect(await recipeOf(dra16.environment.id)).toBe(oldHash);
-  await recoverComputeNeon(dra16.input, dra16.read, dra16.head, dra16.blobs, dra16.clock);
+  await recover(dra16.input, dra16.read, dra16.head, dra16.blobs, dra16.clock);
   expect(await recipeOf(dra16.environment.id)).toBe(nextHash);
   const journal = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-neon-recovery" }, orderBy: { sequence: "asc" } });
   expect(journal.map(event => [event.runtimeSessionId, event.source])).toEqual([[dra18.ids.primary, `compute:${dra18.ids.task}`], [dra16.ids.primary, `compute:${dra16.ids.task}`]]);
 });
 
-const crossFaults: Record<string, (c: Awaited<ReturnType<typeof both>>) => Parameters<typeof recoverComputeNeon>[0] | Promise<Parameters<typeof recoverComputeNeon>[0]>> = {
+const crossFaults: Record<string, (c: Awaited<ReturnType<typeof both>>) => TestInput | Promise<TestInput>> = {
   "dra16-proof-for-dra18": c => c.dra18.input,
   "dra16-binding-for-dra18": c => ({ ...c.dra18.input, operation: c.dra16.input.operation }),
   "dra16-request-for-dra18-task": c => ({ ...c.dra16.input, taskId: c.dra18.ids.task }),
@@ -696,7 +727,7 @@ test.each(Object.keys(crossFaults))("cross-consumer contradiction is refused wit
   const c = await both();
   const input = await crossFaults[name]!(c);
   const proof = name === "dra16-proof-for-dra18" || name === "dra16-request-for-dra18-task" ? c.dra16.proof : c.dra18.proof;
-  const error = await recoverComputeNeon(input, async () => ({ proof: structuredClone(proof), observer: { ...observer } }), c.dra18.head, c.dra18.blobs, c.dra18.clock).then(() => null, (value: Error) => value);
+  const error = await recover(input, async () => ({ proof: structuredClone(proof), observer: { ...observer, operationId: input.operation.operationId } }), c.dra18.head, c.dra18.blobs, c.dra18.clock).then(() => null, (value: Error) => value);
   if (process.env.NEON_RECOVERY_REASONS) console.log(`REASON ${name}: ${error?.message.slice(0, 140)}`);
   expect(error).toBeInstanceOf(Error);
   expect(await recipeOf(c.dra16.environment.id)).toBe(oldHash); expect(await recipeOf(c.dra18.environment.id)).toBe(oldHash);
@@ -708,8 +739,8 @@ test("a branch that would match only DRA-18's window or name blocks DRA-18 but n
     await db.cleanup(); db = await createTestDatabase();
     const { dra16, dra18 } = await both();
     legacyOf(dra16.proof).inventory.branches.push(branch); legacyOf(dra18.proof).inventory.branches.push(branch);
-    await expect(recoverComputeNeon(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock)).rejects.toThrow("inventory does not prove the create absent");
-    expect((await recoverComputeNeon(dra16.input, dra16.read, dra16.head, dra16.blobs, dra16.clock)).basis).toBe("legacy-provider-rejection");
+    await expect(recover(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock)).rejects.toThrow("inventory does not prove the create absent");
+    expect((await recover(dra16.input, dra16.read, dra16.head, dra16.blobs, dra16.clock)).basis).toBe("legacy-provider-rejection");
   }
 });
 
@@ -717,9 +748,9 @@ test("DRA-16's owner pause refuses only DRA-16; DRA-18 proceeds under its own au
   const { dra16, dra18 } = await both();
   await db.prisma.remoteTask.update({ where: { id: dra16.ids.task }, data: { ownerPaused: true } });
   let reads = 0;
-  await expect(recoverComputeNeon(dra16.input, async () => { reads++; return dra16.read(); }, dra16.head, dra16.blobs, dra16.clock)).rejects.toThrow();
+  await expect(recover(dra16.input, async () => { reads++; return dra16.read(); }, dra16.head, dra16.blobs, dra16.clock)).rejects.toThrow();
   expect(reads).toBe(0);
-  expect((await recoverComputeNeon(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock)).environmentId).toBe(dra18.environment.id);
+  expect((await recover(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock)).environmentId).toBe(dra18.environment.id);
   expect(await recipeOf(dra16.environment.id)).toBe(oldHash);
 });
 
@@ -736,9 +767,9 @@ test("exact retained allocations: paused DRA-16 refuses before any read; unpause
   const before = await snapshot();
   expect(before.slots.map(slot => [slot.id, slot.allocationId])).toEqual([["host:0", "7ebb1829-a987-422a-b8b1-117509ad8ec0"], ["host:1", "c962e9d0-7626-46b2-8a9a-ffe7d85899cf"]]);
   let reads = 0;
-  await expect(recoverComputeNeon(dra16.input, async () => { reads++; return dra16.read(); }, dra16.head, dra16.blobs, dra16.clock)).rejects.toThrow();
+  await expect(recover(dra16.input, async () => { reads++; return dra16.read(); }, dra16.head, dra16.blobs, dra16.clock)).rejects.toThrow();
   expect(reads).toBe(0);
-  const result = await recoverComputeNeon(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock);
+  const result = await recover(dra18.input, dra18.read, dra18.head, dra18.blobs, dra18.clock);
   expect(result).toMatchObject({ environmentId: "c7804078-f94c-4e05-bf1c-f2dd8ad67ede", resourceId: "cmw48yw4w00tyzkxca11te1sl", offerId: "c962e9d0-7626-46b2-8a9a-ffe7d85899cf",
     operationId: "b80f4a2f-4fbc-4a21-93fa-3b5aaca3d117", allocation: "retained-existing-claim", basis: "legacy-provider-rejection" });
   expect(await snapshot()).toEqual(before);
@@ -762,8 +793,8 @@ test.each(Object.keys(unknownCases))("unproven outcome stays pending with no wri
   await unknownCases[name]!(f);
   const before = { env: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }), resource: await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }),
     offers: await db.prisma.computeOffer.findMany(), slots: await db.prisma.computeSlot.findMany() };
-  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...observer } });
-  const error = await recoverComputeNeon(f.input, read, f.head, f.blobs, f.clock).then(() => null, (value: Error) => value);
+  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...f.observer } });
+  const error = await recover(f.input, read, f.head, f.blobs, f.clock).then(() => null, (value: Error) => value);
   if (process.env.NEON_RECOVERY_REASONS) console.log(`REASON ${name}: ${error?.message.slice(0, 140)}`);
   expect(error).toBeInstanceOf(Error);
   expect({ env: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }), resource: await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }),
@@ -775,7 +806,7 @@ test.each(Object.keys(unknownCases))("unproven outcome stays pending with no wri
 // pinned by the operation and observed twice.
 test("original revision differs from the current worktree HEAD; recovery preserves the environment revision and records the source", async () => {
   const f = await fixture(), seen: unknown[] = [];
-  const result = await recoverComputeNeon(f.input, f.read, async (task, base) => { seen.push({ task, base }); return currentHead; });
+  const result = await recover(f.input, f.read, async (task, base) => { seen.push({ task, base }); return currentHead; });
   expect(result.sourceRevision).toBe(currentHead);
   expect(seen).toEqual([{ task: { worktreePath: "/fixture/task", branchName: "codex/task" }, base: revision }, { task: { worktreePath: "/fixture/task", branchName: "codex/task" }, base: revision }]);
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).revision).toBe(revision);
@@ -793,16 +824,16 @@ const sourceFaults: Record<string, { head: (calls: number) => string; edit?: (f:
 test.each(Object.keys(sourceFaults))("source distinction refuses: %s", async name => {
   const f = await fixture(), fault = sourceFaults[name]!; let calls = 0;
   fault.edit?.(f);
-  await expect(recoverComputeNeon(f.input, async () => ({ proof: structuredClone(f.proof), observer: { ...observer } }), async () => fault.head(++calls))).rejects.toThrow(fault.reason);
+  await expect(recover(f.input, async () => ({ proof: structuredClone(f.proof), observer: { ...observer } }), async () => fault.head(++calls))).rejects.toThrow(fault.reason);
   expect(await events()).toBe(0);
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
 });
 
 test("a lost acknowledgment replays only at the recorded source; after source progress the committed projection stands without rewrite", async () => {
   const f = await fixture();
-  const result = await recoverComputeNeon(f.input, f.read, f.head);
-  expect(await recoverComputeNeon(f.input, f.read, f.head)).toEqual(result);
-  await expect(recoverComputeNeon(f.input, f.read, async () => "5".repeat(40))).rejects.toThrow("recorded worktree revision");
+  const result = await recover(f.input, f.read, f.head);
+  expect(await recover(f.input, f.read, f.head)).toEqual(result);
+  await expect(recover(f.input, f.read, async () => "5".repeat(40))).rejects.toThrow("recorded worktree revision");
   expect(await events()).toBe(1);
   expect(await recipeOf(f.environment.id)).toBe(nextHash);
 });
@@ -846,41 +877,218 @@ const nothingWritten = async (f: Awaited<ReturnType<typeof legacyFixture>>) => {
 };
 test.each([["recent (5 min)", 5 * 60_000], ["boundary (exactly 15 min)", FRESH], ["same instant", 0]] as const)("legacy inventory freshness accepts %s", async (_name, age) => {
   const f = await legacyFixture({ consumer: "dra18" }); f.clock.set(listedAt + age);
-  expect((await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).basis).toBe("legacy-provider-rejection");
+  expect((await recover(f.input, f.read, f.head, f.blobs, f.clock)).basis).toBe("legacy-provider-rejection");
 });
 test.each([["stale by 1 ms", FRESH + 1, "older than 15 minutes"], ["stale by hours", 6 * 3_600_000, "older than 15 minutes"], ["dated in the future", -1, "dated after"]] as const)("legacy inventory freshness refuses %s with zero writes", async (_name, age, reason) => {
   const f = await legacyFixture({ consumer: "dra18" }); f.clock.set(listedAt + age);
-  await expect(recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow(reason);
+  await expect(recover(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow(reason);
   await nothingWritten(f);
 });
 test("an inventory that ages past the bound during a slow observation is refused immediately before the first write", async () => {
   const f = await legacyFixture({ consumer: "dra18" }); f.clock.set(listedAt + 14 * 60_000);
   let reads = 0;
   const read = async () => { if (++reads === 2) f.clock.set(listedAt + FRESH + 30_000); return f.read(); }; // the second observation is slow
-  await expect(recoverComputeNeon(f.input, read, f.head, f.blobs, f.clock)).rejects.toThrow("older than 15 minutes");
+  await expect(recover(f.input, read, f.head, f.blobs, f.clock)).rejects.toThrow("older than 15 minutes");
   expect(reads).toBe(2);
   await nothingWritten(f);
 });
 test("a lost acknowledgment replays hours later under the same operation and evidence; age is not re-required", async () => {
   const f = await legacyFixture({ consumer: "dra18" });
-  const result = await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock);
+  const result = await recover(f.input, f.read, f.head, f.blobs, f.clock);
   f.clock.set(listedAt + 6 * 3_600_000);
-  expect(await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
+  expect(await recover(f.input, f.read, f.head, f.blobs, f.clock)).toEqual(result);
   expect(await events()).toBe(1);
 });
 test("a replay never substitutes a fresh inventory: changed evidence after acknowledgment is refused", async () => {
   const f = await legacyFixture({ consumer: "dra18" });
-  await recoverComputeNeon(f.input, f.read, f.head, f.blobs, f.clock);
+  await recover(f.input, f.read, f.head, f.blobs, f.clock);
   const later = listedAt + 6 * 3_600_000; f.clock.set(later + 60_000);
   const fresher = structuredClone(f.proof);
   legacyOf(fresher).inventory.listedAt = new Date(later).toISOString(); fresher.reconciliation.observedAt = new Date(later).toISOString();
-  await expect(recoverComputeNeon(f.input, async () => ({ proof: structuredClone(fresher), observer: { ...observer } }), f.head, f.blobs, f.clock)).rejects.toThrow("changed after acknowledgment");
+  await expect(recover(f.input, async () => ({ proof: structuredClone(fresher), observer: { ...f.observer } }), f.head, f.blobs, f.clock)).rejects.toThrow("changed after acknowledgment");
   expect(await events()).toBe(1);
 });
 test("freshness never promotes inventory-only absence or an unknown outcome", async () => {
   const f = await legacyFixture({ consumer: "dra18" }); f.clock.set(listedAt);
   legacyOf(f.proof).receiptProgress.detail = "Remote dependency request failed; inspect the recorded operation before retrying";
-  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...observer } });
-  await expect(recoverComputeNeon(f.input, read, f.head, f.blobs, f.clock)).rejects.toThrow("no retained record");
+  const read = async () => ({ proof: structuredClone(f.proof), observer: { ...f.observer } });
+  await expect(recover(f.input, read, f.head, f.blobs, f.clock)).rejects.toThrow("no retained record");
   await nothingWritten(f);
+});
+
+// ---------------------------------------------------------------------------
+// Staged handoff (design 551400d9, root v6): one transaction verifies the
+// staged proof, commits projection + event, hands off the group's legacy
+// readers, registers drafted.runtime/2 under this operation and completes it.
+// ---------------------------------------------------------------------------
+const stateWrites = () => db.prisma.toolingStateWrite.findMany({ orderBy: { sequence: "asc" } });
+const operationRow = (id = "op-recovery") => db.prisma.toolingOperation.findUniqueOrThrow({ where: { id } });
+async function legacyRows(f: Awaited<ReturnType<typeof fixture>>, extra: { consumerKind: string; consumerId: string }[] = []) {
+  const rows = [{ consumerKind: "compute-environment", consumerId: f.environment.id }, { consumerKind: "compute-offer", consumerId: f.offer.id }, ...extra];
+  for (const [index, row] of rows.entries()) await db.prisma.toolingLegacyConsumer.create({ data: { id: `legacy-${index}`, repositoryId: "repo", taskId: "task", ...row,
+    status: "retained", provenance: "exact", revision: pin, checkout: `/install/tooling/repo/${pin}` } });
+  return rows;
+}
+/** An unfinished operation of an older release that cannot read v2 (S6 deferral). */
+async function oldReader() {
+  await db.prisma.toolingRelease.create({ data: { id: "tr_old", repositoryId: "repo", revision: "5".repeat(40), tree: "4".repeat(40), policyBlob: "e".repeat(40), checkout: "/install/tooling/repo/old",
+    manifest: { ...releaseManifest, stateFormats: { "drafted.runtime": { read: [1], write: 1, preservesUnknown: false } } }, lockfileDigest: "f".repeat(64), bunVersion: "1.3.14" } });
+  await db.prisma.toolingOperation.create({ data: { id: "op-old", taskId: "task", requestKey: "old-command", inputDigest: "0".repeat(64), kind: "adapter-command", repositoryId: "repo", sessionId: "primary",
+    resourceKey: "runtime-development", generation: 4, releaseId: "tr_old", protocol: 1, status: "running" } });
+}
+const projection = async (f: Awaited<ReturnType<typeof fixture>>) => ({ environment: await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } }),
+  resource: await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } }) });
+
+test("commit registers drafted.runtime/2 under this operation, records handoff and state write, and completes it", async () => {
+  const f = await fixture(), before = await rows();
+  const result = await recover(f.input, f.read, f.head);
+  const [write, ...more] = await stateWrites();
+  expect(more).toEqual([]);
+  expect(write).toMatchObject({ repositoryId: "repo", taskId: "task", family: "drafted.runtime", scopeKey: "runtime-development", version: 2, operationId: "op-recovery", releaseId: release.id });
+  expect(result.stateWrite).toEqual({ family: "drafted.runtime", scopeKey: "runtime-development", version: 2, operationId: "op-recovery", releaseId: release.id, sequence: write!.sequence });
+  const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } });
+  const value = JSON.parse(event.value!);
+  expect(value.stateWrite).toEqual(result.stateWrite);
+  expect(value.handoff).toEqual({ version: 1, operationId: "op-recovery", taskId: "task", environmentId: f.environment.id, resourceId: f.resource.id, rows: [] });
+  expect(value.proof).toMatchObject({ canonical: "baseline", candidateSha256, candidateVersion: 2 });
+  expect(await operationRow()).toMatchObject({ status: "completed", completionEvidence: { kind: "compute-neon-recovery-committed", reference: String(event.sequence) } });
+  // B's strict committed-result reader reproduces exactly this result.
+  const { readCommittedNeonRecovery } = await import("./compute-neon-recovery-result.ts");
+  const { status: _status, ...binding } = (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))!;
+  expect((await readCommittedNeonRecovery(db.prisma, binding))).toMatchObject({ sequence: event.sequence, committed: { result } });
+  // No retained reader, producer, owner or admission; nothing allocated.
+  expect(await db.prisma.toolingRetainedConsumer.count()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-operation-association" } })).toBe(0);
+  expect(await rows()).toEqual(before);
+});
+
+test("the group's retained legacy readers are handed off with snapshots kept, inside the commit", async () => {
+  const f = await fixture(), seeded = await legacyRows(f);
+  await recover(f.input, f.read, f.head);
+  const legacy = await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } });
+  expect(legacy.map(row => ({ consumerKind: row.consumerKind, consumerId: row.consumerId, status: row.status, revision: row.revision, checkout: row.checkout, resolution: row.resolution })))
+    .toEqual(seeded.map(row => ({ ...row, status: "resolved", revision: pin, checkout: `/install/tooling/repo/${pin}`, resolution: { kind: "compute-neon-recovery", reference: "op-recovery" } })));
+  const value = JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } })).value!);
+  expect(value.handoff.rows.map((row: { id: string }) => row.id)).toEqual(["legacy-0", "legacy-1"]);
+  expect(await db.prisma.toolingLegacyConsumer.count({ where: { status: "retained" } })).toBe(0);
+  // Exact replay: the handoff and state write are rechecked, nothing rewritten.
+  const writes = await stateWrites();
+  expect(await recover(f.input, f.read, f.head)).toMatchObject({ stateWrite: { sequence: writes[0]!.sequence } });
+  expect(await stateWrites()).toEqual(writes);
+});
+
+test("a retained legacy reader outside the recovered group refuses before observing, with nothing written", async () => {
+  const f = await fixture();
+  await legacyRows(f, [{ consumerKind: "compute-environment", consumerId: "other-environment" }]);
+  let reads = 0;
+  await expect(recover(f.input, async () => { reads++; return f.read(); }, f.head)).rejects.toThrow("outside the recovered group");
+  expect(reads).toBe(0); expect(await events()).toBe(0); expect(await stateWrites()).toEqual([]);
+  expect(await db.prisma.toolingLegacyConsumer.count({ where: { status: "retained" } })).toBe(3);
+  expect((await operationRow()).status).toBe("running");
+});
+
+test.each(["running", "unknown"] as const)("a failure after the handoff (S6 deferred) rolls everything back; %s status is unchanged", async status => {
+  const f = await fixture();
+  await legacyRows(f); await oldReader();
+  if (status === "unknown") await db.prisma.toolingOperation.update({ where: { id: "op-recovery" }, data: { status } });
+  const input = { ...f.input, operation: (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))! };
+  const before = await projection(f);
+  await expect(recover(input, f.read, f.head)).rejects.toThrow("cannot read drafted.runtime version 2");
+  expect(await events()).toBe(0); expect(await stateWrites()).toEqual([]);
+  expect(await db.prisma.toolingLegacyConsumer.count({ where: { status: "retained" } })).toBe(2);
+  expect(await projection(f)).toEqual(before);
+  expect(await operationRow()).toMatchObject({ status, completionEvidence: null });
+  // Once the older reader finishes, the same operation commits and completes.
+  await db.prisma.toolingOperation.update({ where: { id: "op-old" }, data: { status: "completed", completionEvidence: { kind: "test", reference: "finished" } } });
+  await recover(input, f.read, f.head);
+  expect((await operationRow()).status).toBe("completed");
+  expect(await db.prisma.toolingLegacyConsumer.count({ where: { status: "retained" } })).toBe(0);
+});
+
+test.each(["closed", "open"] as const)("a command-parented recovery requires its %s parent to be open", async parent => {
+  const f = await fixture();
+  await db.prisma.toolingOperation.create({ data: { id: "op-command", taskId: "task", requestKey: "runtime-command", inputDigest: "0".repeat(64), kind: "adapter-command", repositoryId: "repo", sessionId: "primary",
+    generation: 5, releaseId: release.id, protocol: 1, status: parent === "closed" ? "completed" : "running", ...(parent === "closed" ? { completionEvidence: { kind: "test", reference: "ended" } } : {}) } });
+  await db.prisma.toolingOperation.update({ where: { id: "op-recovery" }, data: { parentOperationId: "op-command" } });
+  const input = { ...f.input, operation: (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))! };
+  if (parent === "closed") {
+    await expect(recover(input, f.read, f.head)).rejects.toThrow("open command");
+    expect(await events()).toBe(0); expect(await stateWrites()).toEqual([]); expect((await operationRow()).status).toBe("running");
+  } else {
+    await recover(input, f.read, f.head);
+    expect((await operationRow()).status).toBe("completed");
+  }
+});
+
+test("a completed operation without its committed event is never success", async () => {
+  const f = await fixture();
+  await db.prisma.toolingOperation.update({ where: { id: "op-recovery" }, data: { status: "completed", completionEvidence: { kind: "test", reference: "none" } } });
+  const input = { ...f.input, operation: (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))! };
+  await expect(recover(input, f.read, f.head)).rejects.toThrow("without its committed event");
+  expect(await events()).toBe(0); expect(await stateWrites()).toEqual([]);
+});
+
+test.each(["candidate-first-commit", "receipt-mismatch", "candidate-equals-baseline"])("refuses a proof not over the staged baseline and candidate: %s", async fault => {
+  const f = await fixture();
+  const read = async () => { const proof = structuredClone(f.proof);
+    if (fault === "candidate-first-commit") Object.assign(proof, { canonical: "candidate", receiptSha256: candidateSha256 });
+    if (fault === "receipt-mismatch") proof.receiptSha256 = "9".repeat(64);
+    if (fault === "candidate-equals-baseline") proof.candidateSha256 = proof.baselineSha256;
+    return { proof, observer: f.observer }; };
+  await expect(recover(f.input, read, f.head)).rejects.toThrow();
+  expect(await events()).toBe(0); expect(await stateWrites()).toEqual([]); expect((await operationRow()).status).toBe("running");
+});
+
+// Constructed broken invariant (event and completion are atomic): an event
+// whose operation is not completed is refused with no durable change; the
+// transient CAS rolls back, preserving the original status.
+test.each(["unknown", "running"] as const)("an existing event with a %s operation is a broken invariant: refused, nothing written", async status => {
+  const f = await fixture();
+  await legacyRows(f);
+  await recover(f.input, f.read, f.head);
+  await db.prisma.toolingOperation.update({ where: { id: "op-recovery" }, data: { status, completionEvidence: Prisma.DbNull } });
+  const input = { ...f.input, operation: (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))! };
+  const before = { operation: await operationRow(), projection: await projection(f), writes: await stateWrites(), legacy: await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }),
+    events: await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }) };
+  await expect(recover(input, f.read, f.head)).rejects.toThrow("broken commit invariant");
+  expect(await operationRow()).toEqual(before.operation);
+  expect(await projection(f)).toEqual(before.projection);
+  expect(await stateWrites()).toEqual(before.writes);
+  expect(await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } })).toEqual(before.legacy);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } })).toEqual(before.events);
+});
+
+test("a committed recovery answers a lost acknowledgment by strict verification only", async () => {
+  const f = await fixture();
+  await legacyRows(f);
+  const result = await recover(f.input, f.read, f.head);
+  const before = { operation: await operationRow(), writes: await stateWrites(), legacy: await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }) };
+  expect(await recover(f.input, f.read, f.head)).toEqual(result);
+  expect(await operationRow()).toEqual(before.operation);
+  expect(await stateWrites()).toEqual(before.writes);
+  expect(await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } })).toEqual(before.legacy);
+  expect(await events()).toBe(1);
+});
+
+test("the bound release must declare every observation contract of the exact group, including baseline", async () => {
+  const partial = await releaseCheckout(["runtime-neon-recovery/v1"]), noBaseline = await releaseCheckout(["runtime-neon-recovery/v1", "compute-traffic/v1"]), full = await releaseCheckout(baselineContracts);
+  try {
+    await expect(verifyBoundObserver(partial.release, recoveryContracts, plainExecute)).rejects.toThrow("required observation contracts: compute-traffic/v1");
+    expect((await verifyBoundObserver(noBaseline.release, recoveryContracts, plainExecute)).adapterSha256).toMatch(/^[a-f0-9]{64}$/);
+    await expect(verifyBoundObserver(noBaseline.release, baselineContracts, plainExecute)).rejects.toThrow("required observation contracts: compute-baseline/v1");
+    expect((await verifyBoundObserver(full.release, baselineContracts, plainExecute)).adapterSha256).toMatch(/^[a-f0-9]{64}$/);
+    // The recovery contract itself is never optional.
+    await expect(verifyBoundObserver(full.release, ["compute-traffic/v1"], plainExecute)).rejects.toThrow("runtime-neon-recovery/v1");
+  } finally { for (const value of [partial, noBaseline, full]) await rm(value.checkout, { recursive: true, force: true }); }
+});
+
+test.each(["plain", "baseline"] as const)("the production observer path receives the exact %s group's contracts", async kind => {
+  const f = await fixture();
+  if (kind === "baseline") await legacyRows(f, [{ consumerKind: "compute-baseline", consumerId: "task:development" }]);
+  const seen: string[][] = [];
+  const read = async (input: any) => { seen.push(input.observationContracts); return f.read(); };
+  await recover(f.input, read, f.head);
+  expect(seen).toEqual([kind === "baseline" ? baselineContracts : recoveryContracts, kind === "baseline" ? baselineContracts : recoveryContracts]);
+  if (kind === "baseline") expect(JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } })).value!).handoff.rows
+    .map((row: { consumerKind: string }) => row.consumerKind)).toContain("compute-baseline");
 });
