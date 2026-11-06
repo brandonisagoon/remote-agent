@@ -4,8 +4,14 @@
  * Remote Agent server routes/scheduler/inbox and Drafted's manageRuntime
  * together; it is NOT production Docker or PlanetScale acceptance.
  *
- * Hold mode for root browser verification:
- *   DRA37_HOLD=1 bun test test/dra37-runtime.test.ts
+ * EXPLICIT cross-repository rehearsal, never part of the default `bun test`
+ * gate (the file name is deliberately not *.test.ts). It requires the paired
+ * Drafted checkout and an exact commit, and fails when either is missing:
+ *   DRA37_DRAFTED_SOURCE=/path/to/drafted DRA37_DRAFTED_REVISION=<40-hex sha> \
+ *     bun test ./test/dra37-runtime.rehearsal.ts
+ *
+ * Hold mode for root browser verification (same inputs, plus):
+ *   DRA37_HOLD=1 bun test ./test/dra37-runtime.rehearsal.ts -t "delivered offer"
  * prints the task app URL and the exact normal stop/cleanup command
  * (`touch <root>/release-hold`), then performs Drafted's normal stop and
  * removes only this fixture's own temporary root.
@@ -16,7 +22,10 @@ import path from "node:path";
 import { dra37Server } from "./dra37-fixture.ts";
 
 setDefaultTimeout(Number(process.env.DRA37_HOLD_SECONDS ?? 0) * 1000 + 300_000);
-const DRAFTED_REVISION = process.env.DRA37_DRAFTED_REVISION ?? "8df8d50";
+const DRAFTED = { source: process.env.DRA37_DRAFTED_SOURCE ?? "", revision: process.env.DRA37_DRAFTED_REVISION ?? "" };
+if (!DRAFTED.source || !/^[a-f0-9]{40}$/.test(DRAFTED.revision)) {
+  throw new Error("DRA-37 runtime rehearsal requires DRA37_DRAFTED_SOURCE (paired Drafted checkout with node_modules) and DRA37_DRAFTED_REVISION (exact 40-character commit); it is not part of the default test gate");
+}
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
@@ -30,7 +39,7 @@ async function until<T>(read: () => Promise<T>, done: (value: T) => boolean, lab
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
 test("the original primary's delivered offer runs the actual Drafted runtime to a healthy task-owned app, and a normal stop ends exactly that process", async () => {
-  const server = await dra37Server({ slots: 1, draftedRevision: DRAFTED_REVISION });
+  const server = await dra37Server({ slots: 1, drafted: DRAFTED });
   cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE }));
   const task = await server.seedTask("app");
   await server.start();
@@ -92,7 +101,7 @@ test("the original primary's delivered offer runs the actual Drafted runtime to 
  * fixture proxy: the next DRA-37 transport step.)
  */
 test("without physical observer evidence a stopped app's allocation stays charged and the next waiter gets no offer", async () => {
-  const server = await dra37Server({ slots: 1, draftedRevision: DRAFTED_REVISION });
+  const server = await dra37Server({ slots: 1, drafted: DRAFTED });
   cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE }));
   const first = await server.seedTask("first"), second = await server.seedTask("second");
   await server.start();

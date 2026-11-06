@@ -5,6 +5,7 @@
  * every request, offer, reservation, claim and delivery goes through the
  * server's normal routes and workers. Never points at live config or data. */
 import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,8 +31,6 @@ function git(cwd: string, ...args: string[]) {
 
 export type Dra37Task = { id: string; sessionId: string; worktree: string; revision: string; recipe: { key: string; purpose: "development"; revision: string; recipeDigest: string } };
 
-/** Paired Drafted repository: read only (objects and node_modules). */
-export const DRAFTED_WORKTREE = "/Users/brandon/Desktop/.worktrees/drafted-workflow/dra-27-live-tooling-release";
 /**
  * The configured tooling source and its prepared checkout, exactly as a
  * deployed server sees them: a `--shared` clone of the paired Drafted
@@ -39,9 +38,11 @@ export const DRAFTED_WORKTREE = "/Users/brandon/Desktop/.worktrees/drafted-workf
  * detached worktree of the pinned commit at the server's install path, with
  * its readiness receipt, is the prepared checkout. Nothing is committed.
  */
-async function prepareDraftedTooling(root: string, install: string, revision: string) {
+async function prepareDraftedTooling(root: string, install: string, revision: string, paired: string) {
+  if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("The DRA-37 runtime rehearsal requires an exact 40-character Drafted commit");
+  if (!existsSync(path.join(paired, ".git")) || !existsSync(path.join(paired, "node_modules"))) throw new Error(`Paired Drafted source ${paired} must be a git checkout with installed node_modules`);
   const source = path.join(root, "tooling-source");
-  const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-checkout", "--shared", DRAFTED_WORKTREE, source], { stdout: "pipe", stderr: "pipe" });
+  const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-checkout", "--shared", paired, source], { stdout: "pipe", stderr: "pipe" });
   if (clone.exitCode) throw new Error(`Cannot clone Drafted: ${clone.stderr.toString()}`);
   const full = git(source, "rev-parse", "--verify", `${revision}^{commit}`), tree = git(source, "rev-parse", `${full}^{tree}`);
   // The dependency link is a symlink; Drafted ignores only a node_modules
@@ -50,13 +51,13 @@ async function prepareDraftedTooling(root: string, install: string, revision: st
   const checkout = path.join(install, "tooling", REPOSITORY, full);
   await mkdir(path.dirname(checkout), { recursive: true });
   git(source, "worktree", "add", "--detach", checkout, full);
-  await symlink(path.join(DRAFTED_WORKTREE, "node_modules"), path.join(checkout, "node_modules"));
+  await symlink(path.join(paired, "node_modules"), path.join(checkout, "node_modules"));
   if (git(checkout, "status", "--porcelain", "--untracked-files=normal")) throw new Error("Prepared Drafted checkout is not clean");
   await writeFile(`${checkout}.ready`, `${full}\n`, { mode: 0o600 });
   return { source, root: checkout, revision: full, tree };
 }
 
-export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; draftedRevision?: string }) {
+export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string } }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
@@ -69,7 +70,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   // actual observer (see dra37-docker.ts). The app it reports is real.
   await writeFile(path.join(bin, "docker"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} --no-env-file ${JSON.stringify(path.join(import.meta.dir, "dra37-docker.ts"))} ${JSON.stringify(apps)} "$@"\n`, { mode: 0o700 });
   const install = path.join(root, "install");
-  const drafted = options.draftedRevision ? await prepareDraftedTooling(root, install, options.draftedRevision) : null;
+  const drafted = options.drafted ? await prepareDraftedTooling(root, install, options.drafted.revision, options.drafted.source) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
   const fixture = {
     root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted,
