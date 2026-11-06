@@ -25,6 +25,7 @@ import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/ro
 import { TOOLING_OPERATION_HEADER, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
 import { activateToolingRelease, canonicalDigest, confirmToolingConsumer, registerToolingStateWrite, retainToolingConsumer } from "../apps/server/services/tasks/tooling-releases.ts";
 import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
+import { finalizationResourceIdentity } from "../apps/server/services/tasks/finalization-resources.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
 for (const name of Object.keys(process.env)) if (name.startsWith("REMOTE_AGENT_")) delete process.env[name];
@@ -904,24 +905,43 @@ test("stored adoption child: after its offer is withdrawn the same key returns t
 // delivered offer's fresh B command must adopt that never-produced waiting work.
 /** A produced env; B active; A's continuation settled; stand-in verified stop.
  * Then B's separate `runtime up` admitted the stopped environment and waits. */
-async function retiredThenWaiting(options: { longOpenA?: boolean; danglingProducer?: boolean } = {}) {
+/** A synthetic stopped observation of the environment's exact current resource. */
+const stoppedObservation = (resource: { id: string; identity: string }, state: "stopped" | "running" = "stopped") => ({ version: 1, environmentId: ENV, taskId: "task", primarySessionId: "primary",
+  purpose: "development", revision: computeBody.revision, recipeDigest: computeBody.recipeDigest, resourceId: resource.id, resourceIdentity: resource.identity, observedAt: Date.now(), state,
+  coverage: "complete", configurationDigest: "c".repeat(64), routes: [], operations: { coverage: "complete", active: 0, generation: "a".repeat(64) } });
+/** `shape`: "request-child" (one command reuses its request child for claim/bind:
+ * producer existingOperationId null) or "existing-offer" (a delivered offer's
+ * fresh command claims and binds: producer existingOperationId = offer). */
+async function retiredThenWaiting(options: { longOpenA?: boolean; danglingProducer?: boolean; shape?: "request-child" | "existing-offer" } = {}) {
   const f = await fixture();
   await f.activate(A, 0);
   // Optionally an older A command that stays open across B's activation.
   const longOpen = options.longOpenA ? await f.command("a-long-open") : null;
-  const a = await f.command("a-runtime-up");
+  let a = await f.command("a-runtime-up");
   expect((await a.request()).called?.status).toBe(200);
-  await f.environment(); await f.offer("offer-a");
+  await f.environment();
+  if (options.shape === "existing-offer") {
+    expect((await a.settle()).status).toBe(200); // waiting
+    await f.offer("offer-a");
+    a = await f.command("a-runtime-up-offer");
+  } else await f.offer("offer-a");
   expect((await a.claim("offer-a")).called?.status).toBe(200);
   await f.claimed("offer-a");
   expect((await a.bind("offer-a")).called?.status).toBe(200);
   expect((await a.settle()).status).toBe(200);
+  expect(a.bindings.at(-1)!.existingOperationId).toBe(options.shape === "existing-offer" ? "offer-a" : null);
+  // The domain registered the running app's resource for the environment (synthetic rows).
+  const row = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: KEY, kind: "task-runtime", purpose: "development", externalId: "/fixture/runtime.json", metadata: {} } });
+  const resource = { id: row.id, identity: finalizationResourceIdentity(row).identityDigest };
+  await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { resourceId: row.id, resourceIdentity: resource.identity } });
   await f.activate(B, 1);
   const continuation = (await bindServerContinuation({ prisma: db.prisma, config: f.config, task: await f.task(), environmentId: ENV,
     request: { requestKey: `compute-continue:${ENV}:1`, inputDigest: canonicalDigest({ continue: 1 }) } })).binding!;
   expect((await f.settleOperation(continuation)).status).toBe(200);
-  // STAND-IN verified stop, as the domain records it: stopped + completedAt
-  // (historical claimedAt kept), and A's reader resolves.
+  // STAND-IN verified stop, as the domain records it: a stopped observation of
+  // the exact current resource, the offer stopped + completedAt (historical
+  // claimedAt kept), the environment suspended, and A's reader resolved.
+  await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { observation: stoppedObservation(resource), state: "suspended" } });
   await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "stopped", completedAt: new Date() } });
   expect(await resolveEnvironmentConsumers(db.prisma, ENV, { kind: "stopped", reference: "stand-in-stop" })).toBe(1);
   if (options.danglingProducer) {
@@ -935,7 +955,7 @@ async function retiredThenWaiting(options: { longOpenA?: boolean; danglingProduc
   expect((await waiting.settle()).status).toBe(200);
   await Bun.sleep(5); // the delivered offer is created after the earlier lifetime's stop completed
   await f.offer("offer-b");
-  return { f, a, waiting, longOpen };
+  return { f, a, waiting, longOpen, resource, row };
 }
 
 test("retired lifetime: the delivered offer's fresh B command adopts waiting work admitted after A's stopped, resolved lifetime (exact echo)", async () => {
@@ -1042,5 +1062,48 @@ test("retired lifetime (B295): offers must be terminal and claims physically sto
     const begun = await longOpen!.beginChild("offer-b");
     expect(begun.body).toMatchObject({ code: "retained-release-required" });
     expect(begun.body.error).toMatch(/admitted at generation 2; this command runs generation 1/);
+  }
+}, 60_000);
+
+test("retired lifetime: both supported producer shapes adopt; the stop must be bound to the current resource; an inconsistent offer proof refuses", async () => {
+  const adopt = async (f: Awaited<ReturnType<typeof fixture>>) => {
+    const fresh = await f.command("b-runtime-up-offer");
+    const claim = await fresh.claim("offer-b");
+    expect(claim.begun?.status, JSON.stringify(claim.begun?.body)).toBe(200);
+    expect(claim.called?.status).toBe(200);
+    await f.claimed("offer-b");
+    expect((await fresh.bind("offer-b")).called?.status).toBe(200);
+    expect((await fresh.settle()).status).toBe(200);
+  };
+  const refusedFor = async (f: Awaited<ReturnType<typeof fixture>>, pattern: RegExp) => {
+    const begun = await (await f.command("b-offer")).beginChild("offer-b");
+    expect(begun.body).toMatchObject({ code: "retained-release-required" });
+    expect(begun.body.error).toMatch(pattern);
+  };
+  // Shape 1: producer is the request child reused for claim/bind (existingOperationId null).
+  { const { f } = await retiredThenWaiting({ shape: "request-child" }); await adopt(f); }
+  // Shape 2: producer is a delivered offer's claim child (existingOperationId = offer), as in S9nBtk.
+  { await db.cleanup(); db = await createTestDatabase(); const { f } = await retiredThenWaiting({ shape: "existing-offer" }); await adopt(f); }
+  // The latest observation says running: refused.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, resource } = await retiredThenWaiting();
+    await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { observation: stoppedObservation(resource, "running") } });
+    await refusedFor(f, /no stopped observation of its current resource/);
+  }
+  // The stop was observed for a different resource identity than the current one: refused.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, row } = await retiredThenWaiting();
+    await db.prisma.remoteTaskResource.update({ where: { id: row.id }, data: { externalId: "/fixture/replaced-runtime.json" } });
+    await refusedFor(f, /no stopped observation of its current resource/);
+  }
+  // ADVERSARIAL corrupted proof (refusal only): the producer's reader names another offer than its existing reference.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, a } = await retiredThenWaiting({ shape: "existing-offer" });
+    const producer = a.bindings.at(-1)!.operationId;
+    await db.prisma.toolingRetainedConsumer.updateMany({ where: { operationId: producer, consumerId: ENV }, data: { evidence: { kind: "compute-bind", reference: "offer-elsewhere" } } });
+    await refusedFor(f, /has no single resolved offer proof/);
   }
 }, 60_000);

@@ -587,6 +587,22 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
     const earlier = await store.computeOffer.findUnique({ where: { id: mapped! } });
     if (!earlier || earlier.environmentId !== environment.id || earlier.id === offerId || !stoppedBefore(earlier)) return `Environment ${environment.id} earlier producer ${operationId} offer ${mapped} did not physically stop before offer ${offerId}`;
   }
+  // An earlier lifetime's stop must be bound to the CURRENT resource: the
+  // claim re-proves a fresh stop only for saved requests (claimCompute), so
+  // adoption itself requires the environment's latest physical observation to
+  // be stopped/absent for its exact current resource identity, as the domain's
+  // stop (reconcileObservedCompute) verified it.
+  if (latestProducer.size || others.some(other => other.claimedAt !== null)) {
+    const { ComputeObservation } = await import("./compute-observation.ts");
+    const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
+    const resource = environment.resourceId ? await store.remoteTaskResource.findUnique({ where: { id: environment.resourceId } }) : null;
+    const observation = ComputeObservation.safeParse(environment.observation);
+    if (!resource || resource.taskId !== current.id || !observation.success || !["stopped", "absent"].includes(observation.data.state)
+      || observation.data.environmentId !== environment.id || observation.data.taskId !== current.id || observation.data.primarySessionId !== environment.primarySessionId
+      || observation.data.resourceId !== resource.id || observation.data.resourceIdentity !== finalizationResourceIdentity(resource).identityDigest) {
+      return `Environment ${environment.id} has no stopped observation of its current resource`;
+    }
+  }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
   return null;
 }
