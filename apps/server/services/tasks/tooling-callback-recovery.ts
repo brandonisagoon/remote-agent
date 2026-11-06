@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import { SERVER_INSTANCE, attemptRecords, recordInterruptedAttempt } from "./tooling-operations.ts";
+import { SERVER_INSTANCE, attemptRecords, recordInterruptedAttempt, validReconciliation } from "./tooling-operations.ts";
 import { markToolingOperationInterrupted } from "./tooling-releases.ts";
 
 /**
@@ -53,7 +53,7 @@ export async function recoverInterruptedCallbacks(input: { prisma: PrismaClient;
   }
 }
 
-type Operation = { id: string; status: string; sessionId: string; taskId: string };
+type Operation = { id: string; status: string; sessionId: string; taskId: string; inputDigest: string };
 async function recoverOperation(prisma: PrismaClient, operation: Operation, current: Instance, probe: (pid: number) => PidState): Promise<{ reason: string } | { attempts: string[] } | null> {
   const records = await attemptRecords(prisma, operation, operation.id); // overflow throws: blocked
   const malformed = records.find(record => !record.value);
@@ -64,7 +64,18 @@ async function recoverOperation(prisma: PrismaClient, operation: Operation, curr
   const results = (attemptId: string) => values.filter(value => value.attemptId === attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
   // Window 1: an intent without any result. Window 2: an unknown result while still running.
   const resultless = intents.filter(intent => !results(intent.attemptId).length);
-  const unknownWhileRunning = operation.status === "running" ? intents.filter(intent => results(intent.attemptId).includes("unknown")) : [];
+  // Window 2 counts only UNRECONCILED unknown attempts, judged by the same
+  // strict stored-link validation as settlement. An attempt already
+  // reconciled by its exact acknowledged replay (the operation then returned
+  // to running, and may have produced) is history, never swept again. A
+  // reconciliation record that does not validate is never credited and never
+  // swept: the operation stays blocked.
+  const unknownWhileRunning: typeof intents = [];
+  if (operation.status === "running") for (const intent of intents.filter(value => results(value.attemptId).includes("unknown"))) {
+    if (validReconciliation(records, intent.attemptId, operation)) continue;
+    if (values.some(value => value.attemptId === intent.attemptId && value.state === "reconciled")) return { reason: `attempt ${intent.attemptId} has a reconciliation record that does not validate` };
+    unknownWhileRunning.push(intent);
+  }
   const candidates = [...resultless, ...unknownWhileRunning];
   if (!candidates.length) return null;
   const evidence: string[] = [];
@@ -76,7 +87,7 @@ async function recoverOperation(prisma: PrismaClient, operation: Operation, curr
     if (stamp.data.pid === current.pid) return { reason: `attempt ${intent.attemptId} names this process's PID ${stamp.data.pid} (reused)` };
     const state = probe(stamp.data.pid);
     if (state !== "exited") return { reason: `attempt ${intent.attemptId} server PID ${stamp.data.pid} is ${state}` };
-    evidence.push(`interrupted-by-restart:${stamp.data.instance}:${stamp.data.pid}`);
+    evidence.push(`interrupted-by-restart:${stamp.data.instance}:${stamp.data.pid}:recovered-by:${current.instance}:${current.pid}`);
   }
   await prisma.$transaction(async tx => {
     // Under the write lock (first write below): the history and status must be

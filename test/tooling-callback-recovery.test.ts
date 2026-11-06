@@ -111,7 +111,7 @@ test("window 1 (intent, no result): stuck before recovery; recovery records the 
   const records = await f.records();
   const [intent, appended] = [records[0], records.at(-1)];
   expect(appended).toEqual({ version: 1, operationId: intent.operationId, role: "outcome", state: "unknown", attemptId: intent.attemptId, route: intent.route, inputDigest: intent.inputDigest,
-    requestKey: intent.requestKey, status: null, evidence: `interrupted-by-restart:${crashed.server.instance}:${crashed.server.pid}` });
+    requestKey: intent.requestKey, status: null, evidence: `interrupted-by-restart:${crashed.server.instance}:${crashed.server.pid}:recovered-by:${SERVER_INSTANCE.instance}:${SERVER_INSTANCE.pid}` });
   // Idempotent: a second boot changes nothing.
   const count = (await f.records()).length;
   expect(await recoverInterruptedCallbacks({ prisma: db.prisma })).toEqual({ repaired: [], blocked: [] });
@@ -123,6 +123,15 @@ test("window 1 (intent, no result): stuck before recovery; recovery records the 
   expect((await f.call("compute-claim", { ...computeBody, offerId: "offer-a" })).status).toBe(200);
   await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "running", claimedAt: new Date() } });
   expect((await f.call("compute-bind", { offerId: "offer-a", resourceKey: KEY })).status).toBe(200);
+  // A LATER boot (the crashed PID still exited) leaves the reconciled,
+  // producing operation running: its unknown attempt is history, not swept again.
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { key: `producer:compute-environment:${ENV}` } })).toBeGreaterThan(0);
+  const reconciledHistory = await f.records();
+  for (const boot of [{ instance: crypto.randomUUID(), pid: process.pid, host: SERVER_INSTANCE.host }, undefined]) {
+    expect(await recoverInterruptedCallbacks({ prisma: db.prisma, ...(boot ? { current: boot } : {}) })).toEqual({ repaired: [], blocked: [] });
+    expect(await f.status()).toBe("running");
+    expect(await f.records()).toEqual(reconciledHistory);
+  }
   const settled = await f.settle();
   expect(settled.status, JSON.stringify(settled.body)).toBe(200);
   expect(await f.status()).toBe("completed");
@@ -140,6 +149,29 @@ test("window 2 (unknown result recorded, still running): recovery only moves run
   expect(await f.records()).toEqual(before);
   expect((await f.call("compute-request", computeBody)).status).toBe(200);
   expect(await f.status()).toBe("running");
+  // Later boot: the reconciled unknown result is never swept again.
+  const history = await f.records();
+  expect(await recoverInterruptedCallbacks({ prisma: db.prisma })).toEqual({ repaired: [], blocked: [] });
+  expect(await f.status()).toBe("running");
+  expect(await f.records()).toEqual(history);
+});
+
+test("a reconciliation record that does not validate is never credited: the running operation stays blocked and untouched", async () => {
+  const f = await fixture();
+  const crashed = await crashingServer(f.child.operationId, "compute-request", computeBody, "unknown-result");
+  // ADVERSARIAL seeded record, used only to prove refusal: it names an
+  // acknowledgment that does not exist.
+  const [intent] = await f.records();
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `outcome:${f.child.operationId}`,
+    value: JSON.stringify({ version: 1, operationId: f.child.operationId, role: "outcome", state: "reconciled", attemptId: intent.attemptId, acknowledgedAttemptId: crypto.randomUUID(),
+      route: intent.route, inputDigest: intent.inputDigest, requestKey: intent.requestKey }) } });
+  const history = await f.records();
+  const report = await recoverInterruptedCallbacks({ prisma: db.prisma });
+  expect(report.repaired).toEqual([]);
+  expect(report.blocked).toEqual([{ operationId: f.child.operationId, reason: `attempt ${intent.attemptId} has a reconciliation record that does not validate` }]);
+  expect(await f.status()).toBe("running");
+  expect(await f.records()).toEqual(history);
+  expect(crashed.server.pid).not.toBe(process.pid);
 });
 
 test("a live crashed-server PID, this instance's own attempts, uncertain or other-host stamps, unstamped, malformed or overflowing history stay blocked", async () => {

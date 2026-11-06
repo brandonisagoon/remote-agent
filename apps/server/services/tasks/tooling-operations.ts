@@ -385,7 +385,7 @@ const REQUEST_ROUTE = "POST /api/tasks/:taskId/compute-request";
 /** A reconciliation record is valid only when it names an earlier unknown
  * compute-request attempt of this operation and a LATER acknowledged 2xx
  * compute-request attempt with the same request digest. */
-function validReconciliation(records: Awaited<ReturnType<typeof attemptRecords>>, attemptId: string, operation: { id: string; inputDigest: string }) {
+export function validReconciliation(records: Awaited<ReturnType<typeof attemptRecords>>, attemptId: string, operation: { id: string; inputDigest: string }) {
   const values = records.flatMap(record => record.value ? [{ ...record.value, sequence: record.sequence }] : []);
   const intentOf = (id: string) => values.find(value => value.attemptId === id && value.state === "intent");
   const exact = (value: { operationId: string; inputDigest: string; route?: string } | undefined) => Boolean(value && value.operationId === operation.id && value.inputDigest === operation.inputDigest && value.route === REQUEST_ROUTE);
