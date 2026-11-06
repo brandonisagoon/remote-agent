@@ -663,3 +663,33 @@ test("never-attempted: settlement racing the orphan's callback or a new child's 
   }
   console.log(JSON.stringify({ concurrentBegin: outcomes }));
 }, 60_000);
+
+test("never-attempted: unrelated task association volume or malformation never blocks an orphan; a malformed record naming it does; settlement replays stably", async () => {
+  const association = (key: string, value: string) => ({ runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key, value });
+  // Historical volume (seeded): 5001 unrelated renewal-style associations plus one unrelated malformed row.
+  {
+    const { f, restarted, orphanId } = await orphaned();
+    await db.prisma.runtimeMetadataEvent.createMany({ data: Array.from({ length: 5001 }, (_, index) => association(`admission:environment-key:history-${index}`,
+      JSON.stringify({ version: 1, operationId: crypto.randomUUID(), role: "admission", state: "confirmed" }))) });
+    await db.prisma.runtimeMetadataEvent.create({ data: association("producer:compute-environment:unrelated", "{not json") });
+    const settled = await restarted.settle();
+    expect(settled.status, JSON.stringify(settled.body)).toBe(200);
+    const row = await f.operation(orphanId);
+    expect(row).toMatchObject({ status: "completed", completionEvidence: { kind: "never-attempted", reference: restarted.fence.operationId } });
+    // Replay: the same settlement returns the same outcome and changes nothing.
+    const again = await restarted.settle();
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual(settled.body);
+    expect(await f.operation(orphanId)).toEqual(row);
+  }
+  // A malformed record that names the orphan (ADVERSARIAL, refusal only) still refuses.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted, orphanId } = await orphaned();
+    await db.prisma.runtimeMetadataEvent.create({ data: association("owner:compute-offer:offer-1", `{"operationId":"${orphanId}", truncated`) });
+    const settled = await restarted.settle();
+    expect(settled.status).toBe(409);
+    expect(settled.body.error).toMatch(/bound with unreadable association \d+ naming it/);
+    expect((await f.operation(orphanId)).status).toBe("bound");
+  }
+}, 60_000);

@@ -1048,21 +1048,32 @@ const settlementEvidence = (outcome: "completed" | "no-effect", requestKey: stri
 
 /** Any record that a child was attempted or had an effect: a callback
  * attempt, a state write, a retained reader, a child of its own, or any
- * association naming it (owner, admission, producer, completion). Bounded and
- * strict: overflow or an unreadable association is itself evidence. Returns a
- * description, or null when there is provably none. */
+ * association naming it (owner, admission, producer, completion). Returns a
+ * description, or null when there is provably none.
+ *
+ * The association scan is scoped to THIS child, never the task's whole
+ * history (unrelated volume or malformation must not block every orphan).
+ * Assumption, documented: every supported association value is written with
+ * JSON.stringify and names its operation by the opaque, immutable operation
+ * ID (a UUID, JSON-escaped as itself), so any record about this child
+ * contains that ID verbatim. A substring prefilter therefore finds every
+ * candidate (including malformed rows that name the child); each is then
+ * parsed strictly and counts when its operationId equals the child. A
+ * candidate that cannot be parsed, or more candidates than the bound, is
+ * itself evidence (fail closed). */
 async function childEffectEvidence(tx: Prisma.TransactionClient, binding: { sessionId: string; taskId: string }, childId: string) {
   if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", childId) } })) return "callback attempt history";
   if (await tx.toolingStateWrite.count({ where: { operationId: childId } })) return "state writes";
   if (await tx.toolingRetainedConsumer.count({ where: { operationId: childId } })) return "retained readers";
   if (await tx.toolingOperation.count({ where: { parentOperationId: childId } })) return "children of its own";
-  const events = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, NOT: { key: { startsWith: "outcome:" } } }, take: 5001 });
-  if (events.length > 5000) return "association history beyond its bound";
+  const events = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION,
+    NOT: { key: { startsWith: "outcome:" } }, value: { contains: childId } }, take: 1001 });
+  if (events.length > 1000) return "association history naming it beyond its bound";
   for (const event of events) {
     let value: unknown;
-    try { value = JSON.parse(event.value ?? "null"); } catch { return `unreadable association ${event.sequence}`; }
+    try { value = JSON.parse(event.value ?? "null"); } catch { return `unreadable association ${event.sequence} naming it`; }
     const parsed = Association.safeParse(value);
-    if (!parsed.success) return `unreadable association ${event.sequence}`;
+    if (!parsed.success) return `unreadable association ${event.sequence} naming it`;
     if (parsed.data.operationId === childId) return `${parsed.data.role} evidence`;
   }
   return null;
