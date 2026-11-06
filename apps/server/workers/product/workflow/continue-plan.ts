@@ -14,7 +14,10 @@ export async function continuePlanningSession(input: {
   context: WorkerContext;
   workflow: WorkflowConfig;
   issueIdentifier: string;
-  seed: string;
+  /** Shared launch-prompt construction; continuation supplies its facts. */
+  seed: (continuation: { previousWorkflowId: string | null; taskId?: string; branchName?: string }) => string;
+  /** Durable launch-intent provenance, recorded before provider changes. */
+  intent?: Record<string, unknown>;
   compose?: typeof composeForPrompt;
   /** The runtime owner drains the durable inbox; maintenance callers can
    * leave delivery to that owner's existing loop. */
@@ -50,7 +53,11 @@ export async function continuePlanningSession(input: {
       return result("existing", `runtime_session:${session.id} already received workflow ${workflow.id}; instruction ${previous.state}`);
     }
     const task = await taskForSession(prisma, session.id);
-    if (task && (task.primarySessionId !== session.id || (task.ownerPaused || task.phase === "closed"))) {
+    // An owner pause or closure is a decision, not a failure: report it once.
+    if (task && (task.ownerPaused || task.phase === "closed")) {
+      return result("ignored", `Task ${task.id} is ${task.ownerPaused ? "owner-paused" : "closed"}; workflow ${workflow.id} was not started on runtime_session:${session.id}`);
+    }
+    if (task && task.primarySessionId !== session.id) {
       throw new Error("Task is not available for automated workflow continuation; preserve its current owner");
     }
     if (config.repository.tooling && !task?.pinnedToolingRoot) throw new Error("Planning session has no pinned tooling source");
@@ -69,18 +76,28 @@ export async function continuePlanningSession(input: {
       } })) throw new Error("Another session is still working in this worktree; wait before continuing the plan");
     };
     await assertIdle();
-    const provider = workflow.providerId ?? config.acp.providerId;
+    // A prepared prompt was composed for one provider/model; a retry keeps
+    // them rather than replaying it on a different provider after config drift.
+    const recorded = previous ? await prisma.runtimeMetadataEvent.findFirst({ where: {
+      runtimeSessionId: session.id, action: "workflow-continuation", key: instructionId }, orderBy: { sequence: "asc" } }) : null;
+    const original = recorded?.value ? JSON.parse(recorded.value) as { provider?: "codex" | "claude"; model?: string | null } : null;
+    const provider = original?.provider ?? workflow.providerId ?? config.acp.providerId;
+    const model = original ? original.model ?? null : workflow.model;
     const prompt = previous?.text ?? await (input.compose ?? composeForPrompt)(
       session.cwd,
-      `${input.seed}\n- previousWorkflow: ${session.workflowId}\n- continuation: The owner requested execution after planning. Use the existing plan and worktree; this is no longer a planning-only turn.${task ? `\n- taskId: ${task.id}\n- branchName: ${task.branchName}` : ""}`,
+      input.seed({ previousWorkflowId: session.workflowId, ...(task ? { taskId: task.id, branchName: task.branchName } : {}) }),
       provider, config.repository.skillsRoot, task?.pinnedToolingRoot ?? session.cwd,
     );
     // Recheck after composition, which may take time. The reservation blocks
     // inbox delivery during the following asynchronous provider operations.
     await assertIdle();
-    await prisma.runtimeInstruction.upsert({ where: { id: instructionId },
-      create: { id: instructionId, sessionId: session.id, text: prompt, state: "preparing" },
-      update: { state: "preparing", detail: null },
+    await prisma.$transaction(async (tx) => {
+      await tx.runtimeInstruction.upsert({ where: { id: instructionId },
+        create: { id: instructionId, sessionId: session.id, text: prompt, state: "preparing" },
+        update: { state: "preparing", detail: null },
+      });
+      if (!recorded) await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, action: "workflow-continuation", key: instructionId,
+        value: JSON.stringify({ provider, model, previousWorkflowId: session.workflowId, workflowId: workflow.id, intent: input.intent ?? null }), source: `worker:${context.runId}` } });
     });
     reserved = true;
     if (session.agentCommand !== provider) {
@@ -94,12 +111,12 @@ export async function continuePlanningSession(input: {
       } });
     }
     const ready = await runtime.switchAgent(session.id, provider);
-    if (workflow.model) {
+    if (model) {
       const option = ready.configOptions.find((entry) => entry.category === "model" || entry.id === "model");
       if (!option) throw new Error(`Provider ${provider} does not expose a model setting`);
-      const updated = await runtime.setConfigOption(session.id, option.id, workflow.model);
-      if (!updated.some((entry) => entry.id === option.id && entry.currentValue === workflow.model)) {
-        throw new Error(`Provider did not accept workflow model ${workflow.model}`);
+      const updated = await runtime.setConfigOption(session.id, option.id, model);
+      if (!updated.some((entry) => entry.id === option.id && entry.currentValue === model)) {
+        throw new Error(`Provider did not accept workflow model ${model}`);
       }
     }
     if (provider === "claude") await runtime.setMode(session.id, "default");
@@ -124,6 +141,8 @@ export async function continuePlanningSession(input: {
     if (reserved) await prisma.runtimeInstruction.updateMany({
       where: { id: instructionId, state: "preparing" }, data: { state: "preparation-failed", detail },
     });
+    const current = await taskForSession(prisma, session.id).catch(() => null);
+    if (current && (current.ownerPaused || current.phase === "closed")) return result("ignored", `Task ${current.id} became ${current.ownerPaused ? "owner-paused" : "closed"} during preparation; workflow ${workflow.id} was not started: ${detail}`);
     return result("failed", `Workflow continuation failed: ${detail}`);
   } finally {
     continuing.delete(key);

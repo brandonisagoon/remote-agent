@@ -100,6 +100,15 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   worktree and tooling pin. A durable inbox preparation reservation blocks
   follow-ups until setup commits with the workflow change and execution
   prompt; duplicate reactions cannot enqueue a second implementation.
+  Fresh launches, plan continuation and native resume share one prompt
+  construction (`launch-intent.ts`): intent comes only from the configured
+  workflow, its own trigger and a configured-owner (`linear.userId`) actor
+  with the original event time. Unverified execution, a closed source or a
+  newer state starts nothing. Old restrictions count as history only within
+  the skill's scope and when the fetched issue and full comment timeline
+  predate the trigger; newer owner comments are quoted. Issue text is always
+  fenced task data. Persisted pause/closure always wins. A later owner
+  delivery retries a launch that failed before dispatch on its original task.
 
 ## Layout
 
