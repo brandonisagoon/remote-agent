@@ -1,3 +1,6 @@
+/** Bun-only SQLite helper. Never import this from deploy.ts or anything the
+ * Electron/Node graph loads: management runs it as an explicit Bun child
+ * (`bun management/sqlite-snapshot.ts snapshot|restore ...`). */
 import { Database } from "bun:sqlite";
 import { chmodSync, closeSync, copyFileSync, existsSync, fsyncSync, openSync, renameSync, rmSync } from "node:fs";
 import path from "node:path";
@@ -113,5 +116,22 @@ export async function restoreStoppedDatabase(file: string, snapshot: string, evi
   if (process.platform !== "win32") fsyncPath(path.dirname(file));
   for (const target of [live.wal, live.journal]) {
     if (existsSync(target)) throw new Error(`Restored database ${file} has an unexpected ${path.basename(target)}; inspect it before starting the service`);
+  }
+}
+
+// Explicit Bun child entry point used by management/deploy.ts. Prints one
+// JSON line on success; any refusal is a nonzero exit with its message.
+if (import.meta.main) {
+  const [action, ...args] = process.argv.slice(2);
+  try {
+    const busyTimeoutMs = Number(args.at(-1));
+    if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 0) throw new Error("A non-negative busy timeout in milliseconds is required");
+    if (action === "snapshot" && args.length === 3) await snapshotStoppedDatabase(args[0]!, args[1]!, { busyTimeoutMs });
+    else if (action === "restore" && args.length === 4) await restoreStoppedDatabase(args[0]!, args[1]!, args[2]!, { busyTimeoutMs });
+    else throw new Error("Use snapshot <database> <snapshot> <busy-ms> or restore <database> <snapshot> <evidence> <busy-ms>");
+    console.log(JSON.stringify({ ok: true, action }));
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
   }
 }

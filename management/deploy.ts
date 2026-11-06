@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, rmdirSync, statSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { configFilePath, readConfig, type ServerConfig } from "../lib/config.ts";
 import { findExecutable, installLayout, type InstallLayout } from "./paths.ts";
@@ -8,7 +9,13 @@ import { serverDefinition, serviceLabel, supervisor, type ServiceDefinition } fr
 import { syncTree } from "./sync-tree.ts";
 import { waitForHealth } from "./provision.ts";
 import { assertToolingServerCompatibility, assertToolingSnapshotRestoreSafe } from "./tooling-deployment.ts";
-import { restoreStoppedDatabase, snapshotStoppedDatabase } from "./sqlite-snapshot.ts";
+
+/** Bun-only SQLite snapshot/restore helper, always executed as an explicit
+ * Bun child so bun:sqlite never enters the Electron/Node module graph. */
+const SQLITE_HELPER = fileURLToPath(new URL("./sqlite-snapshot.ts", import.meta.url));
+async function runSqliteHelper(context: DeployContext, args: string[]): Promise<void> {
+  await context.effects.run(context.bun, ["--no-env-file", SQLITE_HELPER, ...args, String(context.databaseBusyTimeoutMs ?? 5_000)]);
+}
 
 /** Pull origin/<branch>, rebuild, migrate, restart, verify — roll back on
     failure (TS port of the retired deploy.sh).
@@ -234,7 +241,7 @@ async function snapshotDatabase(context: DeployContext, commit: string): Promise
   }
   mkdirSync(layout.backups, { recursive: true });
   const snapshot = path.join(layout.backups, `remote-agent-${backupStamp()}-${commit}.sqlite`);
-  await snapshotStoppedDatabase(databasePath, snapshot, { ...(context.databaseBusyTimeoutMs !== undefined ? { busyTimeoutMs: context.databaseBusyTimeoutMs } : {}) });
+  await runSqliteHelper(context, ["snapshot", databasePath, snapshot]);
   context.snapshot = snapshot;
   log(`snapshotted SQLite database to ${snapshot}`);
 }
@@ -264,7 +271,7 @@ async function restoreDatabaseSnapshot(context: DeployContext): Promise<void> {
   await context.effects.settle();
   // The replaced database is kept, self-contained, beside the snapshot.
   const evidence = path.join(context.layout.backups, `remote-agent-${backupStamp()}-pre-restore.sqlite`);
-  await restoreStoppedDatabase(databasePath, context.snapshot, evidence, { ...(context.databaseBusyTimeoutMs !== undefined ? { busyTimeoutMs: context.databaseBusyTimeoutMs } : {}) });
+  await runSqliteHelper(context, ["restore", databasePath, context.snapshot, evidence]);
   log(`restored SQLite database from ${context.snapshot}; previous database preserved at ${evidence}`);
 }
 
