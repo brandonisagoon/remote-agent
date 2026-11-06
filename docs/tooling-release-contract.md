@@ -265,6 +265,7 @@ No existing live release operator is invoked or widened here.
 | DRA-27/32 primary | This contract; integration/acceptance records; final shared wiring after worker handoff | Publish contract and review corrections first; integrate only reviewed ready commits |
 | DRA-28 worker | New release persistence/service/routes/tests; `services/tasks/tooling.ts`; new `prisma/schema/tooling-release.prisma` and its migration; shared release/operation storage primitives | Freeze exported primitive signatures before DRA-29 binds consumers; DRA-28 alone generates the shared Prisma client |
 | DRA-29 worker | New operation routing/service/tests; `tooling-capabilities.ts`, `tooling-compatibility.ts`, preparation/observer/finalization consumers and instruction composition | Consume DRA-28 primitives; no independent edits to activation persistence/schema; return shared workflow/runtime wiring as a bounded patch if another lane owns it |
+| DRA-34/35/36 admission correction, same DRA-29 writer | `compute-admission.ts` and focused tests; bounded scheduling in `services/sessions/inbox.ts`; existing baseline/observer accounting | One writer across reservation and collection changes; no dependency on completion of the full DRA-27 redesign. Preserve DRA-9 ownership of provider lifecycle wiring; integrate its reviewed artifact before overlapping edits |
 | DRA-30 worker | Paired Drafted worktree: new state-format/operation-validation modules and focused tests; runtime reader integration, release manifest and adapter guard | Preserve DRA-21 repair; coordinate runtime-config/runtime/CLI field overlaps with DRA-23 before touching them |
 | DRA-23 existing primary | Neon provisioning/recovery, runtime recipe/provider fields and application schema evidence on its own branch | No edits to that branch; agree additive field contracts through linked issues; DRA-27 integrates reviewed ready changes, not live completion |
 | DRA-20 independent source lane | `workers/product/workflow/worker.ts`, `continue-plan.ts` and launch-intent helpers/tests | DRA-27 does not edit its branch; integrate its reviewed commit before applying any overlapping next-turn refresh patch |
@@ -296,3 +297,27 @@ refused after activation: it could erase operation history while external
 effects remain. DRA-33 owns coordinated compatible recovery. The old Drafted
 paired-release operator must not be used to edit refs and restart as a substitute
 for durable selection; its replacement/retirement is a cutover prerequisite.
+
+## Adjacent admission correction (DRA-34)
+
+Reserve verified available capacity before notifying the original primary.
+Dispatch and slow baseline checks must not consume an offer-acceptance timer.
+Persist exact assignment/startup identity and reconcile retries, unknown outcomes
+and legacy in-flight states. A deadline alone never frees started or uncertain
+compute. Owner pauses, conservative charges, managed cap and environment IDs
+remain binding. DRA-35 owns this reservation behavior; DRA-36 keeps collection
+independent from ordinary inbox delivery, bounds overlapping passes, filters
+ineligible waiters before physical scans and diagnoses exact blocked groups.
+These are one existing admission writer's assignments, not another product
+writer. DRA-37 owns combined isolated real-server and app/browser acceptance;
+DRA-33 retains the single held shared rollout.
+
+Before scheduler edits, an isolated SQLite reproduction delayed the baseline
+refresh by 65 seconds using a test replacement for the collector. With a durable
+turn-start event, the offer remained queued with no delivery or reservation
+during the refresh, then expired after 65,728 ms with delivery and claim still
+unset (one test, ten assertions). This verifies the delivery-expiry path using
+real elapsed time; it is not a live-observer measurement or acceptance of the
+repair. Preserve it as a regression scenario alongside DRA-37's real-server
+tests. Evidence and remaining acceptance belong in the paired Drafted
+`docs/acceptance.md` and linked issues.
