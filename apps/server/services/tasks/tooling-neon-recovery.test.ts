@@ -131,14 +131,16 @@ async function commitRecovery(operationId: string, options: { fail?: boolean; cu
   });
 }
 
-/** The guard in front of stand-in domain handlers that only acknowledge. */
-function app(config: Config) {
+/** The guard in front of stand-in domain handlers that only acknowledge
+ * (or, when `status` is given, only refuse). */
+function app(config: Config, status = 200) {
   const handled: string[] = [];
   const server = new Hono<AppEnv>();
   server.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", config); await next(); });
   server.use("/api/*", toolingOperationGuard());
   server.route("/api/sessions", toolingOperationRoutes);
-  server.all("/api/*", async c => { await c.req.json().catch(() => undefined); handled.push(c.req.path.split("/").at(-1)!); return c.json({}); });
+  server.all("/api/*", async c => { await c.req.json().catch(() => undefined); handled.push(c.req.path.split("/").at(-1)!);
+    return status === 200 ? c.json({}) : c.json({ error: "stand-in domain refusal", code: "domain" }, status as 409); });
   const post = async (route: string, body: unknown, operationId?: string) => {
     const response = await server.request(route, { method: "POST", headers: { "content-type": "application/json", ...(operationId ? { [TOOLING_OPERATION_HEADER]: operationId } : {}) }, body: JSON.stringify(body) });
     return { status: response.status, body: await response.json().catch(() => ({})) as Record<string, any> };
@@ -532,4 +534,76 @@ test("operation completion is not the seam's job: a bound recovery whose transac
   const { binding } = await recoveryBegin(config);
   await transitionToolingOperation({ prisma: db.prisma, operationId: binding.operationId, from: "bound", to: "running" });
   expect((await resourceGroupCode({ prisma: db.prisma, task: await task(), reference: { type: "compute-environment", id: ENV } })).code!.revision).toBe(LEGACY);
+});
+
+/**
+ * Decision 002a5602 (DRA-23 crash gap): the client crashes after binding its
+ * recovery child C1 under the command fence P, before its own journal; HEAD
+ * moves, so the identical rerun (same journaled fence key, hence the same P)
+ * binds a new child. Pinned here at the server boundary only: begin, bind
+ * identity and command settlement are real; C2's commit is this file's
+ * labelled STAND-IN (commitRecovery). This is not acceptance of the actual
+ * writer or of a CLI crash; B's suite covers the real writer separately.
+ */
+describe("crash before the client journal: a same-command sibling, and settlement that closes the never-called child", () => {
+  async function crashed(status?: number) {
+    const { config } = await fixture();
+    const { post } = app(config, status);
+    const parent = (await begin(config, { requestKey: "runtime-recover", inputDigest: canonicalDigest({ command: "recover" }), kind: "adapter-command", resourceKey: KEY })).binding;
+    // C1: bound under P at the old HEAD; the client crashed before writing its journal.
+    const oldHead = { ...request(), sourceRevision: "0".repeat(40) };
+    const c1Request = { requestKey: "neon-recovery-old-head", inputDigest: canonicalDigest(stable(oldHead)), kind: NEON_RECOVERY_OPERATION_KIND, existingOperationId: OFFER, resourceKey: KEY,
+      parentOperationId: parent.operationId };
+    const c1 = (await begin(config, c1Request)).binding;
+    return { config, post, parent, c1, c1Request, oldHead };
+  }
+  const row = (id: string) => db.prisma.toolingOperation.findUniqueOrThrow({ where: { id } });
+  const identity = ({ status: _status, completionEvidence: _evidence, updatedAt: _updated, ...rest }: Awaited<ReturnType<typeof row>>) => rest;
+  const settle = (post: ReturnType<typeof app>["post"], parent: { operationId: string; requestKey: string; inputDigest: string }) =>
+    post(`/api/sessions/primary/tooling-operations/${parent.operationId}/settlement`, { requestKey: parent.requestKey, inputDigest: parent.inputDigest, outcome: "completed" }, parent.operationId);
+
+  test("the same key under the same parent replays C1 exactly; the same key under another parent is refused and rebinds nothing", async () => {
+    const { config, c1, c1Request } = await crashed();
+    const before = await row(c1.operationId);
+    expect(c1).toMatchObject({ status: "bound", parentOperationId: c1Request.parentOperationId });
+    expect((await begin(config, c1Request)).binding).toEqual(c1);
+    const other = (await begin(config, { requestKey: "runtime-recover-other", inputDigest: canonicalDigest({ command: "other" }), kind: "adapter-command", resourceKey: KEY })).binding;
+    const count = await db.prisma.toolingOperation.count();
+    await expect(begin(config, { ...c1Request, parentOperationId: other.operationId })).rejects.toThrow("Operation request key was already used with a different request");
+    expect(await db.prisma.toolingOperation.count()).toBe(count);
+    expect(await row(c1.operationId)).toEqual(before);
+  });
+
+  test("a new-HEAD sibling under the same parent commits (stand-in), and completed settlement closes C1 exactly never-attempted with its row kept", async () => {
+    const { config, post, parent, c1 } = await crashed();
+    const c1Before = await row(c1.operationId);
+    const c2 = (await recoveryBegin(config, { requestKey: "neon-recovery-new-head", parentOperationId: parent.operationId })).binding;
+    expect(c2).toMatchObject({ parentOperationId: parent.operationId, existingOperationId: OFFER, resourceKey: KEY });
+    expect(c2.operationId).not.toBe(c1.operationId);
+    await commitRecovery(c2.operationId);
+    expect((await settle(post, parent)).status).toBe(200);
+    expect(await row(parent.operationId)).toMatchObject({ status: "completed", completionEvidence: { kind: "command-completed", reference: parent.requestKey } });
+    const c1After = await row(c1.operationId);
+    expect(c1After).toMatchObject({ status: "completed", completionEvidence: { kind: "never-attempted", reference: parent.operationId } });
+    expect(identity(c1After)).toEqual(identity(c1Before));
+    expect(await row(c2.operationId)).toMatchObject({ status: "completed", completionEvidence: { kind: "compute-neon-recovery-committed" } });
+    // C1 left no attempt, association, state write or reader; only C2 handed the group off.
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { value: { contains: c1.operationId } } })).toBe(0);
+    expect(await db.prisma.toolingStateWrite.count({ where: { operationId: c1.operationId } })).toBe(0);
+    expect(await db.prisma.toolingRetainedConsumer.count()).toBe(0);
+    for (const legacy of await db.prisma.toolingLegacyConsumer.findMany()) expect(legacy.resolution).toEqual({ kind: NEON_RECOVERY_RESOLUTION_KIND, reference: c2.operationId });
+  });
+
+  test("contrast: a child with callback attempt history is never closed as never-attempted", async () => {
+    const { post, parent, c1, oldHead } = await crashed(409);
+    // One real guarded attempt of C1, refused by the stand-in domain handler (no domain effect).
+    expect((await post("/api/tasks/task/compute-neon-recovery", oldHead, c1.operationId)).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { key: `outcome:${c1.operationId}` } })).toBe(2);
+    const settled = await settle(post, parent);
+    expect(settled).toMatchObject({ status: 409, body: { code: "operation-closed" } });
+    expect(settled.body.error).toContain(c1.operationId);
+    expect(await row(parent.operationId)).toMatchObject({ completionEvidence: null });
+    expect((await row(parent.operationId)).status).not.toBe("completed");
+    expect(await row(c1.operationId)).toMatchObject({ status: "running", completionEvidence: null });
+  });
 });
