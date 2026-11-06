@@ -280,6 +280,15 @@ async function recoveredEnvironments(store: FenceStore, taskId: string): Promise
  * after its committed handoff — no first-bootstrap snapshot continues it.
  * Returns the refusal detail, or null. Finalization and cleanup references
  * are never fenced; other groups are unaffected.
+ *
+ * Deliberately conservative scope (accepted, review F3): a recovery operation
+ * in ANY status fences its group, including one that never committed
+ * (abandoned, or settled as never-attempted). Such a group is not stranded —
+ * its legacy rows stay retained, so a new bound recovery operation may begin
+ * and retry — but old-pin header-less continuation is never restored once
+ * recovery of the group has begun. Development-intent references are scoped
+ * only through the task's own intent event (action, source and current
+ * primary); anything else, unreadable or task-wide stays fenced.
  */
 export async function neonRecoveryFence(store: FenceStore, task: Pick<RemoteTask, "id" | "primarySessionId">, reference: Pick<ExistingReference, "type" | "id">): Promise<string | null> {
   if (reference.type === "finalization" || reference.type === "cleanup-request") return null;
@@ -295,8 +304,10 @@ export async function neonRecoveryFence(store: FenceStore, task: Pick<RemoteTask
   if (reference.type === "development-intent") {
     const sequence = Number(reference.id);
     const event = Number.isSafeInteger(sequence) ? await store.runtimeMetadataEvent.findUnique({ where: { sequence } }) : null;
-    const scope = event ? IntentScope.safeParse(parse(event.value)) : null;
-    if (!scope?.success || !scope.data.suspension) return fenced; // task-wide or unreadable: covers the recovered group
+    // Only this task's own development intent from its current primary can scope the reference.
+    const own = event && event.action === DEVELOPMENT_INTENT_ACTION && event.source === `development:${task.id}` && event.runtimeSessionId === task.primarySessionId;
+    const scope = own ? IntentScope.safeParse(parse(event!.value)) : null;
+    if (!scope?.success || !scope.data.suspension) return fenced; // foreign, unreadable or task-wide: covers the recovered group
     return environments.has(scope.data.suspension.environmentId) ? fenced : null;
   }
   // compute-baseline `<task>:<purpose>`: fenced when a recovered environment has that purpose.

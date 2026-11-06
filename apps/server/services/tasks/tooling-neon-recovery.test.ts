@@ -147,7 +147,7 @@ function app(config: Config) {
 }
 
 describe("kind, begin and callback", () => {
-  test("compute-neon-recovery is a bound, digest-pinned callback that admits, produces, retains and owns nothing", () => {
+  test("compute-neon-recovery is a bound, digest-pinned callback that admits, produces, retains, owns and completes nothing", () => {
     expect(TOOLING_OPERATION_KINDS).toContain("compute-neon-recovery");
     const matched = matchToolingCallback("POST", "/api/tasks/task/compute-neon-recovery")!;
     expect(matched.callback).toMatchObject({ kind: "compute-neon-recovery", scope: "task" });
@@ -156,7 +156,8 @@ describe("kind, begin and callback", () => {
     // The retried request may hold a new runtime lock: lockPid is outside the digest.
     const body = request();
     expect(canonicalDigest(matched.callback.input(body, undefined as never))).toBe(canonicalDigest(stable(body)));
-    expect(matched.callback.completes!(body)).toEqual({ kind: "compute-neon-recovery", reference: OFFER });
+    // An HTTP 2xx never manufactures completion (review F1): only the commit transaction completes.
+    expect(matched.callback.completes).toBeUndefined();
     expect(TOOLING_CALLBACK_CLASSIFICATION.find(row => row.route === "POST /api/tasks/:taskId/compute-neon-recovery")).toMatchObject({ rule: "operation" });
     expect(TOOLING_CALLBACKS.filter(callback => callback.kind === "compute-neon-recovery")).toHaveLength(1);
   });
@@ -190,6 +191,39 @@ describe("kind, begin and callback", () => {
     expect(await legacyStatus()).toEqual(["compute-environment:retained", "compute-offer:resolved"]);
     const group = await readNeonRecoveryLegacyGroup(db.prisma, { taskId: "task", offerId: OFFER, resourceKey: KEY });
     expect(group.legacy.map(row => row.consumerKind)).toEqual(["compute-environment"]);
+  });
+});
+
+describe("completion and scope (review F1/F2)", () => {
+  test("a root recovery acknowledged 2xx without a domain commit stays uncompleted; only the commit transaction completes it", async () => {
+    const { config } = await fixture();
+    const { post } = app(config);
+    const { binding } = await recoveryBegin(config);
+    // The stand-in handler acknowledges without committing anything.
+    expect((await post("/api/tasks/task/compute-neon-recovery", request(), binding.operationId)).status).toBe(200);
+    const after = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } });
+    expect(after).toMatchObject({ status: "running", completionEvidence: null });
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { source: "tooling-operation:task", key: `completion:${binding.operationId}` } })).toBe(0);
+    expect(await legacyStatus()).toEqual(["compute-environment:retained", "compute-offer:retained"]);
+    // The domain commit completes it with its exact committed-event evidence ...
+    await commitRecovery(binding.operationId);
+    const completed = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } });
+    expect(completed.status).toBe("completed");
+    expect(completed.completionEvidence).toMatchObject({ kind: "compute-neon-recovery-committed" });
+    // ... and with no HTTP completion evidence, a completed operation admits no further callback (the client reads the committed result).
+    expect((await post("/api/tasks/task/compute-neon-recovery", request(), binding.operationId)).body).toMatchObject({ code: "operation-closed" });
+  });
+
+  test("an unsupported resource scope binds nothing and fences nothing", async () => {
+    const { config } = await fixture();
+    const { post, handled } = app(config);
+    await expect(recoveryBegin(config, { requestKey: "preview", resourceKey: "runtime-preview" })).rejects.toThrow(/supports only resourceKey runtime-development/);
+    expect(await db.prisma.toolingOperation.count()).toBe(0);
+    expect(await neonRecoveryFence(db.prisma, await task(), { type: "compute-offer", id: OFFER })).toBeNull();
+    // The legacy group's own snapshot still continues it, as before any recovery.
+    expect((await post("/api/tasks/task/compute-claim", { key: KEY, purpose: "development", revision: REVISION, recipeDigest: PREVIOUS, offerId: OFFER })).status).toBe(200);
+    expect(handled).toEqual(["compute-claim"]);
+    expect(await legacyStatus()).toEqual(["compute-environment:retained", "compute-offer:retained"]);
   });
 });
 
@@ -414,6 +448,15 @@ describe("group-scoped fence for first-bootstrap continuation", () => {
     expect(await neonRecoveryFence(db.prisma, t, { type: "compute-baseline", id: "task:review" })).toBeNull();
     expect(await neonRecoveryFence(db.prisma, t, { type: "compute-baseline", id: "task:development" })).toMatch(/under Neon recovery/);
     expect(await neonRecoveryFence(db.prisma, t, { type: "finalization", id: "task:final-1" })).toBeNull();
+    // Only this task's own intent event from its current primary can scope a reference (review F4):
+    // a readable foreign event naming another environment's suspension cannot escape the fence.
+    const foreign = async (data: { action?: string; source?: string; runtimeSessionId?: string }) => String((await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: data.runtimeSessionId ?? "primary",
+      source: data.source ?? "development:task", action: data.action ?? "development-compute-intent", key: crypto.randomUUID(),
+      value: JSON.stringify({ action: "stop", reason: "runtime-suspended", suspension: { environmentId: "other-env" } }) } })).sequence);
+    await db.prisma.runtimeSession.create({ data: { id: "stranger", scopeKey: "stranger", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/fixture/stranger", status: "idle" } });
+    for (const data of [{ action: "tooling-capability" }, { source: "development:other-task" }, { runtimeSessionId: "stranger" }]) {
+      expect(await neonRecoveryFence(db.prisma, t, { type: "development-intent", id: await foreign(data) }), JSON.stringify(data)).toMatch(/under Neon recovery/);
+    }
     // A task with no recovery operation is never fenced.
     expect(await neonRecoveryFence(db.prisma, { id: "other-task", primarySessionId: "primary" }, { type: "compute-offer", id: OFFER })).toBeNull();
   });

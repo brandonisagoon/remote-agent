@@ -238,8 +238,11 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
   // it admits, produces and retains nothing. A retried request may hold a new
   // runtime lock, so lockPid is outside the digest.
   { route: "POST /api/tasks/:taskId/compute-neon-recovery", method: "POST", path: taskPath("compute-neon-recovery"), scope: "task", kind: "compute-neon-recovery",
-    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid")),
-    completes: body => text(body.offerId) ? { kind: "compute-neon-recovery", reference: body.offerId as string } : null },
+    // No `completes`: an HTTP 2xx never manufactures completion. Only the
+    // service's commit transaction completes it (completeNeonRecoveryOperation,
+    // exact committed-event evidence), for root and command-parented alike; a
+    // lost acknowledgment resolves through the committed-result read.
+    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid")) },
   { route: "POST /api/tasks/:taskId/compute-enroll", method: "POST", path: taskPath("compute-enroll"), scope: "task", kind: "compute-enroll",
     input: body => body, reference: body => text(body.environmentId) ? { type: "compute-environment", id: body.environmentId as string } : null, referenceRule: "existing",
     produces: async body => text(body.environmentId) ? [body.environmentId as string] : [],
@@ -1065,6 +1068,9 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     return value;
   };
   const before = await owned();
+  // The recovered state is exactly drafted.runtime scope `runtime-development`
+  // (the registration and committed-result verifier fix it); no other scope binds.
+  if (request.kind === "compute-neon-recovery" && request.resourceKey && request.resourceKey !== "runtime-development") throw new ToolingOperationRefused("operation-input", `compute-neon-recovery supports only resourceKey runtime-development, not ${request.resourceKey}`);
   if (request.kind === "compute-neon-recovery" && (!request.existingOperationId || !request.resourceKey)) throw new ToolingOperationRefused("operation-input", "compute-neon-recovery continues an exact existing offer and names its resourceKey");
   if ((request.kind === "compute-configure" || request.kind === "compute-enroll" || request.kind === "development-intent") && !request.existingOperationId) throw new ToolingOperationRefused("operation-input", `${request.kind} operations continue an exact existing operation`);
   // The release this request would run: its command parent's (validated and
