@@ -253,7 +253,7 @@ const OperationRequest = z.strictObject({
 
 async function binding(store: Store, row: ToolingOperation): Promise<ToolingOperationBinding> {
   return { contract: "remote-agent.tooling-operation/v1", operationId: row.id, requestKey: row.requestKey, inputDigest: row.inputDigest, repositoryId: row.repositoryId,
-    taskId: row.taskId, sessionId: row.sessionId, turnId: row.turnId, kind: row.kind, existingOperationId: row.existingOperationId, parentOperationId: row.parentOperationId, resourceKey: row.resourceKey,
+    taskId: row.taskId, sessionId: row.sessionId, turnId: row.turnId, kind: row.kind, existingOperationId: row.existingOperationId, parentOperationId: row.parentOperationId, retainedConsumerId: row.retainedConsumerId, resourceKey: row.resourceKey,
     generation: row.generation, release: record(await store.toolingRelease.findUniqueOrThrow({ where: { id: row.releaseId } })),
     status: z.enum(["bound", "running", "unknown", "completed"]).parse(row.status) };
 }

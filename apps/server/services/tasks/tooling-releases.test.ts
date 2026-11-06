@@ -379,7 +379,7 @@ test("a confirmed retained consumer continues on its producing release after a n
   await transitionToolingOperation({ prisma: db.prisma, operationId: producer.operationId, from: "bound", to: "completed", evidence });
   await activate("k2", "B", 1);
   const continuation = await continueWith(consumer.id);
-  expect(continuation).toMatchObject({ generation: 1, release: { revision: revisions.A }, parentOperationId: null, kind: "adapter-command" });
+  expect(continuation).toMatchObject({ generation: 1, release: { revision: revisions.A }, parentOperationId: null, retainedConsumerId: consumer.id, kind: "adapter-command" });
   const stored = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: continuation.operationId } });
   expect(stored).toMatchObject({ retainedConsumerId: consumer.id, protocol: (await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: producer.operationId } })).protocol });
   expect(await continueWith(consumer.id)).toEqual(continuation);

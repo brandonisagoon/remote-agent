@@ -410,5 +410,22 @@ existing child retries remain subject to normal authority and idempotence.
 Read-only commands must either settle their fence or use a classified read-only
 path, never leave a permanent unfinished command merely from inspecting status.
 
+### State scope and uncertain registration
+
+A command fence with a null resource key covers its owning task's state scopes.
+It already counts as a reader of every state on that task while unfinished.
+Direct runtime commands use their exact `runtime-<purpose>` key; commands that
+can reach several resources use a task-wide fence and retain exact keys on their
+callback children. Keyed operations can access only their own resource scope or
+task-global state. Every route derives the task from the binding, checks current
+authority and the release's declared formats, and accepts no task or file path
+override. This adds no compute, provider or cleanup authority.
+
+A structured 4xx state-write rejection means registration definitely did not
+commit. Once registration may have committed, a later authority change or
+receipt mismatch returns an outcome-unknown failure (5xx), even when the adapter
+must be prevented from writing. The adapter keeps its migration journal and
+reconciles using the same operation; it must not withdraw intent on that result.
+
 These seams are under implementation; activation remains disabled until their
 real-route lifecycle and migration acceptance pass.
