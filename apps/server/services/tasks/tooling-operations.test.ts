@@ -13,7 +13,7 @@ import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
   bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
-import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
+import { canonicalDigest, readToolingOperation, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { cleanupObserverRelease } from "./cleanup-resource-observer.ts";
@@ -262,4 +262,49 @@ test("compatibility uses an explicit code identity and never installs for bound 
   expect(Object.keys(bound.receipt).sort()).toEqual(["adapter", "capability", "capabilityRevision", "checkout", "contract", "instructions", "source", "taskToolingRevision"]);
   await expect(resolveToolingCompatibility({ ...base, release: { repositoryId: "repo", revision: B, checkout } as ToolingReleaseRecord })).rejects.toThrow(/not its bound revision/);
   await expect(resolveToolingCompatibility({ ...base, install: false })).rejects.toThrow(/never install/);
+});
+
+test("activating B after command fence A but before its FIRST callback keeps every callback of A on A", async () => {
+  const { config } = await fixture();
+  await environment("env-1", computeBody.key); await bootstrap([]);
+  const fence = (await begin(config, { requestKey: "cmd-a", inputDigest: canonicalDigest({ argv: ["runtime", "start"] }), kind: "adapter-command" })).binding;
+  expect(fence).toMatchObject({ kind: "adapter-command", release: { revision: A }, parentOperationId: null });
+  await activate("release-b", 2);
+  // First callback after activation: inherits A from its parent, not active B.
+  const request = (await begin(config, { requestKey: "cmd-a:request", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).binding;
+  expect(request).toMatchObject({ release: { revision: A }, generation: 1, parentOperationId: fence.operationId });
+  const { call, seen } = app(config);
+  expect((await call("/api/tasks/task/compute-request", computeBody, request.operationId)).status).toBe(200);
+  await offer("offer-1", "env-1");
+  // A sibling callback of the same command continues the admission it made.
+  const claim = (await begin(config, { requestKey: "cmd-a:claim", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).binding;
+  expect((await call("/api/tasks/task/compute-claim", { ...computeBody, offerId: "offer-1" }, claim.operationId)).status).toBe(200);
+  expect(seen.map(entry => entry.code)).toEqual([A, A]);
+  // The next independent command selects B.
+  const next = (await begin(config, { requestKey: "cmd-b", inputDigest: canonicalDigest({ argv: ["runtime", "status"] }), kind: "adapter-command" })).binding;
+  expect(next.release.revision).toBe(B);
+  // A command fence is a root; parents must be this primary's open command.
+  await expect(begin(config, { requestKey: "nested", inputDigest: canonicalDigest({}), kind: "adapter-command", parentOperationId: fence.operationId })).rejects.toThrow();
+  await expect(begin(config, { requestKey: "foreign", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: request.operationId })).rejects.toThrow(/adapter-command/);
+  await transitionToolingOperation({ prisma: db.prisma, operationId: fence.operationId, from: "bound", to: "completed", evidence: { kind: "adapter-command", reference: "exit-0" } });
+  await expect(begin(config, { requestKey: "cmd-a:late", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).rejects.toThrow(/completed/);
+});
+
+test("prepared-finalization callbacks derive their exact key from the command lineage and keep digest validation", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const fence = (await begin(config, { requestKey: "destroy", inputDigest: canonicalDigest({ argv: ["task", "destroy"] }), kind: "adapter-command" })).binding;
+  const child = (key: string, digestKey: string) => begin(config, { requestKey: `destroy:${key}`, inputDigest: canonicalDigest({ requestKey: digestKey }), kind: "finalization", parentOperationId: fence.operationId });
+  const prepare = (await child("prepare", "finalize:task")).binding;
+  const { call } = app(config);
+  expect((await call("/api/tasks/task/prepare-finalization", { requestKey: "finalize:task", cleanup: true }, prepare.operationId)).status).toBe(200);
+  for (const key of ["finalize:task", "finalize:newer"]) await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: FINALIZATION_PREPARED, key, value: "{}" } });
+  // The adapter has no request key in this body; the server derives the
+  // lineage's own finalization (not the newer one) and checks the digest.
+  const stop = (await child("browser-stop", "finalize:task")).binding;
+  expect((await call("/api/sessions/primary/browser-stop-authority", { key: "browser" }, stop.operationId)).status).toBe(200);
+  const wrong = (await child("browser-stop-wrong", "finalize:newer")).binding;
+  expect((await call("/api/sessions/primary/browser-stop-authority", { key: "browser" }, wrong.operationId)).status).toBe(400);
+  // A sibling continues the finalization its command prepared.
+  const authority = (await child("authority", "finalize:task")).binding;
+  expect((await call("/api/tasks/task/cleanup-authority", { requestKey: "finalize:task" }, authority.operationId)).status).toBe(200);
 });

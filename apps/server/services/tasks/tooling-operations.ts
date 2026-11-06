@@ -39,13 +39,18 @@ const EXISTING_TYPE: Record<ToolingOperationKind, ExistingReference["type"]> = {
   "development-intent": "development-intent", finalization: "finalization", "cleanup-schedule": "cleanup-request",
 };
 
+/** Root fence for one complete adapter command, bound before its first effect
+ * (including effects with no server callback). Callback bindings name it as
+ * `parentOperationId` and inherit its release; it is never a callback kind. */
+export const ADAPTER_COMMAND_KIND = "adapter-command";
 export const BeginToolingOperationInput = z.object({
   requestKey: z.string().trim().min(1).max(256),
   inputDigest: z.string().regex(/^[a-f0-9]{64}$/),
-  kind: z.enum(TOOLING_OPERATION_KINDS),
+  kind: z.enum([...TOOLING_OPERATION_KINDS, ADAPTER_COMMAND_KIND]),
   existingOperationId: z.string().min(1).max(512).optional(),
   resourceKey: z.string().min(1).max(512).optional(),
-}).strict();
+  parentOperationId: z.string().min(1).max(256).optional(),
+}).strict().refine(value => value.kind !== ADAPTER_COMMAND_KIND || !value.parentOperationId, "An adapter command is a root binding");
 
 export type ToolingOperationRefusalCode = "operation-required" | "operation-unknown" | "operation-mismatch" | "operation-ownership" | "operation-input" | "operation-closed" | "retained-release-required" | "producer-unknown";
 export class ToolingOperationRefused extends Error {
@@ -78,6 +83,9 @@ export async function assertOpenTaskPrimary(input: { prisma: OwnershipStore; con
 type Body = Record<string, unknown>;
 type Store = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent" | "computeOffer" | "computeEnvironment" | "remoteTaskResource">;
 type CallbackContext = { store: Store; task: RemoteTask; latestFinalizationKey: () => Promise<string | null> };
+// A bound prepared-finalization callback derives its exact key from the
+// finalization its own command lineage prepared; only unbound (legacy) calls
+// fall back to the latest preparation. The digest is always checked.
 const text = (value: unknown) => typeof value === "string" && value.length > 0 && value.length <= 512 ? value : null;
 const developmentInput = (body: Body) => ({ intentRevision: body.intentRevision, intentDigest: body.intentDigest });
 
@@ -264,6 +272,23 @@ async function recordAssociation(store: Pick<PrismaClient, "runtimeMetadataEvent
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey(role, id),
     value: JSON.stringify({ version: 1, operationId: binding.operationId, role, state, kind: binding.kind, generation: binding.generation, ...(evidence ? { evidence } : {}) }) } });
 }
+/** Same lineage: the operation itself, or a sibling callback of the same
+ * adapter command (and therefore the same retained release). */
+async function sameLineage(store: PrismaClient, operationId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId">, read: ToolingOperationDependencies["read"]) {
+  if (operationId === binding.operationId) return true;
+  if (!binding.parentOperationId) return false;
+  return (await read({ prisma: store, operationId }))?.parentOperationId === binding.parentOperationId;
+}
+/** Finalization request key owned by this binding's command lineage. */
+async function lineageFinalizationKey(store: PrismaClient, task: RemoteTask, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId">, read: ToolingOperationDependencies["read"]) {
+  if (!task.primarySessionId) return null;
+  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION, key: { startsWith: `owner:finalization:${task.id}:` } }, orderBy: { sequence: "desc" }, take: 64 });
+  for (const event of events) {
+    const value = Association.safeParse(JSON.parse(event.value ?? "null"));
+    if (value.success && await sameLineage(store, value.data.operationId, binding, read)) return event.key.slice(`owner:finalization:${task.id}:`.length);
+  }
+  return null;
+}
 export async function owningOperationId(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, reference: ExistingReference) {
   return (await associations(store, task, "owner", referenceId(reference))).at(-1)?.operationId ?? null;
 }
@@ -391,6 +416,8 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
   }
   const binding = await dependencies.read({ prisma: input.prisma, operationId: input.header });
   if (!binding) throw refuse("operation-unknown", "Unknown tooling operation");
+  const latest = context.latestFinalizationKey;
+  context.latestFinalizationKey = async () => (await lineageFinalizationKey(input.prisma, task, binding, dependencies.read)) ?? latest();
   if (binding.taskId !== task.id || binding.repositoryId !== task.repositoryId || binding.release.repositoryId !== task.repositoryId
     || binding.sessionId !== task.primarySessionId || (callback.scope === "session" && binding.sessionId !== param)) throw refuse("operation-ownership", "The operation does not belong to this task's primary session");
   if (binding.kind !== callback.kind) throw refuse("operation-mismatch", `${callback.route} requires a ${callback.kind} operation, not ${binding.kind}`);
@@ -400,10 +427,11 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
   if (callback.reference && !reference) throw refuse("operation-input", `${callback.route} names no existing operation`);
   if (reference && callback.referenceRule === "admission") {
     const environment = await offerEnvironment(context, reference.id);
-    if (binding.existingOperationId !== reference.id && (!environment || await admittingOperationId(store, task, environment.key) !== binding.operationId)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} was not admitted by this operation`);
+    const admitting = environment ? await admittingOperationId(store, task, environment.key) : null;
+    if (binding.existingOperationId !== reference.id && (!admitting || !await sameLineage(input.prisma, admitting, binding, dependencies.read))) throw refuse("operation-mismatch", `${reference.type} ${reference.id} was not admitted by this operation`);
   } else if (reference) {
     const owner = await owningOperationId(store, task, reference);
-    if (owner && owner !== binding.operationId) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
+    if (owner && !await sameLineage(input.prisma, owner, binding, dependencies.read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
     if (callback.referenceRule === "existing" && !owner && binding.existingOperationId !== reference.id.slice(reference.id.startsWith(`${task.id}:`) ? task.id.length + 1 : 0)) throw refuse("operation-mismatch", `${callback.route} continues ${reference.type} ${reference.id}, not this operation's existing operation`);
     // Never take over an uncertain first-bootstrap consumer with newer code.
     if (!owner) {
@@ -495,7 +523,11 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   };
   const before = await owned();
   if ((request.kind === "compute-configure" || request.kind === "compute-enroll" || request.kind === "development-intent") && !request.existingOperationId) throw new ToolingOperationRefused("operation-input", `${request.kind} operations continue an exact existing operation`);
-  if (request.existingOperationId) {
+  // The release this request would run: its command parent's (validated and
+  // inherited atomically by the binding primitive), else the active one.
+  const parent = request.parentOperationId ? await dependencies.read({ prisma: input.prisma, operationId: request.parentOperationId }) : null;
+  if (request.parentOperationId && (!parent || parent.kind !== ADAPTER_COMMAND_KIND || parent.taskId !== before.task.id || parent.sessionId !== input.sessionId)) throw new ToolingOperationRefused("operation-ownership", "Parent must be this primary's adapter-command binding");
+  if (request.existingOperationId && request.kind !== ADAPTER_COMMAND_KIND) {
     const type = EXISTING_TYPE[request.kind];
     const reference: ExistingReference = { type, id: type === "finalization" || type === "cleanup-request" ? `${before.task.id}:${request.existingOperationId}` : request.existingOperationId };
     if (!await existingReceipt(input.prisma, before.task, reference)) throw new ToolingOperationRefused("operation-input", `Existing ${type} ${request.existingOperationId} does not belong to this task`);
@@ -507,8 +539,12 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     if (ownerId) {
       const original = await dependencies.read({ prisma: input.prisma, operationId: ownerId });
       if (!original) throw new ToolingOperationRefused("operation-unknown", "Existing operation binding is missing");
-      if (original.kind === request.kind && original.inputDigest === request.inputDigest && original.resourceKey === (request.resourceKey ?? null)) return { binding: original };
-      throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation`);
+      // The original binding continues under a fresh key or a new command
+      // fence only when it would run the same retained code; never newer code.
+      const requested = parent?.release ?? (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId }))?.release;
+      if (original.kind === request.kind && original.inputDigest === request.inputDigest && original.resourceKey === (request.resourceKey ?? null)
+        && ((original.parentOperationId ?? null) === (request.parentOperationId ?? null) || requested?.id === original.release.id)) return { binding: original };
+      throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release`);
     }
     const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: before.task.repositoryId, consumerKind: type, consumerId: reference.id });
     if (consumer.status === "legacy" || consumer.status === "unavailable") throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} is a retained first-bootstrap legacy consumer; only its legacy path may continue it until reconciled`);
@@ -517,7 +553,8 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   const binding = await dependencies.bind({ prisma: input.prisma, config: input.config, taskId: before.task.id, sessionId: input.sessionId, turnId, request });
   if (binding.contract !== "remote-agent.tooling-operation/v1" || binding.taskId !== before.task.id || binding.sessionId !== input.sessionId || binding.repositoryId !== before.task.repositoryId
     || binding.requestKey !== request.requestKey || binding.kind !== request.kind || binding.inputDigest !== request.inputDigest
-    || binding.existingOperationId !== (request.existingOperationId ?? null) || binding.resourceKey !== (request.resourceKey ?? null)) throw new ToolingOperationRefused("operation-mismatch", "Operation request key already names a different operation");
+    || binding.existingOperationId !== (request.existingOperationId ?? null) || binding.resourceKey !== (request.resourceKey ?? null)
+    || (binding.parentOperationId ?? null) !== (request.parentOperationId ?? null)) throw new ToolingOperationRefused("operation-mismatch", "Operation request key already names a different operation");
   const after = await owned();
   if (after.task.id !== before.task.id || after.task.worktreePath !== before.task.worktreePath) throw new ToolingOperationRefused("operation-ownership", "Task ownership changed while binding the operation");
   return { binding };
