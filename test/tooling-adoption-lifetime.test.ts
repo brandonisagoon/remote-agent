@@ -904,9 +904,11 @@ test("stored adoption child: after its offer is withdrawn the same key returns t
 // delivered offer's fresh B command must adopt that never-produced waiting work.
 /** A produced env; B active; A's continuation settled; stand-in verified stop.
  * Then B's separate `runtime up` admitted the stopped environment and waits. */
-async function retiredThenWaiting() {
+async function retiredThenWaiting(options: { longOpenA?: boolean; danglingProducer?: boolean } = {}) {
   const f = await fixture();
   await f.activate(A, 0);
+  // Optionally an older A command that stays open across B's activation.
+  const longOpen = options.longOpenA ? await f.command("a-long-open") : null;
   const a = await f.command("a-runtime-up");
   expect((await a.request()).called?.status).toBe(200);
   await f.environment(); await f.offer("offer-a");
@@ -918,15 +920,22 @@ async function retiredThenWaiting() {
   const continuation = (await bindServerContinuation({ prisma: db.prisma, config: f.config, task: await f.task(), environmentId: ENV,
     request: { requestKey: `compute-continue:${ENV}:1`, inputDigest: canonicalDigest({ continue: 1 }) } })).binding!;
   expect((await f.settleOperation(continuation)).status).toBe(200);
-  // STAND-IN verified stop: the offer stops (its historical claimedAt is kept) and A's reader resolves.
-  await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "stopped" } });
+  // STAND-IN verified stop, as the domain records it: stopped + completedAt
+  // (historical claimedAt kept), and A's reader resolves.
+  await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "stopped", completedAt: new Date() } });
   expect(await resolveEnvironmentConsumers(db.prisma, ENV, { kind: "stopped", reference: "stand-in-stop" })).toBe(1);
+  if (options.danglingProducer) {
+    // ADVERSARIAL seeded record (refusal only): a newer producer intent of A's producer with no outcome, before B's admission.
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `producer:compute-environment:${ENV}`,
+      value: JSON.stringify({ version: 1, operationId: a.bindings.at(-1)!.operationId, role: "producer", state: "intent" }) } });
+  }
   const waiting = await f.command("b-runtime-up");
   const request = await waiting.request();
   expect(request.called?.status, JSON.stringify(request.called?.body)).toBe(200);
   expect((await waiting.settle()).status).toBe(200);
+  await Bun.sleep(5); // the delivered offer is created after the earlier lifetime's stop completed
   await f.offer("offer-b");
-  return { f, a, waiting };
+  return { f, a, waiting, longOpen };
 }
 
 test("retired lifetime: the delivered offer's fresh B command adopts waiting work admitted after A's stopped, resolved lifetime (exact echo)", async () => {
@@ -990,5 +999,48 @@ test("retired lifetime: an uncertain earlier offer, or a claim or producer withi
     const fresh = await f.command("b-offer");
     await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
     expect((await fresh.beginChild("offer-b")).body.error).toMatch(/paused/);
+  }
+}, 60_000);
+
+test("retired lifetime (B295): offers must be terminal and claims physically stopped before the adopted offer; dangling producer intents and an older long-open command refuse", async () => {
+  const refusedFor = async (f: Awaited<ReturnType<typeof fixture>>, pattern: RegExp) => {
+    const begun = await (await f.command("b-offer")).beginChild("offer-b");
+    expect(begun.body).toMatchObject({ code: "retained-release-required" });
+    expect(begun.body.error).toMatch(pattern);
+  };
+  // A validating earlier offer (live/uncertain) refuses.
+  {
+    const { f } = await retiredThenWaiting();
+    await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "validating" } });
+    await refusedFor(f, /live or uncertain offer offer-a \(validating\)/);
+  }
+  // A claimed earlier offer without a recorded stop completion refuses.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { completedAt: null } });
+    await refusedFor(f, /claimed offer offer-a that did not stop before offer offer-b/);
+  }
+  // A stop that completed only after the adopted offer was created refuses.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { completedAt: new Date(Date.now() + 60_000) } });
+    await refusedFor(f, /did not stop before offer offer-b/);
+  }
+  // A dangling producer intent of the earlier lifetime (no outcome) refuses.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting({ danglingProducer: true });
+    await refusedFor(f, /unknown producer outcome/);
+  }
+  // An older A command left open across B's activation cannot adopt newer work.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { longOpen } = await retiredThenWaiting({ longOpenA: true });
+    expect(longOpen!.fence.release.revision).toBe(A);
+    const begun = await longOpen!.beginChild("offer-b");
+    expect(begun.body).toMatchObject({ code: "retained-release-required" });
+    expect(begun.body.error).toMatch(/admitted at generation 2; this command runs generation 1/);
   }
 }, 60_000);

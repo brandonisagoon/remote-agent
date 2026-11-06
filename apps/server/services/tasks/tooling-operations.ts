@@ -518,7 +518,7 @@ async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmen
  * of the release the primary resolves). Only exact waiting work that never
  * started and whose admitting command definitively settled. Returns the
  * refusal, or null. */
-async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest">,
+async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest" | "generation">,
   dependencies: Pick<ToolingOperationDependencies, "read" | "legacy">, body?: Body) {
   const offer = await store.computeOffer.findUnique({ where: { id: offerId } });
   const environment = offer ? await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } }) : null;
@@ -530,6 +530,8 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
   if (!prior) return "The offer has no admitting operation to adopt";
   const original = await dependencies.read({ prisma: store as PrismaClient, operationId: prior.operationId });
   if (!original || prior.state !== "confirmed" || original.inputDigest !== binding.inputDigest) return `Offer ${offerId} belongs to operation ${prior.operationId}`;
+  // Never adopt newer work with older code: a long-open command of an older generation is refused.
+  if (binding.generation < original.generation) return `Offer ${offerId} was admitted at generation ${original.generation}; this command runs generation ${binding.generation}`;
   const command = await commandOf(store, original, dependencies.read);
   if (!command || command.status !== "completed") return `Admitting command ${command?.operationId ?? prior.operationId} has not settled`;
   if (offer.claimedAt !== null || !["queued", "offered"].includes(offer.state)) return `Offer ${offerId} is ${offer.state}`;
@@ -542,34 +544,48 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
   if (admissionEvents.length > ADMISSION_HISTORY_BOUND) return "Admission history exceeds its bound";
   const admitted = admissionEvents.find(event => { const value = Association.safeParse(parseJson(event.value)).data; return value?.operationId === prior.operationId && value.state === "confirmed"; });
   if (!admitted) return `Admission by ${prior.operationId} has no confirmed record`;
-  // Other offers: none live or uncertain; a claimed one is history only if it predates the admission.
+  // Other offers: every one terminal; a claimed one is history only when it
+  // physically stopped (completedAt) before the adopted offer was created.
   const others = await store.computeOffer.findMany({ where: { environmentId: environment.id, id: { not: offerId } }, take: 1001 });
   if (others.length > 1000) return `Environment ${environment.id} offer history exceeds its bound`;
+  const stoppedBefore = (other: { state: string; completedAt: Date | null }) => other.state === "stopped" && other.completedAt !== null && other.completedAt < offer.createdAt;
   for (const other of others) {
-    if (ACTIVE_OFFERS.includes(other.state)) return `Environment ${environment.id} has a live or uncertain offer ${other.id} (${other.state})`;
-    if (other.claimedAt !== null && other.createdAt >= admitted.occurredAt) return `Environment ${environment.id} has a claimed effect (offer ${other.id}) in the current lifetime`;
+    if (!TERMINAL_OFFERS.includes(other.state)) return `Environment ${environment.id} has a live or uncertain offer ${other.id} (${other.state})`;
+    if (other.claimedAt !== null && !stoppedBefore(other)) return `Environment ${environment.id} has a claimed offer ${other.id} that did not stop before offer ${offerId}`;
   }
   for (const reference of [{ type: "compute-offer", id: offerId }, { type: "compute-environment", id: environment.id }] as const) {
     if (await owningOperationId(store, current, reference)) return `${reference.type} ${reference.id} has an owner`;
     const legacy = await dependencies.legacy({ prisma: store as PrismaClient, repositoryId: current.repositoryId, consumerKind: reference.type, consumerId: reference.id });
     if (legacy.status === "legacy" || legacy.status === "unavailable") return `${reference.type} ${reference.id} is a retained first-bootstrap legacy consumer`;
   }
-  // Producers: only an earlier lifetime's, each with a definite outcome and a settled command.
+  // Producers (bounded, strict): only before the current admission's
+  // confirmation; each operation's latest record definite (no dangling intent);
+  // each confirmed producer settled and mapped, through its own reader's stored
+  // completion proof (or its existing offer reference), to an earlier offer that
+  // physically stopped before the adopted offer, with that reader resolved.
   const producerEvents = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: current.primarySessionId!, source: `tooling-operation:${current.id}`, action: ASSOCIATION,
-    key: associationKey("producer", `compute-environment:${environment.id}`) }, take: 1001 });
+    key: associationKey("producer", `compute-environment:${environment.id}`) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (producerEvents.length > 1000) return `Environment ${environment.id} producer history exceeds its bound`;
-  const producerStates = new Map<string, Set<string>>();
+  const latestProducer = new Map<string, string>();
   for (const event of producerEvents) {
     const value = Association.safeParse(parseJson(event.value));
     if (!value.success || value.data.role !== "producer") return `Environment ${environment.id} producer record ${event.sequence} is unreadable`;
     if (event.sequence >= admitted.sequence) return `Environment ${environment.id} was produced in the current lifetime`;
-    producerStates.set(value.data.operationId, (producerStates.get(value.data.operationId) ?? new Set()).add(value.data.state));
+    if (!latestProducer.has(value.data.operationId)) latestProducer.set(value.data.operationId, value.data.state);
   }
-  for (const [operationId, states] of producerStates) {
-    if (!states.has("confirmed") && !states.has("failed")) return `Environment ${environment.id} has an unknown producer outcome (${operationId})`;
+  for (const [operationId, state] of latestProducer) {
+    if (state !== "confirmed" && state !== "failed") return `Environment ${environment.id} has an unknown producer outcome (${operationId})`;
     const producer = await dependencies.read({ prisma: store as PrismaClient, operationId });
     const producerCommand = producer ? await commandOf(store, producer, dependencies.read) : null;
-    if (!producerCommand || producerCommand.status !== "completed") return `Environment ${environment.id} earlier producer ${operationId} has not settled`;
+    if (!producer || producer.status !== "completed" || !producerCommand || producerCommand.status !== "completed") return `Environment ${environment.id} earlier producer ${operationId} has not settled`;
+    if (state === "failed") continue;
+    const readers = await store.toolingRetainedConsumer.findMany({ where: { operationId, consumerKind: "compute-environment", consumerId: environment.id }, take: 11 });
+    const proofs = readers.flatMap(reader => { const proof = z.object({ kind: z.enum(["compute-bind", "compute-configure"]), reference: z.string() }).safeParse(reader.evidence); return proof.success ? [{ reader, offer: proof.data.reference }] : []; });
+    const referenced = new Set([...proofs.map(proof => proof.offer), ...(producer.existingOperationId ? [producer.existingOperationId] : [])]);
+    if (!proofs.length || readers.length > 10 || referenced.size !== 1 || proofs.some(proof => proof.reader.status !== "resolved")) return `Environment ${environment.id} earlier producer ${operationId} has no single resolved offer proof`;
+    const [mapped] = [...referenced];
+    const earlier = await store.computeOffer.findUnique({ where: { id: mapped! } });
+    if (!earlier || earlier.environmentId !== environment.id || earlier.id === offerId || !stoppedBefore(earlier)) return `Environment ${environment.id} earlier producer ${operationId} offer ${mapped} did not physically stop before offer ${offerId}`;
   }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
   return null;
@@ -1027,7 +1043,8 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     if (ownerId) {
       const original = await dependencies.read({ prisma: input.prisma, operationId: ownerId });
       if (!original) throw new ToolingOperationRefused("operation-unknown", "Existing operation binding is missing");
-      const requested = parent?.release ?? (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId }))?.release;
+      const active = parent ? null : await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId });
+      const requested = parent?.release ?? active?.release, requestedGeneration = parent?.generation ?? active?.generation;
       // Never another request's binding: a client accepts nothing but its own
       // echo, and exact same-key retries were routed to the primitive above. A
       // NEW child is bound only as a sibling under the same open command (same
@@ -1036,9 +1053,9 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
       // admission write lock). Everything else is refused.
       {
         const sibling = Boolean(request.parentOperationId && original.parentOperationId === request.parentOperationId);
-        const adoptable = !sibling && admitted && requested && !await adoptionRefused(input.prisma, before.task, request.existingOperationId,
-          { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest }, dependencies);
-        if (!sibling && !adoptable) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release`);
+        const refusal = sibling ? null : !admitted || !requested ? "it is not waiting work this command can adopt" : await adoptionRefused(input.prisma, before.task, request.existingOperationId,
+          { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest, generation: requestedGeneration ?? 0 }, dependencies);
+        if (refusal) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release (${refusal})`);
       }
     }
     const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: before.task.repositoryId, consumerKind: type, consumerId: reference.id });
@@ -1200,6 +1217,7 @@ const ObserverCapability = z.object({ version: z.literal(1), source: z.literal("
 const FINALIZATION_CONFIRMED_ACTION = "finalization-confirmed", DEVELOPMENT_COMPLETE_ACTION = "development-compute-complete", DEVELOPMENT_SUPERSEDED_ACTION = "development-compute-superseded";
 const COUNTED_COMPUTE_KINDS = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const ACTIVE_OFFERS = ["queued", "offered", "validating", "claimed", "running", "unknown"];
+const TERMINAL_OFFERS = ["stopped", "expired", "declined", "ineligible"];
 const PENDING_INSTRUCTION = ["queued", "preparing", "dispatching", "unknown"];
 type Provenance = ToolingLegacyConsumerInput["provenance"];
 const bounded = <T>(rows: T[], limit: number, what: string) => { if (rows.length > limit) throw new Error(`Legacy consumer inventory: ${what} exceeds its bound of ${limit}`); return rows; };
