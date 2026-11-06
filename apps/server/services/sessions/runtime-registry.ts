@@ -164,6 +164,20 @@ export async function beginRuntimeSession(
   return toAgentRuntimeSession(row);
 }
 
+/** A session is open only while it is not closed AND has no closure
+ * timestamp. Legacy rows that a late provider write left `idle` with
+ * `closedAt` set are still closed. */
+const OPEN_SESSION = { status: { not: "closed" }, closedAt: null } as const;
+
+/** A conditional write found the session already closed (status or
+ * closure timestamp). Callers that started a provider must release it. */
+export class RuntimeSessionClosedError extends Error {
+  constructor(id: string) {
+    super(`runtime session is closed: ${id}`);
+    this.name = "RuntimeSessionClosedError";
+  }
+}
+
 export async function attachRuntimeSession(
   prisma: PrismaClient,
   input: {
@@ -174,8 +188,10 @@ export async function attachRuntimeSession(
     configOptions?: SessionConfigOption[];
   },
 ): Promise<AgentRuntimeSession> {
-  const row = await prisma.runtimeSession.update({
-    where: { id: input.id },
+  // Attaching a provider handle marks the session idle. A close that landed
+  // while the provider was starting stays authoritative.
+  const changed = await prisma.runtimeSession.updateMany({
+    where: { id: input.id, ...OPEN_SESSION },
     data: {
       acpxRecordId: input.acpxRecordId,
       acpxSessionId: input.acpxSessionId,
@@ -187,9 +203,24 @@ export async function attachRuntimeSession(
         : {}),
     },
   });
-  return toAgentRuntimeSession(row);
+  if (!changed.count) {
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } });
+    throw new RuntimeSessionClosedError(input.id);
+  }
+  return toAgentRuntimeSession(
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } }),
+  );
 }
 
+/**
+ * Persists provider-driven session state.
+ *
+ * Closure is terminal. Any write that does not itself close the session is
+ * conditional in the database on the row still being open at write time, so
+ * a provider completion that races a close is a zero-row no-op (returns
+ * false) rather than reviving the session as idle/active/error. A closing
+ * write keeps an earlier closure timestamp instead of replacing it.
+ */
 export async function updateRuntimeSessionState(
   prisma: PrismaClient,
   id: string,
@@ -201,30 +232,50 @@ export async function updateRuntimeSessionState(
     closedAt?: Date | null;
     agentSessionId?: string;
   },
-): Promise<void> {
-  await prisma.runtimeSession.update({
-    where: { id },
-    data: {
-      ...(data.status ? { status: data.status } : {}),
-      ...(data.configOptions
-        ? { latestConfigOptions: storedJson(data.configOptions) }
-        : {}),
-      ...(data.usage ? { latestUsage: storedJson(data.usage) } : {}),
-      ...(data.recoveryDetail !== undefined
-        ? { recoveryDetail: data.recoveryDetail }
-        : {}),
-      ...(data.closedAt !== undefined ? { closedAt: data.closedAt } : {}),
-      ...(data.agentSessionId ? { agentSessionId: data.agentSessionId } : {}),
-    },
+): Promise<boolean> {
+  const fields = {
+    ...(data.status ? { status: data.status } : {}),
+    ...(data.configOptions
+      ? { latestConfigOptions: storedJson(data.configOptions) }
+      : {}),
+    ...(data.usage ? { latestUsage: storedJson(data.usage) } : {}),
+    ...(data.recoveryDetail !== undefined
+      ? { recoveryDetail: data.recoveryDetail }
+      : {}),
+    ...(data.agentSessionId ? { agentSessionId: data.agentSessionId } : {}),
+  };
+  if (data.status === "closed") {
+    const first = await prisma.runtimeSession.updateMany({
+      where: { id, closedAt: null },
+      data: { ...fields, ...(data.closedAt !== undefined ? { closedAt: data.closedAt } : {}) },
+    });
+    if (first.count) return true;
+    const again = await prisma.runtimeSession.updateMany({ where: { id }, data: fields });
+    if (!again.count) throw new Error(`runtime session not found: ${id}`);
+    return true;
+  }
+  if (data.closedAt !== undefined) {
+    throw new Error("closedAt can only be recorded by a closing status write");
+  }
+  const changed = await prisma.runtimeSession.updateMany({
+    where: { id, ...OPEN_SESSION },
+    data: fields,
   });
+  if (changed.count) return true;
+  // Zero rows: either the session closed first (expected no-op) or it never
+  // existed, which stays an error as before.
+  await prisma.runtimeSession.findUniqueOrThrow({ where: { id } });
+  return false;
 }
 
 export async function prepareRuntimeAgentSwitch(
   prisma: PrismaClient,
   input: { id: string; agent: "codex" | "claude" },
 ): Promise<AgentRuntimeSession> {
-  const row = await prisma.runtimeSession.update({
-    where: { id: input.id },
+  // Switching providers restarts an open session only. A closure (including
+  // a legacy idle row with closedAt) is never cleared here.
+  const changed = await prisma.runtimeSession.updateMany({
+    where: { id: input.id, ...OPEN_SESSION },
     data: {
       agentCommand: input.agent,
       acpxRecordId: null,
@@ -234,10 +285,15 @@ export async function prepareRuntimeAgentSwitch(
       latestConfigOptions: Prisma.JsonNull,
       latestUsage: Prisma.JsonNull,
       recoveryDetail: null,
-      closedAt: null,
     },
   });
-  return toAgentRuntimeSession(row);
+  if (!changed.count) {
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } });
+    throw new RuntimeSessionClosedError(input.id);
+  }
+  return toAgentRuntimeSession(
+    await prisma.runtimeSession.findUniqueOrThrow({ where: { id: input.id } }),
+  );
 }
 
 export async function findRuntimeSession(

@@ -44,6 +44,7 @@ import {
   findRuntimeSession,
   listRuntimeSessions,
   prepareRuntimeAgentSwitch,
+  RuntimeSessionClosedError,
   updateRuntimeSessionState,
 } from "../../services/sessions/runtime-registry.ts";
 import { resolveInitialSessionLabels } from "../../services/sessions/session-metadata.ts";
@@ -317,7 +318,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       if (this.shuttingDown || this.recoveringSessions.has(row.id)) throw new CleanupTransportBlockedError("Session transport transition is in progress");
       await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: row.id });
       const task = await this.prisma.remoteTask.findUnique({ where: { worktreePath: row.cwd } });
-      const handle = await this.runtimeFor(row.id).ensureSession({
+      const provider = this.runtimeFor(row.id);
+      const handle = await provider.ensureSession({
         sessionKey: row.id,
         agent: input.agent,
         mode: "persistent",
@@ -331,8 +333,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         },
       });
       this.handles.set(row.id, handle);
-      const runtimeStatus = await this.runtimeFor(row.id).getStatus({ handle });
-      return await attachRuntimeSession(this.prisma, {
+      const runtimeStatus = await provider.getStatus({ handle });
+      return await this.attachStartedProvider(provider, handle, {
         id: row.id,
         acpxRecordId: handle.acpxRecordId ?? row.acpxRecordId ?? row.id,
         acpxSessionId: handle.backendSessionId,
@@ -366,7 +368,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     this.recoveringSessions.add(sessionId);
     try {
       const session = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
-      if (session.status === "closed" || session.status === "provisioning") throw new Error("Session is closed or still provisioning");
+      if (session.status === "closed" || session.closedAt || session.status === "provisioning") throw new Error("Session is closed or still provisioning");
       if (!session.acpxRecordId) throw new Error("Provider process identity is unavailable; recovery cannot prove it stopped");
       const record = await this.store.load(session.acpxRecordId);
       if (!record || record.acpxRecordId !== session.acpxRecordId || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId) {
@@ -379,7 +381,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       if (JSON.stringify(current) !== JSON.stringify(record)) throw new Error("Provider record changed during recovery; inspect and retry");
       if (session.status === "active") {
         const changed = await this.prisma.runtimeSession.updateMany({
-          where: { id: sessionId, status: "active", updatedAt: session.updatedAt },
+          where: { id: sessionId, status: "active", closedAt: null, updatedAt: session.updatedAt },
           data: { status: "idle", recoveryDetail: "Provider process confirmed stopped during explicit instruction reconciliation; prior outcome remains unresolved until recorded." },
         });
         if (!changed.count) throw new Error("Session changed during recovery; inspect and retry");
@@ -449,7 +451,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
           queue.close();
           return;
         }
-        const session = await this.requireSession(input.sessionId);
+        const session = await this.requireOpenSession(input.sessionId);
         await assertTaskOpen(this.prisma, session.cwd);
         await assertNativeSession(this.prisma, session.id);
         if (this.capacity.full) {
@@ -457,7 +459,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         }
         releaseCapacity = await this.capacity.acquire(signal);
         if (cancelled || signal.aborted) throw new Error("Waiting turn cancelled");
-        await this.requireSession(input.sessionId);
+        await this.requireOpenSession(input.sessionId);
         await assertTaskOpen(this.prisma, session.cwd);
         await assertNativeSession(this.prisma, session.id);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
@@ -471,10 +473,12 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         const executionCwd = await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id, requestId });
         const handle = await this.handleFor(session, executionCwd);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
-        await updateRuntimeSessionState(this.prisma, session.id, {
+        // Conditional on the row still being open: a close that landed after
+        // the checks above refuses the turn instead of reviving the session.
+        if (!(await updateRuntimeSessionState(this.prisma, session.id, {
           status: "active",
           recoveryDetail: null,
-        });
+        }))) throw new RuntimeSessionClosedError(session.id);
         await assertTaskOpen(this.prisma, session.cwd);
         await assertNativeSession(this.prisma, session.id);
         if (signal.aborted) throw new Error("Waiting turn cancelled");
@@ -598,7 +602,7 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       completion.resolve(signal.aborted ? { status: "cancelled", stopReason: "cancelled" } : { status: "failed", error: message });
       queue.close();
       if (!signal.aborted && !(error instanceof CleanupTransportBlockedError)) await this.prisma.runtimeSession.updateMany({
-        where: { id: input.sessionId, status: { not: "closed" } },
+        where: { id: input.sessionId, status: { not: "closed" }, closedAt: null },
         data: { status: "error", recoveryDetail: message },
       }).catch(() => undefined);
     }).finally(() => {
@@ -632,13 +636,13 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
     const session = await this.requireSession(input.sessionId);
     if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
-    if (session.status === "closed") throw new Error("Session is closed");
+    if (session.status === "closed" || session.closedAt) throw new Error("Session is closed");
     // A fallback router can race its recovery pass. Claim source ownership
     // with the instruction so a losing route cannot publish false failure.
     const receipt = await this.prisma.$transaction(async (tx) => {
       if (this.recoveringSessions.has(input.sessionId)) throw new Error("Session is being reconciled");
       const current = await tx.runtimeSession.findUniqueOrThrow({ where: { id: input.sessionId } });
-      if (current.status === "closed") throw new Error("Session is closed");
+      if (current.status === "closed" || current.closedAt) throw new Error("Session is closed");
       return queueInstruction(tx, input);
     });
     void deliverInstructions(this.prisma, this, this.config).catch(() => undefined);
@@ -699,7 +703,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       agent,
     });
     try {
-      const handle = await this.runtimeFor(sessionId).ensureSession({
+      const provider = this.runtimeFor(sessionId);
+      const handle = await provider.ensureSession({
         sessionKey: switched.id,
         agent,
         mode: "persistent",
@@ -713,8 +718,8 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
         },
       });
       this.handles.set(switched.id, handle);
-      const status = await this.runtimeFor(sessionId).getStatus({ handle });
-      return await attachRuntimeSession(this.prisma, {
+      const status = await provider.getStatus({ handle });
+      return await this.attachStartedProvider(provider, handle, {
         id: switched.id,
         acpxRecordId: handle.acpxRecordId ?? switched.id,
         acpxSessionId: handle.backendSessionId,
@@ -914,6 +919,14 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     return session;
   }
 
+  /** New work needs an open session: a closure timestamp alone (legacy idle
+   * rows) refuses it too. History and close keep using requireSession. */
+  private async requireOpenSession(sessionId: string): Promise<AgentRuntimeSession> {
+    const session = await this.requireSession(sessionId);
+    if (session.closedAt) throw new RuntimeSessionClosedError(sessionId);
+    return session;
+  }
+
   private async handleFor(session: AgentRuntimeSession, executionCwd?: string): Promise<AcpRuntimeHandle> {
     if (this.shuttingDown) throw new CleanupTransportBlockedError("Session runtime is shutting down");
     if (!executionCwd) await cleanupExecutionDirectory({ prisma: this.prisma, config: this.config, sessionId: session.id });
@@ -925,14 +938,15 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     }
     const existing = this.handles.get(session.id);
     if (existing) return existing;
-    const handle = await this.runtimeFor(session.id).ensureSession({
+    const provider = this.runtimeFor(session.id);
+    const handle = await provider.ensureSession({
       sessionKey: session.id,
       agent: session.agent,
       mode: "persistent",
       cwd: executionCwd ?? session.cwd,
     });
     this.handles.set(session.id, handle);
-    await attachRuntimeSession(this.prisma, {
+    await this.attachStartedProvider(provider, handle, {
       id: session.id,
       acpxRecordId: handle.acpxRecordId ?? session.acpxRecordId ?? session.id,
       acpxSessionId: handle.backendSessionId,
@@ -940,6 +954,34 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       configOptions: session.configOptions,
     });
     return handle;
+  }
+
+  /** Attach a provider this runtime just started. If the session closed while
+   * it was starting, stop that provider while keeping its saved conversation,
+   * drop the local caches and surface the refusal. A failed stop is reported,
+   * and the handle stays cached so the live provider is not orphaned. */
+  private async attachStartedProvider(
+    provider: ReturnType<typeof createAcpRuntime>,
+    handle: AcpRuntimeHandle,
+    input: Parameters<typeof attachRuntimeSession>[1],
+  ): Promise<AgentRuntimeSession> {
+    try {
+      return await attachRuntimeSession(this.prisma, input);
+    } catch (error) {
+      if (!(error instanceof RuntimeSessionClosedError)) throw error;
+      try {
+        await provider.close({ handle, reason: "Session closed while its provider was starting", discardPersistentState: false });
+      } catch (closeError) {
+        // Keep owning the possibly-live provider: a concurrent close may have
+        // dropped its runtime, and a fresh runtime could not stop this process.
+        if (!this.runtimes.has(input.id)) this.runtimes.set(input.id, provider);
+        throw new Error(`${error.message}; stopping the provider started for it failed: ${closeError instanceof Error ? closeError.message : String(closeError)}`, { cause: closeError });
+      }
+      if (this.handles.get(input.id) === handle) this.handles.delete(input.id);
+      if (this.runtimes.get(input.id) === provider) this.runtimes.delete(input.id);
+      this.executionDirectories.delete(input.id);
+      throw error;
+    }
   }
 
   private async loadRecord(
