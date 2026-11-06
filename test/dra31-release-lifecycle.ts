@@ -5,6 +5,7 @@
  * This covers release routing, not physical application/provider acceptance.
  */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { tmpdir } from "node:os";
@@ -162,7 +163,8 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.equal(beforeMigration.fixturesComplete, true);
     const runtimeFile = path.join(stateDirectory, "runtimes", taskId, "development", "runtime.json");
     await mkdir(path.dirname(runtimeFile), { recursive: true, mode: 0o700 });
-    await writeFile(runtimeFile, JSON.stringify(beforeMigration, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    const inputBytes = JSON.stringify(beforeMigration, null, 2) + "\n";
+    await writeFile(runtimeFile, inputBytes, { flag: "wx", mode: 0o600 });
     // This is ordinary registration of synthetic input, not a bound effect.
     await json(await server.socketRequest(`/api/sessions/${sessionId}/task/resources`, { method: "PUT",
       headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "runtime-development", kind: "task-runtime",
@@ -183,8 +185,11 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     const migrationReceiptFile = path.join(path.dirname(runtimeFile), "state-migrations", "runtime.json.drafted.runtime.1-2.json");
     const migrationReceipt = JSON.parse(await readFile(migrationReceiptFile, "utf8"));
     assert.equal(migrationReceipt.phase, "committed");
-    assert.equal(migrationReceipt.operationId, writer.id);
-    assert.match(migrationReceipt.outputDigest, /^[a-f0-9]{64}$/);
+    // Drafted runtime-state-migrate records the executing command identity;
+    // a derived registration writer does not change the migration's owner.
+    assert.equal(migrationReceipt.operationId, migrationOperation.id);
+    assert.equal(migrationReceipt.inputDigest, createHash("sha256").update(inputBytes).digest("hex"));
+    assert.equal(migrationReceipt.outputDigest, createHash("sha256").update(migratedBytes).digest("hex"));
     const operationCount = await server.db.prisma.toolingOperation.count({ where: { taskId } });
     const taskWrites = await server.db.prisma.toolingStateWrite.findMany({ where: { taskId }, orderBy: { sequence: "asc" } });
     const replayed = await runCli(b.checkout, migrationKey, undefined, "migrate-state");
