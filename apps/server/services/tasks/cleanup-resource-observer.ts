@@ -36,22 +36,41 @@ function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
   return { result, cancel: () => reader.cancel().catch(() => {}) };
 }
 
-async function waitForOwnedGroupExit(group: number) {
-  const deadline = Date.now() + 1000;
+type GroupScan = { error: { code?: string | number | null; killed?: boolean; signal?: string | null } | null; stdout: string; stderr: string };
+const groupExitDependencies = {
+  now: () => performance.now(),
+  sleep: (ms: number) => Bun.sleep(ms),
+  scan: (timeoutMs: number): Promise<GroupScan> => new Promise(resolve => {
+    execFile("/bin/ps", ["-axo", "pgid="], {
+      timeout: timeoutMs, maxBuffer: 1024 * 1024, encoding: "utf8",
+    }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
+  }),
+};
+
+/** Read-only group proof, with a bounded seam for deterministic deadline tests. */
+export async function waitForOwnedGroupExit(group: number, dependencies = groupExitDependencies) {
+  if (!Number.isSafeInteger(group) || group <= 0) throw failure("OBSERVER_GROUP");
+  const deadline = dependencies.now() + 1000;
   while (true) {
     // The helper has already killed its group. This is observation only:
     // never signal a numeric group after its leader could have been reaped.
-    const groups = await new Promise<string>((resolve, reject) => {
-      execFile("/bin/ps", ["-axo", "pgid="], {
-        timeout: 250, maxBuffer: 1024 * 1024, encoding: "utf8",
-      }, (error, stdout, stderr) => {
-        if (error || stderr.length) reject(failure("OBSERVER_GROUP"));
-        else resolve(stdout);
-      });
-    });
-    if (!groups.split("\n").some(line => Number(line.trim()) === group)) return;
-    if (Date.now() >= deadline) throw failure("OBSERVER_GROUP");
-    await Bun.sleep(10);
+    const remaining = Math.floor(deadline - dependencies.now());
+    if (remaining <= 0) throw failure("OBSERVER_GROUP");
+    const { error, stdout, stderr } = await dependencies.scan(Math.min(250, remaining));
+    // Late output cannot prove absence within this attempt's budget.
+    if (dependencies.now() >= deadline || stderr.length) throw failure("OBSERVER_GROUP");
+    if (error) {
+      // Only execFile's managed timeout is retryable. In particular, a
+      // maxBuffer error can also kill ps, but carries its own error code.
+      if (!error.killed || error.signal !== "SIGTERM" || error.code != null) throw failure("OBSERVER_GROUP");
+    } else {
+      const lines = stdout.trim().split("\n").map(line => line.trim());
+      if (lines.some(line => !/^\d+$/.test(line) || !Number.isSafeInteger(Number(line)))) throw failure("OBSERVER_GROUP");
+      if (!lines.some(line => Number(line) === group)) return;
+    }
+    // A timeout is unknown, never absence. Retry only inside the original
+    // absolute budget and require a complete valid scan before success.
+    await dependencies.sleep(Math.min(10, Math.max(0, deadline - dependencies.now())));
   }
 }
 
