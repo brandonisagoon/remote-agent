@@ -201,8 +201,31 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.deepEqual(JSON.parse(await readFile(migrationReceiptFile, "utf8")), migrationReceipt, "Replay must preserve the committed receipt and its identity");
     steps.push({ action: "state-migration-verified", operationId: migrationOperation.id, scopeKey: "runtime-development", version: 2,
       beforeDigest: canonicalDigest(beforeMigration), afterDigest: canonicalDigest(migratedState), replayUnchanged: true });
+    // Rollback selects an older compatible reader for subsequent operations;
+    // it must not rewind migrated bytes or their durable write history.
+    const rollbackPid = server.pid;
+    const rollback = await activate(a.revision, 2, "dra31-compatible-rollback-a");
+    assert.equal(rollback.selection.generation, 3);
+    assert.equal(rollback.selection.release.revision, a.revision);
+    const rollbackKey = "dra31-read-migrated-state-on-a";
+    const rollbackRead = await runCli(a.checkout, rollbackKey);
+    assert.equal(rollbackRead.code, 0, rollbackRead.stderr);
+    assert.equal(JSON.parse(rollbackRead.stdout).phase, beforeMigration.phase);
+    const rollbackOperation = await server.db.prisma.toolingOperation.findFirstOrThrow({ where: { taskId, requestKey: rollbackKey } });
+    assert.equal(rollbackOperation.status, "completed");
+    assert.equal((await server.db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: rollbackOperation.releaseId } })).revision, a.revision);
+    assert.equal(await readFile(runtimeFile, "utf8"), migratedBytes);
+    assert.deepEqual(await server.db.prisma.toolingStateWrite.findMany({ where: { taskId }, orderBy: { sequence: "asc" } }), taskWrites);
+    assert.deepEqual(JSON.parse(await readFile(migrationReceiptFile, "utf8")), migrationReceipt);
+    const restored = await activate(b.revision, 3, "dra31-return-to-b");
+    assert.equal(restored.selection.generation, 4);
+    assert.equal(restored.selection.release.revision, b.revision);
+    assert.equal(server.pid, rollbackPid, "Compatible rollback and reactivation must not restart the server");
+    assert.equal((await server.db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "dra31-paused" } })).ownerPaused, true);
+    steps.push({ action: "compatible-rollback-verified", operationId: rollbackOperation.id, revision: a.revision, stateVersion: 2,
+      restoredRevision: b.revision, generation: 4, stateAndHistoryUnchanged: true });
     steps.push({ action: "verified", originalPid: pid, restartedPid: server.pid, retainedOperation: old.binding.operationId, independentOperation: operation.id,
-      activeRevision: b.revision, generation: 2, originalPin: original.toolingRevision });
+      activeRevision: b.revision, generation: 4, originalPin: original.toolingRevision });
     passed = true;
   } catch (error) {
     evidence.failure = error instanceof Error ? error.message : String(error);
