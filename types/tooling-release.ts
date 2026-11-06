@@ -58,3 +58,40 @@ export interface BeginToolingOperationRequest {
   parentOperationId?: string;
   resourceKey?: string;
 }
+
+/** State API values are evidence for the owning operation and task only.
+ * Unknown retained provenance is a 409 refusal, never an empty consumer list. */
+export interface ToolingStateEvidenceResponse {
+  operationId: string;
+  taskId: string;
+  family: string;
+  scopeKey: string;
+  version: number | null;
+  source: "recorded" | "legacy-assumed" | "none";
+  consumers: Array<{
+    /** Exact operation ID, or `legacy:<consumer-id>` for a retained legacy row. */
+    operationId: string;
+    /** Null only for a proven pre-protocol reader, never unknown provenance. */
+    format: ToolingStateFormat | null;
+  }>;
+}
+
+export interface ToolingStateWriteRequest {
+  family: string;
+  scopeKey: string;
+  version: number;
+}
+
+export interface ToolingStateWriteResponse {
+  operationId: string;
+  taskId: string;
+  family: string;
+  scopeKey: string;
+  write: {
+    version: number;
+    preservesUnknown: boolean;
+    operationId: string;
+    releaseId: string;
+    sequence: number;
+  };
+}

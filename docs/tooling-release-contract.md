@@ -353,3 +353,30 @@ real elapsed time; it is not a live-observer measurement or acceptance of the
 repair. Preserve it as a regression scenario alongside DRA-37's real-server
 tests. Evidence and remaining acceptance belong in the paired Drafted
 `docs/acceptance.md` and linked issues.
+
+### State evidence response contract
+
+The paired state client and server use the response interfaces in
+`types/tooling-release.ts`. Read evidence is
+`GET /api/sessions/:sessionId/tooling-operations/:operationId/state?family=...&scopeKey=...`.
+It returns `{operationId, taskId, family, scopeKey, version, source, consumers}`;
+`source` is `recorded`, `legacy-assumed` or `none`. Each consumer is
+`{operationId, format}`. A proven pre-protocol consumer has a null format and
+an identity `legacy:<consumer-id>`; an unresolved or ambiguous executable
+provenance instead refuses this state with 409, never an empty inventory.
+The inventory includes unfinished release-bound operations and retained legacy
+consumers that can read the affected state, not just the active release.
+
+Before every file write, the client sends
+`POST /api/sessions/:sessionId/tooling-operations/:operationId/state-writes`
+with `{family, scopeKey, version}`. The result is
+`{operationId, taskId, family, scopeKey, write}` where `write` contains the exact
+version, writer's preservation flag, operation/release IDs and durable sequence.
+The client validates all echoed identities and version before changing bytes.
+Both routes require the matching operation header and derive task/repository
+from the stored operation. They recheck current owner authority and lifecycle;
+callers cannot choose another task or a release. Scope is the operation's
+resource key, or `task` for task-global state; arbitrary file paths do not become
+new state scopes. Registration delegates to the atomic per-state checks and
+retains the existing structured error codes. These are frozen wire shapes for
+parallel implementation; this section does not claim the routes are wired yet.
