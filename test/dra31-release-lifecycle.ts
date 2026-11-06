@@ -12,9 +12,10 @@ import { z } from "zod";
 import { parseServiceFile } from "../lib/config.ts";
 import { isolatedServer } from "../test-support/isolated-server.ts";
 import { canonicalDigest } from "../apps/server/services/tasks/tooling-releases.ts";
+import { verifyPreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
 const Receipt = z.object({ repositoryId: z.literal("fixture"), revision: z.string().regex(/^[a-f0-9]{40}$/),
-  tree: z.string().regex(/^[a-f0-9]{40}$/), policyBlob: z.string(), checkout: z.string() });
+  tree: z.string().regex(/^[a-f0-9]{40}$/), policyBlob: z.string(), checkout: z.string(), lockfileDigest: z.string().regex(/^[a-f0-9]{64}$/) });
 const cleanEnv = (home: string) => ({ PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: home });
 
 async function git(root: string, ...args: string[]) {
@@ -33,7 +34,12 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
   assert.equal(a.policyBlob, b.policyBlob, "This rehearsal requires compatible team policy");
   const source = await realpath(path.join(artifactRoot, "source"));
   const install = await realpath(path.join(artifactRoot, "install"));
-  for (const release of [a, b]) assert.equal(await realpath(release.checkout), path.join(install, "tooling", "fixture", release.revision));
+  for (const release of [a, b]) {
+    assert.equal(await realpath(release.checkout), path.join(install, "tooling", "fixture", release.revision));
+    // Require current real install receipts before starting the rehearsal;
+    // activation must not unexpectedly install dependencies inside a tick.
+    await verifyPreparedToolingRelease(release);
+  }
   const server = await isolatedServer();
   const taskId = "dra31-existing", sessionId = "dra31-existing-primary";
   const stateDirectory = path.join(server.root, "state");
@@ -100,9 +106,19 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     const retained = await runCli(a.checkout, requestKey, old.binding.operationId);
     assert.equal(retained.code, 0, retained.stderr);
     assert.equal(JSON.parse(retained.stdout).phase, "absent");
+    const retainedOperation = await server.db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: old.binding.operationId } });
+    assert.equal(retainedOperation.status, "completed");
+    assert.equal((await server.db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: retainedOperation.releaseId } })).revision, a.revision);
     const freshKey = "dra31-independent-b";
     const stale = await runCli(a.checkout, freshKey);
     assert.notEqual(stale.code, 0, "A cached release cannot start independent work after B activates");
+    assert.match(stale.stderr, /is bound to tooling release .*not this checkout/);
+    const refused = await server.db.prisma.toolingOperation.findFirstOrThrow({ where: { taskId, requestKey: freshKey } });
+    assert.equal(refused.status, "bound", "Stale A must refuse before starting B's operation");
+    assert.equal((await server.db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: refused.releaseId } })).revision, b.revision);
+    assert.equal(await server.db.prisma.toolingOperation.count({ where: { parentOperationId: refused.id } }), 0);
+    assert.equal(await server.db.prisma.toolingStateWrite.count({ where: { operationId: refused.id } }), 0);
+    assert.equal(await server.db.prisma.remoteTaskResource.count({ where: { taskId } }), 0);
     const fresh = await runCli(b.checkout, freshKey);
     assert.equal(fresh.code, 0, fresh.stderr);
     assert.equal(JSON.parse(fresh.stdout).phase, "absent");
@@ -130,8 +146,15 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     throw error;
   } finally {
     evidence.passed = passed;
-    await writeFile(resultFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
-    await server.cleanup({ keepEvidence: true });
+    try {
+      await server.stop();
+      // Preserve synthetic selection/operation evidence before the fixture
+      // removes its DB. No full database or config/credential copy is kept.
+      evidence.selection = await server.db.prisma.toolingSelection.findMany();
+      evidence.operations = await server.db.prisma.toolingOperation.findMany();
+      evidence.stateWrites = await server.db.prisma.toolingStateWrite.findMany();
+      await writeFile(resultFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
+    } finally { await server.cleanup({ keepEvidence: true }); }
     console.log(JSON.stringify({ passed, evidence: resultFile }));
   }
 }
