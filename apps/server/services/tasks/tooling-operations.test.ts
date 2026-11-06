@@ -330,6 +330,7 @@ test("state evidence and write registration are guarded by the owning operation 
   expect((await write({ family: "drafted.runtime", scopeKey: "runtime", version: 2 })).status).toBe(409); // undeclared write version
   expect(await (await state("family=drafted.runtime&scopeKey=runtime")).json()).toMatchObject({ version: 1, source: "recorded" });
   // Unknown first-bootstrap provenance refuses rather than returning an empty inventory.
+  await environment("env-x"); await db.prisma.computeEnvironment.update({ where: { id: "env-x" }, data: { state: "running" } }); // a live consumer
   await db.prisma.toolingLegacyConsumer.create({ data: { id: "legacy-unknown", repositoryId: "repo", taskId: "task", consumerKind: "compute-environment", consumerId: "env-x", provenance: "unavailable", detail: "no receipt" } });
   expect((await state("family=drafted.runtime&scopeKey=runtime")).status).toBe(409);
   await db.prisma.toolingLegacyConsumer.update({ where: { id: "legacy-unknown" }, data: { provenance: "exact", revision: LEGACY, checkout: "/install/legacy", detail: null } });
