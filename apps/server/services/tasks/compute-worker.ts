@@ -5,17 +5,26 @@ import { reconcileObservedCompute, offerNextCompute } from "./compute-admission.
 import { refreshComputeObservation, computeEvidenceState } from "./compute-observation.ts";
 import { considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
-import { verifiedComputeRuntime } from "./compute-observer.ts";
+import { operationEnvironment, verifiedComputeRuntime } from "./compute-observer.ts";
+import { bindServerToolingOperation } from "./tooling-operations.ts";
+import { canonicalDigest } from "./tooling-releases.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 
-async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }) {
+/** Executing a recorded suspension is its own server-initiated operation:
+ * bound once per environment/intent, so a retry or unknown outcome reuses the
+ * original release even after a later activation. Pre-protocol repositories
+ * keep the legacy configured revision; neither path installs tooling. */
+async function continueSuspension(input: Context & { taskId: string; primarySessionId: string; environmentId: string; intentRevision: number; intentDigest: string }, bind = bindServerToolingOperation) {
   const reference = { intentRevision: input.intentRevision, intentDigest: input.intentDigest };
-  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference });
-  const env = Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
+  const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
+  if (task.primarySessionId !== input.primarySessionId) throw new Error("Compute continuation primary changed");
+  const binding = await bind({ prisma: input.prisma, config: input.config, task, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
+    inputDigest: canonicalDigest(reference), kind: "development-intent", existingOperationId: String(input.intentRevision) } });
+  const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: binding?.release ?? null, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
-    cwd: runtime.receipt.checkout, env, timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
+    cwd: runtime.receipt.checkout, env: operationEnvironment(binding), timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
   });
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
@@ -25,6 +34,7 @@ const defaults = { refresh: refreshComputeObservation, evidence: computeEvidence
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
  * idle. Every adapter effect renews the existing scoped development intent. */
+export { continueSuspension as continueComputeSuspension };
 export async function tickCompute(input: Context, dependencies: Partial<typeof defaults> = {}) {
   if (!input.config.compute?.enabled) return { observed: 0, unavailable: 0 };
   const deps = { ...defaults, ...dependencies };

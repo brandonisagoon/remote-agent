@@ -9,7 +9,7 @@ import { assertGeneratedCacheMounts } from "./generated-cache-mounts.ts";
 export const generatedCacheOwnerObservation = { resolve: resolveCleanupObserver, observe: runCleanupResourceObserver };
 /** Server-selected source ownership only. Input paths cannot choose a command,
  * owner record, replacement container, or a different cleanup operation. */
-export async function observeGeneratedCacheOwner(input: { prisma: Pick<PrismaClient,"remoteTaskResource">; config: ServerConfig; task: RemoteTask;
+export async function observeGeneratedCacheOwner(input: { prisma: Pick<PrismaClient,"remoteTaskResource"|"runtimeMetadataEvent">; config: ServerConfig; task: RemoteTask;
   preparedRevision: number; requestKey: string; operationRevision: number; operationDigest: string; ownerSha256?: string; target?: z.infer<typeof FinalizationTreeTarget> }, dependencies = generatedCacheOwnerObservation) {
   const resources = (await input.prisma.remoteTaskResource.findMany({ where: { taskId:input.task.id }, orderBy:{ id:"asc" } })).map(resource => CleanupObserverResource.parse({
     id:resource.id,key:resource.key,kind:resource.kind,purpose:resource.purpose,externalId:resource.externalId,state:resource.state,expiresAt:resource.expiresAt?.toISOString() ?? null,metadata:resource.metadata,
@@ -25,7 +25,7 @@ export async function observeGeneratedCacheOwner(input: { prisma: Pick<PrismaCli
     version:1,stage:"prepare",task:{ id:input.task.id,primarySessionId:input.task.primarySessionId,worktreePath:input.task.worktreePath,toolingRevision:input.task.toolingRevision },resource,resources }) });
   await assertGeneratedCacheMounts(paths);
   await finalizationResourceObservation.pathsIdle!(paths);
-  const capability = await dependencies.resolve({ task:input.task,config:input.config });
+  const capability = await dependencies.resolve({ task:input.task,config:input.config,prisma:input.prisma });
   const observed = validateStudioSourceResult(request,await dependencies.observe({ capability,request }));
   await finalizationResourceObservation.pathsIdle!(paths);
   const fresh = await input.prisma.remoteTaskResource.findMany({ where:{taskId:input.task.id},orderBy:{id:"asc"} });

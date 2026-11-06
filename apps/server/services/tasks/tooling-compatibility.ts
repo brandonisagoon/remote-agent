@@ -4,6 +4,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { RepositoryConfig } from "../../../../lib/config.ts";
+import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
 import { withToolingInstructions } from "../../../../lib/skills/compose.ts";
 import { prepareTooling } from "./tooling.ts";
 
@@ -42,11 +43,26 @@ export function describeUnavailableSkills(seed: string): string {
   return seed.replace(/{{SKILL:([a-z0-9+-]+)}}/g, (_token, skill: string) => `[requested skill ${skill}; resume only when its instructions are available]`);
 }
 
+/** An already prepared checkout for an exact release or legacy configured
+ * revision. Never installs: observers and bound operations only consume
+ * checkouts that activation/preparation already verified. */
+function preparedCheckout(root: string, revision: string): string {
+  if (!existsSync(root)) throw new Error(`Tooling ${revision} is not prepared; observation and bound operations never install tooling`);
+  const resolved = realpathSync(root);
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: resolved, encoding: "utf8", timeout: 10_000 }).trim();
+  if (head !== revision) throw new Error(`Prepared tooling checkout is at ${head}, not its bound revision ${revision}`);
+  return resolved;
+}
+
 /** Compatibility is a separate, named capability. It never replaces the task's
- * policy/tooling pin or treats the mutable source checkout as a capability. */
+ * policy/tooling pin or treats the mutable source checkout as a capability.
+ * `release` is the caller's explicit operation/selection binding; this inner
+ * consumer never reads the active selection itself. Without a release the
+ * pre-protocol configured-host revision is used (installing only when
+ * `install` is not false). */
 export async function resolveToolingCompatibility(input: {
   task: RemoteTask; repository: RepositoryConfig; installRoot: string; capability: ToolingCapability;
-  worktreePath: string; seed: string; pinnedToolingRoot?: string;
+  worktreePath: string; seed: string; pinnedToolingRoot?: string; release?: ToolingReleaseRecord; install?: boolean;
 }): Promise<{ prompt: string; receipt: CompatibilityReceipt }> {
   const { task, capability } = input;
   let root = input.pinnedToolingRoot;
@@ -57,8 +73,16 @@ export async function resolveToolingCompatibility(input: {
   let adapter: string | null = null;
   if (!instructions) {
     if (!input.repository.tooling) throw new Error(`No owner-configured host capability supplies ${capability}`);
-    root = await prepareTooling(input.repository, input.installRoot);
-    revision = input.repository.tooling.revision;
+    if (input.release) {
+      if (input.release.repositoryId !== input.repository.id) throw new Error("Bound tooling release belongs to another repository");
+      revision = input.release.revision;
+      root = preparedCheckout(input.release.checkout, revision);
+    } else {
+      revision = input.repository.tooling.revision;
+      root = input.install === false
+        ? preparedCheckout(path.join(input.installRoot, "tooling", input.repository.id, revision), revision)
+        : await prepareTooling(input.repository, input.installRoot);
+    }
     const manifestFile = committedFile(root, revision, ".remote-agent-capabilities.json");
     if (!manifestFile) throw new Error(`Configured tooling revision ${revision} does not declare a versioned ${capability} compatibility capability`);
     const manifest = Manifest.parse(JSON.parse(manifestFile.content));

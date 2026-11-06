@@ -17,14 +17,19 @@ import { forwardedLinearRoute } from "./webhooks/post.linear.ts";
 import { sourceMessageRoutes } from "./source-messages.ts";
 import { nativeReportRoutes } from "./tasks/native-reports.ts";
 import { computeRoutes } from "./tasks/compute.ts";
+import { toolingOperationGuard, toolingOperationRoutes } from "./tasks/tooling-operations.ts";
 
 export function mountRoutes(app: Hono<AppEnv>): void {
+  // Before every route: adapter effect callbacks must name their bound
+  // tooling operation once the repository has a release-aware generation.
+  app.use("/api/*", toolingOperationGuard());
   app.route("/health", healthRoutes);
   app.route("/api/diagnostics", diagnosticsRoutes);
   app.route("/api/source-messages", sourceMessageRoutes);
   app.route("/webhooks", webhookRoutes);
   app.route("/api/sessions", sessionRoutes);
   app.route("/api/sessions", sessionTaskRoutes);
+  app.route("/api/sessions", toolingOperationRoutes);
   app.route("/api/tasks", taskRoutes);
   app.route("/api/tasks", taskSupervisionRoutes);
   app.route("/api/tasks", taskCompletionRoutes);

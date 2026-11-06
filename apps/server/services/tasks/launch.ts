@@ -4,6 +4,7 @@ import { getRepositoryConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { spawnAgentThread } from "../launches/spawn.ts";
 import { beginTask } from "./store.ts";
+import { getActiveToolingRelease } from "./tooling-releases.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { provisionTaskWorktree } from "./provision.ts";
 import { createHash } from "node:crypto";
@@ -27,11 +28,14 @@ export async function launchTask(input: LaunchInput) {
 async function performLaunch(input: LaunchInput, requestFingerprint: string) {
   const repository = getRepositoryConfig(input.config, input.repositoryId);
   if (!repository.tooling) throw new Error("Select a repository with external tooling");
-  const task = await beginTask(input.prisma, { requestKey: input.requestKey, repository, machineId: input.config.machine, branchName: input.branchName, requestFingerprint });
+  // New tasks start from the active generation (the next independent
+  // operation boundary); a retried launch keeps its recorded pin.
+  const selection = await getActiveToolingRelease({ prisma: input.prisma, config: input.config, repositoryId: repository.id });
+  const task = await beginTask(input.prisma, { requestKey: input.requestKey, repository, machineId: input.config.machine, branchName: input.branchName, requestFingerprint, selection });
   if (task.primarySessionId && await input.prisma.runtimeInstruction.findUnique({ where: { id: `launch:${task.requestKey}` } })) return task;
   try {
     const worktreePath = await provisionTaskWorktree(input.prisma, task.id, repository, task.id);
-    const { prompt, toolingRoot } = await prepareTaskPrompt({ ...input, repository, task, worktreePath,
+    const { prompt, toolingRoot } = await prepareTaskPrompt({ ...input, repository, task, worktreePath, release: selection?.release ?? null,
       installRoot: input.config.installRoot, seed: `Use {{SKILL:prepare}}.\nTask: ${task.id}\n\n${input.prompt}` });
     await spawnAgentThread({ config: { ...input.config, activeRepositoryId: repository.id, repository }, prisma: input.prisma, agentRuntime: input.runtime, launchKey: task.requestKey, provider: input.provider, prompt, machine: input.config.machine, worktreePath, lifecycle: "persistent", role: "primary", taskId: task.id, toolingRoot });
     return input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });

@@ -1,5 +1,6 @@
 import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { RepositoryConfig } from "../../../../lib/config.ts";
+import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
 import { composeForPrompt, withToolingInstructions } from "../../../../lib/skills/compose.ts";
 import { prepareTooling } from "./tooling.ts";
 import { describeUnavailableSkills, resolveToolingCompatibility } from "./tooling-compatibility.ts";
@@ -12,8 +13,12 @@ export async function prepareTaskPrompt(input: {
   prisma: PrismaClient; task: RemoteTask; repository: RepositoryConfig;
   installRoot: string; worktreePath: string; provider: "codex" | "claude";
   seed: string; compose?: typeof composeForPrompt;
+  /** The selection the task was pinned from. Its already prepared immutable
+   * checkout is used as-is; preparation never reinstalls a release. */
+  release?: ToolingReleaseRecord | null;
 }): Promise<{ prompt: string; toolingRoot?: string }> {
   const { task } = input;
+  const release = input.release && input.release.revision === task.toolingRevision && input.release.repositoryId === task.repositoryId ? input.release : undefined;
   const assertAvailable = async () => {
     const current = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
     if ((current.ownerPaused || current.phase === "closed")) throw new Error("Task preparation is closed; preserve its existing work");
@@ -21,7 +26,7 @@ export async function prepareTaskPrompt(input: {
   await assertAvailable();
   let toolingRoot: string | undefined;
   try {
-    toolingRoot = await prepareTooling({ ...input.repository, tooling: { root: task.toolingRoot, revision: task.toolingRevision } }, input.installRoot);
+    toolingRoot = release ? release.checkout : await prepareTooling({ ...input.repository, tooling: { root: task.toolingRoot, revision: task.toolingRevision } }, input.installRoot);
     await input.prisma.remoteTask.update({ where: { id: task.id }, data: { pinnedToolingRoot: toolingRoot } });
     const prompt = await (input.compose ?? composeForPrompt)(input.worktreePath, input.seed, input.provider, input.repository.skillsRoot, toolingRoot);
     await input.prisma.remoteTask.update({ where: { id: task.id }, data: { phase: "preparing", environmentStatus: "preparing", recoveryDetail: null } });
@@ -31,7 +36,8 @@ export async function prepareTaskPrompt(input: {
     const detail = error instanceof Error ? error.message : String(error);
     let compatibilityFailure: string;
     try {
-      const compatibility = await resolveToolingCompatibility({ ...input, capability: "prepare", pinnedToolingRoot: toolingRoot });
+      const { release: _selected, ...rest } = input;
+      const compatibility = await resolveToolingCompatibility({ ...rest, capability: "prepare", pinnedToolingRoot: toolingRoot, ...(release ? { release } : {}) });
       await assertAvailable();
       // The task predates its primary session. Persist the capability receipt
       // before launch, independently of the unchanged task tooling pin.

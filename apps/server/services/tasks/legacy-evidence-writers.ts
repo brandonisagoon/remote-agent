@@ -5,7 +5,7 @@ import { CleanupWritersInput, evidenceWriterIds, validateCleanupWritersResult } 
 import { resolveCleanupObserver, runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
-type Database = Pick<PrismaClient, "remoteTaskResource">;
+type Database = Pick<PrismaClient, "remoteTaskResource" | "runtimeMetadataEvent">;
 export const evidenceWriterObservation = { resolve: resolveCleanupObserver, observe: runCleanupResourceObserver };
 
 /** Reuses the configured, immutable read-only inspector. A stale Allocated
@@ -28,7 +28,7 @@ export async function assertLegacyEvidenceWriters(input: { prisma: Database; con
     const request = CleanupWritersInput.parse({ version: 1, mode: "stopped-writers", task: { id: input.task.id, primarySessionId: input.task.primarySessionId,
       worktreePath: input.task.worktreePath, toolingRevision: input.task.toolingRevision }, resources,
       evidence: { resourceId: input.entry.resourceId, path: input.entry.target.path, planDigest: finalizationDigest(input.entry.target) }, writerResourceIds });
-    const capability = await dependencies.resolve({ task: input.task, config: input.config });
+    const capability = await dependencies.resolve({ task: input.task, config: input.config, prisma: input.prisma });
     validateCleanupWritersResult(request, await dependencies.observe({ capability, request }));
   }
   const assertUnchanged = async (database: Database = input.prisma) => {

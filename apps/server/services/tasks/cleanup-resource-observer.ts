@@ -3,7 +3,9 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 import { z } from "zod";
-import type { RemoteTask } from "../../../../generated/prisma/client.ts";
+import type { PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
+import type { ToolingOperationBinding, ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
+import { FINALIZATION_PREPARED_ACTION, TOOLING_OPERATION_ENV, boundRelease, currentToolingOperation, producingToolingOperation } from "./tooling-operations.ts";
 import { getRepositoryConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { CleanupObservationContracts, resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { CleanupObserverBatchInput } from "./cleanup-observer-schema.ts";
@@ -132,13 +134,28 @@ export async function verifyCleanupObserver(capability: CleanupObserverCapabilit
   try { return await checkedCapability(capability, retainedPreview); } catch (error) { throw error instanceof CleanupObserverError ? error : failure(); }
 }
 
-export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig }, resolve = resolveToolingCompatibility) {
+/** Cleanup proofs keep the accepted finalization's operation binding: an
+ * explicit release, the guarded callback's binding, else the operation that
+ * prepared the task's latest finalization. None is a pre-protocol
+ * finalization and keeps the legacy configured-host revision. */
+export async function cleanupObserverRelease(input: { task: RemoteTask; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingReleaseRecord | null }) {
+  const bound = boundRelease(input.release);
+  if (bound !== undefined || !input.prisma || !input.task.primarySessionId) return bound ?? null;
+  const prepared = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.task.primarySessionId, source: `finalizer:${input.task.id}`, action: FINALIZATION_PREPARED_ACTION }, orderBy: { sequence: "desc" } });
+  if (!prepared) return null;
+  return (await producingToolingOperation({ prisma: input.prisma, task: input.task, reference: { type: "finalization", id: prepared.key } }))?.release ?? null;
+}
+
+export async function resolveCleanupObserver(input: { task: RemoteTask; config: ServerConfig; prisma?: Pick<PrismaClient, "runtimeMetadataEvent">; release?: ToolingReleaseRecord | null }, resolve = resolveToolingCompatibility) {
   try {
     if (!input.task.worktreePath) throw failure();
+    const release = await cleanupObserverRelease(input);
     const selected = await resolve({ task: input.task, repository: getRepositoryConfig(input.config, input.task.repositoryId), installRoot: input.config.installRoot,
-      capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}) });
+      capability: "cleanup", worktreePath: input.task.worktreePath, seed: "Read-only exact resource observation", ...(input.task.pinnedToolingRoot ? { pinnedToolingRoot: input.task.pinnedToolingRoot } : {}),
+      ...(release ? { release } : {}) });
     const receipt = selected.receipt;
-    if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision) throw failure();
+    if (receipt.capability !== "cleanup" || receipt.source !== "configured-host" || !receipt.adapter || receipt.taskToolingRevision !== input.task.toolingRevision
+      || release && receipt.capabilityRevision !== release.revision) throw failure();
     const value = CleanupObserverCapability.parse({ version: 1, source: receipt.source, checkout: receipt.checkout, revision: receipt.capabilityRevision,
       adapter: receipt.adapter, adapterSha256: hash(await readFile(receipt.adapter)) });
     if (value.checkout === input.task.worktreePath || inside(input.task.worktreePath, value.checkout)) throw failure();
@@ -149,7 +166,7 @@ export async function resolveCleanupObserver(input: { task: RemoteTask; config: 
 /** Private stdin and bounded JSON output only. The CLI action must use the
  * tooling's read-only inspectors; no control socket or primary-session identity
  * is inherited, and calling ordinary reconciliation is not this protocol. */
-export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability }) {
+export async function runCleanupResourceObserver(input: { capability: CleanupObserverCapability; request: unknown; timeoutMs?: number; compatibleCapability?: CleanupObserverCapability; operation?: Pick<ToolingOperationBinding, "operationId"> | null }) {
   const timeoutMs = input.timeoutMs ?? 60_000;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) throw failure("OBSERVER_INPUT");
   let bytes: string, request: unknown;
@@ -167,6 +184,10 @@ export async function runCleanupResourceObserver(input: { capability: CleanupObs
   const capability = input.compatibleCapability ? await verifyCleanupObserver(input.compatibleCapability, true) : original;
   const env: Record<string, string> = {};
   for (const name of ["PATH", "HOME", "TMPDIR", "USER", "CLOUDFLARE_API_TOKEN", "DRAFTED_CLOUDFLARE_CREDENTIALS"]) if (process.env[name] !== undefined) env[name] = process.env[name]!;
+  // The strict version-1 observer envelope is unchanged; an operation binding
+  // travels only as process context.
+  const operation = input.operation === undefined ? currentToolingOperation() : input.operation;
+  if (operation) env[TOOLING_OPERATION_ENV] = operation.operationId;
   let output: string;
   try { output = await executeOwnedObserver([process.execPath, "--no-env-file", capability.adapter, "cleanup", "observe-resource"], { cwd: capability.checkout, input: bytes, timeoutMs, env, failureRequest: request }); }
   catch (error) { throw error instanceof CleanupObserverError ? error : failure("OBSERVER_TRANSPORT"); }
