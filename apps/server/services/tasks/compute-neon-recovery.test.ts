@@ -11,8 +11,9 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { bindComputeResource, requestCompute } from "./compute-admission.ts";
 import { configureCompute } from "./compute-configuration.ts";
 import { canonicalSha256, ComputeNeonRecoveryProof, ReviewedLegacyNeonSources, neonRecoveryInputDigest, readNeonRecovery, readRecoverySource, readReleaseBlobs, recoverComputeNeon, verifyBoundObserver, type BoundToolingOperation, type NeonRecoveryInput } from "./compute-neon-recovery.ts";
-import { runWithToolingOperation } from "./tooling-operations.ts";
-import { readToolingOperation } from "./tooling-releases.ts";
+import { matchToolingCallback, resourceGroupCode, runWithToolingOperation } from "./tooling-operations.ts";
+import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
+import { accountingCode } from "./compute-observer.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
@@ -414,22 +415,38 @@ test("operation input digest is canonical, excludes only the volatile lock and m
   expect(neonRecoveryInputDigest({ ...request, outcome: "owned" })).not.toBe(neonRecoveryInputDigest(request));
 });
 
-// FOUNDATION PORT (DRA-24): the service is unreachable. No route, operation
-// kind or admission hook is wired yet; the admission hook stays null until the
-// reader handoff and lost-acknowledgment contract are closed. The reviewed
-// isolated candidate's route expectations, for the later integration: an
-// authenticated POST answers 400 for an unknown field or an unchanged recipe
-// digest, 409 `operation-required` without an admitted binding (nothing
-// written, no private path in the body), and 401 without a bearer.
-test("route is not exposed in this foundation port: the exact request reaches no handler and writes nothing", async () => {
+// The route is wired behind the tooling-operation guard. The service's binding
+// is ONLY the guarded callback scope (currentToolingOperation): without an
+// admitted operation nothing recovers, and every refusal writes nothing.
+test("the guarded route never recovers without its admitted operation scope, and refusals write nothing", async () => {
   const f = await fixture();
   const app = createApp({ config, prisma: db.prisma, agentRuntime: createFakeAgentRuntime() });
-  const response = await app.request("/api/tasks/task/compute-neon-recovery", { method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json" }, body: JSON.stringify(f.input.request) });
-  expect(response.status).toBe(404);
-  expect(await events()).toBe(0);
-  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
-  const unauthenticated = await app.request("/api/tasks/task/compute-neon-recovery", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(f.input.request) });
-  expect(unauthenticated.status).toBe(401);
+  const post = (body: unknown, headers: Record<string, string> = {}, task = "task") => app.request(`/api/tasks/${task}/compute-neon-recovery`,
+    { method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+  const state = async () => ({ events: await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }), operation: await operationRow(), projection: await projection(f),
+    writes: await stateWrites(), legacy: await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }) });
+  const before = await state();
+  // No bearer.
+  expect((await app.request("/api/tasks/task/compute-neon-recovery", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(f.input.request) })).status).toBe(401);
+  // Pre-protocol (no active generation) and no header: the handler runs with no scope and the service refuses.
+  const unscoped = await post(f.input.request);
+  expect(unscoped.status).toBe(409);
+  expect(await unscoped.json()).toEqual({ error: "Neon recovery could not be verified; preserve the receipt, allocation and provider resources" });
+  // The body can never carry a binding or release: the request is strict.
+  expect((await post({ ...f.input.request, operation: f.input.operation })).status).toBe(400);
+  // After release-aware activation a header-less recovery is a new effect.
+  await db.prisma.toolingSelection.create({ data: { repositoryId: "repo", generation: 5, releaseId: release.id, activatedAt: new Date() } });
+  const headerless = await post(f.input.request);
+  expect(headerless.status).toBe(428);
+  expect(await headerless.json()).toMatchObject({ code: "operation-required" });
+  // An unknown operation, another task's path, or an input other than the bound digest is refused by the guard.
+  const unknown = await post(f.input.request, { "x-remote-agent-operation": "op-missing" });
+  expect(unknown.status).toBe(409); expect(await unknown.json()).toMatchObject({ code: "operation-unknown" });
+  const foreign = await post(f.input.request, { "x-remote-agent-operation": "op-recovery" }, "other-task");
+  expect(foreign.status).toBe(409); expect(await foreign.json()).toMatchObject({ code: "operation-ownership" });
+  const changed = await post({ ...f.input.request, recipeHash: "9".repeat(64) }, { "x-remote-agent-operation": "op-recovery" });
+  expect(changed.status).toBe(400); expect(await changed.json()).toMatchObject({ code: "operation-input" });
+  expect(await state()).toEqual(before);
 });
 
 test("lost acknowledgment from a new lock holder after publication reproduces the original result", async () => {
@@ -1091,4 +1108,176 @@ test.each(["plain", "baseline"] as const)("the production observer path receives
   expect(seen).toEqual([kind === "baseline" ? baselineContracts : recoveryContracts, kind === "baseline" ? baselineContracts : recoveryContracts]);
   if (kind === "baseline") expect(JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } })).value!).handoff.rows
     .map((row: { consumerKind: string }) => row.consumerKind)).toContain("compute-baseline");
+});
+
+// ---------------------------------------------------------------------------
+// T1 (acceptance plan, section 3): the REAL writer's commit is exactly what the
+// public read, the completion evidence and code selection see. No seeded record.
+// ---------------------------------------------------------------------------
+const readResult = (operationId = "op-recovery") => createApp({ config, prisma: db.prisma, agentRuntime: createFakeAgentRuntime() })
+  .request(`/api/tasks/task/compute-neon-recovery/${operationId}`, { headers: { authorization: `Bearer ${config.apiKey}` } });
+const groupCode = async (f: Awaited<ReturnType<typeof fixture>>) => {
+  const task = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } });
+  return { environment: await resourceGroupCode({ prisma: db.prisma, task, reference: { type: "compute-environment", id: f.environment.id } }),
+    offer: await resourceGroupCode({ prisma: db.prisma, task, reference: { type: "compute-offer", id: f.offer.id } }),
+    reclaim: await accountingCode({ config, prisma: db.prisma }, task, { environment: { id: f.environment.id } }, "reclaim-observe") };
+};
+
+test("real writer: the committed recovery is the exact public result, its completion evidence and the group's code, never the active release", async () => {
+  const f = await fixture();
+  await legacyRows(f);
+  const result = await recover(f.input, f.read, f.head);
+  const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } });
+  expect(await operationRow()).toMatchObject({ status: "completed", completionEvidence: { kind: "compute-neon-recovery-committed", reference: String(event.sequence) } });
+  // The public read returns exactly the client's committed-result envelope.
+  const response = await readResult();
+  expect(response.status).toBe(200);
+  const { lockPid: _pid, ...stable } = f.input.request;
+  expect(await response.json()).toEqual({
+    operation: { operationId: "op-recovery", requestKey: f.input.operation.requestKey, inputDigest: f.input.operation.inputDigest, taskId: "task", sessionId: "primary",
+      kind: "compute-neon-recovery", existingOperationId: f.offer.id, resourceKey: "runtime-development", release: { id: release.id, revision: release.revision, tree: release.tree } },
+    request: stable, result });
+  // The handed-off group runs the recovery operation's release.
+  const recovered = (selected: Awaited<ReturnType<typeof groupCode>>) => {
+    for (const value of Object.values(selected)) {
+      expect(value.code).toMatchObject({ id: release.id, repositoryId: "repo", revision: release.revision, checkout: release.checkout });
+      expect(value.binding).toMatchObject({ operationId: "op-recovery", kind: "compute-neon-recovery", status: "completed" });
+    }
+  };
+  recovered(await groupCode(f));
+  // Activating another release does not move the group's code.
+  await db.prisma.toolingRelease.create({ data: { id: "tr_other", repositoryId: "repo", revision: "7".repeat(40), tree: "5".repeat(40), policyBlob: "e".repeat(40), checkout: "/install/tooling/repo/other",
+    manifest: releaseManifest, lockfileDigest: "f".repeat(64), bunVersion: "1.3.14" } });
+  await db.prisma.toolingSelection.create({ data: { repositoryId: "repo", generation: 6, releaseId: "tr_other", activatedAt: new Date() } });
+  recovered(await groupCode(f));
+  expect((await readResult()).status).toBe(200);
+});
+
+test("real writer rollback: no public result, no completion, and the legacy snapshot still selects the group's code", async () => {
+  const f = await fixture();
+  await legacyRows(f); await oldReader();
+  await expect(recover(f.input, f.read, f.head)).rejects.toThrow("cannot read drafted.runtime version 2");
+  const response = await readResult();
+  expect(response.status).toBe(200);
+  expect(await response.json()).toBeNull();
+  expect(await operationRow()).toMatchObject({ status: "running", completionEvidence: null });
+  for (const value of Object.values(await groupCode(f))) expect(value).toEqual({ code: { repositoryId: "repo", revision: pin, checkout: `/install/tooling/repo/${pin}` }, binding: null });
+});
+
+// The client (Drafted runtime-neon-observer neonRecoveryInputDigest) pins the
+// same golden value for this exact vector; the server side pins it here for
+// both the service and the guard's callback projection.
+test("client and server request digests meet at one golden vector; only the lock PID is outside it", async () => {
+  const vector = { offerId: "11111111-1111-4111-8111-111111111111", operationId: "22222222-2222-4222-8222-222222222222", resourceKey: "runtime-development",
+    previousRecipeHash: "b".repeat(64), recipeHash: "c".repeat(64), baselineFile: "/private/runtime/neon-recovery-baseline.json", lockPid: 4242, outcome: "absent" as const,
+    sourceRevision: "22406a5eddb33f983a669f8f686b9a416beac113" };
+  const golden = "42f8ed79662f5fb88f64ac9cd6b822002706070ef0e889689488c9e3731d5086";
+  const guard = matchToolingCallback("POST", "/api/tasks/task/compute-neon-recovery", vector)!.callback;
+  for (const body of [vector, { ...vector, lockPid: 1 }]) {
+    expect(neonRecoveryInputDigest(body)).toBe(golden);
+    expect(canonicalDigest(await guard.input(body, undefined as never))).toBe(golden);
+  }
+  expect(neonRecoveryInputDigest({ ...vector, outcome: "owned" })).not.toBe(golden);
+});
+
+// ---------------------------------------------------------------------------
+// Service-level handoff wiring (C473 review of 89c070d, T1–T3): the cutoff,
+// the legacy basis's executed revision and the group digest are decided under
+// the commit lock by the service, not only by the helper's own tests.
+// ---------------------------------------------------------------------------
+/** The group's two legacy readers at an explicit snapshot revision. */
+async function legacyRowsAt(f: Awaited<ReturnType<typeof fixture>>, revision: string) {
+  for (const [index, row] of [{ consumerKind: "compute-environment", consumerId: f.environment.id }, { consumerKind: "compute-offer", consumerId: f.offer.id }].entries())
+    await db.prisma.toolingLegacyConsumer.create({ data: { id: `legacy-${index}`, repositoryId: "repo", taskId: "task", ...row, status: "retained", provenance: "exact", revision, checkout: `/install/tooling/repo/${revision}` } });
+}
+/** A runtime capability the server granted the primary at `at`. */
+const grantRuntime = (revision: string, at: string) => db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", action: "tooling-capability", key: `grant-${at}`, source: "task:task",
+  occurredAt: new Date(at), value: JSON.stringify({ contract: "remote-agent.tooling-capability/v1", capability: "runtime", capabilityRevision: revision }) } });
+/** Everything the service may write. */
+const serviceState = async (f: Awaited<ReturnType<typeof fixture>>) => ({ recovery: await db.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-neon-recovery" } }),
+  writes: await stateWrites(), legacy: await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }), operation: await operationRow(), projection: await projection(f), rows: await rows() });
+const handedOff = async (revision: string) => (await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }))
+  .map(row => ({ id: row.id, status: row.status, revision: row.revision, checkout: row.checkout, resolution: row.resolution }));
+const resolvedAt = (revision: string) => ["legacy-0", "legacy-1"].map(id => ({ id, status: "resolved", revision, checkout: `/install/tooling/repo/${revision}`,
+  resolution: { kind: "compute-neon-recovery", reference: "op-recovery" } }));
+
+// T1: journaled (provider-rejection) basis, original request 2026-11-04T10:01:00Z.
+const granted = "1".repeat(40), requestedAt = "2026-11-04T10:01:00.000Z";
+test.each(["running", "unknown"] as const)("journaled basis: a runtime grant after the original request never authorizes the handoff; %s status and every row are preserved", async status => {
+  const f = await fixture();
+  await legacyRowsAt(f, granted);
+  await grantRuntime(granted, "2026-11-04T10:01:01.000Z");
+  if (status === "unknown") await db.prisma.toolingOperation.update({ where: { id: "op-recovery" }, data: { status } });
+  const input = { ...f.input, operation: (await readToolingOperation({ prisma: db.prisma, operationId: "op-recovery" }))! };
+  const before = await serviceState(f);
+  // Begin-time eligibility is advisory (any grant counts); the commit's proof-derived cutoff decides.
+  await expect(recover(input, f.read, f.head)).rejects.toThrow(`granted by ${requestedAt}`);
+  expect(await serviceState(f)).toEqual(before);
+  expect(before.operation).toMatchObject({ status, completionEvidence: null });
+});
+
+test("journaled basis: a runtime grant exactly at the original request (inclusive) hands off its readers and commits", async () => {
+  const f = await fixture();
+  await legacyRowsAt(f, granted);
+  await grantRuntime(granted, requestedAt);
+  await recover(f.input, f.read, f.head);
+  expect(await handedOff(granted)).toEqual(resolvedAt(granted));
+  expect(await operationRow()).toMatchObject({ status: "completed" });
+  expect(JSON.parse((await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery" } })).value!).handoff.rows.map((row: { revision: string }) => row.revision)).toEqual([granted, granted]);
+});
+
+// T2: the DRA-16 shape — legacy provider-rejection basis WITH the group's legacy readers.
+const executedGrant = "f4f93c8bb2f8497c69405f548ac0efcb8dc67e8f";
+test.each(["pin", "granted-before-start"] as const)("legacy basis with its group: readers at the executed revision (%s) are handed off with snapshots kept", async variant => {
+  const f = await legacyFixture();
+  const executed = variant === "pin" ? pin : executedGrant;
+  if (variant === "granted-before-start") {
+    legacyOf(f.proof).source.revision = executed;
+    await grantRuntime(executed, "2026-11-05T23:16:00.000Z");
+  }
+  await legacyRowsAt(f, executed);
+  expect(await recover(f.input, f.read, f.head, f.blobs, f.clock)).toMatchObject({ basis: "legacy-provider-rejection", outcome: "absent" });
+  expect(await handedOff(executed)).toEqual(resolvedAt(executed));
+  expect(await operationRow()).toMatchObject({ status: "completed" });
+});
+
+test("legacy basis with its group: readers at another (even granted) revision than the executed one are refused with nothing written", async () => {
+  const f = await legacyFixture();
+  // The proof's executed source is the pin; the readers ran a granted revision.
+  await grantRuntime(executedGrant, "2026-11-05T23:16:00.000Z");
+  await legacyRowsAt(f, executedGrant);
+  const before = await serviceState(f);
+  await expect(recover(f.input, f.read, f.head, f.blobs, f.clock)).rejects.toThrow("is not the reviewed executed revision");
+  expect(await serviceState(f)).toEqual(before);
+});
+
+// T3: the group read before observation is pinned by its digest under the lock.
+const groupChanges: Record<string, { inject: (f: Awaited<ReturnType<typeof fixture>>) => Promise<unknown>; expected: (legacy: Awaited<ReturnType<typeof serviceState>>["legacy"]) => unknown }> = {
+  // A baseline reader of exactly this resource appears (it would also add compute-baseline/v1 to the required contracts).
+  "baseline reader appears": {
+    inject: () => db.prisma.toolingLegacyConsumer.create({ data: { id: "legacy-2", repositoryId: "repo", taskId: "task", consumerKind: "compute-baseline", consumerId: "task:development",
+      status: "retained", provenance: "exact", revision: pin, checkout: `/install/tooling/repo/${pin}` } }),
+    expected: legacy => [...legacy.map(row => row.id), "legacy-2"],
+  },
+  // A member's reader is resolved by ordinary evidence, shrinking the handed-off set.
+  "offer reader resolved elsewhere": {
+    inject: () => db.prisma.toolingLegacyConsumer.update({ where: { id: "legacy-1" }, data: { status: "resolved", resolution: { kind: "compute-decline", reference: "external" }, resolvedAt: new Date() } }),
+    expected: legacy => legacy.map(row => row.id),
+  },
+};
+test.each(Object.keys(groupChanges))("a group change during observation (%s) refuses at the lock; only the injected change remains", async name => {
+  const f = await fixture(), change = groupChanges[name]!;
+  await legacyRows(f);
+  const before = await serviceState(f);
+  let injected = false;
+  const read = async () => { if (!injected) { injected = true; await change.inject(f); } return f.read(); };
+  await expect(recover(f.input, read, f.head)).rejects.toThrow("group changed since it was read");
+  expect(injected).toBe(true);
+  const after = await serviceState(f);
+  // No service write: the recovery event, state writes, operation, projection and allocations are unchanged.
+  expect({ ...after, legacy: undefined }).toEqual({ ...before, legacy: undefined });
+  // Legacy rows differ from before ONLY by the externally injected pre-commit change; none was resolved by the operation.
+  expect(after.legacy.map(row => row.id)).toEqual(change.expected(before.legacy));
+  expect(after.legacy.filter(row => (row.resolution as { reference?: string } | null)?.reference === "op-recovery")).toEqual([]);
+  for (const row of before.legacy.filter(row => row.id !== "legacy-1" || name !== "offer reader resolved elsewhere")) expect(after.legacy.find(value => value.id === row.id)).toEqual(row);
 });

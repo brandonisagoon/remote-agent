@@ -12,20 +12,11 @@
  */
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
-import { canonicalSha256, neonRecoveryInputDigest } from "./compute-neon-recovery.ts";
+import { canonicalSha256, type ComputeNeonRecoveryProof, NeonRecoveryEventAction, neonRecoveryEvidence, neonRecoveryInputDigest, neonRecoveryJournalKey } from "./compute-neon-recovery.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
 export const seededValues = { head: "22406a5eddb33f983a669f8f686b9a416beac113", revision: "a".repeat(40), pin: "d".repeat(40), oldHash: "b".repeat(64), nextHash: "c".repeat(64) } as const;
 const { head, revision, pin, oldHash, nextHash } = seededValues;
-
-/** Test mirror of the writer's staged evidence (design §7: + candidateSha256). */
-export const stagedEvidence = (proof: any) => {
-  const { baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision } = proof;
-  return finalizationDigest({ baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
-};
-/** Test mirror of the writer's transition key. */
-const transitionKey = (environmentId: string, resourceId: string, request: { offerId: string; operationId: string; previousRecipeHash: string; recipeHash: string }) =>
-  finalizationDigest({ environmentId, resourceId, offerId: request.offerId, operationId: request.operationId, previousRecipeHash: request.previousRecipeHash, recipeHash: request.recipeHash });
 
 /** A recovery request for `taskId`; its operation binding must use this
  * request's offerId as existingOperationId and its lock-free digest. */
@@ -66,9 +57,9 @@ export async function seedCommittedNeonRecovery(prisma: PrismaClient, binding: T
     rows: [{ id: legacy.id, consumerKind: legacy.consumerKind, consumerId: legacy.consumerId, revision: legacy.revision, checkout: legacy.checkout }] };
   const value = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskIdentity: `identity-${task}`, request,
     environment: { id: environmentId }, resource: { id: resourceId }, offer: { id: request.offerId }, allocations: { offers: [], slots: [], wait: null }, operation: binding,
-    proof, observer, evidence: stagedEvidence(proof), projectionIdentity: "6".repeat(64), handoff, stateWrite, result };
-  const event = await prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `compute:${task}`, action: "compute-neon-recovery",
-    key: transitionKey(environmentId, resourceId, request), value: JSON.stringify(value) } });
+    proof, observer, evidence: neonRecoveryEvidence(proof as ComputeNeonRecoveryProof), projectionIdentity: "6".repeat(64), handoff, stateWrite, result };
+  const event = await prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `compute:${task}`, action: NeonRecoveryEventAction,
+    key: neonRecoveryJournalKey(environmentId, resourceId, request), value: JSON.stringify(value) } });
   /** Exactly what the public read returns for this record. */
   const { lockPid: _pid, ...stable } = request;
   const committed = { operation: { operationId: binding.operationId, requestKey: binding.requestKey, inputDigest: binding.inputDigest, taskId: task, sessionId: binding.sessionId, kind: "compute-neon-recovery" as const,

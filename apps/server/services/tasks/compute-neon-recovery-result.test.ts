@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test
 import { z } from "zod";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "./compute-neon-recovery-result.ts";
-import { seedCommittedNeonRecovery, seededInputDigest, seededRecoveryRequest, stagedEvidence } from "./compute-neon-recovery-result.fixture.ts";
+import { seedCommittedNeonRecovery, seededInputDigest, seededRecoveryRequest } from "./compute-neon-recovery-result.fixture.ts";
+import { neonRecoveryEvidence } from "./compute-neon-recovery.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 
 let db: TestDatabase;
@@ -180,7 +181,7 @@ test.each<[string, (value: any) => void, string]>([
   ["candidate digest without matching evidence", value => { value.proof.candidateSha256 = "5".repeat(64); }, "event-mismatch"],
   ["first commit observed over a published candidate", value => { value.proof.canonical = "candidate"; }, "event-mismatch"],
   ["first commit whose canonical receipt was not the baseline", value => { value.proof.receiptSha256 = value.proof.candidateSha256; }, "event-mismatch"],
-  ["candidate equal to the baseline", value => { value.proof.candidateSha256 = value.proof.baselineSha256; value.evidence = stagedEvidence(value.proof); }, "event-mismatch"],
+  ["candidate equal to the baseline", value => { value.proof.candidateSha256 = value.proof.baselineSha256; value.evidence = neonRecoveryEvidence(value.proof); }, "event-mismatch"],
   ["handoff row twice", value => { value.handoff.rows.push(value.handoff.rows[0]); }, "event-mismatch"],
   ["handoff row with an extra field", value => { value.handoff.rows[0].extra = 1; }, "event-unreadable"],
   ["handoff snapshot revision", value => { value.handoff.rows[0].revision = "e".repeat(40); }, "event-mismatch"],
