@@ -777,6 +777,7 @@ export async function readOperationStateEvidence(input: { prisma: PrismaClient; 
     add(reader.operationId, reader.format, `Retained ${reader.consumerKind} ${reader.consumerId}`);
   // Retained first-bootstrap readers: exact provenance, or a 409 refusal.
   const legacy = await input.prisma.toolingLegacyConsumer.findMany({ where: { repositoryId: binding.repositoryId, taskId: binding.taskId, status: "retained" }, take: 1001 });
+  if (legacy.length > 1000) throw new ToolingOperationRefused("operation-input", "Retained legacy consumer inventory exceeds its bound; this state cannot be proven");
   for (const row of legacy) {
     if (row.provenance === "unavailable") throw new ToolingOperationRefused("operation-unknown", `Retained ${row.consumerKind} ${row.consumerId} has unresolved executable provenance: ${row.detail ?? "unavailable"}`);
     consumers.set(`legacy:${row.id}`, null);
