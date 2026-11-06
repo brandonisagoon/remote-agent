@@ -153,9 +153,17 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.equal(fixtureCode, 0, fixtureError);
     const beforeMigration = JSON.parse(fixtureText);
     assert.equal(beforeMigration.version, 1);
+    assert.equal(typeof beforeMigration.pending, "string");
+    assert(beforeMigration.pending.length > 0, "The fixture must carry an uncertain provider outcome");
+    assert(Array.isArray(beforeMigration.resources) && beforeMigration.resources.some((resource: Record<string, unknown>) =>
+      typeof resource.id === "string" && resource.id.length > 0 && resource.released !== true), "The fixture must carry an unreleased exact provider ID");
+    assert.equal(beforeMigration.setupComplete, true);
+    assert.equal(beforeMigration.schemaApplied, true);
+    assert.equal(beforeMigration.fixturesComplete, true);
     const runtimeFile = path.join(stateDirectory, "runtimes", taskId, "development", "runtime.json");
     await mkdir(path.dirname(runtimeFile), { recursive: true, mode: 0o700 });
     await writeFile(runtimeFile, JSON.stringify(beforeMigration, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    // This is ordinary registration of synthetic input, not a bound effect.
     await json(await server.socketRequest(`/api/sessions/${sessionId}/task/resources`, { method: "PUT",
       headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "runtime-development", kind: "task-runtime",
         purpose: "development", externalId: runtimeFile, state: "allocated", metadata: { recipeHash: beforeMigration.recipeHash } }) }));
@@ -168,15 +176,24 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.deepEqual({ ...migratedState, version: 1 }, beforeMigration, "Migration must preserve every saved ID, pending outcome and setup flag");
     const migrationOperation = await server.db.prisma.toolingOperation.findFirstOrThrow({ where: { taskId, requestKey: migrationKey } });
     assert.equal(migrationOperation.status, "completed");
-    const registered = await server.db.prisma.toolingStateWrite.findMany({ where: { operationId: migrationOperation.id } });
+    const registered = await server.db.prisma.toolingStateWrite.findMany({ where: { taskId, family: "drafted.runtime", scopeKey: "runtime-development", version: 2 } });
     assert.equal(registered.length, 1);
-    assert.equal(registered[0]!.version, 2);
-    assert.equal(registered[0]!.scopeKey, "runtime-development");
+    const writer = await server.db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: registered[0]!.operationId } });
+    assert(writer.id === migrationOperation.id || writer.parentOperationId === migrationOperation.id, "The migration write must belong to its command or exact child");
+    const migrationReceiptFile = path.join(path.dirname(runtimeFile), "state-migrations", "runtime.json.drafted.runtime.1-2.json");
+    const migrationReceipt = JSON.parse(await readFile(migrationReceiptFile, "utf8"));
+    assert.equal(migrationReceipt.phase, "committed");
+    assert.equal(migrationReceipt.operationId, writer.id);
+    assert.match(migrationReceipt.outputDigest, /^[a-f0-9]{64}$/);
+    const operationCount = await server.db.prisma.toolingOperation.count({ where: { taskId } });
+    const taskWrites = await server.db.prisma.toolingStateWrite.findMany({ where: { taskId }, orderBy: { sequence: "asc" } });
     const replayed = await runCli(b.checkout, migrationKey, undefined, "migrate-state");
     assert.equal(replayed.code, 0, replayed.stderr);
     assert.equal(JSON.parse(replayed.stdout).alreadySettled, true);
     assert.equal(await readFile(runtimeFile, "utf8"), migratedBytes, "An acknowledged migration replay must not rewrite state");
-    assert.deepEqual(await server.db.prisma.toolingStateWrite.findMany({ where: { operationId: migrationOperation.id } }), registered);
+    assert.equal(await server.db.prisma.toolingOperation.count({ where: { taskId } }), operationCount, "Replay must not create a root or child operation");
+    assert.deepEqual(await server.db.prisma.toolingStateWrite.findMany({ where: { taskId }, orderBy: { sequence: "asc" } }), taskWrites);
+    assert.deepEqual(JSON.parse(await readFile(migrationReceiptFile, "utf8")), migrationReceipt, "Replay must preserve the committed receipt and its identity");
     steps.push({ action: "state-migration-verified", operationId: migrationOperation.id, scopeKey: "runtime-development", version: 2,
       beforeDigest: canonicalDigest(beforeMigration), afterDigest: canonicalDigest(migratedState), replayUnchanged: true });
     steps.push({ action: "verified", originalPid: pid, restartedPid: server.pid, retainedOperation: old.binding.operationId, independentOperation: operation.id,
