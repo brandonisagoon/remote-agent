@@ -56,7 +56,9 @@ export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Sto
   return owned;
 }
 /** Exact evidence for a group that consumes the explicit budget. */
-export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[]; detail: string; action: string };
+export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[]; detail: string; action: string;
+  /** Uncredited baseline only: why, and the latest recorded refresh outcome (diagnostic, never proof). */
+  baseline?: { reason?: string; observedAt?: number; refresh?: { outcome: string; phase?: string; code?: string; since: number } } };
 const BLOCKER_ACTION: Record<ComputeBlocker["reason"], string> = {
   "unrecorded-resource": "No fresh stopped observation accounts for these resources; the collector must observe them stopped or their owner must release them.",
   "uncredited-baseline": "The original group has no current stopped proof; the next settled baseline refresh can credit it.",
@@ -98,13 +100,16 @@ async function unaccounted(store: Store, input: Context): Promise<{ count: numbe
   for (const baseline of baselines) if (baseline.credited) for (const id of baseline.resourceIds) recorded.add(id);
   const originalClaims = baselines.filter(baseline => !baseline.credited && baseline.resourceIds.some(id => !recorded.has(id)));
   const groups = new Map<string, ComputeBlocker>();
-  const add = (group: string, reason: ComputeBlocker["reason"], id: string, detail: string) => {
-    const value = groups.get(group) ?? groups.set(group, { group, reason, ids: [], detail, action: BLOCKER_ACTION[reason] }).get(group)!;
+  const add = (group: string, reason: ComputeBlocker["reason"], id: string, detail: string, baseline?: ComputeBlocker["baseline"]) => {
+    const value = groups.get(group) ?? groups.set(group, { group, reason, ids: [], detail, action: BLOCKER_ACTION[reason], ...(baseline ? { baseline } : {}) }).get(group)!;
     if (!value.ids.includes(id)) value.ids.push(id);
   };
   // Baseline groups first: their exact credit reason explains their members.
   for (const group of originalClaims) for (const id of group.resourceIds.filter(id => !recorded.has(id)))
-    add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id, `baseline ${group.reason ?? "uncredited"}${group.observedAt === undefined ? "" : ` (last proof observed ${new Date(group.observedAt).toISOString()})`}`);
+    add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id, `baseline ${group.reason ?? "uncredited"}${group.observedAt === undefined ? "" : ` (last proof observed ${new Date(group.observedAt).toISOString()})`}${
+      group.refresh ? ` (last refresh ${group.refresh.outcome}${group.refresh.phase ? ` at ${group.refresh.phase}` : ""}${group.refresh.code ? ` ${group.refresh.code}` : ""} since ${new Date(group.refresh.since).toISOString()})`
+        : group.reason === "missing-proof" ? " (never observed)" : ""}`,
+      { ...(group.reason ? { reason: group.reason } : {}), ...(group.observedAt === undefined ? {} : { observedAt: group.observedAt }), ...(group.refresh ? { refresh: group.refresh } : {}) });
   for (const resource of resources) if (!recorded.has(resource.id)) add(`${resource.taskId}:${resource.purpose}`, "unrecorded-resource", resource.id, `resource ${resource.key} (${resource.kind}, ${resource.state})`);
   for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id, `environment ${environment.id} is ${environment.state} without an allocation`);
   return { count: groups.size, blockers: [...groups.values()] };

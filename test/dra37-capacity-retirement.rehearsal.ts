@@ -171,6 +171,11 @@ export async function rehearseCapacityRetirement() {
     assert.equal(registered.status, 200, JSON.stringify(registered.body));
     const resource = await prisma.remoteTaskResource.findFirstOrThrow({ where: { taskId: t5.id, key: "runtime-development" } });
     const callsBefore = (await observerCalls()).length;
+    // Before any observation of it: reported as never observed.
+    const unobserved = await call(await socket(`/api/tasks/${t1.id}/compute-policy?capacity=1`));
+    const neverObserved = unobserved.body?.capacity?.blockers?.unaccounted?.find((value: { group: string }) => value.group === `${t5.id}:development`);
+    steps.push({ action: "capacity-diagnostic-never-observed", observerCalls: callsBefore, blocker: neverObserved });
+    if (callsBefore === 0) assert(neverObserved?.reason === "unrecorded-resource" || neverObserved?.detail?.includes("never observed"), JSON.stringify(neverObserved));
     await end(o4);
     await until("the observer to be asked for the historical group", async () => (await observerCalls()).length > callsBefore, 30_000);
     await Bun.sleep(5_000); // Several selection/collection ticks with eligible waiters.
@@ -185,8 +190,17 @@ export async function rehearseCapacityRetirement() {
     assert.equal(capacity.usable, 0);
     const group = capacity.blockers.unaccounted.find((value: { group: string }) => value.group === `${t5.id}:development`);
     assert(group && group.ids.includes(resource.id), `The diagnostic names the exact group and resource: ${JSON.stringify(capacity.blockers)}`);
-    assert(["uncredited-baseline", "unrecorded-resource"].includes(group.reason));
-    assert(typeof group.detail === "string" && group.detail.length && typeof group.action === "string" && group.action.length);
+    // The exact cause: the observer failed at the observe phase with its fixed
+    // code, distinct from a group never observed; never its raw output.
+    assert.equal(group.reason, "uncredited-baseline");
+    assert.equal(group.baseline?.reason, "refresh-failed", JSON.stringify(group));
+    assert.deepEqual({ outcome: group.baseline.refresh.outcome, phase: group.baseline.refresh.phase, code: group.baseline.refresh.code }, { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT" });
+    assert(group.detail.includes("last refresh failed at observe OBSERVER_EXIT"), group.detail);
+    assert(typeof group.action === "string" && group.action.length);
+    const refreshEvents = await prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" } });
+    assert(refreshEvents.length >= 1);
+    for (const text of [JSON.stringify(blocked.body), ...refreshEvents.map(event => event.value ?? "")]) assert(!text.includes("physical inventory unavailable"), "raw observer output is never recorded or reported");
+    steps.push({ action: "observer-failure-diagnosed", refreshEvents: refreshEvents.map(event => ({ key: event.key, source: event.source, value: JSON.parse(event.value!) })) });
     assert((await observerCalls()).every(entry => entry.mode === "unavailable" && entry.args[1] === "baseline-observe"));
     assert(state.waits.some(wait => wait.environmentId === environments[t1.id]) && state.waits.some(wait => wait.environmentId === environments[t4.id]), "Eligible waiters are kept, not dropped");
     await instruct(t1.id, "ordinary-while-historical");

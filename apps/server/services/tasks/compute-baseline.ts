@@ -6,6 +6,7 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { CleanupObserverError } from "./cleanup-observer-diagnostics.ts";
 
 export const countedComputeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const Purpose = z.enum(["development", "review"]);
@@ -74,6 +75,38 @@ function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: C
       && current.identities.some(identity => identity.id === resource.resourceId && identity.identityDigest === resource.resourceIdentity));
 }
 
+/** Durable, non-sensitive outcome of a group's latest refresh: a fixed phase
+ * and code with the time it began. Diagnostic only: never proof, never
+ * credit, never raw observer/provider output. Written only on a change of
+ * outcome/phase/code (bounded), outside every credit transaction. */
+export const BaselineRefreshPhase = z.enum(["snapshot", "observe", "validate", "credit"]);
+const RefreshRecord = z.object({ version: z.literal(1), groupId: Sha, outcome: z.enum(["credited", "failed", "deferred"]),
+  phase: BaselineRefreshPhase.optional(), code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/).optional(), since: z.number().int().nonnegative() }).strict();
+export type BaselineRefresh = Omit<z.infer<typeof RefreshRecord>, "version" | "groupId">;
+const REFRESH_ACTION = "compute-baseline-refresh";
+const refreshSource = (machineId: string) => `compute-baseline:${machineId}`;
+const PHASE_CODES: Record<z.infer<typeof BaselineRefreshPhase>, string> = { snapshot: "SNAPSHOT_UNAVAILABLE", observe: "OBSERVER_UNVERIFIED", validate: "OBSERVATION_INVALID", credit: "PROOF_REJECTED" };
+const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown) => error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
+const parseJson = (text: string | null | undefined) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
+async function latestRefresh(store: Pick<Store, "remoteTask" | "runtimeMetadataEvent">, machineId: string, taskId: string, groupId: string) {
+  const task = await store.remoteTask.findUnique({ where: { id: taskId }, select: { primarySessionId: true } });
+  if (!task?.primarySessionId) return null;
+  const where = { runtimeSessionId: task.primarySessionId, source: refreshSource(machineId), action: REFRESH_ACTION, key: groupId };
+  const event = await store.runtimeMetadataEvent.findFirst({ where, orderBy: { sequence: "desc" } });
+  const parsed = RefreshRecord.safeParse(parseJson(event?.value));
+  return { where, record: parsed.success && parsed.data.groupId === groupId ? parsed.data : null };
+}
+async function recordRefresh(input: Context, taskId: string, groupId: string, value: Omit<BaselineRefresh, "since">) {
+  try {
+    const latest = await latestRefresh(input.prisma, input.config.machine, taskId, groupId);
+    if (!latest) return;
+    const prior = latest.record;
+    if (prior && prior.outcome === value.outcome && prior.phase === value.phase && prior.code === value.code) return;
+    await input.prisma.runtimeMetadataEvent.create({ data: { ...latest.where,
+      value: JSON.stringify(RefreshRecord.parse({ version: 1, groupId, ...value, since: (input.now ?? new Date()).getTime() })) } });
+  } catch { /* Diagnostic only: never affects accounting. */ }
+}
+
 const readInstalled: Read = async (input, task, request) => (await import("./compute-observer.ts")).readInstalledComputeBaseline(input, task, request);
 
 /** Accounting only, also usable before policy activation. Each group's proof
@@ -104,6 +137,7 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
     for (;;) {
       const entry = entries[index++]; if (!entry) return;
       const [id, group] = entry;
+      let phase: z.infer<typeof BaselineRefreshPhase> = "snapshot";
       try {
         const row = await input.prisma.$transaction(async tx => {
           // Another process may have discovered a member after this inventory,
@@ -115,10 +149,14 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
         });
         const before = await snapshot(input.prisma, row, input.runtime);
-        if (!before.settled) { unavailable++; continue; }
+        if (!before.settled) { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
+        phase = "observe";
         const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
           purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
-        const observation = ComputeBaselineObservation.parse(await read(input, before.task, request));
+        const raw = await read(input, before.task, request);
+        phase = "validate";
+        const observation = ComputeBaselineObservation.parse(raw);
+        phase = "credit";
         const credited = await input.prisma.$transaction(async tx => {
           const held = await tx.computeBaseline.findUniqueOrThrow({ where: { id } });
           if (held.refreshToken !== token) return false;
@@ -127,24 +165,31 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
           return saved.count === 1;
         });
-        if (credited) observed++; else unavailable++;
-      } catch { unavailable++; }
+        if (credited) { observed++; await recordRefresh(input, group.taskId, id, { outcome: "credited" }); }
+        else { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
+      } catch (error) { unavailable++; await recordRefresh(input, group.taskId, id, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
     }
   }));
   return { observed, unavailable };
 }
 
 /** Why a group is not credited; each names the evidence that is missing. */
-export type BaselineCreditReason = "missing-proof" | "unobservable" | "inventory-unavailable" | "family-active" | "membership-changed" | "proof-stale" | "not-proven-stopped";
+export type BaselineCreditReason = "missing-proof" | "refresh-failed" | "unobservable" | "inventory-unavailable" | "family-active" | "membership-changed" | "proof-stale" | "not-proven-stopped";
 /** Recheck inside the existing admission transaction. A stale/missing cache
  * only retains reservation; it can never turn into an environment or claim. */
 export async function computeBaselineCredits(store: Store, input: { machineId: string; policy: ComputePolicy; runtime?: Runtime; now?: Date }) {
   const rows = await store.computeBaseline.findMany({ where: { machineId: input.machineId }, take: 1001 });
   if (rows.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
   return Promise.all(rows.map(async row => {
-    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined;
+    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined, refresh: BaselineRefresh | undefined;
     const proof = Proof.safeParse(row.proof);
-    if (!proof.success) reason = "missing-proof";
+    if (!proof.success) {
+      // No current proof: the latest recorded refresh distinguishes a failed or
+      // deferred observation from one never made. It never credits.
+      const latest = (await latestRefresh(store, row.machineId, row.taskId, row.id).catch(() => null))?.record;
+      if (latest) { const { version: _version, groupId: _group, ...summary } = latest; refresh = summary; }
+      reason = latest?.outcome === "failed" ? "refresh-failed" : latest?.outcome === "deferred" ? "family-active" : "missing-proof";
+    }
     else if (!input.runtime) { reason = "unobservable"; observedAt = proof.data.observation.observedAt; }
     else {
       observedAt = proof.data.observation.observedAt;
@@ -155,6 +200,6 @@ export async function computeBaselineCredits(store: Store, input: { machineId: s
         if (!credited) reason = !current.settled ? "family-active" : current.digest !== proof.data.snapshotDigest ? "membership-changed" : !fresh ? "proof-stale" : "not-proven-stopped";
       } catch { reason = "inventory-unavailable"; /* Unknown original claims remain reserved. */ }
     }
-    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }) };
+    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }), ...(refresh ? { refresh } : {}) };
   }));
 }

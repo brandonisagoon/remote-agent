@@ -8,6 +8,7 @@ import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.t
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { claimCompute, confirmComputeDelivery, offerNextCompute, readComputeCapacity, reconcileComputeOffers, requestCompute } from "./compute-admission.ts";
 import { refreshComputeBaselines } from "./compute-baseline.ts";
+import { CleanupObserverError } from "./cleanup-observer-diagnostics.ts";
 
 const cleanups: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanups.splice(0).reverse()) await close(); });
@@ -205,7 +206,8 @@ console.log(JSON.stringify({version:1,kind:'compute-baseline',machineId:input.ma
   const reads = (await readFile(calls, "utf8")).trim().split("\n").length;
   if (mode === "normal") expect(reads).toBe(2); else { expect(reads).toBeGreaterThanOrEqual(1); expect(reads).toBeLessThanOrEqual(2); }
   expect(await f.prisma.computeEnvironment.count({ where: { taskId: "old" } })).toBe(0);
-  expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
+  // Refresh writes only its own diagnostic outcome records, never other facts.
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: { not: "compute-baseline-refresh" } } })).toBe(0);
 });
 
 test.each(["stale", "missing-runtime", "executing", "queued"])("diagnostic cannot turn %s activity/proof into free credit", async kind => {
@@ -266,8 +268,51 @@ test("DRA-36: a long refresh of one group never clears another group's fresh pro
   // Only the group whose own refresh is in progress loses credit.
   const during = await readComputeCapacity(input);
   expect(during).toMatchObject({ unaccounted: 1 });
-  expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"], detail: "baseline missing-proof", action: expect.stringContaining("baseline refresh") }]);
+  // In flight after an earlier credit: no proof now, last recorded outcome credited.
+  expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"],
+    detail: `baseline missing-proof (last refresh credited since ${f.now.toISOString()})`, action: expect.stringContaining("baseline refresh"),
+    baseline: { reason: "missing-proof", refresh: { outcome: "credited", since: f.now.getTime() } } }]);
   release();
   expect(await pass).toEqual({ observed: 2, unavailable: 0 });
   expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
+});
+
+// DRA-37 real-server finding: an observer failure left only "missing-proof".
+test("each group's refresh outcome is diagnosed by phase and fixed code, never as proof, credit or raw output", async () => {
+  const f = await fixture();
+  const blocker = async () => (await readComputeCapacity({ ...f.admission, taskId: "waiting" })).blockers.unaccounted.find(value => value.group === "old:development");
+  const events = () => f.prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" }, orderBy: { sequence: "asc" } });
+  // Never observed: no baseline group exists yet.
+  expect(await blocker()).toMatchObject({ reason: "unrecorded-resource" });
+  // An observer failure: its fixed code and phase, still charged.
+  expect(await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); })).toEqual({ observed: 0, unavailable: 1 });
+  let value = await blocker();
+  expect(value).toMatchObject({ reason: "uncredited-baseline", baseline: { reason: "refresh-failed", refresh: { outcome: "failed", phase: "observe", code: "OBSERVER_EXIT", since: f.now.getTime() } } });
+  expect(value!.detail).toContain("last refresh failed at observe OBSERVER_EXIT");
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
+  expect(await offerNextCompute(f.admission)).toBeNull();
+  // A repeated identical failure records nothing new (bounded history).
+  const count = (await events()).length;
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_EXIT"); });
+  expect((await events()).length).toBe(count);
+  // A non-observer failure carrying sensitive text: a fixed phase code only.
+  await refreshComputeBaselines(f.context, async () => { throw new Error("stderr: token=sk-live-SECRET-VALUE at /private/path"); });
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "observe", code: "OBSERVER_UNVERIFIED" });
+  // Invalid observer output fails validation, not credit.
+  await refreshComputeBaselines(f.context, async () => ({ version: 1, kind: "compute-baseline", secret: "sk-live-SECRET-VALUE" }));
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "validate", code: "OBSERVATION_INVALID" });
+  for (const event of await events()) {
+    expect(event.value).not.toContain("SECRET");
+    expect(event.value).not.toContain("/private/path");
+    expect(Object.keys(JSON.parse(event.value!)).sort()).toEqual(expect.arrayContaining(["groupId", "outcome", "since", "version"]));
+  }
+  // Recovery only through a valid stopped proof.
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  expect(await blocker()).toBeUndefined();
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0, headroom: 1 });
+  expect(JSON.parse((await events()).at(-1)!.value!)).toMatchObject({ outcome: "credited" });
+  // A later failure invalidates that credit again: the charge returns with its cause.
+  await refreshComputeBaselines(f.context, async () => { throw new CleanupObserverError("OBSERVER_TIMEOUT"); });
+  expect((await blocker())?.baseline?.refresh).toMatchObject({ outcome: "failed", phase: "observe", code: "OBSERVER_TIMEOUT" });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1, headroom: 0 });
 });
