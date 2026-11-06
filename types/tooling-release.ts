@@ -44,6 +44,8 @@ export interface ToolingOperationBinding {
   /** Command binding from which this callback inherited its immutable release.
    * Absent/null identifies a root operation; never a provider-resource ID. */
   parentOperationId?: string | null;
+  /** Server-only continuation provenance; never accepted in public begin requests. */
+  retainedConsumerId?: string | null;
   resourceKey: string | null;
   generation: number;
   release: ToolingReleaseRecord;
@@ -94,4 +96,18 @@ export interface ToolingStateWriteResponse {
     releaseId: string;
     sequence: number;
   };
+}
+
+/** An adapter reports its command outcome using the same durable identity.
+ * This settles the fence only; child operations and live consumers keep their
+ * own lifetimes. Unknown outcomes retain the journal and send no success. */
+export interface ToolingCommandSettlementRequest {
+  requestKey: string;
+  inputDigest: string;
+  outcome: "completed" | "no-effect";
+}
+
+export interface ToolingCommandSettlementResponse {
+  binding: ToolingOperationBinding;
+  outcome: "completed" | "no-effect";
 }

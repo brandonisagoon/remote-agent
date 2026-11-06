@@ -380,3 +380,35 @@ resource key, or `task` for task-global state; arbitrary file paths do not becom
 new state scopes. Registration delegates to the atomic per-state checks and
 retains the existing structured error codes. These are frozen wire shapes for
 parallel implementation; this section does not claim the routes are wired yet.
+
+### Command settlement and retained consumers
+
+A resource or observer can outlive its creating callback and command. Remote
+Agent retains a separate durable consumer with the exact producing operation
+and state scope. Pending/uncertain consumers retain reader requirements; only
+verified replacement, no-effect, stopped or absent evidence resolves them.
+Completing a command never resolves its children or consumers. Server-started
+continuations derive an `adapter-command` fence from a confirmed retained
+consumer, with `retainedConsumerId` recorded separately from command parentage.
+Public begin requests cannot choose this field or an arbitrary release.
+
+A successful adapter command posts
+`/api/sessions/:sessionId/tooling-operations/:operationId/settlement`, with the
+matching operation header and `{requestKey,inputDigest,outcome:"completed"}`.
+The server checks the stored command identity, current ownership, and durable
+child/consumer outcomes; unresolved effects cannot be declared successful.
+The response is `{binding,outcome}` with the exact completed command binding.
+The client validates it before forgetting the retry journal. A lost response
+retries the same settlement and identity. A failure or uncertain command result
+retains the journal for reconciliation, never sends a success settlement.
+
+`outcome:"no-effect"` is an explicit abandonment path, accepted only for a
+bound command with no child operations, state writes or retained consumers.
+The server records evidence before completion and refuses key/outcome reuse
+with changed meaning. A completed parent cannot spawn new children; its exact
+existing child retries remain subject to normal authority and idempotence.
+Read-only commands must either settle their fence or use a classified read-only
+path, never leave a permanent unfinished command merely from inspecting status.
+
+These seams are under implementation; activation remains disabled until their
+real-route lifecycle and migration acceptance pass.
