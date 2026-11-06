@@ -4,6 +4,10 @@
  * Remote Agent server routes/scheduler/inbox and Drafted's manageRuntime
  * together; it is NOT production Docker or PlanetScale acceptance.
  *
+ * Tooling preparation here is a DEPENDENCY-INJECTED PARTIAL REHEARSAL (see
+ * dra37-fixture.ts): symlinked paired node_modules and a fixture-written
+ * readiness receipt, not frozen install or release acceptance.
+ *
  * EXPLICIT cross-repository rehearsal, never part of the default `bun test`
  * gate (the file name is deliberately not *.test.ts). It requires the paired
  * Drafted checkout and an exact commit, and fails when either is missing:

@@ -32,11 +32,15 @@ function git(cwd: string, ...args: string[]) {
 export type Dra37Task = { id: string; sessionId: string; worktree: string; revision: string; recipe: { key: string; purpose: "development"; revision: string; recipeDigest: string } };
 
 /**
- * The configured tooling source and its prepared checkout, exactly as a
- * deployed server sees them: a `--shared` clone of the paired Drafted
- * repository (it only reads the paired objects) is the source, and a
- * detached worktree of the pinned commit at the server's install path, with
- * its readiness receipt, is the prepared checkout. Nothing is committed.
+ * DEPENDENCY-INJECTED PARTIAL REHEARSAL of tooling preparation, not release
+ * acceptance. The configured source is a `--shared` clone of the paired
+ * Drafted repository (it only reads the paired objects) at the exact commit,
+ * and the checkout at the server's install path is a detached worktree of
+ * that commit. Its dependencies are a SYMLINK to the paired checkout's
+ * mutable node_modules and its legacy `.ready` receipt is written here: no
+ * frozen install, install receipt, worktree lock or prepareToolingRelease
+ * verification happens. Final real-release acceptance must use the
+ * supported preparation against an isolated clone with frozen dependencies.
  */
 async function prepareDraftedTooling(root: string, install: string, revision: string, paired: string) {
   if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("The DRA-37 runtime rehearsal requires an exact 40-character Drafted commit");
@@ -54,7 +58,8 @@ async function prepareDraftedTooling(root: string, install: string, revision: st
   await symlink(path.join(paired, "node_modules"), path.join(checkout, "node_modules"));
   if (git(checkout, "status", "--porcelain", "--untracked-files=normal")) throw new Error("Prepared Drafted checkout is not clean");
   await writeFile(`${checkout}.ready`, `${full}\n`, { mode: 0o600 });
-  return { source, root: checkout, revision: full, tree };
+  return { source, root: checkout, revision: full, tree,
+    preparation: "dependency-injected partial rehearsal: symlinked paired node_modules and fixture-written .ready; not frozen install verification" };
 }
 
 export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string } }) {
