@@ -36,6 +36,16 @@ the installed operation protocol and all required observer contracts. Committed
 capability entries remain the entrypoint/instruction inventory; using that
 inventory internally does not require agents to resolve capabilities.
 
+`write` names the default new-state version. Optional `writeVersions` declares
+every version this release may persist, including explicit migrations and
+compatible saves of older state; omitted means exactly `[write]`. The list is
+nonempty, unique, includes `write`, and is a subset of `read`. For example, a
+lossless runtime reader that preserves version 1 and can explicitly migrate to
+version 2 declares `read: [1, 2], write: 1, writeVersions: [1, 2]`. Declaring a
+version does not authorize a migration: the server still records and validates
+the exact affected state/version before any write. An old idempotent write
+receipt cannot authorize overwriting a newer recorded format.
+
 Missing release manifests are legacy-only. The bootstrap transition must retain
 legacy executables and receipts for reconciliation; it must not pretend that an
 old executable enforces the new operation protocol. Normal activation requires a
@@ -243,6 +253,28 @@ owned binding. These endpoints are not themselves compute/cleanup authority.
 The CLI derives its actual immutable release from its checkout and compares it
 to the returned binding before effects. An old release cannot take a new B
 binding and execute A. Retries must reuse the durable operation identity.
+
+An `adapter-command` root binding fences a complete adapter command before its
+first effect, including commands with no server effect callback. Callback begin
+requests carry `parentOperationId`, distinct from `existingOperationId` (which
+continues to name a compute/finalization/development record). The server reads
+and validates the parent inside the binding transaction and derives the child's
+release, generation and protocol from it, never from the active selection.
+The parent must be an unfinished command binding owned by the same task,
+session and repository; an unknown outcome requires reconciliation before any
+new child effect. Parent identity is part of idempotency comparison. No caller
+chooses a release by sending a revision or path. Existing exact operation
+references and their owning bindings must agree with this lineage; a parent
+does not grant permission to take over another operation or bypass authority.
+
+Persist the parent ID on the callback binding and return it on the wire
+(absent/null means a root binding). Preserve the binding through retries and
+observer/process lifetime. A completed parent cannot spawn fresh callbacks;
+an exact completed-child replay remains subject to its existing protocol's
+evidence and current authority checks. Completion of a command must not erase
+retained environment/cleanup consumers. The regression boundary is activation
+of B after command A is bound but before its **first** callback: that callback
+must still execute A, while the next independent command selects B.
 
 DRA-30 implements Drafted's wire consumer in a new module; DRA-29 owns server
 validation of `x-remote-agent-operation`. Operation kinds and callback-to-kind
