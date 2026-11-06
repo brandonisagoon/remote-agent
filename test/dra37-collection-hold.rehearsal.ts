@@ -15,10 +15,10 @@
  *    each slowed by a bounded 3.5 s and forwarded. Expected outcome on current
  *    production: proof older than collectorFreshnessSeconds is rejected
  *    (PROOF_REJECTED), which is the intended conservative freshness behaviour
- *    (root decision after C345), so no slow cycle records proof. Success
- *    authority, if ever reached, is the stored stopped proof for the exact
- *    historical resource IDs plus a dispatched offer; refresh diagnostics only
- *    time attempts and never grant capacity.
+ *    (root decision after C345), so no slow cycle records proof. OBSERVATIONAL
+ *    ONLY, never acceptance: it records attempts and stored rows; a stored
+ *    proof row is not treated as stopped/fresh credit, and refresh
+ *    diagnostics never grant capacity.
  *
  * Real isolated Remote Agent server (private migrated SQLite, loopback TCP,
  * control socket), ONE compute slot, Drafted prepared by the supported frozen
@@ -41,6 +41,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { dra37Server } from "./dra37-fixture.ts";
+import { guardInventory, recordedBarriers } from "./dra37-drain.ts";
 
 const DRAFTED = { source: process.env.DRA37_DRAFTED_SOURCE ?? "", revision: process.env.DRA37_DRAFTED_REVISION ?? "" };
 if (process.env.DRA37_REAL_DOCKER !== "1" || process.env.DRA37_COLLECTION_HOLD !== "1" || !DRAFTED.source || !/^[a-f0-9]{40}$/.test(DRAFTED.revision)) {
@@ -105,22 +106,20 @@ function harness(server: Server, evidence: Record<string, any>) {
   const instruction = (id: string) => prisma.runtimeInstruction.findUniqueOrThrow({ where: { id } });
   const offersFor = (environmentId: string) => prisma.computeOffer.findMany({ where: { environmentId }, orderBy: { createdAt: "asc" } });
   const allocations = async () => (await prisma.computeSlot.findMany({ where: { allocationId: { not: null } } })).map(slot => slot.allocationId);
-  /** Live guard (barrier) processes of THIS fixture: argv names its policy. */
-  const barrierProcesses = () => Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe" }).stdout.toString().split("\n")
-    .filter(line => line.includes(real.policy) && !line.includes("ps -axo"));
-  /** Exactly recorded barrier PIDs (hold/delay starts) that are still THIS
-   * fixture's guard: ESRCH = gone; a live PID whose argv no longer names the
-   * policy is a reused PID, not ours; no process is ever signalled. */
-  const liveRecordedBarriers = () => {
-    const pids = [...new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => Number(entry.pid)))];
-    return pids.filter(pid => {
-      try { process.kill(pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
-      return Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe" }).stdout.toString().includes(real.policy);
-    });
+  /** Fail-closed absence of this fixture's guard/barrier processes
+   * (dra37-drain.ts): a failed ps read or an unknown PID state is never
+   * treated as absence; only ESRCH proves a recorded PID gone. */
+  const recordedPids = () => [...new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => Number(entry.pid)))];
+  const barrierState = () => {
+    const guards = guardInventory(real.policy), recorded = recordedBarriers(recordedPids(), real.policy);
+    return { absent: guards !== null && guards.length === 0 && recorded.live.length === 0 && recorded.unknown.length === 0, guards, ...recorded };
   };
   const noBarrierProcesses = async (label: string) => {
-    await until(`${label}: no live barrier process`, async () => (barrierProcesses().length === 0 && liveRecordedBarriers().length === 0) || null, 30_000);
-    step("barrier-absence", { label, recordedBarrierPids: new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => entry.pid)).size, live: 0 });
+    let last = barrierState();
+    const deadline = Date.now() + 30_000;
+    while (!last.absent && Date.now() < deadline) { await Bun.sleep(250); last = barrierState(); }
+    if (!last.absent) throw new Error(`${label}: barrier processes not provably absent: ${JSON.stringify(last).slice(0, 2_000)}`);
+    step("barrier-absence", { label, recordedBarrierPids: recordedPids().length, live: 0, unknown: 0 });
   };
   /** Independent offer-turn hold > 60 s: the same reservation survives and
    * ANOTHER original primary's ordinary instruction completes meanwhile. */
@@ -153,7 +152,7 @@ function harness(server: Server, evidence: Record<string, any>) {
     step(`${phase}-held`, { offer: offer.id, heldForMs, dispatchDeadline: offer.dispatchDeadline, otherInstruction: other, otherCompletedAtMs });
     return offer;
   }
-  return { step, prisma, real, calls, app, observation, agentEvent, instruct, instruction, offersFor, allocations, barrierProcesses, noBarrierProcesses, heldOfferTurn };
+  return { step, prisma, real, calls, app, observation, agentEvent, instruct, instruction, offersFor, allocations, barrierState, noBarrierProcesses, heldOfferTurn };
 }
 async function pool<T>(items: T[], width: number, work: (item: T) => Promise<void>) {
   let index = 0;
@@ -356,8 +355,8 @@ test.skipIf(process.env.DRA37_BASELINE_EXPERIMENT !== "1")("OPTIONAL EXPERIMENT 
       if (progressDoneAt === null && (await h.instruction(progress)).state === "completed") progressDoneAt = Date.now();
       const cycles = cyclesOf(rows), offers = await h.offersFor(envW.id);
       evidence.samples.push({ phase: "slow-baseline", atMs: Date.now() - requestedAt, cycles: cycles.map(cycle => ({ token: cycle.token, records: cycle.records.length, proven: cycle.proven, spanMs: cycle.endedAt - cycle.startedAt })), offers: offers.length });
-      // Success authority: every exact historical runtime resource is covered
-      // by a stored stopped proof (never a diagnostic record).
+      // Observational only (not acceptance): rows with a stored proof covering
+      // every exact historical resource; NOT verified stopped/fresh credit.
       const stored = await prisma.computeBaseline.findMany();
       const covered = new Set(stored.filter(row => row.proof !== null).flatMap(row => JSON.parse(JSON.stringify(row.resourceIds)) as string[]));
       const allProven = runtimes.every(resource => covered.has(resource.id));

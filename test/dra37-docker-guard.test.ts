@@ -259,3 +259,33 @@ test("fixture subnet selection uses true IPv4 CIDR overlap and fails closed on i
   refused(listed, { code: 0, stdout: [line(id("a"), [{ Subnet: "10.249.0.0/40" }]), line(id("b"), null)].join("\n") }, /Malformed IPv4 subnet/);
   refused(listed, { code: 0, stdout: [line(id("a"), { Subnet: "10.0.0.0/8" }), line(id("b"), null)].join("\n") }, /Malformed IPAM config/);
 });
+
+test("cleanup drain fails closed: ps failure, undrained guard, unreadable identity; only ESRCH proves a barrier gone", async () => {
+  const { drainGuards, guardInventory, recordedBarriers } = await import("./dra37-drain.ts");
+  const POLICY = "/private/fixture/docker-policy.json";
+  type State = "gone" | "exists" | "unknown";
+  const probe = (inventory: { code: number | null; stdout: string }, states: Record<number, State>, identities: Record<number, { code: number | null; stdout: string }> = {}) => ({
+    ps: (args: string[]) => args[0] === "-axo" ? inventory : identities[Number(args.at(-1))] ?? { code: 1, stdout: "" },
+    state: (pid: number) => states[pid] ?? "gone",
+  });
+  const ok = { code: 0, stdout: "" }, clock = { t: 0 };
+  const fast = { sleep: async () => { clock.t += 250; }, now: () => clock.t };
+  // ps failure is never absence.
+  expect(guardInventory(POLICY, probe({ code: 1, stdout: "" }, {}))).toBeNull();
+  const psFailed = await drainGuards({ policyPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 1, stdout: "" }, {}), ...fast });
+  expect(psFailed.problems).toEqual(["guard process inventory (ps) failed; exact cleanup cannot be claimed"]);
+  // A guard that never drains within the bound blocks exact cleanup.
+  const undrained = await drainGuards({ policyPath: POLICY, barrierPids: [], boundMs: 1_000, probe: probe({ code: 0, stdout: `4242 bun ${POLICY} create\n` }, {}), ...fast });
+  expect(undrained.problems[0]).toMatch(/guard processes still running after the drain bound.*4242/);
+  // Recorded barrier PIDs: ESRCH -> gone; reused PID (not our argv) -> not ours;
+  // still ours -> live; identity read failed and not provably gone -> unknown.
+  const barriers = recordedBarriers([1, 2, 3, 4, 5], POLICY, probe(ok, { 1: "gone", 2: "exists", 3: "exists", 4: "exists", 5: "unknown" }, {
+    2: { code: 0, stdout: "/usr/bin/some-other-process" }, 3: { code: 0, stdout: `bun ${POLICY} inspect` }, 4: { code: 1, stdout: "" }, 5: { code: 1, stdout: "" } }));
+  expect(barriers.live).toEqual([`3: bun ${POLICY} inspect`]);
+  expect(barriers.unknown.map(entry => entry.split(":")[0])).toEqual(["4", "5"]);
+  const blocked = await drainGuards({ policyPath: POLICY, barrierPids: [3, 4], boundMs: 1_000, probe: probe(ok, { 3: "exists", 4: "unknown" }, { 3: { code: 0, stdout: `bun ${POLICY}` } }), ...fast });
+  expect(blocked.problems.map(problem => problem.split(":")[0])).toEqual(["recorded barrier processes still alive", "recorded barrier processes in an unknown state"]);
+  // All provably gone and nothing running: no problem.
+  const clean = await drainGuards({ policyPath: POLICY, barrierPids: [7, 8], boundMs: 1_000, probe: probe(ok, { 7: "gone", 8: "gone" }), ...fast });
+  expect(clean.problems).toEqual([]);
+});

@@ -12,6 +12,7 @@ import path from "node:path";
 import { createTestDatabase } from "../test-support/db.ts";
 import { parseServiceFile } from "../lib/config.ts";
 import { prepareToolingRelease, verifyPreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
+import { drainGuards } from "./dra37-drain.ts";
 
 const sourceRoot = path.resolve(import.meta.dir, "..");
 export const MACHINE = "dra37-machine", REPOSITORY = "dra37-repo";
@@ -354,36 +355,17 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       for (const turn of turns) turn.kill("SIGKILL");
       await fixture.stop();
       // Guard drain is a precondition of exact cleanup, never best effort: an
-      // unreadable process inventory or a guard still running after the bound
-      // (e.g. a create deferring termination until ledgered) is a cleanup
-      // problem. Nothing outside this fixture's exact handles is ever signalled.
-      const drainProblems: string[] = [], drain: Record<string, unknown> = {};
+      // unreadable process inventory, a guard still running after the bound
+      // (e.g. a create deferring termination until ledgered) or a recorded
+      // barrier PID not provably gone (only ESRCH proves it) is a problem, and
+      // then NO object is removed. Nothing outside this fixture's exact
+      // handles is ever signalled (dra37-drain.ts).
+      let drainProblems: string[] = [], drain: Record<string, unknown> = {};
       if (real) {
-        const inventory = () => {
-          const result = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "pipe" });
-          return result.exitCode === 0 ? result.stdout.toString().split("\n").filter(line => line.includes(real!.policy) && !line.includes("ps -axo")) : null;
-        };
-        const deadline = Date.now() + 60_000;
-        let guards = inventory();
-        while ((guards === null || guards.length) && Date.now() < deadline) { await Bun.sleep(250); guards = inventory(); }
-        if (guards === null) drainProblems.push("guard process inventory (ps) failed; exact cleanup cannot be claimed");
-        else if (guards.length) drainProblems.push(`guard processes still running after the drain bound; exact cleanup cannot be claimed: ${guards.join(" | ")}`);
-        // Every exactly recorded barrier PID (hold/delay) must be gone. A live
-        // PID counts only if it is still this fixture's guard (argv names the
-        // policy); EPERM or any non-ESRCH answer is unknown, hence a problem.
         const calls = existsSync(path.join(apps, "docker-calls.jsonl")) ? readFileSync(path.join(apps, "docker-calls.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
         const barrierPids = [...new Set(calls.filter(call => call.hold === "start" || call.delay === "start").map(call => Number(call.pid)))];
-        const live: string[] = [];
-        for (const pid of barrierPids) {
-          let exists = true;
-          try { process.kill(pid, 0); } catch (error) { exists = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-          if (!exists) continue;
-          const identity = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
-          if (identity.exitCode !== 0 && identity.stdout.toString().trim() === "") continue; // exited between the two reads
-          if (identity.stdout.toString().includes(real.policy)) live.push(`${pid}: ${identity.stdout.toString().trim()}`);
-        }
-        if (live.length) drainProblems.push(`recorded barrier processes still alive: ${live.join(" | ")}`);
-        Object.assign(drain, { recordedBarrierPids: barrierPids.length, liveRecordedBarriers: live, guardInventory: guards });
+        const result = await drainGuards({ policyPath: real.policy, barrierPids, boundMs: 60_000 });
+        drainProblems = result.problems; drain = result;
       }
       let preserve = !!options.keepEvidence;
       if (real) {
@@ -411,7 +393,9 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
         };
         const remove: Record<"container" | "network" | "volume", string[][]> = { container: [["stop"], ["rm"]], network: [["network", "rm"]], volume: [["volume", "rm"]] };
         const entries = fixture.dockerLedger().reverse(), removed: string[] = [];
-        for (const kind of ["container", "network", "volume"] as const) {
+        // An undrained guard may still be creating (and about to ledger) an
+        // object: remove nothing; keep the full ledger, inventory and evidence.
+        for (const kind of drainProblems.length ? [] : ["container", "network", "volume"] as const) {
           for (const entry of entries.filter(value => value.kind === kind)) {
             const before = identity(entry);
             if (before === "absent") { problems.push(`${kind} ${entry.id} was already absent before cleanup`); continue; }
