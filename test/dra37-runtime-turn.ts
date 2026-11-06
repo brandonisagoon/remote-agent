@@ -75,6 +75,7 @@ const docker = {
     await savePrivate(path.join(directory, "app", "environment.json"), environment);
     created = state;
     state.network = { id: network.id, createdAt: network.createdAt };
+    writeFileSync(path.join(apps, `${taskId}.network.json`), JSON.stringify(network), { mode: 0o600 });
     const container: Container = { id: Bun.CryptoHasher.hash("sha256", `${taskId}:${state.purpose}`, "hex") as string, image: `sha256:${"a".repeat(64)}`,
       createdAt: new Date().toISOString(), running: false, labels: { "dev.drafted.task": taskId, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } };
     write(container); effect("create", { id: container.id });

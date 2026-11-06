@@ -82,3 +82,41 @@ test("the original primary's delivered offer runs the actual Drafted runtime to 
   expect(effects.filter(value => value.effect === "start")).toHaveLength(1);
   expect(effects.filter(value => value.effect === "stop").map(value => value.appPid)).toEqual([identity.pid]);
 });
+
+/**
+ * Physical evidence boundary. Drafted's actual `compute observe` requires the
+ * traffic journal its traffic daemon writes from the proxy's access log. The
+ * synthetic proxy writes none, so observation is unavailable; the server must
+ * then keep the stopped app's allocation charged and offer nothing to the
+ * next waiter. (Verified handoff needs the real traffic daemon fed by the
+ * fixture proxy: the next DRA-37 transport step.)
+ */
+test("without physical observer evidence a stopped app's allocation stays charged and the next waiter gets no offer", async () => {
+  const server = await dra37Server({ slots: 1, draftedRevision: DRAFTED_REVISION });
+  cleanups.push(() => server.cleanup({ keepEvidence: !!process.env.DRA37_KEEP_EVIDENCE }));
+  const first = await server.seedTask("first"), second = await server.seedTask("second");
+  await server.start();
+  const prisma = server.db.prisma;
+  const turnFor = (taskId: string) => async () => (await server.agentEvents()).find(event => event.task === taskId && (event.event === "runtime-up" || event.event === "runtime-error"));
+  expect((await server.runtimeTurn(first.id, "up")).code).toBe(0);
+  const firstTurn = await until(turnFor(first.id), Boolean, "first runtime turn");
+  expect(firstTurn, JSON.stringify(firstTurn)).toMatchObject({ event: "runtime-up", code: 0, result: { phase: "ready" } });
+  const waiting = await server.runtimeTurn(second.id, "up");
+  expect(waiting.code, waiting.stderr).toBe(0);
+  expect(waiting.result).toMatchObject({ phase: "waiting-compute" });
+  const firstIdentity = JSON.parse(readFileSync(path.join(server.apps, `${first.id}.identity.json`), "utf8")) as { pid: number };
+  const allocation = (await prisma.computeSlot.findFirstOrThrow({ where: { allocationId: { not: null } } })).allocationId!;
+
+  expect((await server.runtimeTurn(first.id, "stop")).code).toBe(0);
+  expect(alive(firstIdentity.pid)).toBe(false);
+  // Several collector periods: the actual observer runs (via the synthetic
+  // Docker CLI) but cannot produce a complete observation.
+  const calls = path.join(server.apps, "docker-calls.jsonl");
+  await until(async () => (existsSync(calls) ? readFileSync(calls, "utf8") : "").split("\n").filter(line => line.includes('"container","ls"')).length, count => count >= 3, "observer attempts", 90_000);
+  const environment = await prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: first.id } });
+  expect(environment.observation).toBeNull();
+  expect(await prisma.computeSlot.findFirst({ where: { allocationId: allocation } })).not.toBeNull();
+  expect((await prisma.computeOffer.findUniqueOrThrow({ where: { id: allocation } })).state).toBe("claimed");
+  expect(await prisma.computeOffer.count({ where: { environmentId: (await prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: second.id } })).id } })).toBe(0);
+  expect(await turnFor(second.id)()).toBeUndefined();
+});

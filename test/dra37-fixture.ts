@@ -63,8 +63,11 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   const token = crypto.randomUUID(), url = `http://127.0.0.1:${port}`;
   const configFile = path.join(root, "config.json"), controlSocket = path.join(root, "control.sock");
   const repo = path.join(root, "repo"), worktrees = path.join(root, "worktrees"), specs = path.join(root, "specs"), agentLog = path.join(root, "agent.jsonl");
-  const apps = path.join(root, "apps"), state = path.join(root, "state");
-  await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 });
+  const apps = path.join(root, "apps"), state = path.join(root, "state"), bin = path.join(root, "bin");
+  await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
+  // SYNTHETIC Docker CLI, first on the server's PATH only, for Drafted's
+  // actual observer (see dra37-docker.ts). The app it reports is real.
+  await writeFile(path.join(bin, "docker"), `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} --no-env-file ${JSON.stringify(path.join(import.meta.dir, "dra37-docker.ts"))} ${JSON.stringify(apps)} "$@"\n`, { mode: 0o700 });
   const install = path.join(root, "install");
   const drafted = options.draftedRevision ? await prepareDraftedTooling(root, install, options.draftedRevision) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
@@ -124,7 +127,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       offset = log.length;
       // Explicit environment: no inherited REMOTE_AGENT_* or provider secrets.
       child = Bun.spawn([process.execPath, "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
+        env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
           ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
