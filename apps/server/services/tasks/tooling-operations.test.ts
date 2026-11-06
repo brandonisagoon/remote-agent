@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +11,7 @@ import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts"
 import { toolingOperationGuard, toolingOperationRoutes } from "../../routes/tasks/tooling-operations.ts";
 import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
-  bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
+  bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
 import { canonicalDigest, readToolingOperation, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
@@ -340,4 +340,55 @@ test("state evidence and write registration are guarded by the owning operation 
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "working" } });
   await transitionToolingOperation({ prisma: db.prisma, operationId: op.operationId, from: "bound", to: "completed", evidence: { kind: "adapter-command", reference: "exit-0" } });
   expect((await write({ family: "drafted.runtime", scopeKey: "runtime", version: 1 })).status).toBe(409);
+});
+
+describe("review of 73ab07f", () => {
+  const receipt = (revision: string, checkout: string) => JSON.stringify({ contract: "remote-agent.tooling-capability/v1", capability: "runtime", source: "configured-host", taskToolingRevision: LEGACY, capabilityRevision: revision, checkout, instructions: "/i", adapter: "/a" });
+  const inventory = () => db.prisma.$transaction(tx => inventoryLegacyToolingConsumers(tx, { repositoryId: "repo", legacyRevision: B }));
+
+  test("closed tasks and resources without a baseline row are inventoried, and a closed task's group keeps its snapshot", async () => {
+    await fixture();
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key: "r", value: receipt(LEGACY, "/install/legacy") } });
+    await environment("closed-env"); await db.prisma.computeEnvironment.update({ where: { id: "closed-env" }, data: { state: "running" } });
+    await db.prisma.remoteTaskResource.create({ data: { id: "orphan", taskId: "task", key: "orphan", kind: "docker-container", purpose: "development", externalId: "orphan", state: "ready" } });
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+    const consumers = await inventory();
+    expect(consumers).toContainEqual(expect.objectContaining({ consumerKind: "compute-environment", consumerId: "closed-env", provenance: expect.objectContaining({ revision: LEGACY }) }));
+    expect(consumers).toContainEqual(expect.objectContaining({ consumerKind: "compute-baseline", consumerId: "task:development" }));
+    await bootstrap(consumers.map(value => [value.consumerKind, value.consumerId]));
+    expect((await resourceGroupCode({ prisma: db.prisma, task: await task(), reference: { type: "compute-environment", id: "closed-env" } })).code!.revision).toBe(LEGACY);
+  });
+
+  test("several distinct recorded executables are ambiguous, never the newest", async () => {
+    await fixture(); await environment("env-1"); await db.prisma.computeEnvironment.update({ where: { id: "env-1" }, data: { state: "running" } });
+    for (const [key, revision] of [["old", LEGACY], ["new", A]] as const) await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key, value: receipt(revision, `/install/${key}`) } });
+    expect((await inventory()).find(value => value.consumerId === "env-1")!.provenance).toEqual({ unavailable: expect.stringContaining("ambiguous: 2") });
+  });
+
+  test("finished consumers are not retained, overflow fails activation, and retained consumers resolve when they finish", async () => {
+    await fixture();
+    const intent = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "development:task", action: "development-compute-intent", key: "pause-1", value: "{}" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "development:task", action: "development-compute-complete", key: "pause-1", value: "{}" } });
+    for (const action of [FINALIZATION_PREPARED, "finalization-confirmed"]) await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action, key: "finalize:task", value: "{}" } });
+    await environment("done-env"); // waiting, no resource, no offers: nothing to account
+    expect(await inventory()).toEqual([]);
+    // A consumer retained at bootstrap is resolved once its evidence shows it finished.
+    await bootstrap([["development-intent", String(intent.sequence)]]);
+    expect(await resolveFinishedLegacyConsumers({ prisma: db.prisma, repositoryId: "repo" })).toEqual({ resolved: 1 });
+    expect((await db.prisma.toolingLegacyConsumer.findFirstOrThrow()).status).toBe("resolved");
+    // Overflow is a failure, not a silent truncation.
+    await db.prisma.computeOffer.createMany({ data: Array.from({ length: 1001 }, (_, index) => ({ id: `o-${index}`, environmentId: "done-env", machineId: "host", instructionId: `i-${index}`, dispatchDeadline: new Date() })) });
+    await expect(inventory()).rejects.toThrow("exceeds its bound");
+  });
+
+  test("two operations racing for one existing record: exactly one reaches effects", async () => {
+    const { config } = await fixture(); await bootstrap([]);
+    const first = (await begin(config, { requestKey: "f1", inputDigest: canonicalDigest({ requestKey: "finalize:task" }), kind: "finalization" })).binding;
+    await activate("release-b", 2);
+    const second = (await begin(config, { requestKey: "f2", inputDigest: canonicalDigest({ requestKey: "finalize:task" }), kind: "finalization" })).binding;
+    const { call, seen } = app(config);
+    const results = await Promise.all([call("/api/tasks/task/cleanup-authority", { requestKey: "finalize:task" }, first.operationId), call("/api/tasks/task/cleanup-authority", { requestKey: "finalize:task" }, second.operationId)]);
+    expect(results.map(response => response.status).sort()).toEqual([200, 409]);
+    expect(seen).toHaveLength(1);
+  });
 });

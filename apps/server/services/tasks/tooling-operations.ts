@@ -289,8 +289,19 @@ async function lineageFinalizationKey(store: PrismaClient, task: RemoteTask, bin
   }
   return null;
 }
+/** The first recorded owner (lowest sequence) is the owner: a concurrent
+ * second claim loses deterministically, whatever its insertion order. */
 export async function owningOperationId(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, reference: ExistingReference) {
-  return (await associations(store, task, "owner", referenceId(reference))).at(-1)?.operationId ?? null;
+  if (!task.primarySessionId) return null;
+  const first = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION, key: associationKey("owner", referenceId(reference)) }, orderBy: { sequence: "asc" } });
+  return first ? Association.parse(JSON.parse(first.value ?? "null")).operationId : null;
+}
+/** Claim ownership, then re-read: only the first recorded owner (or its
+ * command lineage) proceeds to effects. */
+async function claimOwnership(prisma: PrismaClient, binding: ToolingOperationBinding, task: RemoteTask, reference: ExistingReference, read: ToolingOperationDependencies["read"]) {
+  if (!await owningOperationId(prisma, task, reference)) await recordAssociation(prisma, binding, "owner", referenceId(reference), "confirmed");
+  const owner = await owningOperationId(prisma, task, reference);
+  if (!owner || !await sameLineage(prisma, owner, binding, read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
 }
 async function admittingOperationId(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, environmentKey: string) {
   return (await associations(store, task, "admission", `environment-key:${environmentKey}`))[0]?.operationId ?? null;
@@ -461,7 +472,7 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
     catch { binding = (await dependencies.read({ prisma, operationId: binding.operationId })) ?? binding; }
   }
   const { callback, body, context, reference } = admission;
-  if (reference && callback.referenceRule !== "admission" && !await owningOperationId(prisma, context.task, reference)) await recordAssociation(prisma, binding, "owner", referenceId(reference), "confirmed");
+  if (reference && callback.referenceRule !== "admission") await claimOwnership(prisma, binding, context.task, reference, dependencies.read);
   const admitted = callback.admits?.(body);
   if (admitted && await admittingOperationId(prisma, context.task, admitted) !== binding.operationId) await recordAssociation(prisma, binding, "admission", `environment-key:${admitted}`, "confirmed");
   const produced = binding.status === "completed" ? [] : await callback.produces?.(body, context) ?? [];
@@ -588,55 +599,135 @@ export async function bindServerContinuation(input: { prisma: PrismaClient; conf
   if (!active || active.release.id !== group.binding.release.id) throw new ToolingOperationRefused("retained-release-required", `Compute environment ${input.environmentId} runs release ${group.binding.release.revision}; continuation requires a retained-release binding`);
   const binding = await dependencies.bind({ prisma: input.prisma, config: input.config, taskId: input.task.id, sessionId: input.task.primarySessionId, turnId: null, request });
   if (binding.taskId !== input.task.id || binding.kind !== request.kind || binding.inputDigest !== request.inputDigest || binding.release.id !== group.binding.release.id) throw new Error("Server tooling operation identity changed");
-  if (request.existingOperationId) await recordAssociation(input.prisma, binding, "owner", referenceId({ type: "development-intent", id: request.existingOperationId }), "confirmed");
+  if (request.existingOperationId) await claimOwnership(input.prisma, binding, input.task, { type: "development-intent", id: request.existingOperationId }, dependencies.read);
   return { binding, code: binding.release };
 }
 
 const CapabilityReceipt = z.object({ capability: z.string(), source: z.literal("configured-host"), capabilityRevision: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/), checkout: z.string().startsWith("/") }).passthrough();
-async function recordedCapability(tx: Prisma.TransactionClient, task: Pick<RemoteTask, "id" | "primarySessionId">, capability: "runtime" | "cleanup") {
-  if (!task.primarySessionId) return null;
-  const events = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `task:${task.id}`, action: "tooling-capability" }, orderBy: { sequence: "desc" }, take: 200 });
-  for (const event of events) {
-    const receipt = CapabilityReceipt.safeParse(JSON.parse(event.value ?? "null"));
-    if (receipt.success && receipt.data.capability === capability) return receipt.data;
-  }
-  return null;
-}
-const provenance = (receipt: z.infer<typeof CapabilityReceipt> | null, what: string): ToolingLegacyConsumerInput["provenance"] =>
-  receipt ? { revision: receipt.capabilityRevision, checkout: receipt.checkout, receipt } : { unavailable: `No recorded configured-host ${what} capability receipt; original executable unknown` };
+const ObserverCapability = z.object({ version: z.literal(1), source: z.literal("configured-host"), checkout: z.string().startsWith("/"), revision: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/) }).passthrough();
+const FINALIZATION_CONFIRMED_ACTION = "finalization-confirmed", DEVELOPMENT_COMPLETE_ACTION = "development-compute-complete", DEVELOPMENT_SUPERSEDED_ACTION = "development-compute-superseded";
+const COUNTED_COMPUTE_KINDS = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
+const ACTIVE_OFFERS = ["queued", "offered", "validating", "claimed", "running", "unknown"];
+const PENDING_INSTRUCTION = ["queued", "preparing", "dispatching", "unknown"];
+type Provenance = ToolingLegacyConsumerInput["provenance"];
+const bounded = <T>(rows: T[], limit: number, what: string) => { if (rows.length > limit) throw new Error(`Legacy consumer inventory: ${what} exceeds its bound of ${limit}`); return rows; };
 
-/** DRA-28 `ToolingLegacyInventory`: every pre-boundary consumer with the
- * exact executable receipt it used, from durable receipts only — never the
- * current configuration. Runs inside the first activation transaction. */
+/** Exactly one distinct executable, or an explicit ambiguity: several
+ * pre-boundary receipts (e.g. after the configured ref moved) never resolve
+ * to "the newest". */
+function single(receipts: Array<{ revision: string; checkout: string; receipt: unknown }>, what: string): Provenance {
+  const distinct = new Map(receipts.map(value => [`${value.revision}\0${value.checkout}`, value]));
+  if (distinct.size === 1) { const [value] = distinct.values(); return { revision: value!.revision, checkout: value!.checkout, receipt: value!.receipt }; }
+  if (!distinct.size) return { unavailable: `No recorded configured-host ${what} capability receipt; original executable unknown` };
+  return { unavailable: `ambiguous: ${distinct.size} distinct recorded ${what} executables (${[...distinct.values()].map(value => value.revision.slice(0, 12)).join(", ")})` };
+}
+async function recordedCapabilities(tx: Prisma.TransactionClient, task: Pick<RemoteTask, "id" | "primarySessionId">, capability: "runtime" | "cleanup") {
+  if (!task.primarySessionId) return [];
+  const events = bounded(await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `task:${task.id}`, action: "tooling-capability" }, orderBy: { sequence: "asc" }, take: 5001 }), 5000, `task ${task.id} capability receipts`);
+  return events.flatMap(event => {
+    const receipt = CapabilityReceipt.safeParse(JSON.parse(event.value ?? "null"));
+    return receipt.success && receipt.data.capability === capability ? [{ revision: receipt.data.capabilityRevision, checkout: receipt.data.checkout, receipt: receipt.data }] : [];
+  });
+}
+/** The prepared plan's own persisted observer capabilities. */
+function plannedObservers(value: unknown, found: Array<{ revision: string; checkout: string; receipt: unknown }> = []) {
+  if (Array.isArray(value)) for (const item of value) plannedObservers(item, found);
+  else if (value && typeof value === "object") for (const [key, item] of Object.entries(value)) {
+    const capability = key === "observer" ? ObserverCapability.safeParse((item as Record<string, unknown> | null)?.capability) : null;
+    if (capability?.success) found.push({ revision: capability.data.revision, checkout: capability.data.checkout, receipt: capability.data });
+    else plannedObservers(item, found);
+  }
+  return found;
+}
+
+type ConsumerStore = Prisma.TransactionClient;
+/** Liveness of a consumer from protocol evidence; terminal ones are neither
+ * inventoried nor kept retained. */
+async function liveConsumer(tx: ConsumerStore, task: RemoteTask, kind: string, id: string): Promise<boolean> {
+  if (kind === "compute-offer") return Boolean(await tx.computeOffer.findFirst({ where: { id, state: { in: ACTIVE_OFFERS } } }));
+  if (kind === "compute-environment") {
+    const environment = await tx.computeEnvironment.findUnique({ where: { id } });
+    if (!environment) return false;
+    if (["running", "unknown", "starting", "offered"].includes(environment.state) || await tx.computeOffer.count({ where: { environmentId: id, state: { in: ACTIVE_OFFERS } } })) return true;
+    const resource = environment.resourceId ? await tx.remoteTaskResource.findUnique({ where: { id: environment.resourceId } }) : null;
+    return Boolean(resource && resource.state !== "released");
+  }
+  if (kind === "compute-baseline") {
+    const purpose = id.slice(task.id.length + 1);
+    return Boolean(await tx.remoteTaskResource.count({ where: { taskId: task.id, purpose, state: { not: "released" }, kind: { in: COUNTED_COMPUTE_KINDS } } }));
+  }
+  if (!task.primarySessionId) return false;
+  if (kind === "development-intent") {
+    const intent = await tx.runtimeMetadataEvent.findUnique({ where: { sequence: Number(id) } });
+    if (!intent || intent.action !== DEVELOPMENT_INTENT_ACTION) return false;
+    const complete = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `development:${task.id}`, action: DEVELOPMENT_COMPLETE_ACTION, key: intent.key } });
+    const superseded = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `development:${task.id}`, action: DEVELOPMENT_SUPERSEDED_ACTION, sequence: { gt: intent.sequence } } });
+    return !complete && !superseded;
+  }
+  const requestKey = id.slice(task.id.length + 1);
+  if (kind === "finalization") return !await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: FINALIZATION_CONFIRMED_ACTION, key: requestKey } });
+  if (kind === "cleanup-request") {
+    const request = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: CLEANUP_REQUEST_ACTION, key: requestKey } });
+    const instructionId = request ? z.object({ instructionId: z.string() }).safeParse(JSON.parse(request.value ?? "null")).data?.instructionId : undefined;
+    return Boolean(instructionId && await tx.runtimeInstruction.findFirst({ where: { id: instructionId, state: { in: PENDING_INSTRUCTION } } }));
+  }
+  return true; // Unknown kinds stay retained (conservative).
+}
+
+/** DRA-28 `ToolingLegacyInventory`: every live pre-boundary consumer, open or
+ * closed task alike, with its exact unambiguous executable. Bounds fail
+ * activation rather than silently dropping consumers. */
 export const inventoryLegacyToolingConsumers: ToolingLegacyInventory = async (tx, input) => {
-  const tasks = await tx.remoteTask.findMany({ where: { repositoryId: input.repositoryId, phase: { not: "closed" } }, orderBy: { id: "asc" }, take: 2001 });
-  if (tasks.length > 2000) throw new Error("Legacy consumer inventory exceeds its bound");
+  const tasks = bounded(await tx.remoteTask.findMany({ where: { repositoryId: input.repositoryId }, orderBy: { id: "asc" }, take: 5001 }), 5000, "tasks");
   const consumers: ToolingLegacyConsumerInput[] = [];
   for (const task of tasks) {
-    const runtime = await recordedCapability(tx, task, "runtime"), cleanup = await recordedCapability(tx, task, "cleanup");
-    for (const environment of await tx.computeEnvironment.findMany({ where: { taskId: task.id }, take: 101 })) {
-      consumers.push({ taskId: task.id, consumerKind: "compute-environment", consumerId: environment.id, provenance: provenance(runtime, "runtime") });
-      for (const row of await tx.computeOffer.findMany({ where: { environmentId: environment.id, state: { in: ["queued", "offered", "validating", "claimed", "running", "unknown"] } }, take: 101 }))
-        consumers.push({ taskId: task.id, consumerKind: "compute-offer", consumerId: row.id, provenance: provenance(runtime, "runtime") });
+    const runtime = single(await recordedCapabilities(tx, task, "runtime"), "runtime"), cleanupReceipts = await recordedCapabilities(tx, task, "cleanup");
+    const push = async (consumerKind: string, consumerId: string, provenance: Provenance) => { if (await liveConsumer(tx, task, consumerKind, consumerId)) consumers.push({ taskId: task.id, consumerKind, consumerId, provenance }); };
+    for (const environment of bounded(await tx.computeEnvironment.findMany({ where: { taskId: task.id }, take: 1001 }), 1000, `task ${task.id} environments`)) {
+      await push("compute-environment", environment.id, runtime);
+      for (const row of bounded(await tx.computeOffer.findMany({ where: { environmentId: environment.id, state: { in: ACTIVE_OFFERS } }, take: 1001 }), 1000, `environment ${environment.id} offers`))
+        await push("compute-offer", row.id, runtime);
     }
-    for (const baseline of await tx.computeBaseline.findMany({ where: { taskId: task.id }, take: 11 }))
-      consumers.push({ taskId: task.id, consumerKind: "compute-baseline", consumerId: `${task.id}:${baseline.purpose}`, provenance: provenance(runtime, "runtime") });
+    // Baseline groups computed as refreshComputeBaselines does: existing rows
+    // plus unreleased counted resources not attached to an environment.
+    const purposes = new Set(bounded(await tx.computeBaseline.findMany({ where: { taskId: task.id }, take: 101 }), 100, `task ${task.id} baselines`).map(row => row.purpose));
+    const attached = new Set((await tx.computeEnvironment.findMany({ where: { taskId: task.id, resourceId: { not: null } }, select: { resourceId: true }, take: 1001 })).map(row => row.resourceId));
+    for (const resource of bounded(await tx.remoteTaskResource.findMany({ where: { taskId: task.id, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: COUNTED_COMPUTE_KINDS } }, take: 10001 }), 10000, `task ${task.id} resources`))
+      if (!attached.has(resource.id)) purposes.add(resource.purpose);
+    for (const purpose of purposes) await push("compute-baseline", `${task.id}:${purpose}`, runtime);
     if (!task.primarySessionId) continue;
     const intent = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `development:${task.id}`, action: DEVELOPMENT_INTENT_ACTION }, orderBy: { sequence: "desc" } });
-    if (intent) consumers.push({ taskId: task.id, consumerKind: "development-intent", consumerId: String(intent.sequence), provenance: provenance(runtime, "runtime") });
-    const prepared = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED_ACTION }, take: 101 });
-    for (const key of new Set(prepared.map(event => event.key)))
-      consumers.push({ taskId: task.id, consumerKind: "finalization", consumerId: `${task.id}:${key}`, provenance: provenance(cleanup, "cleanup") });
-    for (const request of await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: CLEANUP_REQUEST_ACTION }, take: 101 })) {
+    if (intent) await push("development-intent", String(intent.sequence), runtime);
+    const prepared = bounded(await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: FINALIZATION_PREPARED_ACTION }, orderBy: { sequence: "asc" }, take: 1001 }), 1000, `task ${task.id} finalizations`);
+    for (const key of new Set(prepared.map(event => event.key))) {
+      // The prepared plan's persisted observer is the exact executable.
+      const planned = prepared.filter(event => event.key === key).flatMap(event => plannedObservers(JSON.parse(event.value ?? "null")));
+      await push("finalization", `${task.id}:${key}`, single(planned.length ? planned : cleanupReceipts, "cleanup"));
+    }
+    for (const request of bounded(await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `finalizer:${task.id}`, action: CLEANUP_REQUEST_ACTION }, take: 1001 }), 1000, `task ${task.id} cleanup requests`)) {
       // The scheduled instruction's marker holds its exact immutable adapter.
       const instructionId = z.object({ instructionId: z.string() }).safeParse(JSON.parse(request.value ?? "null")).data?.instructionId;
       const marker = instructionId ? await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: "cleanup-inbox", action: CLEANUP_INSTRUCTION_ACTION, key: instructionId } }) : null;
-      const capability = marker ? z.object({ capability: CapabilityReceipt }).passthrough().safeParse(JSON.parse(marker.value ?? "null")).data?.capability ?? null : null;
-      consumers.push({ taskId: task.id, consumerKind: "cleanup-request", consumerId: `${task.id}:${request.key}`, provenance: provenance(capability, "cleanup") });
+      const capability = marker ? CapabilityReceipt.safeParse(z.object({ capability: z.unknown() }).passthrough().safeParse(JSON.parse(marker.value ?? "null")).data?.capability).data : undefined;
+      await push("cleanup-request", `${task.id}:${request.key}`, capability ? { revision: capability.capabilityRevision, checkout: capability.checkout, receipt: capability } : single([], "cleanup marker"));
     }
   }
   return consumers;
 };
+
+/** Resolve retained first-bootstrap consumers whose protocol evidence now
+ * shows them finished, lifting state-write deferral and legacy continuation
+ * for them. Bounded; conservative (unknown kinds stay retained). */
+export async function resolveFinishedLegacyConsumers(input: { prisma: PrismaClient; repositoryId: string; taskId?: string }, resolve = (async (value: { prisma: PrismaClient; id: string; evidence: { kind: string; reference: string } }) => (await import("./tooling-releases.ts")).resolveToolingLegacyConsumer(value))) {
+  const rows = bounded(await input.prisma.toolingLegacyConsumer.findMany({ where: { repositoryId: input.repositoryId, status: "retained", ...(input.taskId ? { taskId: input.taskId } : {}) }, take: 1001 }), 1000, "retained legacy consumers");
+  let resolved = 0;
+  for (const row of rows) {
+    const task = await input.prisma.remoteTask.findUnique({ where: { id: row.taskId } });
+    if (!task || await input.prisma.$transaction(tx => liveConsumer(tx, task, row.consumerKind, row.consumerId))) continue;
+    await resolve({ prisma: input.prisma, id: row.id, evidence: { kind: `${row.consumerKind}-finished`, reference: row.consumerId.slice(0, 512) } }).then(() => resolved++).catch(() => undefined);
+  }
+  return { resolved };
+}
 
 // ---------------------------------------------------------------------------
 // Guarded state evidence for the owning operation (frozen wire shapes in
@@ -664,6 +755,7 @@ export async function readOperationStateEvidence(input: { prisma: PrismaClient; 
   if (!parsed.success) throw refuse("operation-input", "A state family and scopeKey are required");
   const { family, scopeKey } = parsed.data;
   const binding = await ownedStateOperation({ ...input, scopeKey }, dependencies);
+  await resolveFinishedLegacyConsumers({ prisma: input.prisma, repositoryId: binding.repositoryId, taskId: binding.taskId });
   const releases = await import("./tooling-releases.ts");
   const readable = await (dependencies.readable ?? releases.assertToolingStateReadable)({ prisma: input.prisma, operationId: binding.operationId, family, scopeKey });
   const consumers = new Map<string, ToolingStateFormat | null>();
@@ -701,6 +793,8 @@ export async function registerOperationStateWrite(input: { prisma: PrismaClient;
   const parsed = StateWriteInput.safeParse(input.body);
   if (!parsed.success) throw refuse("operation-input", "A state family, scopeKey and positive version are required");
   const binding = await ownedStateOperation({ ...input, scopeKey: parsed.data.scopeKey }, dependencies);
+  // Finished first-bootstrap readers no longer defer this task's writes.
+  await resolveFinishedLegacyConsumers({ prisma: input.prisma, repositoryId: binding.repositoryId, taskId: binding.taskId });
   const write = await (dependencies.register ?? (await import("./tooling-releases.ts")).registerToolingStateWrite)({ prisma: input.prisma, operationId: binding.operationId, ...parsed.data });
   // The receipt is not an effect; refuse to hand it out if authority changed.
   await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
