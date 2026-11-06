@@ -325,7 +325,7 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
         await assertCleanupResourceUpdate({ prisma: tx, config: c.get("config"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values);
       }
       // A closed legacy resource release's limits, atomic with the write.
-      assertClosedReleaseResourceUpdate(existing, values);
+      await assertClosedReleaseResourceUpdate(existing, values, tx);
       return tx.remoteTaskResource.update({ where: { id: existing.id }, data: { state: values.state, metadata: values.metadata, expiresAt: values.expiresAt } });
     });
     return c.json({ resource });

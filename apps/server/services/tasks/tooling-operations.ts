@@ -35,6 +35,9 @@ export type ToolingOperationKind = typeof TOOLING_OPERATION_KINDS[number];
 /** Existing durable operations. `type` is also DRA-28's legacy consumerKind;
  * finalization and cleanup-request IDs are `<taskId>:<requestKey>`. */
 export type ExistingReference = { type: "compute-offer" | "compute-environment" | "finalization" | "development-intent" | "cleanup-request" | "compute-baseline"; id: string };
+/** Narrows a begin kind to a callback kind (the only kinds that continue an
+ * existing domain record through existingOperationId). */
+const isCallbackKind = (kind: string): kind is ToolingOperationKind => (TOOLING_OPERATION_KINDS as readonly string[]).includes(kind);
 const EXISTING_TYPE: Record<ToolingOperationKind, ExistingReference["type"]> = {
   "compute-admission": "compute-offer", "compute-configure": "compute-offer", "compute-enroll": "compute-environment",
   "development-intent": "development-intent", finalization: "finalization", "cleanup-schedule": "cleanup-request",
@@ -721,7 +724,7 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   // inherited atomically by the binding primitive), else the active one.
   const parent = request.parentOperationId ? await dependencies.read({ prisma: input.prisma, operationId: request.parentOperationId }) : null;
   if (request.parentOperationId && (!parent || parent.kind !== ADAPTER_COMMAND_KIND || parent.taskId !== before.task.id || parent.sessionId !== input.sessionId)) throw new ToolingOperationRefused("operation-ownership", "Parent must be this primary's adapter-command binding");
-  if (request.existingOperationId && request.kind !== ADAPTER_COMMAND_KIND) {
+  if (request.existingOperationId && isCallbackKind(request.kind)) {
     const type = EXISTING_TYPE[request.kind];
     const reference: ExistingReference = { type, id: type === "finalization" || type === "cleanup-request" ? `${before.task.id}:${request.existingOperationId}` : request.existingOperationId };
     if (!await existingReceipt(input.prisma, before.task, reference)) throw new ToolingOperationRefused("operation-input", `Existing ${type} ${request.existingOperationId} does not belong to this task`);
@@ -1130,7 +1133,80 @@ function assertRuntimeProviderProgress(key: string, before: unknown, after: unkn
     if ([...keys].some(field => JSON.stringify(identity[field]) !== JSON.stringify(current[field])) || was === true && now !== true) throw refuse("operation-mismatch", `A closed resource release can only mark ${key}'s existing providers released`);
   });
 }
-export function assertClosedReleaseResourceUpdate(existing: { taskId: string; key: string; kind?: string; state: string; metadata: unknown; expiresAt: Date | null }, next: { state: string; metadata?: unknown; expiresAt: Date | null }) {
+const PREVIEW_KINDS = new Set(["cloudflare-tunnel", "cloudflare-dns-record", "cloudflare-dns-route", "local-http"]);
+const Hex32 = z.string().regex(/^[a-f0-9]{32}$/), Uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+const Hostname = z.string().regex(/^[a-z0-9.-]+\.[a-z]+$/i).max(253);
+/** Identities Drafted's public-preview cleanup discovers and records before
+ * deleting; each may be added where absent, never changed once known. */
+const PREVIEW_DISCOVERY: Record<string, z.ZodType> = { hostname: Hostname, tunnelId: Uuid, zoneId: Hex32, accountId: Hex32, dnsRecordId: Hex32.nullable() };
+const CLEANUP_OBSERVED = ["exact-dns-record-absent", "exact-tunnel-absent", "task-hostname-removed-shared-tunnel-preserved"];
+const PreviewCleanup = z.object({ complete: z.literal(true), hostname: Hostname, tunnelId: Uuid.optional(), sharedTunnelPreserved: z.boolean().optional(),
+  quickTunnelConnectorRemoved: z.literal(true).optional(), observedAt: z.string().max(64) }).strict();
+/** The identity a receipt already carries under the writer's aliases
+ * (Drafted hostOf/tunnelOf/dnsId and its zone/account recovery). */
+function ownPreviewIdentity(existing: { kind?: string; externalId?: string }, before: Record<string, unknown>): Record<string, unknown> {
+  const tunnel = (before.publicTunnel && typeof before.publicTunnel === "object" ? before.publicTunnel : {}) as Record<string, unknown>;
+  const route = (before.routeResult && typeof before.routeResult === "object" ? before.routeResult : {}) as Record<string, unknown>;
+  const first = (schema: z.ZodType, ...values: unknown[]) => values.find((value) => schema.safeParse(value).success);
+  const external = existing.externalId ?? "";
+  return {
+    hostname: hostOf(before.publicUrl) ?? hostOf(before.hostname) ?? hostOf(tunnel.hostname) ?? (Hostname.safeParse(external).success ? external.toLowerCase() : undefined),
+    tunnelId: first(Uuid, tunnel.id, before.tunnelId, before.id, external, /^([a-f0-9-]+)\.cfargotunnel\.com\.?$/i.exec(String(before.content ?? before.target ?? ""))?.[1]),
+    dnsRecordId: first(Hex32, before.dnsRecordId, before.recordId, route.dnsTag, existing.kind === "cloudflare-dns-record" ? external : undefined),
+    zoneId: first(Hex32, before.zoneId, before.zone, tunnel.zoneId),
+    accountId: first(Hex32, before.accountId, before.account, tunnel.accountId),
+  };
+}
+const hostOf = (value: unknown) => { try { return typeof value === "string" ? new URL(value.startsWith("http") ? value : `https://${value}`).hostname : undefined; } catch { return undefined; } };
+/** Public-preview cleanup progress (Drafted public-preview.ts): exact
+ * discovered identities consistent with the receipt's existing identity, the
+ * observed-absence marker on the released write, clearing publicUrl only with
+ * a completion marker for the same host, and once-only connector keys naming
+ * existing same-purpose connector receipts. Returns the keys it decided. */
+async function assertPreviewProgress(store: Pick<PrismaClient, "remoteTaskResource">, existing: { taskId: string; key: string; kind?: string; purpose?: string; externalId?: string },
+  before: Record<string, unknown>, after: Record<string, unknown>, nextState: string) {
+  const decided = new Set<string>();
+  const own = ownPreviewIdentity(existing, before), knownHost = own.hostname as string | undefined;
+  for (const [key, schema] of Object.entries(PREVIEW_DISCOVERY)) {
+    if (!(key in after) && !(key in before)) continue;
+    decided.add(key);
+    if (before[key] !== undefined && before[key] !== null) { if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key}'s known ${key}`); continue; }
+    if (after[key] === undefined) continue;
+    if (!schema.safeParse(after[key]).success) throw refuse("operation-mismatch", `A closed resource release records ${existing.key} ${key} only in its exact provider form`);
+    if (own[key] !== undefined && after[key] !== own[key]) throw refuse("operation-mismatch", `Discovered ${key} does not match ${existing.key}'s existing identity`);
+  }
+  if ("cleanupObserved" in after || "cleanupObserved" in before) {
+    decided.add("cleanupObserved");
+    if (JSON.stringify(before.cleanupObserved) !== JSON.stringify(after.cleanupObserved)
+      && (nextState !== "released" || !CLEANUP_OBSERVED.includes(String(after.cleanupObserved)))) throw refuse("operation-mismatch", `${existing.key} records an observed absence only on its own release`);
+  }
+  if ("publicPreviewCleanup" in after || "publicPreviewCleanup" in before) {
+    decided.add("publicPreviewCleanup");
+    if (before.publicPreviewCleanup !== undefined) { if (JSON.stringify(before.publicPreviewCleanup) !== JSON.stringify(after.publicPreviewCleanup)) throw refuse("operation-mismatch", `${existing.key}'s recorded preview cleanup cannot be rewritten`); }
+    else {
+      const marker = PreviewCleanup.safeParse(after.publicPreviewCleanup);
+      if (!marker.success || knownHost && marker.data.hostname !== knownHost) throw refuse("operation-mismatch", `${existing.key} records preview cleanup only for its own host in the writer's shape`);
+    }
+  }
+  if ("publicUrl" in after || "publicUrl" in before) {
+    decided.add("publicUrl");
+    if (JSON.stringify(before.publicUrl) !== JSON.stringify(after.publicUrl)
+      && (after.publicUrl !== null || !PreviewCleanup.safeParse(after.publicPreviewCleanup).success || hostOf(before.publicUrl) !== (after.publicPreviewCleanup as { hostname?: string }).hostname)) throw refuse("operation-mismatch", `${existing.key}'s publicUrl may only be cleared with its completed cleanup`);
+  }
+  if ("connectorKeys" in after || "connectorKeys" in before) {
+    decided.add("connectorKeys");
+    if (before.connectorKeys !== undefined) { if (JSON.stringify(before.connectorKeys) !== JSON.stringify(after.connectorKeys)) throw refuse("operation-mismatch", `${existing.key}'s connector keys cannot change`); }
+    else {
+      const keys = z.array(z.string().min(1).max(512)).max(100).safeParse(after.connectorKeys);
+      if (!keys.success || keys.data.length === 0 || keys.data.join("\0") !== [...new Set(keys.data)].sort().join("\0") || keys.data.includes(existing.key)) throw refuse("operation-mismatch", `${existing.key} records connector keys only as its sorted connector receipts`);
+      const connectors = await store.remoteTaskResource.findMany({ where: { taskId: existing.taskId, key: { in: keys.data }, kind: { in: ["launch-agent", "docker-container"] }, ...(existing.purpose ? { purpose: existing.purpose } : {}) } });
+      if (connectors.length !== keys.data.length) throw refuse("operation-mismatch", `${existing.key}'s connector keys must name its existing connector receipts`);
+    }
+  }
+  return decided;
+}
+export async function assertClosedReleaseResourceUpdate(existing: { taskId: string; key: string; kind?: string; purpose?: string; externalId?: string; state: string; metadata: unknown; expiresAt: Date | null },
+  next: { state: string; metadata?: unknown; expiresAt: Date | null }, store?: Pick<PrismaClient, "remoteTaskResource">) {
   const binding = currentToolingOperation();
   if (!binding || binding.kind !== CLOSED_RESOURCE_RELEASE_KIND) return;
   if (existing.taskId !== binding.taskId || existing.key !== binding.resourceKey) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
@@ -1140,7 +1216,9 @@ export function assertClosedReleaseResourceUpdate(existing: { taskId: string; ke
   const before = (existing.metadata && typeof existing.metadata === "object" ? existing.metadata : {}) as Record<string, unknown>;
   const after = (next.metadata && typeof next.metadata === "object" ? next.metadata : {}) as Record<string, unknown>;
   const runtime = existing.kind === "task-runtime";
+  const preview = existing.kind !== undefined && PREVIEW_KINDS.has(existing.kind) && store ? await assertPreviewProgress(store, existing, before, after, next.state) : new Set<string>();
   for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (preview.has(key)) continue;
     if (key === "observed" || key === "observedAt") { if (key in after && !ObservationString.safeParse(after[key]).success) throw refuse("operation-mismatch", `A closed resource release records ${key} only as an observation string`); continue; }
     if (runtime && key === "progress") { if (!RuntimeProgress.safeParse(after[key] ?? null).success) throw refuse("operation-mismatch", `A closed resource release records ${existing.key} progress only in its runtime shape`); continue; }
     if (runtime && key === "providers") { assertRuntimeProviderProgress(existing.key, before[key], after[key]); continue; }

@@ -858,3 +858,48 @@ test("closed runtime receipts accept the runtime writer's monotonic cleanup prog
   expect((await put("released", { ...identity, providers: released(1), observed: "released", progress: { ...progress, state: "complete" } })).status).toBe(200);
   expect((await put("ready", { ...identity, providers: released(1), observed: "ready", progress })).status).toBe(409);
 });
+
+test("closed public-preview receipts accept the preview writer's exact discovery and completion and nothing else", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt: new Date() } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  const hostname = "task.example.test", tunnelId = "0f0e0d0c-0b0a-4908-8706-050403020100", zoneId = "a".repeat(32), accountId = "b".repeat(32), dnsRecordId = "c".repeat(32);
+  const resources = {
+    preview: { key: "preview", kind: "local-http", purpose: "review", externalId: "http://localhost:3000", metadata: { publicUrl: `https://${hostname}` } },
+    dns: { key: "dns", kind: "cloudflare-dns-record", purpose: "review", externalId: hostname, metadata: { zone: zoneId, routeResult: { dnsTag: dnsRecordId } } },
+    tunnel: { key: "tunnel", kind: "cloudflare-tunnel", purpose: "review", externalId: "task-preview", metadata: { tunnelId, accountId, zoneId, hostname } },
+    connector: { key: "connector", kind: "launch-agent", purpose: "review", externalId: "ai.drafted.task.task-preview.cloudflare", metadata: { tunnelId } },
+  };
+  for (const resource of Object.values(resources)) await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", ...resource } });
+  const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  const put = async (name: keyof typeof resources, state: string, metadata: Record<string, unknown>) => {
+    const resource = resources[name];
+    const { binding } = await begin(config, { requestKey: `release-${name}`, inputDigest: canonicalDigest({ key: resource.key, action: "release" }), kind: "closed-resource-release", resourceKey: resource.key });
+    return (await server.request("http://localhost/api/sessions/primary/task/resources", { method: "PUT",
+      headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: binding.operationId }, body: JSON.stringify({ ...resource, state, metadata }) })).status;
+  };
+  const discovered = { hostname, tunnelId, zoneId, dnsRecordId };
+  // Discovery consistent with each receipt's existing identity.
+  expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered })).toBe(200);
+  expect(await put("tunnel", "ready", { ...resources.tunnel.metadata, dnsRecordId, connectorKeys: ["connector"] })).toBe(200);
+  // Refused: discoveries contradicting existing identity, changing a known identity, foreign shapes, unknown connectors.
+  expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered, dnsRecordId: "d".repeat(32) })).toBe(409);
+  expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered, hostname: "other.example.test" })).toBe(409);
+  expect(await put("tunnel", "ready", { ...resources.tunnel.metadata, tunnelId: "1f0e0d0c-0b0a-4908-8706-050403020100", dnsRecordId, connectorKeys: ["connector"] })).toBe(409);
+  expect(await put("preview", "ready", { ...resources.preview.metadata, tunnelId: "not-a-uuid" })).toBe(409);
+  expect(await put("tunnel", "ready", { ...resources.tunnel.metadata, dnsRecordId, connectorKeys: ["connector", "missing"] })).toBe(409);
+  expect(await put("tunnel", "ready", { ...resources.tunnel.metadata, dnsRecordId, connectorKeys: [] })).toBe(409);
+  expect(await put("preview", "ready", { ...resources.preview.metadata, arbitrary: true })).toBe(409);
+  // The observed absence only on release; publicUrl cleared only with its own completed cleanup.
+  expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered, cleanupObserved: "exact-dns-record-absent" })).toBe(409);
+  expect(await put("dns", "released", { ...resources.dns.metadata, ...discovered, cleanupObserved: "anything" })).toBe(409);
+  expect(await put("dns", "released", { ...resources.dns.metadata, ...discovered, cleanupObserved: "exact-dns-record-absent" })).toBe(200);
+  const observedAt = new Date().toISOString();
+  expect(await put("preview", "ready", { publicUrl: null })).toBe(409);
+  expect(await put("preview", "ready", { publicUrl: null, publicPreviewCleanup: { complete: true, hostname: "other.example.test", observedAt } })).toBe(409);
+  expect(await put("preview", "ready", { ...discovered, publicUrl: null, publicPreviewCleanup: { complete: true, hostname, tunnelId, sharedTunnelPreserved: false, observedAt } })).toBe(200);
+  // Completed cleanup is final: no rewrite, no restored URL, no resurrection of the released DNS receipt.
+  expect(await put("preview", "ready", { ...discovered, publicUrl: `https://${hostname}`, publicPreviewCleanup: { complete: true, hostname, tunnelId, sharedTunnelPreserved: false, observedAt } })).toBe(409);
+  expect(await put("preview", "ready", { ...discovered, publicUrl: null, publicPreviewCleanup: { complete: true, hostname, tunnelId, sharedTunnelPreserved: true, observedAt } })).toBe(409);
+  expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered, cleanupObserved: "exact-dns-record-absent" })).toBe(409);
+});
