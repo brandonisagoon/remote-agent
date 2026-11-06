@@ -152,7 +152,8 @@ async function pool<T>(items: T[], width: number, work: (item: T) => Promise<voi
 async function finish(server: Server, evidence: Record<string, any>, evidenceFile: string, passed: boolean) {
   const prisma = server.db.prisma;
   evidence.passed = passed;
-  evidence.end = provenance(server);
+  // Evidence is always written; a provenance read failure is itself recorded.
+  try { evidence.end = provenance(server); } catch (error) { evidence.end = { error: error instanceof Error ? error.message : String(error) }; evidence.passed = false; }
   evidence.rows = await (async () => ({ environments: await prisma.computeEnvironment.findMany(), offers: await prisma.computeOffer.findMany(), slots: await prisma.computeSlot.findMany(),
     baselines: await prisma.computeBaseline.findMany(), instructions: await prisma.runtimeInstruction.findMany(),
     baselineRefreshes: await prisma.runtimeMetadataEvent.findMany({ where: { action: "compute-baseline-refresh" }, orderBy: { sequence: "asc" } }),
