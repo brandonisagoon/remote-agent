@@ -11,10 +11,14 @@
  * - Every command is parsed with an exact option grammar (allowlist). Any
  *   unknown option, command or target is refused.
  * - create: unique prefixed --name, a ledger --network, only recorded image
- *   IDs in image position, only --pull=never, loopback ephemeral publishing,
- *   bind sources whose realpath stays inside the fixture root, and volume
+ *   IDs in image position, only --pull=never, bind sources whose realpath stays inside the fixture root, and volume
  *   mounts naming an already-ledgered volume (so Docker cannot implicitly
  *   create an unrecorded one).
+ * - Publication is optional and never added: internal app containers stay
+ *   unpublished on their private ledger network. A container that does
+ *   publish (Drafted's proxy) must name an explicit 127.0.0.1 host port
+ *   inside the OS ephemeral range that no other ledger container owns; the
+ *   port is recorded with the container in the ledger.
  * - Every destructive/exec target must be a ledger object.
  * - Every created object (ID and name) is durably appended (fsync) to the
  *   ledger BEFORE its ID is written to the caller.
@@ -36,7 +40,7 @@ function refuse(reason: string): never { log({ refused: reason, args: raw }); co
 const NAME = /(?<![A-Za-z0-9_.-])(drafted-[dr]-[0-9a-f]{24}[a-z0-9-]*)/g;
 const inbound = (value: string) => value.replace(NAME, `${policy.prefix}-$1`);
 const outbound = (text: string) => text.split(`${policy.prefix}-drafted-`).join("drafted-");
-type Entry = { kind: "container" | "network" | "volume"; id: string; name: string };
+type Entry = { kind: "container" | "network" | "volume"; id: string; name: string; published?: number[] };
 const ledger = (): Entry[] => existsSync(policy.ledger) ? readFileSync(policy.ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 const owned = (value: string, kinds: Entry["kind"][]) => ledger().some(entry => kinds.includes(entry.kind) && (entry.id === value || entry.name === value || (/^[a-f0-9]{12,}$/.test(value) && entry.id.startsWith(value))));
 function record(entry: Entry) {
@@ -64,7 +68,16 @@ const [command, sub] = args;
 const isContainerVerb = command === "container" && ["inspect", "start", "stop", "kill", "rm", "logs", "wait"].includes(sub ?? "");
 const verb = isContainerVerb ? sub! : command!;
 const rest = args.slice(isContainerVerb ? 2 : 1);
-let created: Entry["kind"] | null = null, createdName = "";
+let created: Entry["kind"] | null = null, createdName = "", createdPublished: number[] = [];
+/** The OS ephemeral port range (macOS sysctl, Linux procfs); unknown means refuse. */
+function ephemeralRange(): [number, number] {
+  if (process.platform === "darwin") {
+    const read = (key: string) => Number(Bun.spawnSync(["/usr/sbin/sysctl", "-n", key], { stdout: "pipe" }).stdout.toString().trim());
+    return [read("net.inet.ip.portrange.first"), read("net.inet.ip.portrange.last")];
+  }
+  const [first, last] = existsSync("/proc/sys/net/ipv4/ip_local_port_range") ? readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/).map(Number) : [];
+  return [first ?? NaN, last ?? NaN];
+}
 
 if (command === "info" || command === "version") parse(args.slice(1), ["--format"], [], false);
 else if (command === "image" && sub === "inspect") { const { positionals } = parse(args.slice(2), ["--format"], [], false); if (positionals.some(value => !["oven/bun:1.3.14", "nginx:1.28-alpine", ...policy.images].includes(value))) refuse("image inspect of a non-fixture image"); }
@@ -108,9 +121,20 @@ else if (command === "exec") {
   if (values("--pull").some(value => value !== "never")) refuse("only --pull=never is allowed");
   if (!values("--label").some(value => /^dev\.drafted\.task=dra37-/.test(value))) refuse("missing DRA-37 task label");
   if (!positionals.length || !policy.images.includes(positionals[0]!)) refuse("the image position must be one recorded immutable fixture image ID");
-  for (const publish of values("--publish")) {
-    const match = /^127\.0\.0\.1:(\d+):(\d+)$/.exec(publish);
-    if (!match || Number(match[1]) < 1024 || Number(match[1]) > 65535) refuse(`publish ${publish} is not a loopback ephemeral port`);
+  // Optional: no publication is the normal internal-container case.
+  const publishes = values("--publish");
+  if (publishes.length) {
+    const [first, last] = ephemeralRange();
+    if (!Number.isInteger(first) || !Number.isInteger(last) || first < 1024 || last > 65535 || first > last) refuse("the OS ephemeral port range is unavailable; publication refused");
+    const claimed = new Set(ledger().flatMap(entry => entry.published ?? []));
+    for (const publish of publishes) {
+      const match = /^127\.0\.0\.1:([1-9]\d*):([1-9]\d*)(\/tcp)?$/.exec(publish);
+      if (!match) refuse(`publish ${publish} must be an explicit 127.0.0.1:<host>:<container> port`);
+      const host = Number(match[1]);
+      if (host < first || host > last || Number(match[2]) > 65535) refuse(`publish ${publish} is outside the OS ephemeral range ${first}-${last}`);
+      if (claimed.has(host) || createdPublished.includes(host)) refuse(`publish ${publish} host port is already owned by a fixture container`);
+      createdPublished.push(host);
+    }
   }
   for (const value of values("--mount")) {
     const mount = Object.fromEntries(value.split(",").map(pair => [pair.split("=")[0]!, pair.split("=")[1] ?? true])) as Record<string, string | true>;
@@ -140,7 +164,7 @@ if (code === 0 && created) {
   const id = stdout.trim();
   if (created !== "volume" && !/^[a-f0-9]{64}$/.test(id)) { log({ unrecognizedCreateOutput: id.slice(0, 200) }); refuse("create output is not an exact object ID; the object needs manual reconciliation"); }
   // Durable before the caller can act on the new object.
-  record({ kind: created, id, name: createdName });
+  record({ kind: created, id, name: createdName, ...(createdPublished.length ? { published: createdPublished } : {}) });
 }
 process.stderr.write(stderr);
 process.stdout.write(outbound(stdout));
