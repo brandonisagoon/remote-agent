@@ -13,7 +13,7 @@ import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
-  StateWriteOutcomeUnknown, currentToolingOperation, runWithToolingOperation, toolingProcessContext, bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, registerOperationStateWrite, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
+  StateWriteOutcomeUnknown, admitToolingCallback, afterBoundCallback, beforeBoundCallback, type CallbackAdmission, currentToolingOperation, runWithToolingOperation, toolingProcessContext, bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, registerOperationStateWrite, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
 import { canonicalDigest, confirmToolingConsumer, readToolingOperation, registerToolingStateWrite, retainToolingConsumer, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
@@ -596,20 +596,34 @@ describe("review of 5eb3b2c", () => {
     expect(toolingProcessContext(null)).toEqual({});
   });
 
-  test("a closed task continues only its own existing cleanup operation", async () => {
+  test("a closed task continues only its own exact cleanup lineage; other commands get no authority", async () => {
     const { config } = await fixture(); await bootstrap([]);
     const closedAt = new Date();
     await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt } });
-    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
-    const destroy = () => begin(config, { requestKey: "destroy", inputDigest: canonicalDigest({ argv: ["task", "destroy"] }), kind: "adapter-command" });
-    await expect(destroy()).rejects.toThrow(/original operation recorded before settled primary closure/);
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed", connectionId: config.activeConnectionId, issueIdentifier: "DRA-1" } });
+    const link = await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: "primary", provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-1", relationship: "handles", endedAt: closedAt } });
+    const fence = (key: string, extra: Record<string, unknown> = {}) => begin(config, { requestKey: key, inputDigest: canonicalDigest({ argv: [key] }), kind: "adapter-command", ...extra });
+    const cleanup = { existingOperationId: "finalize:task" };
+    await expect(fence("destroy", cleanup)).rejects.toThrow(/original operation recorded before settled primary closure/);
     await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "finalizer:task", action: "finalization-cleanup-started", key: "finalize:task", value: "{}", occurredAt: new Date(closedAt.getTime() - 1000) } });
-    const fence = (await destroy()).binding;
-    expect(fence.kind).toBe("adapter-command");
-    expect((await begin(config, { requestKey: "destroy/finalization", inputDigest: canonicalDigest({ requestKey: "finalize:task" }), kind: "finalization", parentOperationId: fence.operationId })).binding.kind).toBe("finalization");
+    // runtime up / migrate-state on a closed task: no fence, so no effect or state authority.
+    await expect(fence("runtime-up")).rejects.toThrow(/must name its cleanup operation/);
+    await expect(fence("migrate-state", { resourceKey: "runtime" })).rejects.toThrow(/must name its cleanup operation/);
     await expect(begin(config, { requestKey: "new-compute", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).rejects.toThrow(/Task is closed/);
+    // The exact cleanup command and its finalization continue.
+    const destroy = (await fence("destroy", cleanup)).binding;
+    expect((await begin(config, { requestKey: "destroy/finalization", inputDigest: canonicalDigest({ requestKey: "finalize:task" }), kind: "finalization", parentOperationId: destroy.operationId })).binding.kind).toBe("finalization");
+    await expect(begin(config, { requestKey: "destroy/other", inputDigest: canonicalDigest({ requestKey: "finalize:other" }), kind: "finalization", parentOperationId: destroy.operationId })).rejects.toThrow(/only continues finalization finalize:task/);
     const { call } = app(config);
-    expect((await call(`/api/sessions/primary/tooling-operations/${fence.operationId}/state?family=drafted.runtime&scopeKey=task`, undefined, fence.operationId, "GET")).status).toBe(200);
+    const evidence = () => call(`/api/sessions/primary/tooling-operations/${destroy.operationId}/state?family=drafted.runtime&scopeKey=task`, undefined, destroy.operationId, "GET");
+    expect((await evidence()).status).toBe(200);
+    // Shared ownership still binds: pause, revocation, unconfigured repository.
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    expect((await evidence()).status).toBe(409);
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: false } });
+    await db.prisma.runtimeSessionResourceLink.delete({ where: { id: link.id } });
+    expect((await evidence()).status).toBe(409);
+    await expect(fence("destroy-2", cleanup)).rejects.toThrow(/revoked/);
   });
 
   test("the task read names its exact latest prepared finalization key", async () => {
@@ -621,4 +635,25 @@ describe("review of 5eb3b2c", () => {
     await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "other-primary", source: "finalizer:other", action: FINALIZATION_PREPARED, key: "finalize:other", value: "{}" } });
     expect(await read()).toBe("finalize:task:2");
   });
+});
+
+test("settlement trusts only the latest callback attempt's own acknowledgment", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const fence = (await begin(config, { requestKey: "runtime-up", inputDigest: canonicalDigest({ argv: ["runtime", "up"] }), kind: "adapter-command" })).binding;
+  const child = (await begin(config, { requestKey: "runtime-up/request", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).binding;
+  const admit = async () => (await admitToolingCallback({ prisma: db.prisma, config, method: "POST", pathname: "/api/tasks/task/compute-request", header: child.operationId, body: computeBody })) as Extract<CallbackAdmission, { mode: "bound" }>;
+  const { call } = app(config);
+  const settle = () => call(`/api/sessions/primary/tooling-operations/${fence.operationId}/settlement`, { requestKey: fence.requestKey, inputDigest: fence.inputDigest, outcome: "completed" }, fence.operationId);
+  // Attempt 1 acknowledged; attempt 2 starts (non-producing callback) and is still in flight.
+  const one = await admit(), first = await beforeBoundCallback(db.prisma, config, one); await afterBoundCallback(db.prisma, one, first, 200);
+  const two = await admit(), second = await beforeBoundCallback(db.prisma, config, two);
+  expect((await settle()).status).toBe(409);
+  // Attempt 3 starts; attempt 2's slower acknowledgment cannot cover it.
+  const three = await admit(), third = await beforeBoundCallback(db.prisma, config, three);
+  await afterBoundCallback(db.prisma, two, second, 200);
+  expect((await settle()).status).toBe(409);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: fence.operationId }))!.status).toBe("bound");
+  await afterBoundCallback(db.prisma, three, third, 200);
+  expect((await settle()).status).toBe(200);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))!.status).toBe("completed");
 });

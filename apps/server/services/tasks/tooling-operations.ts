@@ -97,10 +97,24 @@ export async function assertClosedCleanupPrimary(input: { prisma: PrismaClient; 
   const session = await input.prisma.runtimeSession.findUnique({ where: { id: input.sessionId } });
   if (!task || !session || task.phase !== "closed" || session.role !== "primary" || !task.worktreePath || session.cwd !== task.worktreePath
     || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId || task.machineId !== input.config.machine || task.ownerPaused) throw new Error("Only the closed task's original primary may continue its existing cleanup");
+  // Shared ownership still binds after closure (cleanup-lifecycle's closed
+  // rule): configured repository/connection and the original source link,
+  // which closure may have ended but revocation removes.
+  const repository = input.config.repositories[task.repositoryId];
+  if (!repository || !repository.tooling) throw new Error("Task repository has no configured tooling capability source");
+  if ((task.connectionId === null) !== (task.issueIdentifier === null)) throw new Error("Closed cleanup source identity is incomplete");
+  if (task.issueIdentifier) {
+    if (!task.connectionId || !input.config.connections[task.connectionId]) throw new Error("Task connection is no longer configured");
+    const link = await input.prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: task.connectionId, resourceType: "issue-identifier", externalId: task.issueIdentifier, relationship: "handles" } });
+    if (!link) throw new Error("Task source ownership was revoked");
+  }
   const operation = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `finalizer:${task.id}`, action: "finalization-cleanup-started", key: `finalize:${task.id}` } });
   await assertClosedCleanupFamily(input.prisma, task, session, operation, input.runtime);
-  return { task, session };
+  return { task, session, cleanupKey: `finalize:${task.id}` };
 }
+/** The exact closed-cleanup lineage: a fence naming the task's own cleanup
+ * operation as its existing operation. No other command crosses closure. */
+const closedCleanupFence = (binding: Pick<ToolingOperationBinding, "kind" | "existingOperationId" | "taskId">) => binding.kind === ADAPTER_COMMAND_KIND && binding.existingOperationId === `finalize:${binding.taskId}`;
 
 type Body = Record<string, unknown>;
 type Store = Pick<PrismaClient, "remoteTask" | "runtimeSession" | "runtimeSessionResourceLink" | "runtimeMetadataEvent" | "computeOffer" | "computeEnvironment" | "remoteTaskResource">;
@@ -293,7 +307,7 @@ export function boundCode(explicit?: ToolingCodeIdentity | null): ToolingCodeIde
 // producer — intent before the effect, confirmed/failed after. A newest
 // producer intent without an outcome is an unknown effect: fail closed.
 const ASSOCIATION = "tooling-operation-association";
-const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown"]), evidence: z.string().optional() }).passthrough();
+const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown"]), attemptId: z.string().optional(), evidence: z.string().optional() }).passthrough();
 type Role = z.infer<typeof Association>["role"];
 const associationKey = (role: Role, id: string) => `${role}:${id}`;
 const referenceId = (reference: Pick<ExistingReference, "type" | "id">) => `${reference.type}:${reference.id}`;
@@ -302,9 +316,23 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION, key: associationKey(role, id) }, orderBy: { sequence: "desc" }, take: 64 });
   return events.map(event => Association.parse(JSON.parse(event.value ?? "null")));
 }
-async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, state: "acknowledged" | "refused" | "unknown", status: number | null) {
+/** One record per callback attempt: `intent` before its handler, then its
+ * own definite outcome. Settlement trusts only the latest attempt's own
+ * acknowledgment, so an older slow acknowledgment never covers a newer
+ * in-flight or unknown attempt. */
+async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, attemptId: string, state: "intent" | "acknowledged" | "refused" | "unknown", status: number | null) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
-    value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
+}
+/** The latest attempt's definite acknowledgment, or null (in flight, refused,
+ * unknown or missing). */
+async function latestAttemptAcknowledged(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operation: { id: string; inputDigest: string }) {
+  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operation.id) }, orderBy: { sequence: "desc" }, take: 1001 });
+  if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operation.id} exceeds its bound`);
+  const values = events.map(event => z.object({ state: z.string(), attemptId: z.string().optional(), operationId: z.string(), inputDigest: z.string() }).passthrough().safeParse(JSON.parse(event.value ?? "null")).data).filter(Boolean);
+  const latest = values.find(value => value!.state === "intent");
+  if (!latest?.attemptId) return false;
+  return values.some(value => value!.attemptId === latest.attemptId && value!.state === "acknowledged" && value!.operationId === operation.id && value!.inputDigest === operation.inputDigest);
 }
 async function recordAssociation(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId" | "kind" | "generation">, role: Role, id: string, state: "intent" | "confirmed" | "failed", evidence?: string) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey(role, id),
@@ -419,7 +447,10 @@ async function assertBindingAuthority(input: { prisma: PrismaClient; config: Ser
   if (!task || task.primarySessionId !== input.binding.sessionId || task.repositoryId !== input.binding.repositoryId) throw refuse("operation-ownership", "The operation no longer belongs to this task's primary session");
   if (input.binding.kind !== "finalization") {
     try {
-      if (task.phase === "closed" && input.binding.kind === ADAPTER_COMMAND_KIND) await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId });
+      if (task.phase === "closed" && input.binding.kind === ADAPTER_COMMAND_KIND) {
+        if (!closedCleanupFence(input.binding)) throw new Error("Only the task's own cleanup command continues after closure");
+        await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId });
+      }
       else await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.binding.sessionId });
     }
     catch (error) { throw refuse("operation-ownership", error instanceof Error ? error.message : String(error)); }
@@ -512,6 +543,13 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
     try { binding = await dependencies.transition({ prisma, operationId: binding.operationId, from: "bound", to: "running" }); }
     catch { binding = (await dependencies.read({ prisma, operationId: binding.operationId })) ?? binding; }
   }
+  // This attempt is in flight from here until its own outcome is recorded.
+  const attemptId = crypto.randomUUID();
+  await recordCallbackOutcome(prisma, binding, admission.callback.route, attemptId, "intent", null);
+  try { return { ...await prepareBoundEffects(prisma, config, admission, binding, dependencies), attemptId }; }
+  catch (error) { await recordCallbackOutcome(prisma, binding, admission.callback.route, attemptId, "refused", null).catch(() => undefined); throw error; }
+}
+async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, admission: Extract<CallbackAdmission, { mode: "bound" }>, binding: ToolingOperationBinding, dependencies: ToolingOperationDependencies) {
   const { callback, body, context, reference } = admission;
   if (reference && callback.referenceRule !== "admission") await claimOwnership(prisma, binding, context.task, reference, dependencies.read);
   const admitted = callback.admits?.(body);
@@ -532,12 +570,12 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
 /** After the handler: success confirms producer intent and may complete the
  * operation with its protocol evidence; a refused (4xx) handler fails the
  * intent; an exception or 5xx leaves it unknown and the operation `unknown`. */
-export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[] }, status: number | "exception",
+export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[]; attemptId?: string }, status: number | "exception",
   dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
   const ok = typeof status === "number" && status >= 200 && status < 300, refused = typeof status === "number" && status >= 400 && status < 500;
   // Exact per-callback outcome for command settlement: an acknowledgment of
   // this operation's route and request digest, distinct from physical proof.
-  await recordCallbackOutcome(prisma, state.binding, admission.callback.route, ok ? "acknowledged" : refused ? "refused" : "unknown", typeof status === "number" ? status : null);
+  await recordCallbackOutcome(prisma, state.binding, admission.callback.route, state.attemptId ?? "legacy-attempt", ok ? "acknowledged" : refused ? "refused" : "unknown", typeof status === "number" ? status : null);
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
   // An HTTP status never proves absence: a bind/configure follows the
   // physical start, and a handler may commit before refusing. Readers are
@@ -594,9 +632,18 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   const request = parsed.data;
   const owned = async () => {
     const closed = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId }, select: { phase: true } });
-    const value = closed?.phase === "closed" && CLOSED_CLEANUP_KINDS.includes(request.kind)
-      ? await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, ...(input.runtime ? { runtime: input.runtime } : {}) })
-      : await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId });
+    let value;
+    if (closed?.phase === "closed" && CLOSED_CLEANUP_KINDS.includes(request.kind)) {
+      value = await assertClosedCleanupPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, ...(input.runtime ? { runtime: input.runtime } : {}) });
+      // Exact cleanup lineage only: the fence names the cleanup operation, and
+      // its finalization children continue exactly that request key.
+      if (request.kind === ADAPTER_COMMAND_KIND && request.existingOperationId !== value.cleanupKey) throw new ToolingOperationRefused("operation-ownership", `A closed task's command must name its cleanup operation ${value.cleanupKey} as existingOperationId`);
+      if (request.kind === "finalization") {
+        if (request.inputDigest !== dependencies.digest({ requestKey: value.cleanupKey })) throw new ToolingOperationRefused("operation-ownership", `A closed task only continues finalization ${value.cleanupKey}`);
+        const parent = request.parentOperationId ? await dependencies.read({ prisma: input.prisma, operationId: request.parentOperationId }) : null;
+        if (request.parentOperationId && (!parent || !closedCleanupFence(parent))) throw new ToolingOperationRefused("operation-ownership", "A closed task's finalization must belong to its cleanup command");
+      }
+    } else value = await assertOpenTaskPrimary({ prisma: input.prisma, config: input.config, sessionId: input.sessionId });
     if (value.task.ownerPaused && PAUSE_BLOCKED.includes(request.kind)) throw new ToolingOperationRefused("operation-ownership", "Task is paused by its owner; no new tooling operation starts");
     return value;
   };
@@ -718,11 +765,10 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
       if (pending) throw refuse("operation-closed", `Retained ${pending.consumerKind} ${pending.consumerId} has an unconfirmed producing effect; the command cannot be declared successful`);
       for (const child of children) {
         if (child.status === "completed") continue;
-        // Finite callback lifetimes end only on their exact durable outcome.
-        const latest = child.status === "running" ? await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", child.id) }, orderBy: { sequence: "desc" } }) : null;
-        const value = latest ? Association.safeParse(JSON.parse(latest.value ?? "null")).data as (z.infer<typeof Association> & { inputDigest?: string }) | undefined : undefined;
-        if (!value || value.state !== "acknowledged" || value.operationId !== child.id || value.inputDigest !== child.inputDigest)
-          throw refuse("operation-closed", `Child operation ${child.id} is ${child.status} without a confirmed callback outcome; the command cannot be declared successful`);
+        // Finite callback lifetimes end only on the latest attempt's own
+        // definite acknowledgment.
+        if (child.status !== "running" || !await latestAttemptAcknowledged(tx, binding, child))
+          throw refuse("operation-closed", `Child operation ${child.id} is ${child.status} without a confirmed latest callback outcome; the command cannot be declared successful`);
         const done = await tx.toolingOperation.updateMany({ where: { id: child.id, status: "running" }, data: { status: "completed", completionEvidence: { kind: "callback-acknowledged", reference: binding.operationId } } });
         if (done.count !== 1) throw refuse("operation-closed", `Child operation ${child.id} changed during settlement`);
       }
