@@ -10,7 +10,7 @@
  * and the compute domain handlers behind the guard (they only acknowledge).
  * No Docker, provider, Drafted checkout or live configuration.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
 import { Hono } from "hono";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
@@ -20,20 +20,23 @@ import { toolingOperationGuard, toolingOperationRoutes } from "../../routes/task
 import {
   TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation, matchToolingCallback, producerOperationId, resourceGroupCode,
 } from "./tooling-operations.ts";
-import { canonicalDigest, transitionToolingOperation } from "./tooling-releases.ts";
+import { canonicalDigest, completeNeonRecoveryOperation, readToolingOperation, registerToolingStateWriteInTransaction, transitionToolingOperation } from "./tooling-releases.ts";
+import { canonicalSha256 } from "./compute-neon-recovery.ts";
 import {
-  NEON_RECOVERY_EVENT_ACTION, NEON_RECOVERY_OPERATION_KIND, NEON_RECOVERY_RESOLUTION_KIND, neonRecoveryFence, neonRecoveryHandoffCode, readNeonRecoveryLegacyGroup, resolveNeonRecoveryLegacyGroup,
+  NEON_RECOVERY_EVENT_ACTION, NEON_RECOVERY_OPERATION_KIND, NEON_RECOVERY_RESOLUTION_KIND, neonRecoveryFence, neonRecoveryHandoffCode, neonRecoveryObservationContracts, readNeonRecoveryLegacyGroup, resolveNeonRecoveryLegacyGroup,
   type NeonRecoveryHandoff,
 } from "./tooling-neon-recovery.ts";
 import { accountingCode } from "./compute-observer.ts";
 import { computeTaskIdentity } from "./compute-admission.ts";
-import { finalizationResourceIdentity } from "./finalization-resources.ts";
+import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 
 for (const name of Object.keys(process.env)) if (name.startsWith("REMOTE_AGENT_")) delete process.env[name];
 
 let db: TestDatabase;
-beforeEach(async () => { db = await createTestDatabase(); });
-afterEach(async () => { await db.cleanup(); });
+// Several tests rebuild the migrated database per scenario; keep them bounded but tolerant of host load.
+setDefaultTimeout(120_000);
+beforeEach(async () => { db = await createTestDatabase(); }, 60_000);
+afterEach(async () => { await db.cleanup(); }, 60_000);
 
 const LEGACY = "1".repeat(40), A = "a".repeat(40), OLD = "b".repeat(40), GRANTED = "9".repeat(40);
 const KEY = "runtime-development", ENV = "22222222-2222-4222-8222-222222222222", OFFER = "33333333-3333-4333-8333-333333333333";
@@ -83,20 +86,47 @@ const recoveryBegin = (config: Config, extra: Record<string, unknown> = {}, offe
   begin(config, { requestKey: `neon-${offerId}`, inputDigest: canonicalDigest(stable(request(offerId))), kind: NEON_RECOVERY_OPERATION_KIND, existingOperationId: offerId, resourceKey: KEY, ...extra });
 const legacyStatus = async () => (await db.prisma.toolingLegacyConsumer.findMany({ where: { taskId: "task" }, orderBy: { consumerKind: "asc" } })).map(row => `${row.consumerKind}:${row.status}`);
 
-/** STAND-IN for root's recovery commit (compute-neon-recovery.ts, under its
- * write lock): the real handoff resolver plus the projection, event and
- * completion it composes in the same transaction. */
-async function commitRecovery(operationId: string, options: { fail?: boolean; release?: { id: string; revision: string; tree: string }; offerId?: string } = {}) {
-  const binding = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operationId } });
-  const release = await db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: binding.releaseId } });
+/** STAND-IN for the recovery service's commit (A432 integrates it in
+ * compute-neon-recovery.ts under its write lock), composed from the REAL
+ * seams in the design's order: the operation is running (the service's CAS),
+ * the legacy handoff with the proof-derived capability cutoff, the real
+ * drafted.runtime/2 registration, the projection, the full stored event
+ * (strictly readable by readCommittedNeonRecovery) and the real completion
+ * seam. The proof/observer values are synthetic: no observer runs here. */
+async function commitRecovery(operationId: string, options: { fail?: boolean; cutoff?: Date } = {}) {
+  const operation = (await readToolingOperation({ prisma: db.prisma, operationId }))!;
+  const offerId = operation.existingOperationId!, computeOperation = request().operationId;
+  const stableRequest = { ...request(offerId) };
   return db.prisma.$transaction(async tx => {
-    const handoff = await resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: options.offerId ?? OFFER, resourceKey: KEY, operationId });
+    await tx.toolingOperation.updateMany({ where: { id: operationId, status: { in: ["bound", "running"] } }, data: { status: "running" } });
+    const handoff = await resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId, resourceKey: KEY, operationId, grantedAtOrBefore: options.cutoff ?? new Date() });
+    const write = await registerToolingStateWriteInTransaction(tx, { operationId, family: "drafted.runtime", scopeKey: KEY, version: 2 });
     const resource = await tx.remoteTaskResource.update({ where: { taskId_key: { taskId: "task", key: KEY } }, data: { metadata: { revision: REVISION, recipeHash: RECOVERED } } });
-    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "compute:task", action: NEON_RECOVERY_EVENT_ACTION, key: `journal-${operationId}`,
-      value: JSON.stringify({ version: 1, operation: { operationId, kind: NEON_RECOVERY_OPERATION_KIND, taskId: "task", release: options.release ?? { id: release.id, revision: release.revision, tree: release.tree } }, handoff }) } });
-    await tx.computeEnvironment.update({ where: { id: ENV }, data: { recipeDigest: RECOVERED, resourceIdentity: finalizationResourceIdentity(resource).identityDigest } });
+    const identity = finalizationResourceIdentity(resource).identityDigest;
+    await tx.computeEnvironment.update({ where: { id: ENV }, data: { recipeDigest: RECOVERED, resourceIdentity: identity } });
+    const saved = { provider: "planetscale" as const, id: "ps-task", name: "drafted-task" };
+    const attempt = { version: 1 as const, name: saved.name, projectId: "spatial-project", templateBranchId: "br-template", parentLsn: "0/1A2B3C4", requestedAt: "2026-11-04T10:01:00.000Z",
+      expiresAt: "2026-11-11T10:01:00.000Z", rejection: { status: 422, code: "BRANCHES_LIMIT_EXCEEDED", observedAt: "2026-11-04T10:01:01.000Z" } };
+    const reconciliation = { operation: "create-neon", outcome: "absent", name: saved.name, projectId: "spatial-project", observedAt: "2026-11-05T09:00:00.000Z", attempt, absence: { basis: "provider-rejection" } };
+    const release = operation.release;
+    const proof = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskId: "task", primarySessionId: "primary", toolingRevision: LEGACY,
+      environmentId: ENV, resourceId: resource.id, resourceKey: KEY, offerId, operationId: computeOperation, revision: REVISION, sourceRevision: stableRequest.sourceRevision,
+      previousRecipeHash: PREVIOUS, recipeHash: RECOVERED, receiptSha256: "2".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), lockPid: stableRequest.lockPid,
+      stage: { phase: "failed", pending: null, setupComplete: false, schemaApplied: false, fixturesComplete: false, spatialSchema: false, container: false, containerOperation: false, configuration: false, coverage: false, startBundle: false },
+      baselineProviders: [saved], providers: [saved], reconciliation, baselineNeonCreateSha256: canonicalSha256(attempt),
+      operation: { operationId, releaseId: release.id, revision: release.revision, tree: release.tree }, candidateSha256: "4".repeat(64), candidateVersion: 2, canonical: "baseline" };
+    const observer = { operationId, releaseId: release.id, revision: release.revision, tree: release.tree, adapterSha256: "8".repeat(64) };
+    const stateWrite = { family: "drafted.runtime", scopeKey: KEY, version: 2, operationId, releaseId: release.id, sequence: write.sequence };
+    const result = { environmentId: ENV, resourceId: resource.id, resourceIdentity: identity, offerId, operationId: computeOperation, previousRecipeHash: PREVIOUS, recipeHash: RECOVERED,
+      sourceRevision: stableRequest.sourceRevision, outcome: "absent", basis: "provider-rejection", reconciliationSha256: finalizationDigest(reconciliation), observer, allocation: "retained-existing-claim", stateWrite };
+    const { baselineSha256, candidateSha256, baselineProviders, providers, stage, previousRecipeHash, recipeHash, revision, toolingRevision } = proof;
+    const evidence = finalizationDigest({ baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId: computeOperation, revision, toolingRevision });
+    const key = finalizationDigest({ environmentId: ENV, resourceId: resource.id, offerId, operationId: computeOperation, previousRecipeHash: PREVIOUS, recipeHash: RECOVERED });
+    const event = await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "compute:task", action: NEON_RECOVERY_EVENT_ACTION, key, value: JSON.stringify({
+      version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskIdentity: "identity-task", request: stableRequest, environment: { id: ENV }, resource: { id: resource.id },
+      offer: { id: offerId }, allocations: { offers: [], slots: [], wait: null }, operation: { ...operation, status: "running" }, proof, observer, evidence, projectionIdentity: "6".repeat(64), handoff, stateWrite, result }) } });
     if (options.fail) throw new Error("injected failure after the handoff");
-    await tx.toolingOperation.update({ where: { id: operationId }, data: { status: "completed", completionEvidence: { kind: NEON_RECOVERY_OPERATION_KIND, reference: OFFER } } });
+    await completeNeonRecoveryOperation(tx, { operationId, eventSequence: event.sequence });
     return handoff;
   });
 }
@@ -174,7 +204,7 @@ describe("exact legacy group eligibility (computed from server rows only)", () =
 
   test("unavailable, foreign-revision, unrelated, finalizing and touched groups refuse with nothing bound", async () => {
     await refused(() => db.prisma.toolingLegacyConsumer.updateMany({ where: { consumerKind: "compute-environment" }, data: { provenance: "unavailable", revision: null, checkout: null } }), /provenance is unavailable/);
-    await refused(() => db.prisma.toolingLegacyConsumer.updateMany({ where: { consumerKind: "compute-environment" }, data: { revision: OLD } }), /neither the task pin nor a granted runtime capability/);
+    await refused(() => db.prisma.toolingLegacyConsumer.updateMany({ where: { consumerKind: "compute-environment" }, data: { revision: OLD } }), /neither the task pin nor a runtime capability granted/);
     // G6: any retained legacy reader outside the group (another environment of the task).
     await refused(async () => { await db.prisma.computeEnvironment.create({ data: { id: "other-env", taskId: "task", primarySessionId: "primary", machineId: "host", key: "runtime-review",
       purpose: "review", revision: REVISION, recipeDigest: PREVIOUS, state: "running", taskIdentity: "9".repeat(64) } }); await legacyRow("compute-environment", "other-env"); }, /outside the recovered group/);
@@ -204,6 +234,32 @@ describe("exact legacy group eligibility (computed from server rows only)", () =
     expect((await recoveryBegin(config)).binding.kind).toBe("compute-neon-recovery");
     await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key: "broken", value: "{not json" } });
     await expect(readNeonRecoveryLegacyGroup(db.prisma, { taskId: "task", offerId: OFFER, resourceKey: KEY })).rejects.toThrow(/cannot read capability grant/);
+  });
+
+  test("authoritative handoff counts only capabilities granted by the original request's cutoff, and the legacy basis's reviewed revision", async () => {
+    const { config } = await fixture({ rows: [["compute-environment", ENV, GRANTED], ["compute-offer", OFFER, GRANTED]] });
+    const requestStart = new Date(Date.now() - 10 * 60_000);
+    // Granted AFTER the original failed request: begin is advisory and binds, the authoritative resolver refuses.
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key: "late", occurredAt: new Date(requestStart.getTime() + 1000),
+      value: JSON.stringify({ capability: "runtime", capabilityRevision: GRANTED }) } });
+    const { binding } = await recoveryBegin(config);
+    const resolve = (input: { grantedAtOrBefore: Date; legacySourceRevision?: string }) => db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId, ...input }));
+    await expect(resolve({ grantedAtOrBefore: requestStart })).rejects.toThrow(/granted by/);
+    await expect(db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId } as never))).rejects.toThrow(/capability cutoff/);
+    expect(await legacyStatus()).toEqual(["compute-environment:retained", "compute-offer:retained"]);
+    // Granted at the cutoff (inclusive): eligible, unless the legacy basis names another reviewed revision.
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "task:task", action: "tooling-capability", key: "early", occurredAt: requestStart,
+      value: JSON.stringify({ capability: "runtime", capabilityRevision: GRANTED }) } });
+    await expect(resolve({ grantedAtOrBefore: requestStart, legacySourceRevision: LEGACY })).rejects.toThrow(/not the reviewed executed revision/);
+    expect((await resolve({ grantedAtOrBefore: requestStart, legacySourceRevision: GRANTED })).rows).toHaveLength(2);
+  });
+
+  test("observation contracts are stated explicitly for the service's bound-observer check, never inferred from the format manifest", async () => {
+    const { resource } = await fixture();
+    expect(neonRecoveryObservationContracts(await readNeonRecoveryLegacyGroup(db.prisma, { taskId: "task", offerId: OFFER, resourceKey: KEY }))).toEqual(["runtime-neon-recovery/v1", "compute-traffic/v1"]);
+    await db.prisma.computeBaseline.create({ data: { id: "baseline-1", machineId: "host", taskId: "task", purpose: "development", resourceIds: [resource.id], refreshToken: "t" } });
+    await legacyRow("compute-baseline", "task:development");
+    expect(neonRecoveryObservationContracts(await readNeonRecoveryLegacyGroup(db.prisma, { taskId: "task", offerId: OFFER, resourceKey: KEY }))).toEqual(["runtime-neon-recovery/v1", "compute-traffic/v1", "compute-baseline/v1"]);
   });
 
   test("development intents and baselines join the group only on exact proof", async () => {
@@ -246,7 +302,7 @@ describe("transaction-safe handoff resolver", () => {
     const { config } = await fixture();
     const { binding } = await recoveryBegin(config);
     const before = { offers: await db.prisma.computeOffer.findMany(), associations: await db.prisma.runtimeMetadataEvent.count({ where: { source: "tooling-operation:task" } }) };
-    const handoff = await db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId }));
+    const handoff = await db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId, grantedAtOrBefore: new Date() }));
     expect(handoff).toMatchObject({ version: 1, operationId: binding.operationId, taskId: "task", environmentId: ENV });
     expect(handoff.rows.map(row => [row.consumerKind, row.revision]).sort()).toEqual([["compute-environment", LEGACY], ["compute-offer", LEGACY]]);
     for (const row of await db.prisma.toolingLegacyConsumer.findMany()) {
@@ -259,8 +315,8 @@ describe("transaction-safe handoff resolver", () => {
     expect(await db.prisma.toolingStateWrite.count()).toBe(0);
     expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } })).status).toBe("bound");
     // Exact replay by the same operation: same handoff, no writes. Another operation is refused.
-    expect(await db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId }))).toEqual(handoff);
-    await expect(db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: crypto.randomUUID() }))).rejects.toThrow(/already handed off/);
+    expect(await db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId, grantedAtOrBefore: new Date() }))).toEqual(handoff);
+    await expect(db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: crypto.randomUUID(), grantedAtOrBefore: new Date() }))).rejects.toThrow(/already handed off/);
   });
 
   test("a later failure in the same transaction rolls the handoff back; a changed group refuses under the lock", async () => {
@@ -271,7 +327,7 @@ describe("transaction-safe handoff resolver", () => {
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: NEON_RECOVERY_EVENT_ACTION } })).toBe(0);
     const read = await readNeonRecoveryLegacyGroup(db.prisma, { taskId: "task", offerId: OFFER, resourceKey: KEY });
     await db.prisma.computeOffer.create({ data: { id: "late-offer", environmentId: ENV, machineId: "host", instructionId: "late", state: "expired", dispatchDeadline: new Date() } });
-    await expect(db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId, expectedDigest: read.digest }))).rejects.toThrow(/changed since it was read/);
+    await expect(db.prisma.$transaction(tx => resolveNeonRecoveryLegacyGroup(tx, { taskId: "task", offerId: OFFER, resourceKey: KEY, operationId: binding.operationId, grantedAtOrBefore: new Date(), expectedDigest: read.digest }))).rejects.toThrow(/changed since it was read/);
     // An unrelated retained reader appearing before the lock refuses and resolves nothing.
     await legacyRow("compute-environment", "unrelated-env");
     await expect(commitRecovery(binding.operationId)).rejects.toThrow(/outside the recovered group/);
@@ -307,14 +363,14 @@ describe("post-handoff code selection", () => {
     };
     const event = { where: { action: NEON_RECOVERY_EVENT_ACTION } };
     await scenario(id => db.prisma.toolingOperation.update({ where: { id }, data: { status: "running" } }), /not this task's completed recovery/);
-    await scenario(() => db.prisma.runtimeMetadataEvent.deleteMany(event), /0 recovery events/);
+    await scenario(() => db.prisma.runtimeMetadataEvent.deleteMany(event), /no committed recovery event names the operation/);
     await scenario(async () => { const row = await db.prisma.runtimeMetadataEvent.findFirstOrThrow(event);
       await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "compute:task", action: NEON_RECOVERY_EVENT_ACTION, key: "duplicate", value: row.value } }); }, /2 recovery events/);
-    await scenario(() => db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "compute:task", action: NEON_RECOVERY_EVENT_ACTION, key: "torn", value: "{" } }), /unreadable/);
+    await scenario(() => db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "compute:task", action: NEON_RECOVERY_EVENT_ACTION, key: "torn", value: "{" } }), /not JSON/);
     await scenario(async () => { const row = await db.prisma.runtimeMetadataEvent.findFirstOrThrow(event), value = JSON.parse(row.value!);
-      await db.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value: JSON.stringify({ ...value, operation: { ...value.operation, release: { ...value.operation.release, revision: OLD } } }) } }); }, /does not record this exact handoff/);
+      await db.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value: JSON.stringify({ ...value, operation: { ...value.operation, release: { ...value.operation.release, revision: OLD } } }) } }); }, /stored operation binding is not this operation/);
     await scenario(async () => { const row = await db.prisma.runtimeMetadataEvent.findFirstOrThrow(event), value = JSON.parse(row.value!) as { handoff: NeonRecoveryHandoff };
-      await db.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value: JSON.stringify({ ...value, handoff: { ...value.handoff, rows: value.handoff.rows.filter(entry => entry.consumerKind !== "compute-environment") } }) } }); }, /does not record this exact handoff/);
+      await db.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value: JSON.stringify({ ...value, handoff: { ...value.handoff, rows: value.handoff.rows.filter(entry => entry.consumerKind !== "compute-environment") } }) } }); }, /not exactly the recorded handoff/);
     await scenario(async () => db.prisma.toolingLegacyConsumer.updateMany({ where: { consumerKind: "compute-environment" }, data: { resolution: { kind: NEON_RECOVERY_RESOLUTION_KIND, reference: crypto.randomUUID() } } }), /missing/);
   });
 

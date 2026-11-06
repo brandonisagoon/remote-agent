@@ -59,11 +59,23 @@ const IntentScope = z.object({ action: z.enum(["stop", "resume"]), reason: z.str
 const Capability = z.object({ capability: z.string(), capabilityRevision: z.string() }).passthrough();
 const Ids = z.array(z.string()).max(10_000);
 
+export type NeonRecoveryGroupInput = {
+  taskId: string; offerId: string; resourceKey: string;
+  /** Names the recovering operation, so its own earlier handoff is recognised as a replay rather than refused. */
+  operationId?: string;
+  /** Authoritative cutoff (the proof-derived start of the ORIGINAL failed
+   * provider request): only runtime capabilities granted at or before it can
+   * have executed. Without it (begin) the check is advisory and any grant
+   * counts; the resolver always requires it, so a later grant never authorizes. */
+  grantedAtOrBefore?: Date;
+  /** For the legacy-provider-rejection basis: the reviewed executed revision
+   * every handed-off legacy snapshot must equal. */
+  legacySourceRevision?: string;
+};
 /** Read the exact recovery group of `offerId` and decide handoff eligibility
- * (G0–G3, G5, G6). Read-only; call at begin and again under the write lock.
- * `operationId` names the recovering operation, so its own earlier handoff is
- * recognised as a replay rather than refused. */
-export async function readNeonRecoveryLegacyGroup(store: GroupStore, input: { taskId: string; offerId: string; resourceKey: string; operationId?: string }): Promise<NeonRecoveryGroup> {
+ * (G0–G3, G5, G6). Read-only; call at begin (advisory) and again under the
+ * write lock through `resolveNeonRecoveryLegacyGroup` (authoritative). */
+export async function readNeonRecoveryLegacyGroup(store: GroupStore, input: NeonRecoveryGroupInput): Promise<NeonRecoveryGroup> {
   const task = await store.remoteTask.findUnique({ where: { id: input.taskId } });
   if (!task?.primarySessionId) return refuse("requires the task's original primary");
   const offer = await store.computeOffer.findUnique({ where: { id: input.offerId } });
@@ -103,9 +115,12 @@ export async function readNeonRecoveryLegacyGroup(store: GroupStore, input: { ta
   }
   if (legacy.length && handedOff.length) return refuse("group is partially handed off");
   if (legacy.length) {
-    const allowed = await executedRevisions(store, task);
+    if (input.grantedAtOrBefore !== undefined && !Number.isFinite(input.grantedAtOrBefore.getTime())) return refuse("needs a valid capability cutoff");
+    const allowed = await executedRevisions(store, task, input.grantedAtOrBefore);
     const foreign = legacy.find(row => !allowed.has(row.revision));
-    if (foreign) return refuse(`refuses ${foreign.consumerKind} ${foreign.consumerId}: its snapshot ${foreign.revision} is neither the task pin nor a granted runtime capability`);
+    if (foreign) return refuse(`refuses ${foreign.consumerKind} ${foreign.consumerId}: its snapshot ${foreign.revision} is neither the task pin nor a runtime capability granted ${input.grantedAtOrBefore ? `by ${input.grantedAtOrBefore.toISOString()}` : "to this primary"}`);
+    const unreviewed = input.legacySourceRevision === undefined ? undefined : legacy.find(row => row.revision !== input.legacySourceRevision);
+    if (unreviewed) return refuse(`refuses ${unreviewed.consumerKind} ${unreviewed.consumerId}: its snapshot ${unreviewed.revision} is not the reviewed executed revision ${input.legacySourceRevision}`);
     await assertUntouched(store, task, environment, offerIds);
   }
   const group = { taskId: task.id, repositoryId: task.repositoryId, environmentId: environment.id, environmentKey: environment.key, resourceId: resource.id, resourceKey: input.resourceKey, offerIds, legacy, handedOff };
@@ -141,10 +156,12 @@ async function baselineMember(store: GroupStore, task: RemoteTask, resource: { i
   return true;
 }
 
-/** The task pin, plus runtime capabilities the server granted this primary. */
-async function executedRevisions(store: GroupStore, task: RemoteTask) {
+/** The task pin, plus runtime capabilities the server granted this primary
+ * (at or before `cutoff` when given). */
+async function executedRevisions(store: GroupStore, task: RemoteTask, cutoff?: Date) {
   const allowed = new Set<string>([task.toolingRevision]);
-  const grants = bounded(await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId!, source: `task:${task.id}`, action: CAPABILITY_ACTION }, take: BOUND + 1 }), "the granted capabilities");
+  const grants = bounded(await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId!, source: `task:${task.id}`, action: CAPABILITY_ACTION,
+    ...(cutoff ? { occurredAt: { lte: cutoff } } : {}) }, take: BOUND + 1 }), "the granted capabilities");
   for (const grant of grants) {
     const value = Capability.safeParse(parse(grant.value));
     if (!value.success) return refuse(`cannot read capability grant ${grant.sequence}`);
@@ -163,7 +180,11 @@ async function assertUntouched(store: GroupStore, task: RemoteTask, environment:
   if (reader) refuse(`refuses a legacy group with a retained reader (${reader.id})`);
 }
 
-/** G4: the recovering release reads the original v1 and writes the recovered v2. */
+/** G4 (state format only): the recovering release reads the original v1 and
+ * writes the recovered v2. The format manifest establishes NOTHING about
+ * observation: the service must also verify, from the bound release's own
+ * committed capability manifest (verifyBoundObserver), every contract in
+ * `neonRecoveryObservationContracts(group)`. */
 export function assertNeonRecoveryRelease(release: Pick<ToolingReleaseRecord, "revision" | "manifest">) {
   const format = release.manifest.stateFormats[NEON_RECOVERY_STATE_FAMILY];
   if (!format || !format.read.includes(1) || !format.read.includes(2) || !(format.writeVersions ?? [format.write]).includes(2)) {
@@ -171,16 +192,27 @@ export function assertNeonRecoveryRelease(release: Pick<ToolingReleaseRecord, "r
   }
 }
 
+/** Runtime observation contracts the bound release's committed capability
+ * manifest must declare for this group: recovery and environment observation
+ * always, baseline accounting when a baseline reader is handed off. */
+export function neonRecoveryObservationContracts(group: Pick<NeonRecoveryGroup, "legacy" | "handedOff">): string[] {
+  const baseline = [...group.legacy, ...group.handedOff].some(row => row.consumerKind === "compute-baseline");
+  return ["runtime-neon-recovery/v1", "compute-traffic/v1", ...(baseline ? ["compute-baseline/v1"] : [])];
+}
+
 /**
  * Inside the recovery service's proof transaction, under its write lock:
- * re-read the group, require it to equal `expectedDigest` when given, and
+ * re-read the group with the authoritative capability cutoff (and the
+ * legacy basis's reviewed revision when given), require it to equal
+ * `expectedDigest` when given, and
  * resolve exactly its retained legacy readers with this operation as
  * evidence. Rows and their snapshots are kept (CAS retained -> resolved). The
  * task must then hold no retained legacy reader. An exact replay returns the
  * same handoff without writing. The caller stores the result as the event's
  * `handoff`, and rolls everything back if any later step fails.
  */
-export async function resolveNeonRecoveryLegacyGroup(tx: Prisma.TransactionClient, input: { taskId: string; offerId: string; resourceKey: string; operationId: string; expectedDigest?: string }): Promise<NeonRecoveryHandoff> {
+export async function resolveNeonRecoveryLegacyGroup(tx: Prisma.TransactionClient, input: NeonRecoveryGroupInput & { operationId: string; grantedAtOrBefore: Date; expectedDigest?: string }): Promise<NeonRecoveryHandoff> {
+  if (!(input.grantedAtOrBefore instanceof Date)) refuse("handoff requires the original request's capability cutoff");
   const group = await readNeonRecoveryLegacyGroup(tx, input);
   // First commit only: a replay has already resolved the rows it read.
   if (input.expectedDigest !== undefined && !group.handedOff.length && group.digest !== input.expectedDigest) refuse("group changed since it was read");
@@ -192,20 +224,17 @@ export async function resolveNeonRecoveryLegacyGroup(tx: Prisma.TransactionClien
   if (remaining) refuse(`left retained legacy reader ${remaining.consumerKind} ${remaining.consumerId}`);
   return NeonRecoveryHandoff.parse({ version: 1, operationId: input.operationId, taskId: group.taskId, environmentId: group.environmentId, resourceId: group.resourceId, rows });
 }
-const EventScope = z.object({
-  operation: z.object({ operationId: z.string(), kind: z.literal(NEON_RECOVERY_OPERATION_KIND), taskId: z.string(), release: z.object({ id: z.string(), revision: z.string(), tree: z.string() }).passthrough() }).passthrough(),
-  handoff: NeonRecoveryHandoff,
-}).passthrough();
-
 /**
  * Code of a group whose first-bootstrap reader row was handed off by a
- * committed recovery: that operation's own release, after strict validation
- * of the resolution, the completed operation (kind, task, primary,
- * repository, release) and its single original event naming this exact row.
- * Null when the row is not a recovery handoff. Never falls back to the
- * active release: any mismatch throws.
+ * committed recovery: that operation's own release. Strict: the resolution,
+ * the completed operation (kind, task, primary, repository, release), and the
+ * single committed event read through `readCommittedNeonRecovery` (full stored
+ * binding, proof, state write and the exact handed-off rows, this one among
+ * them). Null when the row is not a recovery handoff. Never falls back to the
+ * active release: any mismatch throws. Callers check a confirmed producer
+ * first; this never outranks one.
  */
-export async function neonRecoveryHandoffCode(store: Pick<PrismaClient, "toolingLegacyConsumer" | "runtimeMetadataEvent">, input: { task: RemoteTask; reference: Pick<ExistingReference, "type" | "id"> },
+export async function neonRecoveryHandoffCode(store: Pick<PrismaClient, "toolingLegacyConsumer" | "runtimeMetadataEvent" | "toolingStateWrite">, input: { task: RemoteTask; reference: Pick<ExistingReference, "type" | "id"> },
   read: ToolingOperationDependencies["read"]): Promise<{ code: ToolingCodeIdentity; binding: ToolingOperationBinding } | null> {
   const { task, reference } = input;
   const row = await store.toolingLegacyConsumer.findUnique({ where: { repositoryId_consumerKind_consumerId: { repositoryId: task.repositoryId, consumerKind: reference.type, consumerId: reference.id } } });
@@ -219,18 +248,14 @@ export async function neonRecoveryHandoffCode(store: Pick<PrismaClient, "tooling
   if (!binding) return fail("the operation is missing");
   if (binding.kind !== NEON_RECOVERY_OPERATION_KIND || binding.status !== "completed" || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId
     || binding.repositoryId !== task.repositoryId || binding.release.repositoryId !== task.repositoryId) fail("the operation is not this task's completed recovery");
-  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `compute:${task.id}`, action: NEON_RECOVERY_EVENT_ACTION }, orderBy: { sequence: "asc" }, take: BOUND + 1 });
-  if (events.length > BOUND) fail("the recovery history exceeds its bound");
-  const matching = [];
-  for (const event of events) {
-    const value = EventScope.safeParse(parse(event.value));
-    if (!value.success) fail(`recovery event ${event.sequence} is unreadable`);
-    if (value.data!.operation.operationId === binding.operationId) matching.push(value.data!);
-  }
-  if (matching.length !== 1) fail(`${matching.length} recovery events name the operation`);
-  const event = matching[0]!, own = { id: row.id, consumerKind: row.consumerKind, consumerId: row.consumerId, revision: row.revision!, checkout: row.checkout! };
-  if (event.operation.taskId !== task.id || event.operation.release.id !== binding.release.id || event.operation.release.revision !== binding.release.revision || event.operation.release.tree !== binding.release.tree
-    || event.handoff.operationId !== binding.operationId || event.handoff.taskId !== task.id || !event.handoff.rows.some(value => canonicalDigest(value) === canonicalDigest(own))) fail("the original event does not record this exact handoff");
+  // Dynamic: the result reader imports the recovery service, which imports this module.
+  const { readCommittedNeonRecovery } = await import("./compute-neon-recovery-result.ts");
+  let committed: Awaited<ReturnType<typeof readCommittedNeonRecovery>>;
+  try { committed = await readCommittedNeonRecovery(store, binding); }
+  catch (error) { return fail(error instanceof Error ? error.message : String(error)); }
+  if (!committed) return fail("no committed recovery event names the operation");
+  // readCommittedNeonRecovery proved the rows this operation resolved are
+  // exactly its recorded handoff with unchanged snapshots; this row is one.
   return { code: binding.release, binding };
 }
 
