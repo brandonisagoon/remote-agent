@@ -56,8 +56,8 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
   const activate = async (revision: string, expectedGeneration: number, requestKey: string) =>
     json(await server.request("/api/tooling-releases/fixture/activations", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ revision, expectedGeneration, requestKey }), signal: AbortSignal.timeout(120_000) }));
-  const runCli = async (checkout: string, requestKey: string, operationId?: string) => {
-    const child = Bun.spawn([process.execPath, "--no-env-file", path.join(checkout, "src/cli.ts"), "runtime", "status", "--task", taskId, "--socket", server.controlSocket], {
+  const runCli = async (checkout: string, requestKey: string, operationId?: string, action = "status") => {
+    const child = Bun.spawn([process.execPath, "--no-env-file", path.join(checkout, "src/cli.ts"), "runtime", action, "--task", taskId, "--socket", server.controlSocket], {
       cwd: checkout, stdout: "pipe", stderr: "pipe", stdin: "ignore",
       env: { ...cleanEnv(server.root), DRAFTED_RUNTIME_STATE_DIRECTORY: stateDirectory, REMOTE_AGENT_TOOLING_REQUEST_KEY: requestKey,
         ...(operationId ? { REMOTE_AGENT_TOOLING_OPERATION: operationId } : {}) },
@@ -65,7 +65,7 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     const limit = setTimeout(() => { if (child.exitCode === null) child.kill("SIGKILL"); }, 60_000);
     try {
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      steps.push({ action: "runtime-status", revision: path.basename(checkout), requestKey, operationId, code, stdout, stderr });
+      steps.push({ action: `runtime-${action}`, revision: path.basename(checkout), requestKey, operationId, code, stdout, stderr });
       return { code, stdout, stderr };
     } finally { clearTimeout(limit); }
   };
@@ -138,6 +138,47 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.equal(original.pinnedToolingRoot, a.checkout);
     assert.equal(original.primarySessionId, sessionId);
     assert.equal((await server.db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "dra31-paused" } })).ownerPaused, true);
+
+    // Synthetic saved-state input, not a provisioned resource or seeded state
+    // registration. Execute the committed repository's fixture in its own
+    // process; never import product-owned modules into the server process.
+    // The fixture includes an uncertain provider outcome and exact IDs. Only
+    // the normal migrate-state CLI may change its bytes or register version 2.
+    const fixtureProcess = Bun.spawn([process.execPath, "--no-env-file", "-e",
+      "const { runtimeFixture } = await import(process.argv[1]); process.stdout.write(JSON.stringify(runtimeFixture(JSON.parse(process.argv[2]))));",
+      path.join(b.checkout, "test-support/runtime-state-fixture.ts"), JSON.stringify({ taskId, worktree })],
+    { cwd: b.checkout, env: cleanEnv(server.root), stdout: "pipe", stderr: "pipe", stdin: "ignore" });
+    const [fixtureCode, fixtureText, fixtureError] = await Promise.all([fixtureProcess.exited,
+      new Response(fixtureProcess.stdout).text(), new Response(fixtureProcess.stderr).text()]);
+    assert.equal(fixtureCode, 0, fixtureError);
+    const beforeMigration = JSON.parse(fixtureText);
+    assert.equal(beforeMigration.version, 1);
+    const runtimeFile = path.join(stateDirectory, "runtimes", taskId, "development", "runtime.json");
+    await mkdir(path.dirname(runtimeFile), { recursive: true, mode: 0o700 });
+    await writeFile(runtimeFile, JSON.stringify(beforeMigration, null, 2) + "\n", { flag: "wx", mode: 0o600 });
+    await json(await server.socketRequest(`/api/sessions/${sessionId}/task/resources`, { method: "PUT",
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "runtime-development", kind: "task-runtime",
+        purpose: "development", externalId: runtimeFile, state: "allocated", metadata: { recipeHash: beforeMigration.recipeHash } }) }));
+    const migrationKey = "dra31-runtime-state-migration";
+    const migrated = await runCli(b.checkout, migrationKey, undefined, "migrate-state");
+    assert.equal(migrated.code, 0, migrated.stderr);
+    assert.equal(JSON.parse(migrated.stdout).status, "migrated");
+    const migratedBytes = await readFile(runtimeFile, "utf8"), migratedState = JSON.parse(migratedBytes);
+    assert.equal(migratedState.version, 2);
+    assert.deepEqual({ ...migratedState, version: 1 }, beforeMigration, "Migration must preserve every saved ID, pending outcome and setup flag");
+    const migrationOperation = await server.db.prisma.toolingOperation.findFirstOrThrow({ where: { taskId, requestKey: migrationKey } });
+    assert.equal(migrationOperation.status, "completed");
+    const registered = await server.db.prisma.toolingStateWrite.findMany({ where: { operationId: migrationOperation.id } });
+    assert.equal(registered.length, 1);
+    assert.equal(registered[0]!.version, 2);
+    assert.equal(registered[0]!.scopeKey, "runtime-development");
+    const replayed = await runCli(b.checkout, migrationKey, undefined, "migrate-state");
+    assert.equal(replayed.code, 0, replayed.stderr);
+    assert.equal(JSON.parse(replayed.stdout).alreadySettled, true);
+    assert.equal(await readFile(runtimeFile, "utf8"), migratedBytes, "An acknowledged migration replay must not rewrite state");
+    assert.deepEqual(await server.db.prisma.toolingStateWrite.findMany({ where: { operationId: migrationOperation.id } }), registered);
+    steps.push({ action: "state-migration-verified", operationId: migrationOperation.id, scopeKey: "runtime-development", version: 2,
+      beforeDigest: canonicalDigest(beforeMigration), afterDigest: canonicalDigest(migratedState), replayUnchanged: true });
     steps.push({ action: "verified", originalPid: pid, restartedPid: server.pid, retainedOperation: old.binding.operationId, independentOperation: operation.id,
       activeRevision: b.revision, generation: 2, originalPin: original.toolingRevision });
     passed = true;
