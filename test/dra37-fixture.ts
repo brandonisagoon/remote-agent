@@ -45,26 +45,74 @@ export type Dra37Task = { id: string; sessionId: string; worktree: string; revis
  * This proves preparation and verification only, NOT release-aware
  * activation (no selection, generation or command binding).
  */
-async function prepareDraftedTooling(root: string, install: string, revision: string, paired: string) {
-  if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error("The DRA-37 runtime rehearsal requires an exact 40-character Drafted commit");
+async function prepareDraftedTooling(root: string, install: string, revisions: string[], paired: string) {
+  if (!revisions.length || revisions.some(revision => !/^[a-f0-9]{40}$/.test(revision)) || new Set(revisions).size !== revisions.length) throw new Error("The DRA-37 runtime rehearsal requires distinct exact 40-character Drafted commits");
   if (!existsSync(path.join(paired, ".git"))) throw new Error(`Paired Drafted source ${paired} must be a git checkout`);
   const source = path.join(root, "tooling-source");
   const clone = Bun.spawnSync(["git", "clone", "--quiet", "--no-checkout", "--shared", paired, source], { stdout: "pipe", stderr: "pipe" });
   if (clone.exitCode) throw new Error(`Cannot clone Drafted: ${clone.stderr.toString()}`);
-  const release = await prepareToolingRelease({ repositoryId: REPOSITORY, toolingRoot: source, installRoot: install, revision });
-  await verifyPreparedToolingRelease(release);
-  if (release.revision !== revision) throw new Error(`Prepared release ${release.revision} is not the requested ${revision}`);
-  return { source, root: release.checkout, revision: release.revision, tree: release.tree,
-    release: { repositoryId: release.repositoryId, revision: release.revision, tree: release.tree, policyBlob: release.policyBlob, checkout: release.checkout,
-      lockfileDigest: release.lockfileDigest, bunVersion: release.bunVersion, serverProtocol: release.manifest.serverProtocol, stateFormats: Object.keys(release.manifest.stateFormats) },
+  const releases: Array<PreparedDrafted["release"]> = [];
+  for (const revision of revisions) {
+    const release = await prepareToolingRelease({ repositoryId: REPOSITORY, toolingRoot: source, installRoot: install, revision });
+    await verifyPreparedToolingRelease(release);
+    if (release.revision !== revision) throw new Error(`Prepared release ${release.revision} is not the requested ${revision}`);
+    releases.push({ repositoryId: release.repositoryId, revision: release.revision, tree: release.tree, policyBlob: release.policyBlob, checkout: release.checkout,
+      lockfileDigest: release.lockfileDigest, bunVersion: release.bunVersion, serverProtocol: release.manifest.serverProtocol, stateFormats: Object.keys(release.manifest.stateFormats) });
+  }
+  const first = releases[0]!;
+  return { source, root: first.checkout, revision: first.revision, tree: first.tree, release: first, releases,
     preparation: "supported prepareToolingRelease (frozen install + install receipt + locked worktree) verified by verifyPreparedToolingRelease; no release-aware activation" };
+}
+type PreparedDrafted = { release: { repositoryId: string; revision: string; tree: string; policyBlob: string; checkout: string; lockfileDigest: string; bunVersion: string;
+  serverProtocol: { min: number; max: number }; stateFormats: string[] } };
+
+/** The synthetic product (app, its own schema tool and lockfile), written into
+ * a task worktree or the fixture product repository. */
+async function writeSyntheticProduct(directory: string, label: string, realMode: boolean, root: string) {
+      // Synthetic product app for real-Docker mode (runs inside the container).
+      await writeFile(path.join(directory, "app.ts"), `// Drafted's supported activity publisher (same pattern as its lot-test
+// server): this synthetic service has no background work, so its complete
+// coverage reports only request lifetimes.
+const environment = process.env;
+let activity: { begin(kind: "background-job"): Promise<() => void> } | undefined;
+if (environment.DRAFTED_COMPUTE_ACTIVITY_MODULE === "/run/drafted/compute-activity.js" && environment.DRAFTED_COMPUTE_ACTIVITY_DIRECTORY && environment.DRAFTED_COMPUTE_ACTIVITY_SERVICE) {
+  const module = await import(environment.DRAFTED_COMPUTE_ACTIVITY_MODULE);
+  activity = await module.createComputeActivitySource(environment.DRAFTED_COMPUTE_ACTIVITY_DIRECTORY, environment.DRAFTED_COMPUTE_ACTIVITY_SERVICE, { coverage: "complete" });
+}
+Bun.serve({ hostname: "0.0.0.0", port: 8080, async fetch(request) {
+  const url = new URL(request.url);
+  if (url.pathname === "/health") return Response.json({ ready: true, taskId: ${JSON.stringify(label)}, pid: process.pid, activity: Boolean(activity) });
+  if (url.pathname === "/") return new Response("<!doctype html><title>DRA-37 ${label}</title><h1>DRA-37 synthetic task app ${label}</h1>", { headers: { "content-type": "text/html" } });
+  return new Response("not found", { status: 404 });
+} });
+`);
+      if (realMode) {
+        // The synthetic PRODUCT's own schema tool. Drafted runs the product's
+        // `prisma db push` in its container; providers are synthetic (no real
+        // database), so this product tool records the request and succeeds.
+        const tool = path.join(directory, "tools", "prisma-fixture");
+        await mkdir(tool, { recursive: true });
+        await writeFile(path.join(tool, "package.json"), JSON.stringify({ name: "dra37-prisma-fixture", version: "1.0.0", bin: { prisma: "cli.js" } }));
+        await writeFile(path.join(tool, "cli.js"), `#!/usr/bin/env bun
+const args = process.argv.slice(2);
+if (args[0] !== "db" || args[1] !== "push") { console.error("DRA-37 synthetic product prisma supports only db push"); process.exit(2); }
+console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfigured: Boolean(process.env.DATABASE_URL) }));
+`, { mode: 0o755 });
+        await writeFile(path.join(directory, "package.json"), JSON.stringify({ name: label, private: true, dependencies: { "dra37-prisma-fixture": "file:./tools/prisma-fixture" } }));
+        await writeFile(path.join(directory, ".gitignore"), "node_modules\n");
+        const install = Bun.spawnSync([process.execPath, "install"], { cwd: directory, stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root } });
+        if (install.exitCode) throw new Error(`Synthetic product lockfile could not be created offline: ${install.stderr.toString().slice(-500)}`);
+      }
 }
 
 /** Real-Docker mode inputs, recorded before any effect. */
 export const REAL_IMAGES = { app: "oven/bun:1.3.14", proxy: "nginx:1.28-alpine" } as const;
 type RealDocker = { docker: string; prefix: string; images: { app: string; proxy: string }; ledger: string; policy: string };
 
-export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string }; relay?: boolean; docker?: "synthetic" | "real" }) {
+export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string; additionalRevisions?: string[] }; relay?: boolean; docker?: "synthetic" | "real";
+  /** Committed-CLI mode: the primary runs the exact capability checkout's
+   * Drafted CLI with this test-only provider preload (dra37-agent.ts). */
+  cli?: { preload: string } }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
@@ -101,7 +149,10 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker.ts"))});`, ""].join("\n"), { mode: 0o700 });
   }
   const install = path.join(root, "install");
-  const drafted = options.drafted ? await prepareDraftedTooling(root, install, options.drafted.revision, options.drafted.source) : null;
+  // Committed-CLI mode: private synthetic PlanetScale state and one private
+  // recipe outside every worktree and tooling checkout.
+  const planetscale = path.join(root, "planetscale"), cliRecipe = path.join(specs, "runtime.recipe.json");
+  const drafted = options.drafted ? await prepareDraftedTooling(root, install, [options.drafted.revision, ...(options.drafted.additionalRevisions ?? [])], options.drafted.source) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
   const fixture = {
     root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted, real,
@@ -130,6 +181,37 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       const text = await readFile(agentLog, "utf8").catch(() => "");
       return text.split("\n").filter(Boolean).map(line => JSON.parse(line));
     },
+    /** Owner request over the isolated loopback TCP listener (bearer). */
+    async request(route: string, init: RequestInit = {}) {
+      return fetch(`${url}${route}`, { ...init, redirect: "error", signal: init.signal ?? AbortSignal.timeout(120_000),
+        headers: { ...(init.headers as Record<string, string> | undefined), authorization: `Bearer ${token}` } });
+    },
+    /** Committed-CLI mode inputs: the synthetic product committed in the
+     * configured repository (with a local bare origin/staging base, no
+     * network), the scripted synthetic PlanetScale state and one private
+     * recipe whose credentials file holds only synthetic values. */
+    async prepareCliProduct() {
+      if (!options.cli) throw new Error("This fixture is not in committed-CLI mode");
+      await writeSyntheticProduct(repo, "dra37-ab", Boolean(real), root);
+      git(repo, "config", "user.name", "DRA-37"); git(repo, "config", "user.email", "dra37@example.invalid");
+      git(repo, "add", "."); git(repo, "commit", "-qm", "synthetic product");
+      const origin = path.join(root, "origin.git");
+      git(root, "init", "-q", "--bare", origin); git(repo, "remote", "add", "origin", origin); git(repo, "push", "-q", "origin", "HEAD:staging");
+      await mkdir(planetscale, { mode: 0o700 }); await mkdir(specs, { recursive: true });
+      const authorization = `synthetic-not-a-credential-${crypto.randomUUID()}:synthetic-not-a-credential-${crypto.randomUUID()}`;
+      const planetscaleState = { organization: "dra37-synthetic", database: "dra37-synthetic", baseBranch: "main", baseBranchId: "dra37base0000", authorization };
+      await writeFile(path.join(planetscale, "planetscale-state.json"), JSON.stringify(planetscaleState), { mode: 0o600 });
+      const credentialsFile = path.join(specs, "runtime.credentials.json");
+      const [tokenId, tokenSecret] = authorization.split(":");
+      await writeFile(credentialsFile, JSON.stringify({ CLERK_SECRET_KEY: "sk_test_fixture", NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fixture",
+        STUDIO_PLANETSCALE_SERVICE_TOKEN_ID: tokenId, STUDIO_PLANETSCALE_SERVICE_TOKEN: tokenSecret }), { mode: 0o600 });
+      await writeFile(cliRecipe, JSON.stringify({ version: 1, profile: "platform", image: real ? REAL_IMAGES.app : "dra37-synthetic:1", credentialsFile,
+        runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"],
+        planetscale: { organization: planetscaleState.organization, database: planetscaleState.database, baseBranch: planetscaleState.baseBranch, baseBranchId: planetscaleState.baseBranchId },
+        ...(real ? { setup: [["bun", "install", "--frozen-lockfile"]] } : {}),
+        services: { api: { command: ["bun", "app.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], traffic: { operations: "none" }, readyTimeoutSeconds: 15 }), { mode: 0o600 });
+      return { planetscale, recipe: cliRecipe, credentialsFile, planetscaleState: { ...planetscaleState, authorization: "<synthetic, not recorded>" } };
+    },
     /** Identity seed only: task row, its original primary session row and a
      * committed task worktree. No compute, offer, slot or instruction rows. */
     async seedTask(name: string, state: { phase?: string; ownerPaused?: boolean } = {}): Promise<Dra37Task> {
@@ -137,40 +219,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await mkdir(worktree, { recursive: true });
       git(worktree, "init", "-q", "-b", "main"); git(worktree, "config", "user.name", "DRA-37"); git(worktree, "config", "user.email", "dra37@example.invalid");
       await writeFile(path.join(worktree, "app.txt"), `${name}\n`);
-      // Synthetic product app for real-Docker mode (runs inside the container).
-      await writeFile(path.join(worktree, "app.ts"), `// Drafted's supported activity publisher (same pattern as its lot-test
-// server): this synthetic service has no background work, so its complete
-// coverage reports only request lifetimes.
-const environment = process.env;
-let activity: { begin(kind: "background-job"): Promise<() => void> } | undefined;
-if (environment.DRAFTED_COMPUTE_ACTIVITY_MODULE === "/run/drafted/compute-activity.js" && environment.DRAFTED_COMPUTE_ACTIVITY_DIRECTORY && environment.DRAFTED_COMPUTE_ACTIVITY_SERVICE) {
-  const module = await import(environment.DRAFTED_COMPUTE_ACTIVITY_MODULE);
-  activity = await module.createComputeActivitySource(environment.DRAFTED_COMPUTE_ACTIVITY_DIRECTORY, environment.DRAFTED_COMPUTE_ACTIVITY_SERVICE, { coverage: "complete" });
-}
-Bun.serve({ hostname: "0.0.0.0", port: 8080, async fetch(request) {
-  const url = new URL(request.url);
-  if (url.pathname === "/health") return Response.json({ ready: true, taskId: ${JSON.stringify(`dra37-${name}`)}, pid: process.pid, activity: Boolean(activity) });
-  if (url.pathname === "/") return new Response("<!doctype html><title>DRA-37 ${name}</title><h1>DRA-37 synthetic task app ${name}</h1>", { headers: { "content-type": "text/html" } });
-  return new Response("not found", { status: 404 });
-} });
-`);
-      if (real) {
-        // The synthetic PRODUCT's own schema tool. Drafted runs the product's
-        // `prisma db push` in its container; providers are synthetic (no real
-        // database), so this product tool records the request and succeeds.
-        const tool = path.join(worktree, "tools", "prisma-fixture");
-        await mkdir(tool, { recursive: true });
-        await writeFile(path.join(tool, "package.json"), JSON.stringify({ name: "dra37-prisma-fixture", version: "1.0.0", bin: { prisma: "cli.js" } }));
-        await writeFile(path.join(tool, "cli.js"), `#!/usr/bin/env bun
-const args = process.argv.slice(2);
-if (args[0] !== "db" || args[1] !== "push") { console.error("DRA-37 synthetic product prisma supports only db push"); process.exit(2); }
-console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfigured: Boolean(process.env.DATABASE_URL) }));
-`, { mode: 0o755 });
-        await writeFile(path.join(worktree, "package.json"), JSON.stringify({ name: `dra37-${name}`, private: true, dependencies: { "dra37-prisma-fixture": "file:./tools/prisma-fixture" } }));
-        await writeFile(path.join(worktree, ".gitignore"), "node_modules\n");
-        const install = Bun.spawnSync([process.execPath, "install"], { cwd: worktree, stdout: "pipe", stderr: "pipe", env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root } });
-        if (install.exitCode) throw new Error(`Synthetic product lockfile could not be created offline: ${install.stderr.toString().slice(-500)}`);
-      }
+      await writeSyntheticProduct(worktree, `dra37-${name}`, Boolean(real), root);
       git(worktree, "add", "."); git(worktree, "commit", "-qm", `synthetic ${name}`);
       const revision = git(worktree, "rev-parse", "HEAD"), sessionId = `dra37-${name}-primary`, id = `dra37-${name}`;
       await db.prisma.runtimeSession.create({ data: { id: sessionId, scopeKey: `dra37:${name}`, agentCommand: "codex", repositoryId: REPOSITORY, machineId: MACHINE,
@@ -202,7 +251,8 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
       child = Bun.spawn([process.execPath, "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
           ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}), ...(options.relay === false ? { DRA37_RELAY: "0" } : {}),
-          ...(real ? { DRA37_DOCKER_MODE: "real" } : {}) } });
+          ...(real ? { DRA37_DOCKER_MODE: "real" } : {}),
+          ...(options.cli ? { DRA37_AGENT_MODE: "cli", DRA37_PRELOAD: options.cli.preload, DRA37_BIN: bin, DRA37_STATE: state, DRA37_PLANETSCALE_DIRECTORY: planetscale, DRA37_RECIPE_FILE: cliRecipe } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
         for (;;) { const part = await reader.read(); if (part.done) break; log += decoder.decode(part.value, { stream: true }); }

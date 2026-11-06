@@ -210,7 +210,9 @@ else if (command === "exec") {
   created = "container"; createdName = name!;
 } else refuse(`unmodelled command ${command} ${sub ?? ""}`);
 
-log({ args });
+// The caller's checkout (cwd) and bound tooling operation, so evidence shows
+// which release a server-run observer or CLI command executed from.
+log({ args, cwd: process.cwd(), operation: process.env.REMOTE_AGENT_TOOLING_OPERATION ?? null });
 const child = Bun.spawn([policy.docker, ...args], { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
 const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
 if (code !== 0) log({ exit: code, command: args.slice(0, 3), stderr: stderr.slice(-1_500) });
