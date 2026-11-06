@@ -5,7 +5,7 @@
  * every request, offer, reservation, claim and delivery goes through the
  * server's normal routes and workers. Never points at live config or data. */
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -123,6 +123,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   const configFile = path.join(root, "config.json"), controlSocket = path.join(root, "control.sock");
   const repo = path.join(root, "repo"), worktrees = path.join(root, "worktrees"), specs = path.join(root, "specs"), agentLog = path.join(root, "agent.jsonl");
   const apps = path.join(root, "apps"), state = path.join(root, "state"), bin = path.join(root, "bin");
+  // Fixture-owned task IDs the Docker guard accepts in dev.drafted.task labels.
+  const tasksFile = path.join(root, "docker-tasks.jsonl");
   await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
   // SYNTHETIC Docker CLI, first on the server's PATH only, for Drafted's
   // actual observer (see dra37-docker.ts). The app it reports is real.
@@ -142,7 +144,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     };
     real = { docker, prefix: `dra37fx-${path.basename(root).replace(/^dra37-/, "").toLowerCase()}`, images: { app: imageId(REAL_IMAGES.app), proxy: imageId(REAL_IMAGES.proxy) },
       ledger: path.join(root, "docker-ledger.jsonl"), policy: path.join(root, "docker-policy.json") };
-    await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl") }), { mode: 0o600 });
+    await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl"), tasks: tasksFile }), { mode: 0o600 });
     await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
       `process.argv.splice(2, 0, ${JSON.stringify(real.policy)});`,
       `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker-guard.ts"))});`, ""].join("\n"), { mode: 0o700 });
@@ -190,6 +192,19 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       const text = await readFile(agentLog, "utf8").catch(() => "");
       return text.split("\n").filter(Boolean).map(line => JSON.parse(line));
     },
+    /** Durably register one fixture-owned task ID (a seeded identity or the
+     * ID returned by a successful normal owner launch). The Docker guard
+     * accepts only registered IDs, and the CLI-mode primary waits for its own
+     * registration before any Docker-capable command. */
+    registerTask(taskId: string) {
+      if (!/^[A-Za-z0-9_-]{1,128}$/.test(taskId)) throw new Error(`Refusing to register malformed task ID ${JSON.stringify(taskId)}`);
+      if (fixture.registeredTasks().includes(taskId)) return;
+      const descriptor = openSync(tasksFile, "a", 0o600);
+      try { writeSync(descriptor, JSON.stringify({ taskId, at: new Date().toISOString() }) + "\n"); fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    },
+    registeredTasks(): string[] {
+      return existsSync(tasksFile) ? readFileSync(tasksFile, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { taskId: string }).taskId) : [];
+    },
     /** Owner request over the isolated loopback TCP listener (bearer). */
     async request(route: string, init: RequestInit = {}) {
       return fetch(`${url}${route}`, { ...init, redirect: "error", signal: init.signal ?? AbortSignal.timeout(120_000),
@@ -234,6 +249,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await writeSyntheticProduct(worktree, `dra37-${name}`, Boolean(real), root);
       git(worktree, "add", "."); git(worktree, "commit", "-qm", `synthetic ${name}`);
       const revision = git(worktree, "rev-parse", "HEAD"), sessionId = `dra37-${name}-primary`, id = `dra37-${name}`;
+      fixture.registerTask(id);
       await db.prisma.runtimeSession.create({ data: { id: sessionId, scopeKey: `dra37:${name}`, agentCommand: "codex", repositoryId: REPOSITORY, machineId: MACHINE,
         role: "primary", lifecycle: "persistent", cwd: worktree, worktreePath: worktree, status: "idle", name: `DRA-37 ${name}` } });
       await db.prisma.remoteTask.create({ data: { id, requestKey: `dra37:${name}`, repositoryId: REPOSITORY, machineId: MACHINE, branchName: `dra37/${name}`, worktreePath: worktree,
@@ -265,7 +281,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
           ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}), ...(options.relay === false ? { DRA37_RELAY: "0" } : {}),
           ...(real ? { DRA37_DOCKER_MODE: "real" } : {}),
           ...(options.decision ? { DRA37_DECISION_DIRECTORY: decision } : {}),
-          ...(options.cli ? { DRA37_AGENT_MODE: "cli", DRA37_PRELOAD: options.cli.preload, DRA37_BIN: bin, DRA37_STATE: state, DRA37_PLANETSCALE_DIRECTORY: planetscale, DRA37_RECIPE_FILE: cliRecipe } : {}) } });
+          ...(options.cli ? { DRA37_AGENT_MODE: "cli", DRA37_PRELOAD: options.cli.preload, DRA37_BIN: bin, DRA37_STATE: state, DRA37_PLANETSCALE_DIRECTORY: planetscale, DRA37_RECIPE_FILE: cliRecipe, DRA37_TASKS_FILE: tasksFile } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
         for (;;) { const part = await reader.read(); if (part.done) break; log += decoder.decode(part.value, { stream: true }); }

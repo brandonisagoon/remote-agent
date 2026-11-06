@@ -416,6 +416,10 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     // --- 3. Normal launch; the primary runs A's committed runtime up and claims its offer.
     const launched = await json(await post("/api/tasks", { requestKey: "dra37-ab-task", repositoryId: REPOSITORY, branchName: "dra37/ab", prompt: "DRA37-RUNTIME: up", provider: "codex" }), 201);
     const taskId = launched.task.id as string;
+    // Register the exact launched task (and nothing broader) for the Docker
+    // guard; the primary waits for this before any Docker-capable command.
+    server.registerTask(taskId);
+    step("registered-task", { taskId, registered: server.registeredTasks() });
     const task = await until("launched primary", async () => { const row = await prisma.remoteTask.findUnique({ where: { id: taskId } }); return row?.primarySessionId ? row : null; });
     expect({ toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot }).toEqual({ toolingRevision: RELEASE_A, pinnedToolingRoot: releaseA.checkout });
     step("launch", { task: { id: task.id, primarySessionId: task.primarySessionId, worktreePath: task.worktreePath, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot } });

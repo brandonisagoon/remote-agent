@@ -10,6 +10,9 @@
  *   private fixture network (Drafted's NGINX reaches the app by name).
  * - Every command is parsed with an exact option grammar (allowlist). Any
  *   unknown option, command or target is refused.
+ * - Every create carries exactly one dev.drafted.task label naming a task the
+ *   fixture registered (policy.tasks), at most one valid purpose label and
+ *   at most one operation label; task and operation labels are ledgered.
  * - create: unique prefixed --name, a ledger --network, only recorded image
  *   IDs in image position, only --pull=never. --mount is split like Docker
  *   (comma fields, first "="), with only type/source/target/readonly, no
@@ -39,7 +42,7 @@
 import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
 import { readEngineSubnets, selectFixtureSubnet } from "./dra37-subnet.ts";
 
-type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string };
+type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string; tasks: string };
 const policy = JSON.parse(readFileSync(process.argv[2]!, "utf8")) as Policy;
 const root = realpathSync(policy.root);
 const raw = process.argv.slice(3);
@@ -49,7 +52,7 @@ function refuse(reason: string): never { log({ refused: reason, args: raw }); co
 const NAME = /(?<![A-Za-z0-9_.-])(drafted-[dr]-[0-9a-f]{24}[a-z0-9-]*)/g;
 const inbound = (value: string) => value.replace(NAME, `${policy.prefix}-$1`);
 const outbound = (text: string) => text.split(`${policy.prefix}-drafted-`).join("drafted-");
-type Entry = { kind: "container" | "network" | "volume"; id: string; name: string; published?: number[] };
+type Entry = { kind: "container" | "network" | "volume"; id: string; name: string; published?: number[]; task?: string; operation?: string };
 const ledger = (): Entry[] => existsSync(policy.ledger) ? readFileSync(policy.ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
 /** Exact full ledger ID or exact ledger name only. Never an ID prefix: Docker
  * resolves exact names before ID prefixes, so a foreign object NAMED like a
@@ -58,6 +61,21 @@ const owned = (value: string, kinds: Entry["kind"][]) => ledger().some(entry => 
 function record(entry: Entry) {
   const descriptor = openSync(policy.ledger, "a", 0o600);
   try { writeSync(descriptor, JSON.stringify({ ...entry, at: new Date().toISOString() }) + "\n"); fsyncSync(descriptor); } finally { closeSync(descriptor); }
+}
+
+/** Fixture-owned task IDs, registered by the fixture (seeded identities and
+ * successful normal owner-launch responses) before any Docker-capable work. */
+const registeredTasks = () => existsSync(policy.tasks) ? new Set(readFileSync(policy.tasks, "utf8").split("\n").filter(Boolean).map(line => (JSON.parse(line) as { taskId: string }).taskId)) : new Set<string>();
+/** Exactly one task label naming a registered fixture task; at most one
+ * valid purpose and one operation label. Returns the label facts. */
+function fixtureLabels(labels: string[]) {
+  const named = (key: string) => labels.filter(value => value.startsWith(`${key}=`)).map(value => value.slice(key.length + 1));
+  const tasks = named("dev.drafted.task"), purposes = named("dev.drafted.purpose"), operations = named("dev.drafted.operation");
+  if (tasks.length !== 1) refuse(`exactly one dev.drafted.task label is required (got ${tasks.length})`);
+  if (!registeredTasks().has(tasks[0]!)) refuse(`task ${tasks[0]} is not a registered fixture task`);
+  if (purposes.length > 1 || purposes.some(value => !["development", "review"].includes(value))) refuse("at most one dev.drafted.purpose label of development or review is allowed");
+  if (operations.length > 1) refuse("at most one dev.drafted.operation label is allowed");
+  return { task: tasks[0]!, ...(operations[0] ? { operation: operations[0] } : {}) };
 }
 
 /** Exact option grammar: value options take `--x v` or `--x=v`; flags take none. */
@@ -107,7 +125,7 @@ const [command, sub] = args;
 const isContainerVerb = command === "container" && ["inspect", "start", "stop", "kill", "rm", "logs", "wait"].includes(sub ?? "");
 const verb = isContainerVerb ? sub! : command!;
 const rest = args.slice(isContainerVerb ? 2 : 1);
-let created: Entry["kind"] | null = null, createdName = "", createdPublished: number[] = [];
+let created: Entry["kind"] | null = null, createdName = "", createdPublished: number[] = [], createdLabels: { task?: string; operation?: string } = {};
 /** The OS ephemeral port range (macOS sysctl, Linux procfs); unknown means refuse. */
 function ephemeralRange(): [number, number] {
   if (process.platform === "darwin") {
@@ -136,7 +154,7 @@ else if (command === "exec") {
   const { options, positionals } = parse(args.slice(2), command === "network" ? ["--label", "--subnet"] : ["--label"], [], false);
   if (positionals.length !== 1 || !positionals[0]!.startsWith(`${policy.prefix}-`)) refuse(`${command} name must be fixture-prefixed`);
   if (ledger().some(entry => entry.kind === command && entry.name === positionals[0])) refuse(`${command} name ${positionals[0]} already exists in the ledger`);
-  if (!options.some(([name, value]) => name === "--label" && typeof value === "string" && /^dev\.drafted\.task=dra37-/.test(value))) refuse("missing DRA-37 task label");
+  createdLabels = fixtureLabels(options.filter(([name]) => name === "--label").map(([, value]) => value as string));
   if (options.some(([name]) => name === "--subnet")) refuse("callers may not choose a subnet; the guard assigns fixture subnets");
   if (command === "network") {
     // Read-only, fail-closed inventory and true CIDR interval overlap.
@@ -162,7 +180,7 @@ else if (command === "exec") {
   if (ledger().some(entry => entry.kind === "container" && entry.name === name)) refuse(`container name ${name} already exists in the ledger`);
   if (values("--network").length !== 1 || !owned(values("--network")[0]!, ["network"])) refuse("create needs exactly one ledger --network");
   if (values("--pull").some(value => value !== "never")) refuse("only --pull=never is allowed");
-  if (!values("--label").some(value => /^dev\.drafted\.task=dra37-/.test(value))) refuse("missing DRA-37 task label");
+  createdLabels = fixtureLabels(values("--label"));
   if (!positionals.length || !policy.images.includes(positionals[0]!)) refuse("the image position must be one recorded immutable fixture image ID");
   // Optional: no publication is the normal internal-container case.
   const publishes = values("--publish");
@@ -216,7 +234,7 @@ else if (command === "exec") {
 
 // The caller's checkout (cwd) and bound tooling operation, so evidence shows
 // which release a server-run observer or CLI command executed from.
-log({ args, cwd: process.cwd(), operation: process.env.REMOTE_AGENT_TOOLING_OPERATION ?? null });
+log({ args, cwd: process.cwd(), operation: process.env.REMOTE_AGENT_TOOLING_OPERATION ?? null, ...(created ? { labels: createdLabels } : {}) });
 const child = Bun.spawn([policy.docker, ...args], { stdin: "inherit", stdout: "pipe", stderr: "pipe" });
 const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
 if (code !== 0) log({ exit: code, command: args.slice(0, 3), stderr: stderr.slice(-1_500) });
@@ -225,7 +243,7 @@ if (code === 0 && created) {
   const exact = created === "volume" ? id === createdName : /^[a-f0-9]{64}$/.test(id);
   if (!exact) { log({ unrecognizedCreateOutput: id.slice(0, 200), kind: created, name: createdName }); refuse(`${created} create output is not the exact expected ID; ${createdName} needs manual reconciliation`); }
   // Durable before the caller can act on the new object.
-  record({ kind: created, id, name: createdName, ...(createdPublished.length ? { published: createdPublished } : {}) });
+  record({ kind: created, id, name: createdName, ...createdLabels, ...(createdPublished.length ? { published: createdPublished } : {}) });
 }
 process.stderr.write(stderr);
 process.stdout.write(outbound(stdout));

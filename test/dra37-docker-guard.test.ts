@@ -12,6 +12,8 @@ const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 const IMAGE = `sha256:${"e".repeat(64)}`, NETWORK = "a".repeat(64), PREFIX = "dra37fx-test";
 const DRAFTED_APP = "drafted-d-000000000000000000000000-app";
+// A normal owner launch returns an opaque generated task ID like this one.
+const GENERATED = "cmw4qdng70000x3xc25jf7tqe";
 const STUB = `const { appendFileSync, readFileSync } = require("node:fs");
 const directory = require("node:path").dirname(process.argv[1]);
 const args = process.argv.slice(2);
@@ -37,7 +39,9 @@ function fixture(stub: Record<string, unknown> = {}) {
   mkdirSync(worktree, { recursive: true }); mkdirSync(runtimeState, { recursive: true });
   writeFileSync(docker, `#!${process.execPath} --no-env-file\n${STUB}`, { mode: 0o700 });
   writeFileSync(path.join(root, "stub.json"), JSON.stringify({ networks: { ["9".repeat(64)]: [{ Subnet: "10.249.0.0/28" }] }, createOutput: "c".repeat(64), networkId: "b".repeat(64), ...stub }));
-  writeFileSync(policy, JSON.stringify({ root, prefix: PREFIX, docker, images: [IMAGE], ledger, log: path.join(root, "calls.jsonl") }));
+  const tasks = path.join(root, "tasks.jsonl");
+  writeFileSync(tasks, ["dra37-first", GENERATED].map(taskId => JSON.stringify({ taskId })).join("\n") + "\n");
+  writeFileSync(policy, JSON.stringify({ root, prefix: PREFIX, docker, images: [IMAGE], ledger, log: path.join(root, "calls.jsonl"), tasks }));
   writeFileSync(ledger, [{ kind: "network", id: NETWORK, name: `${PREFIX}-${DRAFTED_APP}` },
     { kind: "volume", id: `${PREFIX}-drafted-d-000000000000000000000000-dependencies`, name: `${PREFIX}-drafted-d-000000000000000000000000-dependencies` },
     { kind: "container", id: "d".repeat(64), name: `${PREFIX}-drafted-d-000000000000000000000000-proxy`, published: [55001] }]
@@ -157,6 +161,31 @@ test("accepted creates forward the exact rewritten argv and durably ledger the e
   const volume = guard("volume", "create", "--label", "dev.drafted.task=dra37-first", "drafted-d-111111111111111111111111-dependencies");
   expect(volume.code, volume.stderr).toBe(0);
   expect(ledger().at(-1)).toMatchObject({ kind: "volume", id: `${PREFIX}-drafted-d-111111111111111111111111-dependencies` });
+}, 60_000);
+
+test("create labels: exactly one registered fixture task (opaque generated IDs included), no duplicates", () => {
+  const { guard, ledger, setStub } = fixture();
+  const refused = (result: { code: number | null; stderr: string; stubCalls: unknown[] }, reason: RegExp) => {
+    expect(result.code).toBe(125); expect(result.stderr).toMatch(reason); expect(result.stubCalls).toEqual([]);
+  };
+  const network = (name: string, ...labels: string[]) => guard("network", "create", ...labels.flatMap(label => ["--label", label]), name);
+  // Positive: the exact network create a normal owner launch produced.
+  setStub({ networks: { ["9".repeat(64)]: [{ Subnet: "10.249.0.0/28" }] }, networkId: "b".repeat(64) });
+  const accepted = network("drafted-d-1b39289de5e52459e384ced2-app", `dev.drafted.task=${GENERATED}`, "dev.drafted.purpose=development", "dev.drafted.operation=55c464ea-fedd-4c3a-9b25-db5ecf4a969d");
+  expect(accepted.code, accepted.stderr).toBe(0);
+  expect(ledger().at(-1)).toMatchObject({ kind: "network", id: "b".repeat(64), name: `${PREFIX}-drafted-d-1b39289de5e52459e384ced2-app`, task: GENERATED, operation: "55c464ea-fedd-4c3a-9b25-db5ecf4a969d" });
+  // Negatives: unknown (including dra37-looking) IDs, missing, duplicate and conflicting labels.
+  refused(network("drafted-d-222222222222222222222222-app", "dev.drafted.task=cmw4qdng70000x3xc25jf7zzzz"), /is not a registered fixture task/);
+  refused(network("drafted-d-222222222222222222222222-app", "dev.drafted.task=dra37-unregistered"), /is not a registered fixture task/);
+  refused(network("drafted-d-222222222222222222222222-app", "dev.drafted.purpose=development"), /exactly one dev.drafted.task label is required \(got 0\)/);
+  refused(network("drafted-d-222222222222222222222222-app", `dev.drafted.task=${GENERATED}`, `dev.drafted.task=${GENERATED}`), /exactly one dev.drafted.task label is required \(got 2\)/);
+  refused(network("drafted-d-222222222222222222222222-app", `dev.drafted.task=${GENERATED}`, "dev.drafted.task=dra37-first"), /exactly one dev.drafted.task label is required \(got 2\)/);
+  refused(network("drafted-d-222222222222222222222222-app", `dev.drafted.task=${GENERATED}`, "dev.drafted.purpose=development", "dev.drafted.purpose=review"), /at most one dev.drafted.purpose/);
+  refused(network("drafted-d-222222222222222222222222-app", `dev.drafted.task=${GENERATED}`, "dev.drafted.purpose=production"), /at most one dev.drafted.purpose/);
+  refused(network("drafted-d-222222222222222222222222-app", `dev.drafted.task=${GENERATED}`, "dev.drafted.operation=a", "dev.drafted.operation=b"), /at most one dev.drafted.operation/);
+  refused(guard("volume", "create", "--label", "dev.drafted.task=someone-else", "drafted-d-222222222222222222222222-dependencies"), /is not a registered fixture task/);
+  refused(guard("create", "--name", "drafted-d-333333333333333333333333-app", "--network", NETWORK, "--label", "dev.drafted.task=someone-else", IMAGE), /is not a registered fixture task/);
+  refused(guard("create", "--name", "drafted-d-333333333333333333333333-app", "--network", NETWORK, "--label", `dev.drafted.task=${GENERATED}`, "--label", "dev.drafted.task=dra37-first", IMAGE), /got 2/);
 }, 60_000);
 
 test("malformed create output and implicit image volumes fail closed without ledgering", () => {

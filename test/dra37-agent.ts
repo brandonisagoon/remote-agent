@@ -53,10 +53,25 @@ async function capability() {
   if (!response.ok || !body?.receipt || typeof body.receipt.checkout !== "string") throw new Error(`Runtime capability unavailable (${response.status}): ${JSON.stringify(body).slice(0, 500)}`);
   return body.receipt as Record<string, unknown> & { checkout: string };
 }
+/** Test-side handshake: a launched task's ID is known to the fixture only
+ * from the launch response, which can arrive after this primary's first turn
+ * starts. No Docker-capable command runs until the fixture registered it. */
+async function awaitRegistration(task: string) {
+  const file = process.env.DRA37_TASKS_FILE;
+  if (!file) throw new Error("CLI mode requires DRA37_TASKS_FILE");
+  const registered = () => existsSync(file) && readFileSync(file, "utf8").split("\n").filter(Boolean).some(line => JSON.parse(line).taskId === task);
+  const startedAt = Date.now(), deadline = startedAt + 120_000;
+  while (!registered()) {
+    if (Date.now() > deadline) throw new Error(`Task ${task} was never registered by the fixture; no Docker-capable command was run`);
+    await Bun.sleep(100);
+  }
+  audit({ event: "registration-confirmed", waitedMs: Date.now() - startedAt });
+}
 async function committedCli(label: string, args: string[]) {
-  const receipt = await capability();
   const socket = process.env.REMOTE_AGENT_SOCKET!, task = process.env.REMOTE_AGENT_TASK_ID;
   if (!task) throw new Error("CLI mode requires the session's REMOTE_AGENT_TASK_ID");
+  await awaitRegistration(task);
+  const receipt = await capability();
   const command = [process.execPath, "--no-env-file", "--preload", process.env.DRA37_PRELOAD!, `${receipt.checkout}/src/cli.ts`, ...args, "--task", task, "--socket", socket];
   const startedAt = Date.now();
   const child = Bun.spawn(command, { cwd: process.cwd(), stdin: "ignore", stdout: "pipe", stderr: "pipe",
