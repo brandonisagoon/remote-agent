@@ -972,6 +972,9 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       try {
         await provider.close({ handle, reason: "Session closed while its provider was starting", discardPersistentState: false });
       } catch (closeError) {
+        // Keep owning the possibly-live provider: a concurrent close may have
+        // dropped its runtime, and a fresh runtime could not stop this process.
+        if (!this.runtimes.has(input.id)) this.runtimes.set(input.id, provider);
         throw new Error(`${error.message}; stopping the provider started for it failed: ${closeError instanceof Error ? closeError.message : String(closeError)}`, { cause: closeError });
       }
       if (this.handles.get(input.id) === handle) this.handles.delete(input.id);

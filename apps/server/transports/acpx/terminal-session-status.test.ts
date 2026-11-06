@@ -39,7 +39,7 @@ async function fixture(options: { cachedHandle?: boolean } = {}) {
   const statusEntered = gate(), statusRelease = gate();
   let holdStatus = false, throwFromEvents = false;
   // Named provider calls the test can hold: ensureSession, setMode, setConfigOption, close.
-  const holds = new Map<string, { entered: PromiseWithResolvers<void>; release: PromiseWithResolvers<void> }>();
+  const holds = new Map<string, { entered: ReturnType<typeof gate<void>>; release: ReturnType<typeof gate<void>> }>();
   const hold = (name: string) => { const value = { entered: gate(), release: gate() }; holds.set(name, value); return value; };
   const pause = async (name: string) => { const value = holds.get(name); if (value) { holds.delete(name); value.entered.resolve(); await value.release.promise; } };
   const closes: Array<{ handle: unknown; discardPersistentState?: boolean }> = [];
@@ -230,6 +230,24 @@ test("a refused attach whose provider stop fails reports the failure and keeps t
   const result = await turn.result;
   expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("provider did not stop") });
   expect(f.cached()).toMatchObject({ handle: true, runtime: true });
+  expect(await f.row()).toEqual(closed);
+});
+
+test("a failed stop after a concurrent close keeps the started provider owned", async () => {
+  const f = await fixture({ cachedHandle: false });
+  const starting = f.hold("ensureSession");
+  f.provider.close = async () => { throw new Error("provider did not stop"); };
+  const turn = f.runtime.startTurn({ sessionId: ID, text: "Do the work" });
+  await starting.entered.promise;
+  await f.runtime.close(ID, "Owner closed the task"); // drops the runtime cache while the provider starts
+  expect((f.runtime as any).runtimes.has(ID)).toBe(false);
+  const closed = await f.row();
+  starting.release.resolve();
+  await turn.result;
+  for await (const _ of turn.events) {}
+  await (f.runtime as any).turnChains.get(ID);
+  expect((f.runtime as any).handles.get(ID)).toBe(f.ensured[0]);
+  expect((f.runtime as any).runtimes.get(ID)).toBe(f.provider);
   expect(await f.row()).toEqual(closed);
 });
 
