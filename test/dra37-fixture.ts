@@ -112,7 +112,10 @@ type RealDocker = { docker: string; prefix: string; images: { app: string; proxy
 export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; drafted?: { source: string; revision: string; additionalRevisions?: string[] }; relay?: boolean; docker?: "synthetic" | "real";
   /** Committed-CLI mode: the primary runs the exact capability checkout's
    * Drafted CLI with this test-only provider preload (dra37-agent.ts). */
-  cli?: { preload: string } }) {
+  cli?: { preload: string };
+  /** Server-side test-only synthetic compute-decision transport
+   * (dra37-decision-preload.ts) with a synthetic decision credential. */
+  decision?: { preload: string; quietPeriodSeconds: number } }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
@@ -152,10 +155,16 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   // Committed-CLI mode: private synthetic PlanetScale state and one private
   // recipe outside every worktree and tooling checkout.
   const planetscale = path.join(root, "planetscale"), cliRecipe = path.join(specs, "runtime.recipe.json");
+  // Server-side synthetic decision transport state (credential is synthetic).
+  const decision = path.join(root, "decision"), decisionApiKey = `synthetic-not-a-credential-${crypto.randomUUID()}`;
+  if (options.decision) {
+    await mkdir(decision, { mode: 0o700 });
+    await writeFile(path.join(decision, "decision-state.json"), JSON.stringify({ apiKey: decisionApiKey }), { mode: 0o600 });
+  }
   const drafted = options.drafted ? await prepareDraftedTooling(root, install, [options.drafted.revision, ...(options.drafted.additionalRevisions ?? [])], options.drafted.source) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
   const fixture = {
-    root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted, real,
+    root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted, real, decisionDirectory: options.decision ? decision : null,
     /** Exact fixture-created Docker objects, in creation order. */
     dockerLedger(): Array<{ kind: "container" | "network" | "volume"; id: string; name?: string }> {
       return real && existsSync(real.ledger) ? readFileSync(real.ledger, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)) : [];
@@ -248,10 +257,11 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     async start() {
       offset = log.length;
       // Explicit environment: no inherited REMOTE_AGENT_* or provider secrets.
-      child = Bun.spawn([process.execPath, "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+      child = Bun.spawn([process.execPath, ...(options.decision ? ["--preload", options.decision.preload] : []), "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
         env: { PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`, TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
           ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}), ...(options.relay === false ? { DRA37_RELAY: "0" } : {}),
           ...(real ? { DRA37_DOCKER_MODE: "real" } : {}),
+          ...(options.decision ? { DRA37_DECISION_DIRECTORY: decision } : {}),
           ...(options.cli ? { DRA37_AGENT_MODE: "cli", DRA37_PRELOAD: options.cli.preload, DRA37_BIN: bin, DRA37_STATE: state, DRA37_PLANETSCALE_DIRECTORY: planetscale, DRA37_RECIPE_FILE: cliRecipe } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
@@ -354,7 +364,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
         server: { publicUrl: url, apiKey: token, listen: { host: "127.0.0.1", port }, databaseUrl: db.databaseUrl,
           acpSocketPath: path.join(root, "acp.sock"), controlSocketPath: controlSocket },
         acpx: { stateDir: path.join(root, "acpx"), maxConcurrentTurns: 4 }, installation: { root: install },
-        compute: { enabled: true, slots: options.slots, deliveryTimeoutSeconds: options.deliveryTimeoutSeconds ?? 30, collectorFreshnessSeconds: 15 } },
+        compute: { enabled: true, slots: options.slots, deliveryTimeoutSeconds: options.deliveryTimeoutSeconds ?? 30, collectorFreshnessSeconds: 15,
+          ...(options.decision ? { quietPeriodSeconds: options.decision.quietPeriodSeconds, decisionApiKey } : {}) } },
       providers: { codex: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] }, claude: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] } },
       connections: {}, repositories: { [REPOSITORY]: { root: repo, worktreeRoot: worktrees, ...(drafted ? { tooling: { root: drafted.source, ref: drafted.revision } } : {}) } },
     });

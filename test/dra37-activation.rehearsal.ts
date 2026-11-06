@@ -6,10 +6,16 @@
  * (prepareToolingRelease + verifyPreparedToolingRelease) from a private
  * `--shared` clone of the paired Drafted repository, under the private
  * repository ID `dra37-repo`. Drafted's COMMITTED CLI, operation guards,
- * runtime, Docker transports and observer run unchanged; the only test-only
- * transport is test/dra37-provider-preload.ts, which answers
- * api.planetscale.com from scripted synthetic state inside each CLI process
- * (never forwarding a request or credential). Docker objects are real local
+ * runtime, Docker transports and observer run unchanged. Two test-only
+ * synthetic external transports, each scoped to one exact endpoint set and
+ * refusing every other outbound external host (nothing is forwarded; all
+ * credentials are synthetic):
+ *  - test/dra37-provider-preload.ts in each CLI process: api.planetscale.com;
+ *  - test/dra37-decision-preload.ts in the server process: the compute
+ *    decision request (POST api.openai.com/v1/decisions), answered
+ *    `suspend-compute` once, only after arming and only when the request's
+ *    own evidence (from the real collector over the real app's telemetry)
+ *    proves idle; `leave-running` otherwise. Docker objects are real local
  * containers behind the fixture policy guard with exact-ID ledger cleanup.
  *
  *   transport check (no Docker, no server process):
@@ -29,9 +35,12 @@
  *  4. Owner TCP activation of B (generation 2), same server PID.
  *  5. The server's physical observer keeps executing A's checkout with the
  *     producer operation (guard log cwd/operation) and keeps observing running.
- *  6. Owner instruction → the primary runs the ACTIVE release's committed
- *     `runtime stop`; app stopped and observed stopped; operations settled;
- *     A's retained consumer resolved.
+ *  6. Natural idle suspension: after arming (and one ordinary app request),
+ *     the server's real collector, idle attempt, decision request, decision
+ *     receipt and runtime-suspended intent lead to the server-started
+ *     continuation, bound through A's confirmed retained consumer and executed
+ *     from A's checkout; app stopped and observed stopped; operations
+ *     settled; A's retained consumer resolved. Nothing is seeded.
  *  7. Owner instruction → B's committed `runtime up` (+ offer claim) adopts the
  *     SAME environment, resource and app container IDs.
  *  8. Optional bounded hold for root's browser (released only by the hold
@@ -40,9 +49,9 @@
  *
  * Known scope limits (recorded in evidence): owner instructions are not
  * Linear source messages (no "independent turn" release line; binding uses
- * the active selection either way); the server-derived idle continuation is
- * NOT triggered (its natural path needs the server's compute decision API);
- * this runner records the confirmed A consumer it would bind to instead.
+ * the active selection either way); the idle decision itself is synthetic
+ * (no model judgement is exercised) and the quiet period is the policy
+ * minimum range (60 s) rather than the 1800 s default.
  * It is written against the intended corrected admission behaviour
  * (DRA-37 H1/H2) and must not be accepted before that fix is integrated.
  */
@@ -53,6 +62,7 @@ import path from "node:path";
 import { dra37Server, MACHINE, REPOSITORY } from "./dra37-fixture.ts";
 
 const PRELOAD = path.join(import.meta.dir, "dra37-provider-preload.ts");
+const DECISION_PRELOAD = path.join(import.meta.dir, "dra37-decision-preload.ts");
 const SOURCE = process.env.DRA37_DRAFTED_SOURCE ?? "", RELEASE_A = process.env.DRA37_RELEASE_A ?? "", RELEASE_B = process.env.DRA37_RELEASE_B ?? "";
 if (!SOURCE || !/^[a-f0-9]{40}$/.test(RELEASE_A) || !/^[a-f0-9]{40}$/.test(RELEASE_B) || RELEASE_A === RELEASE_B) {
   throw new Error("The DRA-37 A/B runner requires DRA37_DRAFTED_SOURCE and two distinct exact DRA37_RELEASE_A/DRA37_RELEASE_B commits; it is not part of the default test gate");
@@ -185,7 +195,7 @@ console.log(JSON.stringify(out));
     for (const refused of [out.wrongCredential, out.otherOrganization, out.release, out.redirect, out.delete]) expect(refused).toMatch(/Remote dependency request failed|DRA-37 synthetic PlanetScale refused/);
   }
   const requests = readJsonl(path.join(product.planetscale, "planetscale-requests.jsonl"));
-  expect(requests.filter(entry => entry.outcome === "external-passthrough")).toEqual([]);
+  expect(requests.filter(entry => entry.outcome === "refused-external")).toEqual([]);
   expect(requests.filter(entry => entry.outcome === "loaded")).toHaveLength(2);
   const issued = readJsonl(path.join(product.planetscale, "planetscale-passwords.jsonl"));
   expect(issued.filter(entry => entry.role === "admin" && entry.event === "issued").length).toBe(2);
@@ -206,12 +216,69 @@ console.log(JSON.stringify(out));
   passed = true;
 });
 
+test("transport: the server's real compute classifier is answered only by the armed, idle-gated synthetic decision preload", async () => {
+  const root = (await import("node:fs")).mkdtempSync(path.join((await import("node:os")).tmpdir(), "dra37-decision-"));
+  let passed = false;
+  cleanups.push(async () => { if (passed && !process.env.DRA37_KEEP_EVIDENCE) (await import("node:fs")).rmSync(root, { recursive: true, force: true }); });
+  const apiKey = `synthetic-not-a-credential-${crypto.randomUUID()}`;
+  writeFileSync(path.join(root, "decision-state.json"), JSON.stringify({ apiKey }), { mode: 0o600 });
+  const probe = path.join(root, "decision-probe.ts");
+  writeFileSync(probe, `import { classifyCompute } from ${JSON.stringify(path.join(sourceRoot, "apps/server/services/tasks/compute-decision.ts"))};
+import { writeFileSync } from "node:fs";
+const [directory, apiKey] = process.argv.slice(2);
+const evidence = (environmentId, overrides = {}) => ({ version: 2,
+  task: { id: "dra37-task", primarySessionId: "dra37-primary", environmentId, purpose: "development", revision: "a".repeat(40) },
+  observedAt: Date.now(), evidenceDigest: "b".repeat(64),
+  traffic: { coverage: "complete", lastMeaningfulAt: null, lastUnknownAt: null, inFlight: 0, activeStreams: 0, quietForMs: 120000, collectorAgeMs: 1000, ...overrides.traffic },
+  activity: { ownedSessionsSettled: true, operationsComplete: true, pendingInstructions: 0, ownerPaused: false, reviewProtected: false, latestInstructionAt: null },
+  conversation: [], policy: { quietPeriodSeconds: 60, collectorFreshnessSeconds: 15 },
+  measurement: { unknownInFlight: 0, probeConnections: 0, probeStreams: 0, lastUnknownAgeMs: null, coverageForMs: 120000, operations: { coverage: "complete", active: 0 } },
+  thread: { name: null, issueIdentifier: null, taskPhase: "working", order: "oldest-to-newest", totalMessages: 0, windowMessages: 0, omittedMessages: 0, messageIndexes: [], truncations: [] } });
+const out = {};
+out.beforeArm = await classifyCompute(evidence("env-a"), { apiKey });
+writeFileSync(directory + "/decision-arm.json", JSON.stringify({ environmentId: "env-a" }));
+out.otherEnvironment = await classifyCompute(evidence("env-b"), { apiKey });
+// Armed but NOT idle (one request in flight): the server's own deterministic
+// gate refuses before any request (the preload's proof is a second check).
+out.armedBusy = await classifyCompute(evidence("env-a", { traffic: { inFlight: 1 } }), { apiKey });
+out.armedIdle = await classifyCompute(evidence("env-a"), { apiKey });
+out.afterConsumed = await classifyCompute(evidence("env-a"), { apiKey });
+out.wrongCredential = await classifyCompute(evidence("env-a"), { apiKey: "synthetic-wrong" });
+try { await fetch("https://example.invalid/"); out.otherHost = "accepted"; } catch (error) { out.otherHost = String(error.message); }
+try { await fetch("https://api.openai.com/v1/decisions", { method: "POST", redirect: "follow", headers: { authorization: "Bearer " + apiKey, "content-type": "application/json" }, body: "{}" }); out.redirect = "accepted"; } catch (error) { out.redirect = String(error.message); }
+console.log(JSON.stringify(out));
+`, { mode: 0o600 });
+  const child = Bun.spawnSync([process.execPath, "--no-env-file", "--preload", DECISION_PRELOAD, probe, root, apiKey], { cwd: sourceRoot, stdout: "pipe", stderr: "pipe",
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: root, TMPDIR: process.env.TMPDIR ?? "/tmp", DRA37_DECISION_DIRECTORY: root } });
+  expect(child.exitCode, child.stderr.toString().slice(-2_000)).toBe(0);
+  const out = JSON.parse(child.stdout.toString().trim().split("\n").at(-1)!);
+  expect(out.beforeArm).toMatchObject({ kind: "recommendation", choice: "leave-running" });
+  expect(out.otherEnvironment).toMatchObject({ kind: "recommendation", choice: "leave-running" });
+  expect(out.armedBusy).toMatchObject({ kind: "diagnostic", failure: "ineligible-evidence" });
+  expect(out.armedIdle).toMatchObject({ kind: "recommendation", choice: "suspend-compute", confidence: 0.9, requested: true });
+  expect(out.afterConsumed).toMatchObject({ kind: "recommendation", choice: "leave-running" });
+  expect(out.wrongCredential).toMatchObject({ failure: "request-failed" });
+  expect(out.otherHost).toMatch(/refused unexpected outbound external host or path/);
+  expect(out.redirect).toMatch(/redirects must be refused/);
+  const entries = readJsonl(path.join(root, "decision-requests.jsonl"));
+  expect(entries.filter(entry => entry.outcome === "answered").map(entry => entry.response.answers[0].choice)).toEqual(["leave-running", "leave-running", "suspend-compute", "leave-running"]);
+  for (const entry of entries.filter(value => value.outcome === "answered")) {
+    expect(entry.requestSchema).toEqual({ keys: ["input", "model", "questions"], model: "gpt-6-luna", question: "compute_action", choices: ["leave-running", "suspend-compute", "eligible-for-authorized-closure"] });
+    expect(entry.respondedAt).toBeGreaterThanOrEqual(entry.receivedAt);
+  }
+  expect(entries.filter(entry => entry.outcome === "refused").map(entry => entry.reason).sort()).toEqual(["redirects must be refused by the caller", "unexpected credential", "unexpected outbound external host or path"]);
+  expect(readFileSync(path.join(root, "decision-requests.jsonl"), "utf8").includes(apiKey)).toBe(false);
+  console.log(JSON.stringify({ decisionTransport: { root, answered: entries.filter(entry => entry.outcome === "answered").length, refused: 3 } }));
+  passed = true;
+});
+
 // ---------------------------------------------------------------------------
 // Physical committed-CLI A/B acceptance.
 // ---------------------------------------------------------------------------
 const physical = process.env.DRA37_REAL_DOCKER === "1" && process.env.DRA37_AB_ACCEPTANCE === "1";
 test.skipIf(!physical)("physical: A environment and retained consumer survive B activation, then B adopts the same stopped environment", async () => {
-  const server = await dra37Server({ slots: 1, drafted: { source: SOURCE, revision: RELEASE_A, additionalRevisions: [RELEASE_B] }, docker: "real", cli: { preload: PRELOAD } });
+  const server = await dra37Server({ slots: 1, drafted: { source: SOURCE, revision: RELEASE_A, additionalRevisions: [RELEASE_B] }, docker: "real", cli: { preload: PRELOAD },
+    decision: { preload: DECISION_PRELOAD, quietPeriodSeconds: 60 } });
   let passed = false;
   // Acceptance evidence is always preserved; Docker objects are always cleaned by exact ID.
   cleanups.push(() => server.cleanup({ keepEvidence: true }));
@@ -325,25 +392,60 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     const stillConfirmed = await prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: confirmedA!.id } });
     expect(stillConfirmed.status).toBe("confirmed");
     step("observer-remains-a", { observerCalls: observerCalls.slice(0, 5), observation: observedAfterB, producer: { id: producer.id, kind: producer.kind, releaseId: producer.releaseId },
-      idleContinuation: { exercised: false, reason: "The natural server-derived continuation needs a recorded runtime-suspended intent, created only by the server's compute decision path (api.openai.com/v1/decisions) after its quiet-period policy; this runner intercepts only PlanetScale.",
-        wouldBindRetainedConsumer: { id: stillConfirmed.id, releaseId: stillConfirmed.releaseId, generation: stillConfirmed.generation, status: stillConfirmed.status } } });
+      retainedConsumer: { id: stillConfirmed.id, releaseId: stillConfirmed.releaseId, generation: stillConfirmed.generation, status: stillConfirmed.status } });
     await hold("after-b-activation", urlA, { taskId, environmentId: environment.id, activeRelease: RELEASE_B, servingRelease: RELEASE_A });
 
-    // --- 6. Owner instruction: the primary stops through the ACTIVE release's committed CLI.
-    const beforeStop = (await cliRuns()).length;
-    await instruct(taskId, "dra37-ab-stop", "DRA37-RUNTIME: stop");
-    const stop = await runAfter(beforeStop, "runtime stop", run => run.label === "runtime-stop");
-    expect(stop.capability.checkout).toBe(releaseB.checkout);
-    const stoppedApp = containers(taskId).find(value => value.id === appA.id)!;
+    // --- 6. Natural server-derived idle suspension and retained continuation on A.
+    // Arm the synthetic decision transport for this exact environment, then
+    // make one ordinary application request so the idle episode starts after
+    // arming (an earlier conservative leave-running is superseded by real use).
+    const decisionLog = path.join(server.decisionDirectory!, "decision-requests.jsonl");
+    writeFileSync(path.join(server.decisionDirectory!, "decision-arm.json"), JSON.stringify({ environmentId: environment.id }), { mode: 0o600, flag: "wx" });
+    const armedAt = Date.now();
+    const touch = await fetch(new URL("/", urlA), { redirect: "error", signal: AbortSignal.timeout(10_000) });
+    step("decision-armed", { environmentId: environment.id, armedAt: new Date(armedAt).toISOString(), touch: { status: touch.status } });
+    await touch.arrayBuffer();
+    const suspendAnswer = await until("the armed idle decision request", async () => {
+      const entries = readJsonl(decisionLog);
+      const refused = entries.find(entry => entry.outcome === "refused");
+      if (refused) throw new Error(`Decision transport refused a request: ${JSON.stringify(refused)}`);
+      return entries.find(entry => entry.outcome === "answered" && entry.response.answers[0].choice === "suspend-compute") ?? null;
+    }, 600_000);
+    expect(suspendAnswer).toMatchObject({ armed: true, idleProof: { idle: true }, evidence: { environmentId: environment.id } });
+    expect(suspendAnswer.evidence.traffic.quietForMs).toBeGreaterThanOrEqual(suspendAnswer.evidence.policy.quietPeriodSeconds * 1000);
+    // The server's own decision receipt and runtime-suspended intent.
+    const decisionReceipt = await until("the server decision receipt", async () => {
+      const rows = await prisma.runtimeMetadataEvent.findMany({ where: { source: `compute:${taskId}`, action: "compute-idle-decision" }, orderBy: { sequence: "asc" } });
+      return rows.map(row => ({ sequence: row.sequence, key: row.key, value: JSON.parse(row.value ?? "null") })).find(row => row.value?.outcome === "suspension-recorded") ?? null;
+    });
+    expect(decisionReceipt.value.result).toMatchObject({ choice: "suspend-compute", evidenceDigest: suspendAnswer.evidence.evidenceDigest });
+    // The server-started continuation binds through A's confirmed retained consumer.
+    const continuation = await until("the retained continuation operation", async () =>
+      (await prisma.toolingOperation.findMany({ where: { taskId, retainedConsumerId: confirmedA!.id } }))[0] ?? null);
+    expect(continuation.releaseId).toBe(releaseRowA.id);
+    const stoppedApp = await until("the app stopped by the continuation", async () => {
+      const app = containers(taskId).find(value => value.id === appA.id)!;
+      return app.running ? null : app;
+    });
     expect(stoppedApp).toMatchObject({ status: "exited", running: false });
+    const continuationCalls = readJsonl(path.join(server.apps, "docker-calls.jsonl")).filter(call => call.args && call.operation === continuation.id);
+    expect(continuationCalls.length, "the continuation reached Docker under its own operation").toBeGreaterThan(0);
+    for (const call of continuationCalls) expect(call.cwd, JSON.stringify(call)).toBe(releaseA.checkout);
     await until("app observed stopped", async () => ((await prisma.computeEnvironment.findUniqueOrThrow({ where: { id: environment.id } })).observation as { state?: string } | null)?.state === "stopped");
     const resolvedA = await until("A retained consumer resolved after proven stop", async () => {
       const row = await prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: confirmedA!.id } });
       return row.status === "resolved" ? row : null;
     });
+    const settledContinuation = await until("the continuation settled", async () => {
+      const row = await prisma.toolingOperation.findUniqueOrThrow({ where: { id: continuation.id } });
+      return ["bound", "running"].includes(row.status) ? null : row;
+    });
     const openAfterStop = (await prisma.toolingOperation.findMany({ where: { taskId } })).filter(row => ["bound", "running"].includes(row.status));
     expect(openAfterStop, JSON.stringify(openAfterStop)).toEqual([]);
-    step("stopped-and-settled", { proof: "app stopped and observed stopped; every operation settled; A's retained consumer resolved", stop, engine: containers(taskId), resolvedA,
+    expect((await cliRuns()).filter(run => run.label === "runtime-stop")).toEqual([]);
+    step("idle-continuation-on-a", { proof: "app stopped by the server-derived idle continuation bound to A's retained consumer, executed from A's checkout, and observed stopped; every operation settled; A's retained consumer resolved",
+      decision: { requestAt: suspendAnswer.receivedAt, respondedAt: suspendAnswer.respondedAt, requestSchema: suspendAnswer.requestSchema, idleProof: suspendAnswer.idleProof, response: suspendAnswer.response },
+      decisionReceipt, continuation: settledContinuation, continuationCalls: continuationCalls.slice(0, 8), engine: containers(taskId), resolvedA,
       offers: await prisma.computeOffer.findMany({ where: { environmentId: environment.id } }), slots: await prisma.computeSlot.findMany() });
 
     // --- 7. Owner instruction: B's committed runtime up adopts the same environment/resource/container.
@@ -375,7 +477,11 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     expect(server.pid).toBe(pid);
     expect((await ownerPaused())["dra37-control"]).toBe(true);
     const providerRequests = readJsonl(path.join(product.planetscale, "planetscale-requests.jsonl"));
-    expect(providerRequests.filter(entry => entry.outcome === "refused" || entry.outcome === "external-passthrough"), JSON.stringify(providerRequests).slice(0, 3_000)).toEqual([]);
+    expect(providerRequests.filter(entry => entry.outcome === "refused" || entry.outcome === "refused-external"), JSON.stringify(providerRequests).slice(0, 3_000)).toEqual([]);
+    const decisionRequests = readJsonl(path.join(server.decisionDirectory!, "decision-requests.jsonl"));
+    expect(decisionRequests.filter(entry => entry.outcome === "refused"), JSON.stringify(decisionRequests).slice(0, 3_000)).toEqual([]);
+    expect(decisionRequests.filter(entry => entry.outcome === "loaded").map(entry => entry.pid)).toEqual([pid]);
+    expect(decisionRequests.filter(entry => entry.response?.answers[0].choice === "suspend-compute")).toHaveLength(1);
     const stability = provenanceStability(evidence.start, provenance(server));
     expect(stability.stable, JSON.stringify(stability)).toBe(true);
     passed = true;
@@ -390,6 +496,8 @@ test.skipIf(!physical)("physical: A environment and retained consumer survive B 
     evidence.rows = await prismaRows().catch(error => ({ error: String(error) }));
     evidence.agent = await server.agentEvents().catch(() => []);
     evidence.providerRequests = readJsonl(path.join(server.root, "planetscale", "planetscale-requests.jsonl"));
+    evidence.decisionRequests = readJsonl(path.join(server.root, "decision", "decision-requests.jsonl"));
+    evidence.decisionReceipts = await prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["compute-idle-decision", "compute-idle-attempt"] } }, orderBy: { sequence: "asc" } }).catch(error => String(error));
     evidence.ledger = server.dockerLedger();
     writeFileSync(evidenceFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
     console.log(JSON.stringify({ abEvidence: evidenceFile, passed }));

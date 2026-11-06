@@ -18,8 +18,8 @@
  *   POST …/branches/<name>/passwords    synthetic admin/readwriter password
  *   DELETE …/branches/<name>/passwords/<id>  only an admin password this
  *                                       transport issued for that branch, once
- * Every other host keeps the original fetch unchanged; non-loopback hosts are
- * only logged so the runner can prove no other external request happened.
+ * Unix-socket and loopback requests keep the original fetch; every other
+ * outbound external host is refused (logged and thrown), never forwarded.
  *
  * Private files in DRA37_PLANETSCALE_DIRECTORY (shared by every CLI process
  * of one rehearsal, so A's branch is visible to B's later resume):
@@ -62,11 +62,13 @@ const synthetic = async (input: string | URL | Request, init?: RequestInit) => {
   const request = new Request(input, init);
   const url = new URL(request.url);
   if (url.hostname !== "api.planetscale.com") {
-    // Unchanged; observed only. Unix-socket requests (control socket) carry
-    // an arbitrary host and are recognised by their `unix` option.
+    // Unix-socket (control socket; arbitrary host, `unix` option) and
+    // loopback requests are unchanged. Any other outbound external host is
+    // refused, never forwarded with a synthetic or real credential.
     const unix = Boolean(init && (init as { unix?: string }).unix);
-    if (!unix && !LOOPBACK.has(url.hostname)) log({ outcome: "external-passthrough", method: request.method, origin: url.origin });
-    return original(input as Parameters<typeof fetch>[0], init);
+    if (unix || LOOPBACK.has(url.hostname)) return original(input as Parameters<typeof fetch>[0], init);
+    log({ outcome: "refused-external", method: request.method, origin: url.origin });
+    throw new TypeError(`DRA-37 synthetic transport refused unexpected outbound host ${url.hostname}`);
   }
   const refuse = (reason: string): never => {
     log({ outcome: "refused", reason, method: request.method, path: url.pathname });
