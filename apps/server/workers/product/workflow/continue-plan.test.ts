@@ -316,20 +316,42 @@ test("a new plan continuation adopts the selected release and retries its record
     manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
   await db.prisma.toolingSelection.create({ data: { repositoryId: f.input.context.config.repository.id, releaseId: "selected", generation: 4, activatedAt: new Date() } });
   const originalSwitch = f.runtime.switchAgent;
-  const selectedInput = { ...f.input, verifyRelease: async () => {} }; // Synthetic checkout; integrity refusal is tested separately.
+  const verified: string[] = [];
+  const selectedInput = { ...f.input, verifyRelease: async (_store: unknown, release: { id: string }) => { verified.push(release.id); } }; // Synthetic checkout; integrity refusal is tested separately.
   f.runtime.switchAgent = async () => { throw new Error("Synthetic preparation interruption"); };
   expect((await continuePlanningSession(selectedInput))?.status).toBe("failed");
   expect(f.compositions[0]?.[4]).toBe("/prepared/release-b");
   const evidence = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "workflow-continuation" } });
   expect(JSON.parse(evidence.value!).tooling).toEqual({ releaseId: "selected", generation: 4, revision: "b".repeat(40) });
-  await db.prisma.toolingSelection.update({ where: { repositoryId: f.input.context.config.repository.id }, data: { generation: 5 } });
+  await db.prisma.toolingRelease.create({ data: { id: "newly-selected", repositoryId: f.input.context.config.repository.id,
+    revision: "e".repeat(40), tree: "f".repeat(40), policyBlob: "d".repeat(40), checkout: "/prepared/release-c",
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  await db.prisma.toolingSelection.update({ where: { repositoryId: f.input.context.config.repository.id }, data: { generation: 5, releaseId: "newly-selected" } });
   f.runtime.switchAgent = originalSwitch;
   expect((await continuePlanningSession(selectedInput))?.status).toBe("delivered");
   await f.settle();
   expect(f.compositions).toHaveLength(1);
+  expect(verified).toEqual(["selected", "selected"]);
   const retained = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.originalTask.id } });
   expect(retained.toolingRevision).toBe(f.originalTask.toolingRevision);
   expect(retained.pinnedToolingRoot).toBe(f.originalTask.pinnedToolingRoot);
+});
+
+test("a prepared continuation refuses a damaged retained release without provider changes or recomposition", async () => {
+  const f = await fixture();
+  const repositoryId = f.input.context.config.repository.id;
+  const release = await db.prisma.toolingRelease.create({ data: { id: "retained-preparation", repositoryId,
+    revision: "b".repeat(40), tree: "c".repeat(40), policyBlob: "d".repeat(40), checkout: "/missing/dra27-retained-fixture",
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  const instructionId = `workflow:${f.session.id}:plan:implement`;
+  await db.prisma.runtimeInstruction.create({ data: { id: instructionId, sessionId: f.session.id, text: "Retained prompt", state: "preparation-failed" } });
+  await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, action: "workflow-continuation", key: instructionId,
+    value: JSON.stringify({ provider: "codex", model: null, tooling: { releaseId: release.id, revision: release.revision, generation: 1 } }), source: "test" } });
+  expect((await continuePlanningSession(f.input))?.status).toBe("failed");
+  expect(f.calls).toHaveLength(0);
+  expect(f.compositions).toHaveLength(0);
+  expect(f.runtime.sentMessages).toHaveLength(0);
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: instructionId } })).toMatchObject({ state: "preparation-failed", text: "Retained prompt" });
 });
 
 

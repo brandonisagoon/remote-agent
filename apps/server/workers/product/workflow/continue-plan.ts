@@ -5,6 +5,7 @@ import { deliverInstructions } from "../../../services/sessions/inbox.ts";
 import { taskForSession } from "../../../services/tasks/store.ts";
 import { getActiveToolingRelease } from "../../../services/tasks/tooling-releases.ts";
 import { verifyStoredToolingRelease } from "../../../services/tasks/tooling-release-verification.ts";
+import { ToolingReleaseManifestSchema } from "../../../services/tasks/tooling.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 
 const continuing = new Set<string>();
@@ -83,13 +84,25 @@ export async function continuePlanningSession(input: {
     // them rather than replaying it on a different provider after config drift.
     const recorded = previous ? await prisma.runtimeMetadataEvent.findFirst({ where: {
       runtimeSessionId: session.id, action: "workflow-continuation", key: instructionId }, orderBy: { sequence: "asc" } }) : null;
-    const original = recorded?.value ? JSON.parse(recorded.value) as { provider?: "codex" | "claude"; model?: string | null } : null;
+    const original = recorded?.value ? JSON.parse(recorded.value) as { provider?: "codex" | "claude"; model?: string | null; tooling?: { releaseId?: string; generation?: number; revision?: string } | null } : null;
     const provider = original?.provider ?? workflow.providerId ?? config.acp.providerId;
     const model = original ? original.model ?? null : workflow.model;
     // A new continuation is an independent preparation boundary. A retry
     // preserves its already-recorded prompt/provider and original task pin.
     const selection = task && !previous ? await getActiveToolingRelease({ prisma, config, repositoryId: task.repositoryId }) : null;
     if (selection) await (input.verifyRelease ?? verifyStoredToolingRelease)(prisma, selection.release);
+    // A saved prompt retains its original release even after activation. It
+    // still needs intact executable code before provider setup or delivery.
+    // Do not substitute the active release when that provenance is missing.
+    if (previous && original?.tooling != null) {
+      const retained = original.tooling;
+      if (!task || typeof retained.releaseId !== "string" || typeof retained.revision !== "string"
+        || !Number.isSafeInteger(retained.generation) || retained.generation! < 1) throw new Error("Prepared workflow tooling provenance is invalid");
+      const release = await prisma.toolingRelease.findUnique({ where: { id: retained.releaseId } });
+      if (!release || release.repositoryId !== task.repositoryId || release.revision !== retained.revision)
+        throw new Error("Prepared workflow tooling release is unavailable or changed");
+      await (input.verifyRelease ?? verifyStoredToolingRelease)(prisma, { ...release, manifest: ToolingReleaseManifestSchema.parse(release.manifest) });
+    }
     const prompt = previous?.text ?? await (input.compose ?? composeForPrompt)(
       session.cwd,
       input.seed({ previousWorkflowId: session.workflowId, ...(task ? { taskId: task.id, branchName: task.branchName } : {}) }),
