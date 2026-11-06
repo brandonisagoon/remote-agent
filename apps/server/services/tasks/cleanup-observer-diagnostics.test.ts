@@ -1,4 +1,3 @@
-import * as childProcess from "node:child_process";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
@@ -94,18 +93,22 @@ test("capability drift after real execution refuses otherwise complete output", 
   await expect(runCleanupResourceObserver({ capability: f.capability, request })).rejects.toThrow("[OBSERVER_CAPABILITY]");
 });
 
-test("owned process-group observation failure cannot return successful output or leak ps stderr", async () => {
+test("owned process-group query failure cannot return successful output or leak query details", async () => {
   const f = await realFixture(`const input=JSON.parse(await Bun.stdin.text()); await Bun.write(input.pidFile,String(process.pid)); console.log("{}");`);
-  const pidFile = path.join(f.root, "pid"), execute = childProcess.execFile;
-  const mock = spyOn(childProcess, "execFile").mockImplementation(((...args: any[]) => {
-    const callback = args.at(-1);
-    return (execute as any)(...args.slice(0, -1), (...result: any[]) => {
-      if (args[0] === "/bin/ps" && existsSync(pidFile)) callback(new Error("inspection failed"), result[1], "private-process-body");
-      else callback(...result);
-    });
-  }) as any);
+  const pidFile = path.join(f.root, "pid"), query = process.kill;
+  let queryFailureInjected = false;
+  const mock = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    // Capability verification still uses real queries. Inject only after the
+    // actual observer has run, at the owned helper's read-only group query.
+    if (pid < -1 && signal === 0 && existsSync(pidFile)) {
+      queryFailureInjected = true;
+      throw Object.assign(new Error("private-process-body"), { code: "EPERM" });
+    }
+    return query(pid, signal);
+  });
   try {
     const error = await runCleanupResourceObserver({ capability: f.capability, request: { pidFile } }).catch(error => error);
+    expect(queryFailureInjected).toBeTrue();
     if (!(error instanceof CleanupObserverError)) throw new Error("Expected typed failure");
     expect(error.diagnostic.code).toBe("OBSERVER_GROUP");
     expect(error.message).not.toContain("private-process-body");
