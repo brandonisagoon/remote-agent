@@ -24,15 +24,13 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (task.primarySessionId !== input.primarySessionId) throw new Error("Compute continuation primary changed");
   // A command fence derived from the group's retained reader; the adapter's
   // child callbacks (development intent, resources) inherit its release.
-  const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`,
-    // Mirrors the adapter's cliInputDigest for the exact spawned command.
-    inputDigest: canonicalDigest({ operation: "compute continue", taskId: input.taskId, positionals: ["compute", "continue"], options: { task: input.taskId }, files: {},
-      stdin: createHash("sha256").update(JSON.stringify({ ...reference, environmentId: input.environmentId })).digest("hex") }) } });
+  const command = computeContinueInput(input.taskId, reference, input.environmentId);
+  const { binding, code } = await bind({ prisma: input.prisma, config: input.config, task, environmentId: input.environmentId, request: { requestKey: `compute-continue:${input.environmentId}:${input.intentRevision}`, inputDigest: command.inputDigest } });
   const runtime = await verifiedComputeRuntime({ ...input, sessionId: input.primarySessionId, development: reference, release: code, install: false });
   await executeOwnedObserver([process.execPath, "--no-env-file", runtime.adapterPath, "compute", "continue", "--socket", input.config.controlIpcPath, "--task", input.taskId], {
     // Bound process context the release-aware adapter reads for its callbacks.
     cwd: runtime.receipt.checkout, env: operationEnvironment(binding, input.config.controlIpcPath),
-    timeoutMs: 60_000, input: JSON.stringify({ ...reference, environmentId: input.environmentId }),
+    timeoutMs: 60_000, input: command.stdin,
   });
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
@@ -42,6 +40,14 @@ const defaults = { refresh: refreshComputeObservation, evidence: computeEvidence
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
  * idle. Every adapter effect renews the existing scoped development intent. */
+/** The exact spawned `compute continue` input and the digest the adapter's
+ * cliInputDigest computes for it, including the CLI's effective parser
+ * defaults; a retained continuation fence must carry this exact digest. */
+export function computeContinueInput(taskId: string, reference: { intentRevision: number; intentDigest: string }, environmentId: string) {
+  const stdin = JSON.stringify({ ...reference, environmentId });
+  return { stdin, inputDigest: canonicalDigest({ operation: "compute continue", taskId, positionals: ["compute", "continue"], options: { purpose: "development", task: taskId }, files: {},
+    stdin: createHash("sha256").update(stdin).digest("hex") }) };
+}
 export { continueSuspension as continueComputeSuspension };
 export async function tickCompute(input: Context, dependencies: Partial<typeof defaults> = {}) {
   if (!input.config.compute?.enabled) return { observed: 0, unavailable: 0 };
