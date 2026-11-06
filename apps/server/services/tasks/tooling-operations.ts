@@ -3,7 +3,7 @@ import { z } from "zod";
 import type { Prisma, PrismaClient, RemoteTask } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
-import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection } from "../../../../types/tooling-release.ts";
+import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
   bindToolingOperation, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, transitionToolingOperation,
   type ToolingLegacyConsumerInput, type ToolingLegacyConsumerState, type ToolingLegacyInventory,
@@ -637,3 +637,73 @@ export const inventoryLegacyToolingConsumers: ToolingLegacyInventory = async (tx
   }
   return consumers;
 };
+
+// ---------------------------------------------------------------------------
+// Guarded state evidence for the owning operation (frozen wire shapes in
+// types/tooling-release.ts). Task/repository come from the stored operation;
+// callers cannot choose another task, release or arbitrary path scope.
+export const StateQuery = z.object({ family: z.string().regex(/^[a-z][a-z0-9.-]{0,63}$/), scopeKey: z.string().min(1).max(512) }).strict();
+export const StateWriteInput = StateQuery.extend({ version: z.number().int().positive() }).strict();
+const LIVE_OPERATION = ["bound", "running", "unknown"];
+
+async function ownedStateOperation(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operationId: string; header: string | undefined; scopeKey: string },
+  dependencies: Pick<ToolingOperationDependencies, "read">) {
+  if (!input.header || input.header !== input.operationId) throw refuse("operation-required", "State evidence requires the matching operation header");
+  const binding = await dependencies.read({ prisma: input.prisma, operationId: input.operationId });
+  if (!binding || binding.sessionId !== input.sessionId) throw refuse("operation-unknown", "Unknown tooling operation for this session");
+  if (!LIVE_OPERATION.includes(binding.status)) throw refuse("operation-closed", `Operation ${binding.operationId} is ${binding.status}`);
+  if (input.scopeKey !== "task" && input.scopeKey !== binding.resourceKey) throw refuse("operation-input", "State scope must be this operation's resource key or task");
+  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
+  return binding;
+}
+
+/** GET .../tooling-operations/:operationId/state?family&scopeKey */
+export async function readOperationStateEvidence(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operationId: string; header: string | undefined; query: unknown },
+  dependencies: Pick<ToolingOperationDependencies, "read"> & { readable?: typeof import("./tooling-releases.ts").assertToolingStateReadable; retained?: typeof import("./tooling-releases.ts").readToolingRetainedConsumers } = toolingOperationDependencies): Promise<import("../../../../types/tooling-release.ts").ToolingStateEvidenceResponse> {
+  const parsed = StateQuery.safeParse(input.query);
+  if (!parsed.success) throw refuse("operation-input", "A state family and scopeKey are required");
+  const { family, scopeKey } = parsed.data;
+  const binding = await ownedStateOperation({ ...input, scopeKey }, dependencies);
+  const releases = await import("./tooling-releases.ts");
+  const readable = await (dependencies.readable ?? releases.assertToolingStateReadable)({ prisma: input.prisma, operationId: binding.operationId, family, scopeKey });
+  const consumers = new Map<string, ToolingStateFormat | null>();
+  const add = (operationId: string, format: ToolingStateFormat | null, what: string) => {
+    if (format === null && !operationId.startsWith("legacy:")) throw new ToolingOperationRefused("operation-mismatch", `${what} cannot read ${family}: its release does not declare this state; the state is blocked`);
+    consumers.set(operationId, format);
+  };
+  // Unfinished release-bound operations of this task that can reach the state.
+  const open = await input.prisma.toolingOperation.findMany({ where: { taskId: binding.taskId, status: { in: LIVE_OPERATION } }, take: 1001 });
+  if (open.length > 1000) throw new ToolingOperationRefused("operation-input", "Unfinished operation inventory exceeds its bound");
+  for (const row of open) {
+    if (row.resourceKey !== null && scopeKey !== "task" && row.resourceKey !== scopeKey) continue;
+    const other = await dependencies.read({ prisma: input.prisma, operationId: row.id });
+    if (!other) throw new ToolingOperationRefused("operation-unknown", `Operation ${row.id} provenance is unavailable`);
+    add(other.operationId, other.release.manifest.stateFormats[family] ?? null, `Unfinished operation ${other.operationId}`);
+  }
+  // Retained readers outlive their producing operations.
+  for (const reader of await (dependencies.retained ?? releases.readToolingRetainedConsumers)({ prisma: input.prisma, taskId: binding.taskId, family, scopeKey }))
+    add(reader.operationId, reader.format, `Retained ${reader.consumerKind} ${reader.consumerId}`);
+  // Retained first-bootstrap readers: exact provenance, or a 409 refusal.
+  const legacy = await input.prisma.toolingLegacyConsumer.findMany({ where: { repositoryId: binding.repositoryId, taskId: binding.taskId, status: "retained" }, take: 1001 });
+  for (const row of legacy) {
+    if (row.provenance === "unavailable") throw new ToolingOperationRefused("operation-unknown", `Retained ${row.consumerKind} ${row.consumerId} has unresolved executable provenance: ${row.detail ?? "unavailable"}`);
+    consumers.set(`legacy:${row.id}`, null);
+  }
+  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
+  return { operationId: binding.operationId, taskId: binding.taskId, family, scopeKey, version: readable.version, source: readable.source,
+    consumers: [...consumers].map(([operationId, format]) => ({ operationId, format })) };
+}
+
+/** POST .../tooling-operations/:operationId/state-writes — registered before
+ * the adapter changes bytes; DRA-28's atomic per-state checks decide. */
+export async function registerOperationStateWrite(input: { prisma: PrismaClient; config: ServerConfig; sessionId: string; operationId: string; header: string | undefined; body: unknown },
+  dependencies: Pick<ToolingOperationDependencies, "read"> & { register?: typeof import("./tooling-releases.ts").registerToolingStateWrite } = toolingOperationDependencies): Promise<import("../../../../types/tooling-release.ts").ToolingStateWriteResponse> {
+  const parsed = StateWriteInput.safeParse(input.body);
+  if (!parsed.success) throw refuse("operation-input", "A state family, scopeKey and positive version are required");
+  const binding = await ownedStateOperation({ ...input, scopeKey: parsed.data.scopeKey }, dependencies);
+  const write = await (dependencies.register ?? (await import("./tooling-releases.ts")).registerToolingStateWrite)({ prisma: input.prisma, operationId: binding.operationId, ...parsed.data });
+  // The receipt is not an effect; refuse to hand it out if authority changed.
+  await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
+  if (write.operationId !== binding.operationId || write.version !== parsed.data.version) throw new ToolingOperationRefused("operation-mismatch", "State write receipt does not match this operation");
+  return { operationId: binding.operationId, taskId: binding.taskId, family: parsed.data.family, scopeKey: parsed.data.scopeKey, write };
+}

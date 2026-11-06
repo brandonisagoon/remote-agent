@@ -308,3 +308,36 @@ test("prepared-finalization callbacks derive their exact key from the command li
   const authority = (await child("authority", "finalize:task")).binding;
   expect((await call("/api/tasks/task/cleanup-authority", { requestKey: "finalize:task" }, authority.operationId)).status).toBe(200);
 });
+
+test("state evidence and write registration are guarded by the owning operation and refuse unknown provenance", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const op = (await begin(config, { requestKey: "cmd-state", inputDigest: canonicalDigest({ argv: ["runtime", "configure"] }), kind: "adapter-command", resourceKey: "runtime" })).binding;
+  const { call } = app(config);
+  const state = (query: string, operationId = op.operationId, header: string | null = op.operationId, session = "primary") =>
+    call(`/api/sessions/${session}/tooling-operations/${operationId}/state?${query}`, undefined, header ?? undefined, "GET");
+  const write = (body: unknown, header: string | undefined = op.operationId) => call(`/api/sessions/primary/tooling-operations/${op.operationId}/state-writes`, body, header);
+  expect((await state("family=drafted.runtime&scopeKey=runtime", op.operationId, null)).status).toBe(428);
+  expect((await state("family=drafted.runtime&scopeKey=runtime", op.operationId, op.operationId, "other-primary")).status).toBe(409);
+  expect((await state("family=drafted.runtime&scopeKey=/tmp/arbitrary")).status).toBe(400); // no arbitrary path scopes
+  const before = await state("family=drafted.runtime&scopeKey=runtime");
+  expect(before.status).toBe(200);
+  expect(await before.json()).toEqual({ operationId: op.operationId, taskId: "task", family: "drafted.runtime", scopeKey: "runtime", version: 1, source: "legacy-assumed",
+    consumers: [{ operationId: op.operationId, format: manifest.stateFormats["drafted.runtime"] }] });
+  const registered = await write({ family: "drafted.runtime", scopeKey: "runtime", version: 1 });
+  expect(registered.status).toBe(200);
+  expect(await registered.json()).toMatchObject({ operationId: op.operationId, taskId: "task", family: "drafted.runtime", scopeKey: "runtime", write: { version: 1, operationId: op.operationId, releaseId: "release-a" } });
+  expect((await write({ family: "drafted.runtime", scopeKey: "runtime", version: 1, taskId: "other" })).status).toBe(400); // no caller-chosen task
+  expect((await write({ family: "drafted.runtime", scopeKey: "runtime", version: 2 })).status).toBe(409); // undeclared write version
+  expect(await (await state("family=drafted.runtime&scopeKey=runtime")).json()).toMatchObject({ version: 1, source: "recorded" });
+  // Unknown first-bootstrap provenance refuses rather than returning an empty inventory.
+  await db.prisma.toolingLegacyConsumer.create({ data: { id: "legacy-unknown", repositoryId: "repo", taskId: "task", consumerKind: "compute-environment", consumerId: "env-x", provenance: "unavailable", detail: "no receipt" } });
+  expect((await state("family=drafted.runtime&scopeKey=runtime")).status).toBe(409);
+  await db.prisma.toolingLegacyConsumer.update({ where: { id: "legacy-unknown" }, data: { provenance: "exact", revision: LEGACY, checkout: "/install/legacy", detail: null } });
+  expect((await (await state("family=drafted.runtime&scopeKey=runtime")).json()).consumers).toContainEqual({ operationId: "legacy:legacy-unknown", format: null });
+  // Lifecycle and current authority are rechecked.
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  expect((await state("family=drafted.runtime&scopeKey=runtime")).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "working" } });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: op.operationId, from: "bound", to: "completed", evidence: { kind: "adapter-command", reference: "exit-0" } });
+  expect((await write({ family: "drafted.runtime", scopeKey: "runtime", version: 1 })).status).toBe(409);
+});

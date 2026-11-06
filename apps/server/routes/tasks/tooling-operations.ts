@@ -2,13 +2,14 @@ import { Hono, type MiddlewareHandler } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import {
   TOOLING_OPERATION_HEADER, ToolingOperationRefused, admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation,
-  isToolingCallbackPath, readSessionToolingOperation, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
+  isToolingCallbackPath, readOperationStateEvidence, readSessionToolingOperation, registerOperationStateWrite, runAsLegacyContinuation, runWithToolingOperation, toolingOperationDependencies,
   type ToolingOperationDependencies,
 } from "../../services/tasks/tooling-operations.ts";
-import { ToolingOperationError } from "../../services/tasks/tooling-releases.ts";
+import { ToolingOperationError, ToolingStateFormatError } from "../../services/tasks/tooling-releases.ts";
 
 const failure = (error: unknown) => {
   if (error instanceof ToolingOperationRefused) return { body: { error: error.message, code: error.code }, status: error.code === "operation-required" ? 428 as const : error.code === "operation-input" ? 400 as const : 409 as const };
+  if (error instanceof ToolingStateFormatError) return { body: { error: error.message, code: error.code }, status: error.code === "invalid-request" ? 400 as const : error.code === "not-found" ? 404 as const : 409 as const };
   if (error instanceof ToolingOperationError) return { body: { error: error.message, code: error.code }, status: error.code === "invalid-request" ? 400 as const : 409 as const };
   return { body: { error: error instanceof Error ? error.message : String(error) }, status: 409 as const };
 };
@@ -25,6 +26,19 @@ toolingOperationRoutes.post("/:sessionId/tooling-operations", async c => {
 toolingOperationRoutes.get("/:sessionId/tooling-operations/:operationId", async c => {
   const owned = await readSessionToolingOperation({ prisma: c.get("prisma"), sessionId: c.req.param("sessionId"), operationId: c.req.param("operationId") });
   return owned ? c.json(owned) : c.json({ error: "No such tooling operation for this session" }, 404);
+});
+
+toolingOperationRoutes.get("/:sessionId/tooling-operations/:operationId/state", async c => {
+  try { return c.json(await readOperationStateEvidence({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId"), operationId: c.req.param("operationId"),
+    header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, query: { family: c.req.query("family"), scopeKey: c.req.query("scopeKey") } })); }
+  catch (error) { const { body, status } = failure(error); return c.json(body, status); }
+});
+toolingOperationRoutes.post("/:sessionId/tooling-operations/:operationId/state-writes", async c => {
+  let body: unknown;
+  try { body = await c.req.json(); } catch { return c.json({ error: "A JSON state write request is required", code: "operation-input" }, 400); }
+  try { return c.json(await registerOperationStateWrite({ prisma: c.get("prisma"), config: c.get("config"), sessionId: c.req.param("sessionId"), operationId: c.req.param("operationId"),
+    header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, body })); }
+  catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
 });
 
 /** Single inventory point for adapter effect callbacks. Runs before every
