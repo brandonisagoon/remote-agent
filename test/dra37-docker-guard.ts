@@ -186,7 +186,8 @@ else if (command === "exec") {
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
         const owner = Number(existsSync(`${lock}/owner`) ? readFileSync(`${lock}/owner`, "utf8") : NaN);
-        let alive = true; try { if (Number.isInteger(owner)) process.kill(owner, 0); } catch { alive = false; }
+        // Only ESRCH proves the owner gone; EPERM or anything else is unknown.
+        let alive = true; try { if (Number.isInteger(owner)) process.kill(owner, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
         if (Number.isInteger(owner) && !alive) { rmSync(lock, { recursive: true, force: true }); log({ networkLock: "recovered", deadOwner: owner }); continue; }
         if (Date.now() > lockDeadline) refuse("the fixture network-create lock stayed busy; nothing was created");
         await Bun.sleep(100);
@@ -274,7 +275,7 @@ else if (command === "exec") {
 
 /** True once this guard's caller is gone (reparented): a barrier must never
  * outlive the observer that is waiting on it. */
-const callerGone = (() => { const original = process.ppid; return () => { if (process.ppid !== original) return true; try { process.kill(original, 0); return false; } catch { return true; } }; })();
+const callerGone = (() => { const original = process.ppid; return () => { if (process.ppid !== original) return true; try { process.kill(original, 0); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; } }; })();
 if (policy.delayFile && policy.holdCwd && process.cwd().startsWith(`${policy.holdCwd}/`) && existsSync(policy.delayFile)) {
   const { ms } = JSON.parse(readFileSync(policy.delayFile, "utf8")) as { ms: number };
   if (!Number.isInteger(ms) || ms < 0 || ms > 4_500) refuse("collector delay must be 0..4500 ms (under Drafted's 5 s Docker deadline)");

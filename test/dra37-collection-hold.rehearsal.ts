@@ -9,24 +9,16 @@
  *    the charge stays exact, then an independently held offer turn (> 60 s)
  *    whose reservation survives while another original primary's ordinary
  *    instruction completes.
- * 2. "slow baseline": ONE real baseline refresh cycle longer than 60 s. Twelve
- *    pre-admission (historical) runtimes form twelve real baseline groups;
- *    each group's real `compute baseline-observe` (60 s server timeout) makes
- *    8 Docker calls, each slowed by a bounded 3.5 s and then FORWARDED for its
- *    real result (under Drafted's 5 s per-command deadline). With the
- *    server's four-group concurrency the single-flight cycle spans > 60 s and
- *    credits every group; the waiting task's offer dispatch is delayed by it.
- *    Then an independently held offer turn (> 60 s), reservation survival,
- *    another original primary's instruction completing, claim and completion.
- *    CURRENTLY FAILS CLOSED on a production finding: Drafted stamps the
- *    baseline observation's observedAt at its START, and the server records
- *    and credits proof only within collectorFreshnessSeconds (15 s) of it,
- *    while allowing the observe 60 s; any real group observe slower than the
- *    freshness window is PROOF_REJECTED, so no slow cycle can credit.
- *
- * EXPLICIT, never part of the default gate:
- *   DRA37_REAL_DOCKER=1 DRA37_COLLECTION_HOLD=1 DRA37_DRAFTED_SOURCE=<drafted checkout> \
- *     DRA37_DRAFTED_REVISION=<sha> bun test ./test/dra37-collection-hold.rehearsal.ts
+ * 2. OPTIONAL EXPERIMENT, not required acceptance (gated separately by
+ *    DRA37_BASELINE_EXPERIMENT=1): twelve pre-admission runtimes form real
+ *    baseline groups whose real `compute baseline-observe` Docker calls are
+ *    each slowed by a bounded 3.5 s and forwarded. Expected outcome on current
+ *    production: proof older than collectorFreshnessSeconds is rejected
+ *    (PROOF_REJECTED), which is the intended conservative freshness behaviour
+ *    (root decision after C345), so no slow cycle records proof. Success
+ *    authority, if ever reached, is the stored stopped proof for the exact
+ *    historical resource IDs plus a dispatched offer; refresh diagnostics only
+ *    time attempts and never grant capacity.
  *
  * Real isolated Remote Agent server (private migrated SQLite, loopback TCP,
  * control socket), ONE compute slot, Drafted prepared by the supported frozen
@@ -116,7 +108,20 @@ function harness(server: Server, evidence: Record<string, any>) {
   /** Live guard (barrier) processes of THIS fixture: argv names its policy. */
   const barrierProcesses = () => Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe" }).stdout.toString().split("\n")
     .filter(line => line.includes(real.policy) && !line.includes("ps -axo"));
-  const noBarrierProcesses = (label: string) => until(`${label}: no live barrier process`, async () => barrierProcesses().length === 0 || null, 30_000);
+  /** Exactly recorded barrier PIDs (hold/delay starts) that are still THIS
+   * fixture's guard: ESRCH = gone; a live PID whose argv no longer names the
+   * policy is a reused PID, not ours; no process is ever signalled. */
+  const liveRecordedBarriers = () => {
+    const pids = [...new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => Number(entry.pid)))];
+    return pids.filter(pid => {
+      try { process.kill(pid, 0); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; }
+      return Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe" }).stdout.toString().includes(real.policy);
+    });
+  };
+  const noBarrierProcesses = async (label: string) => {
+    await until(`${label}: no live barrier process`, async () => (barrierProcesses().length === 0 && liveRecordedBarriers().length === 0) || null, 30_000);
+    step("barrier-absence", { label, recordedBarrierPids: new Set(calls().filter(entry => entry.hold === "start" || entry.delay === "start").map(entry => entry.pid)).size, live: 0 });
+  };
   /** Independent offer-turn hold > 60 s: the same reservation survives and
    * ANOTHER original primary's ordinary instruction completes meanwhile. */
   async function heldOfferTurn(taskId: string, environmentId: string, otherTaskId: string, phase: string) {
@@ -138,7 +143,12 @@ function harness(server: Server, evidence: Record<string, any>) {
     }
     const heldForMs = Date.now() - heldAt;
     expect(heldForMs).toBeGreaterThan(60_000);
+    // Independent progress: the OTHER primary's instruction completed while
+    // this offer turn was still held (observed before the release below).
     expect(otherCompletedAtMs, "another original primary's instruction completed while the offer turn was held").not.toBeNull();
+    expect(otherCompletedAtMs!).toBeLessThan(heldForMs);
+    expect((await instruction(other)).state).toBe("completed");
+    expect(existsSync(path.join(server.apps, "agent-offer-barrier")), "the offer turn is still held at this point").toBe(true);
     await server.holdAgentOffers(false);
     step(`${phase}-held`, { offer: offer.id, heldForMs, dispatchDeadline: offer.dispatchDeadline, otherInstruction: other, otherCompletedAtMs });
     return offer;
@@ -272,7 +282,7 @@ test("observation unavailable > 60 s through bounded abandoned observer attempts
   } finally { await finish(server, evidence, evidenceFile, passed); }
 });
 
-test("slow baseline: one real refresh cycle > 60 s over twelve historical groups delays dispatch; held offer turn > 60 s keeps its reservation while another primary progresses", async () => {
+test.skipIf(process.env.DRA37_BASELINE_EXPERIMENT !== "1")("OPTIONAL EXPERIMENT (not required): slow baseline over twelve historical groups; expected to stop at intended proof freshness", async () => {
   const server = await dra37Server({ slots: 1, drafted: DRAFTED, docker: "real", computeEnabled: false });
   let passed = false;
   cleanups.push(() => server.cleanup({ keepEvidence: true }));
@@ -339,12 +349,19 @@ test("slow baseline: one real refresh cycle > 60 s over twelve historical groups
     let accepted: Cycle | undefined;
     for (;;) {
       const rows = await refreshes();
-      const unexpected = rows.filter(row => row.outcome !== "proof-recorded" && row.code !== "OBSERVER_GROUP");
-      if (unexpected.length) throw new Error(`Baseline refresh failed with an unexpected outcome: ${JSON.stringify(unexpected).slice(0, 3_000)}`);
+      // Diagnostics only time attempts. A rejected proof is the intended
+      // freshness outcome: the experiment ends there, honestly labelled.
+      const rejected = rows.filter(row => row.outcome === "failed" && row.code === "PROOF_REJECTED");
+      if (rejected.length) throw new Error(`EXPERIMENT ENDED (expected, intended freshness behaviour): ${rejected.length} group proof(s) rejected as older than collectorFreshnessSeconds`);
       if (progressDoneAt === null && (await h.instruction(progress)).state === "completed") progressDoneAt = Date.now();
       const cycles = cyclesOf(rows), offers = await h.offersFor(envW.id);
       evidence.samples.push({ phase: "slow-baseline", atMs: Date.now() - requestedAt, cycles: cycles.map(cycle => ({ token: cycle.token, records: cycle.records.length, proven: cycle.proven, spanMs: cycle.endedAt - cycle.startedAt })), offers: offers.length });
-      accepted = cycles.find(cycle => cycle.proven && cycle.endedAt - cycle.startedAt > 60_000);
+      // Success authority: every exact historical runtime resource is covered
+      // by a stored stopped proof (never a diagnostic record).
+      const stored = await prisma.computeBaseline.findMany();
+      const covered = new Set(stored.filter(row => row.proof !== null).flatMap(row => JSON.parse(JSON.stringify(row.resourceIds)) as string[]));
+      const allProven = runtimes.every(resource => covered.has(resource.id));
+      accepted = allProven ? cycles.find(cycle => cycle.endedAt - cycle.startedAt > 60_000) : undefined;
       if (accepted) break;
       if (!cycles.some(cycle => cycle.proven)) expect(offers, "no offer before every historical group has proof").toEqual([]);
       if (Date.now() - requestedAt > 900_000) throw new Error(`No proven > 60 s refresh cycle within its bound: ${JSON.stringify(cycles.map(cycle => ({ token: cycle.token, proven: cycle.proven, spanMs: cycle.endedAt - cycle.startedAt })))}`);

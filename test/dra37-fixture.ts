@@ -346,15 +346,44 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       // stop this fixture's runtime-turn processes, then wait (bounded) until
       // no guard process of this fixture remains (a forwarded create defers
       // termination until its exact ID is ledgered).
+      // Release every test-only barrier first (absent files are no-ops).
+      for (const file of [observerHoldFile, collectorDelayFile, agentBarrierFile]) await rm(file, { force: true });
+      // These are processes THIS fixture spawned (exact Subprocess handles).
       for (const turn of turns) turn.kill("SIGTERM");
       await Promise.race([Promise.all([...turns].map(turn => turn.exited)), Bun.sleep(30_000)]);
       for (const turn of turns) turn.kill("SIGKILL");
       await fixture.stop();
+      // Guard drain is a precondition of exact cleanup, never best effort: an
+      // unreadable process inventory or a guard still running after the bound
+      // (e.g. a create deferring termination until ledgered) is a cleanup
+      // problem. Nothing outside this fixture's exact handles is ever signalled.
+      const drainProblems: string[] = [], drain: Record<string, unknown> = {};
       if (real) {
+        const inventory = () => {
+          const result = Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe", stderr: "pipe" });
+          return result.exitCode === 0 ? result.stdout.toString().split("\n").filter(line => line.includes(real!.policy) && !line.includes("ps -axo")) : null;
+        };
         const deadline = Date.now() + 60_000;
-        const guards = () => Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe" }).stdout.toString().split("\n").filter(line => line.includes(real!.policy) && !line.includes("ps -axo"));
-        while (guards().length && Date.now() < deadline) await Bun.sleep(250);
-        if (guards().length) console.error(JSON.stringify({ dockerCleanup: { guardsStillRunning: guards() } }));
+        let guards = inventory();
+        while ((guards === null || guards.length) && Date.now() < deadline) { await Bun.sleep(250); guards = inventory(); }
+        if (guards === null) drainProblems.push("guard process inventory (ps) failed; exact cleanup cannot be claimed");
+        else if (guards.length) drainProblems.push(`guard processes still running after the drain bound; exact cleanup cannot be claimed: ${guards.join(" | ")}`);
+        // Every exactly recorded barrier PID (hold/delay) must be gone. A live
+        // PID counts only if it is still this fixture's guard (argv names the
+        // policy); EPERM or any non-ESRCH answer is unknown, hence a problem.
+        const calls = existsSync(path.join(apps, "docker-calls.jsonl")) ? readFileSync(path.join(apps, "docker-calls.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
+        const barrierPids = [...new Set(calls.filter(call => call.hold === "start" || call.delay === "start").map(call => Number(call.pid)))];
+        const live: string[] = [];
+        for (const pid of barrierPids) {
+          let exists = true;
+          try { process.kill(pid, 0); } catch (error) { exists = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
+          if (!exists) continue;
+          const identity = Bun.spawnSync(["ps", "-o", "command=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+          if (identity.exitCode !== 0 && identity.stdout.toString().trim() === "") continue; // exited between the two reads
+          if (identity.stdout.toString().includes(real.policy)) live.push(`${pid}: ${identity.stdout.toString().trim()}`);
+        }
+        if (live.length) drainProblems.push(`recorded barrier processes still alive: ${live.join(" | ")}`);
+        Object.assign(drain, { recordedBarrierPids: barrierPids.length, liveRecordedBarriers: live, guardInventory: guards });
       }
       let preserve = !!options.keepEvidence;
       if (real) {
@@ -364,7 +393,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
         // alone never authorizes touching an object. Afterwards each ID must
         // be gone, and read-only prefix inventories must be empty. Objects
         // discovered there are reported, never deleted.
-        const results: Array<{ args: string[]; code: number | null; stdout?: string; stderr: string }> = [], problems: string[] = [];
+        const results: Array<{ args: string[]; code: number | null; stdout?: string; stderr: string }> = [], problems: string[] = [...drainProblems];
         const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" });
           const entry = { args, code: result.exitCode, stdout: result.stdout.toString().trim().slice(0, 4_000), stderr: result.stderr.toString().trim().slice(0, 300) }; results.push(entry); return entry; };
         const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -409,7 +438,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
         const calls = existsSync(path.join(apps, "docker-calls.jsonl")) ? readFileSync(path.join(apps, "docker-calls.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line) as Record<string, unknown>) : [];
         for (const call of calls.filter(value => value.unrecognizedCreateOutput !== undefined)) problems.push(`unrecognized create output for ${String(call.name)}: ${String(call.unrecognizedCreateOutput)}`);
         const refusals = calls.filter(value => value.refused).map(value => value.refused);
-        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ prefix: real.prefix, ledger: fixture.dockerLedger(), removed, inventory, refusals, results, problems }, null, 2), { mode: 0o600 });
+        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ prefix: real.prefix, drain, ledger: fixture.dockerLedger(), removed, inventory, refusals, results, problems }, null, 2), { mode: 0o600 });
         console.log(JSON.stringify({ dockerCleanup: { ledger: entries.length, removed: removed.length, inventory, refusals: refusals.length, problems } }));
         if (problems.length) {
           // Never delete the evidence of an incomplete cleanup.
