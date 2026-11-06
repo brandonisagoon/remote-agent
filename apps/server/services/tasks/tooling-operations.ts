@@ -408,12 +408,19 @@ async function claimOwnership(prisma: PrismaClient, binding: ToolingOperationBin
   const owner = await owningOperationId(prisma, task, reference);
   if (!owner || !await sameLineage(prisma, owner, binding, read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
 }
-/** Admissions in newest-first order of each operation's latest record. A
- * refused (`failed`) admission never admitted anything; an `intent` without
- * an outcome may have, so it still counts (fail closed). */
+/** Admissions in newest-first order of each operation's latest record. Only
+ * exact domain proof marks one `failed` (it never admitted anything); an
+ * `intent` without an outcome may have, so it still counts (fail closed).
+ * The whole bounded history is read: overflow refuses rather than dropping
+ * an older holder. */
+const ADMISSION_HISTORY_BOUND = 1000;
 async function admissionHistory(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, environmentKey: string) {
+  if (!task.primarySessionId) return [];
+  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION,
+    key: associationKey("admission", `environment-key:${environmentKey}`) }, orderBy: { sequence: "desc" }, take: ADMISSION_HISTORY_BOUND + 1 });
+  if (events.length > ADMISSION_HISTORY_BOUND) throw refuse("operation-input", `Admission history of environment key ${environmentKey} exceeds its bound; reconcile it before any admission`);
   const latest = new Map<string, z.infer<typeof Association>["state"]>();
-  for (const value of await associations(store, task, "admission", `environment-key:${environmentKey}`)) if (!latest.has(value.operationId)) latest.set(value.operationId, value.state);
+  for (const value of events.map(event => Association.parse(JSON.parse(event.value ?? "null")))) if (!latest.has(value.operationId)) latest.set(value.operationId, value.state);
   return [...latest].filter(([, state]) => state !== "failed").map(([operationId, state]) => ({ operationId, state }));
 }
 async function admittingOperationId(store: Pick<PrismaClient, "runtimeMetadataEvent">, task: Pick<RemoteTask, "id" | "primarySessionId">, environmentKey: string) {
@@ -435,16 +442,19 @@ const commandOf = async (store: AdmissionStore, operation: ToolingOperationBindi
  * an offer is live, or a producer is unknown or still has a live reader.
  * Returns the refusal reason, or null. Same-release re-admission is unchanged. */
 async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmentKey: string, binding: ToolingOperationBinding, read: ToolingOperationDependencies["read"]) {
-  const environment = await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: environmentKey } } });
-  if (!environment) return null;
+  // The prior admission is checked even before any environment row exists:
+  // a first request whose domain create has not happened yet still holds it.
   const prior = await priorAdmission(store, task, environmentKey, binding, read);
   if (!prior) return null;
   const original = await read({ prisma: store as PrismaClient, operationId: prior.operationId });
   if (!original) return `Environment key ${environmentKey} was admitted by unknown operation ${prior.operationId}`;
   if (original.release.id === binding.release.id) return null;
-  const held = `Environment ${environment.id} is held by operation ${original.operationId} (release ${original.release.revision})`;
+  const held = `Environment key ${environmentKey} is held by operation ${original.operationId} (release ${original.release.revision})`;
   const command = await commandOf(store, original, read);
   if (!command || command.status !== "completed") return `${held}: its command is ${command?.status ?? "missing"}`;
+  if (prior.state !== "confirmed") return `${held}: its admission outcome is unknown`;
+  const environment = await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: environmentKey } } });
+  if (!environment) return null;
   if (await store.computeOffer.count({ where: { environmentId: environment.id, state: { in: ACTIVE_OFFERS } } })) return `${held}: an offer is live`;
   try { await producerOperationId(store, task, environment.id); } catch { return `${held}: its producer outcome is unknown`; }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `${held}: a reader is retained`;
@@ -702,7 +712,11 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   // handler's own outcome later confirms or fails it.
   const admitted = callback.admits?.(body) ?? admission.adopt?.environmentKey;
   let admittedKey: string | undefined;
-  if (admitted && await admittingOperationId(prisma, context.task, admitted) !== binding.operationId) {
+  const current = admitted ? (await admissionHistory(prisma, context.task, admitted))[0] : undefined;
+  // The same operation retrying its own unconfirmed admission (409 after
+  // commit, lost response): no new intent; its success confirms the original.
+  if (admitted && current?.operationId === binding.operationId && current.state !== "confirmed") admittedKey = admitted;
+  else if (admitted && current?.operationId !== binding.operationId) {
     await prisma.$transaction(async tx => {
       await recordAssociation(tx, binding, "admission", `environment-key:${admitted}`, "intent");
       const refused = admission.adopt ? await adoptionRefused(tx, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read);
@@ -733,8 +747,14 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   // this operation's route and request digest, distinct from physical proof.
   await recordCallbackOutcome(prisma, state.binding, admission.callback.route, state.attemptId ?? "legacy-attempt", ok ? "acknowledged" : refused ? "refused" : "unknown", typeof status === "number" ? status : null);
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
-  // A refused request never admitted anything; an unknown outcome stays an intent.
-  if (state.admitted && (ok || refused)) await recordAssociation(prisma, state.binding, "admission", `environment-key:${state.admitted}`, ok ? "confirmed" : "failed");
+  // An HTTP refusal is not proof: a handler may commit before refusing, or a
+  // response may be lost. The admission stays an intent (it still holds the
+  // key) until this same operation succeeds, unless exact domain proof shows
+  // an adopting claim was never granted.
+  if (state.admitted) {
+    if (ok) await recordAssociation(prisma, state.binding, "admission", `environment-key:${state.admitted}`, "confirmed");
+    else if (admission.adopt && await claimNeverGranted(prisma, admission.adopt.offerId)) await recordAssociation(prisma, state.binding, "admission", `environment-key:${state.admitted}`, "failed");
+  }
   // An HTTP status never proves absence: a bind/configure follows the
   // physical start, and a handler may commit before refusing. Readers are
   // confirmed only by the producing callback's verified result (which also
@@ -1204,13 +1224,18 @@ async function confirmProducingReader(prisma: PrismaClient, id: string, evidence
   const pending = await prisma.toolingRetainedConsumer.findMany({ where: { taskId: confirmed.taskId, consumerKind: confirmed.consumerKind, consumerId: confirmed.consumerId, status: "pending", id: { not: id } }, take: 101 });
   for (const row of pending) if (await sameLineage(prisma, row.operationId, binding, read)) await resolveToolingConsumer({ prisma, id: row.id, evidence: { kind: "replaced", reference: id } });
 }
+/** Exact domain proof that a claim was never granted: the offer is durably
+ * withdrawn and was never claimed. */
+async function claimNeverGranted(prisma: PrismaClient, offerId: string | null) {
+  const row = offerId ? await prisma.computeOffer.findUnique({ where: { id: offerId } }) : null;
+  return Boolean(row && row.claimedAt === null && ["expired", "declined", "ineligible"].includes(row.state));
+}
 /** Exact pre-effect domain proof: the claimed offer is durably withdrawn and
  * was never claimed, so no start authority existed. Anything else (claimed,
  * validating, uncertain) keeps the reader pending. */
 async function resolveIfClaimNotGranted(prisma: PrismaClient, id: string, body: Body) {
   const offerId = text(body.offerId);
-  const row = offerId ? await prisma.computeOffer.findUnique({ where: { id: offerId } }) : null;
-  if (!row || row.claimedAt !== null || !["expired", "declined", "ineligible"].includes(row.state)) return;
+  if (!await claimNeverGranted(prisma, offerId)) return;
   // Start authority is exactly a durable claim (assertComputeStartIntent).
   await resolveToolingConsumer({ prisma, id, evidence: { kind: "claim-not-granted", reference: offerId! } });
 }

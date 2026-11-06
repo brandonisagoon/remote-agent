@@ -54,20 +54,21 @@ async function fixture() {
     requestKey: `activate-${revision.slice(0, 1)}`, revision, expectedGeneration }, { prepare, inventoryLegacyConsumers: inventoryLegacyToolingConsumers })).generation;
 
   const handled: string[] = [];
-  let domain: (route: string) => number = () => 200;
+  let domain: (route: string) => number | Promise<number> = () => 200;
   const server = new Hono<AppEnv>();
   server.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", config); await next(); });
   server.use("/api/*", toolingOperationGuard());
   server.route("/api/sessions", toolingOperationRoutes);
   server.all("/api/*", async c => {
     await c.req.json().catch(() => undefined);
-    const route = c.req.path.split("/").at(-1)!, status = domain(route);
+    const route = c.req.path.split("/").at(-1)!, status = await domain(route);
     handled.push(`${c.req.header(TOOLING_OPERATION_HEADER)?.slice(0, 8)}:${route}:${status}`);
     return c.json(status === 200 ? {} : { error: "synthetic domain refusal", code: "domain" }, status as 200);
   });
   const post = async (route: string, body: unknown, operationId?: string): Promise<Reply> => {
     const response = await server.request(route, { method: "POST", headers: { "content-type": "application/json", ...(operationId ? { [TOOLING_OPERATION_HEADER]: operationId } : {}) }, body: JSON.stringify(body) });
-    return { status: response.status, body: await response.json() as Record<string, any> };
+    // A handler exception (lost response) is an unstructured 500 body.
+    return { status: response.status, body: await response.json().catch(() => ({})) as Record<string, any> };
   };
   const begin = (request: Record<string, unknown>) => post("/api/sessions/primary/tooling-operations", request);
 
@@ -151,7 +152,7 @@ test("H1: a cross-release request is refused before any effect while A's command
   console.log(JSON.stringify({ H1: { a: short(a.fence), aChild: short(a.bindings[0]!), b: short(b.fence), bChild: short(refused.child!), refusal: refused.called?.body, admissions: await f.admissions(), handled: f.handled } }));
 });
 
-test("H2: never-produced waiting work admitted by settled A is adopted by the next B command's claim; replays are not rebound; a failed request admits nothing", async () => {
+test("H2: never-produced waiting work admitted by settled A is adopted by the next B command's claim; replays are not rebound", async () => {
   const f = await fixture();
   await f.activate(A, 0);
   const a = await f.command("a-runtime-up");
@@ -159,13 +160,6 @@ test("H2: never-produced waiting work admitted by settled A is adopted by the ne
   await f.environment();
   expect((await a.settle()).status).toBe(200); // A's command ends waiting.
   await f.activate(B, 1);
-
-  // A B request the domain refuses never takes the admission.
-  const probe = await f.command("b-runtime-status");
-  f.setDomain(route => route === "compute-request" ? 409 : 200);
-  expect((await probe.request()).called?.status).toBe(409);
-  f.setDomain(() => 200);
-  expect(await f.admissions()).toEqual([`${short(a.bindings[0]!)}:intent`, `${short(a.bindings[0]!)}:confirmed`, `${short(probe.bindings[0]!)}:intent`, `${short(probe.bindings[0]!)}:failed`]);
 
   // offerNextCompute delivers an offer; the instructed active (B) adapter claims it directly.
   await f.offer("offer-delivered");
@@ -187,7 +181,7 @@ test("H2: never-produced waiting work admitted by settled A is adopted by the ne
   const original = a.bindings[0]!;
   const replayA = await f.begin({ requestKey: original.requestKey, inputDigest: original.inputDigest, kind: "compute-admission", parentOperationId: a.fence.operationId });
   expect(replayA.body.binding).toMatchObject({ operationId: original.operationId, release: { revision: A } });
-  console.log(JSON.stringify({ H2: { a: short(a.fence), aChild: short(original), probe: short(probe.fence), b: short(b.fence), bClaim: short(claim.child!), admissions: await f.admissions(), handled: f.handled } }));
+  console.log(JSON.stringify({ H2: { a: short(a.fence), aChild: short(original), b: short(b.fence), bClaim: short(claim.child!), admissions: await f.admissions(), handled: f.handled } }));
 });
 
 /** Settled A admitted a waiting environment, B is active and an offer was delivered. */
@@ -241,6 +235,75 @@ test("H2: waiting work with a claimed effect, a paused task or another recipe is
   await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
   expect((await pausedCommand.beginChild("offer-delivered")).body.error).toMatch(/paused/);
   expect(await paused.admissions()).toHaveLength(2); // settled A's intent + confirmed only
+});
+
+test("review 1: a request that commits then answers 409, or loses its response, keeps its admission intent; only the same operation recovers it", async () => {
+  const f = await fixture();
+  await f.activate(A, 0);
+  const a = await f.command("a-runtime-up");
+  // The domain commits (creates the environment), then a later step fails as 409.
+  f.setDomain(async route => { if (route === "compute-request") { await f.environment(); return 409; } return 200; });
+  expect((await a.request()).called?.status).toBe(409);
+  const child = a.bindings[0]!;
+  expect(await f.admissions()).toEqual([`${short(child)}:intent`]);
+  // B activates; an independent B request cannot take the key behind the unknown intent.
+  await f.activate(B, 1);
+  const b = await f.command("b-runtime-up");
+  const blocked = await b.request();
+  expect(blocked.called?.body).toMatchObject({ code: "retained-release-required" });
+  expect(blocked.called?.body.error).toContain(`held by operation ${short(child)}`);
+  // Lost response (handler exception) on the same operation: still an intent.
+  f.setDomain(route => { if (route === "compute-request") throw new Error("lost response"); return 200; });
+  expect((await a.request()).called?.status).toBe(500);
+  expect(await f.admissions()).toEqual([`${short(child)}:intent`]);
+  // The same operation's successful retry confirms its ORIGINAL intent (no
+  // second intent). (The child itself stays `unknown` after the lost response:
+  // existing reconciliation rules, unchanged here, govern its later effects.)
+  f.setDomain(() => 200);
+  expect((await a.request()).called?.status).toBe(200);
+  expect(await f.admissions()).toEqual([`${short(child)}:intent`, `${short(child)}:confirmed`]);
+  // B remains refused: A's command is still open.
+  expect((await b.request()).called?.body).toMatchObject({ code: "retained-release-required" });
+  console.log(JSON.stringify({ review1: { a: short(a.fence), child: short(child), blocked: blocked.called?.body.error.split(". Begin")[0], admissions: await f.admissions(), handled: f.handled } }));
+});
+
+test("review 2: before any environment exists, a gated first A request holds the key; a competing B request is refused, and concurrent first requests serialize", async () => {
+  const f = await fixture();
+  await f.activate(A, 0);
+  const a = await f.command("a-runtime-up");
+  await f.activate(B, 1);
+  const b = await f.command("b-runtime-up");
+  let open!: () => void;
+  const gate = new Promise<void>(resolve => { open = resolve; });
+  f.setDomain(async route => { if (route === "compute-request") await gate; return 200; });
+  const pending = a.request();
+  const deadline = Date.now() + 5_000;
+  while (!(await f.admissions()).length && Date.now() < deadline) await Bun.sleep(10);
+  expect(await f.admissions()).toEqual([`${short(a.bindings[0]!)}:intent`]);
+  expect(await db.prisma.computeEnvironment.count()).toBe(0); // A's domain create has not happened yet
+  f.setDomain(() => 200); // B would not be gated
+  const competing = await b.request();
+  expect(competing.called?.status).toBe(409);
+  expect(competing.called?.body.error).toContain(`held by operation ${short(a.bindings[0]!)}`);
+  expect(f.handled.some(entry => entry.startsWith(short(b.bindings[0]!)))).toBe(false);
+  open();
+  expect((await pending).called?.status).toBe(200);
+  expect(await f.admissions()).toEqual([`${short(a.bindings[0]!)}:intent`, `${short(a.bindings[0]!)}:confirmed`]);
+
+  // Truly concurrent first requests from two releases on a fresh key: exactly one wins.
+  await db.cleanup(); db = await createTestDatabase();
+  const g = await fixture();
+  await g.activate(A, 0);
+  const ga = await g.command("a-first");
+  const aChild = await g.begin({ requestKey: "a-first/request", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: ga.fence.operationId });
+  await g.activate(B, 1);
+  const gb = await g.command("b-first");
+  const bChild = await g.begin({ requestKey: "b-first/request", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: gb.fence.operationId });
+  const results = await Promise.all([ga.call("compute-request", computeBody, aChild.body.binding.operationId), gb.call("compute-request", computeBody, bChild.body.binding.operationId)]);
+  expect(results.map(result => result.status).sort()).toEqual([200, 409]);
+  expect(g.handled.filter(entry => entry.endsWith("compute-request:200"))).toHaveLength(1);
+  expect((await g.admissions()).filter(entry => entry.endsWith(":intent"))).toHaveLength(1);
+  console.log(JSON.stringify({ review2: { competing: competing.called?.body.error.split(". Begin")[0], race: { statuses: results.map(result => result.status), admissions: await g.admissions(), handled: g.handled } } }));
 });
 
 test("H3: after A's group stops and its continuation settles, an independent B command adopts the SAME environment (stand-in stop, synthetic rows)", async () => {
