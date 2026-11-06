@@ -22,10 +22,11 @@ import { createTestDatabase, type TestDatabase } from "../test-support/db.ts";
 import { testConfig } from "../test-support/config.ts";
 import type { AppEnv } from "../apps/server/middleware/context.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/routes/tasks/tooling-operations.ts";
-import { TOOLING_OPERATION_HEADER, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
+import { TOOLING_OPERATION_HEADER, freshObservation, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
 import { activateToolingRelease, canonicalDigest, confirmToolingConsumer, registerToolingStateWrite, retainToolingConsumer } from "../apps/server/services/tasks/tooling-releases.ts";
 import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
 import { finalizationResourceIdentity } from "../apps/server/services/tasks/finalization-resources.ts";
+import { ComputePolicy } from "../lib/compute-policy.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
 for (const name of Object.keys(process.env)) if (name.startsWith("REMOTE_AGENT_")) delete process.env[name];
@@ -44,7 +45,8 @@ type Reply = { status: number; body: Record<string, any> };
 async function fixture() {
   const base = testConfig({ machine: "host" });
   const repository = { ...base.repository, id: "repo", tooling: { root: "/fixture/tooling-source", revision: LEGACY, policyBlob: POLICY } };
-  const config = { ...base, repository, repositories: { repo: repository } } as typeof base;
+  // The normal configured compute policy (collector freshness 15s); admission itself stays a stand-in.
+  const config = { ...base, repository, repositories: { repo: repository }, compute: ComputePolicy.parse({ collectorFreshnessSeconds: 15 }) } as typeof base;
   // Identity only: the task and its original primary.
   await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/fixture/task", status: "idle" } });
   await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: "repo", machineId: "host", branchName: "codex/task", worktreePath: "/fixture/task",
@@ -1105,5 +1107,56 @@ test("retired lifetime: both supported producer shapes adopt; the stop must be b
     const producer = a.bindings.at(-1)!.operationId;
     await db.prisma.toolingRetainedConsumer.updateMany({ where: { operationId: producer, consumerId: ENV }, data: { evidence: { kind: "compute-bind", reference: "offer-elsewhere" } } });
     await refusedFor(f, /has no single resolved offer proof/);
+  }
+}, 60_000);
+
+test("freshness: the stopped-observation age boundary is inclusive and the future is refused (explicit clock)", () => {
+  const now = 1_800_000_000_000;
+  expect(freshObservation(now, now, 15)).toBe(true);
+  expect(freshObservation(now - 15_000, now, 15)).toBe(true); // exactly at the boundary
+  expect(freshObservation(now - 15_001, now, 15)).toBe(false); // one millisecond beyond
+  expect(freshObservation(now + 1, now, 15)).toBe(false); // in the future
+});
+
+test("retired lifetime freshness: old, future or just-beyond-boundary stopped evidence and a missing policy refuse; staleness after begin is caught by the claim's recheck", async () => {
+  const refusedFor = async (f: Awaited<ReturnType<typeof fixture>>, pattern: RegExp) => {
+    const begun = await (await f.command("b-offer")).beginChild("offer-b");
+    expect(begun.body).toMatchObject({ code: "retained-release-required" });
+    expect(begun.body.error).toMatch(pattern);
+  };
+  const observedAt = async (value: number) => {
+    const row = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: ENV } });
+    await db.prisma.computeEnvironment.update({ where: { id: ENV }, data: { observation: { ...(row.observation as object), observedAt: value } } });
+  };
+  for (const [label, offset] of [["old", -60_000], ["beyond boundary", -16_000], ["future", 5_000]] as const) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    await observedAt(Date.now() + offset);
+    await refusedFor(f, /stopped observation is not fresh/);
+    void label;
+  }
+  // No configured compute freshness policy: refused, never assumed.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    delete (f.config as { compute?: unknown }).compute;
+    await refusedFor(f, /no configured compute freshness policy/);
+  }
+  // Fresh at begin, stale by the claim: the authoritative recheck (current time, inside its transaction) refuses.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    const fresh = await f.command("b-runtime-up-offer");
+    const begun = await fresh.beginChild("offer-b");
+    expect(begun.status, JSON.stringify(begun.body)).toBe(200);
+    await observedAt(Date.now() - 16_000);
+    const handled = f.handled.length;
+    const claim = await fresh.call("compute-claim", { ...computeBody, offerId: "offer-b" }, begun.body.binding.operationId);
+    expect(claim.status).toBe(409);
+    expect(claim.body.error).toMatch(/stopped observation is not fresh/);
+    expect(f.handled.length).toBe(handled);
+    // Fresh again (a new collector observation): the same child's claim proceeds.
+    await observedAt(Date.now());
+    expect((await fresh.call("compute-claim", { ...computeBody, offerId: "offer-b" }, begun.body.binding.operationId)).status).toBe(200);
   }
 }, 60_000);

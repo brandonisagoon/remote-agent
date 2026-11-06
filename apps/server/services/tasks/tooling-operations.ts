@@ -513,12 +513,18 @@ async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmen
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `${held}: a reader is retained`;
   return null;
 }
-/** Eligibility of a never-produced waiting offer for adoption by another
- * command lineage of any release (a delivered offer is run by a fresh command
- * of the release the primary resolves). Only exact waiting work that never
- * started and whose admitting command definitively settled. Returns the
- * refusal, or null. */
-async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest" | "generation">,
+/** A physical observation is fresh when it is not in the future and its age
+ * is at most the configured collector freshness (inclusive boundary). */
+export function freshObservation(observedAt: number, now: number, freshnessSeconds: number) {
+  return observedAt <= now && now - observedAt <= freshnessSeconds * 1000;
+}
+/** Eligibility of a waiting offer for adoption by another command lineage of
+ * any release (a delivered offer is run by a fresh command of the release the
+ * primary resolves). Only exact waiting work whose CURRENT lifetime never
+ * started (any earlier lifetime of the environment provably retired: stopped,
+ * mapped, settled, resolved and freshly observed stopped) and whose admitting
+ * command definitively settled. Returns the refusal, or null. */
+async function adoptionRefused(store: AdmissionStore, config: ServerConfig, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest" | "generation">,
   dependencies: Pick<ToolingOperationDependencies, "read" | "legacy">, body?: Body) {
   const offer = await store.computeOffer.findUnique({ where: { id: offerId } });
   const environment = offer ? await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } }) : null;
@@ -587,12 +593,16 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
     const earlier = await store.computeOffer.findUnique({ where: { id: mapped! } });
     if (!earlier || earlier.environmentId !== environment.id || earlier.id === offerId || !stoppedBefore(earlier)) return `Environment ${environment.id} earlier producer ${operationId} offer ${mapped} did not physically stop before offer ${offerId}`;
   }
-  // An earlier lifetime's stop must be bound to the CURRENT resource: the
-  // claim re-proves a fresh stop only for saved requests (claimCompute), so
-  // adoption itself requires the environment's latest physical observation to
-  // be stopped/absent for its exact current resource identity, as the domain's
-  // stop (reconcileObservedCompute) verified it.
+  // An earlier lifetime's stop must be bound to the CURRENT resource and be
+  // FRESH: the claim re-proves a fresh stop only for saved requests
+  // (claimCompute), and capacity accounting is not a physical-stop
+  // prerequisite, so adoption itself requires the environment's latest
+  // physical observation to be stopped/absent for its exact current resource
+  // identity (as the domain's stop verified it), observed within the
+  // configured collector freshness at this moment (rechecked at the claim).
   if (latestProducer.size || others.some(other => other.claimedAt !== null)) {
+    const freshness = config.compute?.collectorFreshnessSeconds;
+    if (!freshness) return `Environment ${environment.id} has no configured compute freshness policy to judge its earlier lifetime's stop`;
     const { ComputeObservation } = await import("./compute-observation.ts");
     const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
     const resource = environment.resourceId ? await store.remoteTaskResource.findUnique({ where: { id: environment.resourceId } }) : null;
@@ -602,6 +612,7 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
       || observation.data.resourceId !== resource.id || observation.data.resourceIdentity !== finalizationResourceIdentity(resource).identityDigest) {
       return `Environment ${environment.id} has no stopped observation of its current resource`;
     }
+    if (!freshObservation(observation.data.observedAt, Date.now(), freshness)) return `Environment ${environment.id} stopped observation is not fresh (observed ${observation.data.observedAt}, freshness ${freshness}s)`;
   }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
   return null;
@@ -670,7 +681,7 @@ export type CallbackAdmission =
   | { mode: "evidence"; binding: ToolingOperationBinding }
   | { mode: "legacy-continuation"; reference: ExistingReference; code: ToolingCodeIdentity }
   | { mode: "bound"; binding: ToolingOperationBinding; callback: ToolingCallback; body: Body; context: CallbackContext; reference?: ExistingReference;
-    /** A claim adopting a never-produced waiting environment admitted by another, settled command lineage. */
+    /** A claim adopting waiting work (current lifetime never started) admitted by another, settled command lineage. */
     adopt?: { environmentKey: string; offerId: string } };
 
 async function callbackTask(store: Store, callback: Pick<ToolingCallback, "scope">, param: string) {
@@ -761,10 +772,10 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     const admitting = environment ? await admittingOperationId(store, task, environment.key) : null;
     if (!admitting || !await sameLineage(input.prisma, admitting, binding, dependencies.read)) {
       if (binding.existingOperationId !== reference.id) throw refuse("operation-mismatch", `${reference.type} ${reference.id} was not admitted by this operation`);
-      // Admitted by another lineage: only a claim may adopt exact,
-      // never-produced waiting work, rechecked atomically before effects.
+      // Admitted by another lineage: only a claim may adopt exact waiting work
+      // whose current lifetime never started, rechecked atomically before effects.
       if (admitting && environment) {
-        const refused = callback.route === "POST /api/tasks/:taskId/compute-claim" ? await adoptionRefused(input.prisma, task, reference.id, binding, dependencies, input.body) : `${callback.route} cannot adopt another lineage's offer`;
+        const refused = callback.route === "POST /api/tasks/:taskId/compute-claim" ? await adoptionRefused(input.prisma, input.config, task, reference.id, binding, dependencies, input.body) : `${callback.route} cannot adopt another lineage's offer`;
         if (refused) throw refuse("retained-release-required", `${reference.type} ${reference.id} was admitted by operation ${admitting}: ${refused}`);
         adopt = { environmentKey: environment.key, offerId: reference.id };
       }
@@ -837,7 +848,7 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   else if (admitted && current?.operationId !== binding.operationId) {
     await prisma.$transaction(async tx => {
       await recordAssociation(tx, binding, "admission", `environment-key:${admitted}`, "intent");
-      const refused = admission.adopt ? await adoptionRefused(tx, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read, true);
+      const refused = admission.adopt ? await adoptionRefused(tx, config, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read, true);
       if (refused) throw refuse("retained-release-required", refused);
     });
     admittedKey = admitted;
@@ -1064,12 +1075,12 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
       // Never another request's binding: a client accepts nothing but its own
       // echo, and exact same-key retries were routed to the primitive above. A
       // NEW child is bound only as a sibling under the same open command (same
-      // lineage), or to adopt never-produced waiting work whose admitting
-      // command settled (any release; the claim rechecks atomically under the
-      // admission write lock). Everything else is refused.
+      // lineage), or to adopt waiting work whose current lifetime never started
+      // and whose admitting command settled (any release; the claim rechecks
+      // atomically under the admission write lock). Everything else is refused.
       {
         const sibling = Boolean(request.parentOperationId && original.parentOperationId === request.parentOperationId);
-        const refusal = sibling ? null : !admitted || !requested ? "it is not waiting work this command can adopt" : await adoptionRefused(input.prisma, before.task, request.existingOperationId,
+        const refusal = sibling ? null : !admitted || !requested ? "it is not waiting work this command can adopt" : await adoptionRefused(input.prisma, input.config, before.task, request.existingOperationId,
           { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest, generation: requestedGeneration ?? 0 }, dependencies);
         if (refusal) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release (${refusal})`);
       }
