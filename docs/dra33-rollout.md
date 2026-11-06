@@ -1,6 +1,67 @@
 # DRA-33 release gate
 
-This implementation is local until the release and live acceptance receipts below exist. Passing automated tests is not deployment or completion of the umbrella issue.
+## Current coordinated cutover — November 6
+
+The owner authorized completion through verified deployment on November 6. The
+existing DRA-21 executor (`cmw46mdjx0000s8xcrouvmoum`, `drafted-tooling`) alone
+owns shared process changes and the single coordinated server/tooling cutover.
+The source primary continues implementation, isolated acceptance and review;
+the execution reservation is not a hold on that work. Historical issue states
+and an unlaunched child issue do not block reviewed artifact integration.
+DRA-23 retains its separate source ownership.
+
+The dated sections below describe the October rollout. Their wait-for-issue-Done,
+unchanged-server and no-schema-change assumptions do **not** authorize or govern
+this new server deployment. Do not use the superseded DRA-6 recovery kit or the
+old tooling-only paired-release operator.
+
+The release handoff must distinguish **source-ready**, **verified** and
+**deployed**. Record exact commits and trees, PR merge status, hosted gate URLs,
+independent reviews, isolated acceptance receipts and exclusions. A healthy
+process or a green source gate alone is not deployed workflow acceptance.
+
+### Required execution evidence
+
+1. Freeze the reviewed server and tooling objects. Run repository gates for the
+   actual changes and retain earlier scoped acceptance honestly. Preserve old
+   task pins, owner pauses, original primaries, queued instructions and resources.
+2. Reconcile the candidate migration inventory with the applied ledger without
+   rewriting history. The candidate includes the exact already-applied
+   `20261105203000_metadata_polling_indexes` SQL, SHA-256
+   `08bac435f8a88df49d790230a7e6624adb767319ea20090b6b17b6dc70c6519b`.
+   The pending `20261105200000_tooling_release` migration sorts earlier;
+   `test/dra33-migration-order.rehearsal.ts` verifies actual Prisma deployment
+   after the later index migration, unchanged prior ledger rows and replay.
+   This disposable proof does not replace the executor's actual database,
+   process and recovery rehearsal.
+3. Require a reviewed, bounded, no-cancel bootstrap drain before stopping the
+   shared daemon. Deployed `6f972` has no supported global hold. Tooling callback
+   admission is not a global drain; owner pause, shutdown cancellation and
+   quiet polling are not substitutes. The executor must prove ingress and
+   worker coverage, preservation of queued work, and recovery after interruption.
+4. Retain the complete old reader closure: code, generated Prisma client,
+   dependencies, installed tooling and frozen receipts. Symlinked dependencies
+   must not be mutated by preparing the new release. After tooling activation,
+   a pre-protocol server is not an accepted rollback reader. Do not rewind a
+   database after newly admitted effects; use a compatible reader or reviewed
+   forward recovery.
+5. Inventory legacy consumers and exact capability receipts before first
+   selection. Ambiguous or unavailable receipts block that activation. Keep
+   runtime v1 for v1-only readers; explicit runtime v2 migration is separate.
+   Retire old roots only when unfinished operations, retained consumers, legacy
+   readers, task pins and rollback requirements no longer reference them.
+6. The sole executor records the actual cutover and post-cutover health and
+   workflow receipts. Stop on a failing gate; do not independently restart a
+   shared service or launch product work merely to manufacture acceptance.
+
+The coordinating source primary maintains the concrete handoff at
+`/private/tmp/dra33-cutover-readiness-20261106.json`, including pending external
+execution requirements and delivery receipts. That private file is a release
+artifact, not a portable path for another installation.
+
+## Historical October rollout
+
+The following records remain evidence of that earlier rollout only.
 
 ## Scope
 
