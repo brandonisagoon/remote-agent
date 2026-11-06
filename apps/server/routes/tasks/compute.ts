@@ -4,7 +4,7 @@ import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../..
 import { Hono } from "hono";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
-import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, offerNextCompute, readComputeCapacity, requestCompute } from "../../services/tasks/compute-admission.ts";
+import { bindComputeResource, claimCompute, ComputeRequest, declineCompute, readComputeCapacity, requestCompute, scheduleComputeOffers } from "../../services/tasks/compute-admission.ts";
 import { computeEvidenceState } from "../../services/tasks/compute-observation.ts";
 import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-attempt.ts";
 import { developmentProjection } from "../../services/tasks/development-intent.ts";
@@ -55,7 +55,9 @@ computeRoutes.post("/:taskId/compute-request", async c => {
   try {
     const input = { prisma: c.get("prisma"), machineId: config.machine, policy: config.compute, config, runtime: c.get("agentRuntime") };
     const environment = await requestCompute({ ...input, config, taskId: c.req.param("taskId"), request: parsed.data });
-    await offerNextCompute(input);
+    // Selection may wait on slow accounting; it is coalesced and never holds
+    // this request (or the adapter's timeout) open.
+    void scheduleComputeOffers(input);
     const allocation = await input.prisma.computeOffer.findFirst({ where: { environmentId: environment.id, state: { in: ["claimed", "running", "unknown"] } }, orderBy: { createdAt: "desc" } });
     return c.json({ enabled: true, environment, ...(allocation ? { allocationId: allocation.id } : {}) }, 202);
   } catch { return c.json({ error: "The requested compute environment is unavailable or its ownership changed" }, 409); }

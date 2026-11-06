@@ -246,17 +246,36 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
   } finally { flushing.delete(runtime); }
 }
 
+/** One coalesced inbox tick. Compute selection (which may wait on a slow
+ * physical accounting scan) runs detached and coalesced in its own scheduler;
+ * message controls and instruction delivery never wait for it. */
+export function createInstructionTick(prisma: PrismaClient, runtime: AgentSessionRuntime, config: ServerConfig, dependencies: {
+  scheduleCompute?: (input: { prisma: PrismaClient; machineId: string; policy: NonNullable<ServerConfig["compute"]>; config: ServerConfig; runtime: AgentSessionRuntime }) => Promise<unknown>;
+} = {}) {
+  let delivering: Promise<void> | undefined;
+  return () => {
+    if (config.compute?.enabled) {
+      const policy = config.compute;
+      void (dependencies.scheduleCompute
+        ? dependencies.scheduleCompute({ prisma, machineId: config.machine, policy, config, runtime })
+        : import("../tasks/compute-admission.ts").then(module => module.scheduleComputeOffers({ prisma, machineId: config.machine, policy, config, runtime })))
+        .catch(() => console.error("Compute admission requires reconciliation"));
+    }
+    if (delivering) return delivering;
+    delivering = deliverMessageControls(prisma, runtime, async (message) => {
+      const { tracker } = await import("../../integrations/tracker/port.ts");
+      if (tracker.sourceMessages.provider !== message.provider) throw new Error("Source integration is unavailable");
+      return tracker.sourceMessages.validateOwner(config, prisma, message);
+    }).then(() => deliverInstructions(prisma, runtime, config)).catch(() => console.error("Instruction inbox reconciliation failed"))
+      .finally(() => { delivering = undefined; });
+    return delivering;
+  };
+}
+
 export function startInstructionDelivery(prisma: PrismaClient, runtime: AgentSessionRuntime, config: ServerConfig) {
-  const tick = () => void Promise.resolve().then(async () => {
-    if (config.compute?.enabled) await (await import("../tasks/compute-admission.ts")).offerNextCompute({ prisma, machineId: config.machine, policy: config.compute, config, runtime })
-      .catch(() => console.error("Compute admission requires reconciliation"));
-  }).then(() => deliverMessageControls(prisma, runtime, async (message) => {
-    const { tracker } = await import("../../integrations/tracker/port.ts");
-    if (tracker.sourceMessages.provider !== message.provider) throw new Error("Source integration is unavailable");
-    return tracker.sourceMessages.validateOwner(config, prisma, message);
-  })).then(() => deliverInstructions(prisma, runtime, config)).catch(() => console.error("Instruction inbox reconciliation failed"));
-  const timer = setInterval(tick, 1000);
+  const tick = createInstructionTick(prisma, runtime, config);
+  const timer = setInterval(() => void tick(), 1000);
   timer.unref();
-  tick();
+  void tick();
   return () => clearInterval(timer);
 }

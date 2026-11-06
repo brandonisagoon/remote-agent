@@ -189,16 +189,21 @@ console.log(JSON.stringify({version:1,kind:'compute-baseline',machineId:input.ma
   if (mode === "restart-before-delivery") await writeFile(state, JSON.stringify("running"));
   if (mode === "broken-capability") await writeFile(path.join(checkout, "observer.ts"), "throw new Error('changed');");
   const delivered = await confirmComputeDelivery({ ...admission, sessionId: "waiting", requestId: offer!.instructionId });
-  if (mode === "restart-before-delivery" || mode === "broken-capability") {
-    expect(delivered).toBeNull(); expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
-  } else {
-    expect(delivered?.state).toBe("offered");
-    if (mode === "restart-before-claim") {
-      await writeFile(state, JSON.stringify("running"));
-      await expect(claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).rejects.toThrow("reservation is unavailable");
-    } else expect((await claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).offer.state).toBe("claimed");
-    expect((await readFile(calls, "utf8")).trim().split("\n")).toHaveLength(3);
+  // DRA-34: selection reserved after a fresh refresh; delivery only records
+  // progress and never re-scans. The claim makes the next fresh decision.
+  expect(delivered?.state).toBe("offered");
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: offer!.id } })).toBe(1);
+  if (mode === "restart-before-claim") await writeFile(state, JSON.stringify("running"));
+  if (mode === "normal") expect((await claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).offer.state).toBe("claimed");
+  else {
+    await expect(claimCompute({ ...admission, taskId: "waiting", offerId: offer!.id, request: f.request })).rejects.toThrow("reservation is unavailable");
+    // A refused claim never frees the running turn's reservation.
+    expect(await f.prisma.computeSlot.count({ where: { allocationId: offer!.id } })).toBe(1);
   }
+  // Selection's fresh read always happened; the claim reads again only when the
+  // family is settled and the capability verifies.
+  const reads = (await readFile(calls, "utf8")).trim().split("\n").length;
+  if (mode === "normal") expect(reads).toBe(2); else { expect(reads).toBeGreaterThanOrEqual(1); expect(reads).toBeLessThanOrEqual(2); }
   expect(await f.prisma.computeEnvironment.count({ where: { taskId: "old" } })).toBe(0);
   expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
 });

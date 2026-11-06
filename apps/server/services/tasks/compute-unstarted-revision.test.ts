@@ -29,7 +29,9 @@ const advance = (head: (worktree: string) => Promise<string> = async () => B) =>
 test("never-started revision keeps the same environment, queue position and offer history, once", async () => {
   const environment = await task(); await task("peer");
   const offer = (await offerNextCompute(context()))!;
+  // Fixture: the assignment was withdrawn (selection-time reservation released).
   await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: "expired", completedAt: now } });
+  await db.prisma.computeSlot.updateMany({ where: { allocationId: offer.id }, data: { allocationId: null } });
   await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "completed" } });
   const waiting = await db.prisma.computeWait.findMany({ orderBy: { sequence: "asc" } });
   const updated = await advance();
@@ -74,7 +76,9 @@ test.each(["resource", "released-resource", "binding", "configuration", "observa
   if (fault === "configuration" || fault === "observation") await db.prisma.computeEnvironment.update({ where: { id: environment.id }, data: { [fault]: {} } });
   if (fault === "traffic") await db.prisma.computeTraffic.create({ data: { routeId: "route", environmentId: environment.id, taskId: "one", epoch: "epoch", state: {} } });
   if (fault === "unexplained-slot") {
+    // A queued assignment explains its own reservation; a withdrawn one cannot.
     const offer = (await offerNextCompute(context()))!;
+    await db.prisma.computeOffer.update({ where: { id: offer.id }, data: { state: "expired" } });
     await db.prisma.computeSlot.update({ where: { id: "host:0" }, data: { allocationId: offer.id } });
   }
   if (fault === "no-wait") await db.prisma.computeWait.delete({ where: { environmentId: environment.id } });

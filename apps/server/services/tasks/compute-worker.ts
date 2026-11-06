@@ -1,7 +1,7 @@
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
-import { reconcileObservedCompute, offerNextCompute } from "./compute-admission.ts";
+import { reconcileObservedCompute, scheduleComputeOffers } from "./compute-admission.ts";
 import { refreshComputeObservation, computeEvidenceState } from "./compute-observation.ts";
 import { considerIdleComputeSuspension } from "./compute-suspension.ts";
 import { developmentProjection } from "./development-intent.ts";
@@ -86,7 +86,7 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       }
     }
   }));
-  await offerNextCompute({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute, config: input.config, runtime: input.runtime });
+  await scheduleComputeOffers({ prisma: input.prisma, machineId: input.config.machine, policy: input.config.compute, config: input.config, runtime: input.runtime });
   return { observed, unavailable };
 }
 
