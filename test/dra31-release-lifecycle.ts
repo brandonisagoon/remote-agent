@@ -44,8 +44,12 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
   const server = await isolatedServer();
   const taskId = "dra31-existing", sessionId = "dra31-existing-primary";
   const stateDirectory = path.join(server.root, "state");
+  const repositoryRoot = path.resolve(import.meta.dir, "..");
   const evidence: Record<string, unknown> = { scope: "real server and committed Drafted CLI; no physical provider/app acceptance", serverRoot: server.root,
-    serverRevision: await git(path.resolve(import.meta.dir, ".."), "rev-parse", "HEAD"), releases: [a, b], steps: [] };
+    serverRevision: await git(repositoryRoot, "rev-parse", "HEAD"), releases: [a, b], steps: [],
+    sourceProvenance: { status: await git(repositoryRoot, "status", "--porcelain"),
+      trackedDiffDigest: createHash("sha256").update(await git(repositoryRoot, "diff", "HEAD", "--binary")).digest("hex"),
+      runnerDigest: createHash("sha256").update(await readFile(import.meta.path)).digest("hex") } };
   const steps = evidence.steps as unknown[];
   let passed = false;
   const resultFile = path.join(server.root, "release-lifecycle.json");
@@ -54,9 +58,17 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     assert.equal(response.status, status, JSON.stringify(body));
     return body;
   };
-  const activate = async (revision: string, expectedGeneration: number, requestKey: string) =>
-    json(await server.request("/api/tooling-releases/fixture/activations", { method: "POST", headers: { "content-type": "application/json" },
+  const activate = async (revision: string, expectedGeneration: number, requestKey: string) => {
+    const beforePid = server.pid;
+    const result = await json(await server.request("/api/tooling-releases/fixture/activations", { method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ revision, expectedGeneration, requestKey }), signal: AbortSignal.timeout(120_000) }));
+    const paused = await server.db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "dra31-paused" } });
+    steps.push({ action: "activation", revision, expectedGeneration, requestKey, beforePid, afterPid: server.pid,
+      ownerPaused: paused.ownerPaused, receipt: result });
+    assert.equal(server.pid, beforePid, "Activation must not restart the isolated server");
+    assert.equal(paused.ownerPaused, true, "Activation must preserve owner pause");
+    return result;
+  };
   const runCli = async (checkout: string, requestKey: string, operationId?: string, action = "status") => {
     const child = Bun.spawn([process.execPath, "--no-env-file", path.join(checkout, "src/cli.ts"), "runtime", action, "--task", taskId, "--socket", server.controlSocket], {
       cwd: checkout, stdout: "pipe", stderr: "pipe", stdin: "ignore",
@@ -66,7 +78,9 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     const limit = setTimeout(() => { if (child.exitCode === null) child.kill("SIGKILL"); }, 60_000);
     try {
       const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
-      steps.push({ action: `runtime-${action}`, revision: path.basename(checkout), requestKey, operationId, code, stdout, stderr });
+      const recorded = await server.db.prisma.toolingOperation.findFirst({ where: { taskId, requestKey } });
+      steps.push({ action: `runtime-${action}`, revision: path.basename(checkout), requestKey,
+        operationId: recorded?.id ?? operationId, suppliedOperationId: operationId, code, stdout, stderr });
       return { code, stdout, stderr };
     } finally { clearTimeout(limit); }
   };
@@ -237,6 +251,9 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
       // Preserve synthetic selection/operation evidence before the fixture
       // removes its DB. No full database or config/credential copy is kept.
       evidence.selection = await server.db.prisma.toolingSelection.findMany();
+      evidence.activations = await server.db.prisma.toolingActivation.findMany();
+      evidence.legacyBoundaries = await server.db.prisma.toolingLegacyBoundary.findMany();
+      evidence.legacyConsumers = await server.db.prisma.toolingLegacyConsumer.findMany();
       evidence.operations = await server.db.prisma.toolingOperation.findMany();
       evidence.stateWrites = await server.db.prisma.toolingStateWrite.findMany();
       await writeFile(resultFile, JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
