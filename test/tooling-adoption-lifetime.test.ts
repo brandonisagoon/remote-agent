@@ -897,3 +897,98 @@ test("stored adoption child: after its offer is withdrawn the same key returns t
     expect(refused.body.binding).toBeUndefined();
   }
 }, 60_000);
+
+// ---------------------------------------------------------------------------
+// A retired prior lifetime (physical run at 216fa0e): A produced and stopped
+// the environment; B's separate waiting command then admitted it again; the
+// delivered offer's fresh B command must adopt that never-produced waiting work.
+/** A produced env; B active; A's continuation settled; stand-in verified stop.
+ * Then B's separate `runtime up` admitted the stopped environment and waits. */
+async function retiredThenWaiting() {
+  const f = await fixture();
+  await f.activate(A, 0);
+  const a = await f.command("a-runtime-up");
+  expect((await a.request()).called?.status).toBe(200);
+  await f.environment(); await f.offer("offer-a");
+  expect((await a.claim("offer-a")).called?.status).toBe(200);
+  await f.claimed("offer-a");
+  expect((await a.bind("offer-a")).called?.status).toBe(200);
+  expect((await a.settle()).status).toBe(200);
+  await f.activate(B, 1);
+  const continuation = (await bindServerContinuation({ prisma: db.prisma, config: f.config, task: await f.task(), environmentId: ENV,
+    request: { requestKey: `compute-continue:${ENV}:1`, inputDigest: canonicalDigest({ continue: 1 }) } })).binding!;
+  expect((await f.settleOperation(continuation)).status).toBe(200);
+  // STAND-IN verified stop: the offer stops (its historical claimedAt is kept) and A's reader resolves.
+  await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "stopped" } });
+  expect(await resolveEnvironmentConsumers(db.prisma, ENV, { kind: "stopped", reference: "stand-in-stop" })).toBe(1);
+  const waiting = await f.command("b-runtime-up");
+  const request = await waiting.request();
+  expect(request.called?.status, JSON.stringify(request.called?.body)).toBe(200);
+  expect((await waiting.settle()).status).toBe(200);
+  await f.offer("offer-b");
+  return { f, a, waiting };
+}
+
+test("retired lifetime: the delivered offer's fresh B command adopts waiting work admitted after A's stopped, resolved lifetime (exact echo)", async () => {
+  const { f, a, waiting } = await retiredThenWaiting();
+  const fresh = await f.command("b-runtime-up-offer");
+  const claim = await fresh.claim("offer-b");
+  console.log(JSON.stringify({ retired: { a: short(a.fence), waitingAdmission: short(waiting.bindings[0]!), fresh: short(fresh.fence), begin: claim.begun?.status, error: claim.begun?.body.error?.split(". Begin")[0] ?? null, claim: claim.called?.status ?? null } }));
+  expect(claim.begun?.status, JSON.stringify(claim.begun?.body)).toBe(200);
+  expect(claim.child).toMatchObject({ parentOperationId: fresh.fence.operationId, existingOperationId: "offer-b", release: { revision: B } });
+  expect(claim.called?.status, JSON.stringify(claim.called?.body)).toBe(200);
+  await f.claimed("offer-b");
+  expect((await fresh.bind("offer-b")).called?.status).toBe(200);
+  expect((await fresh.settle()).status).toBe(200);
+  expect(await producerOperationId(db.prisma, await f.task(), ENV)).toBe(claim.child!.operationId);
+  // History is preserved: A's stopped offer keeps its claim time; A's producer record remains.
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: "offer-a" } })).toMatchObject({ state: "stopped", claimedAt: expect.any(Date) });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { key: `producer:compute-environment:${ENV}` } })).toBeGreaterThanOrEqual(2);
+  expect(await db.prisma.computeEnvironment.count()).toBe(1);
+});
+
+test("retired lifetime: an uncertain earlier offer, or a claim or producer within the current lifetime, refuses; competing adopters yield one winner; replay keeps identity; pause refuses", async () => {
+  // An earlier offer whose outcome is uncertain is not retired.
+  {
+    const { f } = await retiredThenWaiting();
+    await db.prisma.computeOffer.update({ where: { id: "offer-a" }, data: { state: "unknown" } });
+    const refused = await (await f.command("b-offer")).beginChild("offer-b");
+    expect(refused.body).toMatchObject({ code: "retained-release-required" });
+  }
+  // ADVERSARIAL seeded records within the current lifetime (after the waiting admission), refusal only.
+  for (const seed of ["claimed offer", "producer"] as const) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    if (seed === "claimed offer") await db.prisma.computeOffer.create({ data: { id: "offer-x", environmentId: ENV, machineId: "host", instructionId: "instruction-x", state: "stopped", claimedAt: new Date(), dispatchDeadline: new Date() } });
+    else await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `producer:compute-environment:${ENV}`,
+      value: JSON.stringify({ version: 1, operationId: crypto.randomUUID(), role: "producer", state: "confirmed" }) } });
+    const fresh = await f.command("b-offer");
+    const refused = await fresh.beginChild("offer-b");
+    expect(refused.body, seed).toMatchObject({ code: "retained-release-required" });
+  }
+  // Two fresh B commands begun together: exactly one claim wins; the loser and a later command are refused.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    const x = await f.command("b-one"), y = await f.command("b-two");
+    const [bx, by] = [await x.beginChild("offer-b"), await y.beginChild("offer-b")];
+    expect([bx.status, by.status]).toEqual([200, 200]);
+    const handledBefore = f.handled.length;
+    const results = await Promise.all([x.call("compute-claim", { ...computeBody, offerId: "offer-b" }, bx.body.binding.operationId), y.call("compute-claim", { ...computeBody, offerId: "offer-b" }, by.body.binding.operationId)]);
+    expect(results.map(result => result.status).sort()).toEqual([200, 409]);
+    expect(f.handled.slice(handledBefore).filter(entry => entry.endsWith("compute-claim:200"))).toHaveLength(1);
+    expect((await (await f.command("b-three")).beginChild("offer-b")).body).toMatchObject({ code: "retained-release-required" });
+    // The winner's and loser's exact same-key replays keep their own bindings (status may have advanced).
+    const identity = ({ status: _status, ...rest }: Record<string, unknown>) => rest;
+    expect(identity((await x.beginChild("offer-b")).body.binding)).toEqual(identity(bx.body.binding));
+    expect(identity((await y.beginChild("offer-b")).body.binding)).toEqual(identity(by.body.binding));
+  }
+  // The owner pauses: the fresh command's claim child is refused.
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f } = await retiredThenWaiting();
+    const fresh = await f.command("b-offer");
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    expect((await fresh.beginChild("offer-b")).body.error).toMatch(/paused/);
+  }
+}, 60_000);

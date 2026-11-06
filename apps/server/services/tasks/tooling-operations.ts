@@ -533,16 +533,48 @@ async function adoptionRefused(store: AdmissionStore, task: RemoteTask, offerId:
   const command = await commandOf(store, original, dependencies.read);
   if (!command || command.status !== "completed") return `Admitting command ${command?.operationId ?? prior.operationId} has not settled`;
   if (offer.claimedAt !== null || !["queued", "offered"].includes(offer.state)) return `Offer ${offerId} is ${offer.state}`;
-  if (await store.computeOffer.count({ where: { environmentId: environment.id, OR: [{ claimedAt: { not: null } }, { state: { in: ["validating", "claimed", "running", "unknown"] } }] } })) return `Environment ${environment.id} has a claimed effect`;
+  // The CURRENT lifetime starts at the admitting operation's confirmed
+  // admission record. An environment may carry an EARLIER, retired lifetime
+  // (claimed offers, a producer) that is history only when provably retired;
+  // anything live, uncertain or recorded within the current lifetime refuses.
+  const admissionEvents = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: current.primarySessionId!, source: `tooling-operation:${current.id}`, action: ASSOCIATION,
+    key: associationKey("admission", `environment-key:${environment.key}`) }, orderBy: { sequence: "desc" }, take: ADMISSION_HISTORY_BOUND + 1 });
+  if (admissionEvents.length > ADMISSION_HISTORY_BOUND) return "Admission history exceeds its bound";
+  const admitted = admissionEvents.find(event => { const value = Association.safeParse(parseJson(event.value)).data; return value?.operationId === prior.operationId && value.state === "confirmed"; });
+  if (!admitted) return `Admission by ${prior.operationId} has no confirmed record`;
+  // Other offers: none live or uncertain; a claimed one is history only if it predates the admission.
+  const others = await store.computeOffer.findMany({ where: { environmentId: environment.id, id: { not: offerId } }, take: 1001 });
+  if (others.length > 1000) return `Environment ${environment.id} offer history exceeds its bound`;
+  for (const other of others) {
+    if (ACTIVE_OFFERS.includes(other.state)) return `Environment ${environment.id} has a live or uncertain offer ${other.id} (${other.state})`;
+    if (other.claimedAt !== null && other.createdAt >= admitted.occurredAt) return `Environment ${environment.id} has a claimed effect (offer ${other.id}) in the current lifetime`;
+  }
   for (const reference of [{ type: "compute-offer", id: offerId }, { type: "compute-environment", id: environment.id }] as const) {
     if (await owningOperationId(store, current, reference)) return `${reference.type} ${reference.id} has an owner`;
     const legacy = await dependencies.legacy({ prisma: store as PrismaClient, repositoryId: current.repositoryId, consumerKind: reference.type, consumerId: reference.id });
     if (legacy.status === "legacy" || legacy.status === "unavailable") return `${reference.type} ${reference.id} is a retained first-bootstrap legacy consumer`;
   }
-  if ((await associations(store, current, "producer", `compute-environment:${environment.id}`)).length) return `Environment ${environment.id} has a producer`;
+  // Producers: only an earlier lifetime's, each with a definite outcome and a settled command.
+  const producerEvents = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: current.primarySessionId!, source: `tooling-operation:${current.id}`, action: ASSOCIATION,
+    key: associationKey("producer", `compute-environment:${environment.id}`) }, take: 1001 });
+  if (producerEvents.length > 1000) return `Environment ${environment.id} producer history exceeds its bound`;
+  const producerStates = new Map<string, Set<string>>();
+  for (const event of producerEvents) {
+    const value = Association.safeParse(parseJson(event.value));
+    if (!value.success || value.data.role !== "producer") return `Environment ${environment.id} producer record ${event.sequence} is unreadable`;
+    if (event.sequence >= admitted.sequence) return `Environment ${environment.id} was produced in the current lifetime`;
+    producerStates.set(value.data.operationId, (producerStates.get(value.data.operationId) ?? new Set()).add(value.data.state));
+  }
+  for (const [operationId, states] of producerStates) {
+    if (!states.has("confirmed") && !states.has("failed")) return `Environment ${environment.id} has an unknown producer outcome (${operationId})`;
+    const producer = await dependencies.read({ prisma: store as PrismaClient, operationId });
+    const producerCommand = producer ? await commandOf(store, producer, dependencies.read) : null;
+    if (!producerCommand || producerCommand.status !== "completed") return `Environment ${environment.id} earlier producer ${operationId} has not settled`;
+  }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
   return null;
 }
+const parseJson = (text: string | null) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
 /** Confirmed producer of a resource group, or null if none. Throws on a
  * newest producer change without an outcome; retrying that exact operation
  * reconciles it — newer code is never selected instead. */
