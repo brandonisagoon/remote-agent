@@ -657,3 +657,54 @@ test("settlement trusts only the latest callback attempt's own acknowledgment", 
   expect((await settle()).status).toBe(200);
   expect((await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))!.status).toBe("completed");
 });
+
+describe("settlement concurrency (review of f38d564)", () => {
+  async function command() {
+    const { config } = await fixture(); await bootstrap([]);
+    const fence = (await begin(config, { requestKey: "runtime-up", inputDigest: canonicalDigest({ argv: ["runtime", "up"] }), kind: "adapter-command" })).binding;
+    const child = (await begin(config, { requestKey: "runtime-up/request", inputDigest: canonicalDigest(computeBody), kind: "compute-admission", parentOperationId: fence.operationId })).binding;
+    const admit = async () => (await admitToolingCallback({ prisma: db.prisma, config, method: "POST", pathname: "/api/tasks/task/compute-request", header: child.operationId, body: computeBody })) as Extract<CallbackAdmission, { mode: "bound" }>;
+    const { call } = app(config);
+    const settle = () => call(`/api/sessions/primary/tooling-operations/${fence.operationId}/settlement`, { requestKey: fence.requestKey, inputDigest: fence.inputDigest, outcome: "completed" }, fence.operationId);
+    return { config, fence, child, admit, settle };
+  }
+
+  test("A: an older in-flight or unknown attempt cannot hide behind a newer acknowledgment", async () => {
+    const { config, admit, settle } = await command();
+    const a = await admit(), older = await beforeBoundCallback(db.prisma, config, a); // in flight
+    const b = await admit(), newer = await beforeBoundCallback(db.prisma, config, b);
+    await afterBoundCallback(db.prisma, b, newer, 200);
+    expect((await settle()).status).toBe(409);
+    await afterBoundCallback(db.prisma, a, older, "exception"); // unknown outcome
+    const c = await admit(), latest = await beforeBoundCallback(db.prisma, config, c); await afterBoundCallback(db.prisma, c, latest, 200);
+    expect((await settle()).status).toBe(409); // unknown older attempt still outstanding
+  });
+
+  test("A: every attempt definite and the latest acknowledged settles", async () => {
+    const { config, child, admit, settle } = await command();
+    const a = await admit(), older = await beforeBoundCallback(db.prisma, config, a);
+    const b = await admit(), newer = await beforeBoundCallback(db.prisma, config, b);
+    await afterBoundCallback(db.prisma, b, newer, 200);
+    await afterBoundCallback(db.prisma, a, older, 200);
+    expect((await settle()).status).toBe(200);
+    expect((await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))!.status).toBe("completed");
+  });
+
+  test("B: a callback admitted before settlement cannot start after it", async () => {
+    const { config, child, admit, settle } = await command();
+    const done = await admit(), first = await beforeBoundCallback(db.prisma, config, done); await afterBoundCallback(db.prisma, done, first, 200);
+    const stale = await admit(); // read before settlement
+    expect((await settle()).status).toBe(200);
+    await expect(beforeBoundCallback(db.prisma, config, stale)).rejects.toThrow(/completed/);
+    const intents = (await db.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${child.operationId}` } })).map(event => JSON.parse(event.value!).state);
+    expect(intents.filter(state => state === "intent")).toHaveLength(1); // the refused attempt left no intent
+  });
+
+  test("B: a callback whose intent is recorded first blocks settlement until it is definite", async () => {
+    const { config, admit, settle } = await command();
+    const running = await admit(), attempt = await beforeBoundCallback(db.prisma, config, running);
+    expect((await settle()).status).toBe(409);
+    await afterBoundCallback(db.prisma, running, attempt, 200);
+    expect((await settle()).status).toBe(200);
+  });
+});

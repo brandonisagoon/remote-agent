@@ -324,15 +324,22 @@ async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataE
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
     value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status }) } });
 }
-/** The latest attempt's definite acknowledgment, or null (in flight, refused,
- * unknown or missing). */
+/** Settled callback history: every recorded attempt has a definite result
+ * (acknowledged or refused) and the latest attempt is acknowledged. An older
+ * in-flight or unknown attempt never disappears behind a newer
+ * acknowledgment; it needs reconciliation first. */
 async function latestAttemptAcknowledged(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operation: { id: string; inputDigest: string }) {
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operation.id) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operation.id} exceeds its bound`);
-  const values = events.map(event => z.object({ state: z.string(), attemptId: z.string().optional(), operationId: z.string(), inputDigest: z.string() }).passthrough().safeParse(JSON.parse(event.value ?? "null")).data).filter(Boolean);
-  const latest = values.find(value => value!.state === "intent");
-  if (!latest?.attemptId) return false;
-  return values.some(value => value!.attemptId === latest.attemptId && value!.state === "acknowledged" && value!.operationId === operation.id && value!.inputDigest === operation.inputDigest);
+  const values = events.flatMap(event => z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string() }).passthrough().safeParse(JSON.parse(event.value ?? "null")).data ?? []);
+  if (values.some(value => value.operationId !== operation.id || value.inputDigest !== operation.inputDigest)) return false;
+  const intents = values.filter(value => value.state === "intent");
+  if (!intents.length) return false;
+  for (const intent of intents) {
+    const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent").map(value => value.state);
+    if (!results.length || results.includes("unknown")) return false;
+  }
+  return values.some(value => value.attemptId === intents[0]!.attemptId && value.state === "acknowledged");
 }
 async function recordAssociation(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: Pick<ToolingOperationBinding, "operationId" | "taskId" | "sessionId" | "kind" | "generation">, role: Role, id: string, state: "intent" | "confirmed" | "failed", evidence?: string) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey(role, id),
@@ -538,14 +545,23 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
  * intent, then recheck authority. Every write precedes the handler, so a lost
  * response leaves a durable, reconcilable association, not an unbound effect. */
 export async function beforeBoundCallback(prisma: PrismaClient, config: ServerConfig, admission: Extract<CallbackAdmission, { mode: "bound" }>, dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
-  let { binding } = admission;
-  if (binding.status === "bound") {
-    try { binding = await dependencies.transition({ prisma, operationId: binding.operationId, from: "bound", to: "running" }); }
-    catch { binding = (await dependencies.read({ prisma, operationId: binding.operationId })) ?? binding; }
-  }
+  // One short transaction, intent written FIRST (taking the write lock), then
+  // the current child and command parent re-read: either this attempt is
+  // durable before a settlement (which then refuses) or it sees the settled
+  // command and refuses, leaving no intent. No slow effect runs inside.
+  const attemptId = crypto.randomUUID(), replay = admission.binding.status === "completed";
+  await prisma.$transaction(async tx => {
+    await recordCallbackOutcome(tx, admission.binding, admission.callback.route, attemptId, "intent", null);
+    const row = await tx.toolingOperation.findUnique({ where: { id: admission.binding.operationId } });
+    if (!row || !(replay ? row.status === "completed" : ["bound", "running", "unknown"].includes(row.status))) throw refuse("operation-closed", `Operation ${admission.binding.operationId} is ${row?.status ?? "missing"}`);
+    if (row.parentOperationId) {
+      const parent = await tx.toolingOperation.findUnique({ where: { id: row.parentOperationId } });
+      if (!parent || !["bound", "running"].includes(parent.status)) throw refuse("operation-closed", `Command ${row.parentOperationId} is ${parent?.status ?? "missing"}; it starts no further callbacks`);
+    }
+    if (row.status === "bound") await tx.toolingOperation.updateMany({ where: { id: row.id, status: "bound" }, data: { status: "running" } });
+  });
+  const binding = (await dependencies.read({ prisma, operationId: admission.binding.operationId })) ?? admission.binding;
   // This attempt is in flight from here until its own outcome is recorded.
-  const attemptId = crypto.randomUUID();
-  await recordCallbackOutcome(prisma, binding, admission.callback.route, attemptId, "intent", null);
   try { return { ...await prepareBoundEffects(prisma, config, admission, binding, dependencies), attemptId }; }
   catch (error) { await recordCallbackOutcome(prisma, binding, admission.callback.route, attemptId, "refused", null).catch(() => undefined); throw error; }
 }
