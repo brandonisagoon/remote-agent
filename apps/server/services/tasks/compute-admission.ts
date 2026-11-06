@@ -610,6 +610,12 @@ export async function bindComputeResource(input: Context & { taskId: string; off
 /** Only a fresh independently observed exact lifetime can release a claimed
  * slot. Timeouts, receipt states and absence of a provider turn are not proof. */
 export async function reconcileObservedCompute(input: Context & { environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
+  const result = await reconcileObservedComputeOnce(input);
+  if (result.released) await (await import("./tooling-operations.ts")).resolveEnvironmentConsumers(input.prisma, input.environmentId, { kind: "stopped", reference: input.environmentId })
+    .catch(error => console.warn(`Retained readers of ${input.environmentId} remain until reconciled: ${error instanceof Error ? error.message : String(error)}`));
+  return result;
+}
+async function reconcileObservedComputeOnce(input: Context & { environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity"> }) {
   return input.prisma.$transaction(async store => {
     const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
     await assertComputeEnvironmentOwner(store, environment);

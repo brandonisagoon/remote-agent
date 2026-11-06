@@ -66,6 +66,13 @@ async function snapshot(store: Store, input: Context) {
 /** Collector-only reconciliation. It cannot resume, classify, install tooling,
  * recreate source, or mutate provider resources. Active authority is unchanged. */
 export async function reclaimStoppedCompute(input: Context, read = readInstalledComputeReclamation) {
+  const result = await reclaimStoppedComputeOnce(input, read);
+  // Physical stopped/absent proof ends the environment's retained readers.
+  if (result.released) await (await import("./tooling-operations.ts")).resolveEnvironmentConsumers(input.prisma, input.environmentId, { kind: "stopped", reference: input.environmentId })
+    .catch(error => console.warn(`Retained readers of ${input.environmentId} remain until reconciled: ${error instanceof Error ? error.message : String(error)}`));
+  return result;
+}
+async function reclaimStoppedComputeOnce(input: Context, read = readInstalledComputeReclamation) {
   if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
   // Retire any earlier zero-capacity observation before a fallible physical
   // read. Failed/unknown/restarted compute must not reuse a fresh stopped cache.

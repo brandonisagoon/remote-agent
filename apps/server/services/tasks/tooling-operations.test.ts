@@ -11,7 +11,7 @@ import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts"
 import { toolingOperationGuard, toolingOperationRoutes } from "../../routes/tasks/tooling-operations.ts";
 import {
   FINALIZATION_PREPARED_ACTION, TOOLING_CALLBACKS, TOOLING_CALLBACK_CLASSIFICATION, TOOLING_OPERATION_HEADER, TOOLING_OPERATION_KINDS, beginSessionToolingOperation,
-  bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
+  bindServerContinuation, boundCode, inventoryLegacyToolingConsumers, resolveEnvironmentConsumers, resolveFinishedLegacyConsumers, matchToolingCallback, producerOperationId, readSessionToolingOperation, resourceGroupCode,
 } from "./tooling-operations.ts";
 import { canonicalDigest, readToolingOperation, transitionToolingOperation } from "./tooling-releases.ts";
 import { selectCapabilityRelease } from "./tooling-capabilities.ts";
@@ -392,4 +392,36 @@ describe("review of 73ab07f", () => {
     expect(results.map(response => response.status).sort()).toEqual([200, 409]);
     expect(seen).toHaveLength(1);
   });
+});
+
+test("a completed producer's live resource keeps deferring incompatible writes for its own state until stopped proof", async () => {
+  const { config } = await fixture();
+  await environment("env-1", computeBody.key); await bootstrap([]);
+  // Producer A (v1-only reader) starts the group; its callback operation completes.
+  const producer = (await begin(config, { requestKey: "start-a", inputDigest: canonicalDigest(computeBody), kind: "compute-admission" })).binding;
+  const { call } = app(config);
+  expect((await call("/api/tasks/task/compute-request", computeBody, producer.operationId)).status).toBe(200);
+  await offer("offer-1", "env-1");
+  expect((await call("/api/tasks/task/compute-claim", { ...computeBody, offerId: "offer-1" }, producer.operationId)).status).toBe(200);
+  expect((await call("/api/tasks/task/compute-bind", { offerId: "offer-1", resourceKey: "runtime" }, producer.operationId)).status).toBe(200);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: producer.operationId }))!.status).toBe("completed");
+  // B migrates drafted.runtime to version 2.
+  await db.prisma.toolingRelease.create({ data: { id: "release-v2", repositoryId: "repo", revision: "2".repeat(40), tree: "3".repeat(40), policyBlob: "f".repeat(40), checkout: "/install/v2",
+    manifest: { ...manifest, stateFormats: { "drafted.runtime": { read: [1, 2], write: 2, preservesUnknown: true } } }, lockfileDigest: "0".repeat(64), bunVersion: "1.3.0" } });
+  await activate("release-v2", 2);
+  const migrate = async (taskSession: string, key: string) => {
+    const op = (await begin(config, { requestKey: key, inputDigest: canonicalDigest({ argv: ["migrate"] }), kind: "adapter-command" }, taskSession)).binding;
+    return { op, write: () => call(`/api/sessions/${taskSession}/tooling-operations/${op.operationId}/state-writes`, { family: "drafted.runtime", scopeKey: "task", version: 2 }, op.operationId) };
+  };
+  const mine = await migrate("primary", "migrate-task");
+  const deferred = await mine.write();
+  expect(deferred.status).toBe(409);
+  expect(await deferred.json()).toMatchObject({ code: "deferred" });
+  const evidence = await (await call(`/api/sessions/primary/tooling-operations/${mine.op.operationId}/state?family=drafted.runtime&scopeKey=task`, undefined, mine.op.operationId, "GET")).json();
+  expect(evidence.consumers).toContainEqual({ operationId: producer.operationId, format: manifest.stateFormats["drafted.runtime"] });
+  // Only the affected task's state is deferred.
+  expect((await (await migrate("other-primary", "migrate-other")).write()).status).toBe(200);
+  // Stopped proof ends the reader; the same migration now registers.
+  expect(await resolveEnvironmentConsumers(db.prisma, "env-1", { kind: "stopped", reference: "env-1" })).toBe(1);
+  expect((await mine.write()).status).toBe(200);
 });

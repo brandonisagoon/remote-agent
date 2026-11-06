@@ -5,7 +5,7 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import type { BeginToolingOperationRequest, ToolingOperationBinding, ToolingReleaseRecord, ToolingReleaseSelection, ToolingStateFormat } from "../../../../types/tooling-release.ts";
 import {
-  bindToolingOperation, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, transitionToolingOperation,
+  bindToolingOperation, canonicalDigest, confirmToolingConsumer, getActiveToolingRelease, readToolingLegacyBoundary, readToolingLegacyConsumer, readToolingOperation, resolveToolingConsumer, retainToolingConsumer, transitionToolingOperation,
   type ToolingLegacyConsumerInput, type ToolingLegacyConsumerState, type ToolingLegacyInventory,
 } from "./tooling-releases.ts";
 
@@ -476,18 +476,33 @@ export async function beforeBoundCallback(prisma: PrismaClient, config: ServerCo
   const admitted = callback.admits?.(body);
   if (admitted && await admittingOperationId(prisma, context.task, admitted) !== binding.operationId) await recordAssociation(prisma, binding, "admission", `environment-key:${admitted}`, "confirmed");
   const produced = binding.status === "completed" ? [] : await callback.produces?.(body, context) ?? [];
-  for (const environmentId of produced) await recordAssociation(prisma, binding, "producer", `compute-environment:${environmentId}`, "intent");
+  // A durable reader for each producing consumer, independent of command or
+  // callback completion: DRA-28 registration defers incompatible writes while
+  // it is live, until replacement, no-effect, stopped or absent evidence.
+  const consumers: string[] = [];
+  for (const environmentId of produced) {
+    await recordAssociation(prisma, binding, "producer", `compute-environment:${environmentId}`, "intent");
+    consumers.push((await retainToolingConsumer({ prisma, operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId, scopeKey: binding.resourceKey ?? "task" })).id);
+  }
   await assertBindingAuthority({ prisma, config, binding });
-  return { binding, produced };
+  return { binding, produced, consumers };
 }
 
 /** After the handler: success confirms producer intent and may complete the
  * operation with its protocol evidence; a refused (4xx) handler fails the
  * intent; an exception or 5xx leaves it unknown and the operation `unknown`. */
-export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[] }, status: number | "exception",
+export async function afterBoundCallback(prisma: PrismaClient, admission: Extract<CallbackAdmission, { mode: "bound" }>, state: { binding: ToolingOperationBinding; produced: string[]; consumers?: string[] }, status: number | "exception",
   dependencies: ToolingOperationDependencies = toolingOperationDependencies) {
   const ok = typeof status === "number" && status >= 200 && status < 300, refused = typeof status === "number" && status >= 400 && status < 500;
   for (const environmentId of state.produced) if (ok || refused) await recordAssociation(prisma, state.binding, "producer", `compute-environment:${environmentId}`, ok ? "confirmed" : "failed");
+  // Confirm with the callback's own protocol evidence (superseding an older
+  // producer's reader); a refused callback had no effect; an unknown outcome
+  // keeps the reader pending.
+  const proof = admission.callback.completes?.(admission.body);
+  for (const id of state.consumers ?? []) {
+    if (ok && proof) await confirmToolingConsumer({ prisma, id, evidence: proof });
+    else if (refused) await resolveToolingConsumer({ prisma, id, evidence: { kind: "no-effect", reference: `http-${status}` } });
+  }
   const current = await dependencies.read({ prisma, operationId: state.binding.operationId });
   if (!current) return;
   if (!ok && !refused && current.status === "running") await dependencies.transition({ prisma, operationId: current.operationId, from: "running", to: "unknown" }).catch(() => undefined);
@@ -801,4 +816,13 @@ export async function registerOperationStateWrite(input: { prisma: PrismaClient;
   await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
   if (write.operationId !== binding.operationId || write.version !== parsed.data.version) throw new ToolingOperationRefused("operation-mismatch", "State write receipt does not match this operation");
   return { operationId: binding.operationId, taskId: binding.taskId, family: parsed.data.family, scopeKey: parsed.data.scopeKey, write };
+}
+
+/** Stopped/absent physical proof ends every live reader of an environment,
+ * whichever release produced it. Retention otherwise outlives commands. */
+export async function resolveEnvironmentConsumers(prisma: PrismaClient, environmentId: string, evidence: { kind: "stopped" | "absent"; reference: string }) {
+  const live = await prisma.toolingRetainedConsumer.findMany({ where: { consumerKind: "compute-environment", consumerId: environmentId, status: { in: ["pending", "confirmed"] } }, take: 101 });
+  if (live.length > 100) throw new Error(`Retained readers of environment ${environmentId} exceed their bound`);
+  for (const row of live) await resolveToolingConsumer({ prisma, id: row.id, evidence });
+  return live.length;
 }
