@@ -471,44 +471,48 @@ export async function assertToolingStateReadable(input: { prisma: PrismaClient; 
  * original receipt only if the write is still eligible now (not superseded by
  * a newer version, operation still open); history stays readable through
  * readToolingStateVersion. Writes must equal the release's declared version. */
-export async function registerToolingStateWrite(input: { prisma: PrismaClient; operationId: string; family: string; scopeKey: string; version: number }): Promise<ToolingStateVersion> {
+type StateWriteInput = { operationId: string; family: string; scopeKey: string; version: number };
+
+/** Register with the caller's domain transaction, retaining every ordinary
+ * state-format and reader check. The caller owns rollback and serialization. */
+export async function registerToolingStateWriteInTransaction(tx: Prisma.TransactionClient, input: StateWriteInput): Promise<ToolingStateVersion> {
   const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });
   if (!Number.isInteger(input.version) || input.version < 1) throw new ToolingStateFormatError("invalid-request", "State format version must be a positive integer");
-  const attempt = () => input.prisma.$transaction(async (tx) => {
-    const { row, release } = await operationContext(tx, input.operationId);
-    // A retried registration is revalidated like a new one: an identity replay
-    // never authorizes bytes that the current state has moved past.
-    const existing = await tx.toolingStateWrite.findUnique({ where: { operationId_family_scopeKey_version: { operationId: row.id, ...key, version: input.version } } });
-    if (row.status !== "bound" && row.status !== "running") throw new ToolingStateFormatError("operation-closed", `Operation ${row.id} is ${row.status}; it cannot register new state writes`);
-    const format = release.manifest.stateFormats[key.family];
-    if (!format) throw new ToolingStateFormatError("undeclared-format", `Release ${release.revision} does not declare ${key.family}`);
-    const writable = format.writeVersions ?? [format.write];
-    if (!writable.includes(input.version)) throw new ToolingStateFormatError("wrong-write-version", `Release ${release.revision} may write ${key.family} versions ${writable.join(", ")}, not ${input.version}`);
-    const latest = (await latestStateWrites(tx, { taskId: row.taskId, ...key }))[0];
-    const current = latest?.version ?? LEGACY_STATE_FORMATS[key.family]?.write;
-    if (current !== undefined && current > input.version) throw new ToolingStateFormatError("would-rewind", `${key.family} for task ${row.taskId} state ${key.scopeKey} is already version ${current}`);
-    if (current !== undefined && !format.read.includes(current)) throw new ToolingStateFormatError("unreadable-state", `Release ${release.revision} cannot read ${key.family} version ${current}`);
-    const others = await tx.toolingOperation.findMany({ where: { taskId: row.taskId, status: { in: RETAINED }, id: { not: row.id }, releaseId: { not: row.releaseId } } });
-    for (const other of others) {
-      if (other.resourceKey !== null && key.scopeKey !== "task" && other.resourceKey !== key.scopeKey) continue;
-      const reader = record(await tx.toolingRelease.findUniqueOrThrow({ where: { id: other.releaseId } })).manifest.stateFormats[key.family];
-      if (!reader || !reader.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Unfinished operation ${other.id} cannot read ${key.family} version ${input.version}; defer this write until it finishes`);
-    }
-    // Retained consumers keep reading after their producing operation completes.
-    for (const reader of await retainedReaders(tx, row.taskId, key.family, key.scopeKey)) {
-      if (reader.releaseId === row.releaseId) continue;
-      if (!reader.format || !reader.format.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Retained ${reader.consumerKind} ${reader.consumerId} (release ${reader.revision}) cannot read ${key.family} version ${input.version}; defer this write until it is resolved`);
-    }
-    const legacyReader = LEGACY_STATE_FORMATS[key.family];
-    const legacy = await tx.toolingLegacyConsumer.findFirst({ where: { repositoryId: row.repositoryId, taskId: row.taskId, status: "retained" } });
-    if (legacy && (!legacyReader || !legacyReader.read.includes(input.version))) throw new ToolingStateFormatError("deferred", `Retained pre-protocol consumer ${legacy.consumerKind}:${legacy.consumerId} cannot read ${key.family} version ${input.version}`);
-    if (existing) return existing;
-    return tx.toolingStateWrite.create({ data: { repositoryId: row.repositoryId, taskId: row.taskId, ...key, version: input.version, preservesUnknown: format.preservesUnknown, operationId: row.id, releaseId: row.releaseId } });
-  });
-  let written;
-  try { written = await attempt(); }
-  catch (error) { if (!isUniqueViolation(error)) throw error; written = await attempt(); }
+  const { row, release } = await operationContext(tx, input.operationId);
+  // A retried registration is revalidated like a new one: an identity replay
+  // never authorizes bytes that the current state has moved past.
+  const existing = await tx.toolingStateWrite.findUnique({ where: { operationId_family_scopeKey_version: { operationId: row.id, ...key, version: input.version } } });
+  if (row.status !== "bound" && row.status !== "running") throw new ToolingStateFormatError("operation-closed", `Operation ${row.id} is ${row.status}; it cannot register new state writes`);
+  const format = release.manifest.stateFormats[key.family];
+  if (!format) throw new ToolingStateFormatError("undeclared-format", `Release ${release.revision} does not declare ${key.family}`);
+  const writable = format.writeVersions ?? [format.write];
+  if (!writable.includes(input.version)) throw new ToolingStateFormatError("wrong-write-version", `Release ${release.revision} may write ${key.family} versions ${writable.join(", ")}, not ${input.version}`);
+  const latest = (await latestStateWrites(tx, { taskId: row.taskId, ...key }))[0];
+  const current = latest?.version ?? LEGACY_STATE_FORMATS[key.family]?.write;
+  if (current !== undefined && current > input.version) throw new ToolingStateFormatError("would-rewind", `${key.family} for task ${row.taskId} state ${key.scopeKey} is already version ${current}`);
+  if (current !== undefined && !format.read.includes(current)) throw new ToolingStateFormatError("unreadable-state", `Release ${release.revision} cannot read ${key.family} version ${current}`);
+  const others = await tx.toolingOperation.findMany({ where: { taskId: row.taskId, status: { in: RETAINED }, id: { not: row.id }, releaseId: { not: row.releaseId } } });
+  for (const other of others) {
+    if (other.resourceKey !== null && key.scopeKey !== "task" && other.resourceKey !== key.scopeKey) continue;
+    const reader = record(await tx.toolingRelease.findUniqueOrThrow({ where: { id: other.releaseId } })).manifest.stateFormats[key.family];
+    if (!reader || !reader.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Unfinished operation ${other.id} cannot read ${key.family} version ${input.version}; defer this write until it finishes`);
+  }
+  // Retained consumers keep reading after their producing operation completes.
+  for (const reader of await retainedReaders(tx, row.taskId, key.family, key.scopeKey)) {
+    if (reader.releaseId === row.releaseId) continue;
+    if (!reader.format || !reader.format.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Retained ${reader.consumerKind} ${reader.consumerId} (release ${reader.revision}) cannot read ${key.family} version ${input.version}; defer this write until it is resolved`);
+  }
+  const legacyReader = LEGACY_STATE_FORMATS[key.family];
+  const legacy = await tx.toolingLegacyConsumer.findFirst({ where: { repositoryId: row.repositoryId, taskId: row.taskId, status: "retained" } });
+  if (legacy && (!legacyReader || !legacyReader.read.includes(input.version))) throw new ToolingStateFormatError("deferred", `Retained pre-protocol consumer ${legacy.consumerKind}:${legacy.consumerId} cannot read ${key.family} version ${input.version}`);
+  const written = existing ?? await tx.toolingStateWrite.create({ data: { repositoryId: row.repositoryId, taskId: row.taskId, ...key, version: input.version, preservesUnknown: format.preservesUnknown, operationId: row.id, releaseId: row.releaseId } });
   return { version: written.version, preservesUnknown: written.preservesUnknown, operationId: written.operationId, releaseId: written.releaseId, sequence: written.sequence };
+}
+
+export async function registerToolingStateWrite(input: { prisma: PrismaClient } & StateWriteInput): Promise<ToolingStateVersion> {
+  const attempt = () => input.prisma.$transaction(tx => registerToolingStateWriteInTransaction(tx, input));
+  try { return await attempt(); }
+  catch (error) { if (!isUniqueViolation(error)) throw error; return attempt(); }
 }
 
 export type ToolingLegacyConsumerState =
@@ -537,7 +541,7 @@ export async function readToolingLegacyBoundary(input: { prisma: PrismaClient; r
 
 /** CAS retained -> resolved with the existing protocol evidence that the
  * legacy consumer finished. The row and its original snapshot are kept. */
-export async function resolveToolingLegacyConsumer(input: { prisma: PrismaClient; id: string; evidence: { kind: string; reference: string } }): Promise<void> {
+export async function resolveToolingLegacyConsumer(input: { prisma: Pick<PrismaClient, "toolingLegacyConsumer">; id: string; evidence: { kind: string; reference: string } }): Promise<void> {
   const evidence = Evidence.safeParse(input.evidence);
   if (!evidence.success) throw new ToolingOperationError("evidence-required", "Resolving a legacy consumer requires its existing protocol evidence");
   const updated = await input.prisma.toolingLegacyConsumer.updateMany({ where: { id: input.id, status: "retained" }, data: { status: "resolved", resolution: evidence.data, resolvedAt: new Date() } });
