@@ -3,6 +3,7 @@ import type { RepositoryConfig } from "../../../../lib/config.ts";
 import type { ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
 import { composeForPrompt, withToolingInstructions } from "../../../../lib/skills/compose.ts";
 import { prepareTooling } from "./tooling.ts";
+import { verifyStoredToolingRelease } from "./tooling-release-verification.ts";
 import { describeUnavailableSkills, resolveToolingCompatibility } from "./tooling-compatibility.ts";
 
 const credentialRecovery = "If required development credentials appear missing, the owning primary can call resolve_tooling_capability with capability development-credentials. This resolves only the owner-configured committed recovery instructions and adapter without repinning the task. Inspect names and integrity before claiming missing access; export only task-required keys into a private task file, never print values or use production fallback, and verify the actual provider operation. Resolution does not itself decrypt or export anything.";
@@ -26,6 +27,7 @@ export async function prepareTaskPrompt(input: {
   /** The selection the task was pinned from. Its already prepared immutable
    * checkout is used as-is; preparation never reinstalls a release. */
   release?: ToolingReleaseRecord | null;
+  verifyRelease?: typeof verifyStoredToolingRelease;
   /** Test seam; production resolves the named capability. */
   resolveCompatibility?: typeof resolveToolingCompatibility;
   /** A read-only planning launch: fallbacks report the blocker, never repair. */
@@ -43,6 +45,14 @@ export async function prepareTaskPrompt(input: {
     if (!updated.count) throw new TaskPreparationUnavailable();
   };
   await assertAvailable();
+  if (release) {
+    try { await (input.verifyRelease ?? verifyStoredToolingRelease)(input.prisma, release); }
+    catch (error) {
+      await writeOpen({ phase: "blocked", environmentStatus: "degraded", recoveryDetail: `Selected tooling verification failed: ${error instanceof Error ? error.message : String(error)}` });
+      // Never compose fallback instructions from a failed immutable checkout.
+      throw error;
+    }
+  }
   let toolingRoot: string | undefined;
   try {
     toolingRoot = release ? release.checkout : await prepareTooling({ ...input.repository, tooling: { root: task.toolingRoot, revision: task.toolingRevision } }, input.installRoot);

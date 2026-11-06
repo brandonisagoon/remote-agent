@@ -7,7 +7,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { isCurrentMergeApproval } from "../tasks/completion.ts";
 import { bindSourceTurn, sourceReplyInstructions } from "./source-messages.ts";
 import { deliverMessageControls } from "./message-controls.ts";
-import { prepareSourceToolingTurn } from "./tooling-turn.ts";
+import { prepareSourceToolingTurn, recordSourceToolingFailure } from "./tooling-turn.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 
 const active = new WeakMap<AgentSessionRuntime, Set<string>>();
@@ -223,7 +223,8 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         try {
           if (config) toolingTurn = await prepareSourceToolingTurn({ prisma, config, receipt, requestId });
         } catch (error) {
-          console.warn(`Source instruction ${receipt.id} awaits tooling reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+          if (await recordSourceToolingFailure(prisma, receipt, error))
+            console.warn(`Source instruction ${receipt.id} awaits tooling reconciliation: ${error instanceof Error ? error.message : String(error)}`);
           continue;
         }
         running.add(receipt.id);

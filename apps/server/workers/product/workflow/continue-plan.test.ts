@@ -316,17 +316,31 @@ test("a new plan continuation adopts the selected release and retries its record
     manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
   await db.prisma.toolingSelection.create({ data: { repositoryId: f.input.context.config.repository.id, releaseId: "selected", generation: 4, activatedAt: new Date() } });
   const originalSwitch = f.runtime.switchAgent;
+  const selectedInput = { ...f.input, verifyRelease: async () => {} }; // Synthetic checkout; integrity refusal is tested separately.
   f.runtime.switchAgent = async () => { throw new Error("Synthetic preparation interruption"); };
-  expect((await continuePlanningSession(f.input))?.status).toBe("failed");
+  expect((await continuePlanningSession(selectedInput))?.status).toBe("failed");
   expect(f.compositions[0]?.[4]).toBe("/prepared/release-b");
   const evidence = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "workflow-continuation" } });
   expect(JSON.parse(evidence.value!).tooling).toEqual({ releaseId: "selected", generation: 4, revision: "b".repeat(40) });
   await db.prisma.toolingSelection.update({ where: { repositoryId: f.input.context.config.repository.id }, data: { generation: 5 } });
   f.runtime.switchAgent = originalSwitch;
-  expect((await continuePlanningSession(f.input))?.status).toBe("delivered");
+  expect((await continuePlanningSession(selectedInput))?.status).toBe("delivered");
   await f.settle();
   expect(f.compositions).toHaveLength(1);
   const retained = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.originalTask.id } });
   expect(retained.toolingRevision).toBe(f.originalTask.toolingRevision);
   expect(retained.pinnedToolingRoot).toBe(f.originalTask.pinnedToolingRoot);
+});
+
+
+test("a missing selected checkout is refused before plan composition or provider changes", async () => {
+  const f = await fixture();
+  await db.prisma.toolingRelease.create({ data: { id: "unavailable", repositoryId: f.input.context.config.repository.id,
+    revision: "b".repeat(40), tree: "c".repeat(40), policyBlob: "d".repeat(40), checkout: "/missing/dra27-fixture",
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  await db.prisma.toolingSelection.create({ data: { repositoryId: f.input.context.config.repository.id, releaseId: "unavailable", generation: 1, activatedAt: new Date() } });
+  expect((await continuePlanningSession(f.input))?.status).toBe("failed");
+  expect(f.compositions).toHaveLength(0);
+  expect(f.calls).toHaveLength(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
 });

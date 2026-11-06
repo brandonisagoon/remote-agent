@@ -4,6 +4,7 @@ import type { WorkerContext, WorkerResult } from "../../../../../types/dispatche
 import { deliverInstructions } from "../../../services/sessions/inbox.ts";
 import { taskForSession } from "../../../services/tasks/store.ts";
 import { getActiveToolingRelease } from "../../../services/tasks/tooling-releases.ts";
+import { verifyStoredToolingRelease } from "../../../services/tasks/tooling-release-verification.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 
 const continuing = new Set<string>();
@@ -20,6 +21,7 @@ export async function continuePlanningSession(input: {
   /** Durable launch-intent provenance, recorded before provider changes. */
   intent?: Record<string, unknown>;
   compose?: typeof composeForPrompt;
+  verifyRelease?: typeof verifyStoredToolingRelease;
   /** The runtime owner drains the durable inbox; maintenance callers can
    * leave delivery to that owner's existing loop. */
   wakeDelivery?: () => Promise<void>;
@@ -87,6 +89,7 @@ export async function continuePlanningSession(input: {
     // A new continuation is an independent preparation boundary. A retry
     // preserves its already-recorded prompt/provider and original task pin.
     const selection = task && !previous ? await getActiveToolingRelease({ prisma, config, repositoryId: task.repositoryId }) : null;
+    if (selection) await (input.verifyRelease ?? verifyStoredToolingRelease)(prisma, selection.release);
     const prompt = previous?.text ?? await (input.compose ?? composeForPrompt)(
       session.cwd,
       input.seed({ previousWorkflowId: session.workflowId, ...(task ? { taskId: task.id, branchName: task.branchName } : {}) }),

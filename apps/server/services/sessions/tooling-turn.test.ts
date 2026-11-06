@@ -5,7 +5,10 @@ import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { withToolingInstructions } from "../../../../lib/skills/compose.ts";
-import { prepareSourceToolingTurn } from "./tooling-turn.ts";
+import { prepareSourceToolingTurn, recordSourceToolingFailure } from "./tooling-turn.ts";
+
+import { resolveTaskInstruction } from "./inbox.ts";
+import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 
 let db: TestDatabase, root: string;
 const config = testConfig();
@@ -22,7 +25,7 @@ async function fixture() {
   return db.prisma.runtimeInstruction.create({ data: { id: "message", sessionId: "owner", sourceMessageId: "source", text } });
 }
 async function activate() { await db.prisma.toolingSelection.create({ data: { repositoryId: "repo", releaseId: "release-b", generation: 1, activatedAt: new Date() } }); }
-const prepare = (receipt: Awaited<ReturnType<typeof fixture>>) => prepareSourceToolingTurn({ prisma: db.prisma, config, receipt, requestId: "turn" }, { verify: async () => {} });
+const prepare = (receipt: Awaited<ReturnType<typeof fixture>>) => prepareSourceToolingTurn({ prisma: db.prisma, config, receipt, requestId: receipt.id }, { verify: async () => {} });
 
 test("a queued owner turn adopts B with durable instructions while A pin and ingress remain unchanged", async () => {
   const receipt = await fixture(); await activate();
@@ -31,9 +34,9 @@ test("a queued owner turn adopts B with durable instructions while A pin and ing
   expect(turn.text).toContain("Owner request remains verbatim");
   await db.prisma.$transaction(async tx => {
     expect(await turn.claim(tx)).toBe(true);
-    await tx.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "dispatching", executionRequestId: "turn" } });
+    await tx.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "dispatching", executionRequestId: receipt.id } });
   });
-  const recorded = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { source: "tooling-turn", key: "turn" } });
+  const recorded = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { source: "tooling-turn", key: receipt.id } });
   expect(JSON.parse(recorded.value!)).toMatchObject({ releaseId: "release-b", generation: 1, text: turn.text, sourceMessageId: "source" });
   expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } })).text).toBe(receipt.text);
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).toolingRevision).toBe("a".repeat(40));
@@ -59,6 +62,69 @@ test("synthetic continuations never adopt the current release and unavailable pr
   expect(synthetic.text).toBe(receipt.text);
   const broken = { ...receipt, text: receipt.text.replace("Instructions A", "Unverifiable old policy") };
   await expect(prepare(broken)).rejects.toThrow("verifiable original tooling prefix");
-  await expect(prepareSourceToolingTurn({ prisma: db.prisma, config, receipt, requestId: "turn" }, { verify: async () => { throw new Error("tampered checkout"); } })).rejects.toThrow("tampered checkout");
+  await expect(prepareSourceToolingTurn({ prisma: db.prisma, config, receipt, requestId: receipt.id }, { verify: async () => { throw new Error("tampered checkout"); } })).rejects.toThrow("tampered checkout");
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } })).ownerPaused).toBe(false);
+});
+
+
+async function authorizeRetry(receipt: Awaited<ReturnType<typeof fixture>>) {
+  await db.prisma.runtimeSourceMessage.create({ data: { id: "source", provider: "linear", connectionId: "fixture", repositoryId: "repo", machineId: config.machine,
+    resourceId: "issue", resourceIdentifier: "DRA-fixture", commentId: "comment", threadRootId: "comment", authorId: "owner", body: "Owner request", presentation: {}, state: "attention" } });
+  const runtime = createFakeAgentRuntime([{ id: "owner", cwd: path.join(root, "product"), repositoryId: "repo", machineId: config.machine }]);
+  runtime.reconcileInterruptedSession = async id => (await runtime.getSession(id))!;
+  await resolveTaskInstruction(db.prisma, runtime, { taskId: "task", instructionId: receipt.id, action: "retry", reason: "Owner verified prior attempt stopped", requestKey: "owner-retry", ownerAuthenticated: true });
+  const decision = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "instruction-resolved" } });
+  return { receipt: await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } }), requestId: `${receipt.id}:retry:${decision.sequence}` };
+}
+
+test("an owner-authorized retry preserves its recorded release after activation and claims once", async () => {
+  const receipt = await fixture(); await activate();
+  const first = await prepare(receipt);
+  await db.prisma.$transaction(async tx => {
+    expect(await first.claim(tx)).toBe(true);
+    await tx.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "unknown", executionRequestId: receipt.id } });
+  });
+  const released = await db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: "release-b" } });
+  await db.prisma.toolingRelease.create({ data: { ...released, manifest: {}, id: "release-c", revision: "e".repeat(40) } });
+  await db.prisma.toolingSelection.update({ where: { repositoryId: "repo" }, data: { releaseId: "release-c", generation: 2 } });
+  const retry = await authorizeRetry(receipt);
+  const prepared = await prepareSourceToolingTurn({ prisma: db.prisma, config, ...retry }, { verify: async release => { expect(release.revision).toBe("b".repeat(40)); } });
+  expect(prepared.text).toBe(first.text);
+  const claim = () => db.prisma.$transaction(async tx => {
+    if (!(await prepared.claim(tx))) return false;
+    await tx.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "dispatching", executionRequestId: retry.requestId } });
+    return true;
+  });
+  expect(await claim()).toBe(true);
+  expect(await claim()).toBe(false);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } })).text).toBe(receipt.text);
+});
+
+test("a retry predating release selection adopts current code only with a matching durable owner decision", async () => {
+  const receipt = await fixture();
+  await db.prisma.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "unknown", executionRequestId: "old-turn" } });
+  await activate();
+  const retry = await authorizeRetry(receipt);
+  await expect(prepareSourceToolingTurn({ prisma: db.prisma, config, ...retry, requestId: "invented-retry" }, { verify: async () => {} })).rejects.toThrow("unstarted");
+  const prepared = await prepareSourceToolingTurn({ prisma: db.prisma, config, ...retry }, { verify: async () => {} });
+  expect(prepared.text).toContain("Instructions B");
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  expect(await db.prisma.$transaction(tx => prepared.claim(tx))).toBe(false);
+});
+
+test("a failed checkout has a durable idempotent diagnosis and the queued message recovers", async () => {
+  const receipt = await fixture(); await activate();
+  const failure = new Error("Selected checkout is tampered");
+  await expect(prepareSourceToolingTurn({ prisma: db.prisma, config, receipt, requestId: receipt.id }, { verify: async () => { throw failure; } })).rejects.toThrow("tampered");
+  expect(await recordSourceToolingFailure(db.prisma, receipt, failure)).toBe(true);
+  const diagnosed = await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } });
+  expect(diagnosed).toMatchObject({ state: "queued", detail: "Tooling adoption needs attention: Selected checkout is tampered" });
+  expect(await recordSourceToolingFailure(db.prisma, diagnosed, failure)).toBe(false);
+  const recovered = await prepare(diagnosed);
+  await db.prisma.$transaction(async tx => {
+    expect(await recovered.claim(tx)).toBe(true);
+    await tx.runtimeInstruction.update({ where: { id: receipt.id }, data: { state: "dispatching", detail: null, executionRequestId: receipt.id } });
+  });
+  expect(await recordSourceToolingFailure(db.prisma, diagnosed, failure)).toBe(false);
+  expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: receipt.id } })).detail).toBeNull();
 });

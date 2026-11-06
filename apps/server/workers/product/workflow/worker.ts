@@ -52,6 +52,7 @@ export interface WorkflowWorkerDependencies {
   forward?: typeof forwardMessage;
   hasLiveSession?: typeof hasLivePersistentSessionForResource;
   continuePlan?: typeof continuePlanningSession;
+  verifyRelease?: Parameters<typeof prepareTaskPrompt>[0]["verifyRelease"];
 }
 
 /** The fetched issue; its change time and state type order the trigger. */
@@ -251,7 +252,7 @@ export function createWorkflowWorker(
       // A planning primary is an existing conversation to continue, not a
       // duplicate implementation launch. Resolve it before the generic guard.
       const continuation = await (dependencies.continuePlan ?? continuePlanningSession)({
-        context, workflow, issueIdentifier: issue.identifier, compose: dependencies.compose,
+        context, workflow, issueIdentifier: issue.identifier, compose: dependencies.compose, verifyRelease: dependencies.verifyRelease,
         intent: launchIntentRecord(intent),
         seed: ({ previousWorkflowId, ...details }) => buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
           details, continuation: { kind: "plan", previousWorkflowId } }),
@@ -359,7 +360,7 @@ export function createWorkflowWorker(
         const seed = buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
           details: { branchName, ...(task ? { taskId: task.id } : {}) }, preparation: Boolean(task) });
         const { prompt, toolingRoot } = task
-          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose, planning: intent.mode === "planning", release: selection?.release ?? null })
+          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose, planning: intent.mode === "planning", release: selection?.release ?? null, verifyRelease: dependencies.verifyRelease })
           : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
         await (dependencies.assertLaunch ?? assertNativeLaunch)(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueIdentifier: issue.identifier }, context.runId);
         // Composition can take a while: an owner pause or closure saved

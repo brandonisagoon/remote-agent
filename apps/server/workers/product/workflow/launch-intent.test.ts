@@ -134,7 +134,7 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
     return db!.prisma.workerRun.findFirstOrThrow({ where: { receiptId: receipt.id } });
   };
   return { config, repository, runtime, modes, compositions, composedRoots, execute, deliver, launchText, issue, prisma: db.prisma,
-    failNextEnsure: () => { failEnsure = true; }, onCompose: (hook: () => Promise<void>) => { beforeCompose = hook; } };
+    failNextEnsure: () => { failEnsure = true; }, onVerifyRelease: (verify: WorkflowWorkerDependencies["verifyRelease"]) => { dependencies.verifyRelease = verify; }, onCompose: (hook: () => Promise<void>) => { beforeCompose = hook; } };
 }
 
 function split(text: string) {
@@ -464,6 +464,7 @@ test("a planning launch whose composition fails dispatches the read-only blocker
 
 test("fresh workflow uses the selected immutable release while retry preserves its task pin", async () => {
   const f = await fixture("Planning only — historical filing note");
+  f.onVerifyRelease(async () => {}); // This selection fixture has no installed checkout.
   const bootRevision = f.repository.tooling.revision;
   writeFileSync(path.join(f.repository.root, "release-b.txt"), "release B");
   git(f.repository.root, "add", "."); git(f.repository.root, "commit", "-qm", "release B");
@@ -490,4 +491,22 @@ test("fresh workflow uses the selected immutable release while retry preserves i
   expect(await f.prisma.remoteTask.count()).toBe(1);
   expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toolingRevision).toBe(selectedRevision);
   expect(await f.prisma.runtimeInstruction.count({ where: { id: "launch:run-1" } })).toBe(1);
+});
+
+test("a selected checkout failing integrity cannot run the fresh-launch composer or fallback", async () => {
+  const f = await fixture("Implement the approved fix");
+  const revision = f.repository.tooling.revision;
+  const release = { id: "missing-release", repositoryId: f.repository.id, revision,
+    tree: "c".repeat(40), policyBlob: "d".repeat(40), checkout: path.join(directory!, "missing-checkout"),
+    manifest: { contract: "remote-agent.tooling-release/v1" as const, serverProtocol: { min: 1, max: 1 }, stateFormats: {} } };
+  await f.prisma.toolingRelease.create({ data: { ...release, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  const task = await beginTask(f.prisma, { requestKey: "integrity-launch", repository: f.repository, machineId: f.config.machine, branchName: "codex/integrity" });
+  let composed = false, fallback = false;
+  await expect(prepareTaskPrompt({ prisma: f.prisma, task, repository: f.repository, installRoot: f.config.installRoot,
+    worktreePath: f.repository.root, provider: "codex", seed: "Implement", release,
+    compose: async () => { composed = true; return "must not run"; },
+    resolveCompatibility: async () => { fallback = true; throw new Error("must not run"); },
+  })).rejects.toThrow();
+  expect(composed).toBe(false); expect(fallback).toBe(false);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toMatchObject({ phase: "blocked", environmentStatus: "degraded", pinnedToolingRoot: null });
 });
