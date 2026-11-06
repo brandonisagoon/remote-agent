@@ -32,7 +32,12 @@ export async function readToolingDeploymentState(databaseUrl: string): Promise<T
           serverProtocol: ReleaseProtocol.parse(JSON.parse(value.manifest)).serverProtocol };
       });
       const operations = await tx.execute("SELECT DISTINCT protocol FROM ToolingOperation WHERE status != 'completed' ORDER BY protocol");
-      return { selections, retainedProtocols: operations.rows.map(row => z.number().int().nonnegative().parse(row.protocol)) };
+      const retainedTable = await tx.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ToolingRetainedConsumer'");
+      const consumers = retainedTable.rows.length
+        ? (await tx.execute("SELECT DISTINCT protocol FROM ToolingRetainedConsumer WHERE status IN ('pending', 'confirmed') ORDER BY protocol")).rows : [];
+      // Producing callbacks can be complete while their resources still run.
+      // A server rollback must continue to understand those retained readers.
+      return { selections, retainedProtocols: [...new Set([...operations.rows, ...consumers].map(row => z.number().int().nonnegative().parse(row.protocol)))].sort((a, b) => a - b) };
     } finally { await tx.rollback(); }
   } finally { client.close(); }
 }

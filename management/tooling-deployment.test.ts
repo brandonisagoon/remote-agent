@@ -63,6 +63,22 @@ test("doctor reports differing config refs without changing the durable selectio
   } finally { f.client.close(); }
 });
 
+test("a consumer retains its protocol after its producer completes until physical resolution", async () => {
+  const f = await fixture();
+  try {
+    await f.client.execute("CREATE TABLE ToolingRetainedConsumer (id TEXT PRIMARY KEY, protocol INTEGER, status TEXT)");
+    await f.client.execute("INSERT INTO ToolingOperation VALUES ('producer', 2, 'completed')");
+    await f.client.execute("INSERT INTO ToolingRetainedConsumer VALUES ('resource', 2, 'pending')");
+    expect((await readToolingDeploymentState(f.databaseUrl)).retainedProtocols).toEqual([2]);
+    await expect(assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: f.current })).rejects.toThrow("retained tooling operation protocol");
+    await f.client.execute("UPDATE ToolingRetainedConsumer SET status = 'confirmed'");
+    await expect(assertToolingSnapshotRestoreSafe(f.databaseUrl)).rejects.toThrow("database rewind refused");
+    await f.client.execute("UPDATE ToolingRetainedConsumer SET status = 'resolved'");
+    await assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: f.current });
+    expect((await readToolingDeploymentState(f.databaseUrl)).retainedProtocols).toEqual([]);
+  } finally { f.client.close(); }
+});
+
 test("missing database is never created and corrupt selection fails closed", async () => {
   const f = await fixture();
   try {
