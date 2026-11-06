@@ -16,7 +16,8 @@ export class ToolingActivationError extends Error {
   constructor(readonly code: ToolingActivationErrorCode, message: string, readonly detail?: { generation?: number; release?: ToolingReleaseRecord }) { super(message); }
 }
 export type ToolingOperationErrorCode = "invalid-request" | "ownership" | "no-active-release" | "request-conflict" | "unsupported-protocol"
-  | "not-found" | "invalid-transition" | "transition-conflict" | "evidence-required" | "invalid-parent" | "parent-unavailable";
+  | "not-found" | "invalid-transition" | "transition-conflict" | "evidence-required" | "invalid-parent" | "parent-unavailable"
+  | "operation-closed" | "consumer-unavailable";
 /** The only operation kind that may parent callback bindings. */
 export const ADAPTER_COMMAND_KIND = "adapter-command";
 export class ToolingOperationError extends Error {
@@ -27,7 +28,7 @@ export class ToolingOperationError extends Error {
  * read only version 1; they are never treated as preserving unknown data. */
 export const LEGACY_STATE_FORMATS: Readonly<Record<string, ToolingStateFormat>> = { "drafted.runtime": { read: [1], write: 1, preservesUnknown: false } };
 
-type Store = Pick<PrismaClient, "toolingRelease" | "toolingSelection" | "toolingActivation" | "toolingOperation" | "toolingStateWrite" | "toolingLegacyBoundary" | "toolingLegacyConsumer">;
+type Store = Pick<PrismaClient, "toolingRelease" | "toolingSelection" | "toolingActivation" | "toolingOperation" | "toolingStateWrite" | "toolingLegacyBoundary" | "toolingLegacyConsumer" | "toolingRetainedConsumer">;
 const UNIQUE_VIOLATION = "P2002";
 const isUniqueViolation = (error: unknown) => typeof error === "object" && error !== null && (error as { code?: unknown }).code === UNIQUE_VIOLATION;
 
@@ -67,6 +68,8 @@ const ActivationRequest = z.strictObject({
   expectedGeneration: z.number().int().min(0),
 });
 const RETAINED = ["bound", "running", "unknown"];
+/** Retained consumers that still execute their producing release. */
+const LIVE_CONSUMER = ["pending", "confirmed"];
 
 /** Latest actual written format per task/family/scope across a repository. */
 async function latestStateWrites(store: Pick<Store, "toolingStateWrite">, where: { repositoryId?: string; taskId?: string; family?: string; scopeKey?: string }) {
@@ -87,6 +90,17 @@ async function assertStateFormats(store: Store, repositoryId: string, candidate:
     if (!format.read.includes(version)) throw new ToolingActivationError("state-format-incompatible", `${candidate.revision} cannot read ${family} version ${version}, required by ${why}`);
   };
   for (const row of await latestStateWrites(store, { repositoryId })) need(row.family, row.version, `task ${row.taskId} state ${row.scopeKey}`);
+  // A retained consumer keeps executing its producing release, which may still
+  // persist any version it declares writable; the candidate must read those.
+  const retainedConsumers = await store.toolingRetainedConsumer.findMany({ where: { repositoryId, status: { in: LIVE_CONSUMER } }, select: { releaseId: true }, distinct: ["releaseId"], take: 1001 });
+  if (retainedConsumers.length > 1000) throw new ToolingActivationError("state-format-incompatible", "Retained consumer inventory exceeds its bound");
+  for (const { releaseId } of retainedConsumers) {
+    const retained = record(await store.toolingRelease.findUniqueOrThrow({ where: { id: releaseId } }));
+    if (retained.revision === candidate.revision) continue;
+    for (const [family, format] of Object.entries(retained.manifest.stateFormats)) {
+      for (const version of format.writeVersions ?? [format.write]) need(family, version, `retained consumers of release ${retained.revision}`);
+    }
+  }
   if (await store.toolingLegacyConsumer.count({ where: { repositoryId, status: "retained" } })) {
     for (const [family, format] of Object.entries(LEGACY_STATE_FORMATS)) need(family, format.write, "retained pre-protocol consumers");
   }
@@ -250,6 +264,21 @@ async function binding(store: Store, row: ToolingOperation): Promise<ToolingOper
  * returns its original binding (historical identity, regardless of later
  * activations or parent lifecycle); current authority stays with the route. */
 export async function bindToolingOperation(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; sessionId: string; turnId: string | null; request: BeginToolingOperationRequest }): Promise<ToolingOperationBinding> {
+  return bindOperation(input, null);
+}
+
+/** Server-only: bind a server-started continuation of a confirmed retained
+ * consumer. It inherits that consumer's producing release, generation and
+ * protocol, even after its producer completed or a newer release became
+ * active. Callers (DRA-29) verify domain intent, pause and owner; this is
+ * never exposed as caller-selected release in the begin route. */
+export async function bindRetainedToolingOperation(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; sessionId: string; turnId: string | null; request: BeginToolingOperationRequest; retainedConsumerId: string }): Promise<ToolingOperationBinding> {
+  if (typeof input.retainedConsumerId !== "string" || !input.retainedConsumerId || input.retainedConsumerId.length > 256) throw new ToolingOperationError("invalid-request", "Invalid retained consumer identity");
+  if (input.request.parentOperationId) throw new ToolingOperationError("invalid-request", "A retained continuation cannot also name a parent operation");
+  return bindOperation(input, input.retainedConsumerId);
+}
+
+async function bindOperation(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; sessionId: string; turnId: string | null; request: BeginToolingOperationRequest }, retainedConsumerId: string | null): Promise<ToolingOperationBinding> {
   const parsed = OperationRequest.safeParse(input.request);
   if (!parsed.success) throw new ToolingOperationError("invalid-request", parsed.error.issues.map(issue => issue.message).join("; "));
   const request = parsed.data;
@@ -263,7 +292,7 @@ export async function bindToolingOperation(input: { prisma: PrismaClient; config
     if (!row) return null;
     if (row.sessionId !== session.id || row.kind !== request.kind || row.inputDigest !== request.inputDigest
       || row.existingOperationId !== (request.existingOperationId ?? null) || row.parentOperationId !== (request.parentOperationId ?? null)
-      || row.resourceKey !== (request.resourceKey ?? null)) {
+      || row.retainedConsumerId !== retainedConsumerId || row.resourceKey !== (request.resourceKey ?? null)) {
       throw new ToolingOperationError("request-conflict", "Operation request key was already used with a different request");
     }
     return binding(store, row);
@@ -275,7 +304,12 @@ export async function bindToolingOperation(input: { prisma: PrismaClient; config
       const raced = await retained(tx);
       if (raced) return raced;
       let inherited: { releaseId: string; generation: number; protocol: number };
-      if (request.parentOperationId) {
+      if (retainedConsumerId) {
+        const consumer = await tx.toolingRetainedConsumer.findUnique({ where: { id: retainedConsumerId } });
+        if (!consumer || consumer.taskId !== task.id || consumer.repositoryId !== task.repositoryId) throw new ToolingOperationError("ownership", "Retained consumer belongs to another task or repository");
+        if (consumer.status !== "confirmed") throw new ToolingOperationError("consumer-unavailable", `Retained consumer is ${consumer.status}; only a confirmed consumer can start a continuation`);
+        inherited = { releaseId: consumer.releaseId, generation: consumer.generation, protocol: consumer.protocol };
+      } else if (request.parentOperationId) {
         // A callback executes its command's immutable release, read inside this
         // transaction; the active selection is never consulted for a child.
         const parent = await tx.toolingOperation.findUnique({ where: { id: request.parentOperationId } });
@@ -293,7 +327,7 @@ export async function bindToolingOperation(input: { prisma: PrismaClient; config
       }
       const row = await tx.toolingOperation.create({ data: { id: randomUUID(), taskId: task.id, requestKey: request.requestKey, inputDigest: request.inputDigest, kind: request.kind,
         repositoryId: task.repositoryId, sessionId: session.id, turnId: input.turnId, existingOperationId: request.existingOperationId ?? null,
-        parentOperationId: request.parentOperationId ?? null, resourceKey: request.resourceKey ?? null, ...inherited } });
+        parentOperationId: request.parentOperationId ?? null, retainedConsumerId, resourceKey: request.resourceKey ?? null, ...inherited } });
       return binding(tx, row);
     });
   } catch (error) {
@@ -399,6 +433,11 @@ export async function registerToolingStateWrite(input: { prisma: PrismaClient; o
       const reader = record(await tx.toolingRelease.findUniqueOrThrow({ where: { id: other.releaseId } })).manifest.stateFormats[key.family];
       if (!reader || !reader.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Unfinished operation ${other.id} cannot read ${key.family} version ${input.version}; defer this write until it finishes`);
     }
+    // Retained consumers keep reading after their producing operation completes.
+    for (const reader of await retainedReaders(tx, row.taskId, key.family, key.scopeKey)) {
+      if (reader.releaseId === row.releaseId) continue;
+      if (!reader.format || !reader.format.read.includes(input.version)) throw new ToolingStateFormatError("deferred", `Retained ${reader.consumerKind} ${reader.consumerId} (release ${reader.revision}) cannot read ${key.family} version ${input.version}; defer this write until it is resolved`);
+    }
     const legacyReader = LEGACY_STATE_FORMATS[key.family];
     const legacy = await tx.toolingLegacyConsumer.findFirst({ where: { repositoryId: row.repositoryId, taskId: row.taskId, status: "retained" } });
     if (legacy && (!legacyReader || !legacyReader.read.includes(input.version))) throw new ToolingStateFormatError("deferred", `Retained pre-protocol consumer ${legacy.consumerKind}:${legacy.consumerId} cannot read ${key.family} version ${input.version}`);
@@ -442,4 +481,138 @@ export async function resolveToolingLegacyConsumer(input: { prisma: PrismaClient
   if (!evidence.success) throw new ToolingOperationError("evidence-required", "Resolving a legacy consumer requires its existing protocol evidence");
   const updated = await input.prisma.toolingLegacyConsumer.updateMany({ where: { id: input.id, status: "retained" }, data: { status: "resolved", resolution: evidence.data, resolvedAt: new Date() } });
   if (updated.count !== 1) throw new ToolingOperationError((await input.prisma.toolingLegacyConsumer.findUnique({ where: { id: input.id } })) ? "transition-conflict" : "not-found", "Legacy consumer is not retained");
+}
+
+export type ToolingRetainedConsumerStatus = "pending" | "confirmed" | "resolved";
+export interface ToolingRetainedConsumer {
+  id: string;
+  operationId: string;
+  taskId: string;
+  repositoryId: string;
+  consumerKind: string;
+  consumerId: string;
+  scopeKey: string;
+  generation: number;
+  protocol: number;
+  release: ToolingReleaseRecord;
+  status: ToolingRetainedConsumerStatus;
+  evidence: { kind: string; reference: string } | null;
+  resolution: { kind: string; reference: string } | null;
+}
+/** One live retained reader of a state. `format` null is an explicit blocker
+ * (its release does not declare the family), never an empty consumer. */
+export interface ToolingRetainedReader {
+  id: string;
+  operationId: string;
+  consumerKind: string;
+  consumerId: string;
+  scopeKey: string;
+  status: "pending" | "confirmed";
+  releaseId: string;
+  revision: string;
+  generation: number;
+  format: ToolingStateFormat | null;
+}
+const ConsumerInput = z.strictObject({ consumerKind: Identifier, consumerId: z.string().min(1).max(512), scopeKey: z.string().min(1).max(512) });
+const StoredEvidence = Evidence.nullable();
+
+async function consumerRecord(store: Pick<Store, "toolingRelease">, row: Awaited<ReturnType<Store["toolingRetainedConsumer"]["findUniqueOrThrow"]>>): Promise<ToolingRetainedConsumer> {
+  return { id: row.id, operationId: row.operationId, taskId: row.taskId, repositoryId: row.repositoryId, consumerKind: row.consumerKind, consumerId: row.consumerId, scopeKey: row.scopeKey,
+    generation: row.generation, protocol: row.protocol, release: record(await store.toolingRelease.findUniqueOrThrow({ where: { id: row.releaseId } })),
+    status: z.enum(["pending", "confirmed", "resolved"]).parse(row.status), evidence: StoredEvidence.parse(row.evidence ?? null), resolution: StoredEvidence.parse(row.resolution ?? null) };
+}
+
+async function retainedReaders(store: Pick<Store, "toolingRetainedConsumer" | "toolingRelease">, taskId: string, family: string, scopeKey: string): Promise<ToolingRetainedReader[]> {
+  const rows = await store.toolingRetainedConsumer.findMany({ where: { taskId, status: { in: LIVE_CONSUMER }, ...(scopeKey === "task" ? {} : { scopeKey: { in: [scopeKey, "task"] } }) },
+    orderBy: { createdAt: "asc" }, take: 1001 });
+  if (rows.length > 1000) throw new ToolingStateFormatError("deferred", `Retained consumer inventory for task ${taskId} exceeds its bound`);
+  const releases = new Map<string, ToolingReleaseRecord>();
+  const readers: ToolingRetainedReader[] = [];
+  for (const row of rows) {
+    const release = releases.get(row.releaseId) ?? record(await store.toolingRelease.findUniqueOrThrow({ where: { id: row.releaseId } }));
+    releases.set(row.releaseId, release);
+    readers.push({ id: row.id, operationId: row.operationId, consumerKind: row.consumerKind, consumerId: row.consumerId, scopeKey: row.scopeKey, status: row.status as "pending" | "confirmed",
+      releaseId: row.releaseId, revision: release.revision, generation: row.generation, format: release.manifest.stateFormats[family] ?? null });
+  }
+  return readers;
+}
+
+/** Record, before its effect, that a resource/observer/process will keep
+ * executing this operation's release. Idempotent per operation and consumer;
+ * task, repository, release, generation and protocol come from the stored
+ * operation. Several producers' rows may be pending at once. */
+export async function retainToolingConsumer(input: { prisma: PrismaClient; operationId: string; consumerKind: string; consumerId: string; scopeKey: string }): Promise<ToolingRetainedConsumer> {
+  const parsed = ConsumerInput.safeParse({ consumerKind: input.consumerKind, consumerId: input.consumerId, scopeKey: input.scopeKey });
+  if (!parsed.success) throw new ToolingOperationError("invalid-request", parsed.error.issues.map(issue => issue.message).join("; "));
+  const value = parsed.data;
+  const existing = async (store: Store) => {
+    const row = await store.toolingRetainedConsumer.findUnique({ where: { operationId_consumerKind_consumerId: { operationId: input.operationId, consumerKind: value.consumerKind, consumerId: value.consumerId } } });
+    if (row && row.scopeKey !== value.scopeKey) throw new ToolingOperationError("request-conflict", "Retained consumer was already recorded with a different state scope");
+    return row ? consumerRecord(store, row) : null;
+  };
+  const prior = await existing(input.prisma);
+  if (prior) return prior;
+  try {
+    return await input.prisma.$transaction(async (tx) => {
+      const raced = await existing(tx);
+      if (raced) return raced;
+      const operation = await tx.toolingOperation.findUnique({ where: { id: input.operationId } });
+      if (!operation) throw new ToolingOperationError("not-found", "Tooling operation not found");
+      if (operation.status !== "bound" && operation.status !== "running") throw new ToolingOperationError("operation-closed", `Operation ${operation.id} is ${operation.status}; retain consumers before its effect`);
+      const row = await tx.toolingRetainedConsumer.create({ data: { id: randomUUID(), operationId: operation.id, repositoryId: operation.repositoryId, taskId: operation.taskId, ...value,
+        releaseId: operation.releaseId, generation: operation.generation, protocol: operation.protocol } });
+      return consumerRecord(tx, row);
+    });
+  } catch (error) {
+    if (!isUniqueViolation(error)) throw error;
+    const winner = await existing(input.prisma);
+    if (winner) return winner;
+    throw error;
+  }
+}
+
+const sameEvidence = (stored: unknown, evidence: { kind: string; reference: string }) => StoredEvidence.safeParse(stored ?? null).data?.kind === evidence.kind && StoredEvidence.safeParse(stored ?? null).data?.reference === evidence.reference;
+
+/** pending -> confirmed after the caller verified the original protocol
+ * evidence. Atomically resolves the previously confirmed producer of the same
+ * task/kind/consumer only; other pending (uncertain) rows stay retained. */
+export async function confirmToolingConsumer(input: { prisma: PrismaClient; id: string; evidence: { kind: string; reference: string } }): Promise<ToolingRetainedConsumer> {
+  const evidence = Evidence.safeParse(input.evidence);
+  if (!evidence.success) throw new ToolingOperationError("evidence-required", "Confirming a retained consumer requires its original protocol evidence");
+  return input.prisma.$transaction(async (tx) => {
+    const row = await tx.toolingRetainedConsumer.findUnique({ where: { id: input.id } });
+    if (!row) throw new ToolingOperationError("not-found", "Retained consumer not found");
+    if (row.status === "confirmed" && sameEvidence(row.evidence, evidence.data)) return consumerRecord(tx, row);
+    const now = new Date();
+    if ((await tx.toolingRetainedConsumer.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "confirmed", evidence: evidence.data, confirmedAt: now } })).count !== 1) {
+      throw new ToolingOperationError("transition-conflict", `Retained consumer is ${row.status}, not pending`);
+    }
+    await tx.toolingRetainedConsumer.updateMany({ where: { taskId: row.taskId, consumerKind: row.consumerKind, consumerId: row.consumerId, status: "confirmed", id: { not: row.id } },
+      data: { status: "resolved", resolution: { kind: "superseded", reference: row.id }, resolvedAt: now } });
+    return consumerRecord(tx, await tx.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: row.id } }));
+  });
+}
+
+/** pending|confirmed -> resolved with proof that the consumer failed, had no
+ * effect, stopped or is absent. The row and its snapshot are kept. */
+export async function resolveToolingConsumer(input: { prisma: PrismaClient; id: string; evidence: { kind: string; reference: string } }): Promise<ToolingRetainedConsumer> {
+  const evidence = Evidence.safeParse(input.evidence);
+  if (!evidence.success) throw new ToolingOperationError("evidence-required", "Resolving a retained consumer requires its protocol evidence");
+  return input.prisma.$transaction(async (tx) => {
+    const row = await tx.toolingRetainedConsumer.findUnique({ where: { id: input.id } });
+    if (!row) throw new ToolingOperationError("not-found", "Retained consumer not found");
+    if (row.status === "resolved" && sameEvidence(row.resolution, evidence.data)) return consumerRecord(tx, row);
+    if ((await tx.toolingRetainedConsumer.updateMany({ where: { id: row.id, status: { in: LIVE_CONSUMER } }, data: { status: "resolved", resolution: evidence.data, resolvedAt: new Date() } })).count !== 1) {
+      throw new ToolingOperationError("transition-conflict", `Retained consumer is ${row.status}`);
+    }
+    return consumerRecord(tx, await tx.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: row.id } }));
+  });
+}
+
+/** Bounded live (pending/confirmed) retained readers of one task state, with
+ * their exact release format. Scope "task" matches every row; a resource
+ * scope matches its own rows and task-global rows. */
+export async function readToolingRetainedConsumers(input: { prisma: PrismaClient; taskId: string; family: string; scopeKey: string }): Promise<ToolingRetainedReader[]> {
+  const key = StateKey.parse({ family: input.family, scopeKey: input.scopeKey });
+  return retainedReaders(input.prisma, input.taskId, key.family, key.scopeKey);
 }

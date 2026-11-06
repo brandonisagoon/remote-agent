@@ -58,6 +58,9 @@ model ToolingOperation {
   /// Adapter-command binding this callback inherited its release from; null
   /// for a root operation. Never a provider-resource ID.
   parentOperationId   String?
+  /// Confirmed retained consumer this server-started continuation inherited
+  /// its release from; null otherwise. Independent of parentOperationId.
+  retainedConsumerId  String?
   resourceKey         String?
   generation          Int
   releaseId           String
@@ -70,6 +73,7 @@ model ToolingOperation {
 
   @@unique([taskId, requestKey])
   @@index([parentOperationId])
+  @@index([retainedConsumerId])
   @@index([releaseId, status])
   @@index([repositoryId, status])
 }
@@ -123,5 +127,34 @@ model ToolingLegacyConsumer {
 
   @@unique([repositoryId, consumerKind, consumerId])
   @@index([taskId, status])
+  @@index([repositoryId, status])
+}
+
+/// A resource/observer/process that keeps running its producing operation's
+/// release after that operation completes. Retention ends only by proven
+/// resolution or by a newer confirmed producer of the same consumer; rows are
+/// never deleted (audit retained after resolution).
+model ToolingRetainedConsumer {
+  id           String    @id
+  operationId  String
+  repositoryId String
+  taskId       String
+  consumerKind String
+  consumerId   String
+  scopeKey     String
+  releaseId    String
+  generation   Int
+  protocol     Int
+  status       String    @default("pending")
+  evidence     Json?
+  resolution   Json?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  confirmedAt  DateTime?
+  resolvedAt   DateTime?
+
+  @@unique([operationId, consumerKind, consumerId])
+  @@index([taskId, status])
+  @@index([taskId, consumerKind, consumerId, status])
   @@index([repositoryId, status])
 }

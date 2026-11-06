@@ -46,6 +46,7 @@ CREATE TABLE "ToolingOperation" (
     "turnId" TEXT,
     "existingOperationId" TEXT,
     "parentOperationId" TEXT,
+    "retainedConsumerId" TEXT,
     "resourceKey" TEXT,
     "generation" INTEGER NOT NULL,
     "releaseId" TEXT NOT NULL,
@@ -96,6 +97,27 @@ CREATE TABLE "ToolingLegacyConsumer" (
     "resolvedAt" DATETIME
 );
 
+-- CreateTable
+CREATE TABLE "ToolingRetainedConsumer" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "operationId" TEXT NOT NULL,
+    "repositoryId" TEXT NOT NULL,
+    "taskId" TEXT NOT NULL,
+    "consumerKind" TEXT NOT NULL,
+    "consumerId" TEXT NOT NULL,
+    "scopeKey" TEXT NOT NULL,
+    "releaseId" TEXT NOT NULL,
+    "generation" INTEGER NOT NULL,
+    "protocol" INTEGER NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'pending',
+    "evidence" JSONB,
+    "resolution" JSONB,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL,
+    "confirmedAt" DATETIME,
+    "resolvedAt" DATETIME
+);
+
 -- CreateIndex
 CREATE UNIQUE INDEX "ToolingRelease_repositoryId_revision_key" ON "ToolingRelease"("repositoryId", "revision");
 
@@ -104,6 +126,9 @@ CREATE INDEX "ToolingActivation_repositoryId_generation_idx" ON "ToolingActivati
 
 -- CreateIndex
 CREATE INDEX "ToolingOperation_parentOperationId_idx" ON "ToolingOperation"("parentOperationId");
+
+-- CreateIndex
+CREATE INDEX "ToolingOperation_retainedConsumerId_idx" ON "ToolingOperation"("retainedConsumerId");
 
 -- CreateIndex
 CREATE INDEX "ToolingOperation_releaseId_status_idx" ON "ToolingOperation"("releaseId", "status");
@@ -134,4 +159,16 @@ CREATE INDEX "ToolingLegacyConsumer_repositoryId_status_idx" ON "ToolingLegacyCo
 
 -- CreateIndex
 CREATE UNIQUE INDEX "ToolingLegacyConsumer_repositoryId_consumerKind_consumerId_key" ON "ToolingLegacyConsumer"("repositoryId", "consumerKind", "consumerId");
+
+-- CreateIndex
+CREATE INDEX "ToolingRetainedConsumer_taskId_status_idx" ON "ToolingRetainedConsumer"("taskId", "status");
+
+-- CreateIndex
+CREATE INDEX "ToolingRetainedConsumer_taskId_consumerKind_consumerId_status_idx" ON "ToolingRetainedConsumer"("taskId", "consumerKind", "consumerId", "status");
+
+-- CreateIndex
+CREATE INDEX "ToolingRetainedConsumer_repositoryId_status_idx" ON "ToolingRetainedConsumer"("repositoryId", "status");
+
+-- CreateIndex
+CREATE UNIQUE INDEX "ToolingRetainedConsumer_operationId_consumerKind_consumerId_key" ON "ToolingRetainedConsumer"("operationId", "consumerKind", "consumerId");
 

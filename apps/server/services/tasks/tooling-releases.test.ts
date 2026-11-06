@@ -9,6 +9,7 @@ import { testConfig } from "../../../../test-support/config.ts";
 import { acquirePreparationLock, prepareToolingRelease, verifyPreparedToolingRelease, type PrepareToolingReleaseInput } from "./tooling.ts";
 import { activateToolingRelease, assertBootToolingPolicy, assertToolingStateReadable, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary,
   readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, registerToolingStateWrite, resolveToolingLegacyConsumer, transitionToolingOperation,
+  bindRetainedToolingOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
   type ToolingLegacyConsumerInput } from "./tooling-releases.ts";
 
 // Real Git repositories and SQLite fixtures; keep hooks reliable on a loaded host.
@@ -303,6 +304,94 @@ test("callbacks inherit their open adapter command's release, never the active s
   await expect(bind(task, { requestKey: "cb2", kind: "compute-start", parentOperationId: command.operationId })).rejects.toMatchObject({ code: "parent-unavailable" });
   expect(await bind(task, { requestKey: "cb1", kind: "compute-start", parentOperationId: command.operationId })).toEqual(child);
   expect((await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))?.status).toBe("bound");
+});
+
+const opFor = (owner: { id: string; primarySessionId: string | null }, requestKey: string, kind = "compute-start") =>
+  bindToolingOperation({ prisma: db.prisma, config, taskId: owner.id, sessionId: owner.primarySessionId!, turnId: null, request: { requestKey, inputDigest: "7".repeat(64), kind } });
+const retain = (operationId: string, consumerId = "env-1", scopeKey = "runtime:development") =>
+  retainToolingConsumer({ prisma: db.prisma, operationId, consumerKind: "compute-environment", consumerId, scopeKey });
+
+test("retained consumers keep their release's readers after the producing callback completes", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  const producer = await opFor(task, "produce");
+  const consumer = await retain(producer.operationId);
+  expect(consumer).toMatchObject({ status: "pending", taskId: task.id, generation: 1, release: { revision: revisions.A } });
+  await confirmToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: producer.operationId, from: "bound", to: "completed", evidence });
+  // A may still persist v1 through its retained consumer: a v2-only candidate cannot read it.
+  await expect(activate("v2only", "v2only", 1)).rejects.toMatchObject({ code: "state-format-incompatible" });
+  expect((await activate("k2", "v2", 1)).generation).toBe(2);
+  const b = await opFor(task, "b-op");
+  const write = (scopeKey: string) => registerToolingStateWrite({ prisma: db.prisma, operationId: b.operationId, family: "drafted.runtime", scopeKey, version: 2 });
+  await expect(write("runtime:development")).rejects.toMatchObject({ code: "deferred" });
+  expect((await write("runtime:review")).version).toBe(2);
+  expect(await readToolingRetainedConsumers({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "runtime:development" }))
+    .toEqual([expect.objectContaining({ id: consumer.id, status: "confirmed", revision: revisions.A, format: { read: [1], write: 1, preservesUnknown: false } })]);
+  expect((await readToolingRetainedConsumers({ prisma: db.prisma, taskId: task.id, family: "drafted.other", scopeKey: "task" }))[0]?.format).toBeNull();
+  const resolved = await resolveToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence: { kind: "compute-absent", reference: "env-1" } });
+  expect(resolved).toMatchObject({ status: "resolved", resolution: { kind: "compute-absent", reference: "env-1" }, evidence });
+  expect((await write("runtime:development")).version).toBe(2);
+  expect(await readToolingRetainedConsumers({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "task" })).toEqual([]);
+  expect(await db.prisma.toolingRetainedConsumer.count()).toBe(1);
+});
+
+test("pending producers stay retained and confirmation supersedes only the confirmed producer", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  const [p1, p2, p3] = [await opFor(task, "p1"), await opFor(task, "p2"), await opFor(task, "p3")];
+  const r1 = await retain(p1.operationId);
+  const raced = await Promise.all([retain(p2.operationId), retain(p2.operationId)]);
+  expect(raced[0].id).toBe(raced[1].id);
+  const r2 = raced[0], r3 = await retain(p3.operationId);
+  expect(await retain(p1.operationId)).toEqual(r1);
+  await expect(retain(p1.operationId, "env-1", "runtime:review")).rejects.toMatchObject({ code: "request-conflict" });
+  await confirmToolingConsumer({ prisma: db.prisma, id: r1.id, evidence });
+  expect((await confirmToolingConsumer({ prisma: db.prisma, id: r1.id, evidence })).status).toBe("confirmed");
+  await expect(confirmToolingConsumer({ prisma: db.prisma, id: r1.id, evidence: { kind: "compute-claim", reference: "other" } })).rejects.toMatchObject({ code: "transition-conflict" });
+  await expect(confirmToolingConsumer({ prisma: db.prisma, id: r2.id, evidence: { kind: "", reference: "" } })).rejects.toMatchObject({ code: "evidence-required" });
+  await confirmToolingConsumer({ prisma: db.prisma, id: r2.id, evidence: { kind: "compute-claim", reference: "offer-2" } });
+  const statuses = async () => Object.fromEntries((await db.prisma.toolingRetainedConsumer.findMany()).map(row => [row.id, row.status]));
+  expect(await statuses()).toEqual({ [r1.id]: "resolved", [r2.id]: "confirmed", [r3.id]: "pending" });
+  expect((await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: r1.id } })).resolution).toEqual({ kind: "superseded", reference: r2.id });
+  await activate("k2", "v2", 1);
+  const b = await opFor(task, "b-op");
+  await resolveToolingConsumer({ prisma: db.prisma, id: r2.id, evidence: { kind: "compute-stopped", reference: "env-1" } });
+  // The uncertain pending producer still retains its A readers.
+  await expect(registerToolingStateWrite({ prisma: db.prisma, operationId: b.operationId, family: "drafted.runtime", scopeKey: "runtime:development", version: 2 })).rejects.toMatchObject({ code: "deferred" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: p1.operationId, from: "bound", to: "completed", evidence });
+  await expect(retain(p1.operationId, "env-9")).rejects.toMatchObject({ code: "operation-closed" });
+  expect(await retain(p1.operationId)).toMatchObject({ id: r1.id, status: "resolved" });
+  await expect(resolveToolingConsumer({ prisma: db.prisma, id: r1.id, evidence })).rejects.toMatchObject({ code: "transition-conflict" });
+  expect(await db.prisma.toolingRetainedConsumer.count()).toBe(3);
+});
+
+test("a confirmed retained consumer continues on its producing release after a newer activation", async () => {
+  const task = await ownedTask(), other = await ownedTask("task-2");
+  await activate("k1", "A", 0);
+  const producer = await opFor(task, "produce"), foreignProducer = await opFor(other, "produce");
+  const consumer = await retain(producer.operationId), foreign = await retain(foreignProducer.operationId, "env-2");
+  const continueWith = (retainedConsumerId: string, requestKey = "cont", owner = task, extra: object = {}) => bindRetainedToolingOperation({ prisma: db.prisma, config, taskId: owner.id,
+    sessionId: owner.primarySessionId!, turnId: null, request: { requestKey, inputDigest: "8".repeat(64), kind: "adapter-command", ...extra }, retainedConsumerId });
+  await expect(continueWith(consumer.id)).rejects.toMatchObject({ code: "consumer-unavailable" });
+  await confirmToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence });
+  await confirmToolingConsumer({ prisma: db.prisma, id: foreign.id, evidence });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: producer.operationId, from: "bound", to: "completed", evidence });
+  await activate("k2", "B", 1);
+  const continuation = await continueWith(consumer.id);
+  expect(continuation).toMatchObject({ generation: 1, release: { revision: revisions.A }, parentOperationId: null, kind: "adapter-command" });
+  const stored = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: continuation.operationId } });
+  expect(stored).toMatchObject({ retainedConsumerId: consumer.id, protocol: (await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: producer.operationId } })).protocol });
+  expect(await continueWith(consumer.id)).toEqual(continuation);
+  await expect(bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "cont", inputDigest: "8".repeat(64), kind: "adapter-command" } }))
+    .rejects.toMatchObject({ code: "request-conflict" });
+  await expect(continueWith(foreign.id)).rejects.toMatchObject({ code: "request-conflict" });
+  await expect(continueWith(foreign.id, "foreign")).rejects.toMatchObject({ code: "ownership" });
+  await expect(continueWith(consumer.id, "with-parent", task, { parentOperationId: producer.operationId })).rejects.toMatchObject({ code: "invalid-request" });
+  await resolveToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence: { kind: "compute-absent", reference: "env-1" } });
+  await expect(continueWith(consumer.id, "cont-2")).rejects.toMatchObject({ code: "consumer-unavailable" });
+  expect(await continueWith(consumer.id)).toEqual(continuation);
+  expect(await opFor(task, "fresh", "adapter-command")).toMatchObject({ generation: 2, release: { revision: revisions.B } });
 });
 
 test("incompatible writes are deferred only for the affected task state", async () => {
