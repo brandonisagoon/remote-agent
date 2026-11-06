@@ -456,9 +456,6 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
   policy(input); const request = ComputeRequest.parse(input.request);
   let pending = claimValidations.get(input.prisma);
   if (!pending) { pending = new Map(); claimValidations.set(input.prisma, pending); }
-  // The same in-flight validation is the same redemption.
-  const inFlight = pending.get(input.offerId);
-  if (inFlight) return inFlight as ReturnType<typeof finishComputeValidation>;
   // Persist timely intent and retain the existing slot before slow physical
   // reads. VALIDATING is never start authority; redeeming the same
   // reservation after a lost acknowledgment or restart is idempotent.
@@ -471,8 +468,13 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
     assertSavedComputeRequest(environment, saved);
     if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { completed: { offer, environment, resumed: true }, token: null }; }
     if (!["queued", "offered", "validating"].includes(offer.state)) throw new Error("Compute offer is expired or superseded");
+    // Join an in-flight redemption only after this caller's exact owner, task
+    // and recipe were verified above; never touch its token.
+    if (offer.state === "validating" && pending!.has(offer.id)) return { completed: null, token: null, join: true };
     if (!await store.computeSlot.findUnique({ where: { allocationId: offer.id } })) throw new Error("Compute reservation is unavailable");
     if (offer.state === "validating") {
+      // Redeem the same reservation and token; a concurrent redeemer of the
+      // same identity shares it rather than superseding it.
       const token = offer.validationToken ?? randomUUID();
       await store.computeOffer.update({ where: { id: offer.id }, data: { validationToken: token, validationExpiresAt: new Date(at(input).getTime() + COMPUTE_VALIDATION_MS) } });
       return { completed: null, token };
@@ -496,7 +498,10 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
   });
   if (reservation.completed) return reservation.completed;
   const existing = pending.get(input.offerId);
+  // Every caller reaching here passed its own exact identity checks.
   if (existing) return existing as ReturnType<typeof finishComputeValidation>;
+  // The joined validation finished in between: re-read its durable outcome.
+  if ("join" in reservation) return claimCompute(input, refresh);
   const work = finishComputeValidation(input, request, reservation.token!, refresh);
   pending.set(input.offerId, work);
   try { return await work; } finally { if (pending.get(input.offerId) === work) pending.delete(input.offerId); }
@@ -512,6 +517,8 @@ async function finishComputeValidation(input: ClaimInput, request: z.infer<typeo
       const { saved, ...recipe } = request;
       if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || Object.entries(recipe).some(([key, value]) => environment[key as keyof typeof recipe] !== value)) throw new Error("Compute claim identity changed during validation");
       assertSavedComputeRequest(environment, saved);
+      // A same-identity redeemer already completed this reservation.
+      if (["claimed", "running", "unknown"].includes(offer.state)) { await assertComputeStartIntent(store, input.taskId, environment.id, offer.id); return { offer, environment, resumed: true }; }
       // The token is the reservation's redemption identity; its deadline only
       // lets reconciliation reclaim a validation no longer running here.
       if (offer.state !== "validating" || offer.validationToken !== token) throw new Error("Compute validation expired or superseded");

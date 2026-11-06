@@ -35,38 +35,53 @@ async function start(offerInstructionId: string, at: Date) {
 const slots = () => db.prisma.computeSlot.count({ where: { allocationId: { not: null } } });
 const offerState = async (id: string) => (await db.prisma.computeOffer.findUniqueOrThrow({ where: { id } })).state;
 
-test("a >60s physical baseline neither expires a started assignment nor delays its delivery (real clock)", async () => {
-  await task("one", { now: new Date() });
-  const live = { prisma: db.prisma, machineId: "host", policy: settings, config: { machine: "host" } as ServerConfig, runtime: {} };
+// Deterministic form of the DRA-34 reproduction (root's real-clock run:
+// 65,728 ms scan, offer expired, delivery and claim unset). A gated scan is
+// held open while the injected clock passes every former deadline.
+test("a slow physical baseline neither expires a started assignment nor delays its delivery", async () => {
+  await task("one");
+  const live = (ms: number) => ({ ...context(ms), config: { machine: "host" } as ServerConfig, runtime: {} });
   const refresh = spyOn(baseline, "refreshComputeBaselines").mockImplementation(async () => ({ observed: 0, unavailable: 0 }) as never);
   try {
-    const offer = (await offerNextCompute(live))!;
+    const offer = (await offerNextCompute(live(0)))!;
     expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1); // reserved before dispatch
-    const startedAt = new Date();
-    await start(offer.instructionId, startedAt);
-    // A slow scan (here: a concurrent scheduler pass) is in flight for 65 s.
-    let entered!: () => void; const inScan = new Promise<void>(resolve => { entered = resolve; });
-    refresh.mockImplementation(async () => { entered(); await Bun.sleep(65_000); return { observed: 0, unavailable: 0 } as never; });
-    await task("two", { now: new Date() });
-    const scan = scheduleComputeOffers(live);
+    await start(offer.instructionId, began);
+    let entered!: () => void, release!: () => void;
+    const inScan = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+    refresh.mockImplementation(async () => { entered(); await gate; return { observed: 0, unavailable: 0 } as never; });
+    await task("two");
+    const scan = scheduleComputeOffers(live(1));
     await inScan;
-    const confirmStarted = Date.now();
-    const delivered = (await confirmComputeDelivery({ ...live, sessionId: "primary-one", requestId: offer.instructionId }))!;
-    expect(Date.now() - confirmStarted).toBeLessThan(5_000);
-    expect(delivered).toMatchObject({ state: "offered", deliveredAt: startedAt, expiresAt: null });
-    await scan;
-    const elapsed = Date.now() - startedAt.getTime();
-    expect(elapsed).toBeGreaterThan(60_000);
-    // Former 30 s dispatch and 60 s claim windows have both passed.
-    await reconcileComputeOffers(live);
+    // While the scan is held: delivery is recorded without waiting for it.
+    const delivered = (await confirmComputeDelivery({ ...live(65_728), sessionId: "primary-one", requestId: offer.instructionId }))!;
+    expect(delivered).toMatchObject({ state: "offered", deliveredAt: began, expiresAt: null });
+    await reconcileComputeOffers(live(3_600_000)); // far beyond the old 30 s / 60 s windows
     expect(await offerState(offer.id)).toBe("offered");
     expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+    release(); await scan;
     refresh.mockImplementation(async () => ({ observed: 0, unavailable: 0 }) as never);
-    const claimed = await claimCompute({ ...live, taskId: "one", offerId: offer.id, request });
-    expect(claimed.offer.state).toBe("claimed");
-    console.log(JSON.stringify({ dra34: "fixed", elapsedMs: elapsed, offer: "claimed", slotsHeld: await slots(), baselineCalls: refresh.mock.calls.length }));
+    expect((await claimCompute({ ...live(3_600_001), taskId: "one", offerId: offer.id, request })).offer.state).toBe("claimed");
+    expect(await slots()).toBe(1);
   } finally { refresh.mockRestore(); }
-}, 120_000);
+});
+
+test("an in-flight redemption is joined only by the same verified task and recipe", async () => {
+  await task("one"); await task("two");
+  const offer = (await offerNextCompute(context()))!; await start(offer.instructionId, began);
+  let entered!: () => void, release!: () => void;
+  const inValidation = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const first = claimCompute({ ...context(1), taskId: "one", offerId: offer.id, request }, async () => { entered(); await gate; });
+  await inValidation;
+  const foreignTask = claimCompute({ ...context(2), taskId: "two", offerId: offer.id, request }, async () => undefined);
+  const foreignRecipe = claimCompute({ ...context(2), taskId: "one", offerId: offer.id, request: { ...request, recipeDigest: "f".repeat(64) } }, async () => undefined);
+  const same = claimCompute({ ...context(2), taskId: "one", offerId: offer.id, request }, async () => undefined);
+  release();
+  const [a, b, c, d] = await Promise.allSettled([first, foreignTask, foreignRecipe, same]);
+  expect(a.status).toBe("fulfilled"); expect(d.status).toBe("fulfilled");
+  expect(b.status).toBe("rejected"); expect(c.status).toBe("rejected");
+  expect(await db.prisma.computeOffer.count({ where: { state: "claimed" } })).toBe(1);
+  expect(await slots()).toBe(1);
+});
 
 test("slow accounting never blocks ordinary inbox controls or delivery, and scheduler ticks coalesce", async () => {
   const config = { ...testConfig({ machine: "host" }), compute: settings } as ServerConfig;
