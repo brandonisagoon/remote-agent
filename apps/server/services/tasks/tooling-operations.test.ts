@@ -708,3 +708,23 @@ describe("settlement concurrency (review of f38d564)", () => {
     expect((await settle()).status).toBe(200);
   });
 });
+
+// Baseline evidence (pre-protocol 6f972beb vs this head, probe
+// /tmp/dra29-probe/closed-sweep.probe.test.ts): for a never-finalized closed
+// task the release guard blocks no previously accepted callback. Resource
+// receipts stay accepted header-less; closed browser/local stops stay refused.
+test("closed-task sweep callbacks keep their pre-protocol outcomes after activation", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt: new Date() } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  const resource = { key: "container", kind: "docker-container", purpose: "development", externalId: "c".repeat(64) };
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", ...resource } });
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", key: "browser", kind: "browser-profile", purpose: "browser", externalId: "/fixture/profile" } });
+  const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  const send = (method: string, route: string, body: unknown) => server.request(`http://localhost${route}`, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  expect((await send("PUT", "/api/sessions/primary/task/resources", { ...resource, state: "released" })).status).toBe(200);
+  expect((await send("POST", "/api/sessions/primary/browser-stop-authority", { key: "browser" })).status).toBe(428);
+  expect((await send("POST", "/api/sessions/primary/local-service-stop-authority", { key: "container" })).status).toBe(428);
+  // The command fence itself is what a closed sweep without cleanup lineage lacks.
+  await expect(begin(config, { requestKey: "upkeep-closed", inputDigest: canonicalDigest({ argv: ["upkeep", "closed"] }), kind: "adapter-command" })).rejects.toThrow(/original operation recorded before settled primary closure/);
+});
