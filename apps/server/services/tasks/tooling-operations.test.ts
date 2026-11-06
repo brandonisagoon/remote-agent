@@ -829,3 +829,32 @@ describe("closed legacy resource release replay and receipt limits (review of 48
     expect(await state()).toBe("released");
   });
 });
+
+test("closed runtime receipts accept the runtime writer's monotonic cleanup progress and nothing else", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt: new Date() } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+  const providers = [{ provider: "neon", id: "neon-1", name: "db", createdAt: "2030-01-01T00:00:00Z", released: false }, { provider: "redis", id: "redis-1", name: "cache", released: false }];
+  const identity = { recipeHash: "b".repeat(64), revision: "a".repeat(40), containerId: "c".repeat(64), dependencyVolume: "deps", network: { id: "n".repeat(64), createdAt: "x" } };
+  const runtime = { key: "runtime-development", kind: "task-runtime", purpose: "development", externalId: "/fixture/runtime.json" };
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", ...runtime, metadata: { ...identity, providers, observed: "ready", progress: null } } });
+  const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  const binding = (await begin(config, { requestKey: "release-runtime", inputDigest: canonicalDigest({ key: runtime.key, action: "release" }), kind: "closed-resource-release", resourceKey: runtime.key })).binding;
+  const put = (state: string, metadata: Record<string, unknown>) => server.request("http://localhost/api/sessions/primary/task/resources", { method: "PUT",
+    headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: binding.operationId }, body: JSON.stringify({ ...runtime, state, metadata }) });
+  const progress = { step: "release", detail: "Releasing providers", state: "running", updatedAt: new Date().toISOString() };
+  const released = (index: number) => providers.map((provider, at) => at <= index ? { ...provider, released: true } : provider);
+  // Each provider released in reverse order, with progress, as runtime.ts save() writes it.
+  expect((await put("allocated", { ...identity, providers: providers.map((provider, at) => at === 1 ? { ...provider, released: true } : provider), observed: "releasing", progress })).status).toBe(200);
+  expect((await put("allocated", { ...identity, providers: released(1), observed: "releasing", progress })).status).toBe(200);
+  // Refused: un-releasing, provider identity drift, dropped providers, identity drift, non-string observation, foreign progress shape.
+  expect((await put("allocated", { ...identity, providers, observed: "releasing", progress })).status).toBe(409);
+  expect((await put("allocated", { ...identity, providers: released(1).map(provider => ({ ...provider, id: `${provider.id}-other` })), observed: "releasing", progress })).status).toBe(409);
+  expect((await put("allocated", { ...identity, observed: "releasing", progress })).status).toBe(409);
+  expect((await put("allocated", { ...identity, containerId: "d".repeat(64), providers: released(1), observed: "releasing", progress })).status).toBe(409);
+  expect((await put("allocated", { ...identity, providers: released(1), observed: { arbitrary: true }, progress })).status).toBe(409);
+  expect((await put("allocated", { ...identity, providers: released(1), observed: "releasing", progress: { ...progress, extra: "x" } })).status).toBe(409);
+  // The final release and no resurrection.
+  expect((await put("released", { ...identity, providers: released(1), observed: "released", progress: { ...progress, state: "complete" } })).status).toBe(200);
+  expect((await put("ready", { ...identity, providers: released(1), observed: "ready", progress })).status).toBe(409);
+});

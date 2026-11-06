@@ -1109,19 +1109,41 @@ async function resolveIfClaimNotGranted(prisma: PrismaClient, id: string, body: 
 
 /** Inside the resource handler's own write transaction: a closed legacy
  * resource release may update only its exact receipt, never resurrect a
- * released one, change its expiry, or alter metadata beyond the adapter's
- * observation fields. (The ordinary cleanup update check does not apply to
- * never-finalized tasks, so these rules are the binding limits here.) */
-const OBSERVATION_FIELDS = new Set(["observed", "observedAt"]);
-export function assertClosedReleaseResourceUpdate(existing: { taskId: string; key: string; state: string; metadata: unknown; expiresAt: Date | null }, next: { state: string; metadata?: unknown; expiresAt: Date | null }) {
+ * released one or change its expiry, and may change metadata only as the
+ * existing cleanup writers do. (The ordinary cleanup update check does not
+ * apply to never-finalized tasks, so these rules are the binding limits.)
+ *  - every kind: `observed`/`observedAt` observation strings;
+ *  - task-runtime receipts (Drafted runtime.ts save): additionally the
+ *    `progress` record and monotonic provider release — the same providers,
+ *    in order, with identical identity, whose `released` only goes to true.
+ * All identity metadata (recipe, revision, container, volume, network,
+ * compute, review membership, provider IDs) stays exactly equal. */
+const ObservationString = z.string().max(4096);
+const RuntimeProgress = z.object({ step: z.string().max(512), detail: z.string().max(8192), state: z.enum(["running", "failed", "complete"]), updatedAt: z.string().max(64) }).strict().nullable();
+const RuntimeProvider = z.record(z.string(), z.unknown()).refine(value => value.released === undefined || typeof value.released === "boolean");
+function assertRuntimeProviderProgress(key: string, before: unknown, after: unknown) {
+  const previous = z.array(RuntimeProvider).safeParse(before), next = z.array(RuntimeProvider).safeParse(after);
+  if (!previous.success || !next.success || previous.data.length !== next.data.length) throw refuse("operation-mismatch", `A closed resource release cannot change ${key}'s providers`);
+  previous.data.forEach((provider, index) => {
+    const { released: was, ...identity } = provider, { released: now, ...current } = next.data[index]!;
+    const keys = new Set([...Object.keys(identity), ...Object.keys(current)]);
+    if ([...keys].some(field => JSON.stringify(identity[field]) !== JSON.stringify(current[field])) || was === true && now !== true) throw refuse("operation-mismatch", `A closed resource release can only mark ${key}'s existing providers released`);
+  });
+}
+export function assertClosedReleaseResourceUpdate(existing: { taskId: string; key: string; kind?: string; state: string; metadata: unknown; expiresAt: Date | null }, next: { state: string; metadata?: unknown; expiresAt: Date | null }) {
   const binding = currentToolingOperation();
   if (!binding || binding.kind !== CLOSED_RESOURCE_RELEASE_KIND) return;
   if (existing.taskId !== binding.taskId || existing.key !== binding.resourceKey) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
   if (existing.state === "released" && next.state !== "released") throw refuse("operation-mismatch", `Released resource ${existing.key} cannot be resurrected`);
   if ((existing.expiresAt?.getTime() ?? null) !== (next.expiresAt?.getTime() ?? null)) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key}'s expiry`);
-  if (next.metadata !== undefined) {
-    const before = (existing.metadata && typeof existing.metadata === "object" ? existing.metadata : {}) as Record<string, unknown>;
-    const after = (next.metadata && typeof next.metadata === "object" ? next.metadata : {}) as Record<string, unknown>;
-    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) if (!OBSERVATION_FIELDS.has(key) && JSON.stringify(before[key]) !== JSON.stringify(after[key])) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key} metadata ${key}`);
+  if (next.metadata === undefined) return;
+  const before = (existing.metadata && typeof existing.metadata === "object" ? existing.metadata : {}) as Record<string, unknown>;
+  const after = (next.metadata && typeof next.metadata === "object" ? next.metadata : {}) as Record<string, unknown>;
+  const runtime = existing.kind === "task-runtime";
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (key === "observed" || key === "observedAt") { if (key in after && !ObservationString.safeParse(after[key]).success) throw refuse("operation-mismatch", `A closed resource release records ${key} only as an observation string`); continue; }
+    if (runtime && key === "progress") { if (!RuntimeProgress.safeParse(after[key] ?? null).success) throw refuse("operation-mismatch", `A closed resource release records ${existing.key} progress only in its runtime shape`); continue; }
+    if (runtime && key === "providers") { assertRuntimeProviderProgress(existing.key, before[key], after[key]); continue; }
+    if (JSON.stringify(before[key]) !== JSON.stringify(after[key])) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key} metadata ${key}`);
   }
 }
