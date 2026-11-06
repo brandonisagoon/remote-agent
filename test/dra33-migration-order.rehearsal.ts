@@ -49,7 +49,9 @@ test("Prisma deploy adds an older pending migration without changing the later a
       expect(code).toBe(0);
     } finally { clearTimeout(timer); }
   };
-  const query = (sql: string) => { const db = new Database(database, { readonly: true }); try { return db.query(sql).all(); } finally { db.close(); } };
+  // This private fixture connection must be able to initialize WAL files after
+  // Prisma closes its last writer; read-only SQLite cannot recreate a missing WAL.
+  const query = (sql: string) => { const db = new Database(database); try { return db.query(sql).all(); } finally { db.close(); } };
   try {
     await deploy("before-tooling");
     const before = query('SELECT * FROM "_prisma_migrations" ORDER BY migration_name');
@@ -58,7 +60,9 @@ test("Prisma deploy adds an older pending migration without changing the later a
     expect(index.finished_at).not.toBeNull();
     expect(before.some((row: any) => row.migration_name === migrationName)).toBe(false);
     const db = new Database(database);
-    try { db.exec('CREATE TABLE "Dra33PreservedFixture" (id TEXT PRIMARY KEY, value TEXT NOT NULL)'); db.query('INSERT INTO "Dra33PreservedFixture" VALUES (?, ?)').run("retained", "preserve exact data"); } finally { db.close(); }
+    try {
+      expect(db.query('PRAGMA journal_mode=WAL').get()).toEqual({ journal_mode: "wal" });
+      db.exec('CREATE TABLE "Dra33PreservedFixture" (id TEXT PRIMARY KEY, value TEXT NOT NULL)'); db.query('INSERT INTO "Dra33PreservedFixture" VALUES (?, ?)').run("retained", "preserve exact data"); } finally { db.close(); }
     await cp(path.join(committed, migrationName), path.join(migrations, migrationName), { recursive: true });
     await deploy("add-earlier-tooling");
     const after = query('SELECT * FROM "_prisma_migrations" ORDER BY migration_name');
@@ -74,8 +78,11 @@ test("Prisma deploy adds an older pending migration without changing the later a
     expect(query("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'Tooling%'" )).toHaveLength(8);
     await deploy("idempotent-replay");
     expect(query('SELECT * FROM "_prisma_migrations" ORDER BY migration_name')).toEqual(after);
+    expect(query("PRAGMA journal_mode")).toEqual([{ journal_mode: "wal" }]);
+    expect(query("PRAGMA integrity_check")).toEqual([{ integrity_check: "ok" }]);
+    expect(query("PRAGMA foreign_key_check")).toEqual([]);
     expect(await sourceDigests()).toEqual(evidence.sourceDigests);
-    Object.assign(evidence, { passed: true, before, after, indexes, dataPreserved: true, replayUnchanged: true });
+    Object.assign(evidence, { passed: true, before, after, indexes, journalMode: "wal", integrityChecked: true, dataPreserved: true, replayUnchanged: true });
   } finally {
     await writeFile(path.join(directory, "evidence.json"), JSON.stringify(evidence, null, 2) + "\n", { mode: 0o600 });
     console.log(JSON.stringify({ evidence: path.join(directory, "evidence.json"), passed: evidence.passed }));

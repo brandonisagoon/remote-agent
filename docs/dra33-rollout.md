@@ -34,6 +34,15 @@ process or a green source gate alone is not deployed workflow acceptance.
    after the later index migration, unchanged prior ledger rows and replay.
    This disposable proof does not replace the executor's actual database,
    process and recovery rehearsal.
+   The tooling migration now wraps its additive DDL in an explicit transaction,
+   SHA-256 `526b16c7beed684686b83df0cd9179a50bbd3aaba03f160849de72d2fe673a0b`.
+   Before applying it, prove this migration is still pending in the target ledger.
+   Preserve any existing applied checksum; do not rewrite it to match this file.
+   A crash before DDL commit must leave no tooling objects; a crash after commit
+   but before ledger completion must leave the exact complete schema and empty
+   tooling tables. Any recovery through Prisma resolve requires the executor's
+   reviewed classification, stopped-holder proof and unchanged prior ledger.
+   The WAL-mode order/replay test is not a crash-recovery or live-cutover proof.
 3. Require a reviewed, bounded, no-cancel bootstrap drain before stopping the
    shared daemon. Deployed `6f972` has no supported global hold. Tooling callback
    admission is not a global drain; owner pause, shutdown cancellation and
