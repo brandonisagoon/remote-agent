@@ -1,12 +1,12 @@
-import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 import * as baseline from "./compute-baseline.ts";
-import { ComputeCapacityBlocked, claimCompute, computeAdmissionCapacity, confirmComputeDelivery, offerNextCompute, reconcileComputeOffers, requestCompute, scheduleComputeOffers } from "./compute-admission.ts";
-import { createInstructionTick } from "../sessions/inbox.ts";
+import { ComputeCapacityBlocked, claimCompute, computeAdmissionCapacity, computeInstructionAllows, confirmComputeDelivery, offerNextCompute, reconcileComputeOffers, requestCompute, scheduleComputeOffers } from "./compute-admission.ts";
+import { createInstructionTick, resolveTaskInstruction } from "../sessions/inbox.ts";
 
 /** DRA-34: assignments are reserved before dispatch, delivery is progress
  * only, and slow physical accounting can neither expire started work nor hold
@@ -257,4 +257,103 @@ test("a claim refused by accounting reports the exact blocking groups, distinct 
   expect(refused.blockers.allocations).toEqual([expect.objectContaining({ allocationId: offer.id })]);
   expect(await offerState(offer.id)).toBe("validating");
   expect(await db.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+});
+
+// Real-server finding (307bff7): an owner retry of a delivered compute-offer
+// turn interrupted by restart was never redelivered and held its slot.
+describe("owner retry of an interrupted delivered assignment", () => {
+  // The fake runtime plus the provider-liveness check resolveTaskInstruction requires.
+  const runtime = Object.assign(createFakeAgentRuntime(), { reconcileInterruptedSession: async (_sessionId: string) => {} });
+  async function interrupted() {
+    await task("one");
+    const offer = (await offerNextCompute(context()))!;
+    // Delivered in wall-clock time: the owner's later decision is recorded at
+    // its real time, and must follow the delivery it retries.
+    const instruction = await start(offer.instructionId, new Date(Date.now() - 60_000));
+    expect((await confirmComputeDelivery({ ...context(1), sessionId: instruction.sessionId, requestId: offer.instructionId }))!.state).toBe("offered");
+    // Restart: no terminal journal entry, so the inbox records the turn unknown.
+    await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "unknown" } });
+    await db.prisma.runtimeSession.update({ where: { id: instruction.sessionId }, data: { status: "idle" } });
+    return { offer, sessionId: instruction.sessionId, receipt: { id: offer.instructionId, sessionId: instruction.sessionId } };
+  }
+  const retry = (instructionId: string, requestKey: string) => resolveTaskInstruction(db.prisma, runtime, { taskId: "one", instructionId, action: "retry", reason: "owner retried the interrupted offer turn", requestKey });
+  const redispatch = async (instructionId: string, sessionId: string, at: Date) => {
+    const decision = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: sessionId, action: "instruction-resolved", key: instructionId }, orderBy: { sequence: "desc" } });
+    const requestId = `${instructionId}:retry:${decision.sequence}`;
+    await db.prisma.runtimeInstruction.update({ where: { id: instructionId }, data: { state: "dispatching", executionRequestId: requestId } });
+    await db.prisma.runtimeSession.update({ where: { id: sessionId }, data: { status: "active" } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: `${requestId}:started`, runtimeSessionId: sessionId, requestId, phase: "started", occurredAt: at } });
+    return requestId;
+  };
+
+  test("redispatches the same assignment on its same slot; confirmation, claim and repeated retry stay idempotent", async () => {
+    const { offer, sessionId, receipt } = await interrupted();
+    const slot = await db.prisma.computeSlot.findFirstOrThrow({ where: { allocationId: offer.id } });
+    expect(await computeInstructionAllows(db.prisma as never, receipt)).toBe(false); // Unknown, no owner decision.
+    await reconcileComputeOffers(context(600_000)); // No timer releases the uncertain turn's reservation.
+    expect(await offerState(offer.id)).toBe("offered");
+    await retry(offer.instructionId, "retry-1");
+    expect(await computeInstructionAllows(db.prisma as never, receipt, new Date(began.getTime() + 600_000))).toBe(true);
+    expect(await computeInstructionAllows(db.prisma as never, { ...receipt, sessionId: "foreign" })).toBe(false);
+    await reconcileComputeOffers(context(600_000)); // A queued retry keeps its reservation and is not cancelled.
+    expect(await offerState(offer.id)).toBe("offered");
+    expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: offer.instructionId } })).state).toBe("queued");
+    // Interrupted again: a second owner retry is again allowed, same slot.
+    await redispatch(offer.instructionId, sessionId, new Date(began.getTime() + 600_001));
+    await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "unknown" } });
+    await db.prisma.runtimeSession.update({ where: { id: sessionId }, data: { status: "idle" } });
+    await retry(offer.instructionId, "retry-2");
+    expect(await computeInstructionAllows(db.prisma as never, receipt, new Date(began.getTime() + 700_000))).toBe(true);
+    const requestId = await redispatch(offer.instructionId, sessionId, new Date(began.getTime() + 700_001));
+    const confirmed = await confirmComputeDelivery({ ...context(700_002), sessionId, requestId });
+    expect(confirmed).toMatchObject({ id: offer.id, state: "offered" });
+    const claimed = await claimCompute({ ...context(700_003), taskId: "one", offerId: offer.id, request }, async () => undefined);
+    expect(claimed.offer).toMatchObject({ id: offer.id, state: "claimed" });
+    expect((await claimCompute({ ...context(700_004), taskId: "one", offerId: offer.id, request }, async () => undefined)).resumed).toBe(true);
+    expect(await db.prisma.computeOffer.count()).toBe(1);
+    expect((await db.prisma.computeSlot.findMany({ where: { allocationId: { not: null } } })).map(value => value.id)).toEqual([slot.id]);
+  });
+
+  test("never redispatches without the retry, after pause, without the slot, or once claimed", async () => {
+    const { offer, sessionId, receipt } = await interrupted();
+    // An acknowledgment is a resolution, not a retry.
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: sessionId, source: "task-supervisor:one", action: "instruction-resolved", key: offer.instructionId,
+      value: JSON.stringify({ requestKey: null, action: "acknowledge", reason: "fixture" }) } });
+    await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "queued" } });
+    expect(await computeInstructionAllows(db.prisma as never, receipt)).toBe(false);
+    await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "unknown" } });
+    await retry(offer.instructionId, "retry-1");
+    // A released slot is never re-acquired by a retry.
+    const slot = await db.prisma.computeSlot.findFirstOrThrow({ where: { allocationId: offer.id } });
+    await db.prisma.computeSlot.update({ where: { id: slot.id }, data: { allocationId: null } });
+    expect(await computeInstructionAllows(db.prisma as never, receipt)).toBe(false);
+    await db.prisma.computeSlot.update({ where: { id: slot.id }, data: { allocationId: offer.id } });
+    // Pause: refused, then withdrawn with its queued retry and slot (pause kept).
+    await db.prisma.remoteTask.update({ where: { id: "one" }, data: { ownerPaused: true } });
+    expect(await computeInstructionAllows(db.prisma as never, receipt)).toBe(false);
+    await reconcileComputeOffers(context(1_000));
+    expect(await offerState(offer.id)).toBe("ineligible");
+    expect((await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: offer.instructionId } })).state).toBe("cancelled");
+    expect(await slots()).toBe(0);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "one" } })).ownerPaused).toBe(true);
+  });
+
+  test("a retry queued after the assignment was claimed is cancelled with its reason and the claim stays charged", async () => {
+    const { offer, sessionId, receipt } = await interrupted();
+    await retry(offer.instructionId, "retry-1");
+    const requestId = await redispatch(offer.instructionId, sessionId, new Date(began.getTime() + 2));
+    await claimCompute({ ...context(3), taskId: "one", offerId: offer.id, request }, async () => undefined);
+    // Interrupted after the claim and retried again by the owner.
+    await db.prisma.runtimeInstruction.update({ where: { id: offer.instructionId }, data: { state: "unknown" } });
+    await db.prisma.runtimeSession.update({ where: { id: sessionId }, data: { status: "idle" } });
+    await retry(offer.instructionId, "retry-2");
+    expect(requestId).toContain(":retry:");
+    expect(await computeInstructionAllows(db.prisma as never, receipt)).toBe(false);
+    await reconcileComputeOffers(context(4));
+    const instruction = await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: offer.instructionId } });
+    expect(instruction.state).toBe("cancelled");
+    expect(instruction.detail).toContain("already claimed");
+    expect(await offerState(offer.id)).toBe("claimed");
+    expect(await slots()).toBe(1);
+  });
 });

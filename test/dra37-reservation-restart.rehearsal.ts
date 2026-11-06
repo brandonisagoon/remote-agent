@@ -23,7 +23,8 @@
  * ended without a claim and the session is quiescent; owner pause withdraws
  * an unclaimed assignment and the claim is refused; restart after
  * reservation keeps the same assignment and slot; the owner retry of the
- * interrupted offer turn (recorded as observed); a client-side lost claim
+ * interrupted offer turn redelivers the same assignment on the same slot
+ * (required since the correction of the 307bff7 finding); a client-side lost claim
  * acknowledgment and a restart after startup intent redeem the same
  * assignment without extra slots; an unknown start stays charged and blocks
  * the waiter, with the diagnostic naming it.
@@ -70,7 +71,9 @@ export async function rehearseReservationRestart(receiptFile: string) {
   const server = await isolatedServer();
   const control = path.join(server.root, "provider-control");
   const evidence: Record<string, unknown> = { scope: "real isolated server, host compute with one slot, normal owner/control routes, synthetic barrier provider; no adapter, Docker, physical start or release activation",
-    serverRoot: server.root, tooling: { revision: a!.revision, checkout: a!.checkout }, sourceProvenance: await provenance(), steps: [], findings: [] };
+    serverRoot: server.root, tooling: { revision: a!.revision, checkout: a!.checkout }, sourceProvenance: await provenance(), steps: [], findings: [],
+    priorFinding: { commit: "307bff7", evidence: "/private/var/folders/ww/c4nh2mrs6r9936bwb0cmtwc00000gn/T/ra-server-C5ZUuO/reservation-restart.json",
+      sha256: "ecd500f99cf8a247c1b9b1424bd014d25eedaaf30ecea91e3898328364bace81", finding: "owner-retry-of-delivered-compute-offer-is-never-redelivered" } };
   const steps = evidence.steps as unknown[], findings = evidence.findings as unknown[];
   const resultFile = path.join(server.root, "reservation-restart.json");
   let passed = false;
@@ -216,24 +219,20 @@ export async function rehearseReservationRestart(receiptFile: string) {
     // Owner-authorized retry of the interrupted offer turn (recorded as observed).
     const retry = await call(await owner(`/api/tasks/${t1.id}/instructions/${encodeURIComponent(`compute-offer:${o3.offer}`)}/resolve`, { action: "retry", reason: "DRA-37 rehearsal: retry the interrupted compute-offer turn", requestKey: "retry-o3" }));
     steps.push({ action: "owner-retry-offer-turn", ...retry });
-    let claimOffer: { offer: string; n: number } | null = null;
-    try { claimOffer = await nextOffer(t1.id, "the retried offer turn", 15_000); } catch { claimOffer = null; }
-    if (!claimOffer) {
-      const instruction = await prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: `compute-offer:${o3.offer}` } });
-      state = await snapshot("retry-not-redelivered");
-      findings.push({ finding: "owner-retry-of-delivered-compute-offer-is-never-redelivered", retryStatus: retry.status, retryBody: retry.body,
-        instruction: { state: instruction.state, executionRequestId: instruction.executionRequestId, detail: instruction.detail },
-        offer: { id: o3.offer, state: await offerState(o3.offer) }, slotHolders: await slotHolders(),
-        explanation: "After retry the instruction is queued, but the inbox gate computeInstructionAllows dispatches a compute-offer instruction only while its offer is still `queued`; the delivered offer is `offered`, so the retry is never delivered. reconcileComputeOffers keeps an offered reservation while its instruction is non-terminal, so the slot stays held until the owner pauses the task." });
-      // Supported release: owner pause withdraws it; owner resume makes the task eligible again.
-      const pauseT1 = await call(await owner(`/api/tasks/${t1.id}/automation`, { action: "pause" }));
-      assert([200, 202].includes(pauseT1.status), JSON.stringify(pauseT1.body));
-      await until("the stuck reservation withdrawal by pause", async () => await offerState(o3.offer) === "ineligible");
-      steps.push({ action: "owner-pause-releases-stuck-reservation", offer: o3.offer, instruction: (await prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: `compute-offer:${o3.offer}` } })).state, slotHolders: await slotHolders() });
-      const resumeT1 = await call(await owner(`/api/tasks/${t1.id}/automation`, { action: "resume" }));
-      assert.equal(resumeT1.status, 200, JSON.stringify(resumeT1.body));
-      claimOffer = await nextOffer(t1.id, "the first task's assignment after resume");
-    }
+    // Required since the correction: the owner's retry redispatches the SAME
+    // delivered, unclaimed assignment on its SAME still-reserved slot (no
+    // pause/resume recovery, no second grant).
+    const claimOffer = await nextOffer(t1.id, "the retried offer turn on the same assignment", 30_000);
+    assert.equal(claimOffer.offer, o3.offer, "The retry redelivers the same assignment");
+    assert.equal(claimOffer.n, 2, "Second delivery of that assignment");
+    state = await snapshot("retry-redelivered");
+    assert.equal(await offerState(o3.offer), "offered");
+    assert.deepEqual(await slotHolders(), [o3.offer], "Same slot while the retry runs");
+    assert.equal(state.offers.length, offersBefore, "No second assignment");
+    const retried = await prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: `compute-offer:${o3.offer}` } });
+    const decision = await prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { runtimeSessionId: t1.sessionId, action: "instruction-resolved", key: retried.id }, orderBy: { sequence: "desc" } });
+    assert.equal(retried.executionRequestId, `${retried.id}:retry:${decision.sequence}`, "The redispatch runs under the owner's recorded retry attempt");
+    steps.push({ action: "retry-redispatched", offer: o3.offer, instruction: { state: retried.state, executionRequestId: retried.executionRequestId }, decision: { sequence: decision.sequence, value: decision.value } });
 
     // --- 5. Client-side lost claim acknowledgment: the retry redeems the same assignment.
     await decide(claimOffer.offer, claimOffer.n, { action: "claim", taskId: t1.id, request: requests[t1.id], times: 2 });

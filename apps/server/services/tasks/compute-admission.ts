@@ -329,6 +329,7 @@ export async function reconcileComputeOffers(input: Context) {
   policy(input); const now = at(input);
   const offers = await input.prisma.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "validating", "claimed"] } }, take: 1001 });
   if (offers.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
+  await settleUndispatchableRetries(input);
   for (const listed of offers) {
     await input.prisma.$transaction(async store => {
       const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: listed.id } });
@@ -371,6 +372,24 @@ export async function reconcileComputeOffers(input: Context) {
       // Delivered and unclaimed: held while the delivering turn runs.
       if (terminalInstruction.includes(instruction.state) && await sessionQuiescent(store, instruction.sessionId, input.runtime)) await withdraw(store, offer.id, "expired", now);
     });
+  }
+}
+
+/** An owner retry re-queues a previously dispatched offer turn. If its
+ * assignment was meanwhile claimed (startup intent: only the adapter's own
+ * idempotent claim continues it) or withdrawn, the retry can never dispatch;
+ * cancel it (compare-and-set on the still-queued instruction) with the reason
+ * instead of leaving it queued. Nothing here frees or changes a slot. */
+async function settleUndispatchableRetries(input: Context) {
+  const retried = await input.prisma.runtimeInstruction.findMany({ where: { id: { startsWith: "compute-offer:" }, state: "queued", executionRequestId: { not: null } }, take: 1001 });
+  if (retried.length > 1000) throw new Error("Compute retry reconciliation exceeds its bound");
+  for (const instruction of retried) {
+    const offer = await input.prisma.computeOffer.findUnique({ where: { instructionId: instruction.id } });
+    if (!offer || offer.machineId !== input.machineId || ["queued", "offered", "validating"].includes(offer.state)) continue;
+    const detail = ["claimed", "running", "unknown"].includes(offer.state)
+      ? `Compute assignment ${offer.id} is already ${offer.state}; its start continues only through the adapter's own claim, not a redelivered offer turn`
+      : `Compute assignment ${offer.id} was ${offer.state}; a retried offer turn cannot redeem it`;
+    await input.prisma.runtimeInstruction.updateMany({ where: { id: instruction.id, state: "queued", updatedAt: instruction.updatedAt }, data: { state: "cancelled", detail } });
   }
 }
 
@@ -581,10 +600,34 @@ export async function declineCompute(input: Context & { taskId: string; offerId:
 export async function computeInstructionAllows(store: Store, receipt: { id: string; sessionId: string }, now = new Date()) {
   if (!receipt.id.startsWith("compute-offer:")) return true;
   const offer = await store.computeOffer.findUnique({ where: { instructionId: receipt.id } });
-  if (!offer || offer.state !== "queued" || offer.dispatchDeadline <= now) return false;
+  if (!offer) return false;
   const environment = await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } });
   if (!environment || environment.primarySessionId !== receipt.sessionId) return false;
+  // A queued assignment dispatches before its deadline. A delivered,
+  // unclaimed one redispatches only for the owner's explicit retry of its
+  // interrupted turn, on its same still-reserved slot.
+  if (offer.state === "queued" ? offer.dispatchDeadline <= now : !(await ownerRetriesDeliveredOffer(store, offer, environment, receipt))) return false;
   try { await assertComputeEnvironmentOwner(store, environment); return true; } catch (error) { if (!(error instanceof ComputeOwnerUnavailable || error instanceof DevelopmentWorkUnavailable)) throw error; return false; }
+}
+
+const RetryDecision = z.object({ action: z.literal("retry") }).passthrough();
+/** Durable proof that the owner retried THIS delivered, unclaimed
+ * assignment's interrupted turn (resolveTaskInstruction verified the
+ * provider was not alive and recorded the decision): the same instruction is
+ * queued again after a real delivery, its latest supervisor decision is a
+ * retry made after that delivery, and the same slot is still reserved. A
+ * claimed, validating or withdrawn assignment is never redispatched. */
+async function ownerRetriesDeliveredOffer(store: Store, offer: { id: string; state: string; deliveredAt: Date | null; executionRequestId: string | null; machineId: string },
+  environment: ComputeEnvironment, receipt: { id: string; sessionId: string }) {
+  if (offer.state !== "offered" || !offer.deliveredAt || !offer.executionRequestId || offer.machineId !== environment.machineId) return false;
+  const instruction = await store.runtimeInstruction.findUnique({ where: { id: receipt.id } });
+  if (!instruction || instruction.sessionId !== receipt.sessionId || instruction.state !== "queued" || !instruction.executionRequestId) return false;
+  const decision = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: receipt.sessionId, source: `task-supervisor:${environment.taskId}`,
+    action: "instruction-resolved", key: receipt.id }, orderBy: { sequence: "desc" } });
+  let retry = false;
+  try { retry = RetryDecision.safeParse(JSON.parse(decision?.value ?? "null")).success; } catch { retry = false; }
+  if (!decision || !retry || decision.occurredAt < offer.deliveredAt) return false;
+  return Boolean(await store.computeSlot.findFirst({ where: { allocationId: offer.id, machineId: offer.machineId } }));
 }
 
 /** Binds the claimed slot to its first exact runtime receipt before any Docker
