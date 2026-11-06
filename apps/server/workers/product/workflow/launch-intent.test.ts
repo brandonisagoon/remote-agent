@@ -103,6 +103,7 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
   runtime.setMode = async (_id, mode) => { modes.push(mode); };
 
   const compositions: string[] = [];
+  const composedRoots: Array<string | undefined> = [];
   let beforeCompose: (() => Promise<void>) | undefined;
   const issue: WorkflowSourceIssue = { id: "issue-uuid", identifier: "DRA-16", title: "Point users to Send", description,
     branchName: "codex/dra-16", state: { name: "Todo", type: "unstarted" }, updatedAt: minutesAgo(10),
@@ -112,7 +113,8 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
     readComments: async () => overrides.comments === undefined ? [] : overrides.comments,
     react: async () => true,
     postWorktreeComment: async () => "posted" as never,
-    compose: async (_worktree, prompt, provider) => {
+    compose: async (_worktree, prompt, provider, _skillsRoot, toolingRoot) => {
+      composedRoots.push(toolingRoot);
       await beforeCompose?.();
       compositions.push(prompt);
       return prompt.replaceAll(/{{SKILL:([a-z0-9+-]+)}}/g, (_match, token) => provider === "claude" ? `/composed-${token}` : `$composed-${token}`);
@@ -131,7 +133,7 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
       { workers: [createWorkflowWorker(dependencies)], startRun: startWorkerRun, finishRun: finishWorkerRun, react: async () => true });
     return db!.prisma.workerRun.findFirstOrThrow({ where: { receiptId: receipt.id } });
   };
-  return { config, repository, runtime, modes, compositions, execute, deliver, launchText, issue, prisma: db.prisma,
+  return { config, repository, runtime, modes, compositions, composedRoots, execute, deliver, launchText, issue, prisma: db.prisma,
     failNextEnsure: () => { failEnsure = true; }, onCompose: (hook: () => Promise<void>) => { beforeCompose = hook; } };
 }
 
@@ -457,4 +459,35 @@ test("a planning launch whose composition fails dispatches the read-only blocker
   expect(text).not.toContain("Verify readiness before implementing");
   expect(f.modes).toEqual(["plan"]);
   expect((await f.prisma.remoteTask.findFirstOrThrow()).phase).toBe("blocked");
+});
+
+
+test("fresh workflow uses the selected immutable release while retry preserves its task pin", async () => {
+  const f = await fixture("Planning only — historical filing note");
+  const bootRevision = f.repository.tooling.revision;
+  writeFileSync(path.join(f.repository.root, "release-b.txt"), "release B");
+  git(f.repository.root, "add", "."); git(f.repository.root, "commit", "-qm", "release B");
+  const selectedRevision = git(f.repository.root, "rev-parse", "HEAD");
+  const checkout = path.join(directory!, "prepared-b"); mkdirSync(checkout);
+  await f.prisma.toolingRelease.create({ data: { id: "release-b", repositoryId: f.repository.id,
+    revision: selectedRevision, tree: git(f.repository.root, "rev-parse", "HEAD^{tree}"), policyBlob: "c".repeat(40), checkout,
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} },
+    lockfileDigest: "fixture", bunVersion: "fixture" } });
+  await f.prisma.toolingSelection.create({ data: { repositoryId: f.repository.id, releaseId: "release-b", generation: 1, activatedAt: new Date() } });
+  const first = await f.execute(reaction());
+  expect(first.status).not.toBe("failed");
+  const task = await f.prisma.remoteTask.findUniqueOrThrow({ where: { requestKey: "run-1" } });
+  expect(task.toolingRevision).toBe(selectedRevision);
+  expect(task.pinnedToolingRoot).toBe(checkout);
+  expect(f.composedRoots).toEqual([checkout]);
+  expect(await f.launchText()).toContain("authority: verified configured owner action");
+  // Durable retry keeps the original task and pin even after selection changes.
+  await f.prisma.toolingRelease.create({ data: { id: "release-a", repositoryId: f.repository.id,
+    revision: bootRevision, tree: "a".repeat(40), policyBlob: "c".repeat(40), checkout: f.repository.root,
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  await f.prisma.toolingSelection.update({ where: { repositoryId: f.repository.id }, data: { releaseId: "release-a", generation: 2 } });
+  await f.execute(reaction());
+  expect(await f.prisma.remoteTask.count()).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toolingRevision).toBe(selectedRevision);
+  expect(await f.prisma.runtimeInstruction.count({ where: { id: "launch:run-1" } })).toBe(1);
 });

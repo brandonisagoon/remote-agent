@@ -7,6 +7,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { isCurrentMergeApproval } from "../tasks/completion.ts";
 import { bindSourceTurn, sourceReplyInstructions } from "./source-messages.ts";
 import { deliverMessageControls } from "./message-controls.ts";
+import { prepareSourceToolingTurn } from "./tooling-turn.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
 
 const active = new WeakMap<AgentSessionRuntime, Set<string>>();
@@ -218,15 +219,23 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
           continue;
         }
         const requestId = await instructionRequestId(prisma, receipt);
+        let toolingTurn: Awaited<ReturnType<typeof prepareSourceToolingTurn>> | undefined;
+        try {
+          if (config) toolingTurn = await prepareSourceToolingTurn({ prisma, config, receipt, requestId });
+        } catch (error) {
+          console.warn(`Source instruction ${receipt.id} awaits tooling reconciliation: ${error instanceof Error ? error.message : String(error)}`);
+          continue;
+        }
         running.add(receipt.id);
         void (async () => {
           try {
-            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: receipt.text + (receipt.sourceMessageId ? sourceReplyInstructions(receipt.sourceMessageId) : ""), beforeStart: async () => {
+            const turn = runtime.startTurn({ sessionId: receipt.sessionId, requestId, text: (toolingTurn?.text ?? receipt.text) + (receipt.sourceMessageId ? sourceReplyInstructions(receipt.sourceMessageId) : ""), beforeStart: async () => {
               if (!(await sourceAuthorityAllows(prisma, config, receipt))) return false;
               return prisma.$transaction(async (tx) => {
               const currentTask = await tx.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
               if (currentTask && (currentTask.ownerPaused || currentTask.phase === "closed")) return false;
               if (!(await instructionAuthorityAllows(tx, receipt))) return false;
+              if (toolingTurn && !(await toolingTurn.claim(tx))) return false;
               const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null, executionRequestId: requestId } });
               if (claim.count && receipt.sourceMessageId) await bindSourceTurn(tx, receipt.sourceMessageId, receipt.sessionId, requestId);
               return claim.count > 0;

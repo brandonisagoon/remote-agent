@@ -22,6 +22,7 @@ import { branchTemplateFor, isSafeBranchName, renderBranchName, renderWorktreeNa
 import { buildWorkflowSessionName } from "./launch.ts";
 import { beginTask, taskForSession } from "../../../services/tasks/store.ts";
 import { prepareTaskPrompt } from "../../../services/tasks/preparation.ts";
+import { getActiveToolingRelease } from "../../../services/tasks/tooling-releases.ts";
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 import { continuePlanningSession } from "./continue-plan.ts";
 import { deliverManagedMerge } from "./merge-delivery.ts";
@@ -309,9 +310,11 @@ export function createWorkflowWorker(
       if (launching.has(lock)) return result(WorkerRunStatus.Existing, `launch request ${taskScope.requestKey} is already launching in this process`, issue.identifier);
       launching.add(lock);
       try {
+      const selection = repository.tooling ? await getActiveToolingRelease({ prisma: context.prisma, config: context.config, repositoryId: repository.id }) : null;
       const task = repository.tooling ? await beginTask(context.prisma, {
         requestKey: taskScope.requestKey,
         repository,
+        selection,
         machineId: context.config.machine,
         connectionId: context.config.activeConnectionId,
         issueIdentifier: issue.identifier,
@@ -356,7 +359,7 @@ export function createWorkflowWorker(
         const seed = buildWorkflowLaunchPrompt({ workflow, intent, issue: launchIssue, ordering,
           details: { branchName, ...(task ? { taskId: task.id } : {}) }, preparation: Boolean(task) });
         const { prompt, toolingRoot } = task
-          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose, planning: intent.mode === "planning" })
+          ? await prepareTaskPrompt({ prisma: context.prisma, task, repository, installRoot: context.config.installRoot, worktreePath, provider, seed, compose: dependencies.compose, planning: intent.mode === "planning", release: selection?.release ?? null })
           : { prompt: await (dependencies.compose ?? composeForPrompt)(worktreePath, seed, provider, repository.skillsRoot, worktreePath), toolingRoot: worktreePath };
         await (dependencies.assertLaunch ?? assertNativeLaunch)(context.prisma, { connectionId: context.config.activeConnectionId, repositoryId: repository.id, issueIdentifier: issue.identifier }, context.runId);
         // Composition can take a while: an owner pause or closure saved

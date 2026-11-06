@@ -3,6 +3,7 @@ import { composeForPrompt } from "../../../../../lib/skills/compose.ts";
 import type { WorkerContext, WorkerResult } from "../../../../../types/dispatcher/index.ts";
 import { deliverInstructions } from "../../../services/sessions/inbox.ts";
 import { taskForSession } from "../../../services/tasks/store.ts";
+import { getActiveToolingRelease } from "../../../services/tasks/tooling-releases.ts";
 import { buildWorkflowSessionName } from "./launch.ts";
 
 const continuing = new Set<string>();
@@ -83,10 +84,13 @@ export async function continuePlanningSession(input: {
     const original = recorded?.value ? JSON.parse(recorded.value) as { provider?: "codex" | "claude"; model?: string | null } : null;
     const provider = original?.provider ?? workflow.providerId ?? config.acp.providerId;
     const model = original ? original.model ?? null : workflow.model;
+    // A new continuation is an independent preparation boundary. A retry
+    // preserves its already-recorded prompt/provider and original task pin.
+    const selection = task && !previous ? await getActiveToolingRelease({ prisma, config, repositoryId: task.repositoryId }) : null;
     const prompt = previous?.text ?? await (input.compose ?? composeForPrompt)(
       session.cwd,
       input.seed({ previousWorkflowId: session.workflowId, ...(task ? { taskId: task.id, branchName: task.branchName } : {}) }),
-      provider, config.repository.skillsRoot, task?.pinnedToolingRoot ?? session.cwd,
+      provider, config.repository.skillsRoot, selection?.release.checkout ?? task?.pinnedToolingRoot ?? session.cwd,
     );
     // Recheck after composition, which may take time. The reservation blocks
     // inbox delivery during the following asynchronous provider operations.
@@ -97,7 +101,7 @@ export async function continuePlanningSession(input: {
         update: { state: "preparing", detail: null },
       });
       if (!recorded) await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: session.id, action: "workflow-continuation", key: instructionId,
-        value: JSON.stringify({ provider, model, previousWorkflowId: session.workflowId, workflowId: workflow.id, intent: input.intent ?? null }), source: `worker:${context.runId}` } });
+        value: JSON.stringify({ provider, model, previousWorkflowId: session.workflowId, workflowId: workflow.id, intent: input.intent ?? null, tooling: selection ? { releaseId: selection.release.id, generation: selection.generation, revision: selection.release.revision } : null }), source: `worker:${context.runId}` } });
     });
     reserved = true;
     if (session.agentCommand !== provider) {

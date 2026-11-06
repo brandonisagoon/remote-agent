@@ -308,3 +308,25 @@ test("a retried continuation keeps the provider and model its prompt was compose
   expect(f.calls).toEqual(["provider:codex", "model:gpt-6-astra"]);
   expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).toMatchObject({ agentCommand: "codex" });
 });
+
+test("a new plan continuation adopts the selected release and retries its recorded preparation without repinning", async () => {
+  const f = await fixture();
+  await db.prisma.toolingRelease.create({ data: { id: "selected", repositoryId: f.input.context.config.repository.id,
+    revision: "b".repeat(40), tree: "c".repeat(40), policyBlob: "d".repeat(40), checkout: "/prepared/release-b",
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: {} }, lockfileDigest: "fixture", bunVersion: "fixture" } });
+  await db.prisma.toolingSelection.create({ data: { repositoryId: f.input.context.config.repository.id, releaseId: "selected", generation: 4, activatedAt: new Date() } });
+  const originalSwitch = f.runtime.switchAgent;
+  f.runtime.switchAgent = async () => { throw new Error("Synthetic preparation interruption"); };
+  expect((await continuePlanningSession(f.input))?.status).toBe("failed");
+  expect(f.compositions[0]?.[4]).toBe("/prepared/release-b");
+  const evidence = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "workflow-continuation" } });
+  expect(JSON.parse(evidence.value!).tooling).toEqual({ releaseId: "selected", generation: 4, revision: "b".repeat(40) });
+  await db.prisma.toolingSelection.update({ where: { repositoryId: f.input.context.config.repository.id }, data: { generation: 5 } });
+  f.runtime.switchAgent = originalSwitch;
+  expect((await continuePlanningSession(f.input))?.status).toBe("delivered");
+  await f.settle();
+  expect(f.compositions).toHaveLength(1);
+  const retained = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.originalTask.id } });
+  expect(retained.toolingRevision).toBe(f.originalTask.toolingRevision);
+  expect(retained.pinnedToolingRoot).toBe(f.originalTask.pinnedToolingRoot);
+});
