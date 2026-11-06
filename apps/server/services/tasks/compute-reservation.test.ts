@@ -132,7 +132,8 @@ test("the managed cap holds under concurrency and blocked capacity names its exa
   const capacity = await db.prisma.$transaction(store => computeAdmissionCapacity(store, context(3, capped)));
   expect(capacity).toMatchObject({ occupied: 1, usable: 1, headroom: 0 });
   expect(capacity.blockers.allocations).toEqual([expect.objectContaining({ allocationId: first.id, state: "offered", environmentId: first.environmentId })]);
-  expect(capacity.blockers.unaccounted).toEqual([{ group: "three:development", reason: "unrecorded-resource", ids: ["legacy-app"] }]);
+  expect(capacity.blockers.unaccounted).toEqual([{ group: "three:development", reason: "unrecorded-resource", ids: ["legacy-app"],
+    detail: "resource old-app (task-runtime, ready)", action: expect.stringContaining("observe them stopped") }]);
 });
 
 test("lost claim acknowledgment and restart redeem the same reservation; an abandoned validation is reclaimed", async () => {
@@ -236,7 +237,10 @@ test("closed waiters are retired with a receipt before any physical scan; paused
   } finally { refresh.mockRestore(); }
   const closed = await db.prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: "closed" } });
   expect(await db.prisma.computeWait.count({ where: { environmentId: closed.id } })).toBe(0);
-  expect(await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "compute-wait-retired", key: { startsWith: closed.id } } })).toMatchObject({ value: expect.stringContaining("task-closed") });
+  const receipt = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-wait-retired", key: { startsWith: closed.id } } });
+  expect(JSON.parse(receipt.value!)).toMatchObject({ environmentId: closed.id, taskId: "closed", primarySessionId: "primary-closed", reason: "task-closed",
+    wait: { sequence: expect.any(Number) }, evidence: { taskPhase: "closed", primaryStatus: "idle" } });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-wait-retired" } })).toBe(1); // exactly the terminal wait
   const paused = await db.prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: "paused" } });
   expect(await db.prisma.computeWait.count({ where: { environmentId: paused.id } })).toBe(1);
 });

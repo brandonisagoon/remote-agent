@@ -76,15 +76,22 @@ function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: C
 
 const readInstalled: Read = async (input, task, request) => (await import("./compute-observer.ts")).readInstalledComputeBaseline(input, task, request);
 
-/** Accounting only, also usable before policy activation. Invalidate every old
- * free cache before even the first fallible inventory/adapter read. */
+/** Accounting only, also usable before policy activation. Each group's proof
+ * is invalidated when that group's own refresh begins (before its fallible
+ * read), so a long pass never clears unrelated fresh proof. A failure of the
+ * host-wide inventory is evidence against every group and invalidates all. */
 export async function refreshComputeBaselines(input: Context, read: Read = readInstalled) {
   const machineId = input.config.machine, token = randomUUID();
-  await input.prisma.computeBaseline.updateMany({ where: { machineId }, data: { refreshToken: token, proof: Prisma.DbNull } });
-  const existing = await input.prisma.computeBaseline.findMany({ where: { machineId }, take: 1001 });
-  const resources = await input.prisma.remoteTaskResource.findMany({ where: { task: { machineId }, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: countedComputeKinds } }, orderBy: { id: "asc" }, take: 10001 });
-  const environments = await input.prisma.computeEnvironment.findMany({ where: { machineId }, take: 1001 });
-  if (existing.length > 1000 || resources.length > 10000 || environments.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
+  let existing: ComputeBaseline[], resources: Awaited<ReturnType<Store["remoteTaskResource"]["findMany"]>>, environments: Awaited<ReturnType<Store["computeEnvironment"]["findMany"]>>;
+  try {
+    existing = await input.prisma.computeBaseline.findMany({ where: { machineId }, take: 1001 });
+    resources = await input.prisma.remoteTaskResource.findMany({ where: { task: { machineId }, purpose: { in: ["development", "review"] }, state: { not: "released" }, kind: { in: countedComputeKinds } }, orderBy: { id: "asc" }, take: 10001 });
+    environments = await input.prisma.computeEnvironment.findMany({ where: { machineId }, take: 1001 });
+    if (existing.length > 1000 || resources.length > 10000 || environments.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
+  } catch (error) {
+    await input.prisma.computeBaseline.updateMany({ where: { machineId }, data: { refreshToken: token, proof: Prisma.DbNull } });
+    throw error;
+  }
   const groups = new Map(existing.map(row => [row.id, { taskId: row.taskId, purpose: row.purpose, ids: Ids.parse(row.resourceIds) }]));
   for (const resource of resources) {
     const id = key(machineId, resource.taskId, resource.purpose);
@@ -127,20 +134,27 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
   return { observed, unavailable };
 }
 
+/** Why a group is not credited; each names the evidence that is missing. */
+export type BaselineCreditReason = "missing-proof" | "unobservable" | "inventory-unavailable" | "family-active" | "membership-changed" | "proof-stale" | "not-proven-stopped";
 /** Recheck inside the existing admission transaction. A stale/missing cache
  * only retains reservation; it can never turn into an environment or claim. */
 export async function computeBaselineCredits(store: Store, input: { machineId: string; policy: ComputePolicy; runtime?: Runtime; now?: Date }) {
   const rows = await store.computeBaseline.findMany({ where: { machineId: input.machineId }, take: 1001 });
   if (rows.length > 1000) throw new Error("Compute baseline inventory exceeds its bound");
   return Promise.all(rows.map(async row => {
-    let credited = false;
-    try {
-      const proof = Proof.parse(row.proof);
-      if (input.runtime) {
-        const current = await snapshot(store, row, input.runtime);
-        credited = current.settled && current.digest === proof.snapshotDigest && matches(proof.observation, row, current, input.now ?? new Date(), input.policy.collectorFreshnessSeconds);
-      }
-    } catch { /* Unknown original claims remain reserved. */ }
-    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited };
+    let credited = false, reason: BaselineCreditReason | undefined, observedAt: number | undefined;
+    const proof = Proof.safeParse(row.proof);
+    if (!proof.success) reason = "missing-proof";
+    else if (!input.runtime) { reason = "unobservable"; observedAt = proof.data.observation.observedAt; }
+    else {
+      observedAt = proof.data.observation.observedAt;
+      try {
+        const current = await snapshot(store, row, input.runtime), now = input.now ?? new Date();
+        const fresh = observedAt <= now.getTime() && now.getTime() - observedAt <= input.policy.collectorFreshnessSeconds * 1000;
+        credited = current.settled && current.digest === proof.data.snapshotDigest && matches(proof.data.observation, row, current, now, input.policy.collectorFreshnessSeconds);
+        if (!credited) reason = !current.settled ? "family-active" : current.digest !== proof.data.snapshotDigest ? "membership-changed" : !fresh ? "proof-stale" : "not-proven-stopped";
+      } catch { reason = "inventory-unavailable"; /* Unknown original claims remain reserved. */ }
+    }
+    return { taskId: row.taskId, purpose: row.purpose, resourceIds: Ids.parse(row.resourceIds), credited, ...(reason ? { reason } : {}), ...(observedAt === undefined ? {} : { observedAt }) };
   }));
 }

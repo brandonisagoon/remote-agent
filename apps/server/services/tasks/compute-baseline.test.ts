@@ -250,3 +250,24 @@ test("changing original credit with two eligible waiters never exceeds one manag
   expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
   expect(await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" } })).toEqual(originals);
 });
+
+test("DRA-36: a long refresh of one group never clears another group's fresh proof, and names the exact pending group", async () => {
+  const f = await fixture();
+  await f.prisma.runtimeSession.create({ data: { id: "old-2", scopeKey: "old-2", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/old-2", status: "closed", closedAt: f.now } });
+  await f.prisma.remoteTask.create({ data: { id: "old-2", requestKey: "old-2", repositoryId: "repo", machineId: "host", branchName: "codex/old-2", worktreePath: "/old-2", toolingRoot: "/old/tooling", toolingRevision: "a".repeat(40), primarySessionId: "old-2", phase: "closed" } });
+  await f.prisma.remoteTaskResource.create({ data: { id: "old-2-app", taskId: "old-2", key: "app", kind: "docker-container", purpose: "development", externalId: "old-2-container", state: "ready" } });
+  const policy = ComputePolicy.parse({ enabled: true, slots: 2 }), input = { ...f.admission, policy, taskId: "waiting" };
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 2, unavailable: 0 });
+  expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
+  let entered!: () => void, release!: () => void;
+  const held = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
+  const pass = refreshComputeBaselines(f.context, async (input, task, raw) => { if (task.id === "old-2") { entered(); await gate; } return f.read(input, task, raw); });
+  await held;
+  // Only the group whose own refresh is in progress loses credit.
+  const during = await readComputeCapacity(input);
+  expect(during).toMatchObject({ unaccounted: 1 });
+  expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"], detail: "baseline missing-proof", action: expect.stringContaining("baseline refresh") }]);
+  release();
+  expect(await pass).toEqual({ observed: 2, unavailable: 0 });
+  expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
+});

@@ -56,7 +56,12 @@ export async function assertComputeEnvironmentOwner(store: OwnerStore & Pick<Sto
   return owned;
 }
 /** Exact evidence for a group that consumes the explicit budget. */
-export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[] };
+export type ComputeBlocker = { group: string; reason: "unrecorded-resource" | "uncredited-baseline" | "uncertain-environment"; ids: string[]; detail: string; action: string };
+const BLOCKER_ACTION: Record<ComputeBlocker["reason"], string> = {
+  "unrecorded-resource": "No fresh stopped observation accounts for these resources; the collector must observe them stopped or their owner must release them.",
+  "uncredited-baseline": "The original group has no current stopped proof; the next settled baseline refresh can credit it.",
+  "uncertain-environment": "This environment may still be running; only a fresh physical reclamation releases its charge.",
+};
 /** Unknown existing environments consume the explicit budget conservatively.
  * A stale Ready/Allocated receipt is not proof that physical compute is free.
  * Every debited group is returned with the exact rows that caused it. */
@@ -93,13 +98,15 @@ async function unaccounted(store: Store, input: Context): Promise<{ count: numbe
   for (const baseline of baselines) if (baseline.credited) for (const id of baseline.resourceIds) recorded.add(id);
   const originalClaims = baselines.filter(baseline => !baseline.credited && baseline.resourceIds.some(id => !recorded.has(id)));
   const groups = new Map<string, ComputeBlocker>();
-  const add = (group: string, reason: ComputeBlocker["reason"], id: string) => {
-    const value = groups.get(group) ?? groups.set(group, { group, reason, ids: [] }).get(group)!;
+  const add = (group: string, reason: ComputeBlocker["reason"], id: string, detail: string) => {
+    const value = groups.get(group) ?? groups.set(group, { group, reason, ids: [], detail, action: BLOCKER_ACTION[reason] }).get(group)!;
     if (!value.ids.includes(id)) value.ids.push(id);
   };
-  for (const resource of resources) if (!recorded.has(resource.id)) add(`${resource.taskId}:${resource.purpose}`, "unrecorded-resource", resource.id);
-  for (const group of originalClaims) for (const id of group.resourceIds.filter(id => !recorded.has(id))) add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id);
-  for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id);
+  // Baseline groups first: their exact credit reason explains their members.
+  for (const group of originalClaims) for (const id of group.resourceIds.filter(id => !recorded.has(id)))
+    add(`${group.taskId}:${group.purpose}`, "uncredited-baseline", id, `baseline ${group.reason ?? "uncredited"}${group.observedAt === undefined ? "" : ` (last proof observed ${new Date(group.observedAt).toISOString()})`}`);
+  for (const resource of resources) if (!recorded.has(resource.id)) add(`${resource.taskId}:${resource.purpose}`, "unrecorded-resource", resource.id, `resource ${resource.key} (${resource.kind}, ${resource.state})`);
+  for (const environment of uncertain) add(`${environment.taskId}:${environment.purpose}`, "uncertain-environment", environment.id, `environment ${environment.id} is ${environment.state} without an allocation`);
   return { count: groups.size, blockers: [...groups.values()] };
 }
 const baselineRefreshes = new WeakMap<PrismaClient, Map<string, Promise<unknown>>>();
@@ -370,9 +377,13 @@ export async function eligibleComputeWaiters(store: WaiterStore, input: Context)
     const task = environment && await store.remoteTask.findUnique({ where: { id: environment.taskId } });
     const primary = task?.primarySessionId ? await store.runtimeSession.findUnique({ where: { id: task.primarySessionId } }) : null;
     if (!environment || !task || task.phase === "closed" || !primary || primary.closedAt || primary.status === "closed") {
-      await store.computeWait.deleteMany({ where: { environmentId: wait.environmentId } });
-      if (environment) await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: environment.primarySessionId, source: `compute:${environment.taskId}`, action: "compute-wait-retired", key: `${environment.id}:${wait.sequence}`,
-        value: JSON.stringify({ version: 1, environmentId: environment.id, reason: !task ? "task-missing" : task.phase === "closed" ? "task-closed" : "primary-closed" }) } });
+      // Terminal only: remove exactly this wait row and audit what proved it.
+      const removed = await store.computeWait.deleteMany({ where: { environmentId: wait.environmentId, sequence: wait.sequence, machineId: wait.machineId } });
+      if (removed.count === 1 && environment) await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: environment.primarySessionId, source: `compute:${environment.taskId}`, action: "compute-wait-retired", key: `${environment.id}:${wait.sequence}`,
+        value: JSON.stringify({ version: 1, environmentId: environment.id, taskId: environment.taskId, primarySessionId: environment.primarySessionId, machineId: wait.machineId,
+          wait: { sequence: wait.sequence, eligibleAt: wait.eligibleAt.toISOString() },
+          reason: !task ? "task-missing" : task.phase === "closed" ? "task-closed" : "primary-closed",
+          evidence: { taskPhase: task?.phase ?? null, primarySessionId: task?.primarySessionId ?? null, primaryStatus: primary?.status ?? null, primaryClosedAt: primary?.closedAt?.toISOString() ?? null } }) } });
       continue;
     }
     let owned;
