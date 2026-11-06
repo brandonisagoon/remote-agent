@@ -427,8 +427,10 @@ receipt mismatch returns an outcome-unknown failure (5xx), even when the adapter
 must be prevented from writing. The adapter keeps its migration journal and
 reconciles using the same operation; it must not withdraw intent on that result.
 
-These seams are under implementation; activation remains disabled until their
-real-route lifecycle and migration acceptance pass.
+These seams are integrated and independently audited. Source activation is
+enabled for normal isolated lifecycle verification; the route still requires
+owner bearer authentication and is absent from trusted sockets. Combined
+lifecycle acceptance remains required, and DRA-33's live cutover is held.
 
 ### Closed legacy resource cleanup compatibility
 
@@ -469,5 +471,7 @@ any effect rather than turn a stale empty inventory into permission.
 DRA-29 owns server kind/admission/receipt/state/settlement enforcement and focused
 real-route regressions; DRA-30 owns the paired per-resource wrapper and client
 regressions. No schema migration or new wire field is required. Root owns this
-contract and independent integration review. Activation remains disabled while
-this compatibility correction and isolated lifecycle acceptance are incomplete.
+contract and independent integration review. The compatibility correction has
+passed real-route runtime, preview and crash-recovery checks. Source activation
+is enabled for the isolated lifecycle rehearsal; no live activation or shared
+deployment is authorized by that source change.

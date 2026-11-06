@@ -146,8 +146,8 @@ export async function rehearseReleaseLifecycle(receiptFile: string) {
     // The fixture includes an uncertain provider outcome and exact IDs. Only
     // the normal migrate-state CLI may change its bytes or register version 2.
     const fixtureProcess = Bun.spawn([process.execPath, "--no-env-file", "-e",
-      "const { runtimeFixture } = await import(process.argv[1]); process.stdout.write(JSON.stringify(runtimeFixture(JSON.parse(process.argv[2]))));",
-      path.join(b.checkout, "test-support/runtime-state-fixture.ts"), JSON.stringify({ taskId, worktree })],
+      "const { runtimeFixture } = await import(process.argv[1]); const { RuntimeConfig, digest } = await import(process.argv[3]); const state = runtimeFixture(JSON.parse(process.argv[2])); state.recipe = RuntimeConfig.parse(state.recipe); state.recipeHash = digest(state.recipe); process.stdout.write(JSON.stringify(state));",
+      path.join(b.checkout, "test-support/runtime-state-fixture.ts"), JSON.stringify({ taskId, worktree }), path.join(b.checkout, "src/runtime-config.ts")],
     { cwd: b.checkout, env: cleanEnv(server.root), stdout: "pipe", stderr: "pipe", stdin: "ignore" });
     const [fixtureCode, fixtureText, fixtureError] = await Promise.all([fixtureProcess.exited,
       new Response(fixtureProcess.stdout).text(), new Response(fixtureProcess.stderr).text()]);
