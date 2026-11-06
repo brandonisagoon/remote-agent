@@ -56,7 +56,8 @@ test("tooling policy is read from a commit, not dirty source changes", () => {
   git(repo.root, "add", "."); git(repo.root, "commit", "-m", "tooling policy");
   const revision = git(repo.root, "rev-parse", "HEAD");
   writeFileSync(path.join(repo.root, ".remote-agent.config.json"), JSON.stringify({ preparation: "command" }));
-  expect(readToolingSource(repo.root, revision)).toEqual({ revision, settings: { preparation: "agent" } });
+  expect(readToolingSource(repo.root, revision)).toEqual({ revision, tree: git(repo.root, "rev-parse", `${revision}^{tree}`),
+    policyBlob: git(repo.root, "rev-parse", `${revision}:.remote-agent.config.json`), settings: { preparation: "agent" } });
 });
 
 test("new tasks pin fetched staging while retries preserve their base, worktree and unfinished edits", async () => {

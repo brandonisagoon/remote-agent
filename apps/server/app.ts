@@ -11,6 +11,8 @@ import {
 } from "./middleware/context.ts";
 import { errorHandler } from "./middleware/error-handler.ts";
 import { mountRoutes } from "./routes/index.ts";
+import { toolingReleaseRoutes } from "./routes/tooling-releases/index.ts";
+import { TOOLING_ACTIVATION_ENABLED } from "./services/tasks/tooling-releases.ts";
 import type { AgentSessionRuntime, CommandClient } from "../../types/runtime/index.ts";
 
 export interface CreateAppOptions {
@@ -41,6 +43,9 @@ export function createApp({
   if (!trustLocal) app.use("/api/*", apiAuthMiddleware());
   app.onError(errorHandler);
 
+  // Owner activation is a TCP bearer route only: never on the trusted local
+  // socket (or the placement forwarding built on it), never a session tool.
+  if (!trustLocal) app.route("/api/tooling-releases", toolingReleaseRoutes({ enabled: TOOLING_ACTIVATION_ENABLED }));
   mountRoutes(app);
 
   app.notFound((c) => c.json({ error: "Not Found" }, 404));

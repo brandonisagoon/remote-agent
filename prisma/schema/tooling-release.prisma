@@ -1,0 +1,77 @@
+/// An immutable prepared tooling commit. Rows are never deleted or rewritten:
+/// retained operations keep resolving their exact checkout (no GC in v1).
+model ToolingRelease {
+  id             String   @id
+  repositoryId   String
+  revision       String
+  tree           String
+  policyBlob     String
+  checkout       String
+  manifest       Json
+  lockfileDigest String
+  bunVersion     String
+  createdAt      DateTime @default(now())
+
+  @@unique([repositoryId, revision])
+}
+
+/// The active release per repository. `generation` only increases.
+model ToolingSelection {
+  repositoryId String   @id
+  generation   Int
+  releaseId    String
+  activatedAt  DateTime
+  updatedAt    DateTime @updatedAt
+}
+
+/// A policy-changing (restart-required) activation. At most one per
+/// repository; it blocks other activations and only server boot promotes it.
+model ToolingPendingActivation {
+  repositoryId       String   @id
+  requestKey         String   @unique
+  releaseId          String
+  expectedGeneration Int
+  createdAt          DateTime @default(now())
+}
+
+/// Idempotent owner activation receipts. A key is bound to its complete
+/// request digest and its exact recorded result, even after newer activations.
+model ToolingActivation {
+  requestKey         String   @id
+  repositoryId       String
+  requestDigest      String
+  revision           String
+  expectedGeneration Int
+  releaseId          String
+  outcome            String
+  generation         Int
+  createdAt          DateTime @default(now())
+  promotedAt         DateTime?
+
+  @@index([repositoryId, generation])
+}
+
+/// Persisted before any tooling effect. Retries with the same task request key
+/// return this exact binding regardless of the current selection.
+model ToolingOperation {
+  id                  String   @id
+  taskId              String
+  requestKey          String
+  inputDigest         String
+  kind                String
+  repositoryId        String
+  sessionId           String
+  turnId              String?
+  existingOperationId String?
+  resourceKey         String?
+  generation          Int
+  releaseId           String
+  protocol            Int
+  status              String   @default("bound")
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([taskId, requestKey])
+  @@index([releaseId, status])
+  @@index([repositoryId, status])
+}
