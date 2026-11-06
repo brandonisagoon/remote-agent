@@ -231,19 +231,48 @@ console.log(JSON.stringify({ dra37SyntheticSchemaPush: true, args, databaseConfi
     },
     async cleanup(options: { keepEvidence?: boolean } = {}) {
       await fixture.stop();
+      let preserve = !!options.keepEvidence;
       if (real) {
         // Exact ledger objects only, through normal stop/rm, newest first.
-        const results: unknown[] = [];
-        const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" }); results.push({ args, code: result.exitCode, stderr: result.stderr.toString().trim().slice(0, 300) }); };
+        // Each ID is then inspected: it must be gone. A nonzero stop/rm is
+        // acceptable only when that object is confirmed absent afterwards.
+        const results: Array<{ args: string[]; code: number | null; stderr: string }> = [], problems: string[] = [];
+        const run = (args: string[]) => { const result = Bun.spawnSync([real!.docker, ...args], { stdout: "pipe", stderr: "pipe" }); const entry = { args, code: result.exitCode, stderr: result.stderr.toString().trim().slice(0, 300) }; results.push(entry); return entry; };
+        // Exact per-kind absence wording from the engine, naming this exact ID.
+        const absent = (kind: "container" | "network" | "volume", id: string) => {
+          const probe = run(kind === "container" ? ["inspect", id] : [kind, "inspect", id]);
+          const escaped = id.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const missing = kind === "container" ? new RegExp(`no such object: ${escaped}`, "i")
+            : kind === "network" ? new RegExp(`network ${escaped} not found`, "i") : new RegExp(`${escaped}: no such volume`, "i");
+          return probe.code !== 0 && missing.test(probe.stderr);
+        };
         const entries = fixture.dockerLedger().reverse();
-        for (const entry of entries.filter(value => value.kind === "container")) { run(["stop", entry.id]); run(["rm", entry.id]); }
-        for (const entry of entries.filter(value => value.kind === "network")) run(["network", "rm", entry.id]);
-        for (const entry of entries.filter(value => value.kind === "volume")) run(["volume", "rm", entry.id]);
-        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ ledger: fixture.dockerLedger(), results }, null, 2), { mode: 0o600 });
-        console.log(JSON.stringify({ dockerCleanup: results }));
+        for (const entry of entries.filter(value => value.kind === "container")) {
+          const stopped = run(["stop", entry.id]), removed = run(["rm", entry.id]);
+          if (!absent("container", entry.id)) problems.push(`container ${entry.id} remains`);
+          else if (stopped.code !== 0 && !/no such/i.test(stopped.stderr) || removed.code !== 0 && !/no such/i.test(removed.stderr)) problems.push(`container ${entry.id} removal had an unexplained failure`);
+        }
+        for (const entry of entries.filter(value => value.kind === "network")) {
+          const removed = run(["network", "rm", entry.id]);
+          if (!absent("network", entry.id)) problems.push(`network ${entry.id} remains`);
+          else if (removed.code !== 0 && !/not found|no such/i.test(removed.stderr)) problems.push(`network ${entry.id} removal had an unexplained failure`);
+        }
+        for (const entry of entries.filter(value => value.kind === "volume")) {
+          const removed = run(["volume", "rm", entry.id]);
+          if (!absent("volume", entry.id)) problems.push(`volume ${entry.id} remains`);
+          else if (removed.code !== 0 && !/no such/i.test(removed.stderr)) problems.push(`volume ${entry.id} removal had an unexplained failure`);
+        }
+        await writeFile(path.join(root, "docker-cleanup.json"), JSON.stringify({ ledger: fixture.dockerLedger(), results, problems }, null, 2), { mode: 0o600 });
+        console.log(JSON.stringify({ dockerCleanup: { removed: entries.length, problems } }));
+        if (problems.length) {
+          // Never delete the evidence of an incomplete cleanup.
+          preserve = true;
+          await db.cleanup();
+          throw new Error(`DRA-37 Docker cleanup is incomplete; evidence preserved at ${root}: ${problems.join("; ")}`);
+        }
       }
       await db.cleanup();
-      if (!options.keepEvidence) await rm(root, { recursive: true, force: true });
+      if (!preserve) await rm(root, { recursive: true, force: true });
     },
   };
   try {
