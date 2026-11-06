@@ -1252,7 +1252,7 @@ test("legacy basis with its group: readers at another (even granted) revision th
 });
 
 // T3: the group read before observation is pinned by its digest under the lock.
-const groupChanges: Record<string, { inject: (f: Awaited<ReturnType<typeof fixture>>) => Promise<unknown>; expected: (legacy: Awaited<ReturnType<typeof serviceState>>["legacy"]) => unknown }> = {
+const groupChanges: Record<string, { inject: (f: Awaited<ReturnType<typeof fixture>>) => Promise<unknown>; expected: (legacy: Awaited<ReturnType<typeof serviceState>>["legacy"]) => string[] }> = {
   // A baseline reader of exactly this resource appears (it would also add compute-baseline/v1 to the required contracts).
   "baseline reader appears": {
     inject: () => db.prisma.toolingLegacyConsumer.create({ data: { id: "legacy-2", repositoryId: "repo", taskId: "task", consumerKind: "compute-baseline", consumerId: "task:development",
