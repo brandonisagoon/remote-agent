@@ -1,19 +1,20 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { Prisma } from "../../../../generated/prisma/client.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
-import { bindComputeResource, requestCompute } from "./compute-admission.ts";
+import { bindComputeResource, confirmComputeDelivery, requestCompute, scheduleComputeOffers } from "./compute-admission.ts";
 import { configureCompute } from "./compute-configuration.ts";
 import { canonicalSha256, ComputeNeonRecoveryProof, ReviewedLegacyNeonSources, neonRecoveryInputDigest, readNeonRecovery, readRecoverySource, readReleaseBlobs, recoverComputeNeon, verifyBoundObserver, type BoundToolingOperation, type NeonRecoveryInput } from "./compute-neon-recovery.ts";
 import { matchToolingCallback, resourceGroupCode, runWithToolingOperation } from "./tooling-operations.ts";
 import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
-import { accountingCode } from "./compute-observer.ts";
+import { accountingCode, refreshComputeObservation } from "./compute-observer.ts";
+import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 import { createApp } from "../../app.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
@@ -39,8 +40,11 @@ type TestInput = NeonRecoveryInput & { operation: BoundToolingOperation };
  * binding is the scope's, never an argument. */
 const recover = (input: TestInput, ...rest: Parameters<typeof recoverComputeNeon> extends [unknown, ...infer R] ? R : never) =>
   runWithToolingOperation(input.operation, () => recoverComputeNeon(input, ...rest), config.controlIpcPath);
-beforeEach(async () => { db = await createTestDatabase(); });
-afterEach(async () => { await db.cleanup(); });
+// Database setup applies every migration; its hooks are bounded explicitly
+// rather than by bun's 5 s default, which host load alone can exceed. Tests
+// keep the default except the git-heavy observer and collector cases below.
+beforeEach(async () => { db = await createTestDatabase(); }, 60_000);
+afterEach(async () => { await db.cleanup(); }, 60_000);
 
 type Ids = { task: string; primary: string; name: string; planetscaleId: string; slot: string; environmentId?: string; offerId?: string; operationId?: string; resourceId?: string };
 const defaultIds: Ids = { task: "task", primary: "primary", name: childName, planetscaleId: planetscale.id, slot: "host:0" };
@@ -346,7 +350,7 @@ test("bound observer runs only from the exact prepared release checkout, never t
   const legacy = await releaseCheckout(["compute-traffic/v1", "runtime-configuration/v1"]);
   try { await expect(verifyBoundObserver(legacy.release, recoveryContracts, plainExecute)).rejects.toThrow("cannot verify Neon recovery"); }
   finally { await rm(legacy.checkout, { recursive: true, force: true }); }
-});
+}, 60_000);
 
 test("production reader sends the declared operation envelope to the bound release's adapter", async () => {
   const f = await fixture(), calls: { argv: string[]; options: any }[] = [];
@@ -1281,3 +1285,204 @@ test.each(Object.keys(groupChanges))("a group change during observation (%s) ref
   expect(after.legacy.filter(row => (row.resolution as { reference?: string } | null)?.reference === "op-recovery")).toEqual([]);
   for (const row of before.legacy.filter(row => row.id !== "legacy-1" || name !== "offer reader resolved elsewhere")) expect(after.legacy.find(value => value.id === row.id)).toEqual(row);
 });
+
+// ---------------------------------------------------------------------------
+// Collector acceptance after recovery (plan a32a7305, section 3 T2/T3).
+// SERVER HALF ONLY with the default fixture observer: an immutable, committed,
+// prepared release checkout whose runtime adapter answers `compute observe`
+// for a container-less runtime with a physical state read from a control file
+// BESIDE the checkout (default "stopped"). Finding pinned by T3: ordinary
+// capacity accounting credits only a fresh "stopped" observation; "absent" is
+// credited only through the separate reclamation contract, so the Drafted
+// container-less branch must report "stopped" here (plan section 2 said "absent"). It is NOT the Drafted observer, whose container-less
+// branch (DRA-23 v8) is pending. DRA24_OBSERVER_CHECKOUT is a PREPARED
+// INTERFACE ONLY, not a drop-in full-pair proof: it swaps which committed
+// checkout is executed, but this fixture registers /private/runtime/runtime.json
+// without the canonical receipt, provider journal, private task state or
+// Docker inventory the real observer reads. Real private-fixture integration
+// with the frozen DRA-23 correction remains required. The collector is the real
+// refreshComputeObservation with the real capability resolution; only the
+// process runner is a recording plain executor (not the process-group
+// supervisor) so argv, cwd, process context and envelope are asserted.
+// ---------------------------------------------------------------------------
+type ObserverRelease = { source: "fixture" | "drafted"; checkout: string; revision: string; tree: string; adapter: string; adapterSha256: string; manifestSha256: string; cleanup: () => Promise<void>;
+  /** Fixture only: the physical state its next observation reports. */
+  report: (state: "stopped" | "absent") => Promise<void> };
+const FIXTURE_OBSERVER = `if (process.argv.slice(-2).join(" ") !== "compute observe") { console.error("fixture observer: unsupported command"); process.exit(2); }
+const input = JSON.parse(await Bun.stdin.text());
+const control = import.meta.dir + ".state";
+const state = (await Bun.file(control).exists()) ? (await Bun.file(control).text()).trim() : "stopped";
+if (state !== "stopped" && state !== "absent") { console.error("fixture observer: unsupported state"); process.exit(4); }
+const metadata = input.resource.metadata ?? {};
+// Server half only: physical absence of a container-less runtime without coverage. Anything else is unsupported.
+if (metadata.compute != null || metadata.containerId != null) { console.error("fixture observer covers only a container-less runtime"); process.exit(3); }
+console.log(JSON.stringify({ observation: { version: 1, environmentId: input.environment.id, taskId: input.task.id, primarySessionId: input.task.primarySessionId,
+  purpose: input.environment.purpose, revision: input.environment.revision, recipeDigest: input.environment.recipeDigest, resourceId: input.resource.id,
+  resourceIdentity: input.resource.identityDigest, observedAt: Date.now(), state, coverage: "complete", configurationDigest: "0".repeat(64), routes: [],
+  operations: { coverage: "complete", active: 0, generation: "0".repeat(64) } }, traffic: [] }));
+`;
+async function observerRelease(): Promise<ObserverRelease> {
+  const sha = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+  const prepared = process.env.DRA24_OBSERVER_CHECKOUT;
+  const checkout = prepared ? await realpath(prepared) : await realpath(await mkdtemp(path.join(tmpdir(), "neon-recovery-observer-")));
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: checkout, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" } }).trim();
+  if (!prepared) {
+    git("init", "-q");
+    await writeFile(path.join(checkout, "observer.ts"), FIXTURE_OBSERVER, { mode: 0o644 });
+    await writeFile(path.join(checkout, "runtime.md"), "Fixture runtime observer (server-half acceptance only).\n", { mode: 0o644 });
+    await writeFile(path.join(checkout, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { runtime: { instructions: "runtime.md", adapter: "observer.ts",
+      observationContracts: ["compute-traffic/v1", "runtime-neon-recovery/v1"] } } }), { mode: 0o644 });
+    git("add", "-A"); git("commit", "-q", "-m", "fixture observer release");
+  }
+  if (git("status", "--porcelain=v1", "--untracked-files=normal")) throw new Error("Observer checkout is not clean");
+  const revision = git("rev-parse", "HEAD"), manifest = git("show", `${revision}:.remote-agent-capabilities.json`);
+  const adapter = path.join(checkout, JSON.parse(manifest).capabilities.runtime.adapter);
+  const identity: ObserverRelease = { source: prepared ? "drafted" : "fixture", checkout, revision, tree: git("rev-parse", "HEAD^{tree}"), adapter,
+    adapterSha256: sha(await readFile(adapter)), manifestSha256: sha(manifest),
+    cleanup: async () => { if (!prepared) await rm(checkout, { recursive: true, force: true }); await rm(`${checkout}.state`, { force: true }); },
+    report: async state => { if (prepared) throw new Error("A prepared observer reports its own physical state"); await writeFile(`${checkout}.state`, state); } };
+  // Recorded in the run log: the exact observer code this acceptance executed.
+  console.log("DRA24_OBSERVER_IDENTITY", JSON.stringify({ ...identity, cleanup: undefined, report: undefined }));
+  return identity;
+}
+type ObserverCall = { argv: string[]; cwd: string; operation: string | null; taskId: string | null; sessionId: string | null; input: unknown; output: unknown };
+/** Plain process runner with stdin/env, recording every adapter execution. */
+function recordingExecute(calls: ObserverCall[]) {
+  return (async (argv: string[], options: { cwd: string; input?: string; env?: Record<string, string>; timeoutMs: number }) => {
+    const output = execFileSync(argv[0]!, argv.slice(1), { cwd: options.cwd, encoding: "utf8", input: options.input, env: options.env, timeout: options.timeoutMs });
+    if (argv[0] === process.execPath) calls.push({ argv, cwd: options.cwd, operation: options.env?.REMOTE_AGENT_TOOLING_OPERATION ?? null, taskId: options.env?.REMOTE_AGENT_TASK_ID ?? null,
+      sessionId: options.env?.REMOTE_AGENT_SESSION_ID ?? null, input: options.input ? JSON.parse(options.input) : null, output: JSON.parse(output) });
+    return output;
+  }) as any;
+}
+/** A recovery committed by the real writer for the release the observer checkout IS. */
+async function recoveredForObserver(allocation: "unknown" | "stopped") {
+  const observer = await observerRelease();
+  const collectorConfig = { ...config, compute: ComputePolicy.parse({ enabled: true, slots: 1 }), repositories: { repo: { ...config.repository, id: "repo",
+    tooling: { repository: "https://example.invalid/tooling.git", revision: observer.revision } } } } as unknown as typeof config;
+  await db.prisma.toolingRelease.create({ data: { id: release.id, repositoryId: "repo", revision: observer.revision, tree: observer.tree, checkout: observer.checkout, policyBlob: "e".repeat(40),
+    manifest: releaseManifest, lockfileDigest: "f".repeat(64), bunVersion: "1.3.14" } });
+  const f = await fixture({ allocation });
+  await legacyRows(f);
+  const bound = { ...f.observer, revision: observer.revision, tree: observer.tree };
+  const read = async () => ({ proof: { ...structuredClone(f.proof), operation: { operationId: "op-recovery", releaseId: release.id, revision: observer.revision, tree: observer.tree } }, observer: { ...bound } });
+  return { f, observer, collectorConfig, commit: () => recover({ ...f.input, config: collectorConfig }, read, f.head) };
+}
+const otherActive = async (generation: number) => {
+  await db.prisma.toolingRelease.create({ data: { id: "tr_active", repositoryId: "repo", revision: "7".repeat(40), tree: "5".repeat(40), policyBlob: "e".repeat(40), checkout: "/install/tooling/repo/active",
+    manifest: releaseManifest, lockfileDigest: "f".repeat(64), bunVersion: "1.3.14" } });
+  await db.prisma.toolingSelection.create({ data: { repositoryId: "repo", generation, releaseId: "tr_active", activatedAt: new Date() } });
+};
+
+test("T2 server collector: after the committed handoff the real collector runs the recovery release's observer and records a fresh stopped observation of the new identity", async () => {
+  const { f, observer, collectorConfig, commit } = await recoveredForObserver("stopped");
+  try {
+    const calls: ObserverCall[] = [], dependencies = { resolve: resolveSessionToolingCapability, execute: recordingExecute(calls) };
+    const collect = () => refreshComputeObservation({ prisma: db.prisma, config: collectorConfig, environmentId: f.environment.id }, dependencies);
+    // Before the commit the group is still the legacy pin's: its snapshot checkout is not prepared, nothing is executed or recorded.
+    await expect(collect()).rejects.toThrow("is not prepared");
+    expect(calls).toEqual([]);
+    expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).observation).toBeNull();
+    await commit();
+    // A different active selection (and the task pin) must not be what observes the recovered group.
+    await otherActive(6);
+    const started = Date.now();
+    const recorded = await collect();
+    const resource = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } });
+    const identity = finalizationResourceIdentity(resource).identityDigest;
+    expect(calls).toHaveLength(1);
+    const [call] = calls;
+    expect(call!.argv).toEqual([process.execPath, "--no-env-file", observer.adapter, "compute", "observe"]);
+    expect(call!.cwd).toBe(observer.checkout);
+    expect({ operation: call!.operation, taskId: call!.taskId, sessionId: call!.sessionId }).toEqual({ operation: "op-recovery", taskId: "task", sessionId: "primary" });
+    // The envelope names the recovered recipe and identity; a container-less runtime carries no compute coverage.
+    const envelope = call!.input as { environment: { recipeDigest: string }; resource: { identityDigest: string; metadata: Record<string, unknown> } };
+    expect(envelope.environment.recipeDigest).toBe(nextHash);
+    expect(envelope.resource.identityDigest).toBe(identity);
+    expect(envelope.resource.metadata.compute).toBeUndefined();
+    const environment = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+    expect(environment.observation).toEqual(recorded);
+    expect(recorded).toMatchObject({ state: "stopped", environmentId: f.environment.id, taskId: "task", primarySessionId: "primary", resourceId: resource.id, resourceIdentity: identity, recipeDigest: nextHash });
+    expect(recorded.observedAt).toBeGreaterThanOrEqual(started);
+    // The capability the collector resolved is the recovery release's own revision.
+    const grant = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "tooling-capability", source: "task:task" }, orderBy: { sequence: "desc" } });
+    expect(JSON.parse(grant.value!)).toMatchObject({ capability: "runtime", source: "configured-host", capabilityRevision: observer.revision, checkout: observer.checkout, adapter: observer.adapter });
+  } finally { await observer.cleanup(); }
+}, 60_000);
+
+test("T3 separated adoption: no offer until the real collector accounts for the recovered resource; then the real scheduler offers, the request command settles and a fresh command adopts and claims", async () => {
+  const { f, observer, collectorConfig, commit } = await recoveredForObserver("stopped");
+  try {
+    await commit();
+    await otherActive(6);
+    const runtime = createFakeAgentRuntime();
+    runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+    const app = createApp({ config: collectorConfig, prisma: db.prisma, agentRuntime: runtime });
+    const call = async (route: string, body: unknown, operation?: string) => {
+      const response = await app.request(route, { method: "POST", headers: { authorization: `Bearer ${config.apiKey}`, "content-type": "application/json", ...(operation ? { "x-remote-agent-operation": operation } : {}) },
+        body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() as any };
+    };
+    const recipe = { key: "runtime-development", purpose: "development", revision, recipeDigest: nextHash };
+    const command = async (requestKey: string) => {
+      const fence = (await call("/api/sessions/primary/tooling-operations", { requestKey, inputDigest: canonicalDigest({ command: requestKey }), kind: "adapter-command", resourceKey: "runtime-development" })).body.binding;
+      const child = (existing?: string) => call("/api/sessions/primary/tooling-operations", { requestKey: `${requestKey}/compute-admission/${existing ?? "new"}`, inputDigest: canonicalDigest(recipe),
+        kind: "compute-admission", parentOperationId: fence.operationId, ...(existing ? { existingOperationId: existing } : {}) });
+      const settle = () => call(`/api/sessions/primary/tooling-operations/${fence.operationId}/settlement`, { requestKey: fence.requestKey, inputDigest: fence.inputDigest, outcome: "completed" }, fence.operationId);
+      return { fence, child, settle };
+    };
+    // Command A: an ordinary bound request admits the environment key and waits; the route schedules the real offer.
+    const a = await command("a-runtime-up");
+    const requestChild = (await a.child()).body.binding;
+    expect((await call("/api/tasks/task/compute-request", recipe, requestChild.operationId)).status).toBe(202);
+    const context = { prisma: db.prisma, machineId: "host", policy: collectorConfig.compute!, config: collectorConfig, runtime };
+    const { offerNextCompute, readComputeCapacity } = await import("./compute-admission.ts");
+    await scheduleComputeOffers(context);
+    // Before any physical observation the recovered resource is unaccounted: capacity offers nothing.
+    expect(await db.prisma.computeOffer.count({ where: { environmentId: f.environment.id } })).toBe(1);
+    expect(await db.prisma.computeWait.count({ where: { environmentId: f.environment.id } })).toBe(1);
+    expect((await readComputeCapacity({ ...context, taskId: "task" })).blockers.unaccounted).toEqual([expect.objectContaining({ reason: "unrecorded-resource", ids: [f.resource.id] })]);
+    expect(await offerNextCompute(context)).toBeNull();
+    const calls: ObserverCall[] = [];
+    const collect = () => refreshComputeObservation({ prisma: db.prisma, config: collectorConfig, environmentId: f.environment.id }, { resolve: resolveSessionToolingCapability, execute: recordingExecute(calls) });
+    // A fresh "absent" from the ordinary observe contract is recorded but does NOT account capacity.
+    await observer.report("absent");
+    expect(await collect()).toMatchObject({ state: "absent", recipeDigest: nextHash });
+    expect((await readComputeCapacity({ ...context, taskId: "task" })).blockers.unaccounted).toEqual([expect.objectContaining({ reason: "unrecorded-resource", ids: [f.resource.id] })]);
+    await scheduleComputeOffers(context);
+    expect(await db.prisma.computeOffer.count({ where: { environmentId: f.environment.id } })).toBe(1);
+    // The real collector (T2 path) records the fresh stopped observation of the recovered identity.
+    await observer.report("stopped");
+    expect(await collect()).toMatchObject({ state: "stopped", recipeDigest: nextHash });
+    expect(calls.map(value => [value.cwd, value.operation])).toEqual([[observer.checkout, "op-recovery"], [observer.checkout, "op-recovery"]]);
+    expect((await readComputeCapacity({ ...context, taskId: "task" })).blockers.unaccounted).toEqual([]);
+    // The production scheduler tick now reserves the slot and offers.
+    await scheduleComputeOffers(context);
+    const offers = await db.prisma.computeOffer.findMany({ where: { environmentId: f.environment.id }, orderBy: { createdAt: "asc" } });
+    expect(offers.map(offer => offer.id)[0]).toBe(f.offer.id);
+    const delivered = offers.find(offer => offer.id !== f.offer.id);
+    expect(delivered, JSON.stringify(offers)).toBeDefined();
+    expect(delivered).toMatchObject({ state: "queued", claimedAt: null });
+    expect(delivered!.createdAt.getTime()).toBeGreaterThan(f.offer.completedAt!.getTime());
+    expect((await a.settle()).status).toBe(200);
+    // The primary's turn starts on the scheduler's instruction (runtime simulation only), and delivery is the real domain step.
+    const instruction = await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: delivered!.instructionId } });
+    expect(instruction.sessionId).toBe("primary");
+    await db.prisma.runtimeInstruction.update({ where: { id: instruction.id }, data: { state: "dispatching", executionRequestId: instruction.id } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: `${instruction.id}:started`, runtimeSessionId: "primary", requestId: instruction.id, phase: "started", occurredAt: new Date() } });
+    expect(await confirmComputeDelivery({ ...context, sessionId: "primary", requestId: instruction.id })).toMatchObject({ id: delivered!.id, state: "offered" });
+    // Command B adopts the delivered offer: the request command settled and the environment's
+    // latest observation is the collector's fresh stopped observation of its current resource.
+    const b = await command("b-runtime-up-offer");
+    await collect();
+    const adopted = await b.child(delivered!.id);
+    expect(adopted.status, JSON.stringify(adopted.body)).toBe(200);
+    expect(adopted.body.binding).toMatchObject({ kind: "compute-admission", existingOperationId: delivered!.id, release: { id: "tr_active" } });
+    const claimed = await call("/api/tasks/task/compute-claim", { ...recipe, offerId: delivered!.id }, adopted.body.binding.operationId);
+    expect(claimed.status, JSON.stringify(claimed.body)).toBe(200);
+    expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: delivered!.id } })).state).toBe("claimed");
+    // Recovery granted nothing itself: no producer exists until an ordinary bind.
+    const { producerOperationId } = await import("./tooling-operations.ts");
+    expect(await producerOperationId(db.prisma, await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: "task" } }), f.environment.id)).toBeNull();
+  } finally { await observer.cleanup(); }
+}, 60_000);
