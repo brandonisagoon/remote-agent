@@ -1,16 +1,12 @@
 import { afterEach, beforeEach, expect, setDefaultTimeout, test } from "bun:test";
 import { z } from "zod";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
-import { testConfig } from "../../../../test-support/config.ts";
-import { ComputePolicy } from "../../../../lib/compute-policy.ts";
-import { requestCompute } from "./compute-admission.ts";
-import { canonicalSha256, type ComputeNeonRecoveryProof, neonRecoveryInputDigest, recoverComputeNeon, type BoundToolingOperation } from "./compute-neon-recovery.ts";
+import { canonicalSha256, neonRecoveryInputDigest } from "./compute-neon-recovery.ts";
 import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "./compute-neon-recovery-result.ts";
-import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { finalizationDigest } from "./finalization-resources.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 
 let db: TestDatabase;
-const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: true, slots: 2 }) });
 const head = "22406a5eddb33f983a669f8f686b9a416beac113", revision = "a".repeat(40), pin = "d".repeat(40), oldHash = "b".repeat(64), nextHash = "c".repeat(64);
 const release = { id: "tr_release_b", repositoryId: "repo", revision: "9".repeat(40), tree: "6".repeat(40), checkout: "/install/tooling/repo/release-b" };
 /** The server's full release record, as readToolingOperation projects it. */
@@ -38,53 +34,50 @@ const stagedEvidence = (proof: any) => {
   return finalizationDigest({ baselineSha256, candidateSha256, baselineProviders, providers, reconciliation, stage, previousRecipeHash, recipeHash, offerId, operationId, revision, toolingRevision });
 };
 
-/** One container-less runtime with a retained claim, recovered through the
- * real writer (`recoverComputeNeon`) with a fixed observation. */
-async function committed(ids = { task: "task", primary: "primary", operation: "op-recovery", slot: "host:0" }) {
-  const worktree = `/fixture/${ids.task}`;
+/** Test mirror of the writer's transition key (finalizationDigest of the
+ * request's transition identity), until its export is committed. */
+const transitionKey = (environmentId: string, resourceId: string, request: { offerId: string; operationId: string; previousRecipeHash: string; recipeHash: string }) =>
+  finalizationDigest({ environmentId, resourceId, offerId: request.offerId, operationId: request.operationId, previousRecipeHash: request.previousRecipeHash, recipeHash: request.recipeHash });
+
+/** One committed recovery exactly as the staged design (551400d9) stores it in
+ * its single transaction: the event (full stored binding, staged proof,
+ * verbatim legacy-group handoff, drafted.runtime/2 state write, result), the
+ * real ToolingStateWrite row and the resolved ToolingLegacyConsumer row. The
+ * writer itself is being bridged (A432); its real-writer integration test
+ * follows that commit. */
+async function committed(ids = { task: "task", primary: "primary", operation: "op-recovery" }) {
+  await db.prisma.runtimeSession.findUnique({ where: { id: ids.primary } }) ?? await db.prisma.runtimeSession.create({ data: { id: ids.primary, scopeKey: ids.task, agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: `/fixture/${ids.task}`, status: "idle" } });
+  const environmentId = crypto.randomUUID(), resourceId = `resource-${ids.task}`, offerId = crypto.randomUUID(), computeOperation = crypto.randomUUID();
   const saved = { provider: "planetscale" as const, id: `ps-${ids.task}`, name: `drafted-${ids.task}` };
-  await db.prisma.runtimeSession.create({ data: { id: ids.primary, scopeKey: ids.task, agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: worktree, status: "idle" } });
-  await db.prisma.remoteTask.create({ data: { id: ids.task, requestKey: ids.task, repositoryId: "repo", machineId: "host", branchName: `codex/${ids.task}`, worktreePath: worktree, toolingRoot: "/fixture/tooling", toolingRevision: pin, primarySessionId: ids.primary, phase: "working" } });
-  const environment = await requestCompute({ prisma: db.prisma, config, machineId: "host", policy: config.compute!, taskId: ids.task, request: { key: "runtime-development", purpose: "development", revision, recipeDigest: oldHash } });
-  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: ids.task, key: environment.key, kind: "task-runtime", purpose: "development", externalId: `/private/${ids.task}/runtime.json`, state: "failed",
-    metadata: { recipeHash: oldHash, revision, providers: [saved], observed: "failed" } } });
-  const offer = await db.prisma.computeOffer.create({ data: { id: crypto.randomUUID(), environmentId: environment.id, machineId: "host", instructionId: `historical-offer:${ids.task}`, dispatchDeadline: new Date(), state: "unknown", claimedAt: new Date(Date.now() - 3_600_000) } });
-  await db.prisma.computeSlot.create({ data: { id: ids.slot, ordinal: Number(ids.slot.split(":")[1]), machineId: "host", allocationId: offer.id } });
-  await db.prisma.computeWait.deleteMany({ where: { environmentId: environment.id } });
-  await db.prisma.computeEnvironment.update({ where: { id: environment.id }, data: { state: "unknown", resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest } });
-  const computeOperation = crypto.randomUUID();
-  const request = { offerId: offer.id, operationId: computeOperation, resourceKey: environment.key, previousRecipeHash: oldHash, recipeHash: nextHash, baselineFile: `/private/${ids.task}/baseline.json`, lockPid: 4242, outcome: "absent" as const, sourceRevision: head };
-  const operation: BoundToolingOperation = { contract: "remote-agent.tooling-operation/v1", operationId: ids.operation, requestKey: `neon-recovery-${ids.task}`, inputDigest: neonRecoveryInputDigest(request),
-    repositoryId: "repo", taskId: ids.task, sessionId: ids.primary, kind: "compute-neon-recovery", existingOperationId: offer.id, resourceKey: environment.key, generation: 5, release: { ...release } };
+  const request = { offerId, operationId: computeOperation, resourceKey: "runtime-development", previousRecipeHash: oldHash, recipeHash: nextHash, baselineFile: `/private/${ids.task}/baseline.json`, lockPid: 4242, outcome: "absent" as const, sourceRevision: head };
+  const binding: ToolingOperationBinding = { contract: "remote-agent.tooling-operation/v1", operationId: ids.operation, requestKey: `neon-recovery-${ids.task}`, inputDigest: neonRecoveryInputDigest(request),
+    repositoryId: "repo", taskId: ids.task, sessionId: ids.primary, turnId: null, kind: "compute-neon-recovery", existingOperationId: offerId, parentOperationId: null, retainedConsumerId: null,
+    resourceKey: "runtime-development", generation: 5, release: fullRelease, status: "running" };
   const attempt = { version: 1 as const, name: saved.name, projectId: "spatial-project", templateBranchId: "br-template", parentLsn: "0/1A2B3C4", requestedAt: "2026-11-04T10:01:00.000Z", expiresAt: "2026-11-11T10:01:00.000Z",
     rejection: { status: 422, code: "BRANCHES_LIMIT_EXCEEDED", observedAt: "2026-11-04T10:01:01.000Z" } };
-  const proof: ComputeNeonRecoveryProof = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskId: ids.task, primarySessionId: ids.primary, toolingRevision: pin,
-    environmentId: environment.id, resourceId: resource.id, resourceKey: environment.key, offerId: offer.id, operationId: computeOperation, revision, sourceRevision: head,
-    previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "1".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), lockPid: 4242,
+  const reconciliation = { operation: "create-neon", outcome: "absent", name: saved.name, projectId: "spatial-project", observedAt: "2026-11-05T09:00:00.000Z", attempt, absence: { basis: "provider-rejection" } };
+  // First commit: the canonical receipt is still its baseline.
+  const proof = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskId: ids.task, primarySessionId: ids.primary, toolingRevision: pin,
+    environmentId, resourceId, resourceKey: "runtime-development", offerId, operationId: computeOperation, revision, sourceRevision: head,
+    previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "2".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), lockPid: 4242,
     stage: { phase: "failed", pending: null, setupComplete: false, schemaApplied: false, fixturesComplete: false, spatialSchema: false, container: false, containerOperation: false, configuration: false, coverage: false, startBundle: false },
-    baselineProviders: [saved], providers: [saved],
-    reconciliation: { operation: "create-neon", outcome: "absent", name: saved.name, projectId: "spatial-project", observedAt: "2026-11-05T09:00:00.000Z", attempt, absence: { basis: "provider-rejection" } },
-    baselineNeonCreateSha256: canonicalSha256(attempt), operation: { operationId: ids.operation, releaseId: release.id, revision: release.revision, tree: release.tree } };
+    baselineProviders: [saved], providers: [saved], reconciliation, baselineNeonCreateSha256: canonicalSha256(attempt),
+    operation: { operationId: ids.operation, releaseId: release.id, revision: release.revision, tree: release.tree },
+    candidateSha256: "4".repeat(64), candidateVersion: 2, canonical: "baseline" };
   const observer = { operationId: ids.operation, releaseId: release.id, revision: release.revision, tree: release.tree, adapterSha256: "8".repeat(64) };
-  const written = await recoverComputeNeon({ prisma: db.prisma, config, taskId: ids.task, request, operation }, async () => ({ proof: structuredClone(proof), observer: { ...observer } }), async () => head);
-  const original = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-neon-recovery", source: `compute:${ids.task}` } });
-  // The foundation writer predates the staged design: the same transaction's
-  // planned rows and fields (S5 handoff, S6 drafted.runtime/2, S6b event) are
-  // added here exactly as designed, keeping the writer's own key and values.
   const write = await db.prisma.toolingStateWrite.create({ data: { repositoryId: "repo", taskId: ids.task, family: "drafted.runtime", scopeKey: "runtime-development", version: 2, preservesUnknown: true, operationId: ids.operation, releaseId: release.id } });
-  const legacy = await db.prisma.toolingLegacyConsumer.create({ data: { id: `legacy-${ids.task}`, repositoryId: "repo", taskId: ids.task, consumerKind: "compute-environment", consumerId: environment.id, provenance: "first-bootstrap",
+  const legacy = await db.prisma.toolingLegacyConsumer.create({ data: { id: `legacy-${ids.task}`, repositoryId: "repo", taskId: ids.task, consumerKind: "compute-environment", consumerId: environmentId, provenance: "exact",
     revision: pin, checkout: "/fixture/tooling", status: "resolved", resolution: { kind: "compute-neon-recovery", reference: ids.operation }, resolvedAt: new Date() } });
   const stateWrite = { family: "drafted.runtime" as const, scopeKey: "runtime-development" as const, version: 2 as const, operationId: ids.operation, releaseId: release.id, sequence: write.sequence };
-  const result = { ...written, stateWrite };
-  const value = JSON.parse(original.value!);
-  value.proof = { ...value.proof, candidateSha256: "4".repeat(64), candidateVersion: 2, canonical: "baseline" };
-  value.evidence = stagedEvidence(value.proof);
-  value.handoff = { legacyRows: [{ id: legacy.id, consumerKind: legacy.consumerKind, consumerId: legacy.consumerId, revision: legacy.revision, checkout: legacy.checkout }] };
-  value.stateWrite = stateWrite; value.result = result;
-  // The service records the full stored binding (parent explicitly null for a root operation).
-  const binding: ToolingOperationBinding = { ...operation, turnId: null, parentOperationId: null, retainedConsumerId: null, release: fullRelease, status: "running" };
-  value.operation = binding;
-  const event = await db.prisma.runtimeMetadataEvent.update({ where: { sequence: original.sequence }, data: { value: JSON.stringify(value) } });
+  const result = { environmentId, resourceId, resourceIdentity: "5".repeat(64), offerId, operationId: computeOperation, previousRecipeHash: oldHash, recipeHash: nextHash, sourceRevision: head,
+    outcome: "absent" as const, basis: "provider-rejection" as const, reconciliationSha256: finalizationDigest(reconciliation), observer, allocation: "retained-existing-claim" as const, stateWrite };
+  // The legacy-group helper's NeonRecoveryHandoff, stored verbatim.
+  const handoff = { version: 1, operationId: ids.operation, taskId: ids.task, environmentId, resourceId,
+    rows: [{ id: legacy.id, consumerKind: legacy.consumerKind, consumerId: legacy.consumerId, revision: legacy.revision, checkout: legacy.checkout }] };
+  const value = { version: 1, contract: "runtime-neon-recovery/v1", transition: "neon-template-child", taskIdentity: `identity-${ids.task}`, request,
+    environment: { id: environmentId }, resource: { id: resourceId }, offer: { id: offerId }, allocations: { offers: [], slots: [], wait: null }, operation: binding,
+    proof, observer, evidence: stagedEvidence(proof), projectionIdentity: "6".repeat(64), handoff, stateWrite, result };
+  const event = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: ids.primary, source: `compute:${ids.task}`, action: "compute-neon-recovery", key: transitionKey(environmentId, resourceId, request), value: JSON.stringify(value) } });
   return { request, operation: binding, result, event, write, legacy };
 }
 const read = (operation: Parameters<typeof readCommittedNeonRecovery>[1]) => readCommittedNeonRecovery(db.prisma, operation);
@@ -100,7 +93,7 @@ const unverifiable = async (promise: Promise<unknown>, reason: string) => {
   expect((error as NeonRecoveryResultUnverifiable).reason).toBe(reason as NeonRecoveryResultUnverifiable["reason"]);
 };
 
-test("returns the real writer's exact committed result in the client's strict shape, without the lock PID", async () => {
+test("returns the exact committed result in the client's strict shape, without the lock PID", async () => {
   const f = await committed();
   const all = async () => db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } });
   const before = await all();
@@ -201,7 +194,7 @@ test("two events naming the operation, or a second event under its transition ke
 
 test("another task's valid event is independent; a history past its bound refuses", async () => {
   const f = await committed();
-  const g = await committed({ task: "task-2", primary: "primary-2", operation: "op-recovery-2", slot: "host:1" });
+  const g = await committed({ task: "task-2", primary: "primary-2", operation: "op-recovery-2" });
   expect((await read(g.operation))?.sequence).toBe(g.event.sequence);
   expect((await read(f.operation))?.sequence).toBe(f.event.sequence);
   await db.prisma.runtimeMetadataEvent.createMany({ data: Array.from({ length: 1000 }, (_, index) => ({ runtimeSessionId: "primary", source: "compute:task", action: "compute-neon-recovery", key: `filler-${index}`, value: "{}" })) });
@@ -230,10 +223,19 @@ test.each<[string, (value: any) => void, string]>([
   ["candidate version 1", value => { value.proof.candidateVersion = 1; }, "event-unreadable"],
   ["candidate digest without matching evidence", value => { value.proof.candidateSha256 = "5".repeat(64); }, "event-mismatch"],
   ["first commit observed over a published candidate", value => { value.proof.canonical = "candidate"; }, "event-mismatch"],
+  ["first commit whose canonical receipt was not the baseline", value => { value.proof.receiptSha256 = value.proof.candidateSha256; }, "event-mismatch"],
   ["candidate equal to the baseline", value => { value.proof.candidateSha256 = value.proof.baselineSha256; value.evidence = stagedEvidence(value.proof); }, "event-mismatch"],
-  ["handoff row twice", value => { value.handoff.legacyRows.push(value.handoff.legacyRows[0]); }, "event-mismatch"],
-  ["handoff row with an extra field", value => { value.handoff.legacyRows[0].extra = 1; }, "event-unreadable"],
-  ["handoff snapshot revision", value => { value.handoff.legacyRows[0].revision = "e".repeat(40); }, "event-mismatch"],
+  ["handoff row twice", value => { value.handoff.rows.push(value.handoff.rows[0]); }, "event-mismatch"],
+  ["handoff row with an extra field", value => { value.handoff.rows[0].extra = 1; }, "event-unreadable"],
+  ["handoff snapshot revision", value => { value.handoff.rows[0].revision = "e".repeat(40); }, "event-mismatch"],
+  ["handoff row without exact revision", value => { value.handoff.rows[0].revision = null; }, "event-unreadable"],
+  ["handoff row without exact checkout", value => { value.handoff.rows[0].checkout = null; }, "event-unreadable"],
+  ["handoff of another operation", value => { value.handoff.operationId = "op-other"; }, "event-mismatch"],
+  ["handoff of another task", value => { value.handoff.taskId = "elsewhere"; }, "event-mismatch"],
+  ["handoff of another environment", value => { value.handoff.environmentId = crypto.randomUUID(); }, "event-mismatch"],
+  ["handoff of another resource", value => { value.handoff.resourceId = "other-resource"; }, "event-mismatch"],
+  ["handoff version 2", value => { value.handoff.version = 2; }, "event-unreadable"],
+  ["superseded handoff shape", value => { value.handoff = { legacyRows: value.handoff.rows }; }, "event-unreadable"],
 ])("staged fields: %s", async (_name, change, reason) => {
   const f = await committed();
   await rewrite(f.event.sequence, change);
@@ -242,16 +244,18 @@ test.each<[string, (value: any) => void, string]>([
 
 test("each handed-off legacy row must be resolved by this operation with its snapshot unchanged", async () => {
   const f = await committed();
-  for (const data of [{ status: "retained" }, { resolution: { kind: "compute-neon-recovery", reference: "op-other" } }, { resolution: { kind: "compute-bind", reference: "op-recovery" } }, { checkout: "/elsewhere" }, { consumerId: "other-environment" }, { taskId: "elsewhere" }]) {
+  for (const data of [{ status: "retained" }, { resolution: { kind: "compute-neon-recovery", reference: "op-other" } }, { resolution: { kind: "compute-bind", reference: "op-recovery" } }, { checkout: "/elsewhere" },
+    { revision: "e".repeat(40) }, { consumerId: "other-environment" }, { taskId: "elsewhere" }, { provenance: "unavailable" }, { revision: null, checkout: null }]) {
     await db.prisma.toolingLegacyConsumer.update({ where: { id: f.legacy.id }, data });
     await unverifiable(read(f.operation), "event-mismatch");
-    await db.prisma.toolingLegacyConsumer.update({ where: { id: f.legacy.id }, data: { status: f.legacy.status, resolution: f.legacy.resolution as object, checkout: f.legacy.checkout, consumerId: f.legacy.consumerId, taskId: f.legacy.taskId } });
+    await db.prisma.toolingLegacyConsumer.update({ where: { id: f.legacy.id }, data: { status: f.legacy.status, resolution: f.legacy.resolution as object, checkout: f.legacy.checkout, revision: f.legacy.revision,
+      consumerId: f.legacy.consumerId, taskId: f.legacy.taskId, provenance: f.legacy.provenance } });
   }
   expect(await read(f.operation)).not.toBeNull();
   await db.prisma.toolingLegacyConsumer.delete({ where: { id: f.legacy.id } });
   await unverifiable(read(f.operation), "event-mismatch");
   // A group that had no legacy rows hands off none.
-  await rewrite(f.event.sequence, value => { value.handoff.legacyRows = []; });
+  await rewrite(f.event.sequence, value => { value.handoff.rows = []; });
   expect((await read(f.operation))?.committed.result.stateWrite.sequence).toBe(f.write.sequence);
 });
 
@@ -272,4 +276,23 @@ test("a command-parented operation must match its recorded parent exactly", asyn
   expect((await read({ ...f.operation, parentOperationId: "op-command" }))?.sequence).toBe(f.event.sequence);
   await unverifiable(read(f.operation), "event-mismatch");
   await unverifiable(read({ ...f.operation, parentOperationId: "op-other-command" }), "event-mismatch");
+});
+
+test("the rows this operation resolved must be exactly the recorded handoff", async () => {
+  const f = await committed();
+  const row = (id: string, data: Record<string, unknown>) => db.prisma.toolingLegacyConsumer.create({ data: { id, repositoryId: "repo", taskId: "task", consumerKind: "compute-offer", consumerId: id, provenance: "exact",
+    revision: "d".repeat(40), checkout: "/fixture/tooling", ...data } });
+  // Unrelated rows (still retained, or resolved by other evidence) do not belong to the handoff.
+  await row("unrelated-retained", { status: "retained" });
+  await row("unrelated-resolved", { status: "resolved", resolution: { kind: "compute-bind", reference: "op-recovery" } });
+  expect((await read(f.operation))?.sequence).toBe(f.event.sequence);
+  // A row resolved by this operation but missing from the record is refused.
+  await row("unrecorded", { status: "resolved", resolution: { kind: "compute-neon-recovery", reference: "op-recovery" } });
+  await unverifiable(read(f.operation), "event-mismatch");
+});
+
+test("a task legacy history past its bound refuses", async () => {
+  const f = await committed();
+  await db.prisma.toolingLegacyConsumer.createMany({ data: Array.from({ length: 1000 }, (_, index) => ({ id: `filler-${index}`, repositoryId: "repo", taskId: "task", consumerKind: "compute-offer", consumerId: `filler-${index}`, provenance: "exact" })) });
+  await unverifiable(read(f.operation), "history-bound");
 });

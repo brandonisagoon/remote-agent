@@ -59,7 +59,12 @@ const Proof = ComputeNeonRecoveryProof.extend({ candidateSha256: Sha, candidateV
 type Proof = z.infer<typeof Proof>;
 const StateWrite = z.strictObject({ family: z.literal(NeonRecoveryStateFamily), scopeKey: z.literal(NeonRecoveryStateScope), version: z.literal(NeonRecoveryStateVersion),
   operationId: Id, releaseId: Id, sequence: z.number().int().positive() });
-const Handoff = z.strictObject({ legacyRows: z.array(z.strictObject({ id: Id, consumerKind: Id, consumerId: Id, revision: z.string().min(1).nullable(), checkout: z.string().min(1).nullable() })).max(HANDOFF_BOUND) });
+/** The canonical server-only handoff record (the legacy-group helper's
+ * `NeonRecoveryHandoff`, stored verbatim): full identity, and each resolved
+ * row's exact snapshot. Revision and checkout are never null: a reader
+ * without exact executable provenance is never handed off. */
+const Handoff = z.strictObject({ version: z.literal(1), operationId: Id, taskId: Id, environmentId: Id, resourceId: Id,
+  rows: z.array(z.strictObject({ id: Id, consumerKind: Id, consumerId: Id, revision: z.string().min(1), checkout: z.string().min(1) })).max(HANDOFF_BOUND) });
 /** The server response shape (`ComputeNeonRecoveryResult`), strictly. */
 const Result = z.strictObject({
   environmentId: Id, resourceId: Id, resourceIdentity: Sha, offerId: z.uuid(), operationId: z.uuid(), previousRecipeHash: Sha, recipeHash: Sha, sourceRevision: Revision,
@@ -152,7 +157,7 @@ function verify(event: { sequence: number; key: string; value: StoredEvent }, bi
     || proof.previousRecipeHash !== request.previousRecipeHash || proof.recipeHash !== request.recipeHash || proof.lockPid !== request.lockPid || proof.reconciliation.outcome !== request.outcome) fail("proof is not this request's");
   if (proof.operation.operationId !== binding.operationId || proof.operation.releaseId !== binding.release.id || proof.operation.revision !== binding.release.revision || proof.operation.tree !== binding.release.tree) fail("proof was not observed by the bound release");
   if (evidence(proof) !== value.evidence) fail("recorded evidence does not derive from its proof");
-  if (proof.canonical !== "baseline" || proof.candidateSha256 === proof.baselineSha256) fail("proof was not observed over the staged candidate with the canonical receipt at its baseline");
+  if (proof.canonical !== "baseline" || proof.receiptSha256 !== proof.baselineSha256 || proof.candidateSha256 === proof.baselineSha256) fail("proof was not observed over the staged candidate with the canonical receipt at its baseline");
   if (observer.operationId !== binding.operationId || observer.releaseId !== binding.release.id || observer.revision !== binding.release.revision || observer.tree !== binding.release.tree
     || finalizationDigest(result.observer) !== finalizationDigest(observer)) fail("observer is not the bound release's");
   if (result.environmentId !== value.environment.id || result.resourceId !== value.resource.id || result.offerId !== value.offer.id || result.offerId !== request.offerId
@@ -162,24 +167,31 @@ function verify(event: { sequence: number; key: string; value: StoredEvent }, bi
 }
 
 /** The exact rows the transaction wrote beside the event: the registered
- * drafted.runtime/2 write, and each handed-off legacy row resolved by this
- * operation with its snapshot unchanged. Bounded, read-only. */
+ * drafted.runtime/2 write, and exactly the handed-off legacy rows (the set of
+ * this task's rows resolved by this operation equals the recorded rows, each
+ * with exact provenance and its snapshot unchanged). Bounded, read-only. */
 async function verifyStoredRows(store: Pick<PrismaClient, "toolingStateWrite" | "toolingLegacyConsumer">, event: { sequence: number; value: StoredEvent }, binding: NeonRecoveryResultBinding) {
   const fail = (detail: string): never => { throw new NeonRecoveryResultUnverifiable("event-mismatch", `event ${event.sequence}: ${detail}`); };
   const { stateWrite, handoff } = event.value;
   const write = await store.toolingStateWrite.findUnique({ where: { sequence: stateWrite.sequence } });
   if (!write || write.repositoryId !== binding.repositoryId || write.taskId !== binding.taskId || write.family !== stateWrite.family || write.scopeKey !== stateWrite.scopeKey
     || write.version !== stateWrite.version || write.operationId !== binding.operationId || write.releaseId !== binding.release.id) fail(`state write ${stateWrite.sequence} is not the registered drafted.runtime/2 write of this operation`);
-  const ids = handoff.legacyRows.map(row => row.id);
+  if (handoff.operationId !== binding.operationId || handoff.taskId !== binding.taskId || handoff.environmentId !== event.value.environment.id || handoff.resourceId !== event.value.resource.id) {
+    fail("handoff is not this operation's environment and resource");
+  }
+  const ids = handoff.rows.map(row => row.id);
   if (new Set(ids).size !== ids.length) fail("handoff names a legacy row twice");
-  if (!ids.length) return;
-  const rows = await store.toolingLegacyConsumer.findMany({ where: { id: { in: ids } }, take: HANDOFF_BOUND + 1 });
-  for (const entry of handoff.legacyRows) {
-    const row = rows.find(value => value.id === entry.id);
-    const resolution = z.object({ kind: z.string(), reference: z.string() }).passthrough().safeParse(row?.resolution).data;
-    if (!row || row.repositoryId !== binding.repositoryId || row.taskId !== binding.taskId || row.consumerKind !== entry.consumerKind || row.consumerId !== entry.consumerId
-      || row.revision !== entry.revision || row.checkout !== entry.checkout || row.status !== "resolved" || resolution?.kind !== HANDOFF_EVIDENCE_KIND || resolution.reference !== binding.operationId) {
-      fail(`legacy row ${entry.id} is not resolved by this operation's handoff with its recorded snapshot`);
+  // Every legacy row of the task, bounded: the rows this operation resolved
+  // must be exactly the recorded ones (no unrecorded or missing row).
+  const rows = await store.toolingLegacyConsumer.findMany({ where: { repositoryId: binding.repositoryId, taskId: binding.taskId }, orderBy: { id: "asc" }, take: HANDOFF_BOUND + 1 });
+  if (rows.length > HANDOFF_BOUND) throw new NeonRecoveryResultUnverifiable("history-bound", `more than ${HANDOFF_BOUND} legacy readers for task ${binding.taskId}`);
+  const Resolution = z.object({ kind: z.string(), reference: z.string() }).passthrough();
+  const resolvedHere = rows.filter(row => { const resolution = Resolution.safeParse(row.resolution).data; return resolution?.kind === HANDOFF_EVIDENCE_KIND && resolution.reference === binding.operationId; });
+  if (resolvedHere.length !== ids.length || resolvedHere.some(row => !ids.includes(row.id))) fail("the legacy rows resolved by this operation are not exactly the recorded handoff");
+  for (const entry of handoff.rows) {
+    const row = resolvedHere.find(value => value.id === entry.id)!;
+    if (row.status !== "resolved" || row.provenance !== "exact" || row.consumerKind !== entry.consumerKind || row.consumerId !== entry.consumerId || row.revision !== entry.revision || row.checkout !== entry.checkout) {
+      fail(`legacy row ${entry.id} is not resolved by this operation with exact provenance and its recorded snapshot`);
     }
   }
 }
