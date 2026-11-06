@@ -31,7 +31,7 @@ test("a filled budget holds closed, paused and eligible waiters; the original pr
   const claim = await until(server.agentEvents, events => events.some(event => event.event === "claim" || event.event === "claim-error" || event.event === "claim-skipped"), "first claim");
   const claimed = claim.find(event => String(event.event).startsWith("claim"))!;
   expect(claimed).toMatchObject({ event: "claim", task: first.id, status: 200 });
-  const firstOffer = await prisma.computeOffer.findFirstOrThrow({ where: { environment: undefined, environmentId: (await prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: first.id } })).id } });
+  const firstOffer = await prisma.computeOffer.findFirstOrThrow({ where: { environmentId: (await prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: first.id } })).id } });
   expect(["claimed", "running"]).toContain(firstOffer.state);
   expect(await prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
 
@@ -39,7 +39,7 @@ test("a filled budget holds closed, paused and eligible waiters; the original pr
   //    the eligible one waits without an offer.
   for (const task of [closed, paused, eligible]) expect((await server.requestCompute(task)).status).not.toBe(500);
   await Bun.sleep(3_000);
-  const offers = await prisma.computeOffer.findMany({ include: { environment: false } as never }).catch(() => prisma.computeOffer.findMany());
+  const offers = await prisma.computeOffer.findMany();
   const environments = await prisma.computeEnvironment.findMany();
   const byTask = (taskId: string) => environments.find(environment => environment.taskId === taskId);
   expect(offers.filter(offer => offer.environmentId !== byTask(first.id)?.id)).toEqual([]);
