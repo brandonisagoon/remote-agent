@@ -7,6 +7,7 @@ import { run } from "./run.ts";
 import { resolveCname } from "node:dns/promises";
 import { listTunnels, tunnelHost, tunnelLabel, tunnelLoginCert, tunnelName } from "./tunnel.ts";
 import { serviceLabel, supervisor } from "./supervisor/index.ts";
+import { readToolingDeploymentState } from "./tooling-deployment.ts";
 
 export type CheckStatus = "ok" | "warn" | "fail";
 
@@ -55,10 +56,25 @@ export async function runChecks(): Promise<CheckResult[]> {
   results.push(await serverCheck(config));
   results.push(await acpSocketCheck(config));
   results.push(repositoriesCheck(config));
+  results.push(await toolingSelectionCheck(config));
   results.push(...(await tunnelChecks(config)));
   results.push(...providerChecks());
 
   return results;
+}
+
+export async function toolingSelectionCheck(config: ServerConfig): Promise<CheckResult> {
+  const identity = { id: "tooling-selection", label: "Active tooling releases" };
+  try {
+    const { selections } = await readToolingDeploymentState(config.databaseUrl);
+    if (!selections.length) return { ...identity, status: "ok", detail: "No durable tooling activation; configured tooling remains the legacy source" };
+    const changed = selections.filter(selection => config.repositories[selection.repositoryId]?.tooling?.revision !== selection.revision);
+    if (changed.length) return { ...identity, status: "warn", detail: changed.map(selection => `${selection.repositoryId}: active generation ${selection.generation} uses ${selection.revision}; configured ref differs`).join("; "),
+      remedy: "Inspect active release receipts. Changing tooling.ref does not replace the durable selection; use the supported activation path." };
+    return { ...identity, status: "ok", detail: selections.map(selection => `${selection.repositoryId}: generation ${selection.generation}`).join("; ") };
+  } catch (error) {
+    return { ...identity, status: "fail", detail: error instanceof Error ? error.message : String(error), remedy: "Inspect tooling selection records before deployment; do not reset the database or task pins." };
+  }
 }
 
 function toolCheck(name: string, label: string, remedy: string): CheckResult {

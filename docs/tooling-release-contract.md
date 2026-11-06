@@ -60,6 +60,8 @@ the running committed policy blob. Different workflows, labels, skillsRoot,
 bootstrap or other team policy return `restart-required`, not mixed A policy/B
 code. On restart, reconstruct policy from the durable selection's revision;
 do not first depend on the moving configured ref successfully resolving.
+`restart-required` is a rejection, not a queued activation: no later restart
+may promote that candidate implicitly or block unrelated compatible activation.
 
 Persist selection and activation receipt atomically. The selection contains
 `repositoryId`, monotonically increasing `generation`, release identity and
@@ -109,6 +111,20 @@ or retained process binding; read-only accounting without an effect binding is
 an independently bound observation. Finalization keeps the accepted operation
 and existing exact resource authority. Closure is not permission to change code
 or discard its history.
+An existing group's suspension, reclaim and baseline observation use that
+producer too. An admission request or queued offer never advances the producer;
+only a confirmed start, resume or configuration transition may do so.
+
+Before first activation publishes generation 1, atomically persist a stable
+bootstrap boundary and legacy bindings for existing environments/resources,
+active offers, queued cleanup, pending development intents and finalization
+preparations. Retain the exact recorded executable/observer receipt wherever
+available. Missing or ambiguous provenance is an affected-consumer diagnosis,
+not permission to guess the current configured revision. Later activations do
+not move the bootstrap boundary. New unbound rows may never become legacy just
+because another activation happened later. Persist lifecycle associations before
+effects or in the existing operation transaction; a lost HTTP acknowledgment
+must not erase the producer binding.
 
 At a genuinely independent operation boundary, select the current generation
 and recheck ownership, pause, admission and applicable delivery authority. A
@@ -188,6 +204,13 @@ also validates its actual state before effects. If a state migration would
 invalidate a retained A operation/process, defer that migration for the affected
 state until its consumers finish or provide a compatible reader strategy.
 Neither activation nor unsupported state creates a global task pause.
+Actual written-format evidence outlives completed operation bindings. Checking
+only the latest active manifest would permit A(v1) -> B(v2 writes) -> C(v1-only)
+after B completes. Register the required format before a write and preserve that
+evidence for rollback checks. Candidate potential writes do not globally block
+activation: enforce incompatible migration/write restrictions on the affected
+task/state while unrelated operations continue. Missing required families are
+not silently treated as compatible.
 
 ## Writer map and integration order
 
@@ -264,3 +287,12 @@ hosted runners where available; retain failed/time-limited results honestly.
 DRA-33 alone owns shared bootstrap deployment. DRA-27 supplies reviewed paired
 commits/trees, protocol/state-format evidence and rehearsal results. Merged,
 source-ready, isolated verified and deployed are distinct states.
+
+Once a durable selection exists, server deployment/rollback must preserve its
+protocol instead of falling back to a pre-selection server's boot ref. The
+primary owns `management/tooling-deployment.ts`, deploy guards, doctor selection
+diagnostics and `lib/tooling-server-protocol.json`. Automatic database rewind is
+refused after activation: it could erase operation history while external
+effects remain. DRA-33 owns coordinated compatible recovery. The old Drafted
+paired-release operator must not be used to edit refs and restart as a substitute
+for durable selection; its replacement/retirement is a cutover prerequisite.

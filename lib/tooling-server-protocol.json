@@ -1,0 +1,5 @@
+{
+  "contract": "remote-agent.server-tooling/v1",
+  "selectionVersion": 1,
+  "operationProtocol": { "min": 1, "max": 1 }
+}

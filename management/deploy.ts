@@ -7,6 +7,7 @@ import { runOrThrow } from "./run.ts";
 import { serverDefinition, serviceLabel, supervisor, type ServiceDefinition } from "./supervisor/index.ts";
 import { syncTree } from "./sync-tree.ts";
 import { waitForHealth } from "./provision.ts";
+import { assertToolingServerCompatibility, assertToolingSnapshotRestoreSafe } from "./tooling-deployment.ts";
 
 /** Pull origin/<branch>, rebuild, migrate, restart, verify — roll back on
     failure (TS port of the retired deploy.sh).
@@ -108,6 +109,10 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
 
   if (previous === target && !force) return "up-to-date";
 
+  // Refuse an incompatible candidate before any reset, copy, service stop or
+  // rollback attempt. A failed preflight leaves the running service alone.
+  await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: target });
+
   if (!force && previous !== target) {
     const changed = await runOrThrow("git", ["-C", layout.repo, "diff", "--name-only", previous, target]);
     if (!RELEVANT_CHANGE.test(changed)) {
@@ -125,6 +130,7 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
     // resetting git alone leaves the app copy populated with the new,
     // unbuildable code, and the supervisor restarts the service into it.
     // The service must come back regardless — build() stopped it to migrate.
+    await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: previous });
     await restoreDatabaseSnapshot(context);
     if ((await tryBuild(context, previous)) && (await restartAndCheck(context))) {
       log(`restored ${previous}`);
@@ -143,6 +149,7 @@ async function deployLocked(context: DeployContext, force: boolean): Promise<Dep
   // after an intentionally destructive migration, old code cannot safely run
   // against the new schema.
   log(`HEALTH CHECK FAILED after deploying ${target} — rolling back to ${previous}`);
+  await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: previous });
   await restoreDatabaseSnapshot(context);
   if ((await tryBuild(context, previous)) && (await restartAndCheck(context))) {
     log(`rolled back to ${previous} OK`);
@@ -161,6 +168,7 @@ async function tryBuild(context: DeployContext, commit: string): Promise<boolean
   const { layout, bun, log } = context;
   const env = { REMOTE_AGENT_CONFIG: configFilePath() };
   try {
+    await assertToolingServerCompatibility({ databaseUrl: context.config.databaseUrl, repository: layout.repo, revision: commit });
     await runOrThrow("git", ["-C", layout.repo, "reset", "--hard", "--quiet", commit]);
     syncTree(layout.repo, layout.app);
     await runOrThrow(bun, ["install", "--silent"], { cwd: layout.app, env });
@@ -203,6 +211,7 @@ async function restoreDatabaseSnapshot(context: DeployContext): Promise<void> {
   if (context.snapshot === null || context.snapshot === "absent") return;
   const { databasePath, log } = context;
   if (!databasePath) return;
+  await assertToolingSnapshotRestoreSafe(context.config.databaseUrl);
   await supervisor().stop(serviceLabel(context.config.serviceName));
   copyFileSync(context.snapshot, databasePath);
   if (process.platform !== "win32") chmodSync(databasePath, 0o600);
