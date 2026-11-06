@@ -27,6 +27,17 @@ async function claim(offerId: string) {
   audit({ event: "claim", offerId, status: response.status, body: await response.json().catch(() => null) });
 }
 
+/** Runtime mode: the agent runs the actual Drafted adapter algorithm for the
+ * delivered offer in a separate Bun process, during this delivering turn. */
+async function runtimeTurn(offerId: string) {
+  const child = Bun.spawn([process.execPath, "--no-env-file", `${import.meta.dir}/dra37-runtime-turn.ts`, "up", offerId], { cwd: process.cwd(), stdout: "pipe", stderr: "pipe",
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: process.env.TMPDIR ?? "/tmp", HOME: process.env.HOME ?? "/tmp", DRA37_DRAFTED_ROOT: process.env.DRA37_DRAFTED_ROOT!,
+      DRA37_SOCKET: process.env.REMOTE_AGENT_SOCKET ?? process.env.DRA37_SOCKET!, DRA37_TASK: taskId, DRA37_STATE: process.env.DRA37_STATE!,
+      DRA37_RECIPE: `${specs}/${taskId}.recipe.json`, DRA37_APPS: process.env.DRA37_APPS! } });
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+  audit({ event: "runtime-up", offerId, code, result: code === 0 ? JSON.parse(stdout.trim().split("\n").at(-1)!) : null, stderr: stderr.slice(-2_000) });
+}
+
 for await (const line of createInterface({ input: process.stdin })) {
   const { id, method, params } = JSON.parse(line);
   if (id === undefined) continue;
@@ -36,8 +47,9 @@ for await (const line of createInterface({ input: process.stdin })) {
   else if (method === "session/prompt") {
     const text: string = params.prompt?.map((part: { text?: string }) => part.text ?? "").join("") ?? "";
     audit({ event: "prompt", text: text.slice(0, 400) });
-    const offer = /--compute-offer ([0-9a-f-]{36})/.exec(text)?.[1];
-    if (offer) await claim(offer).catch(error => audit({ event: "claim-error", offerId: offer, error: String(error) }));
+    const offer = /--compute-offer ([0-9a-f-]{36})/.exec(text)?.[1] ?? /\(offer ([0-9a-f-]{36})\)/.exec(text)?.[1];
+    if (offer && process.env.DRA37_DRAFTED_ROOT) await runtimeTurn(offer).catch(error => audit({ event: "runtime-error", offerId: offer, error: String(error) }));
+    else if (offer) await claim(offer).catch(error => audit({ event: "claim-error", offerId: offer, error: String(error) }));
     send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: session, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "dra37 turn complete" } } } });
     send({ jsonrpc: "2.0", id, result: { stopReason: "end_turn" } });
   } else send({ jsonrpc: "2.0", id, result: {} });

@@ -4,7 +4,7 @@
  * and compute admission enabled. Seeds write task/session IDENTITY only;
  * every request, offer, reservation, claim and delivery goes through the
  * server's normal routes and workers. Never points at live config or data. */
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -30,16 +30,45 @@ function git(cwd: string, ...args: string[]) {
 
 export type Dra37Task = { id: string; sessionId: string; worktree: string; revision: string; recipe: { key: string; purpose: "development"; revision: string; recipeDigest: string } };
 
-export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number }) {
+/** Pinned Drafted source: `git archive` of one commit into this fixture's own
+ * temp root. The paired worktree is only read (objects + node_modules link). */
+export const DRAFTED_WORKTREE = "/Users/brandon/Desktop/.worktrees/drafted-workflow/dra-27-live-tooling-release";
+async function materializeDrafted(root: string, revision: string) {
+  const target = path.join(root, `drafted-${revision.slice(0, 12)}`);
+  await mkdir(target);
+  const archive = Bun.spawnSync(["git", "-C", DRAFTED_WORKTREE, "archive", "--format=tar", revision], { stdout: "pipe", stderr: "pipe" });
+  if (archive.exitCode) throw new Error(`Cannot archive Drafted ${revision}: ${archive.stderr.toString()}`);
+  const extract = Bun.spawnSync(["tar", "-x", "-C", target], { stdin: archive.stdout, stderr: "pipe" });
+  if (extract.exitCode) throw new Error(`Cannot extract Drafted ${revision}: ${extract.stderr.toString()}`);
+  await symlink(path.join(DRAFTED_WORKTREE, "node_modules"), path.join(target, "node_modules"));
+  return { root: target, revision: git(DRAFTED_WORKTREE, "rev-parse", `${revision}^{commit}`), tree: git(DRAFTED_WORKTREE, "rev-parse", `${revision}^{tree}`) };
+}
+
+export async function dra37Server(options: { slots: number; deliveryTimeoutSeconds?: number; draftedRevision?: string }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
   const token = crypto.randomUUID(), url = `http://127.0.0.1:${port}`;
   const configFile = path.join(root, "config.json"), controlSocket = path.join(root, "control.sock");
   const repo = path.join(root, "repo"), worktrees = path.join(root, "worktrees"), specs = path.join(root, "specs"), agentLog = path.join(root, "agent.jsonl");
+  const apps = path.join(root, "apps"), state = path.join(root, "state");
+  await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 });
+  const drafted = options.draftedRevision ? await materializeDrafted(root, options.draftedRevision) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
   const fixture = {
-    root, db, url, token, configFile, controlSocket, agentLog,
+    root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted,
+    /** Environment for one actual Drafted runtime invocation (dra37-runtime-turn.ts). */
+    runtimeEnv(taskId: string) {
+      if (!drafted) throw new Error("This fixture has no pinned Drafted checkout");
+      return { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), HOME: root, DRA37_DRAFTED_ROOT: drafted.root, DRA37_SOCKET: controlSocket,
+        DRA37_TASK: taskId, DRA37_STATE: state, DRA37_RECIPE: path.join(specs, `${taskId}.recipe.json`), DRA37_APPS: apps };
+    },
+    async runtimeTurn(taskId: string, action: "up" | "stop" | "status", offer?: string) {
+      const child = Bun.spawn([process.execPath, "--no-env-file", path.join(import.meta.dir, "dra37-runtime-turn.ts"), action, ...(offer ? [offer] : [])],
+        { cwd: path.join(worktrees, taskId.replace(/^dra37-/, "")), stdout: "pipe", stderr: "pipe", env: fixture.runtimeEnv(taskId) });
+      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      return { code, stdout, stderr, result: code === 0 ? JSON.parse(stdout.trim().split("\n").at(-1)!) as Record<string, unknown> : null };
+    },
     get pid() { return child?.pid; }, get output() { return log; },
     async socket(route: string, init: RequestInit = {}) {
       return fetch(`http://dra37${route}`, { ...init, unix: controlSocket, redirect: "error", signal: init.signal ?? AbortSignal.timeout(10_000) } as RequestInit & { unix: string });
@@ -63,6 +92,13 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       const recipe = { key: `app-${name}`, purpose: "development" as const, revision, recipeDigest: Bun.CryptoHasher.hash("sha256", `recipe:${name}`, "hex") as string };
       await mkdir(specs, { recursive: true });
       await writeFile(path.join(specs, `${id}.json`), JSON.stringify(recipe));
+      // Private Drafted recipe for the actual runtime algorithm. Its PlanetScale
+      // identity is a fixture value: the provider transport is synthetic.
+      const credentialsFile = path.join(specs, `${id}.credentials.json`);
+      await writeFile(credentialsFile, JSON.stringify({ CLERK_SECRET_KEY: "sk_test_fixture", NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: "pk_test_fixture" }), { mode: 0o600 });
+      await writeFile(path.join(specs, `${id}.recipe.json`), JSON.stringify({ version: 1, profile: "platform", image: "dra37-synthetic:1", credentialsFile,
+        runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"], planetscale: { organization: "fixture", database: "fixture", baseBranch: "main", baseBranchId: "base" },
+        services: { api: { command: ["bun", "app.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], traffic: { operations: "none" }, readyTimeoutSeconds: 15 }), { mode: 0o600 });
       return { id, sessionId, worktree, revision, recipe };
     },
     /** The adapter's request, through the normal route on the control socket. */
@@ -74,7 +110,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       offset = log.length;
       // Explicit environment: no inherited REMOTE_AGENT_* or provider secrets.
       child = Bun.spawn([process.execPath, "apps/server/server.ts"], { cwd: sourceRoot, stdin: "ignore", stdout: "pipe", stderr: "pipe",
-        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket } });
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", TMPDIR: tmpdir(), LANG: "en_US.UTF-8", HOME: root, REMOTE_AGENT_CONFIG: configFile, DRA37_LOG: agentLog, DRA37_SPECS: specs, DRA37_SOCKET: controlSocket,
+          ...(drafted ? { DRA37_DRAFTED_ROOT: drafted.root, DRA37_STATE: state, DRA37_APPS: apps } : {}) } });
       const consume = async (stream: ReadableStream<Uint8Array>) => {
         const reader = stream.getReader(), decoder = new TextDecoder();
         for (;;) { const part = await reader.read(); if (part.done) break; log += decoder.decode(part.value, { stream: true }); }
