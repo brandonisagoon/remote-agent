@@ -7,11 +7,14 @@ import { requestCompute } from "./compute-admission.ts";
 import { canonicalSha256, type ComputeNeonRecoveryProof, neonRecoveryInputDigest, recoverComputeNeon, type BoundToolingOperation } from "./compute-neon-recovery.ts";
 import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "./compute-neon-recovery-result.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 
 let db: TestDatabase;
 const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: true, slots: 2 }) });
 const head = "22406a5eddb33f983a669f8f686b9a416beac113", revision = "a".repeat(40), pin = "d".repeat(40), oldHash = "b".repeat(64), nextHash = "c".repeat(64);
 const release = { id: "tr_release_b", repositoryId: "repo", revision: "9".repeat(40), tree: "6".repeat(40), checkout: "/install/tooling/repo/release-b" };
+/** The server's full release record, as readToolingOperation projects it. */
+const fullRelease = { ...release, policyBlob: "4".repeat(40), manifest: { schemaVersion: 1, serverProtocol: { min: 1, max: 1 } } } as unknown as ToolingOperationBinding["release"];
 // Database setup applies every migration; keep it bounded but tolerant of host load.
 setDefaultTimeout(60_000);
 beforeEach(async () => { db = await createTestDatabase(); }, 60_000);
@@ -78,8 +81,11 @@ async function committed(ids = { task: "task", primary: "primary", operation: "o
   value.evidence = stagedEvidence(value.proof);
   value.handoff = { legacyRows: [{ id: legacy.id, consumerKind: legacy.consumerKind, consumerId: legacy.consumerId, revision: legacy.revision, checkout: legacy.checkout }] };
   value.stateWrite = stateWrite; value.result = result;
+  // The service records the full stored binding (parent explicitly null for a root operation).
+  const binding: ToolingOperationBinding = { ...operation, turnId: null, parentOperationId: null, retainedConsumerId: null, release: fullRelease, status: "running" };
+  value.operation = binding;
   const event = await db.prisma.runtimeMetadataEvent.update({ where: { sequence: original.sequence }, data: { value: JSON.stringify(value) } });
-  return { request, operation, result, event, write, legacy };
+  return { request, operation: binding, result, event, write, legacy };
 }
 const read = (operation: Parameters<typeof readCommittedNeonRecovery>[1]) => readCommittedNeonRecovery(db.prisma, operation);
 /** Test-only tampering of the stored event's JSON value. */
@@ -112,8 +118,8 @@ test("returns the real writer's exact committed result in the client's strict sh
 
 test("null only when the operation genuinely committed nothing", async () => {
   await committed();
-  const other = { contract: "remote-agent.tooling-operation/v1" as const, operationId: "op-never-committed", requestKey: "k", inputDigest: "e".repeat(64), repositoryId: "repo", taskId: "task", sessionId: "primary",
-    kind: "compute-neon-recovery", existingOperationId: crypto.randomUUID(), resourceKey: "runtime-development", generation: 5, release };
+  const other = { contract: "remote-agent.tooling-operation/v1" as const, operationId: "op-never-committed", requestKey: "k", inputDigest: "e".repeat(64), repositoryId: "repo", taskId: "task", sessionId: "primary", turnId: null,
+    kind: "compute-neon-recovery", existingOperationId: crypto.randomUUID(), parentOperationId: null, retainedConsumerId: null, resourceKey: "runtime-development", generation: 5, release: fullRelease };
   expect(await read(other)).toBeNull();
   // Another task's history is not this task's: its own scan is empty.
   expect(await read({ ...other, taskId: "elsewhere" })).toBeNull();
@@ -129,12 +135,12 @@ test("a retry holding a different lock PID still matches; any other request fiel
 
 test.each([
   ["requestKey", { requestKey: "other" }], ["inputDigest", { inputDigest: "f".repeat(64) }], ["generation", { generation: 6 }], ["existingOperationId", { existingOperationId: crypto.randomUUID() }],
-  ["resourceKey", { resourceKey: "runtime-preview" }], ["repositoryId", { repositoryId: "other-repo" }], ["release id", { release: { ...release, id: "tr_other" } }],
-  ["release revision", { release: { ...release, revision: "7".repeat(40) } }], ["release tree", { release: { ...release, tree: "5".repeat(40) } }], ["release checkout", { release: { ...release, checkout: "/elsewhere" } }],
-  ["parent", { parentOperationId: "op-command" }],
+  ["resourceKey", { resourceKey: "runtime-preview" }], ["repositoryId", { repositoryId: "other-repo" }], ["release id", { release: { ...fullRelease, id: "tr_other" } }],
+  ["release revision", { release: { ...fullRelease, revision: "7".repeat(40) } }], ["release tree", { release: { ...fullRelease, tree: "5".repeat(40) } }], ["release checkout", { release: { ...fullRelease, checkout: "/elsewhere" } }],
+  ["release policy", { release: { ...fullRelease, policyBlob: "3".repeat(40) } }], ["release manifest", { release: { ...fullRelease, manifest: { schemaVersion: 2 } as any } }],
+  ["parent", { parentOperationId: "op-command" }], ["turn", { turnId: "turn-1" }], ["retained consumer", { retainedConsumerId: "consumer-1" }],
 ] as const)("binding %s mismatch is unverifiable, never null", async (_name, change) => {
   const f = await committed();
-  if (_name === "parent") await rewrite(f.event.sequence, value => { value.operation.parentOperationId = null; });
   await unverifiable(read({ ...f.operation, ...change }), "event-mismatch");
 });
 
@@ -142,6 +148,9 @@ test("a binding that is not a bound Neon recovery operation is refused before an
   const f = await committed();
   await unverifiable(read({ ...f.operation, kind: "compute-admission" }), "binding-invalid");
   await unverifiable(read({ ...f.operation, resourceKey: null }), "binding-invalid");
+  // A projection without its (possibly null) parent is never accepted as a root operation.
+  const { parentOperationId: _parent, ...withoutParent } = f.operation;
+  await unverifiable(read(withoutParent), "binding-invalid");
 });
 
 test.each<[string, (value: any) => void]>([
@@ -244,4 +253,23 @@ test("each handed-off legacy row must be resolved by this operation with its sna
   // A group that had no legacy rows hands off none.
   await rewrite(f.event.sequence, value => { value.handoff.legacyRows = []; });
   expect((await read(f.operation))?.committed.result.stateWrite.sequence).toBe(f.write.sequence);
+});
+
+test.each<[string, (value: any) => void]>([
+  ["without its parent", value => { delete value.operation.parentOperationId; }],
+  ["as the route's admitted subset", value => { for (const key of ["turnId", "retainedConsumerId", "status"]) delete value.operation[key]; delete value.operation.release.manifest; delete value.operation.release.policyBlob; }],
+  ["with an extra field", value => { value.operation.extra = 1; }],
+  ["with an extra release field", value => { value.operation.release.extra = 1; }],
+])("a stored binding %s is unreadable, never accepted", async (_name, change) => {
+  const f = await committed();
+  await rewrite(f.event.sequence, change);
+  await unverifiable(read(f.operation), "event-unreadable");
+});
+
+test("a command-parented operation must match its recorded parent exactly", async () => {
+  const f = await committed();
+  await rewrite(f.event.sequence, value => { value.operation.parentOperationId = "op-command"; });
+  expect((await read({ ...f.operation, parentOperationId: "op-command" }))?.sequence).toBe(f.event.sequence);
+  await unverifiable(read(f.operation), "event-mismatch");
+  await unverifiable(read({ ...f.operation, parentOperationId: "op-other-command" }), "event-mismatch");
 });

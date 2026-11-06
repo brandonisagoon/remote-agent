@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import type { ToolingOperationBinding, ToolingReleaseRecord } from "../../../../types/tooling-release.ts";
+import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 import { ComputeNeonRecovery, ComputeNeonRecoveryProof, NeonRecoveryContract, NeonRecoveryOperationKind, NeonRecoveryTransition, neonRecoveryInputDigest } from "./compute-neon-recovery.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
 
@@ -66,12 +66,16 @@ const Result = z.strictObject({
   outcome: z.enum(["absent", "owned"]), basis: z.enum(["provider-rejection", "complete-inventory", "legacy-provider-rejection", "exact-owned-child"]), reconciliationSha256: Sha,
   observer: ObserverIdentity, allocation: z.enum(["retained-existing-claim", "previously-stopped-await-normal-admission"]), stateWrite: StateWrite,
 });
-/** The binding as the route admitted it (it may carry more server fields). */
-const StoredOperation = z.object({
-  contract: z.literal("remote-agent.tooling-operation/v1"), operationId: Id, requestKey: Id, inputDigest: Sha, repositoryId: Id, taskId: Id, sessionId: Id, kind: z.literal(NeonRecoveryOperationKind),
-  existingOperationId: Id, resourceKey: Id, generation: z.number().int().positive(), parentOperationId: Id.nullable().optional(),
-  release: z.object({ id: Id, repositoryId: Id, revision: Revision, tree: Revision, checkout: z.string().min(1) }).passthrough(),
-}).passthrough();
+/** The full stored binding the service records (the server's
+ * `ToolingOperationBinding`, exactly): every field required, nullable ones
+ * explicitly null, so a missing parent is never silently accepted. `status`
+ * is the binding's status when admitted and is not identity. */
+const StoredOperation = z.strictObject({
+  contract: z.literal("remote-agent.tooling-operation/v1"), operationId: Id, requestKey: Id, inputDigest: Sha, repositoryId: Id, taskId: Id, sessionId: Id, turnId: Id.nullable(),
+  kind: z.literal(NeonRecoveryOperationKind), existingOperationId: Id, parentOperationId: Id.nullable(), retainedConsumerId: Id.nullable(), resourceKey: Id, generation: z.number().int().positive(),
+  release: z.strictObject({ id: Id, repositoryId: Id, revision: Revision, tree: Revision, policyBlob: z.string().min(1), checkout: z.string().min(1), manifest: z.record(z.string(), z.unknown()) }),
+  status: z.enum(["bound", "running", "unknown", "completed"]),
+});
 const Row = z.object({ id: Id }).passthrough();
 /** Every top-level field `recoverComputeNeon` writes, and nothing else. */
 const StoredEvent = z.strictObject({
@@ -81,10 +85,10 @@ const StoredEvent = z.strictObject({
 });
 type StoredEvent = z.infer<typeof StoredEvent>;
 
-/** The validated stored binding the caller supplies (a full
- * `ToolingOperationBinding`, or the route's admitted subset). */
-export type NeonRecoveryResultBinding = Pick<ToolingOperationBinding, "contract" | "operationId" | "requestKey" | "inputDigest" | "repositoryId" | "taskId" | "sessionId" | "kind" | "existingOperationId" | "resourceKey" | "generation">
-  & { parentOperationId?: string | null; release: Pick<ToolingReleaseRecord, "id" | "repositoryId" | "revision" | "tree" | "checkout"> };
+/** The validated stored binding the caller supplies: the server's full
+ * `ToolingOperationBinding` (as `readToolingOperation` projects it, with
+ * `parentOperationId` and `retainedConsumerId` present, possibly null). */
+export type NeonRecoveryResultBinding = Omit<ToolingOperationBinding, "status">;
 /** Exactly the client's `NeonCommittedResult`: the operation identity, the
  * stable request (without the attempt's lock PID) and the committed result. */
 export type NeonCommittedResult = {
@@ -95,7 +99,8 @@ export type NeonCommittedResult = {
 };
 
 export async function readCommittedNeonRecovery(store: Pick<PrismaClient, "runtimeMetadataEvent" | "toolingStateWrite" | "toolingLegacyConsumer">, binding: NeonRecoveryResultBinding): Promise<{ sequence: number; committed: NeonCommittedResult } | null> {
-  if (binding.kind !== NeonRecoveryOperationKind || binding.contract !== "remote-agent.tooling-operation/v1" || !binding.existingOperationId || !binding.resourceKey) {
+  if (binding.kind !== NeonRecoveryOperationKind || binding.contract !== "remote-agent.tooling-operation/v1" || !binding.existingOperationId || !binding.resourceKey
+    || binding.parentOperationId === undefined || binding.retainedConsumerId === undefined) {
     throw new NeonRecoveryResultUnverifiable("binding-invalid", `operation ${binding.operationId} is not a bound Neon recovery operation`);
   }
   const where = { runtimeSessionId: binding.sessionId, source: `compute:${binding.taskId}`, action: EVENT_ACTION };
@@ -132,12 +137,14 @@ function verify(event: { sequence: number; key: string; value: StoredEvent }, bi
   const { value } = event, { request, proof, observer, result, operation } = value;
   const fail = (detail: string): never => { throw new NeonRecoveryResultUnverifiable("event-mismatch", `event ${event.sequence}: ${detail}`); };
   if (event.key !== journalKey(value.environment.id, value.resource.id, request)) fail("transition key does not derive from its request");
-  // The stored binding is the caller's validated binding (identity fields).
+  // The stored binding is the caller's validated binding: every immutable
+  // field, including the (possibly null) parent and the release record.
   const identity = (value: NeonRecoveryResultBinding | z.infer<typeof StoredOperation>) => ({ contract: value.contract, operationId: value.operationId, requestKey: value.requestKey, inputDigest: value.inputDigest,
-    repositoryId: value.repositoryId, taskId: value.taskId, sessionId: value.sessionId, kind: value.kind, existingOperationId: value.existingOperationId, resourceKey: value.resourceKey, generation: value.generation,
-    release: { id: value.release.id, repositoryId: value.release.repositoryId, revision: value.release.revision, tree: value.release.tree, checkout: value.release.checkout } });
+    repositoryId: value.repositoryId, taskId: value.taskId, sessionId: value.sessionId, turnId: value.turnId, kind: value.kind, existingOperationId: value.existingOperationId,
+    parentOperationId: value.parentOperationId, retainedConsumerId: value.retainedConsumerId, resourceKey: value.resourceKey, generation: value.generation,
+    release: { id: value.release.id, repositoryId: value.release.repositoryId, revision: value.release.revision, tree: value.release.tree, policyBlob: value.release.policyBlob, checkout: value.release.checkout,
+      manifest: finalizationDigest(value.release.manifest) } });
   if (finalizationDigest(identity(operation)) !== finalizationDigest(identity(binding))) fail("stored operation binding is not this operation");
-  if ("parentOperationId" in operation && (operation.parentOperationId ?? null) !== (binding.parentOperationId ?? null)) fail("stored operation parent differs");
   // The binding's input digest excludes only the attempt's lock PID.
   if (neonRecoveryInputDigest(request) !== binding.inputDigest || request.offerId !== binding.existingOperationId || request.resourceKey !== binding.resourceKey) fail("request is not the operation's input");
   if (proof.taskId !== binding.taskId || proof.primarySessionId !== binding.sessionId || proof.environmentId !== value.environment.id || proof.resourceId !== value.resource.id
