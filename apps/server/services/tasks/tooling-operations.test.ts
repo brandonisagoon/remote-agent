@@ -786,3 +786,46 @@ describe("closed legacy resource release (contract 7a6fe03)", () => {
     await expect(release("release")).rejects.toThrow(/finalization history/);
   });
 });
+
+describe("closed legacy resource release replay and receipt limits (review of 482d71b)", () => {
+  async function setup() {
+    const { config } = await fixture(); await bootstrap([]);
+    await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed", closedAt: new Date() } });
+    await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } });
+    const runtime = { key: "runtime-development", kind: "task-runtime", purpose: "development", externalId: "/fixture/runtime.json", metadata: { recipeHash: "b".repeat(64), revision: "a".repeat(40) } };
+    await db.prisma.remoteTaskResource.create({ data: { taskId: "task", state: "ready", ...runtime } });
+    const server = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+    const send = (method: string, route: string, body: unknown, operationId?: string) => server.request(`http://localhost${route}`, { method,
+      headers: { "content-type": "application/json", ...(operationId ? { [TOOLING_OPERATION_HEADER]: operationId } : {}) }, body: JSON.stringify(body) });
+    const beginRoute = (requestKey: string) => send("POST", "/api/sessions/primary/tooling-operations", { requestKey, inputDigest: canonicalDigest({ key: runtime.key, action: "release" }), kind: "closed-resource-release", resourceKey: runtime.key });
+    const state = async () => (await db.prisma.remoteTaskResource.findFirstOrThrow({ where: { key: runtime.key } })).state;
+    return { runtime, send, beginRoute, state };
+  }
+
+  test("an exact retry after release returns the original binding; a fresh request for the released resource is refused", async () => {
+    const { runtime, send, beginRoute } = await setup();
+    const first = await beginRoute("release-1");
+    expect(first.status).toBe(200);
+    const { binding } = await first.json() as { binding: { operationId: string; requestKey: string; inputDigest: string } };
+    expect((await send("PUT", "/api/sessions/primary/task/resources", { ...runtime, state: "released" }, binding.operationId)).status).toBe(200);
+    // Crash before settlement: the adapter re-begins the same key.
+    const retry = await beginRoute("release-1");
+    expect(retry.status).toBe(200);
+    expect((await retry.json() as { binding: { operationId: string } }).binding.operationId).toBe(binding.operationId);
+    expect((await beginRoute("release-2")).status).toBe(409);
+    // Lost settlement acknowledgment: settle, then the same key still returns it.
+    expect((await send("POST", `/api/sessions/primary/tooling-operations/${binding.operationId}/settlement`, { requestKey: binding.requestKey, inputDigest: binding.inputDigest, outcome: "completed" }, binding.operationId)).status).toBe(200);
+    expect((await (await beginRoute("release-1")).json() as { binding: { operationId: string; status: string } }).binding).toMatchObject({ operationId: binding.operationId, status: "completed" });
+  });
+
+  test("the keyed binding cannot resurrect its released receipt or drift its identity", async () => {
+    const { runtime, send, beginRoute, state } = await setup();
+    const { binding } = await (await beginRoute("release-1")).json() as { binding: { operationId: string } };
+    const put = (body: Record<string, unknown>) => send("PUT", "/api/sessions/primary/task/resources", { ...runtime, ...body }, binding.operationId);
+    expect((await put({ state: "ready", metadata: { ...runtime.metadata, recipeHash: "d".repeat(64) } })).status).toBe(409); // cleanup-sensitive metadata
+    expect((await put({ state: "ready", expiresAt: new Date(Date.now() + 60_000).toISOString() })).status).toBe(409); // expiry
+    expect((await put({ state: "released", metadata: { ...runtime.metadata, observed: "absent", observedAt: new Date().toISOString() } })).status).toBe(200); // observation only
+    expect((await put({ state: "ready" })).status).toBe(409); // resurrection
+    expect(await state()).toBe("released");
+  });
+});

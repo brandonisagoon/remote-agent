@@ -468,6 +468,7 @@ async function legacySnapshot(input: { prisma: PrismaClient; task: RemoteTask; r
 
 export type CallbackAdmission =
   | { mode: "pre-protocol" }
+  | { mode: "evidence"; binding: ToolingOperationBinding }
   | { mode: "legacy-continuation"; reference: ExistingReference; code: ToolingCodeIdentity }
   | { mode: "bound"; binding: ToolingOperationBinding; callback: ToolingCallback; body: Body; context: CallbackContext; reference?: ExistingReference };
 
@@ -516,7 +517,8 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     // identity and cleanup transitions are rechecked by the handler.
     if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND && (input.body.key !== binding.resourceKey || ["bound", "running", "unknown"].indexOf(binding.status) < 0)) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
     await assertBindingAuthority({ prisma: input.prisma, config: input.config, binding });
-    return null;
+    // The handler sees this binding so its write transaction can recheck it.
+    return { mode: "evidence", binding };
   }
   const matched = matchToolingCallback(input.method, input.pathname, input.body);
   if (!matched) return null;
@@ -687,7 +689,15 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     const closed = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId }, select: { phase: true } });
     let value;
     if (request.kind === CLOSED_RESOURCE_RELEASE_KIND) {
-      const eligible = await assertClosedLegacyRelease({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, resourceKey: request.resourceKey!, ...(input.runtime ? { runtime: input.runtime } : {}) });
+      // An exact retry of a stored request (lost settlement acknowledgment,
+      // crash after release) returns its original binding: current ownership,
+      // pause, source, family and exact receipt still bind, but its own
+      // earlier release does not. A fresh request needs an unreleased receipt.
+      const owner = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId }, select: { id: true } });
+      const stored = owner ? await input.prisma.toolingOperation.findUnique({ where: { taskId_requestKey: { taskId: owner.id, requestKey: request.requestKey } } }) : null;
+      const replay = Boolean(stored && stored.kind === CLOSED_RESOURCE_RELEASE_KIND && stored.sessionId === input.sessionId && stored.resourceKey === request.resourceKey && stored.inputDigest === request.inputDigest
+        && stored.parentOperationId === null && stored.existingOperationId === null);
+      const eligible = await assertClosedLegacyRelease({ prisma: input.prisma, config: input.config, sessionId: input.sessionId, resourceKey: request.resourceKey!, admission: !replay, ...(input.runtime ? { runtime: input.runtime } : {}) });
       // The digest must be exactly one allowed action for this stored key.
       if (!CLOSED_RELEASE_ACTIONS.some(action => dependencies.digest({ key: eligible.resource.key, action }) === request.inputDigest)) throw new ToolingOperationRefused("operation-input", `inputDigest is not a reconcile, stop or release of resource ${eligible.resource.key}`);
       value = eligible;
@@ -1095,4 +1105,23 @@ async function resolveIfClaimNotGranted(prisma: PrismaClient, id: string, body: 
   if (!row || row.claimedAt !== null || !["expired", "declined", "ineligible"].includes(row.state)) return;
   // Start authority is exactly a durable claim (assertComputeStartIntent).
   await resolveToolingConsumer({ prisma, id, evidence: { kind: "claim-not-granted", reference: offerId! } });
+}
+
+/** Inside the resource handler's own write transaction: a closed legacy
+ * resource release may update only its exact receipt, never resurrect a
+ * released one, change its expiry, or alter metadata beyond the adapter's
+ * observation fields. (The ordinary cleanup update check does not apply to
+ * never-finalized tasks, so these rules are the binding limits here.) */
+const OBSERVATION_FIELDS = new Set(["observed", "observedAt"]);
+export function assertClosedReleaseResourceUpdate(existing: { taskId: string; key: string; state: string; metadata: unknown; expiresAt: Date | null }, next: { state: string; metadata?: unknown; expiresAt: Date | null }) {
+  const binding = currentToolingOperation();
+  if (!binding || binding.kind !== CLOSED_RESOURCE_RELEASE_KIND) return;
+  if (existing.taskId !== binding.taskId || existing.key !== binding.resourceKey) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
+  if (existing.state === "released" && next.state !== "released") throw refuse("operation-mismatch", `Released resource ${existing.key} cannot be resurrected`);
+  if ((existing.expiresAt?.getTime() ?? null) !== (next.expiresAt?.getTime() ?? null)) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key}'s expiry`);
+  if (next.metadata !== undefined) {
+    const before = (existing.metadata && typeof existing.metadata === "object" ? existing.metadata : {}) as Record<string, unknown>;
+    const after = (next.metadata && typeof next.metadata === "object" ? next.metadata : {}) as Record<string, unknown>;
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) if (!OBSERVATION_FIELDS.has(key) && JSON.stringify(before[key]) !== JSON.stringify(after[key])) throw refuse("operation-mismatch", `A closed resource release cannot change ${existing.key} metadata ${key}`);
+  }
 }

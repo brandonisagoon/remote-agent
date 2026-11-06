@@ -66,6 +66,7 @@ export function toolingOperationGuard(dependencies: ToolingOperationDependencies
         header: c.req.header(TOOLING_OPERATION_HEADER) || undefined, body }, dependencies);
     } catch (error) { const { body: response, status } = failure(error); return c.json(response, status); }
     if (!admission || admission.mode === "pre-protocol") return next();
+    if (admission.mode === "evidence") return runWithToolingOperation(admission.binding, () => next(), c.get("config").controlIpcPath);
     if (admission.mode === "legacy-continuation") return runAsLegacyContinuation(admission.reference, admission.code, () => next());
     const prisma = c.get("prisma");
     let state: Awaited<ReturnType<typeof beforeBoundCallback>>;

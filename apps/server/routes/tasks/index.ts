@@ -35,6 +35,7 @@ import { CleanupReportRequest, publishCleanupReport, cleanupProjection } from ".
 import { SourceReplyInput, replyToSource, readReplyContext } from "../../services/sessions/source-messages.ts";
 
 import { taskResponse } from "./response.ts";
+import { assertClosedReleaseResourceUpdate } from "../../services/tasks/tooling-operations.ts";
 
 export const taskRoutes = new Hono<AppEnv>();
 export const sessionTaskRoutes = new Hono<AppEnv>();
@@ -323,6 +324,8 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
       if (!await developmentResourceUpdate({ prisma: tx, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values, development)) {
         await assertCleanupResourceUpdate({ prisma: tx, config: c.get("config"), sessionId: c.req.param("sessionId"), taskId: task.id }, existing, values);
       }
+      // A closed legacy resource release's limits, atomic with the write.
+      assertClosedReleaseResourceUpdate(existing, values);
       return tx.remoteTaskResource.update({ where: { id: existing.id }, data: { state: values.state, metadata: values.metadata, expiresAt: values.expiresAt } });
     });
     return c.json({ resource });
