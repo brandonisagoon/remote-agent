@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -36,42 +35,33 @@ function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
   return { result, cancel: () => reader.cancel().catch(() => {}) };
 }
 
-type GroupScan = { error: { code?: string | number | null; killed?: boolean; signal?: string | null } | null; stdout: string; stderr: string };
 const groupExitDependencies = {
   now: () => performance.now(),
   sleep: (ms: number) => Bun.sleep(ms),
-  scan: (timeoutMs: number): Promise<GroupScan> => new Promise(resolve => {
-    execFile("/bin/ps", ["-axo", "pgid="], {
-      timeout: timeoutMs, maxBuffer: 1024 * 1024, encoding: "utf8",
-    }, (error, stdout, stderr) => resolve({ error, stdout, stderr }));
-  }),
+  query: (pid: number, signal: 0): void => { process.kill(pid, signal); },
 };
 
 /** Read-only group proof, with a bounded seam for deterministic deadline tests. */
 export async function waitForOwnedGroupExit(group: number, dependencies = groupExitDependencies) {
-  if (!Number.isSafeInteger(group) || group <= 0) throw failure("OBSERVER_GROUP");
+  // Exclude 0 and -1 kernel targeting semantics as well as invalid numbers.
+  if (!Number.isSafeInteger(group) || group <= 1) throw failure("OBSERVER_GROUP");
   const deadline = dependencies.now() + 1000;
-  while (true) {
-    // The helper has already killed its group. This is observation only:
-    // never signal a numeric group after its leader could have been reaped.
-    const remaining = Math.floor(deadline - dependencies.now());
-    if (remaining <= 0) throw failure("OBSERVER_GROUP");
-    const { error, stdout, stderr } = await dependencies.scan(Math.min(250, remaining));
-    // Late output cannot prove absence within this attempt's budget.
-    if (dependencies.now() >= deadline || stderr.length) throw failure("OBSERVER_GROUP");
-    if (error) {
-      // Only execFile's managed timeout is retryable. In particular, a
-      // maxBuffer error can also kill ps, but carries its own error code.
-      if (!error.killed || error.signal !== "SIGTERM" || error.code != null) throw failure("OBSERVER_GROUP");
-    } else {
-      const lines = stdout.trim().split("\n").map(line => line.trim());
-      if (lines.some(line => !/^\d+$/.test(line) || !Number.isSafeInteger(Number(line)))) throw failure("OBSERVER_GROUP");
-      if (!lines.some(line => Number(line) === group)) return;
+  while (dependencies.now() < deadline) {
+    let absent = false;
+    // The owned helper has exited and its pipes have drained. Signal zero
+    // sends NO signal: it checks the whole group's existence/permissions,
+    // including descendants after the leader is reaped. A reused group
+    // stays present; it is never terminated through this stored number.
+    try { dependencies.query(-group, 0); }
+    catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") absent = true;
+      else throw failure("OBSERVER_GROUP");
     }
-    // A timeout is unknown, never absence. Retry only inside the original
-    // absolute budget and require a complete valid scan before success.
+    if (dependencies.now() >= deadline) throw failure("OBSERVER_GROUP");
+    if (absent) return;
     await dependencies.sleep(Math.min(10, Math.max(0, deadline - dependencies.now())));
   }
+  throw failure("OBSERVER_GROUP");
 }
 
 export async function executeOwnedObserver(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string>; failureRequest?: unknown }) {
