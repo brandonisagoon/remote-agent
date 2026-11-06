@@ -847,3 +847,53 @@ test("same release: an exact same-key retry is never re-judged (not stranded) wh
     expect(refused.body).toMatchObject({ code: "retained-release-required" });
   }
 }, 60_000);
+
+test("stored adoption child: after its offer is withdrawn the same key returns the exact binding, a changed identity is refused, pause and revocation still refuse, and the claim still fails", async () => {
+  const setup = async () => {
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment();
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-delivered");
+    const fresh = await f.command("a-runtime-up-offer");
+    const bound = await fresh.beginChild("offer-delivered"); // stored, unclaimed adoption child
+    expect(bound.status).toBe(200);
+    // The offer is withdrawn (expired, never claimed): new adoption is no longer eligible.
+    await db.prisma.computeOffer.update({ where: { id: "offer-delivered" }, data: { state: "expired" } });
+    expect((await (await f.command("a-other")).beginChild("offer-delivered")).body).toMatchObject({ code: "retained-release-required" });
+    return { f, fresh, bound: bound.body.binding as Binding & { resourceKey: string | null } };
+  };
+  {
+    const { f, fresh, bound } = await setup();
+    // Same key: the exact stored binding, under current authority.
+    const retry = await fresh.beginChild("offer-delivered");
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body.binding).toEqual(bound);
+    // Same key, changed identity (each immutable field): refused, never rebound.
+    const same = { requestKey: bound.requestKey, inputDigest: bound.inputDigest, kind: "compute-admission", existingOperationId: "offer-delivered", parentOperationId: fresh.fence.operationId };
+    for (const changed of [{ inputDigest: canonicalDigest({ other: 1 }) }, { kind: "compute-configure" }, { existingOperationId: "offer-other" }, { parentOperationId: (await f.command("a-elsewhere")).fence.operationId }, { resourceKey: KEY }]) {
+      const refused = await f.begin({ ...same, ...changed });
+      expect(refused.status, JSON.stringify(changed)).toBeGreaterThanOrEqual(400);
+      expect(refused.body.binding).toBeUndefined();
+    }
+    // The claim callback still fails: the atomic adoption recheck refuses the withdrawn offer, no handler runs.
+    const handled = f.handled.length;
+    const claim = await fresh.call("compute-claim", { ...computeBody, offerId: "offer-delivered" }, bound.operationId);
+    expect(claim.status).toBe(409);
+    expect(f.handled.length).toBe(handled);
+    expect((await f.operation(bound.operationId)).status).toBe("bound");
+  }
+  // Current pause, and a revoked primary, still refuse the same-key retry.
+  for (const revoke of ["pause", "closed session"] as const) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { fresh } = await setup();
+    if (revoke === "pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    else await db.prisma.runtimeSession.update({ where: { id: "primary" }, data: { status: "closed" } });
+    const refused = await fresh.beginChild("offer-delivered");
+    expect(refused.status, revoke).toBeGreaterThanOrEqual(400);
+    expect(refused.body.error).toMatch(revoke === "pause" ? /paused/ : /open owning task primary/);
+    expect(refused.body.binding).toBeUndefined();
+  }
+}, 60_000);
