@@ -115,7 +115,9 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   cli?: { preload: string };
   /** Server-side test-only synthetic compute-decision transport
    * (dra37-decision-preload.ts) with a synthetic decision credential. */
-  decision?: { preload: string; quietPeriodSeconds: number } }) {
+  decision?: { preload: string; quietPeriodSeconds: number };
+  /** Host compute admission at first start (default true); see setComputeEnabled. */
+  computeEnabled?: boolean }) {
   const port = await loopbackPort();
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "dra37-")));
   const db = await createTestDatabase();
@@ -127,7 +129,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   const tasksFile = path.join(root, "docker-tasks.jsonl");
   // Test-only barriers (absent = no effect): the observer's Docker calls and
   // the synthetic primary's compute-offer turns.
-  const observerHoldFile = path.join(root, "observer-hold"), agentBarrierFile = path.join(apps, "agent-offer-barrier");
+  const observerHoldFile = path.join(root, "observer-hold"), agentBarrierFile = path.join(apps, "agent-offer-barrier"), collectorDelayFile = path.join(root, "collector-delay.json");
   await mkdir(apps, { mode: 0o700 }); await mkdir(state, { mode: 0o700 }); await mkdir(bin, { mode: 0o700 });
   // SYNTHETIC Docker CLI, first on the server's PATH only, for Drafted's
   // actual observer (see dra37-docker.ts). The app it reports is real.
@@ -159,7 +161,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     const ephemeral = process.platform === "darwin" ? [sysctl("net.inet.ip.portrange.first"), sysctl("net.inet.ip.portrange.last")]
       : readFileSync("/proc/sys/net/ipv4/ip_local_port_range", "utf8").trim().split(/\s+/).map(Number);
     await writeFile(real.policy, JSON.stringify({ root, prefix: real.prefix, docker, images: Object.values(real.images), imageVolumes, ephemeral, ledger: real.ledger, log: path.join(apps, "docker-calls.jsonl"), tasks: tasksFile,
-      holdFile: observerHoldFile, holdCwd: path.join(root, "install", "tooling"), holdMaxMs: 300_000 }), { mode: 0o600 });
+      holdFile: observerHoldFile, holdCwd: path.join(root, "install", "tooling"), holdMaxMs: 300_000, delayFile: collectorDelayFile }), { mode: 0o600 });
     await writeFile(path.join(bin, "docker"), [`#!${process.execPath} --no-env-file`,
       `process.argv.splice(2, 0, ${JSON.stringify(real.policy)});`,
       `await import(${JSON.stringify(path.join(import.meta.dir, "dra37-docker-guard.ts"))});`, ""].join("\n"), { mode: 0o700 });
@@ -180,6 +182,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
   }
   const drafted = options.drafted ? await prepareDraftedTooling(root, install, [options.drafted.revision, ...(options.drafted.additionalRevisions ?? [])], options.drafted.source) : null;
   let child: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined, collected: Promise<unknown>[] = [], log = "", offset = 0;
+  // In-flight runtime-turn processes; cleanup stops and awaits them first.
+  const turns = new Set<Bun.Subprocess>();
   const fixture = {
     root, db, url, token, configFile, controlSocket, agentLog, apps, state, drafted, real, decisionDirectory: options.decision ? decision : null,
     /** Exact fixture-created Docker objects, in creation order. */
@@ -196,7 +200,8 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     async runtimeTurn(taskId: string, action: "up" | "stop" | "status", offer?: string) {
       const child = Bun.spawn([process.execPath, "--no-env-file", path.join(import.meta.dir, "dra37-runtime-turn.ts"), action, ...(offer ? [offer] : [])],
         { cwd: path.join(worktrees, taskId.replace(/^dra37-/, "")), stdout: "pipe", stderr: "pipe", env: fixture.runtimeEnv(taskId) });
-      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+      turns.add(child);
+      const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]).finally(() => turns.delete(child));
       return { code, stdout, stderr, result: code === 0 ? JSON.parse(stdout.trim().split("\n").at(-1)!) as Record<string, unknown> : null };
     },
     get pid() { return child?.pid; }, get output() { return log; },
@@ -222,6 +227,14 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     },
     /** Block (or release) the server-spawned observer's Docker calls. */
     async holdObserver(on: boolean) { if (on) await writeFile(observerHoldFile, new Date().toISOString(), { mode: 0o600, flag: "wx" }); else await rm(observerHoldFile); },
+    /** Slow (ms per Docker call, then forwarded) or restore the observer. */
+    async slowCollector(ms: number | null) { if (ms === null) await rm(collectorDelayFile); else await writeFile(collectorDelayFile, JSON.stringify({ ms }), { mode: 0o600, flag: "wx" }); },
+    /** Edit ONLY this isolated fixture config; takes effect at the next start. */
+    async setComputeEnabled(enabled: boolean) {
+      const current = JSON.parse(await readFile(configFile, "utf8"));
+      current.machine.compute.enabled = enabled;
+      await writeFile(configFile, JSON.stringify(parseServiceFile(current)), { mode: 0o600 });
+    },
     /** Hold (or release) the synthetic primary's compute-offer turns. */
     async holdAgentOffers(on: boolean) { if (on) await writeFile(agentBarrierFile, new Date().toISOString(), { mode: 0o600, flag: "wx" }); else await rm(agentBarrierFile); },
     /** Owner request over the isolated loopback TCP listener (bearer). */
@@ -260,7 +273,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
     },
     /** Identity seed only: task row, its original primary session row and a
      * committed task worktree. No compute, offer, slot or instruction rows. */
-    async seedTask(name: string, state: { phase?: string; ownerPaused?: boolean } = {}): Promise<Dra37Task> {
+    async seedTask(name: string, state: { phase?: string; ownerPaused?: boolean; traffic?: boolean } = {}): Promise<Dra37Task> {
       const worktree = path.join(worktrees, name);
       await mkdir(worktree, { recursive: true });
       git(worktree, "init", "-q", "-b", "main"); git(worktree, "config", "user.name", "DRA-37"); git(worktree, "config", "user.email", "dra37@example.invalid");
@@ -284,7 +297,10 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await writeFile(path.join(specs, `${id}.recipe.json`), JSON.stringify({ version: 1, profile: "platform", image: real ? REAL_IMAGES.app : "dra37-synthetic:1", credentialsFile,
         runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY"], planetscale: { organization: "fixture", database: "fixture", baseBranch: "main", baseBranchId: "base" },
         ...(real ? { setup: [["bun", "install", "--frozen-lockfile"]] } : {}),
-        services: { api: { command: ["bun", "app.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], traffic: { operations: "none" }, readyTimeoutSeconds: 15 }), { mode: 0o600 });
+        services: { api: { command: ["bun", "app.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }],
+        // A pre-admission (historical) runtime is uninstrumented: Drafted
+        // refuses traffic coverage without configured host compute admission.
+        ...(state.traffic === false ? {} : { traffic: { operations: "none" } }), readyTimeoutSeconds: 15 }), { mode: 0o600 });
       return { id, sessionId, worktree, revision, recipe };
     },
     /** The adapter's request, through the normal route on the control socket. */
@@ -326,7 +342,20 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
       await writeFile(path.join(root, "server.log"), log, { mode: 0o600 });
     },
     async cleanup(options: { keepEvidence?: boolean } = {}) {
+      // Nothing may still be creating Docker objects when the ledger is read:
+      // stop this fixture's runtime-turn processes, then wait (bounded) until
+      // no guard process of this fixture remains (a forwarded create defers
+      // termination until its exact ID is ledgered).
+      for (const turn of turns) turn.kill("SIGTERM");
+      await Promise.race([Promise.all([...turns].map(turn => turn.exited)), Bun.sleep(30_000)]);
+      for (const turn of turns) turn.kill("SIGKILL");
       await fixture.stop();
+      if (real) {
+        const deadline = Date.now() + 60_000;
+        const guards = () => Bun.spawnSync(["ps", "-axo", "pid=,command="], { stdout: "pipe" }).stdout.toString().split("\n").filter(line => line.includes(real!.policy) && !line.includes("ps -axo"));
+        while (guards().length && Date.now() < deadline) await Bun.sleep(250);
+        if (guards().length) console.error(JSON.stringify({ dockerCleanup: { guardsStillRunning: guards() } }));
+      }
       let preserve = !!options.keepEvidence;
       if (real) {
         // Exact ledger objects only, through normal stop/rm, newest first.
@@ -402,7 +431,7 @@ export async function dra37Server(options: { slots: number; deliveryTimeoutSecon
         server: { publicUrl: url, apiKey: token, listen: { host: "127.0.0.1", port }, databaseUrl: db.databaseUrl,
           acpSocketPath: path.join(root, "acp.sock"), controlSocketPath: controlSocket },
         acpx: { stateDir: path.join(root, "acpx"), maxConcurrentTurns: 4 }, installation: { root: install },
-        compute: { enabled: true, slots: options.slots, deliveryTimeoutSeconds: options.deliveryTimeoutSeconds ?? 30, collectorFreshnessSeconds: 15,
+        compute: { enabled: options.computeEnabled ?? true, slots: options.slots, deliveryTimeoutSeconds: options.deliveryTimeoutSeconds ?? 30, collectorFreshnessSeconds: 15,
           ...(options.decision ? { quietPeriodSeconds: options.decision.quietPeriodSeconds, decisionApiKey } : {}) } },
       providers: { codex: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] }, claude: { command: [process.execPath, path.join(import.meta.dir, "dra37-agent.ts")] } },
       connections: {}, repositories: { [REPOSITORY]: { root: repo, worktreeRoot: worktrees, ...(drafted ? { tooling: { root: drafted.source, ref: drafted.revision } } : {}) } },

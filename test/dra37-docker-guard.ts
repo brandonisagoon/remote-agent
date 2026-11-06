@@ -10,8 +10,11 @@
  *   private fixture network (Drafted's NGINX reaches the app by name).
  * - Every command is parsed with an exact option grammar (allowlist). Any
  *   unknown option, command or target is refused.
- * - Optional test-only collection barrier (policy.holdFile/holdCwd): blocks
- *   the server-spawned observer's Docker calls, bounded, without answering.
+ * - Optional test-only collection barriers for the server-spawned observer
+ *   (cwd inside policy.holdCwd): a hold (holdFile) blocks its Docker calls,
+ *   bounded, without answering; a delay (delayFile) slows each call by a
+ *   bounded time and then forwards it for its real result. Both exit at once
+ *   if the caller is gone, so no barrier process outlives its observer.
  * - Every create carries exactly one dev.drafted.task label naming a task the
  *   fixture registered (policy.tasks), at most one valid purpose label and
  *   at most one operation label; task and operation labels are ledgered.
@@ -41,7 +44,7 @@
  *
  * Usage (via the generated bin/docker shim): docker-guard <policy.json> <args...>
  */
-import { appendFileSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, realpathSync, writeSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { readEngineSubnets, selectFixtureSubnet } from "./dra37-subnet.ts";
 
 type Policy = { root: string; prefix: string; docker: string; images: string[]; ledger: string; log: string; tasks: string;
@@ -49,6 +52,9 @@ type Policy = { root: string; prefix: string; docker: string; images: string[]; 
    * inside `holdCwd` (the server-spawned observer runs from the prepared
    * tooling checkout) wait, bounded by `holdMaxMs`, before reaching Docker. */
   holdFile?: string; holdCwd?: string; holdMaxMs?: number;
+  /** Test-only slow collector: while `delayFile` exists ({ ms }), each such
+   * call waits that long and is then FORWARDED (real Docker result). */
+  delayFile?: string;
   /** Read once by the fixture at setup (read-only): each recorded image's
    * declared Config.Volumes and the OS ephemeral port range, so a create
    * needs no extra engine/OS spawn (callers such as Drafted's computeDocker
@@ -170,6 +176,23 @@ else if (command === "exec") {
   createdLabels = fixtureLabels(options.filter(([name]) => name === "--label").map(([, value]) => value as string));
   if (options.some(([name]) => name === "--subnet")) refuse("callers may not choose a subnet; the guard assigns fixture subnets");
   if (command === "network") {
+    // Concurrent fixture creates must not pick the same subnet: one exclusive
+    // lock covers selection, the forwarded create and its ledger write
+    // (released at process exit). A lock is recovered only when its recorded
+    // owner process is gone.
+    const lock = `${policy.ledger}.network-lock`, lockDeadline = Date.now() + 60_000;
+    for (;;) {
+      try { mkdirSync(lock); writeFileSync(`${lock}/owner`, String(process.pid)); break; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const owner = Number(existsSync(`${lock}/owner`) ? readFileSync(`${lock}/owner`, "utf8") : NaN);
+        let alive = true; try { if (Number.isInteger(owner)) process.kill(owner, 0); } catch { alive = false; }
+        if (Number.isInteger(owner) && !alive) { rmSync(lock, { recursive: true, force: true }); log({ networkLock: "recovered", deadOwner: owner }); continue; }
+        if (Date.now() > lockDeadline) refuse("the fixture network-create lock stayed busy; nothing was created");
+        await Bun.sleep(100);
+      }
+    }
+    process.on("exit", () => { try { if (readFileSync(`${lock}/owner`, "utf8") === String(process.pid)) rmSync(lock, { recursive: true, force: true }); } catch { /* already released */ } });
     // Read-only, fail-closed inventory and true CIDR interval overlap.
     let subnet: string | null;
     try {
@@ -249,6 +272,19 @@ else if (command === "exec") {
   created = "container"; createdName = name!;
 } else refuse(`unmodelled command ${command} ${sub ?? ""}`);
 
+/** True once this guard's caller is gone (reparented): a barrier must never
+ * outlive the observer that is waiting on it. */
+const callerGone = (() => { const original = process.ppid; return () => { if (process.ppid !== original) return true; try { process.kill(original, 0); return false; } catch { return true; } }; })();
+if (policy.delayFile && policy.holdCwd && process.cwd().startsWith(`${policy.holdCwd}/`) && existsSync(policy.delayFile)) {
+  const { ms } = JSON.parse(readFileSync(policy.delayFile, "utf8")) as { ms: number };
+  if (!Number.isInteger(ms) || ms < 0 || ms > 4_500) refuse("collector delay must be 0..4500 ms (under Drafted's 5 s Docker deadline)");
+  const delayedAt = Date.now();
+  log({ delay: "start", pid: process.pid, ppid: process.ppid, ms, args: args.slice(0, 3), cwd: process.cwd() });
+  process.on("SIGTERM", () => { log({ delay: "abandoned", pid: process.pid, waitedMs: Date.now() - delayedAt }); process.exit(143); });
+  while (Date.now() - delayedAt < ms) { if (callerGone()) { log({ delay: "caller-gone", pid: process.pid }); process.exit(143); } await Bun.sleep(100); }
+  process.removeAllListeners("SIGTERM");
+  log({ delay: "forwarded", pid: process.pid, waitedMs: Date.now() - delayedAt });
+}
 if (policy.holdFile && policy.holdCwd && process.cwd().startsWith(`${policy.holdCwd}/`) && existsSync(policy.holdFile)) {
   // Blocks the actual observer process (it waits on this Docker call); this
   // never answers for Docker and never fabricates a result.
@@ -257,7 +293,10 @@ if (policy.holdFile && policy.holdCwd && process.cwd().startsWith(`${policy.hold
   // The caller may abandon a held call (Drafted kills Docker commands after
   // 5 s): record that exactly and exit without reaching Docker.
   process.on("SIGTERM", () => { log({ hold: "abandoned", pid: process.pid, waitedMs: Date.now() - heldAt }); process.exit(143); });
-  while (existsSync(policy.holdFile) && Date.now() < bound) await Bun.sleep(200);
+  while (existsSync(policy.holdFile) && Date.now() < bound) {
+    if (callerGone()) { log({ hold: "caller-gone", pid: process.pid, waitedMs: Date.now() - heldAt }); process.exit(143); }
+    await Bun.sleep(200);
+  }
   process.removeAllListeners("SIGTERM");
   log({ hold: existsSync(policy.holdFile) ? "bound-expired" : "released", pid: process.pid, waitedMs: Date.now() - heldAt });
 }
