@@ -16,7 +16,9 @@ export class ToolingActivationError extends Error {
   constructor(readonly code: ToolingActivationErrorCode, message: string, readonly detail?: { generation?: number; release?: ToolingReleaseRecord }) { super(message); }
 }
 export type ToolingOperationErrorCode = "invalid-request" | "ownership" | "no-active-release" | "request-conflict" | "unsupported-protocol"
-  | "not-found" | "invalid-transition" | "transition-conflict" | "evidence-required";
+  | "not-found" | "invalid-transition" | "transition-conflict" | "evidence-required" | "invalid-parent" | "parent-unavailable";
+/** The only operation kind that may parent callback bindings. */
+export const ADAPTER_COMMAND_KIND = "adapter-command";
 export class ToolingOperationError extends Error {
   constructor(readonly code: ToolingOperationErrorCode, message: string) { super(message); }
 }
@@ -231,19 +233,22 @@ const OperationRequest = z.strictObject({
   inputDigest: z.string().regex(/^[a-f0-9]{64}$/),
   kind: z.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   existingOperationId: z.string().min(1).max(512).optional(),
+  parentOperationId: z.string().min(1).max(256).optional(),
   resourceKey: z.string().min(1).max(512).optional(),
 });
 
 async function binding(store: Store, row: ToolingOperation): Promise<ToolingOperationBinding> {
   return { contract: "remote-agent.tooling-operation/v1", operationId: row.id, requestKey: row.requestKey, inputDigest: row.inputDigest, repositoryId: row.repositoryId,
-    taskId: row.taskId, sessionId: row.sessionId, turnId: row.turnId, kind: row.kind, existingOperationId: row.existingOperationId, resourceKey: row.resourceKey,
+    taskId: row.taskId, sessionId: row.sessionId, turnId: row.turnId, kind: row.kind, existingOperationId: row.existingOperationId, parentOperationId: row.parentOperationId, resourceKey: row.resourceKey,
     generation: row.generation, release: record(await store.toolingRelease.findUniqueOrThrow({ where: { id: row.releaseId } })),
     status: z.enum(["bound", "running", "unknown", "completed"]).parse(row.status) };
 }
 
-/** Persist operation identity before any effect. A new request binds the
- * active selection; a retry returns its original binding regardless of later
- * activations. Operation-specific authority remains the caller's (DRA-29). */
+/** Persist operation identity before any effect. A new root request binds the
+ * active selection; a callback with `parentOperationId` inherits its open
+ * adapter-command parent's release, generation and protocol. An exact retry
+ * returns its original binding (historical identity, regardless of later
+ * activations or parent lifecycle); current authority stays with the route. */
 export async function bindToolingOperation(input: { prisma: PrismaClient; config: ServerConfig; taskId: string; sessionId: string; turnId: string | null; request: BeginToolingOperationRequest }): Promise<ToolingOperationBinding> {
   const parsed = OperationRequest.safeParse(input.request);
   if (!parsed.success) throw new ToolingOperationError("invalid-request", parsed.error.issues.map(issue => issue.message).join("; "));
@@ -257,7 +262,8 @@ export async function bindToolingOperation(input: { prisma: PrismaClient; config
     const row = await store.toolingOperation.findUnique({ where: { taskId_requestKey: { taskId: task.id, requestKey: request.requestKey } } });
     if (!row) return null;
     if (row.sessionId !== session.id || row.kind !== request.kind || row.inputDigest !== request.inputDigest
-      || row.existingOperationId !== (request.existingOperationId ?? null) || row.resourceKey !== (request.resourceKey ?? null)) {
+      || row.existingOperationId !== (request.existingOperationId ?? null) || row.parentOperationId !== (request.parentOperationId ?? null)
+      || row.resourceKey !== (request.resourceKey ?? null)) {
       throw new ToolingOperationError("request-conflict", "Operation request key was already used with a different request");
     }
     return binding(store, row);
@@ -268,13 +274,26 @@ export async function bindToolingOperation(input: { prisma: PrismaClient; config
     return await input.prisma.$transaction(async (tx) => {
       const raced = await retained(tx);
       if (raced) return raced;
-      const selection = await selectionOf(tx, task.repositoryId);
-      if (!selection) throw new ToolingOperationError("no-active-release", `Repository ${task.repositoryId} has no release-aware active tooling generation`);
-      const protocol = Math.min(SERVER_TOOLING_PROTOCOL.max, selection.release.manifest.serverProtocol.max);
-      if (protocol < Math.max(SERVER_TOOLING_PROTOCOL.min, selection.release.manifest.serverProtocol.min)) throw new ToolingOperationError("unsupported-protocol", "Active release has no operation protocol in common with this server");
+      let inherited: { releaseId: string; generation: number; protocol: number };
+      if (request.parentOperationId) {
+        // A callback executes its command's immutable release, read inside this
+        // transaction; the active selection is never consulted for a child.
+        const parent = await tx.toolingOperation.findUnique({ where: { id: request.parentOperationId } });
+        if (!parent || parent.taskId !== task.id || parent.sessionId !== session.id || parent.repositoryId !== task.repositoryId || parent.kind !== ADAPTER_COMMAND_KIND) {
+          throw new ToolingOperationError("invalid-parent", "Parent must be an adapter-command binding of the same task, session and repository");
+        }
+        if (parent.status !== "bound" && parent.status !== "running") throw new ToolingOperationError("parent-unavailable", `Parent command is ${parent.status}; it cannot start new callback effects`);
+        inherited = { releaseId: parent.releaseId, generation: parent.generation, protocol: parent.protocol };
+      } else {
+        const selection = await selectionOf(tx, task.repositoryId);
+        if (!selection) throw new ToolingOperationError("no-active-release", `Repository ${task.repositoryId} has no release-aware active tooling generation`);
+        const protocol = Math.min(SERVER_TOOLING_PROTOCOL.max, selection.release.manifest.serverProtocol.max);
+        if (protocol < Math.max(SERVER_TOOLING_PROTOCOL.min, selection.release.manifest.serverProtocol.min)) throw new ToolingOperationError("unsupported-protocol", "Active release has no operation protocol in common with this server");
+        inherited = { releaseId: selection.release.id, generation: selection.generation, protocol };
+      }
       const row = await tx.toolingOperation.create({ data: { id: randomUUID(), taskId: task.id, requestKey: request.requestKey, inputDigest: request.inputDigest, kind: request.kind,
-        repositoryId: task.repositoryId, sessionId: session.id, turnId: input.turnId, existingOperationId: request.existingOperationId ?? null, resourceKey: request.resourceKey ?? null,
-        generation: selection.generation, releaseId: selection.release.id, protocol } });
+        repositoryId: task.repositoryId, sessionId: session.id, turnId: input.turnId, existingOperationId: request.existingOperationId ?? null,
+        parentOperationId: request.parentOperationId ?? null, resourceKey: request.resourceKey ?? null, ...inherited } });
       return binding(tx, row);
     });
   } catch (error) {
@@ -368,7 +387,8 @@ export async function registerToolingStateWrite(input: { prisma: PrismaClient; o
     if (row.status !== "bound" && row.status !== "running") throw new ToolingStateFormatError("operation-closed", `Operation ${row.id} is ${row.status}; it cannot register new state writes`);
     const format = release.manifest.stateFormats[key.family];
     if (!format) throw new ToolingStateFormatError("undeclared-format", `Release ${release.revision} does not declare ${key.family}`);
-    if (format.write !== input.version) throw new ToolingStateFormatError("wrong-write-version", `Release ${release.revision} writes ${key.family} version ${format.write}, not ${input.version}`);
+    const writable = format.writeVersions ?? [format.write];
+    if (!writable.includes(input.version)) throw new ToolingStateFormatError("wrong-write-version", `Release ${release.revision} may write ${key.family} versions ${writable.join(", ")}, not ${input.version}`);
     const latest = (await latestStateWrites(tx, { taskId: row.taskId, ...key }))[0];
     const current = latest?.version ?? LEGACY_STATE_FORMATS[key.family]?.write;
     if (current !== undefined && current > input.version) throw new ToolingStateFormatError("would-rewind", `${key.family} for task ${row.taskId} state ${key.scopeKey} is already version ${current}`);

@@ -45,6 +45,7 @@ CREATE TABLE "ToolingOperation" (
     "sessionId" TEXT NOT NULL,
     "turnId" TEXT,
     "existingOperationId" TEXT,
+    "parentOperationId" TEXT,
     "resourceKey" TEXT,
     "generation" INTEGER NOT NULL,
     "releaseId" TEXT NOT NULL,
@@ -100,6 +101,9 @@ CREATE UNIQUE INDEX "ToolingRelease_repositoryId_revision_key" ON "ToolingReleas
 
 -- CreateIndex
 CREATE INDEX "ToolingActivation_repositoryId_generation_idx" ON "ToolingActivation"("repositoryId", "generation");
+
+-- CreateIndex
+CREATE INDEX "ToolingOperation_parentOperationId_idx" ON "ToolingOperation"("parentOperationId");
 
 -- CreateIndex
 CREATE INDEX "ToolingOperation_releaseId_status_idx" ON "ToolingOperation"("releaseId", "status");

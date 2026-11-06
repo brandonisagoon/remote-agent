@@ -57,6 +57,10 @@ beforeEach(async () => {
   commit("noformats", { ".remote-agent-release.json": release({}) });
   git(source, "checkout", "-q", revisions.B!);
   commit("w1r12", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1, 2], write: 1, preservesUnknown: true } }) });
+  git(source, "checkout", "-q", revisions.B!);
+  commit("migrating", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1, 2], write: 1, writeVersions: [1, 2], preservesUnknown: true } }) });
+  git(source, "checkout", "-q", revisions.B!);
+  commit("badwrite", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1], write: 1, writeVersions: [1, 2], preservesUnknown: true } }) });
   git(source, "checkout", "-q", "main");
   legacy = [];
   const base = testConfig();
@@ -258,6 +262,47 @@ test("a retried older write registration cannot authorize rewinding newer state"
   await transitionToolingOperation({ prisma: db.prisma, operationId: old.operationId, from: "bound", to: "completed", evidence });
   await expect(write(old.operationId, 1)).rejects.toMatchObject({ code: "operation-closed" });
   expect(await readToolingStateVersion({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "runtime:development" })).toMatchObject({ version: 2, operationId: next.operationId });
+});
+
+test("declared writeVersions allow explicit migrations but never older replays", async () => {
+  const task = await ownedTask();
+  await expect(activate("bad", "badwrite", 0)).rejects.toMatchObject({ code: "preparation-failed" });
+  await activate("k1", "migrating", 0);
+  const op = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request: { requestKey: "op", inputDigest: "f".repeat(64), kind: "runtime-up" } });
+  const write = (version: number) => registerToolingStateWrite({ prisma: db.prisma, operationId: op.operationId, family: "drafted.runtime", scopeKey: "runtime:development", version });
+  expect((await write(1)).version).toBe(1);
+  expect((await write(2)).version).toBe(2);
+  await expect(write(1)).rejects.toMatchObject({ code: "would-rewind" });
+  await expect(write(3)).rejects.toMatchObject({ code: "wrong-write-version" });
+  expect((await write(2)).version).toBe(2);
+});
+
+test("callbacks inherit their open adapter command's release, never the active selection", async () => {
+  const task = await ownedTask(), other = await ownedTask("task-2");
+  const bind = (owner: typeof task, request: { requestKey: string; kind: string; parentOperationId?: string }) =>
+    bindToolingOperation({ prisma: db.prisma, config, taskId: owner.id, sessionId: owner.primarySessionId!, turnId: null, request: { inputDigest: "9".repeat(64), ...request } });
+  await activate("k1", "A", 0);
+  const command = await bind(task, { requestKey: "cmd", kind: "adapter-command" });
+  const foreign = await bind(other, { requestKey: "cmd", kind: "adapter-command" });
+  expect(command.parentOperationId).toBeNull();
+  await activate("k2", "B", 1);
+  const child = await bind(task, { requestKey: "cb1", kind: "compute-start", parentOperationId: command.operationId });
+  expect(child).toMatchObject({ parentOperationId: command.operationId, generation: 1, release: { revision: revisions.A } });
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: child.operationId } })).protocol).toBe((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: command.operationId } })).protocol);
+  const root = await bind(task, { requestKey: "cmd2", kind: "adapter-command" });
+  expect(root).toMatchObject({ parentOperationId: null, generation: 2, release: { revision: revisions.B } });
+  await expect(bind(task, { requestKey: "cb1", kind: "compute-start" })).rejects.toMatchObject({ code: "request-conflict" });
+  await expect(bind(task, { requestKey: "cb1", kind: "compute-start", parentOperationId: root.operationId })).rejects.toMatchObject({ code: "request-conflict" });
+  await expect(bind(task, { requestKey: "x1", kind: "compute-start", parentOperationId: "missing" })).rejects.toMatchObject({ code: "invalid-parent" });
+  await expect(bind(task, { requestKey: "x2", kind: "compute-start", parentOperationId: child.operationId })).rejects.toMatchObject({ code: "invalid-parent" });
+  await expect(bind(task, { requestKey: "x3", kind: "compute-start", parentOperationId: foreign.operationId })).rejects.toMatchObject({ code: "invalid-parent" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: root.operationId, from: "bound", to: "running" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: root.operationId, from: "running", to: "unknown" });
+  await expect(bind(task, { requestKey: "x4", kind: "compute-start", parentOperationId: root.operationId })).rejects.toMatchObject({ code: "parent-unavailable" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: command.operationId, from: "bound", to: "completed", evidence });
+  await expect(bind(task, { requestKey: "cb2", kind: "compute-start", parentOperationId: command.operationId })).rejects.toMatchObject({ code: "parent-unavailable" });
+  expect(await bind(task, { requestKey: "cb1", kind: "compute-start", parentOperationId: command.operationId })).toEqual(child);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))?.status).toBe("bound");
 });
 
 test("incompatible writes are deferred only for the affected task state", async () => {

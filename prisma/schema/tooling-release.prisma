@@ -55,6 +55,9 @@ model ToolingOperation {
   sessionId           String
   turnId              String?
   existingOperationId String?
+  /// Adapter-command binding this callback inherited its release from; null
+  /// for a root operation. Never a provider-resource ID.
+  parentOperationId   String?
   resourceKey         String?
   generation          Int
   releaseId           String
@@ -66,6 +69,7 @@ model ToolingOperation {
   updatedAt           DateTime @updatedAt
 
   @@unique([taskId, requestKey])
+  @@index([parentOperationId])
   @@index([releaseId, status])
   @@index([repositoryId, status])
 }

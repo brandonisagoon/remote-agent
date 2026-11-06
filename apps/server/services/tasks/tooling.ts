@@ -26,8 +26,13 @@ export const ToolingReleaseManifestSchema = z.strictObject({
   stateFormats: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63}){1,3}$/), z.strictObject({
     read: z.array(FormatVersion).min(1).max(32).refine(values => new Set(values).size === values.length, "read versions must be unique"),
     write: FormatVersion,
+    /** Every version this release may persist, including explicit migrations
+     * and compatible saves of older state. Omitted means exactly [write]. */
+    writeVersions: z.array(FormatVersion).min(1).max(32).refine(values => new Set(values).size === values.length, "writeVersions must be unique").optional(),
     preservesUnknown: z.boolean(),
-  }).refine(value => value.read.includes(value.write), "Every declared writer format must also be readable")),
+  }).refine(value => value.read.includes(value.write), "Every declared writer format must also be readable")
+    .refine(value => !value.writeVersions || value.writeVersions.includes(value.write), "writeVersions must include the default write version")
+    .refine(value => (value.writeVersions ?? [value.write]).every(version => value.read.includes(version)), "Every writable version must also be readable")),
 });
 
 const ProcessId = z.number().int().positive();
