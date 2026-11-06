@@ -21,7 +21,9 @@
  * 4. Terminal-consumer probe: the completed legacy intent is still admitted
  *    headerless until lazily resolved (recorded, see `findings`).
  * 5. A new command from the stale A checkout is refused before effects; the
- *    same request key then runs and settles with Drafted B's CLI.
+ *    same request key is then attempted with Drafted B's CLI. Under the owner
+ *    pause the server withholds its state receipt, so that command is refused
+ *    and its operation stays bound (recorded as a finding, pause kept).
  * 6. The finished legacy consumer is resolved through the normal operation
  *    state route on a live development-intent operation (the paused task
  *    withholds state receipts from command operations); afterwards the same
@@ -245,7 +247,8 @@ export async function rehearseLegacyTurn(receiptFile: string) {
     findings.push({ finding: "terminal-legacy-callback-admitted-until-lazy-resolution", consumerStatus: (await server.db.prisma.toolingLegacyConsumer.findUniqueOrThrow({ where: { id: consumer.id } })).status,
       status: terminal.status, body: terminal.body, developmentEventsUnchanged: true });
 
-    // --- 5. A NEW stale-A command is refused before effects; B settles that key.
+    // --- 5. A NEW stale-A command is refused before effects; B then attempts
+    // that key (observed: refused while owner-paused; the operation stays bound).
     const stale = await cli(a.checkout, ["runtime", "status"], "dra31-stale-a-status", server.controlSocket);
     assert.notEqual(stale.code, 0);
     assert.match(stale.stderr, /is bound to tooling release .*not this checkout/);
