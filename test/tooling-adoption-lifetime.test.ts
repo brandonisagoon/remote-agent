@@ -23,7 +23,7 @@ import { testConfig } from "../test-support/config.ts";
 import type { AppEnv } from "../apps/server/middleware/context.ts";
 import { toolingOperationGuard, toolingOperationRoutes } from "../apps/server/routes/tasks/tooling-operations.ts";
 import { TOOLING_OPERATION_HEADER, bindServerContinuation, inventoryLegacyToolingConsumers, producerOperationId, resolveEnvironmentConsumers, resourceGroupCode } from "../apps/server/services/tasks/tooling-operations.ts";
-import { activateToolingRelease, canonicalDigest, registerToolingStateWrite, retainToolingConsumer } from "../apps/server/services/tasks/tooling-releases.ts";
+import { activateToolingRelease, canonicalDigest, confirmToolingConsumer, registerToolingStateWrite, retainToolingConsumer } from "../apps/server/services/tasks/tooling-releases.ts";
 import { computeTaskIdentity } from "../apps/server/services/tasks/compute-admission.ts";
 import type { PreparedToolingRelease } from "../apps/server/services/tasks/tooling.ts";
 
@@ -797,5 +797,53 @@ test("same release: an open old command, produced work or another recipe is refu
     // After the winner adopted, a third fresh command is refused at begin (the winner's command is open).
     const late = await f.command("a-three");
     expect((await late.beginChild("offer-delivered")).body).toMatchObject({ code: "retained-release-required" });
+  }
+}, 60_000);
+
+test("same release: an exact same-key retry is never re-judged (not stranded) while its claim stays atomically refused; a different identity under that key and a retained reader are refused", async () => {
+  const waitingA = async () => {
+    const f = await fixture();
+    await f.activate(A, 0);
+    const first = await f.command("a-runtime-up");
+    expect((await first.request()).called?.status).toBe(200);
+    await f.environment();
+    return { f, first };
+  };
+  {
+    const { f, first } = await waitingA();
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-delivered");
+    const slow = await f.command("a-slow"), fast = await f.command("a-fast");
+    const bound = await slow.beginChild("offer-delivered"); // adoption child, not yet claimed
+    expect(bound.status).toBe(200);
+    // Another fresh command adopts first, so the slow child's work is no longer eligible.
+    const winner = await fast.claim("offer-delivered");
+    expect(winner.called?.status).toBe(200);
+    // The slow command's exact retry (same key) returns its own stored binding...
+    const retry = await slow.beginChild("offer-delivered");
+    expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+    expect(retry.body.binding).toEqual(bound.body.binding);
+    // ...but its claim is refused by the atomic recheck, with no handler call.
+    const handled = f.handled.length;
+    const lost = await slow.call("compute-claim", { ...computeBody, offerId: "offer-delivered" }, bound.body.binding.operationId);
+    expect(lost.status).toBe(409);
+    expect(lost.body.code).toBe("retained-release-required");
+    expect(f.handled.length).toBe(handled);
+    // The same key with a different identity is refused, never rebound.
+    const mismatch = await f.begin({ requestKey: bound.body.binding.requestKey, inputDigest: bound.body.binding.inputDigest, kind: "compute-admission", existingOperationId: "offer-other", parentOperationId: slow.fence.operationId });
+    expect(mismatch.status).toBeGreaterThanOrEqual(400);
+    expect(mismatch.body.binding).toBeUndefined();
+  }
+  {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, first } = await waitingA();
+    // A retained reader of the waiting environment (recorded and confirmed through the real services).
+    const reader = await retainToolingConsumer({ prisma: db.prisma, operationId: first.bindings[0]!.operationId, consumerKind: "compute-environment", consumerId: ENV, scopeKey: KEY });
+    await confirmToolingConsumer({ prisma: db.prisma, id: reader.id, evidence: { kind: "fixture-reader", reference: ENV } });
+    expect((await first.settle()).status).toBe(200);
+    await f.offer("offer-delivered");
+    const fresh = await f.command("a-runtime-up-offer");
+    const refused = await fresh.beginChild("offer-delivered");
+    expect(refused.body).toMatchObject({ code: "retained-release-required" });
   }
 }, 60_000);

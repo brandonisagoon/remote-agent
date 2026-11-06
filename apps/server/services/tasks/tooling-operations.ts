@@ -978,7 +978,11 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
   // inherited atomically by the binding primitive), else the active one.
   const parent = request.parentOperationId ? await dependencies.read({ prisma: input.prisma, operationId: request.parentOperationId }) : null;
   if (request.parentOperationId && (!parent || parent.kind !== ADAPTER_COMMAND_KIND || parent.taskId !== before.task.id || parent.sessionId !== input.sessionId)) throw new ToolingOperationRefused("operation-ownership", "Parent must be this primary's adapter-command binding");
-  if (request.existingOperationId && isCallbackKind(request.kind)) {
+  // An exact retry of an already-stored request key is never re-judged by the
+  // ownership/adoption rules (they may have changed since it was bound): the
+  // binding primitive replays it, and its full identity is validated below.
+  const stored = await input.prisma.toolingOperation.findUnique({ where: { taskId_requestKey: { taskId: before.task.id, requestKey: request.requestKey } } });
+  if (!stored && request.existingOperationId && isCallbackKind(request.kind)) {
     const type = EXISTING_TYPE[request.kind];
     const reference: ExistingReference = { type, id: type === "finalization" || type === "cleanup-request" ? `${before.task.id}:${request.existingOperationId}` : request.existingOperationId };
     if (!await existingReceipt(input.prisma, before.task, reference)) throw new ToolingOperationRefused("operation-input", `Existing ${type} ${request.existingOperationId} does not belong to this task`);
@@ -991,16 +995,14 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     if (ownerId) {
       const original = await dependencies.read({ prisma: input.prisma, operationId: ownerId });
       if (!original) throw new ToolingOperationRefused("operation-unknown", "Existing operation binding is missing");
-      // The original binding continues under a fresh key or a new command
-      // fence only when it would run the same retained code; never newer code.
       const requested = parent?.release ?? (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId }))?.release;
-      // Only the EXACT request (its own request key) returns a stored binding,
-      // and the binding primitive replays and validates it below; a client
-      // accepts nothing but its own echo. Otherwise a new child is bound when
-      // it is a sibling under the same open command (same lineage), or when it
-      // adopts never-produced waiting work whose admitting command settled (any
-      // release; the claim rechecks atomically). Everything else is refused.
-      if (original.requestKey !== request.requestKey) {
+      // Never another request's binding: a client accepts nothing but its own
+      // echo, and exact same-key retries were routed to the primitive above. A
+      // NEW child is bound only as a sibling under the same open command (same
+      // lineage), or to adopt never-produced waiting work whose admitting
+      // command settled (any release; the claim rechecks atomically under the
+      // admission write lock). Everything else is refused.
+      {
         const sibling = Boolean(request.parentOperationId && original.parentOperationId === request.parentOperationId);
         const adoptable = !sibling && admitted && requested && !await adoptionRefused(input.prisma, before.task, request.existingOperationId,
           { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest }, dependencies);
