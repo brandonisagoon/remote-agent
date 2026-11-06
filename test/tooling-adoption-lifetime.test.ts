@@ -508,3 +508,113 @@ test("reconcile: an earlier attempt still in flight blocks reconciliation until 
   expect((await f.operation(child.operationId)).status).toBe("running");
   console.log(JSON.stringify({ inflight: (await attempts(child.operationId)).map(record => `${record.attemptId.slice(0, 8)}:${record.state}`) }));
 });
+
+// ---------------------------------------------------------------------------
+// A child bound but never attempted (client killed between begin and callback).
+/** Begin (only) the configure child Drafted would bind for an offer: kind
+ * compute-configure, existing = offerId, under the command fence. */
+const configureBody = (offerId: string) => ({ offerId, environmentId: ENV, resourceId: "resource", recipeHash: "d".repeat(64) });
+const beginConfigure = (f: Awaited<ReturnType<typeof fixture>>, fence: { operationId: string; requestKey: string }, offerId: string) => {
+  const digest = canonicalDigest(configureBody(offerId));
+  return f.begin({ requestKey: `${fence.requestKey}/compute-configure/${canonicalDigest({ existing: offerId, digest }).slice(0, 24)}`, inputDigest: digest, kind: "compute-configure", existingOperationId: offerId, parentOperationId: fence.operationId });
+};
+/** A started command (request, claim, bind on offer-2) with an orphan configure child for expired offer-1. */
+async function orphaned() {
+  const f = await fixture();
+  await f.activate(A, 0);
+  const a = await f.command("a-runtime-up");
+  expect((await a.request()).called?.status).toBe(200);
+  await f.environment(); await f.offer("offer-1");
+  // Begin the configure child for offer-1, then the client dies before its callback.
+  const orphan = await beginConfigure(f, a.fence, "offer-1");
+  expect(orphan.status, JSON.stringify(orphan.body)).toBe(200);
+  // offer-1 expires and is replaced; the restarted command claims and binds offer-2.
+  await db.prisma.computeOffer.update({ where: { id: "offer-1" }, data: { state: "expired" } });
+  await f.offer("offer-2");
+  const restarted = await f.command("a-runtime-up");
+  expect(restarted.fence.operationId).toBe(a.fence.operationId);
+  expect((await restarted.request()).called?.status).toBe(200);
+  expect((await restarted.claim("offer-2")).called?.status).toBe(200);
+  await f.claimed("offer-2");
+  expect((await restarted.bind("offer-2")).called?.status).toBe(200);
+  return { f, a, restarted, orphanId: orphan.body.binding.operationId as string };
+}
+
+test("never-attempted: a crash between a configure child's begin and its callback, then a replacement offer, still lets the command settle", async () => {
+  const { f, a, restarted, orphanId } = await orphaned();
+  const before = await f.operation(orphanId);
+  expect(before.status).toBe("bound");
+  const settled = await restarted.settle();
+  console.log(JSON.stringify({ neverAttempted: { orphan: orphanId.slice(0, 8), settle: settled.status, body: settled.body } }));
+  expect(settled.status, JSON.stringify(settled.body)).toBe(200);
+  // The original row, identity and lineage are kept; only its status gains exact evidence.
+  const row = await f.operation(orphanId);
+  expect(row).toMatchObject({ id: before.id, requestKey: before.requestKey, inputDigest: before.inputDigest, kind: "compute-configure", existingOperationId: "offer-1",
+    parentOperationId: a.fence.operationId, releaseId: before.releaseId, generation: before.generation, status: "completed", completionEvidence: { kind: "never-attempted", reference: a.fence.operationId } });
+  // The completed orphan can never run its old offer.
+  expect((await restarted.call("compute-configure", configureBody("offer-1"), orphanId)).status).toBe(409);
+});
+
+test("never-attempted: a bound child with any attempt or effect record, or an unknown/running child, still blocks settlement", async () => {
+  // The normal path moves a child to running in the same transaction as its
+  // first attempt, so a BOUND child with records is ADVERSARIALLY seeded here
+  // only to prove refusal.
+  for (const seed of ["attempt", "owner"] as const) {
+    if (seed !== "attempt") { await db.cleanup(); db = await createTestDatabase(); }
+    const { f, restarted, orphanId } = await orphaned();
+    const key = seed === "attempt" ? `outcome:${orphanId}` : "owner:compute-offer:offer-1";
+    const value = seed === "attempt" ? { version: 1, operationId: orphanId, role: "outcome", state: "intent", attemptId: "seeded", route: "POST /api/tasks/:taskId/compute-configure", inputDigest: "x" }
+      : { version: 1, operationId: orphanId, role: "owner", state: "confirmed" };
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key, value: JSON.stringify(value) } });
+    const settled = await restarted.settle();
+    expect(settled.status).toBe(409);
+    expect(settled.body.error).toContain(seed === "attempt" ? "bound with callback attempt history" : "bound with owner evidence");
+    expect((await f.operation(orphanId)).status).toBe("bound");
+    expect((await f.operation(restarted.fence.operationId)).status).not.toBe("completed"); // the parent swap rolled back
+  }
+  // An unknown child (lost callback response) is unchanged by this rule.
+  await db.cleanup(); db = await createTestDatabase();
+  const { f, restarted, orphanId } = await orphaned();
+  f.setDomain(route => { if (route === "compute-configure") throw new Error("lost response"); return 200; });
+  expect((await restarted.call("compute-configure", configureBody("offer-1"), orphanId)).status).toBe(500);
+  expect((await f.operation(orphanId)).status).toBe("unknown");
+  // Refused (its pending reader or its unknown status blocks first); the child stays unknown.
+  const refusedUnknown = await restarted.settle();
+  expect(refusedUnknown.status).toBe(409);
+  expect(refusedUnknown.body.error).toMatch(/unconfirmed producing effect|is unknown/);
+  expect((await f.operation(orphanId)).status).toBe("unknown");
+});
+
+test("never-attempted: settlement racing the orphan's callback or a new child's begin yields a refused settlement or a refused callback, never both effects", async () => {
+  for (let round = 0; round < 3; round++) {
+    await db.cleanup(); db = await createTestDatabase();
+    const { f, restarted, orphanId } = await orphaned();
+    const handledBefore = f.handled.length;
+    const [settled, called] = await Promise.all([restarted.settle(), restarted.call("compute-configure", configureBody("offer-1"), orphanId)]);
+    const row = await f.operation(orphanId), ran = f.handled.slice(handledBefore).some(entry => entry.startsWith(orphanId.slice(0, 8)));
+    if ((row.completionEvidence as { kind?: string } | null)?.kind === "never-attempted") {
+      // Settlement won: the callback was refused before any record or effect.
+      expect([settled.status, called.status, ran]).toEqual([200, 409, false]);
+      expect(await db.prisma.runtimeMetadataEvent.count({ where: { key: `outcome:${orphanId}` } })).toBe(0);
+    } else {
+      // The callback won: settlement is refused, or (callback fully acknowledged first) completes it as acknowledged.
+      expect(ran).toBe(true);
+      expect(settled.status === 409 || (row.completionEvidence as { kind?: string } | null)?.kind === "callback-acknowledged").toBe(true);
+    }
+  }
+  // A new child begun concurrently with settlement: refused, or completed never-attempted and then unusable.
+  await db.cleanup(); db = await createTestDatabase();
+  const { f, restarted } = await orphaned();
+  const [settled, begun] = await Promise.all([restarted.settle(), beginConfigure(f, restarted.fence, "offer-3")]);
+  expect(settled.status).toBe(200);
+  if (begun.status === 200) {
+    const late = begun.body.binding.operationId as string;
+    expect((await f.operation(late)).completionEvidence).toMatchObject({ kind: "never-attempted" });
+    expect((await restarted.call("compute-configure", configureBody("offer-3"), late)).status).toBe(409);
+  } else {
+    // Begun after the parent's swap: refused, no child row.
+    expect(begun.status).toBeGreaterThanOrEqual(400); expect(begun.status).toBeLessThan(500);
+    expect(await db.prisma.toolingOperation.count({ where: { parentOperationId: restarted.fence.operationId, existingOperationId: "offer-3" } })).toBe(0);
+  }
+  console.log(JSON.stringify({ concurrentBegin: { settle: settled.status, begin: begun.status, refusal: begun.body.code ?? null } }));
+});

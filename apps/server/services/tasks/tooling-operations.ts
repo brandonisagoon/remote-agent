@@ -1030,6 +1030,28 @@ export async function bindServerContinuation(input: { prisma: PrismaClient; conf
 export const SettlementInput = z.object({ requestKey: z.string().min(1).max(256), inputDigest: z.string().regex(/^[a-f0-9]{64}$/), outcome: z.enum(["completed", "no-effect"]) }).strict();
 const settlementEvidence = (outcome: "completed" | "no-effect", requestKey: string) => ({ kind: outcome === "completed" ? "command-completed" : "command-no-effect", reference: requestKey });
 
+/** Any record that a child was attempted or had an effect: a callback
+ * attempt, a state write, a retained reader, a child of its own, or any
+ * association naming it (owner, admission, producer, completion). Bounded and
+ * strict: overflow or an unreadable association is itself evidence. Returns a
+ * description, or null when there is provably none. */
+async function childEffectEvidence(tx: Prisma.TransactionClient, binding: { sessionId: string; taskId: string }, childId: string) {
+  if (await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", childId) } })) return "callback attempt history";
+  if (await tx.toolingStateWrite.count({ where: { operationId: childId } })) return "state writes";
+  if (await tx.toolingRetainedConsumer.count({ where: { operationId: childId } })) return "retained readers";
+  if (await tx.toolingOperation.count({ where: { parentOperationId: childId } })) return "children of its own";
+  const events = await tx.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, NOT: { key: { startsWith: "outcome:" } } }, take: 5001 });
+  if (events.length > 5000) return "association history beyond its bound";
+  for (const event of events) {
+    let value: unknown;
+    try { value = JSON.parse(event.value ?? "null"); } catch { return `unreadable association ${event.sequence}`; }
+    const parsed = Association.safeParse(value);
+    if (!parsed.success) return `unreadable association ${event.sequence}`;
+    if (parsed.data.operationId === childId) return `${parsed.data.role} evidence`;
+  }
+  return null;
+}
+
 /** POST .../tooling-operations/:operationId/settlement. Records a finished
  * adapter command after checking its stored identity, current ownership and
  * every child/consumer outcome. Unknown effects are never declared
@@ -1078,6 +1100,17 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
       if (pending) throw refuse("operation-closed", `Retained ${pending.consumerKind} ${pending.consumerId} has an unconfirmed producing effect; the command cannot be declared successful`);
       for (const child of children) {
         if (child.status === "completed") continue;
+        // A child bound but never attempted (client lost between begin and
+        // callback) completes with exact `never-attempted` evidence, only
+        // under this parent's write lock and only with no attempt or effect
+        // record of any kind. Any record keeps it blocking.
+        if (child.status === "bound") {
+          const evidence = await childEffectEvidence(tx, binding, child.id);
+          if (evidence) throw refuse("operation-closed", `Child operation ${child.id} is bound with ${evidence}; the command cannot be declared successful`);
+          const closed = await tx.toolingOperation.updateMany({ where: { id: child.id, status: "bound" }, data: { status: "completed", completionEvidence: { kind: "never-attempted", reference: binding.operationId } } });
+          if (closed.count !== 1) throw refuse("operation-closed", `Child operation ${child.id} changed during settlement`);
+          continue;
+        }
         // Finite callback lifetimes end only on the latest attempt's own
         // definite acknowledgment.
         if (child.status !== "running" || !await latestAttemptAcknowledged(tx, binding, child))
