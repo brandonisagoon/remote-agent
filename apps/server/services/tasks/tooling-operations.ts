@@ -31,7 +31,7 @@ const DEVELOPMENT_INTENT_ACTION = "development-compute-intent";
  * repository has a legacy boundary. */
 export type ToolingCodeIdentity = Pick<ToolingReleaseRecord, "repositoryId" | "revision" | "checkout">;
 
-export const TOOLING_OPERATION_KINDS = ["compute-admission", "compute-configure", "compute-enroll", "development-intent", "finalization", "cleanup-schedule"] as const;
+export const TOOLING_OPERATION_KINDS = ["compute-admission", "compute-configure", "compute-enroll", "development-intent", "finalization", "cleanup-schedule", "compute-neon-recovery"] as const;
 export type ToolingOperationKind = typeof TOOLING_OPERATION_KINDS[number];
 /** Existing durable operations. `type` is also DRA-28's legacy consumerKind;
  * finalization and cleanup-request IDs are `<taskId>:<requestKey>`. */
@@ -41,7 +41,7 @@ export type ExistingReference = { type: "compute-offer" | "compute-environment" 
 const isCallbackKind = (kind: string): kind is ToolingOperationKind => (TOOLING_OPERATION_KINDS as readonly string[]).includes(kind);
 const EXISTING_TYPE: Record<ToolingOperationKind, ExistingReference["type"]> = {
   "compute-admission": "compute-offer", "compute-configure": "compute-offer", "compute-enroll": "compute-environment",
-  "development-intent": "development-intent", finalization: "finalization", "cleanup-schedule": "cleanup-request",
+  "development-intent": "development-intent", finalization: "finalization", "cleanup-schedule": "cleanup-request", "compute-neon-recovery": "compute-offer",
 };
 
 /** Root fence for one complete adapter command, bound before its first effect
@@ -232,6 +232,17 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
   { route: "POST /api/tasks/:taskId/compute-configure", method: "POST", path: taskPath("compute-configure"), scope: "task", kind: "compute-configure",
     input: body => body, reference: offer, referenceRule: "existing", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-configure", reference: body.offerId as string } : null },
+  // DRA-24: a projection transition plus (for a first-bootstrap group) its
+  // legacy reader handoff. No reference rule: the binding continues the offer
+  // by existingOperationId and the digest pins it, so no owner is recorded;
+  // it admits, produces and retains nothing. A retried request may hold a new
+  // runtime lock, so lockPid is outside the digest.
+  { route: "POST /api/tasks/:taskId/compute-neon-recovery", method: "POST", path: taskPath("compute-neon-recovery"), scope: "task", kind: "compute-neon-recovery",
+    // No `completes`: an HTTP 2xx never manufactures completion. Only the
+    // service's commit transaction completes it (completeNeonRecoveryOperation,
+    // exact committed-event evidence), for root and command-parented alike; a
+    // lost acknowledgment resolves through the committed-result read.
+    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid")) },
   { route: "POST /api/tasks/:taskId/compute-enroll", method: "POST", path: taskPath("compute-enroll"), scope: "task", kind: "compute-enroll",
     input: body => body, reference: body => text(body.environmentId) ? { type: "compute-environment", id: body.environmentId as string } : null, referenceRule: "existing",
     produces: async body => text(body.environmentId) ? [body.environmentId as string] : [],
@@ -340,6 +351,7 @@ export function boundCode(explicit?: ToolingCodeIdentity | null): ToolingCodeIde
 // producer — intent before the effect, confirmed/failed after. A newest
 // producer intent without an outcome is an unknown effect: fail closed.
 const ASSOCIATION = "tooling-operation-association";
+export const TOOLING_OPERATION_ASSOCIATION = ASSOCIATION;
 const Association = z.object({ version: z.literal(1), operationId: z.string(), role: z.enum(["owner", "admission", "producer", "completion", "outcome"]), state: z.enum(["intent", "confirmed", "failed", "acknowledged", "refused", "unknown", "reconciled"]), attemptId: z.string().optional(), evidence: z.string().optional() }).passthrough();
 type Role = z.infer<typeof Association>["role"];
 const associationKey = (role: Role, id: string) => `${role}:${id}`;
@@ -646,6 +658,12 @@ export async function resourceGroupCode(input: { prisma: PrismaClient; task: Rem
   }
   const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: input.task.repositoryId, consumerKind: input.reference.type, consumerId: input.reference.id });
   if (consumer.status === "no-boundary") return { code: null, binding: null };
+  // A first-bootstrap group handed off by a committed Neon recovery runs that
+  // operation's release (strictly validated; never the active release).
+  if (consumer.status === "resolved") {
+    const handedOff = await (await import("./tooling-neon-recovery.ts")).neonRecoveryHandoffCode(input.prisma, { task: input.task, reference: input.reference }, dependencies.read);
+    if (handedOff) return handedOff;
+  }
   if (consumer.status === "legacy" && consumer.taskId === input.task.id) return { code: { repositoryId: input.task.repositoryId, revision: consumer.revision, checkout: consumer.checkout }, binding: null };
   if (consumer.status === "not-legacy" && input.unstarted && input.unstarted.taskId === input.task.id) return { code: input.unstarted.release, binding: input.unstarted };
   throw new ToolingOperationRefused("producer-unknown", `${input.reference.type} ${input.reference.id} has no bound producer or retained legacy snapshot (${consumer.status})`);
@@ -687,7 +705,7 @@ export type CallbackAdmission =
 async function callbackTask(store: Store, callback: Pick<ToolingCallback, "scope">, param: string) {
   return callback.scope === "task" ? store.remoteTask.findUnique({ where: { id: param } }) : store.remoteTask.findUnique({ where: { primarySessionId: param } });
 }
-const PAUSE_BLOCKED: readonly string[] = ["compute-admission", "compute-configure", "compute-enroll", "cleanup-schedule"];
+const PAUSE_BLOCKED: readonly string[] = ["compute-admission", "compute-configure", "compute-enroll", "cleanup-schedule", "compute-neon-recovery"];
 
 /** Current authority for a bound callback; repeated immediately before the
  * handler so an await cannot carry a stale owner/pause/source decision. */
@@ -747,6 +765,8 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     const reference = callback.reference ? await callback.reference(input.body, context) : null;
     if (!reference) throw refuse("operation-required", `${callback.route} starts a new effect after release-aware activation`);
     if (await owningOperationId(store, task, reference)) throw refuse("operation-required", `${reference.type} ${reference.id} belongs to a bound operation`);
+    const fenced = await (await import("./tooling-neon-recovery.ts")).neonRecoveryFence(input.prisma, task, reference);
+    if (fenced) throw refuse("operation-required", fenced);
     if (reference.type === "compute-offer") {
       const environment = await offerEnvironment(context, reference.id);
       if (environment && (await admittingOperationId(store, task, environment.key) || await producerOperationId(store, task, environment.id).catch(() => "unknown"))) throw refuse("operation-required", `${reference.type} ${reference.id} belongs to a bound operation`);
@@ -1048,6 +1068,10 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
     return value;
   };
   const before = await owned();
+  // The recovered state is exactly drafted.runtime scope `runtime-development`
+  // (the registration and committed-result verifier fix it); no other scope binds.
+  if (request.kind === "compute-neon-recovery" && request.resourceKey && request.resourceKey !== "runtime-development") throw new ToolingOperationRefused("operation-input", `compute-neon-recovery supports only resourceKey runtime-development, not ${request.resourceKey}`);
+  if (request.kind === "compute-neon-recovery" && (!request.existingOperationId || !request.resourceKey)) throw new ToolingOperationRefused("operation-input", "compute-neon-recovery continues an exact existing offer and names its resourceKey");
   if ((request.kind === "compute-configure" || request.kind === "compute-enroll" || request.kind === "development-intent") && !request.existingOperationId) throw new ToolingOperationRefused("operation-input", `${request.kind} operations continue an exact existing operation`);
   // The release this request would run: its command parent's (validated and
   // inherited atomically by the binding primitive), else the active one.
@@ -1085,8 +1109,19 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
         if (refusal) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release (${refusal})`);
       }
     }
-    const consumer = await dependencies.legacy({ prisma: input.prisma, repositoryId: before.task.repositoryId, consumerKind: type, consumerId: reference.id });
-    if (consumer.status === "legacy" || consumer.status === "unavailable") throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} is a retained first-bootstrap legacy consumer; only its legacy path may continue it until reconciled`);
+    if (request.kind === "compute-neon-recovery") {
+      // The one explicit legacy handoff: the whole first-bootstrap group must be
+      // eligible now (re-proved under the service's write lock), and the
+      // release this binding will run must read v1 and write v2.
+      await resolveFinishedLegacyConsumers({ prisma: input.prisma, repositoryId: before.task.repositoryId, taskId: before.task.id });
+      const recovery = await import("./tooling-neon-recovery.ts");
+      await recovery.readNeonRecoveryLegacyGroup(input.prisma, { taskId: before.task.id, offerId: request.existingOperationId, resourceKey: request.resourceKey! });
+      const release = parent?.release ?? (await dependencies.active({ prisma: input.prisma, config: input.config, repositoryId: before.task.repositoryId }))?.release;
+      if (!release) throw new ToolingOperationRefused("operation-required", "Neon recovery needs a release-aware active generation");
+      recovery.assertNeonRecoveryRelease(release);
+    }
+    const consumer = request.kind === "compute-neon-recovery" ? null : await dependencies.legacy({ prisma: input.prisma, repositoryId: before.task.repositoryId, consumerKind: type, consumerId: reference.id });
+    if (consumer?.status === "legacy" || consumer?.status === "unavailable") throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} is a retained first-bootstrap legacy consumer; only its legacy path may continue it until reconciled`);
   }
   const turnId = await executingTurn(input.prisma, input.sessionId, input.runtime);
   const binding = await dependencies.bind({ prisma: input.prisma, config: input.config, taskId: before.task.id, sessionId: input.sessionId, turnId, request });
@@ -1242,7 +1277,7 @@ export async function settleToolingCommand(input: { prisma: PrismaClient; config
 const CapabilityReceipt = z.object({ capability: z.string(), source: z.literal("configured-host"), capabilityRevision: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/), checkout: z.string().startsWith("/") }).passthrough();
 const ObserverCapability = z.object({ version: z.literal(1), source: z.literal("configured-host"), checkout: z.string().startsWith("/"), revision: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/) }).passthrough();
 const FINALIZATION_CONFIRMED_ACTION = "finalization-confirmed", DEVELOPMENT_COMPLETE_ACTION = "development-compute-complete", DEVELOPMENT_SUPERSEDED_ACTION = "development-compute-superseded";
-const COUNTED_COMPUTE_KINDS = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
+export const COUNTED_COMPUTE_KINDS = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const ACTIVE_OFFERS = ["queued", "offered", "validating", "claimed", "running", "unknown"];
 const TERMINAL_OFFERS = ["stopped", "expired", "declined", "ineligible"];
 const PENDING_INSTRUCTION = ["queued", "preparing", "dispatching", "unknown"];

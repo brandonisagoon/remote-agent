@@ -1,22 +1,25 @@
 import { expect, test, spyOn } from "bun:test";
-import * as childProcess from "node:child_process";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 
-test("session and health requests progress while group-exit inspection is slow", async () => {
-  const original = childProcess.execFile;
+test("session and health requests progress while owned group absence is pending", async () => {
+  const query = process.kill;
   let observing!: () => void;
   const observed = new Promise<void>(resolve => { observing = resolve; });
-  let release!: () => void;
-  const held = new Promise<void>(resolve => { release = resolve; });
-  const spy = spyOn(childProcess, "execFile").mockImplementation(((...args: any[]) => {
-    if (args[0] !== "/bin/ps") return (original as any)(...args);
-    const callback = args.at(-1);
-    observing();
-    // Delay delivery of the real process-table observation, not its contents.
-    return (original as any)(...args.slice(0, -1), (...result: any[]) => {
-      void held.then(() => callback(...result));
-    });
-  }) as any);
+  let held = true, ownedGroup: number | undefined, inspections = 0;
+  const release = () => { held = false; };
+  const spy = spyOn(process, "kill").mockImplementation((pid, signal) => {
+    if (pid < -1 && signal === 0) {
+      ownedGroup ??= pid;
+      if (pid === ownedGroup) {
+        inspections++;
+        observing();
+        // Keep this group's absence unproven until release. The real bounded
+        // polling loop must yield so unrelated requests can still progress.
+        if (held) return true;
+      }
+    }
+    return query(pid, signal);
+  });
   const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => Response.json({ ready: true }) });
   let settled = false;
   const result = executeOwnedObserver([process.execPath, "--no-env-file", "-e", 'console.log("observed")'], { cwd: process.cwd(), timeoutMs: 5000 });
@@ -28,6 +31,7 @@ test("session and health requests progress while group-exit inspection is slow",
     expect(settled).toBeFalse();
     release();
     expect((await result).trim()).toBe("observed");
+    expect(inspections).toBeGreaterThan(1);
   } finally {
     release(); await result.catch(() => {}); spy.mockRestore(); await server.stop(true);
   }

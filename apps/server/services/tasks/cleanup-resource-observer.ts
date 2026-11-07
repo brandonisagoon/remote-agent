@@ -1,4 +1,3 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -36,23 +35,33 @@ function bounded(stream: ReadableStream<Uint8Array>, limit: number) {
   return { result, cancel: () => reader.cancel().catch(() => {}) };
 }
 
-async function waitForOwnedGroupExit(group: number) {
-  const deadline = Date.now() + 1000;
-  while (true) {
-    // The helper has already killed its group. This is observation only:
-    // never signal a numeric group after its leader could have been reaped.
-    const groups = await new Promise<string>((resolve, reject) => {
-      execFile("/bin/ps", ["-axo", "pgid="], {
-        timeout: 250, maxBuffer: 1024 * 1024, encoding: "utf8",
-      }, (error, stdout, stderr) => {
-        if (error || stderr.length) reject(failure("OBSERVER_GROUP"));
-        else resolve(stdout);
-      });
-    });
-    if (!groups.split("\n").some(line => Number(line.trim()) === group)) return;
-    if (Date.now() >= deadline) throw failure("OBSERVER_GROUP");
-    await Bun.sleep(10);
+const groupExitDependencies = {
+  now: () => performance.now(),
+  sleep: (ms: number) => Bun.sleep(ms),
+  query: (pid: number, signal: 0): void => { process.kill(pid, signal); },
+};
+
+/** Read-only group proof, with a bounded seam for deterministic deadline tests. */
+export async function waitForOwnedGroupExit(group: number, dependencies = groupExitDependencies) {
+  // Exclude 0 and -1 kernel targeting semantics as well as invalid numbers.
+  if (!Number.isSafeInteger(group) || group <= 1) throw failure("OBSERVER_GROUP");
+  const deadline = dependencies.now() + 1000;
+  while (dependencies.now() < deadline) {
+    let absent = false;
+    // The owned helper has exited and its pipes have drained. Signal zero
+    // sends NO signal: it checks the whole group's existence/permissions,
+    // including descendants after the leader is reaped. A reused group
+    // stays present; it is never terminated through this stored number.
+    try { dependencies.query(-group, 0); }
+    catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ESRCH") absent = true;
+      else throw failure("OBSERVER_GROUP");
+    }
+    if (dependencies.now() >= deadline) throw failure("OBSERVER_GROUP");
+    if (absent) return;
+    await dependencies.sleep(Math.min(10, Math.max(0, deadline - dependencies.now())));
   }
+  throw failure("OBSERVER_GROUP");
 }
 
 export async function executeOwnedObserver(args: string[], options: { cwd: string; input?: string; timeoutMs: number; env?: Record<string, string>; failureRequest?: unknown }) {

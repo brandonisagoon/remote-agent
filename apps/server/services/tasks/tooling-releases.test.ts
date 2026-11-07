@@ -6,10 +6,11 @@ import path from "node:path";
 import { readConfig, type ServerConfig } from "../../../../lib/config.ts";
 import { createTestDatabase, type TestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
+import { seedCommittedNeonRecovery, seededRecoveryRequest, seededInputDigest } from "./compute-neon-recovery-result.fixture.ts";
 import { acquirePreparationLock, prepareToolingRelease, verifyPreparedToolingRelease, type PrepareToolingReleaseInput } from "./tooling.ts";
 import { activateToolingRelease, assertBootToolingPolicy, assertToolingStateReadable, bindToolingOperation, bootToolingSelections, canonicalDigest, getActiveToolingRelease, readToolingLegacyBoundary,
-  readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, reconcileUnknownAdmissionChild, registerToolingStateWrite, resolveToolingLegacyConsumer, transitionToolingOperation,
-  bindRetainedToolingOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
+  readToolingLegacyConsumer, readToolingOperation, readToolingStateVersion, reconcileUnknownAdmissionChild, registerToolingStateWrite, registerToolingStateWriteInTransaction, resolveToolingLegacyConsumer, transitionToolingOperation,
+  bindRetainedToolingOperation, completeNeonRecoveryOperation, confirmToolingConsumer, readToolingRetainedConsumers, resolveToolingConsumer, retainToolingConsumer,
   type ToolingLegacyConsumerInput } from "./tooling-releases.ts";
 
 // Real Git repositories and SQLite fixtures; keep hooks reliable on a loaded host.
@@ -286,6 +287,70 @@ test("operation lifecycle transitions are explicit compare-and-swap changes", as
   await expect(transitionToolingOperation({ prisma: db.prisma, operationId: "missing", from: "bound", to: "running" })).rejects.toMatchObject({ code: "not-found" });
 });
 
+test("Neon completion cannot turn an unproven operation into success", async () => {
+  const task = await ownedTask();
+  await activate("k1", "A", 0);
+  const bind = (key: string, kind: string) => bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey: key, inputDigest: "a".repeat(64), kind, existingOperationId: "offer", resourceKey: "runtime-development" } });
+  const operation = await bind("recovery", "compute-neon-recovery"), other = await bind("other", "compute-admission");
+  const complete = (operationId: string) => db.prisma.$transaction(tx => completeNeonRecoveryOperation(tx, { operationId, eventSequence: 1 }));
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "bound", to: "running" });
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "evidence-required" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: other.operationId, from: "bound", to: "running" });
+  await expect(complete(other.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "running", to: "unknown" });
+  await expect(complete(operation.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.operationId } })).status).toBe("unknown");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-neon-recovery" } })).toBe(0);
+});
+
+test("Neon completion pins its event and open parent, rolls back, and replays only identical evidence", async () => {
+  const task = await ownedTask();
+  await activate("k1", "migrating", 0);
+  const parent = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey: "command", inputDigest: "a".repeat(64), kind: "adapter-command" } });
+  const request = seededRecoveryRequest(task.id);
+  const child = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey: "recovery", inputDigest: seededInputDigest(request), kind: "compute-neon-recovery", parentOperationId: parent.operationId,
+      existingOperationId: request.offerId, resourceKey: request.resourceKey } });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: child.operationId, from: "bound", to: "running" });
+  const binding = (await readToolingOperation({ prisma: db.prisma, operationId: child.operationId }))!;
+  // Seeded proof isolates the completion seam; actual writer acceptance is separate.
+  const { event } = await seedCommittedNeonRecovery(db.prisma, binding, request);
+  const snapshot = async () => ({ operations: await db.prisma.toolingOperation.findMany({ orderBy: { id: "asc" } }),
+    events: await db.prisma.runtimeMetadataEvent.findMany({ orderBy: { sequence: "asc" } }),
+    writes: await db.prisma.toolingStateWrite.findMany({ orderBy: { sequence: "asc" } }),
+    legacy: await db.prisma.toolingLegacyConsumer.findMany({ orderBy: { id: "asc" } }) });
+  const complete = (sequence = event.sequence) => db.prisma.$transaction(tx => completeNeonRecoveryOperation(tx, { operationId: child.operationId, eventSequence: sequence }));
+  const refused = async (code: string, sequence = event.sequence) => {
+    const before = await snapshot();
+    await expect(complete(sequence)).rejects.toMatchObject({ code });
+    expect(await snapshot()).toEqual(before);
+  };
+  await refused("evidence-required", event.sequence + 1);
+  await db.prisma.toolingOperation.update({ where: { id: parent.operationId }, data: { status: "completed" } });
+  await refused("parent-unavailable");
+  await db.prisma.toolingOperation.update({ where: { id: parent.operationId }, data: { status: "bound", generation: parent.generation + 1 } });
+  await refused("parent-unavailable");
+  await db.prisma.toolingOperation.update({ where: { id: parent.operationId }, data: { generation: parent.generation } });
+  const beforeRollback = await snapshot();
+  await expect(db.prisma.$transaction(async tx => {
+    await completeNeonRecoveryOperation(tx, { operationId: child.operationId, eventSequence: event.sequence });
+    throw new Error("injected before transaction commit");
+  })).rejects.toThrow("injected before transaction commit");
+  expect(await snapshot()).toEqual(beforeRollback);
+  await complete();
+  expect(await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: child.operationId } })).toMatchObject({ status: "completed",
+    completionEvidence: { kind: "compute-neon-recovery-committed", reference: String(event.sequence) } });
+  await db.prisma.toolingOperation.update({ where: { id: parent.operationId }, data: { status: "completed" } });
+  const completed = await snapshot();
+  await complete();
+  expect(await snapshot()).toEqual(completed);
+  await db.prisma.toolingOperation.update({ where: { id: child.operationId }, data: { completionEvidence: { kind: "other", reference: "unrelated" } } });
+  await refused("evidence-required");
+});
+
 test("actual written formats outlive completed operations and block rollback readers", async () => {
   const task = await ownedTask();
   await activate("k1", "A", 0);
@@ -475,6 +540,42 @@ test("incompatible writes are deferred only for the affected task state", async 
   const consumer = await readToolingLegacyConsumer({ prisma: db.prisma, repositoryId: REPO, consumerKind: "compute-environment", consumerId: "env-1" });
   await resolveToolingLegacyConsumer({ prisma: db.prisma, id: (consumer as { id: string }).id, evidence });
   expect((await write(onFirst.operationId, "runtime:development")).version).toBe(2);
+});
+
+test("legacy resolution and state registration share the domain transaction", async () => {
+  const task = await ownedTask();
+  legacy = [{ taskId: task.id, consumerKind: "compute-environment", consumerId: "env-1", provenance: { revision: revisions.A!, checkout: "/old", receipt: { original: true } } }];
+  await activate("k1", "migrating", 0);
+  const operation = await opFor(task, "state-transaction");
+  const original = await db.prisma.toolingLegacyConsumer.findFirstOrThrow();
+  const proof = { kind: "transaction-proof", reference: operation.operationId };
+  const write = { operationId: operation.operationId, family: "drafted.runtime", scopeKey: "runtime:development", version: 2 };
+  await expect(db.prisma.$transaction(tx => registerToolingStateWriteInTransaction(tx, write))).rejects.toMatchObject({ code: "deferred" });
+  const compose = (failAt?: number) => db.prisma.$transaction(async tx => {
+    // Stand-in domain proof; the integration must supply its validated event.
+    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: task.primarySessionId!, source: "state-transaction-test", action: "domain-proof", key: operation.operationId, value: "{}" } });
+    if (failAt === 0) throw new Error("injected transaction failure");
+    await resolveToolingLegacyConsumer({ prisma: tx, id: original.id, evidence: proof });
+    if (failAt === 1) throw new Error("injected transaction failure");
+    const registered = await registerToolingStateWriteInTransaction(tx, write);
+    if (failAt === 2) throw new Error("injected transaction failure");
+    return registered;
+  });
+  for (let step = 0; step < 3; step++) {
+    await expect(compose(step)).rejects.toThrow("injected transaction failure");
+    expect(await db.prisma.toolingLegacyConsumer.findUniqueOrThrow({ where: { id: original.id } })).toEqual(original);
+    expect(await db.prisma.toolingStateWrite.count()).toBe(0);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { source: "state-transaction-test" } })).toBe(0);
+  }
+  const registered = await compose();
+  expect(registered).toMatchObject({ version: 2, operationId: operation.operationId, releaseId: operation.release.id });
+  expect(await registerToolingStateWrite({ prisma: db.prisma, ...write })).toEqual(registered);
+  const resolved = await db.prisma.toolingLegacyConsumer.findUniqueOrThrow({ where: { id: original.id } });
+  expect(resolved).toMatchObject({ status: "resolved", resolution: proof, revision: original.revision, checkout: original.checkout, receipt: original.receipt });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { source: "state-transaction-test" } })).toBe(1);
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "bound", to: "running" });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: operation.operationId, from: "running", to: "unknown" });
+  await expect(db.prisma.$transaction(tx => registerToolingStateWriteInTransaction(tx, write))).rejects.toMatchObject({ code: "operation-closed" });
 });
 
 test("preparation locks are recovered only from provably exited owners", () => {

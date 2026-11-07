@@ -182,7 +182,8 @@ async function withRuntimeManifest(contracts: unknown) {
   return { ...f, revision, hostPin, request };
 }
 
-for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"]]) {
+for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"],
+  ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1"]]) {
   test(`deployed runtime manifest resolves supported contracts ${contracts.join(",")}`, async () => {
     const f = await withRuntimeManifest(contracts);
     const response = await f.request();
@@ -200,7 +201,7 @@ for (const contracts of [deployedManifest.capabilities.runtime.observationContra
   });
 }
 
-for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["compute-traffic/v1", "unknown/v1"],
+for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["compute-traffic/v1", "unknown/v1"], ["runtime-neon-recovery/v2"], ["runtime-neon-recovery/v1", "runtime-neon-recovery/v1"],
   ["compute-traffic/v2"], ["compute-traffic/v1", "compute-baseline/v1", "compute-baseline/v1"], "compute-traffic/v1", null]) {
   test(`deployed runtime manifest rejects invalid contracts ${JSON.stringify(contracts)}`, async () => {
     const f = await withRuntimeManifest(contracts);

@@ -1,5 +1,6 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
 import { ComputeConfiguration, configureCompute } from "../../services/tasks/compute-configuration.ts";
+import { ComputeNeonRecovery, recoverComputeNeon } from "../../services/tasks/compute-neon-recovery.ts";
 import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -8,8 +9,39 @@ import { bindComputeResource, claimCompute, ComputeCapacityBlocked, ComputeReque
 import { computeEvidenceState } from "../../services/tasks/compute-observation.ts";
 import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-attempt.ts";
 import { developmentProjection } from "../../services/tasks/development-intent.ts";
+import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "../../services/tasks/compute-neon-recovery-result.ts";
+import { readSessionToolingOperation } from "../../services/tasks/tooling-operations.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
+// The callback guard supplies the operation scope. Neither the body nor this
+// route may select a release or manufacture an admitted binding.
+computeRoutes.post("/:taskId/compute-neon-recovery", async c => {
+  const request = ComputeNeonRecovery.safeParse(await c.req.json().catch(() => null));
+  if (!request.success) return c.json({ error: "Exact allocation, operation, recipe transition, baseline, lock and reconciliation outcome are required" }, 400);
+  try {
+    return c.json(await recoverComputeNeon({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data }));
+  } catch {
+    return c.json({ error: "Neon recovery could not be verified; preserve the receipt, allocation and provider resources" }, 409);
+  }
+});
+/** Reading an already committed result grants no effect authority. In
+ * particular, pause and completed commands must not hide a lost response. */
+computeRoutes.get("/:taskId/compute-neon-recovery/:operationId", async c => {
+  const prisma = c.get("prisma"), task = await prisma.remoteTask.findUnique({ where: { id: c.req.param("taskId") } });
+  if (!task?.primarySessionId) return c.json({ error: "No such recovery operation for this task" }, 404);
+  try {
+    const owned = await readSessionToolingOperation({ prisma, sessionId: task.primarySessionId, operationId: c.req.param("operationId") });
+    if (!owned || owned.binding.taskId !== task.id || owned.binding.kind !== "compute-neon-recovery") return c.json({ error: "No such recovery operation for this task" }, 404);
+    const result = await readCommittedNeonRecovery(prisma, owned.binding);
+    // The internal verifier also runs before completion inside the writer's
+    // transaction. A public read must see the atomic commit's completed row.
+    if (result && owned.binding.status !== "completed") throw new NeonRecoveryResultUnverifiable("event-mismatch", "Committed recovery has no completed operation");
+    return c.json(result?.committed ?? null);
+  } catch (error) {
+    return c.json({ error: "The stored recovery result could not be verified", code: "neon-recovery-result-unverifiable",
+      ...(error instanceof NeonRecoveryResultUnverifiable ? { reason: error.reason } : {}) }, 409);
+  }
+});
 computeRoutes.post("/:taskId/compute-configure", async c => {
   const request = ComputeConfiguration.safeParse(await c.req.json());
   if (!request.success) return c.json({ error: "Exact pending configuration and previous allocation are required" }, 400);
