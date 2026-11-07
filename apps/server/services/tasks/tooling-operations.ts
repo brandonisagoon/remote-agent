@@ -1586,6 +1586,54 @@ async function claimNeverGranted(prisma: PrismaClient, offerId: string | null) {
   const row = offerId ? await prisma.computeOffer.findUnique({ where: { id: offerId } }) : null;
   return Boolean(row && row.claimedAt === null && ["expired", "declined", "ineligible"].includes(row.state));
 }
+
+/** A refused adopting claim can outlive its validation reservation. Reconcile
+ * only that exact terminal, never-granted claim: its pending reader and intent
+ * otherwise strand the original acknowledged admission and its observer.
+ * No physical credit or producer is created, and the command parent stays open.
+ * Scanning pending readers also recovers withdrawals made by an earlier boot. */
+export async function reconcileWithdrawnComputeClaims(prisma: PrismaClient, machineId: string) {
+  const pending = await prisma.toolingRetainedConsumer.findMany({ where: { consumerKind: "compute-environment", status: "pending" }, take: 1001 });
+  if (pending.length > 1000) throw new Error("Pending compute claim readers exceed their reconciliation bound");
+  for (const candidate of pending) {
+    await prisma.$transaction(async tx => {
+      const reader = await tx.toolingRetainedConsumer.findUnique({ where: { id: candidate.id } });
+      if (!reader || reader.status !== "pending" || reader.confirmedAt || reader.evidence !== null) return;
+      const operation = await tx.toolingOperation.findUnique({ where: { id: reader.operationId } });
+      if (!operation || operation.kind !== "compute-admission" || !operation.existingOperationId || !["running", "unknown"].includes(operation.status)) return;
+      const offer = await tx.computeOffer.findUnique({ where: { id: operation.existingOperationId } });
+      if (!offer || offer.machineId !== machineId || offer.environmentId !== reader.consumerId || offer.claimedAt !== null
+        || !offer.completedAt || !["expired", "declined", "ineligible"].includes(offer.state)) return;
+      if (await tx.computeSlot.count({ where: { allocationId: offer.id } })) return;
+      const environment = await tx.computeEnvironment.findUnique({ where: { id: offer.environmentId } });
+      const task = await tx.remoteTask.findUnique({ where: { id: operation.taskId } });
+      if (!environment || !task || task.machineId !== machineId || environment.machineId !== machineId
+        || environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId || operation.sessionId !== task.primarySessionId
+        || reader.taskId !== task.id || reader.repositoryId !== task.repositoryId || operation.repositoryId !== task.repositoryId
+        || reader.releaseId !== operation.releaseId || reader.generation !== operation.generation || reader.protocol !== operation.protocol) return;
+      const records = await attemptRecords(tx, operation, operation.id);
+      if (!records.length || records.some(record => !record.value || record.value.operationId !== operation.id
+        || record.value.inputDigest !== operation.inputDigest || record.value.route !== "POST /api/tasks/:taskId/compute-claim"
+        || !["intent", "refused", "unknown"].includes(record.value.state))) return;
+      if (!records.some(record => record.value?.state === "intent")) return;
+      const admission = (await admissionHistory(tx, task, environment.key)).find(value => value.operationId === operation.id);
+      if (admission?.state !== "intent") return;
+      // Any other effect, including a failed producer attempt, belongs to its
+      // own reconciliation. A terminal offer alone does not erase it.
+      if (await tx.toolingStateWrite.count({ where: { operationId: operation.id } })
+        || await tx.toolingOperation.count({ where: { parentOperationId: operation.id } })
+        || await tx.toolingRetainedConsumer.count({ where: { operationId: operation.id, id: { not: reader.id } } })
+        || await tx.runtimeMetadataEvent.count({ where: { runtimeSessionId: operation.sessionId, source: `tooling-operation:${task.id}`, action: ASSOCIATION,
+          key: { startsWith: "producer:" }, value: { contains: operation.id } } })) return;
+      const evidence = { kind: "compute-claim-not-granted", reference: offer.id };
+      const binding = { ...operation, operationId: operation.id };
+      await recordAssociation(tx, binding, "admission", `environment-key:${environment.key}`, "failed", `${evidence.kind}:${offer.id}`);
+      await recordAssociation(tx, binding, "completion", operation.id, "confirmed", `${evidence.kind}:${offer.id}`);
+      await tx.toolingRetainedConsumer.update({ where: { id: reader.id }, data: { status: "resolved", resolution: { kind: "claim-not-granted", reference: offer.id }, resolvedAt: new Date() } });
+      await tx.toolingOperation.update({ where: { id: operation.id }, data: { status: "completed", completionEvidence: evidence } });
+    });
+  }
+}
 /** Exact pre-effect domain proof: the claimed offer is durably withdrawn and
  * was never claimed, so no start authority existed. Anything else (claimed,
  * validating, uncertain) keeps the reader pending. */

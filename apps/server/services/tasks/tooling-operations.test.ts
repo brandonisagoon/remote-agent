@@ -143,7 +143,7 @@ test("every adapter callback is classified: effects are bound, owner controls an
 
 /** Real routes and guard across activation; physical observation and turn
  * delivery are explicit fixtures, not physical adapter acceptance. */
-test.each(["same-command", "later-command", "unknown-before-claim"])("active-release saved admission %s confirms a producer only after guarded bind", async mode => {
+test.each(["same-command", "later-command", "unknown-before-claim", "expired-adoption", "expired-adoption-claimed", "expired-adoption-unknown-route", "expired-adoption-confirmed-reader", "expired-adoption-producer"])("active-release saved admission %s confirms a producer only after guarded bind", async mode => {
   const { config } = await fixture();
   const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
   const { savedComputeDigest } = await import("./compute-saved-resource.ts");
@@ -170,7 +170,7 @@ test.each(["same-command", "later-command", "unknown-before-claim"])("active-rel
   expect((await call("compute-request", request, operation.operationId)).status).toBe(202);
   const env = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { taskId_key: { taskId: "task", key: resource.key } } });
   if (mode === "unknown-before-claim") await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { state: "unknown" } });
-  if (mode === "later-command") expect((await settle()).status).toBe(200);
+  if ((mode === "later-command" || mode.startsWith("expired-adoption"))) expect((await settle()).status).toBe(200);
   await activate("release-b", 2);
   const taskRow = await task(), code = () => environmentCode(db.prisma, taskRow, env);
   expect(currentToolingOperation()).toBeUndefined();
@@ -203,10 +203,71 @@ test.each(["same-command", "later-command", "unknown-before-claim"])("active-rel
   await db.prisma.runtimeInstruction.update({ where: { id: assignment.instructionId }, data: { state: "dispatching", executionRequestId: assignment.instructionId } });
   await db.prisma.runtimeLifecycleEvent.create({ data: { id: "saved-delivery", runtimeSessionId: "primary", requestId: assignment.instructionId, phase: "started", occurredAt: new Date() } });
   await confirmComputeDelivery({ ...context, sessionId: "primary", requestId: assignment.instructionId });
-  if (mode === "later-command") {
+  if ((mode === "later-command" || mode.startsWith("expired-adoption"))) {
     command = (await begin(config, { requestKey: "saved-command-b", kind: "adapter-command", inputDigest: canonicalDigest({ action: "resume", key: request.key, offer: assignment.id }) })).binding;
     operation = (await begin(config, { requestKey: "saved-claim-b", kind: "compute-admission", parentOperationId: command.operationId,
       existingOperationId: assignment.id, inputDigest: canonicalDigest(request) })).binding;
+  }
+  if (mode.startsWith("expired-adoption")) {
+    config.compute.slots = 0; // The real guarded claim retains validation when capacity disappears.
+    const refused = await call("compute-claim", { ...request, offerId: assignment.id }, operation.operationId);
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ code: "compute_capacity_blocked" });
+    await expect(code()).rejects.toThrow(/unclaimed admission/);
+    expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(1);
+    const failed = await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: assignment.id } });
+    expect(failed.state).toBe("validating");
+    expect(failed.claimedAt).toBeNull();
+    const { reconcileWithdrawnComputeClaims } = await import("./tooling-operations.ts");
+    await reconcileWithdrawnComputeClaims(db.prisma, "host");
+    expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(1); // validating is never no-effect proof
+    const claimCommand = command, claimOperation = operation;
+    const originalAttempts = await db.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${operation.operationId}` }, orderBy: { sequence: "asc" } });
+    if (mode === "expired-adoption-claimed") await db.prisma.computeOffer.update({ where: { id: assignment.id }, data: { claimedAt: new Date() } });
+    if (mode === "expired-adoption-unknown-route") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `outcome:${operation.operationId}`,
+      value: JSON.stringify({ operationId: operation.operationId, inputDigest: operation.inputDigest, state: "unknown", attemptId: "other", route: "POST /api/tasks/:taskId/compute-bind" }) } });
+    if (mode === "expired-adoption-confirmed-reader") await db.prisma.toolingRetainedConsumer.updateMany({ where: { operationId: operation.operationId }, data: { status: "confirmed", confirmedAt: new Date(), evidence: { kind: "compute-bind", reference: assignment.id } } });
+    if (mode === "expired-adoption-producer") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `producer:compute-environment:${env.id}`,
+      value: JSON.stringify({ version: 1, role: "producer", state: "intent", operationId: operation.operationId }) } });
+    const { reconcileComputeOffers } = await import("./compute-admission.ts");
+    await reconcileComputeOffers({ ...context, now: new Date(failed.validationExpiresAt!.getTime() + 1) });
+    expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: assignment.id } })).state).toBe("expired");
+    if (mode !== "expired-adoption") {
+      expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.operationId } })).status).toBe("running");
+      expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "resolved" } })).toBe(0);
+      await expect(code()).rejects.toThrow();
+      return;
+    }
+    expect((await code()).code?.revision).toBe(A);
+    expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(0);
+    expect(await producerOperationId(db.prisma, taskRow, env.id)).toBeNull();
+    expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.operationId } })).completionEvidence).toEqual({ kind: "compute-claim-not-granted", reference: assignment.id });
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${operation.operationId}` }, orderBy: { sequence: "asc" } })).toEqual(originalAttempts);
+    const count = await db.prisma.runtimeMetadataEvent.count();
+    await reconcileWithdrawnComputeClaims(db.prisma, "host");
+    expect(await db.prisma.runtimeMetadataEvent.count()).toBe(count); // repeat/restart is idempotent
+    expect((await settle()).status).toBe(200); // parent records completion only through its normal endpoint
+    expect((await call("compute-claim", { ...request, offerId: assignment.id }, operation.operationId)).status).toBe(409);
+    config.compute.slots = 1;
+    await db.prisma.runtimeInstruction.update({ where: { id: assignment.instructionId }, data: { state: "completed" } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: "saved-failed-turn-ended", runtimeSessionId: "primary", requestId: assignment.instructionId, phase: "completed", occurredAt: new Date() } });
+    // The earlier simulated expiry was in the future; restore only fixture time.
+    await db.prisma.computeWait.update({ where: { environmentId: env.id }, data: { eligibleAt: new Date(0) } });
+    await scheduleComputeOffers(context);
+    const next = await db.prisma.computeOffer.findFirstOrThrow({ where: { state: "queued" } });
+    await db.prisma.runtimeInstruction.update({ where: { id: next.instructionId }, data: { state: "dispatching", executionRequestId: next.instructionId } });
+    await db.prisma.runtimeLifecycleEvent.create({ data: { id: "saved-next-delivery", runtimeSessionId: "primary", requestId: next.instructionId, phase: "started", occurredAt: new Date() } });
+    await confirmComputeDelivery({ ...context, sessionId: "primary", requestId: next.instructionId });
+    command = (await begin(config, { requestKey: "saved-command-retry", kind: "adapter-command", inputDigest: canonicalDigest({ offer: next.id }) })).binding;
+    operation = (await begin(config, { requestKey: "saved-claim-retry", kind: "compute-admission", parentOperationId: command.operationId, existingOperationId: next.id, inputDigest: canonicalDigest(request) })).binding;
+    expect((await call("compute-claim", { ...request, offerId: next.id }, operation.operationId)).status).toBe(200);
+    expect((await call("compute-bind", { offerId: next.id, resourceKey: resource.key }, operation.operationId)).status).toBe(200);
+    expect((await code()).code?.revision).toBe(B);
+    expect((await settle()).status).toBe(200);
+    expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: claimCommand.operationId } })).status).toBe("completed");
+    expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: claimOperation.operationId } })).completionEvidence).toEqual({ kind: "compute-claim-not-granted", reference: assignment.id });
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
+    return;
   }
   const claim = await call("compute-claim", { ...request, offerId: assignment.id }, operation.operationId);
   expect(await claim.clone().json()).not.toHaveProperty("error");
