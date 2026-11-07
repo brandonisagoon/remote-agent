@@ -7,6 +7,7 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
+import { computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
 
 export const countedComputeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const Purpose = z.enum(["development", "review"]);
@@ -50,9 +51,7 @@ async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
   const instructions = await store.runtimeInstruction.findMany({ where: { sessionId: { in: sessionIds }, state: { in: ["queued", "preparing", "dispatching", "unknown"] } }, orderBy: { id: "asc" }, take: 1001 });
   const lifecycle = await Promise.all(sessions.map(session => store.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: session.id }, orderBy: { sequence: "desc" } })));
   if (relations.length > 4000 || links.length > 4000 || instructions.length > 1000) throw new Error("Compute baseline family exceeds its bound");
-  const settled = !!runtime.observeSessionActivity && instructions.length === 0 && sessions.every(session => ["idle", "closed"].includes(session.status)
-    && !["executing", "queued"].includes(runtime.observeSessionActivity!(session.id).state)
-    && (session.closedAt || lifecycle.find(event => event?.runtimeSessionId === session.id)?.phase !== "started"));
+  const settled = !!runtime.observeSessionActivity && computeFamilySettled(task, sessions, instructions, lifecycle, runtime);
   const environments = await store.computeEnvironment.findMany({ where: { machineId: row.machineId, taskId: task.id, purpose }, orderBy: { id: "asc" }, take: 1001 });
   const offers = await store.computeOffer.findMany({ where: { environmentId: { in: environments.map(environment => environment.id) }, state: { in: ["queued", "offered", "validating", "claimed", "running", "unknown"] } }, orderBy: { id: "asc" }, take: 1001 });
   const slots = await store.computeSlot.findMany({ where: { allocationId: { in: offers.map(offer => offer.id) } }, orderBy: { id: "asc" }, take: 1001 });
@@ -61,6 +60,7 @@ async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
   const claims = await store.remoteTaskResource.findMany({ where: { task: { machineId: row.machineId }, kind: { in: countedComputeKinds } }, orderBy: { id: "asc" }, take: 10001 });
   if (environments.length > 1000 || offers.length > 1000 || slots.length > 1000 || claims.length > 10000) throw new Error("Compute baseline ownership exceeds its bound");
   const digest = finalizationDigest({ task, primary, resources, sessions, relations, links, instructions, lifecycle, environments, offers, slots,
+    familyGeneration: computeFamilyGeneration(task, sessions, instructions),
     claims: claims.map(resource => ({ taskId: resource.taskId, ...finalizationResourceIdentity(resource) })) });
   return { task, primary, resources, identities, resourceSetDigest: finalizationDigest(identities), digest,
     settled: settled && !offers.some(offer => ["claimed", "running", "unknown"].includes(offer.state)) };

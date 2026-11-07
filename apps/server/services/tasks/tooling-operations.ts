@@ -282,6 +282,8 @@ export const TOOLING_CALLBACK_CLASSIFICATION = [
     reason: "Records resource receipts only; cleanup/development transitions keep their executing-turn and intent checks. Ordinary evidence registration is never blocked." },
   { route: "POST /api/tasks/:taskId/automation", rule: "owner-control" as const, kind: "none",
     reason: "Pause/close/stop cancel work, resume clears a flag, development requests only record intent; the handler runs no adapter or provider start. Recorded intents execute through bound development callbacks." },
+  { route: "POST /api/tasks/:taskId/compute-accounting-input", rule: "owner-control" as const, kind: "none",
+    reason: "Explicit owner bearer registers an exact retained configuration locator only; no executable, observation, allocation, resource generation or tooling selection is created." },
   { route: "POST /api/sessions/:sessionId/tooling-capability", rule: "resolution" as const, kind: "none",
     reason: "Returns instructions and an immutable adapter path and never executes it. Uses the guarded binding, else the active generation at this independent boundary; bound resolution never installs." },
   { route: "POST /api/sessions/:sessionId/tooling-operations", rule: "identity" as const, kind: "none", reason: "Persists identity before effects; grants no authority." },

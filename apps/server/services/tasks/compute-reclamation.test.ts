@@ -10,9 +10,13 @@ import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { ComputeObservation } from "./compute-observation.ts";
 import { tickCompute } from "./compute-worker.ts";
 import { readInstalledComputeReclamation } from "./compute-observer.ts";
-import { mkdir, mkdtemp, readFile, rename, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rename, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { retainComputeAccountingInput } from "./compute-accounting-input.ts";
+import { readDevelopmentJson } from "./development-selection.ts";
+import { createApp } from "../../app.ts";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -33,6 +37,111 @@ async function fixture(closed = false) {
     resourceId: raw.resource.id, resourceIdentity: raw.resource.identityDigest, allocationResourceIdentity: raw.allocationResourceIdentity, configurationDigest: raw.configurationDigest, observedAt: Date.now(), state: closed ? "absent" : "stopped", proofDigest: "f".repeat(64) });
   return { ...context, context, task, session, environment, resource, offer, read, configuration };
 }
+async function retainedFixture() {
+  const f = await fixture(true);
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "retained-compute-")));
+  cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const file = path.join(root, "compute.json");
+  const bytes = JSON.stringify({ taskId: f.task.id, primarySessionId: f.session.id, environmentId: f.environment.id,
+    resourceKey: f.resource.key, purpose: f.environment.purpose, revision: f.environment.revision, recipeDigest: f.environment.recipeDigest });
+  await writeFile(file, bytes, { mode: 0o600 });
+  const configuration = { ...f.configuration, configurationSha256: createHash("sha256").update(bytes).digest("hex") };
+  const resource = await f.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { metadata: { ...(f.resource.metadata as object), compute: configuration } } });
+  const identity = finalizationResourceIdentity(resource).identityDigest;
+  const environment = await f.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { configuration, resourceIdentity: identity } });
+  const request = { environmentId: environment.id, resourceIdentity: identity, allocationResourceIdentity: identity,
+    configurationSha256: configuration.configurationSha256, retainedConfigurationFile: file };
+  const input = { ...f.context, taskId: f.task.id, request };
+  const rows = async () => ({ task: await f.prisma.remoteTask.findUnique({ where: { id: f.task.id } }),
+    resource: await f.prisma.remoteTaskResource.findUnique({ where: { id: resource.id } }),
+    environment: await f.prisma.computeEnvironment.findUnique({ where: { id: environment.id } }),
+    offers: await f.prisma.computeOffer.findMany(), slots: await f.prisma.computeSlot.findMany(),
+    instructions: await f.prisma.runtimeInstruction.findMany() });
+  return { ...f, resource, environment, request, input, file, root, rows };
+}
+test("retained input registration preserves original rows; only a later physical collector can reclaim", async () => {
+  const f = await retainedFixture(), before = await f.rows();
+  await retainComputeAccountingInput(f.input);
+  await retainComputeAccountingInput(f.input);
+  expect(await f.rows()).toEqual(before);
+  expect(await f.prisma.runtimeMetadataEvent.count()).toBe(1);
+  const read: typeof f.read = async (...args) => {
+    const raw = args[2] as any;
+    expect(raw.resource.metadata.compute.configurationFile).toBe(f.file);
+    expect(raw.resource.identityDigest).toBe(f.request.resourceIdentity);
+    expect(raw.configurationDigest).toBe(f.request.configurationSha256);
+    return f.read(...args);
+  };
+  // A failed inventory still retains the exact charge, despite a valid locator.
+  await expect(reclaimStoppedCompute(f.context, async () => { throw new Error("inventory unknown"); })).rejects.toThrow("inventory unknown");
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+  expect(await reclaimStoppedCompute(f.context, read)).toEqual({ released: true });
+  expect(await f.prisma.remoteTaskResource.findUnique({ where: { id: f.resource.id } })).toEqual(before.resource);
+  expect(await f.prisma.remoteTask.findUnique({ where: { id: f.task.id } })).toEqual(before.task);
+  expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).configuration).toEqual(before.environment!.configuration);
+});
+test.each(["hash", "identity", "allocation", "task", "active", "unfenced", "public", "symlink", "changed-during-read"])("retained input %s refuses with no registration", async fault => {
+  const f = await retainedFixture();
+  if (fault === "hash") await writeFile(f.file, "{}");
+  if (fault === "identity") f.request.resourceIdentity = "9".repeat(64);
+  if (fault === "allocation") f.request.allocationResourceIdentity = "9".repeat(64);
+  if (fault === "task") f.input.taskId = "other";
+  if (fault === "active") f.context.runtime.observeSessionActivity = f.input.runtime.observeSessionActivity = () => ({ state: "executing" } as never);
+  if (fault === "unfenced") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
+  if (fault === "public") await chmod(f.file, 0o644);
+  if (fault === "symlink") { const link = path.join(f.root, "link.json"); await symlink(f.file, link); f.request.retainedConfigurationFile = link; }
+  const before = await f.rows();
+  const read: typeof readDevelopmentJson = async (...args) => {
+    const value = await readDevelopmentJson(...args);
+    if (fault === "changed-during-read") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { updatedAt: new Date(Date.now() + 1000) } });
+    return value;
+  };
+  await expect(retainComputeAccountingInput(f.input, read)).rejects.toThrow();
+  expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
+  if (fault !== "changed-during-read") expect(await f.rows()).toEqual(before);
+});
+test.each(["new-locator", "duplicate", "malformed", "foreign-session", "new-pin"])("retained input %s cannot replace or reinterpret the immutable binding", async fault => {
+  const f = await retainedFixture();
+  await retainComputeAccountingInput(f.input);
+  const row = (await f.prisma.runtimeMetadataEvent.findFirst())!;
+  if (fault === "new-locator") {
+    const file = path.join(f.root, "other.json"); await writeFile(file, await readFile(f.file), { mode: 0o600 });
+    f.request.retainedConfigurationFile = file;
+    await expect(retainComputeAccountingInput(f.input)).rejects.toThrow("already bound");
+  } else {
+    if (fault === "duplicate") { const { sequence: _, ...data } = row; await f.prisma.runtimeMetadataEvent.create({ data }); }
+    if (fault === "malformed") await f.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { value: "{}" } });
+    if (fault === "foreign-session") {
+      const other = await f.prisma.runtimeSession.create({ data: { scopeKey: "foreign", agentCommand: "codex", repositoryId: "repo", cwd: "/foreign", role: "delegate", status: "closed" } });
+      await f.prisma.runtimeMetadataEvent.update({ where: { sequence: row.sequence }, data: { runtimeSessionId: other.id } });
+    }
+    if (fault === "new-pin") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { toolingRevision: "9".repeat(40) } });
+    let ran = false;
+    await expect(reclaimStoppedCompute(f.context, async (...args) => { ran = true; return f.read(...args); })).rejects.toThrow();
+    expect(ran).toBeFalse();
+  }
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+});
+test("retained input route requires owner bearer even on local socket; rejects adapter headers and grants no credit", async () => {
+  const f = await retainedFixture();
+  const app = createApp({ config: f.config, prisma: f.prisma, agentRuntime: f.context.runtime, trustLocal: true });
+  const post = (headers: Record<string, string>) => app.request(`/api/tasks/${f.task.id}/compute-accounting-input`, {
+    method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(f.request) });
+  expect((await post({})).status).toBe(401);
+  expect((await post({ authorization: `Bearer ${f.config.apiKey}`, "x-remote-agent-operation": "fake" })).status).toBe(400);
+  const before = await f.rows();
+  expect((await post({ authorization: `Bearer ${f.config.apiKey}` })).status).toBe(200);
+  expect(await f.rows()).toEqual(before);
+});
+test("a retained locator registered during physical observation invalidates that observation", async () => {
+  const f = await retainedFixture();
+  await expect(reclaimStoppedCompute(f.context, async (...args) => {
+    await retainComputeAccountingInput(f.input);
+    return f.read(...args);
+  })).rejects.toThrow("changed during observation");
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+  expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).observation).toBeNull();
+});
 test.each([false, true])("paused/closed=%s exact stopped capacity releases without start authority or owner mutation", async closed => {
   const f = await fixture(closed);
   const beforeTask = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
@@ -156,4 +265,34 @@ test("a closed task reads only an existing clean configured adapter, never insta
   await rm(checkout, { recursive: true });
   await expect(readInstalledComputeReclamation({ config }, f.task, {})).rejects.toThrow();
   expect(await Bun.file(path.join(checkout, "observer.ts")).exists()).toBeFalse();
+});
+
+test.each([false, true])("paused/closed=%s reclamation preserves never-dispatched queued history", async closed => {
+  const f = await fixture(closed);
+  f.context.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  const queued = await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: f.session.id, text: "Keep history", state: "queued" } });
+  const task = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  expect(await reclaimStoppedCompute(f.context, f.read)).toEqual({ released: true });
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: queued.id } })).toEqual(queued);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toEqual(task);
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBeNull();
+});
+
+test.each(["unknown", "dispatching", "preparing", "previous-attempt", "missing-runtime", "active", "runtime-queued", "generation-change", "resume"])("queued reclamation with %s keeps the allocation", async kind => {
+  const f = await fixture();
+  f.context.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: f.session.id, text: "Keep history", state: ["unknown", "dispatching", "preparing"].includes(kind) ? kind : "queued", executionRequestId: kind === "previous-attempt" ? "attempt" : null } });
+  if (kind === "missing-runtime") f.context.runtime.observeSessionActivity = undefined;
+  if (kind === "active" || kind === "runtime-queued") f.context.runtime.observeSessionActivity = () => ({ state: kind === "active" ? "executing" : "queued", observedAt: Date.now() });
+  let reads = 0;
+  const run = reclaimStoppedCompute(f.context, async (...args) => {
+    reads++; const result = await f.read(...args);
+    if (kind === "resume") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    if (kind === "generation-change") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { updatedAt: new Date(f.task.updatedAt.getTime() + 1) } });
+    return result;
+  });
+  if (["generation-change", "resume"].includes(kind)) await expect(run).rejects.toThrow("changed during observation");
+  else { expect(await run).toEqual({ released: false }); expect(reads).toBe(0); }
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "preserved" } })).state).toBe(["unknown", "dispatching", "preparing"].includes(kind) ? kind : "queued");
 });
