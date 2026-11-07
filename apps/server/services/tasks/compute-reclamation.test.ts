@@ -157,3 +157,33 @@ test("a closed task reads only an existing clean configured adapter, never insta
   await expect(readInstalledComputeReclamation({ config }, f.task, {})).rejects.toThrow();
   expect(await Bun.file(path.join(checkout, "observer.ts")).exists()).toBeFalse();
 });
+
+test.each([false, true])("paused/closed=%s reclamation preserves never-dispatched queued history", async closed => {
+  const f = await fixture(closed);
+  f.context.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  const queued = await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: f.session.id, text: "Keep history", state: "queued" } });
+  const task = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  expect(await reclaimStoppedCompute(f.context, f.read)).toEqual({ released: true });
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: queued.id } })).toEqual(queued);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } })).toEqual(task);
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBeNull();
+});
+
+test.each(["unknown", "dispatching", "preparing", "previous-attempt", "missing-runtime", "active", "runtime-queued", "generation-change", "resume"])("queued reclamation with %s keeps the allocation", async kind => {
+  const f = await fixture();
+  f.context.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: f.session.id, text: "Keep history", state: ["unknown", "dispatching", "preparing"].includes(kind) ? kind : "queued", executionRequestId: kind === "previous-attempt" ? "attempt" : null } });
+  if (kind === "missing-runtime") f.context.runtime.observeSessionActivity = undefined;
+  if (kind === "active" || kind === "runtime-queued") f.context.runtime.observeSessionActivity = () => ({ state: kind === "active" ? "executing" : "queued", observedAt: Date.now() });
+  let reads = 0;
+  const run = reclaimStoppedCompute(f.context, async (...args) => {
+    reads++; const result = await f.read(...args);
+    if (kind === "resume") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+    if (kind === "generation-change") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { updatedAt: new Date(f.task.updatedAt.getTime() + 1) } });
+    return result;
+  });
+  if (["generation-change", "resume"].includes(kind)) await expect(run).rejects.toThrow("changed during observation");
+  else { expect(await run).toEqual({ released: false }); expect(reads).toBe(0); }
+  expect((await f.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+  expect((await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "preserved" } })).state).toBe(["unknown", "dispatching", "preparing"].includes(kind) ? kind : "queued");
+});

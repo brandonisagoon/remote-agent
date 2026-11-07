@@ -379,3 +379,47 @@ test("a refresh diagnostic is the current cause only for the group's current mem
   expect((await blocker())?.baseline).toMatchObject({ reason: "refresh-failed", refresh: { code: "OBSERVER_TIMEOUT" } });
   expect((await blocker())?.baseline?.previousRefresh).toBeUndefined();
 });
+
+test.each(["paused", "closed"])("%s inbox fence permits physical baseline proof without consuming queued history", async fence => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: "old" }, data: { ownerPaused: fence === "paused", phase: fence === "closed" ? "closed" : "working" } });
+  await f.prisma.runtimeSession.update({ where: { id: "old" }, data: { status: "idle", closedAt: null } });
+  const queued = await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: "old", text: "Owner history", state: "queued" } });
+  const task = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: "old" } });
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual({ observed: 1, unavailable: 0 });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 0 });
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: queued.id } })).toEqual(queued);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: "old" } })).toEqual(task);
+  await f.prisma.remoteTask.update({ where: { id: "old" }, data: { ownerPaused: false, phase: "working" } });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1 });
+});
+
+test.each(["unfenced", "moved", "preparing", "dispatching", "unknown", "previous-attempt", "executing", "runtime-queued", "missing-runtime", "started"])("queued history with %s remains a baseline blocker", async kind => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: "old" }, data: { ownerPaused: true, phase: "working" } });
+  await f.prisma.runtimeSession.update({ where: { id: "old" }, data: { status: "idle", closedAt: null } });
+  if (kind === "unfenced") await f.prisma.remoteTask.update({ where: { id: "old" }, data: { ownerPaused: false } });
+  if (kind === "moved") {
+    await f.prisma.runtimeSession.create({ data: { id: "child", scopeKey: "child", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "delegate", cwd: "/moved", status: "idle" } });
+    await f.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "child", targetSessionId: "old", relationship: "spawned-by" } });
+  }
+  await f.prisma.runtimeInstruction.create({ data: { id: "preserved", sessionId: kind === "moved" ? "child" : "old", text: "Owner history",
+    state: ["preparing", "dispatching", "unknown"].includes(kind) ? kind : "queued", executionRequestId: kind === "previous-attempt" ? "old-attempt" : null } });
+  if (kind === "executing" || kind === "runtime-queued") f.runtime.observeSessionActivity = () => ({ state: kind === "executing" ? "executing" : "queued", observedAt: f.now.getTime() });
+  if (kind === "missing-runtime") f.runtime.observeSessionActivity = undefined;
+  if (kind === "started") await f.prisma.runtimeLifecycleEvent.create({ data: { id: "start", runtimeSessionId: "old", requestId: "other", phase: "started", occurredAt: f.now } });
+  let reads = 0;
+  expect(await refreshComputeBaselines(f.context, async (...args) => { reads++; return f.read(...args); })).toEqual({ observed: 0, unavailable: 1 });
+  expect(reads).toBe(0);
+});
+
+test("pause generation change during a baseline read refuses even when paused again", async () => {
+  const f = await fixture();
+  const original = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: "old" } });
+  expect(await refreshComputeBaselines(f.context, async (...args) => {
+    const result = await f.read(...args);
+    await f.prisma.remoteTask.update({ where: { id: "old" }, data: { updatedAt: new Date(original.updatedAt.getTime() + 1) } });
+    return result;
+  })).toEqual({ observed: 0, unavailable: 1 });
+  expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1 });
+});

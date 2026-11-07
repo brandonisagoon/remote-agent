@@ -9,6 +9,7 @@ import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 import { readInstalledComputeReclamation } from "./compute-observer.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
+import { computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
 
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; config: ServerConfig; environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity">; now?: Date };
@@ -42,9 +43,7 @@ async function snapshot(store: Store, input: Context) {
   if (relations.length > 4000) throw new Error("Compute reclamation relation inventory exceeds its bound");
   const instructions = await store.runtimeInstruction.findMany({ where: { sessionId: { in: sessions.map(value => value.id) }, state: { in: ["queued", "preparing", "dispatching", "unknown"] } }, take: 1001, orderBy: { id: "asc" } });
   const lifecycle = (await Promise.all(sessions.map(value => store.runtimeLifecycleEvent.findFirst({ where: { runtimeSessionId: value.id }, orderBy: { sequence: "desc" } })))).filter(value => value !== null);
-  const settled = instructions.length === 0 && sessions.every(value => (["idle", "closed"].includes(value.status))
-    && !["executing", "queued"].includes(input.runtime.observeSessionActivity?.(value.id)?.state ?? "")
-    && (value.closedAt || lifecycle.find(event => event.runtimeSessionId === value.id)?.phase !== "started"));
+  const settled = computeFamilySettled(task, sessions, instructions, lifecycle, input.runtime);
   const identity = finalizationResourceIdentity(resource);
   let configurationDigest: string;
   if (isSavedComputeEnvironment(environment)) {
@@ -59,7 +58,8 @@ async function snapshot(store: Store, input: Context) {
     if (configuration.configurationSha256 !== pinned) throw new Error("Reclamation has no original physical configuration binding");
     configurationDigest = configuration.configurationSha256;
   }
-  const tuple = { environment, task, primary, links, resource, offers, slots, sessions, relations, instructions, lifecycle };
+  const tuple = { environment, task, primary, links, resource, offers, slots, sessions, relations, instructions, lifecycle,
+    familyGeneration: computeFamilyGeneration(task, sessions, instructions) };
   return { ...tuple, settled, identity, configurationDigest, digest: finalizationDigest(tuple) };
 }
 
