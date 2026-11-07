@@ -124,6 +124,13 @@ or discard its history.
 An existing group's suspension, reclaim and baseline observation use that
 producer too. An admission request or queued offer never advances the producer;
 only a confirmed start, resume or configuration transition may do so.
+Before a saved resource's first claim, independent collection may use the
+latest confirmed admission's exact request binding. Its resource identity,
+recipe, task ownership and acknowledged callback history must still match;
+an uncertain admission or any prior claim refuses this path. This selects
+read-only observer code, never stopped proof or start authority. A successful
+saved resume confirms its producer through the guarded `compute-bind` callback;
+until then its claimed allocation and pending reader remain conservative.
 
 Before first activation publishes generation 1, atomically persist a stable
 bootstrap boundary and legacy bindings for existing environments/resources,

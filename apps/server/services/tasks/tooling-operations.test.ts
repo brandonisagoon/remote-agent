@@ -78,6 +78,50 @@ function app(config: Config, respond: (pathname: string) => { status?: number; b
 }
 const begin = (config: Config, request: Record<string, unknown>, sessionId = "primary") => beginSessionToolingOperation({ prisma: db.prisma, config, sessionId, request });
 
+test("a declined standalone admission can re-admit its exact request under a new operation", async () => {
+  const { config } = await fixture();
+  const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
+  config.compute = ComputePolicy.parse({ enabled: true, slots: 1 });
+  await bootstrap([]);
+  const runtime = createFakeAgentRuntime([{ id: "primary", status: "idle", role: "primary", cwd: "/fixture/primary", repositoryId: "repo", machineId: "host" }]);
+  const server = createApp({ config, prisma: db.prisma, agentRuntime: runtime, trustLocal: true });
+  const call = (suffix: string, body: unknown, operationId: string) => server.request(`/api/tasks/task/${suffix}`, {
+    method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: operationId }, body: JSON.stringify(body),
+  });
+  const { scheduleComputeOffers } = await import("./compute-admission.ts");
+  const context = { prisma: db.prisma, config, machineId: config.machine, policy: config.compute, runtime };
+  const first = (await begin(config, { requestKey: "first-command", kind: "compute-admission", inputDigest: canonicalDigest(computeBody) })).binding;
+  expect((await call("compute-request", computeBody, first.operationId)).status).toBe(202);
+  await scheduleComputeOffers(context);
+  const original = await db.prisma.computeOffer.findFirstOrThrow();
+  expect((await call("compute-decline", { offerId: original.id }, first.operationId)).status).toBe(200);
+  const completed = await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: first.operationId } });
+  expect(completed.status).toBe("completed");
+  const originalAfter = await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: original.id } });
+  expect(originalAfter.state).toBe("declined");
+  await scheduleComputeOffers(context);
+  const next = await db.prisma.computeOffer.findFirstOrThrow({ where: { environmentId: original.environmentId, state: "queued" } });
+  const environmentBefore = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: original.environmentId } });
+  expect(next.id).not.toBe(original.id);
+  const closed = await call("compute-decline", { offerId: next.id }, first.operationId);
+  expect(closed.status).toBe(409);
+  expect(await closed.json()).toMatchObject({ code: "operation-closed" });
+  await expect(begin(config, { requestKey: "decline-existing-offer", kind: "compute-admission", existingOperationId: next.id,
+    inputDigest: canonicalDigest({ existingOperationId: next.id }) })).rejects.toThrow(/belongs to operation/);
+
+  // A fresh request, not adoption or replay of the completed operation, is
+  // the supported same-release boundary. The exact recipe stays unchanged.
+  const second = (await begin(config, { requestKey: "next-command", kind: "compute-admission", inputDigest: canonicalDigest(computeBody) })).binding;
+  expect(second.operationId).not.toBe(first.operationId);
+  expect((await call("compute-request", computeBody, second.operationId)).status).toBe(202);
+  expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: original.environmentId } })).toEqual(environmentBefore);
+  expect((await call("compute-decline", { offerId: next.id }, second.operationId)).status).toBe(200);
+  expect(await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: first.operationId } })).toEqual(completed);
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: original.id } })).toEqual(originalAfter);
+  expect(await db.prisma.computeOffer.count({ where: { claimedAt: { not: null } } })).toBe(0);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: next.id } })).toBe(0);
+}, 30_000);
+
 test("every adapter callback is classified: effects are bound, owner controls and evidence are justified", () => {
   // The paired Drafted control client (src/control.ts taskRegistry) surface.
   const drafted = ["POST /api/tasks/:taskId/compute-request", "POST /api/tasks/:taskId/compute-claim", "POST /api/tasks/:taskId/compute-bind", "POST /api/tasks/:taskId/compute-configure", "POST /api/tasks/:taskId/compute-neon-recovery",
@@ -95,6 +139,118 @@ test("every adapter callback is classified: effects are bound, owner controls an
   for (const excluded of ["/api/tasks/task/automation", "/api/sessions/primary/issue-update", "/api/sessions/primary/tooling-capability"]) expect(matchToolingCallback("POST", excluded)).toBeNull();
   for (const kind of TOOLING_OPERATION_KINDS) { expect(kind).toMatch(/^[a-z][a-z0-9-]{0,63}$/); expect(TOOLING_CALLBACKS.some(callback => callback.kind === kind)).toBe(true); }
   expect(FINALIZATION_PREPARED_ACTION).toBe(FINALIZATION_PREPARED);
+});
+
+/** Real routes and guard across activation; physical observation and turn
+ * delivery are explicit fixtures, not physical adapter acceptance. */
+test.each(["same-command", "later-command"])("active-release saved admission %s confirms a producer only after guarded bind", async mode => {
+  const { config } = await fixture();
+  const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
+  const { savedComputeDigest } = await import("./compute-saved-resource.ts");
+  const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
+  const { environmentCode } = await import("./compute-observer.ts");
+  const { recordComputeObservation } = await import("./compute-observation.ts");
+  const { scheduleComputeOffers, confirmComputeDelivery } = await import("./compute-admission.ts");
+  config.compute = ComputePolicy.parse({ enabled: true, slots: 1 });
+  await bootstrap([]);
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "saved-container", kind: "docker-container", purpose: "development",
+    externalId: "e".repeat(64), state: "allocated", metadata: { image: `sha256:${"f".repeat(64)}` } } });
+  const saved = { resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest };
+  const request = { ...computeBody, key: resource.key, saved, recipeDigest: savedComputeDigest(saved) };
+  const runtime = createFakeAgentRuntime([{ id: "primary", status: "idle", role: "primary", cwd: "/fixture/primary", repositoryId: "repo", machineId: "host" }]);
+  const server = createApp({ config, prisma: db.prisma, agentRuntime: runtime, trustLocal: true });
+  const call = (suffix: string, body: unknown, operationId: string) => server.request(`/api/tasks/task/${suffix}`, {
+    method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: operationId }, body: JSON.stringify(body),
+  });
+  let command = (await begin(config, { requestKey: "saved-command-a", kind: "adapter-command", inputDigest: canonicalDigest({ action: "resume", key: request.key }) })).binding;
+  let operation = (await begin(config, { requestKey: "saved-request", kind: "compute-admission", parentOperationId: command.operationId, inputDigest: canonicalDigest(request) })).binding;
+  const settle = () => server.request(`/api/sessions/primary/tooling-operations/${command.operationId}/settlement`, {
+    method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: command.operationId }, body: JSON.stringify({ requestKey: command.requestKey, inputDigest: command.inputDigest, outcome: "completed" }),
+  });
+  expect((await call("compute-request", request, operation.operationId)).status).toBe(202);
+  const env = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { taskId_key: { taskId: "task", key: resource.key } } });
+  if (mode === "later-command") expect((await settle()).status).toBe(200);
+  await activate("release-b", 2);
+  const taskRow = await task(), code = () => environmentCode(db.prisma, taskRow, env);
+  expect(currentToolingOperation()).toBeUndefined();
+  expect((await code()).binding?.operationId).toBe(operation.operationId);
+  expect((await code()).code?.revision).toBe(A);
+  expect(await producerOperationId(db.prisma, taskRow, env.id)).toBeNull();
+  expect(await db.prisma.toolingRetainedConsumer.count()).toBe(0);
+  // Neither a changed request nor changed physical identity can borrow A or B.
+  await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { revision: B } });
+  await expect(code()).rejects.toThrow(/unclaimed admission/);
+  await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { revision: env.revision } });
+  await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { externalId: "1".repeat(64) } });
+  await expect(code()).rejects.toThrow(/resource ownership changed/);
+  await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { externalId: resource.externalId, updatedAt: resource.updatedAt } });
+  const context = { prisma: db.prisma, config, machineId: config.machine, policy: config.compute, runtime };
+  await scheduleComputeOffers(context);
+  expect(await db.prisma.computeOffer.count()).toBe(0); // provenance is not stopped proof
+  await recordComputeObservation({ prisma: db.prisma, config, environmentId: env.id, observation: {
+    version: 1, environmentId: env.id, taskId: "task", primarySessionId: "primary", purpose: "development", revision: request.revision,
+    recipeDigest: request.recipeDigest, resourceId: resource.id, resourceIdentity: saved.resourceIdentity, configurationDigest: request.recipeDigest,
+    state: "stopped", observedAt: Date.now(), coverage: "incomplete", routes: [], operations: { coverage: "incomplete", active: 0, generation: "0".repeat(64) },
+  } });
+  await scheduleComputeOffers(context);
+  const assignment = await db.prisma.computeOffer.findFirstOrThrow();
+  await db.prisma.runtimeInstruction.update({ where: { id: assignment.instructionId }, data: { state: "dispatching", executionRequestId: assignment.instructionId } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "saved-delivery", runtimeSessionId: "primary", requestId: assignment.instructionId, phase: "started", occurredAt: new Date() } });
+  await confirmComputeDelivery({ ...context, sessionId: "primary", requestId: assignment.instructionId });
+  if (mode === "later-command") {
+    command = (await begin(config, { requestKey: "saved-command-b", kind: "adapter-command", inputDigest: canonicalDigest({ action: "resume", key: request.key, offer: assignment.id }) })).binding;
+    operation = (await begin(config, { requestKey: "saved-claim-b", kind: "compute-admission", parentOperationId: command.operationId,
+      existingOperationId: assignment.id, inputDigest: canonicalDigest(request) })).binding;
+  }
+  const claim = await call("compute-claim", { ...request, offerId: assignment.id }, operation.operationId);
+  expect(await claim.clone().json()).not.toHaveProperty("error");
+  expect(claim.status).toBe(200);
+  expect(await producerOperationId(db.prisma, taskRow, env.id)).toBeNull();
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(1);
+  await expect(code()).rejects.toThrow(/unclaimed admission/);
+  expect((await settle()).status).toBe(409); // a claimed pending reader cannot be settled as completed
+  const wrong = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "other-container", kind: "docker-container", purpose: "development", externalId: "1".repeat(64), state: "allocated" } });
+  expect((await call("compute-bind", { offerId: assignment.id, resourceKey: wrong.key }, operation.operationId)).status).toBe(409);
+  expect(await producerOperationId(db.prisma, taskRow, env.id)).toBeNull();
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(1);
+  const bound = await call("compute-bind", { offerId: assignment.id, resourceKey: resource.key }, operation.operationId);
+  expect(bound.status).toBe(200);
+  expect(await bound.json()).toMatchObject({ environmentId: env.id, resourceId: resource.id, resourceIdentity: saved.resourceIdentity });
+  expect(await producerOperationId(db.prisma, taskRow, env.id)).toBe(operation.operationId);
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "pending" } })).toBe(0);
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { status: "confirmed" } })).toBe(1);
+  expect((await code()).code?.revision).toBe(mode === "later-command" ? B : A);
+  expect((await settle()).status).toBe(200);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
+});
+
+test.each(["admission-unknown", "callback-unknown", "producer-unknown", "claimed-history", "task-pin"])("saved collector refuses %s instead of borrowing the active release", async changed => {
+  const { config } = await fixture();
+  const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
+  const { savedComputeDigest } = await import("./compute-saved-resource.ts");
+  const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
+  const { environmentCode } = await import("./compute-observer.ts");
+  config.compute = ComputePolicy.parse({ enabled: true, slots: 1 }); await bootstrap([]);
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "saved", kind: "docker-container", purpose: "development", externalId: "e".repeat(64), state: "allocated" } });
+  const saved = { resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest };
+  const request = { ...computeBody, key: resource.key, saved, recipeDigest: savedComputeDigest(saved) };
+  const operation = (await begin(config, { requestKey: "request", kind: "compute-admission", inputDigest: canonicalDigest(request) })).binding;
+  const server = createApp({ config, prisma: db.prisma, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  expect((await server.request("/api/tasks/task/compute-request", { method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: operation.operationId }, body: JSON.stringify(request) })).status).toBe(202);
+  const env = await db.prisma.computeEnvironment.findFirstOrThrow();
+  await activate("release-b", 2);
+  if (changed === "admission-unknown" || changed === "producer-unknown") {
+    const role = changed === "admission-unknown" ? "admission" : "producer";
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association",
+      key: role === "admission" ? "admission:environment-key:saved" : `producer:compute-environment:${env.id}`,
+      value: JSON.stringify({ version: 1, operationId: operation.operationId, role, state: "intent" }) } });
+  }
+  if (changed === "callback-unknown") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `outcome:${operation.operationId}`,
+    value: JSON.stringify({ version: 1, operationId: operation.operationId, role: "outcome", state: "intent", attemptId: "lost", route: "POST /api/tasks/:taskId/compute-request", inputDigest: operation.inputDigest }) } });
+  if (changed === "claimed-history") await db.prisma.computeOffer.create({ data: { id: "old-claim", environmentId: env.id, machineId: "host", instructionId: "old-claim", dispatchDeadline: new Date(), claimedAt: new Date(), state: "stopped", completedAt: new Date() } });
+  if (changed === "task-pin") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { toolingRevision: B } });
+  await expect(environmentCode(db.prisma, await task(), env)).rejects.toThrow();
+  expect(await db.prisma.toolingRetainedConsumer.count()).toBe(0);
 });
 
 test("pre-protocol callbacks are unchanged; an active generation refuses a missing header even with compute disabled", async () => {

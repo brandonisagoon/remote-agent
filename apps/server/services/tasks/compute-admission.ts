@@ -638,8 +638,9 @@ async function ownerRetriesDeliveredOffer(store: Store, offer: { id: string; sta
   return Boolean(await store.computeSlot.findFirst({ where: { allocationId: offer.id, machineId: offer.machineId } }));
 }
 
-/** Binds the claimed slot to its first exact runtime receipt before any Docker
- * create. It cannot transfer an allocation to another recipe or container. */
+/** Binds a runtime receipt before creation, or confirms a saved adapter's
+ * successful resume of its already-bound exact resource. Neither path can
+ * transfer an allocation to another recipe or container. */
 export async function bindComputeResource(input: Context & { taskId: string; offerId: string; resourceKey: string }) {
   return input.prisma.$transaction(async store => {
     const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
@@ -648,9 +649,15 @@ export async function bindComputeResource(input: Context & { taskId: string; off
     if (environment.taskId !== input.taskId || environment.machineId !== input.machineId || !["claimed", "running", "unknown"].includes(offer.state)
       || !(await store.computeSlot.findUnique({ where: { allocationId: offer.id } }))) throw new Error("Runtime allocation is unavailable");
     const resource = await store.remoteTaskResource.findUniqueOrThrow({ where: { taskId_key: { taskId: input.taskId, key: input.resourceKey } } });
-    const metadata = z.object({ recipeHash: z.string(), revision: z.string() }).parse(resource.metadata);
-    if (resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.key !== environment.key || resource.state === "released"
-      || metadata.recipeHash !== environment.recipeDigest || metadata.revision !== environment.revision || environment.resourceId && environment.resourceId !== resource.id) throw new Error("Runtime allocation resource changed");
+    if (isSavedComputeEnvironment(environment)) {
+      if (resource.id !== environment.resourceId) throw new Error("Saved allocation resource changed");
+      await assertSavedComputeResource(store, { taskId: input.taskId, key: environment.key, purpose: environment.purpose, recipeDigest: environment.recipeDigest,
+        saved: { resourceId: resource.id, resourceIdentity: environment.resourceIdentity! } });
+    } else {
+      const metadata = z.object({ recipeHash: z.string(), revision: z.string() }).parse(resource.metadata);
+      if (resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.key !== environment.key || resource.state === "released"
+        || metadata.recipeHash !== environment.recipeDigest || metadata.revision !== environment.revision || environment.resourceId && environment.resourceId !== resource.id) throw new Error("Runtime allocation resource changed");
+    }
     const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
     const identity = finalizationResourceIdentity(resource);
     await store.computeEnvironment.update({ where: { id: environment.id }, data: { resourceId: resource.id, resourceIdentity: identity.identityDigest } });

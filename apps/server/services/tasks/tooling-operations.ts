@@ -645,6 +645,32 @@ export async function producerOperationId(store: Pick<PrismaClient, "runtimeMeta
   return null;
 }
 
+/** Read-only code selection before a saved resource's FIRST claim. The
+ * acknowledged exact request is provenance, not a producer or start grant.
+ * Once any claim may have started it, only a confirmed producer can select
+ * code. In particular an unknown/newer admission cannot borrow an older one. */
+async function unclaimedSavedAdmission(prisma: PrismaClient, task: RemoteTask, environmentId: string, read: ToolingOperationDependencies["read"]) {
+  const environment = await prisma.computeEnvironment.findUnique({ where: { id: environmentId } });
+  const { isSavedComputeEnvironment, assertSavedComputeResource } = await import("./compute-saved-resource.ts");
+  if (!environment || !isSavedComputeEnvironment(environment)) return null;
+  const refused = () => refuse("producer-unknown", `Saved environment ${environmentId} has no exact acknowledged unclaimed admission`);
+  if (environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId || environment.machineId !== task.machineId
+    || !["waiting", "offered"].includes(environment.state)) throw refused();
+  await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(prisma, environment);
+  if (await prisma.computeOffer.count({ where: { environmentId, OR: [{ claimedAt: { not: null } }, { state: { in: ["validating", "claimed", "running", "unknown", "stopped"] } }] } })) throw refused();
+  const admitted = (await admissionHistory(prisma, task, environment.key))[0];
+  if (!admitted || admitted.state !== "confirmed") throw refused();
+  const binding = await read({ prisma, operationId: admitted.operationId });
+  const saved = { resourceId: environment.resourceId!, resourceIdentity: environment.resourceIdentity! };
+  const request = { key: environment.key, purpose: environment.purpose, revision: environment.revision, recipeDigest: environment.recipeDigest, saved };
+  if (!binding || binding.kind !== "compute-admission" || !["running", "completed"].includes(binding.status)
+    || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId || binding.repositoryId !== task.repositoryId || binding.release.repositoryId !== task.repositoryId
+    || binding.inputDigest !== canonicalDigest(request)
+    || !await latestAttemptAcknowledged(prisma, binding, { id: binding.operationId, inputDigest: binding.inputDigest })) throw refused();
+  await assertSavedComputeResource(prisma, { taskId: task.id, ...request });
+  return binding;
+}
+
 /** Code for an existing consumer: its confirmed producer/owner binding, else
  * its exact retained first-bootstrap snapshot. Before any boundary the
  * pre-protocol configured revision applies (null). `unstarted` is the
@@ -667,6 +693,10 @@ export async function resourceGroupCode(input: { prisma: PrismaClient; task: Rem
     if (handedOff) return handedOff;
   }
   if (consumer.status === "legacy" && consumer.taskId === input.task.id) return { code: { repositoryId: input.task.repositoryId, revision: consumer.revision, checkout: consumer.checkout }, binding: null };
+  if (consumer.status === "not-legacy" && !input.unstarted && input.reference.type === "compute-environment") {
+    const admitted = await unclaimedSavedAdmission(input.prisma, input.task, input.reference.id, dependencies.read);
+    if (admitted) return { code: admitted.release, binding: admitted };
+  }
   if (consumer.status === "not-legacy" && input.unstarted && input.unstarted.taskId === input.task.id) return { code: input.unstarted.release, binding: input.unstarted };
   throw new ToolingOperationRefused("producer-unknown", `${input.reference.type} ${input.reference.id} has no bound producer or retained legacy snapshot (${consumer.status})`);
 }
