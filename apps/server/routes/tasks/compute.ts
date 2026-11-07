@@ -11,8 +11,21 @@ import { computeIdleAttemptStatus } from "../../services/tasks/compute-idle-atte
 import { developmentProjection } from "../../services/tasks/development-intent.ts";
 import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "../../services/tasks/compute-neon-recovery-result.ts";
 import { readSessionToolingOperation } from "../../services/tasks/tooling-operations.ts";
+import { ComputeAccountingInput, retainComputeAccountingInput } from "../../services/tasks/compute-accounting-input.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
+// Explicit owner authentication also applies on the otherwise trusted local
+// socket. This is not an adapter callback and grants no tooling authority.
+computeRoutes.use("/:taskId/compute-accounting-input", apiAuthMiddleware());
+computeRoutes.post("/:taskId/compute-accounting-input", async c => {
+  if (c.req.header("x-remote-agent-operation")) return c.json({ error: "Owner evidence registration is not a tooling callback" }, 400);
+  const request = ComputeAccountingInput.safeParse(await c.req.json().catch(() => null));
+  if (!request.success) return c.json({ error: "Exact original allocation and retained configuration binding are required" }, 400);
+  try {
+    return c.json(await retainComputeAccountingInput({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"),
+      taskId: c.req.param("taskId"), environmentId: request.data.environmentId, request: request.data }));
+  } catch { return c.json({ error: "Retained compute input could not be verified; original records and capacity are preserved" }, 409); }
+});
 // The callback guard supplies the operation scope. Neither the body nor this
 // route may select a release or manufacture an admitted binding.
 computeRoutes.post("/:taskId/compute-neon-recovery", async c => {

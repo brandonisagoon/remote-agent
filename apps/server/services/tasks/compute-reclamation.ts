@@ -10,11 +10,13 @@ import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 import { readInstalledComputeReclamation } from "./compute-observer.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
+import { retainedComputeConfiguration } from "./compute-accounting-input.ts";
 
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; config: ServerConfig; environmentId: string; runtime: Pick<AgentSessionRuntime, "observeSessionActivity">; now?: Date };
+export type ComputeReclamationContext = Context;
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
-async function snapshot(store: Store, input: Context) {
+export async function readComputeReclamationSnapshot(store: Store, input: Context) {
   const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: input.environmentId } });
   const task = await store.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
   const primary = await store.runtimeSession.findUniqueOrThrow({ where: { id: environment.primarySessionId } });
@@ -46,6 +48,8 @@ async function snapshot(store: Store, input: Context) {
   const settled = computeFamilySettled(task, sessions, instructions, lifecycle, input.runtime);
   const identity = finalizationResourceIdentity(resource);
   let configurationDigest: string;
+  let originalConfiguration: { configurationFile: string; configurationSha256: string } | null = null;
+  let retainedConfiguration: Awaited<ReturnType<typeof retainedComputeConfiguration>> = null;
   if (isSavedComputeEnvironment(environment)) {
     if (identity.identityDigest !== environment.resourceIdentity) throw new Error("Saved reclamation original recipe changed");
     configurationDigest = environment.recipeDigest;
@@ -57,8 +61,10 @@ async function snapshot(store: Store, input: Context) {
       : previous.success ? previous.data.configurationDigest : reclaimed.success ? reclaimed.data.configurationDigest : null;
     if (configuration.configurationSha256 !== pinned) throw new Error("Reclamation has no original physical configuration binding");
     configurationDigest = configuration.configurationSha256;
+    originalConfiguration = configuration;
+    retainedConfiguration = await retainedComputeConfiguration(store, task, environment, resource, configuration);
   }
-  const tuple = { environment, task, primary, links, resource, offers, slots, sessions, relations, instructions, lifecycle,
+  const tuple = { environment, task, primary, links, resource, offers, slots, sessions, relations, instructions, lifecycle, originalConfiguration, retainedConfiguration,
     familyGeneration: computeFamilyGeneration(task, sessions, instructions) };
   return { ...tuple, settled, identity, configurationDigest, digest: finalizationDigest(tuple) };
 }
@@ -81,17 +87,19 @@ async function reclaimStoppedComputeOnce(input: Context, read = readInstalledCom
   if (recorded.machineId !== input.config.machine) throw new Error("Compute reclamation belongs to another host");
   const invalidated = await input.prisma.computeEnvironment.updateMany({ where: { id: recorded.id, machineId: input.config.machine, updatedAt: recorded.updatedAt }, data: { state: "unknown" } });
   if (invalidated.count !== 1) throw new Error("Compute reclamation allocation changed before observation");
-  const before = await snapshot(input.prisma, input);
+  const before = await readComputeReclamationSnapshot(input.prisma, input);
   if (!before.task.ownerPaused && before.task.phase !== "closed" && before.resource.state !== "released" || !before.settled) return { released: false };
   const { environment, task, resource, identity } = before;
   const request = { version: 1, task: { id: task.id, primarySessionId: environment.primarySessionId, toolingRevision: task.toolingRevision, worktreePath: task.worktreePath },
     environment: { id: environment.id, key: environment.key, purpose: environment.purpose, revision: environment.revision, recipeDigest: environment.recipeDigest },
-    resource: { ...identity, metadata: environment.configuration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata), compute: environment.configuration } : resource.metadata },
+    resource: { ...identity, metadata: before.retainedConfiguration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata),
+      compute: { configurationFile: before.retainedConfiguration.retainedConfigurationFile, configurationSha256: before.configurationDigest } }
+      : environment.configuration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata), compute: environment.configuration } : resource.metadata },
     allocationResourceIdentity: environment.resourceIdentity, configurationDigest: before.configurationDigest };
   const observation = ComputeReclamation.parse(await read(input, task, request));
   if (!["stopped", "absent"].includes(observation.state)) return { released: false };
   return input.prisma.$transaction(async tx => {
-    const current = await snapshot(tx, input), now = input.now ?? new Date();
+    const current = await readComputeReclamationSnapshot(tx, input), now = input.now ?? new Date();
     if (!current.settled || current.digest !== before.digest) throw new Error("Compute reclamation changed during observation");
     if (observation.environmentId !== environment.id || observation.taskId !== task.id || observation.primarySessionId !== environment.primarySessionId
       || observation.resourceId !== resource.id || observation.resourceIdentity !== identity.identityDigest || observation.allocationResourceIdentity !== environment.resourceIdentity
