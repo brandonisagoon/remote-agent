@@ -22,7 +22,9 @@ export const operationEnvironment = (binding: Pick<ToolingOperationBinding, "ope
 
 /** Code observing a resource group: its confirmed producer's release, else
  * its retained first-bootstrap snapshot. Only a never-started group uses the
- * guarded callback's own (admitting) binding. Before any activation boundary
+ * guarded callback's own (admitting) binding. An unclaimed saved resource
+ * also has its exact acknowledged request binding for independent collection.
+ * Neither is a producer or start grant. Before any activation boundary
  * the pre-protocol configured revision applies (null). Unknown or missing
  * provenance throws: an observer tick never borrows the active release. */
 export async function environmentCode(prisma: PrismaClient, task: RemoteTask, environment: Pick<ComputeEnvironment, "id">) {

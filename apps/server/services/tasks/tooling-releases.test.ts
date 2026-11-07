@@ -52,6 +52,8 @@ beforeEach(async () => {
   git(source, "checkout", "-q", revisions.B!);
   commit("protocol2", { ".remote-agent-release.json": release(undefined, { min: 2, max: 2 }) });
   git(source, "checkout", "-q", revisions.B!);
+  commit("protocol3", { ".remote-agent-release.json": release(undefined, { min: 3, max: 3 }) });
+  git(source, "checkout", "-q", revisions.B!);
   commit("v2", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [1, 2], write: 2, preservesUnknown: true } }) });
   git(source, "checkout", "-q", revisions.B!);
   commit("v2only", { ".remote-agent-release.json": release({ "drafted.runtime": { read: [2], write: 2, preservesUnknown: true } }) });
@@ -102,10 +104,31 @@ test("two different requests for the same expected generation cannot both win", 
   expect(await db.prisma.toolingActivation.count()).toBe(1);
 });
 
+test("protocol 2 activation keeps protocol 1 bindings and retained continuations executable", async () => {
+  const task = await ownedTask();
+  await activate("protocol-one", "A", 0);
+  const producer = await opFor(task, "protocol-one-producer");
+  const consumer = await retain(producer.operationId);
+  await confirmToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence });
+  await transitionToolingOperation({ prisma: db.prisma, operationId: producer.operationId, from: "bound", to: "completed", evidence });
+  const selected = await activate("protocol-two", "protocol2", 1);
+  expect(selected.generation).toBe(2);
+  const fresh = await opFor(task, "protocol-two-command");
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: fresh.operationId } })).protocol).toBe(2);
+  const continuation = await bindRetainedToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null,
+    request: { requestKey: "protocol-one-continuation", inputDigest: "8".repeat(64), kind: "adapter-command" }, retainedConsumerId: consumer.id });
+  expect(continuation.release.revision).toBe(revisions.A!);
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: continuation.operationId } })).protocol).toBe(1);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: producer.operationId }))?.release.revision).toBe(revisions.A!);
+  await transitionToolingOperation({ prisma: db.prisma, operationId: continuation.operationId, from: "bound", to: "running" });
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: continuation.operationId }))?.status).toBe("running");
+  expect((await bootToolingSelections({ prisma: db.prisma, configuredRepositoryIds: [REPO] }))[REPO]).toBe(revisions.protocol2!);
+});
+
 test("failed candidates leave the active selection unchanged", async () => {
   const active = await activate("k1", "A", 0);
   await expect(activate("legacy", "legacy", 1)).rejects.toMatchObject({ code: "preparation-failed" });
-  await expect(activate("protocol", "protocol2", 1)).rejects.toMatchObject({ code: "preparation-failed" });
+  await expect(activate("protocol", "protocol3", 1)).rejects.toMatchObject({ code: "preparation-failed" });
   await expect(activateToolingRelease({ prisma: db.prisma, config, repositoryId: REPO, requestKey: "ref", revision: "main", expectedGeneration: 1 }, { prepare })).rejects.toMatchObject({ code: "invalid-request" });
   await prepare({ repositoryId: REPO, toolingRoot: source, installRoot: config.installRoot, revision: revisions.B! });
   writeFileSync(path.join(config.installRoot, "tooling", REPO, revisions.B!, "cli.ts"), "tampered\n");
@@ -264,7 +287,7 @@ test("the validated-proof seam returns only an unknown command-parented compute-
   // A release whose protocol this server no longer speaks: refused (adversarially changed manifest).
   const late = await bind("late", "adapter-command"), lateChild = await bind("late/compute-admission", "compute-admission", late.operationId); await unknown(lateChild.operationId); await acknowledge(lateChild.operationId);
   const row = await db.prisma.toolingRelease.findUniqueOrThrow({ where: { id: late.release.id } });
-  await db.prisma.toolingRelease.update({ where: { id: row.id }, data: { manifest: { ...(row.manifest as object), serverProtocol: { min: 2, max: 2 } } } });
+  await db.prisma.toolingRelease.update({ where: { id: row.id }, data: { manifest: { ...(row.manifest as object), serverProtocol: { min: 3, max: 3 } } } });
   await expect(reconcile(lateChild.operationId)).rejects.toMatchObject({ code: "invalid-transition" });
   // The generic transition contract is unchanged.
   await expect(transitionToolingOperation({ prisma: db.prisma, operationId: orphan.operationId, from: "unknown", to: "running" })).rejects.toMatchObject({ code: "invalid-transition" });

@@ -29,6 +29,14 @@ version-1 capability manifest. Version 1 declares:
 ```
 
 `serverProtocol` is an integer protocol range, not a server package version.
+Protocol 2 adds exact unclaimed saved-resource observation and producer
+confirmation after saved resume, including measured Compose enrollment.
+Adapters using those semantics require protocol 2; a protocol-1 server rejects
+their preparation before activation. The updated server supports 1 through 2,
+so existing protocol-1 bindings and retained consumers continue on their
+original releases. The operation envelope and state-format versions do not
+change. Deployment compatibility also refuses a rollback that cannot execute
+an active or retained protocol-2 consumer.
 Every declared writer format must also be readable. Format identifiers describe
 persisted tooling data, not application database versions. Add other format
 families only after inventorying their actual readers. A candidate must declare
@@ -124,6 +132,20 @@ or discard its history.
 An existing group's suspension, reclaim and baseline observation use that
 producer too. An admission request or queued offer never advances the producer;
 only a confirmed start, resume or configuration transition may do so.
+Before a saved resource's first claim, independent collection may use the
+latest confirmed admission's exact request binding. Its resource identity,
+recipe, task ownership and acknowledged callback history must still match;
+an uncertain admission or any prior claim refuses this path. This selects
+read-only observer code, never stopped proof or start authority. A successful
+saved resume confirms its producer through the guarded `compute-bind` callback;
+until then its claimed allocation and pending reader remain conservative.
+A failed collection may leave an unclaimed environment `unknown`; the same
+exact admission can still observe it, and normal fresh physical reconciliation
+determines its state. This exception never covers an uncertain allocation.
+Measured Compose resumes instead retain their existing enrollment recipe and
+configuration. Bind checks that exact resource and recorded observation plus
+the acknowledged enrollment request (or its retained legacy provenance), rather
+than treating a measured recipe as a physical-only saved digest.
 
 Before first activation publishes generation 1, atomically persist a stable
 bootstrap boundary and legacy bindings for existing environments/resources,
