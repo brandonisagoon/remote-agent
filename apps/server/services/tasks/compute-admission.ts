@@ -335,6 +335,9 @@ async function sessionQuiescent(store: Pick<Store, "runtimeSession">, sessionId:
  * is reclaimed. */
 export async function reconcileComputeOffers(input: Context) {
   policy(input); const now = at(input);
+  // Include already-withdrawn claims from a previous pass or server boot.
+  const { reconcileWithdrawnComputeClaims } = await import("./tooling-operations.ts");
+  await reconcileWithdrawnComputeClaims(input.prisma, input.machineId);
   const offers = await input.prisma.computeOffer.findMany({ where: { machineId: input.machineId, state: { in: ["queued", "offered", "validating", "claimed"] } }, take: 1001 });
   if (offers.length > 1000) throw new Error("Compute offer reconciliation exceeds its bound");
   await settleUndispatchableRetries(input);
@@ -381,6 +384,7 @@ export async function reconcileComputeOffers(input: Context) {
       if (terminalInstruction.includes(instruction.state) && await sessionQuiescent(store, instruction.sessionId, input.runtime)) await withdraw(store, offer.id, "expired", now);
     });
   }
+  await reconcileWithdrawnComputeClaims(input.prisma, input.machineId);
 }
 
 /** An owner retry re-queues a previously dispatched offer turn. If its
