@@ -143,14 +143,14 @@ test("every adapter callback is classified: effects are bound, owner controls an
 
 /** Real routes and guard across activation; physical observation and turn
  * delivery are explicit fixtures, not physical adapter acceptance. */
-test.each(["same-command", "later-command"])("active-release saved admission %s confirms a producer only after guarded bind", async mode => {
+test.each(["same-command", "later-command", "unknown-before-claim"])("active-release saved admission %s confirms a producer only after guarded bind", async mode => {
   const { config } = await fixture();
   const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
   const { savedComputeDigest } = await import("./compute-saved-resource.ts");
   const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
   const { environmentCode } = await import("./compute-observer.ts");
   const { recordComputeObservation } = await import("./compute-observation.ts");
-  const { scheduleComputeOffers, confirmComputeDelivery } = await import("./compute-admission.ts");
+  const { scheduleComputeOffers, confirmComputeDelivery, reconcileObservedCompute } = await import("./compute-admission.ts");
   config.compute = ComputePolicy.parse({ enabled: true, slots: 1 });
   await bootstrap([]);
   const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "saved-container", kind: "docker-container", purpose: "development",
@@ -169,6 +169,7 @@ test.each(["same-command", "later-command"])("active-release saved admission %s 
   });
   expect((await call("compute-request", request, operation.operationId)).status).toBe(202);
   const env = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { taskId_key: { taskId: "task", key: resource.key } } });
+  if (mode === "unknown-before-claim") await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { state: "unknown" } });
   if (mode === "later-command") expect((await settle()).status).toBe(200);
   await activate("release-b", 2);
   const taskRow = await task(), code = () => environmentCode(db.prisma, taskRow, env);
@@ -192,6 +193,11 @@ test.each(["same-command", "later-command"])("active-release saved admission %s 
     recipeDigest: request.recipeDigest, resourceId: resource.id, resourceIdentity: saved.resourceIdentity, configurationDigest: request.recipeDigest,
     state: "stopped", observedAt: Date.now(), coverage: "incomplete", routes: [], operations: { coverage: "incomplete", active: 0, generation: "0".repeat(64) },
   } });
+  if (mode === "unknown-before-claim") {
+    expect(await reconcileObservedCompute({ ...context, environmentId: env.id })).toEqual({ released: true });
+    expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: env.id } })).state).toBe("suspended");
+    expect((await code()).code?.revision).toBe(A); // collection can keep refreshing while capacity is unavailable
+  }
   await scheduleComputeOffers(context);
   const assignment = await db.prisma.computeOffer.findFirstOrThrow();
   await db.prisma.runtimeInstruction.update({ where: { id: assignment.instructionId }, data: { state: "dispatching", executionRequestId: assignment.instructionId } });
@@ -224,7 +230,7 @@ test.each(["same-command", "later-command"])("active-release saved admission %s 
   expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
 });
 
-test.each(["admission-unknown", "callback-unknown", "producer-unknown", "claimed-history", "task-pin"])("saved collector refuses %s instead of borrowing the active release", async changed => {
+test.each(["admission-unknown", "callback-unknown", "producer-unknown", "claimed-history", "uncertain-grant", "task-pin"])("saved collector refuses %s instead of borrowing the active release", async changed => {
   const { config } = await fixture();
   const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
   const { savedComputeDigest } = await import("./compute-saved-resource.ts");
@@ -248,9 +254,80 @@ test.each(["admission-unknown", "callback-unknown", "producer-unknown", "claimed
   if (changed === "callback-unknown") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "tooling-operation-association", key: `outcome:${operation.operationId}`,
     value: JSON.stringify({ version: 1, operationId: operation.operationId, role: "outcome", state: "intent", attemptId: "lost", route: "POST /api/tasks/:taskId/compute-request", inputDigest: operation.inputDigest }) } });
   if (changed === "claimed-history") await db.prisma.computeOffer.create({ data: { id: "old-claim", environmentId: env.id, machineId: "host", instructionId: "old-claim", dispatchDeadline: new Date(), claimedAt: new Date(), state: "stopped", completedAt: new Date() } });
+  if (changed === "uncertain-grant") {
+    await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { state: "unknown" } });
+    await db.prisma.computeOffer.create({ data: { id: "uncertain", environmentId: env.id, machineId: "host", instructionId: "uncertain", dispatchDeadline: new Date(), state: "unknown" } });
+  }
   if (changed === "task-pin") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { toolingRevision: B } });
   await expect(environmentCode(db.prisma, await task(), env)).rejects.toThrow();
   expect(await db.prisma.toolingRetainedConsumer.count()).toBe(0);
+});
+
+test("measured Studio resume binds only its exact acknowledged enrollment across activation", async () => {
+  const { config } = await fixture();
+  const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
+  const { savedComputeDigest } = await import("./compute-saved-resource.ts");
+  const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
+  const { enrollCompute, ComputeEnrollment } = await import("./compute-enrollment.ts");
+  const { scheduleComputeOffers, confirmComputeDelivery } = await import("./compute-admission.ts");
+  config.compute = ComputePolicy.parse({ enabled: true, slots: 1 }); await bootstrap([]);
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "studio", kind: "docker-compose-project", purpose: "development", externalId: "task-owned-studio", state: "allocated" } });
+  const identity = finalizationResourceIdentity(resource).identityDigest;
+  const saved = { resourceId: resource.id, resourceIdentity: identity };
+  const runtime = createFakeAgentRuntime([{ id: "primary", status: "idle", role: "primary", cwd: "/fixture/primary", repositoryId: "repo", machineId: "host" }]);
+  const server = createApp({ config, prisma: db.prisma, agentRuntime: runtime, trustLocal: true });
+  const call = (suffix: string, body: unknown, operationId: string) => server.request(`/api/tasks/task/${suffix}`, {
+    method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: operationId }, body: JSON.stringify(body),
+  });
+  const initial = { ...computeBody, key: resource.key, saved, recipeDigest: savedComputeDigest(saved) };
+  const requested = (await begin(config, { requestKey: "studio-initial", kind: "compute-admission", inputDigest: canonicalDigest(initial) })).binding;
+  expect((await call("compute-request", initial, requested.operationId)).status).toBe(202);
+  const env = await db.prisma.computeEnvironment.findFirstOrThrow();
+  const enrolled = { ...computeBody, key: resource.key, environmentId: env.id, resourceIdentity: identity,
+    configuration: { configurationFile: "/fixture/studio-coverage.json", configurationSha256: "5".repeat(64) } };
+  const enrollment = (await begin(config, { requestKey: "studio-enroll", kind: "compute-enroll", existingOperationId: env.id, inputDigest: canonicalDigest(enrolled) })).binding;
+  // The real guarded enrollment transaction, with only its physical reader
+  // replaced by an explicit fixture. No source/claim/bind handler is replaced.
+  const enrollmentApp = new Hono<AppEnv>();
+  enrollmentApp.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", config); await next(); });
+  enrollmentApp.use("/api/*", toolingOperationGuard());
+  enrollmentApp.post("/api/tasks/task/compute-enroll", async c => c.json(await enrollCompute({ prisma: db.prisma, config, taskId: "task", request: ComputeEnrollment.parse(await c.req.json()) }, async () => ({
+    observation: { version: 1, environmentId: env.id, taskId: "task", primarySessionId: "primary", purpose: "development", revision: enrolled.revision,
+      recipeDigest: enrolled.recipeDigest, resourceId: resource.id, resourceIdentity: identity, configurationDigest: enrolled.configuration.configurationSha256,
+      state: "stopped", observedAt: Date.now(), coverage: "incomplete", routes: [], operations: { coverage: "incomplete", active: 0, generation: "0".repeat(64) } }, traffic: [],
+  }))));
+  expect((await enrollmentApp.request("/api/tasks/task/compute-enroll", { method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: enrollment.operationId }, body: JSON.stringify(enrolled) })).status).toBe(200);
+  expect(await producerOperationId(db.prisma, await task(), env.id)).toBe(enrollment.operationId);
+  // Actual enrolled client shape: revision/recipe, deliberately NO saved field.
+  const request = { key: resource.key, purpose: enrolled.purpose, revision: enrolled.revision, recipeDigest: enrolled.recipeDigest };
+  const resume = (await begin(config, { requestKey: "studio-resume", kind: "compute-admission", inputDigest: canonicalDigest(request) })).binding;
+  expect((await call("compute-request", request, resume.operationId)).status).toBe(202);
+  await activate("release-b", 2);
+  const context = { prisma: db.prisma, config, machineId: config.machine, policy: config.compute, runtime };
+  await scheduleComputeOffers(context);
+  const assignment = await db.prisma.computeOffer.findFirstOrThrow();
+  await db.prisma.runtimeInstruction.update({ where: { id: assignment.instructionId }, data: { state: "dispatching", executionRequestId: assignment.instructionId } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "studio-delivery", runtimeSessionId: "primary", requestId: assignment.instructionId, phase: "started", occurredAt: new Date() } });
+  await confirmComputeDelivery({ ...context, sessionId: "primary", requestId: assignment.instructionId });
+  expect((await call("compute-claim", { ...request, offerId: assignment.id }, resume.operationId)).status).toBe(200);
+  const bind = () => call("compute-bind", { offerId: assignment.id, resourceKey: resource.key }, resume.operationId);
+  for (const configuration of [{ ...enrolled.configuration, configurationSha256: "6".repeat(64) }, { ...enrolled.configuration, configurationFile: "/fixture/different.json" }]) {
+    await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { configuration } });
+    expect((await bind()).status).toBe(409);
+    expect(await producerOperationId(db.prisma, await task(), env.id)).toBe(enrollment.operationId);
+  }
+  await db.prisma.computeEnvironment.update({ where: { id: env.id }, data: { configuration: enrolled.configuration } });
+  await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { externalId: "other-studio" } });
+  expect((await bind()).status).toBe(409);
+  await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { externalId: resource.externalId, updatedAt: resource.updatedAt } });
+  const confirmed = await bind();
+  expect(await confirmed.clone().json()).not.toHaveProperty("error");
+  expect(confirmed.status).toBe(200);
+  expect(await producerOperationId(db.prisma, await task(), env.id)).toBe(resume.operationId);
+  expect((await resourceGroupCode({ prisma: db.prisma, task: await task(), reference: { type: "compute-environment", id: env.id } })).code?.revision).toBe(A);
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { operationId: resume.operationId, status: "confirmed" } })).toBe(1);
+  expect(await db.prisma.toolingRetainedConsumer.count({ where: { operationId: resume.operationId, status: "pending" } })).toBe(0);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
 });
 
 test("pre-protocol callbacks are unchanged; an active generation refuses a missing header even with compute disabled", async () => {

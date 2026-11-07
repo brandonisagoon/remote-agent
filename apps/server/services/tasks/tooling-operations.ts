@@ -655,7 +655,7 @@ async function unclaimedSavedAdmission(prisma: PrismaClient, task: RemoteTask, e
   if (!environment || !isSavedComputeEnvironment(environment)) return null;
   const refused = () => refuse("producer-unknown", `Saved environment ${environmentId} has no exact acknowledged unclaimed admission`);
   if (environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId || environment.machineId !== task.machineId
-    || !["waiting", "offered"].includes(environment.state)) throw refused();
+    || !["waiting", "offered", "unknown", "suspended"].includes(environment.state)) throw refused();
   await (await import("./compute-admission.ts")).assertComputeEnvironmentOwner(prisma, environment);
   if (await prisma.computeOffer.count({ where: { environmentId, OR: [{ claimedAt: { not: null } }, { state: { in: ["validating", "claimed", "running", "unknown", "stopped"] } }] } })) throw refused();
   const admitted = (await admissionHistory(prisma, task, environment.key))[0];
@@ -669,6 +669,33 @@ async function unclaimedSavedAdmission(prisma: PrismaClient, task: RemoteTask, e
     || !await latestAttemptAcknowledged(prisma, binding, { id: binding.operationId, inputDigest: binding.inputDigest })) throw refused();
   await assertSavedComputeResource(prisma, { taskId: task.id, ...request });
   return binding;
+}
+
+/** A measured Compose resume keeps its server-accepted enrollment, not the
+ * physical-only saved digest. Confirm against the exact enrollment request
+ * even after later resumes have become the group's producer. */
+export async function assertComputeEnrollmentProvenance(prisma: AdmissionStore, task: RemoteTask, request: { environmentId: string } & Record<string, unknown>) {
+  const legacy = await readToolingLegacyConsumer({ prisma: prisma as PrismaClient, repositoryId: task.repositoryId, consumerKind: "compute-environment", consumerId: request.environmentId });
+  if (legacy.status === "no-boundary" || legacy.status === "legacy" && legacy.taskId === task.id) return;
+  const events = await prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: task.primarySessionId!, source: `tooling-operation:${task.id}`, action: ASSOCIATION,
+    key: associationKey("producer", `compute-environment:${request.environmentId}`) }, orderBy: { sequence: "desc" }, take: 1001 });
+  if (events.length > 1000) throw new Error("Compute enrollment provenance exceeds its bound");
+  const seen = new Set<string>();
+  for (const event of events) {
+    const value = Association.parse(parseJson(event.value));
+    if (seen.has(value.operationId)) continue;
+    seen.add(value.operationId);
+    const binding = await readToolingOperation({ prisma: prisma as PrismaClient, operationId: value.operationId });
+    if (!binding) throw new Error("Compute enrollment operation is unavailable");
+    if (binding.kind !== "compute-enroll") continue;
+    if (value.state === "failed") continue;
+    if (value.state !== "confirmed" || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId || binding.repositoryId !== task.repositoryId
+      || binding.release.repositoryId !== task.repositoryId || !["running", "completed"].includes(binding.status)
+      || binding.inputDigest !== canonicalDigest(request)
+      || !await latestAttemptAcknowledged(prisma, binding, { id: binding.operationId, inputDigest: binding.inputDigest })) break;
+    return;
+  }
+  throw new Error("Compute enrollment configuration has no exact acknowledged provenance");
 }
 
 /** Code for an existing consumer: its confirmed producer/owner binding, else

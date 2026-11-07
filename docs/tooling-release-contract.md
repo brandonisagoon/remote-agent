@@ -131,6 +131,13 @@ an uncertain admission or any prior claim refuses this path. This selects
 read-only observer code, never stopped proof or start authority. A successful
 saved resume confirms its producer through the guarded `compute-bind` callback;
 until then its claimed allocation and pending reader remain conservative.
+A failed collection may leave an unclaimed environment `unknown`; the same
+exact admission can still observe it, and normal fresh physical reconciliation
+determines its state. This exception never covers an uncertain allocation.
+Measured Compose resumes instead retain their existing enrollment recipe and
+configuration. Bind checks that exact resource and recorded observation plus
+the acknowledged enrollment request (or its retained legacy provenance), rather
+than treating a measured recipe as a physical-only saved digest.
 
 Before first activation publishes generation 1, atomically persist a stable
 bootstrap boundary and legacy bindings for existing environments/resources,

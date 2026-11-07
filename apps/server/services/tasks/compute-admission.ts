@@ -653,12 +653,24 @@ export async function bindComputeResource(input: Context & { taskId: string; off
       if (resource.id !== environment.resourceId) throw new Error("Saved allocation resource changed");
       await assertSavedComputeResource(store, { taskId: input.taskId, key: environment.key, purpose: environment.purpose, recipeDigest: environment.recipeDigest,
         saved: { resourceId: resource.id, resourceIdentity: environment.resourceIdentity! } });
+    } else if (resource.kind === "docker-compose-project") {
+      const { ComputeEnrollment } = await import("./compute-enrollment.ts");
+      const enrollment = ComputeEnrollment.parse({ environmentId: environment.id, key: environment.key, purpose: environment.purpose, revision: environment.revision,
+        recipeDigest: environment.recipeDigest, resourceIdentity: environment.resourceIdentity, configuration: environment.configuration });
+      const identity = finalizationResourceIdentity(resource).identityDigest;
+      const observation = ComputeObservation.parse(environment.observation);
+      if (resource.purpose !== "development" || environment.purpose !== resource.purpose || resource.key !== environment.key || resource.state === "released"
+        || resource.id !== environment.resourceId || identity !== environment.resourceIdentity
+        || observation.environmentId !== environment.id || observation.taskId !== input.taskId || observation.primarySessionId !== environment.primarySessionId
+        || observation.resourceId !== resource.id || observation.resourceIdentity !== identity || observation.revision !== environment.revision
+        || observation.recipeDigest !== environment.recipeDigest || observation.configurationDigest !== enrollment.configuration.configurationSha256) throw new Error("Enrolled compute allocation resource or configuration changed");
+      const task = await store.remoteTask.findUniqueOrThrow({ where: { id: input.taskId } });
+      await (await import("./tooling-operations.ts")).assertComputeEnrollmentProvenance(store, task, enrollment);
     } else {
       const metadata = z.object({ recipeHash: z.string(), revision: z.string() }).parse(resource.metadata);
       if (resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.key !== environment.key || resource.state === "released"
         || metadata.recipeHash !== environment.recipeDigest || metadata.revision !== environment.revision || environment.resourceId && environment.resourceId !== resource.id) throw new Error("Runtime allocation resource changed");
     }
-    const { finalizationResourceIdentity } = await import("./finalization-resources.ts");
     const identity = finalizationResourceIdentity(resource);
     await store.computeEnvironment.update({ where: { id: environment.id }, data: { resourceId: resource.id, resourceIdentity: identity.identityDigest } });
     return { environmentId: environment.id, resourceId: resource.id, resourceIdentity: identity.identityDigest };
