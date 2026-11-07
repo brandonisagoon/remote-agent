@@ -290,7 +290,7 @@ export async function assertLegacyEvidenceResourceUpdate(prisma: Database, resou
 
 /** Tooling evidence remains Ready in place. Full boundaries verify both that
  * original file and its disjoint retained copy; this grants no deletion scope. */
-export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config: ServerConfig, prepared: PreparedFinalization) {
+export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config: ServerConfig, prepared: PreparedFinalization, verifyDirectory: (resourceId: string) => Promise<void>) {
   if (!prepared.localCompletion) return;
   const resources = await prisma.remoteTaskResource.findMany({ where: { taskId: prepared.taskId, kind: "evidence", purpose: "tooling", state: { not: "released" } } });
   if (!resources.length) return;
@@ -300,6 +300,7 @@ export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config
     // require making a second copy just to preserve an existing named file.
     for (const resource of resources) {
       if (within(prepared.worktree, resource.externalId)) throw new Error("Retained tooling evidence overlaps the source being removed");
+      if ((await lstat(resource.externalId)).isDirectory()) { await verifyDirectory(resource.id); continue; }
       const metadata = resource.metadata as Record<string, unknown> | null;
       const observed = await observeLegacyEvidenceFile(resource.externalId);
       const sizes = [metadata?.bytes, metadata?.byteSize, metadata?.size].filter(value => value !== undefined);

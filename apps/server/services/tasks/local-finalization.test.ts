@@ -1,6 +1,6 @@
 import { localCleanupReferenceDependencies } from "./local-cleanup-reference.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { chmod, lstat, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
@@ -17,6 +17,7 @@ import { enqueueTaskCleanup, cleanupInstructionAllows } from "./cleanup-inbox.ts
 import { cleanupCandidates } from "./cleanup-candidates.ts";
 import { preparationFailure } from "./preparation-errors.ts";
 import { prepareTaskFinalization } from "./finalization.ts";
+import { RETAINED_TOOLING_TREE } from "./retained-tooling-tree.ts";
 
 let db: TestDatabase, directory: string;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "local-finalize-"))); });
@@ -64,6 +65,86 @@ test("real owner contract and Unix control finalize an unlinked research task wi
     expect(await db.prisma.runtimeIssueUpdate.count()).toBe(0); expect(await db.prisma.runtimeSessionResourceLink.count()).toBe(0);
     expect(await lstat(f.worktree).catch(() => null)).toBeNull();
     expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.task.toolingRevision);
+  } finally { await f.server.stop(true); }
+}, 30_000);
+
+async function retainedTree(f: Awaited<ReturnType<typeof fixture>>) {
+  const root = path.join(directory, "retained-evidence");
+  await mkdir(root, { mode: 0o700 });
+  await writeFile(path.join(root, "result.json"), '{"actualCommand":"passed"}\n', { mode: 0o600 });
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "verification-evidence", kind: "evidence", purpose: "tooling", state: "ready", externalId: root, metadata: { retention: "Preserve original evidence directory" } } });
+  return { root, resource };
+}
+
+test("local cleanup retains the original tooling evidence directory across a failed preparation and confirmation", async () => {
+  const f = await fixture("local-only"), tree = await retainedTree(f);
+  try {
+    await symlink(path.join(tree.root, "result.json"), path.join(tree.root, "unsafe-link"));
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started"] } }, orderBy: { sequence: "asc" } });
+    expect(frozen).toHaveLength(2);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: RETAINED_TOOLING_TREE } })).toBe(0);
+    await rm(path.join(tree.root, "unsafe-link"));
+    const prepared = await f.request("prepare-finalization", f.input);
+    expect(prepared.status).toBe(200);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    const proof = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: RETAINED_TOOLING_TREE } });
+    expect(JSON.parse(proof.value!)).toMatchObject({ provenance: "observed-at-verification", resourceId: tree.resource.id, path: tree.root, preparedRevision: frozen[0]!.sequence, operationRevision: frozen[1]!.sequence });
+    const release = await fetch(`http://localhost/api/sessions/${f.session.id}/task/resources`, { unix: f.socket, method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key: tree.resource.key, kind: tree.resource.kind, purpose: tree.resource.purpose, externalId: tree.root, state: "released", metadata: tree.resource.metadata }) });
+    expect(release.status).toBe(409);
+    expect((await release.json() as { error: string }).error).toContain("original Ready state");
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(200);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: RETAINED_TOOLING_TREE } })).toBe(1);
+    git(f.root, "worktree", "remove", f.worktree);
+    const confirmed = await f.request("confirm-finalization", f.input);
+    expect(confirmed.status).toBe(200);
+    expect(confirmed.data.preparedRevision).toBe(frozen[0]!.sequence);
+    expect(await readFile(path.join(tree.root, "result.json"), "utf8")).toBe('{"actualCommand":"passed"}\n');
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: tree.resource.id } })).toEqual(tree.resource);
+    expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: proof.sequence } })).toEqual(proof);
+  } finally { await f.server.stop(true); }
+}, 30_000);
+
+test.each(["bytes", "new-member", "inode", "hardlink", "mode", "shared-resource", "source-overlap", "recorded-file"])("retained tooling directory refuses %s without replacing its proof", async change => {
+  const f = await fixture("local-only"), tree = await retainedTree(f);
+  try {
+    if (change === "source-overlap") await db.prisma.remoteTaskResource.update({ where: { id: tree.resource.id }, data: { externalId: f.worktree } });
+    if (change === "recorded-file") await db.prisma.remoteTaskResource.update({ where: { id: tree.resource.id }, data: { metadata: { sha256: "a".repeat(64), size: 25 } } });
+    if (change === "shared-resource") await db.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "overlap", kind: "evidence", purpose: "tooling", state: "ready", externalId: path.join(tree.root, "result.json") } });
+    if (["source-overlap", "recorded-file", "shared-resource"].includes(change)) {
+      expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
+      expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: RETAINED_TOOLING_TREE } })).toBe(0);
+      return;
+    }
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(200);
+    const proof = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: RETAINED_TOOLING_TREE } });
+    const file = path.join(tree.root, "result.json");
+    if (change === "bytes") await writeFile(file, "changed\n");
+    if (change === "new-member") await writeFile(path.join(tree.root, "late.json"), "{}\n");
+    if (change === "inode") { await rename(file, path.join(directory, "original.json")); await writeFile(file, '{"actualCommand":"passed"}\n', { mode: 0o600 }); }
+    if (change === "hardlink") await link(file, path.join(directory, "shared.json"));
+    if (change === "mode") await chmod(tree.root, 0o777);
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
+    git(f.root, "worktree", "remove", f.worktree);
+    expect((await f.request("confirm-finalization", f.input)).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: proof.sequence } })).toEqual(proof);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-confirmed" } })).toBe(0);
+    expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: tree.resource.id } })).state).toBe("ready");
+  } finally { await f.server.stop(true); }
+}, 30_000);
+
+test("confirmation cannot first observe a tooling directory after failed preparation and source removal", async () => {
+  const f = await fixture("local-only"), tree = await retainedTree(f);
+  try {
+    await symlink(path.join(tree.root, "result.json"), path.join(tree.root, "unsafe-link"));
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
+    await rm(path.join(tree.root, "unsafe-link"));
+    git(f.root, "worktree", "remove", f.worktree);
+    expect((await f.request("confirm-finalization", f.input)).status).toBe(409);
+    expect((await f.request("prepare-finalization", f.input)).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: [RETAINED_TOOLING_TREE, "finalization-confirmed"] } } })).toBe(0);
+    expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: tree.resource.id } })).toEqual(tree.resource);
   } finally { await f.server.stop(true); }
 }, 30_000);
 

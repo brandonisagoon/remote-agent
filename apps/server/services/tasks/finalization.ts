@@ -1,5 +1,6 @@
 import { ensureLocalCleanupReference } from "./local-cleanup-reference.ts";
 import { verifyRetainedToolingEvidence } from "./legacy-evidence.ts";
+import { verifyRetainedToolingTree } from "./retained-tooling-tree.ts";
 import { legacyOriginalWorkReceipt, assertLegacyOriginalWorkAuthority } from "./legacy-original-work.ts";
 import { ensureLegacyComposeRetention, legacyComposeRetentionReceipt } from "./legacy-compose-finalization.ts";
 import { assertNoRemainingConsumers } from "./work-map-state.ts";
@@ -306,7 +307,9 @@ async function prepareCleanupFinalization(input: FinalizationContext, dependenci
   // Historical adoption remains an immutable artifact reference, not a mandate
   // to archive or capture the finished source again before deleting it.
   await observePreparedFilesystem(input, candidate.prepared, dependencies);
-  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
+  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared, resourceId => verifyRetainedToolingTree({
+    prisma: input.prisma, active, resourceId, record: !confirmed, assertAuthority: prisma => assertPreparedCleanup({ ...input, prisma }),
+  }));
   if (confirmed) await assertFinalizationRemoved(active.prepared);
   await assertPreparedCleanup(input);
   const retainedCompose = await ensureLegacyComposeRetention(input, active, !confirmed);
@@ -325,7 +328,9 @@ async function confirmCleanupFinalization(input: FinalizationContext) {
   const archiveRetention = await verifyPreparedArchives(input.prisma, input.config, active.prepared);
   const legacyOriginalWork = await legacyOriginalWorkReceipt(input.prisma, active.prepared, active.preparation.sequence);
   await assertFinalizationRemoved(active.prepared);
-  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared);
+  await verifyRetainedToolingEvidence(input.prisma, input.config, active.prepared, resourceId => verifyRetainedToolingTree({
+    prisma: input.prisma, active, resourceId, record: false, assertAuthority: prisma => assertPreparedCleanup({ ...input, prisma }),
+  }));
   const retainedCompose = await ensureLegacyComposeRetention(input, active, false);
   return input.prisma.$transaction(async tx => {
     const latest = await assertPreparedCleanup({ ...input, prisma: tx });

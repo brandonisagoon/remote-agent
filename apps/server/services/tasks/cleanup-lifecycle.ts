@@ -325,6 +325,9 @@ export async function assertCleanupResourceUpdate(input: { prisma: Database; con
   if (input.sessionId !== task.primarySessionId) throw new Error("Only the original primary may update active cleanup receipts");
   const saved = CleanupOperation.parse(JSON.parse(operation.value!)).binding.resources.find(record => record.id === resource.id);
   if (!saved || saved.key !== resource.key || saved.kind !== resource.kind || saved.purpose !== resource.purpose || saved.externalId !== resource.externalId) throw new Error("Cleanup resource scope changed");
+  if (next.state !== "ready" && await input.prisma.runtimeMetadataEvent.findFirst({ where: {
+    runtimeSessionId: task.primarySessionId!, source: `finalizer:${task.id}`, action: "finalization-retained-tooling-tree", key: resource.id,
+  } })) throw new Error("Retained tooling directory must keep its original Ready state");
   // Pausing still allows an adapter to record that retained compute stopped.
   // An observation-only write never grants a lifecycle effect or changes state.
   if (next.state === resource.state && next.expiresAt?.getTime() === resource.expiresAt?.getTime()
