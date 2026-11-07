@@ -29,6 +29,14 @@ version-1 capability manifest. Version 1 declares:
 ```
 
 `serverProtocol` is an integer protocol range, not a server package version.
+Protocol 2 adds exact unclaimed saved-resource observation and producer
+confirmation after saved resume, including measured Compose enrollment.
+Adapters using those semantics require protocol 2; a protocol-1 server rejects
+their preparation before activation. The updated server supports 1 through 2,
+so existing protocol-1 bindings and retained consumers continue on their
+original releases. The operation envelope and state-format versions do not
+change. Deployment compatibility also refuses a rollback that cannot execute
+an active or retained protocol-2 consumer.
 Every declared writer format must also be readable. Format identifiers describe
 persisted tooling data, not application database versions. Add other format
 families only after inventorying their actual readers. A candidate must declare
