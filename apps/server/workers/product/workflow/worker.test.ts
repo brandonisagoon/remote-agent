@@ -20,6 +20,7 @@ const ISSUE: SourceIssueWithAgentIssues = {
   branchName: "feature/fix-cube-42",
   state: { name: "Planning", type: "started" },
   updatedAt: new Date(Date.now() - 600_000).toISOString(),
+  documentContent: { id: "description-id", updatedAt: new Date(Date.now() - 600_000).toISOString() },
   labels: { nodes: [] },
   agentIssues: [],
 } as unknown as SourceIssueWithAgentIssues;

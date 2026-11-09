@@ -64,6 +64,7 @@ const GET_SOURCE_ISSUE_FOR_WORKFLOW = `
   query SourceIssueForWorkflow($id: String!) {
     issue(id: $id) {
       updatedAt
+      documentContent { id updatedAt }
       id
       identifier
       branchName
@@ -147,9 +148,15 @@ export async function getSourceIssueForPlanCapture(
 export async function getSourceIssueForWorkflow(
   config: ServerConfig,
   query: { id: string },
-): Promise<SourceIssueWithAgentIssues | null> {
+): Promise<SourceIssueForWorkflow | null> {
   return getSourceIssueForUpdate(config, query);
 }
+
+export type SourceIssueForWorkflow = SourceIssueWithAgentIssues & {
+  updatedAt?: string | null;
+  documentContent?: { id: string; updatedAt: string } | null;
+  state: { name: string; type?: string | null };
+};
 
 export async function getSourceIssueForUpdate(
   config: ServerConfig,
@@ -169,6 +176,8 @@ export async function getSourceIssueForUpdate(
 
 export type SourceIssueForUpdate = SourceIssueWithAgentIssues & {
   updatedAt?: string;
+  /** Description content revision, not the issue's activity timestamp. */
+  documentContent?: { id: string; updatedAt: string } | null;
   state: { id: string; name: string; type: string };
   team: { states: { nodes: Array<{ id: string; name: string; type: string }> } };
 };

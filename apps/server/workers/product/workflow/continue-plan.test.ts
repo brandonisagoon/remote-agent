@@ -79,11 +79,12 @@ function rocket(data: Record<string, unknown> = { userId: OWNER, createdAt: new 
   } as never;
 }
 
-function continuationWorker(f: Awaited<ReturnType<typeof fixture>>, description = "Original screenshot\n## Implementation Plan\nFix stacking", react = async () => true) {
+function continuationWorker(f: Awaited<ReturnType<typeof fixture>>, description = "Original screenshot\n## Implementation Plan\nFix stacking", react = async () => true, readComments = async (): Promise<[] | null> => []) {
   return createWorkflowWorker({
     getIssue: async () => ({ id: "issue", identifier: "DRA-8", title: "Fix lot", description, state: { name: "Todo", type: "unstarted" },
-      updatedAt: new Date(Date.now() - 600_000).toISOString() }) as never,
-    readComments: async () => [],
+      updatedAt: new Date(Date.now() - 600_000).toISOString(),
+      documentContent: { id: "description-id", updatedAt: new Date(Date.now() - 600_000).toISOString() } }) as never,
+    readComments,
     react,
     postWorktreeComment: async () => { throw new Error("Existing thread must stay bound"); },
     compose: f.input.compose,
@@ -123,6 +124,25 @@ test("rocket continues the planned primary on Astra, preserving task, worktree a
   expect(recorded).toMatchObject({ provider: "codex", model: "gpt-6-astra", previousWorkflowId: "plan", workflowId: "implement",
     intent: { mode: "execution", requestKey: "rocket-run", actorId: OWNER, authority: "verified" } });
   expect((await db.prisma.runtimeMetadataEvent.findFirst({ where: { action: "workflow-handoff" } }))?.value).toContain("original-plan-record");
+});
+
+test("evidence recovery continues the same planned primary through its durable inbox once", async () => {
+  const f = await fixture();
+  let reads = 0;
+  const worker = continuationWorker(f, "Issue writing only; leave in Backlog.", undefined, async () => ++reads === 1 ? null : []);
+  expect((await worker.execute(rocket(), f.input.context)).status).toBe("delivered");
+  await f.settle();
+  const current = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.originalTask.id } });
+  for (const key of ["id", "requestKey", "primarySessionId", "worktreePath", "toolingRevision", "pinnedToolingRoot"] as const) expect(current[key]).toBe(f.originalTask[key]);
+  expect(reads).toBe(2);
+  expect(await db.prisma.remoteTask.count()).toBe(1);
+  expect(await db.prisma.runtimeSession.count()).toBe(1);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(1);
+  expect(f.runtime.sentMessages).toHaveLength(1);
+  const instruction = await db.prisma.runtimeInstruction.findFirstOrThrow();
+  expect(instruction.text).toBe(f.runtime.sentMessages[0]!.text);
+  expect(instruction.text).toContain("are history from before this request");
+  expect(instruction.text).not.toContain("wait for an owner decision");
 });
 
 test("a same-provider continuation exits plan mode and selects the execution model", async () => {
