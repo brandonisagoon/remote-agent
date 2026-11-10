@@ -1,4 +1,5 @@
 import path from "node:path";
+import { assertConnectorOwnership } from "./connector-ownership.ts";
 import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
 import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
 import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
@@ -63,6 +64,7 @@ async function current(input: Context, allowConfirmedClosed = false) {
   // These are local ownership checks, including at compact renewal boundaries.
   const root = task.worktreePath, within = (file: string) => file === root || file.startsWith(`${root}${path.sep}`);
   await assertRegisteredPathSharing(input.prisma, task.id, [root]);
+  await assertConnectorOwnership(input.prisma, task.id, task.machineId);
   const ancestors: string[] = [];
   for (let cursor = root; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
   if (await input.prisma.remoteTask.findFirst({ where: { id: { not: task.id }, OR: [

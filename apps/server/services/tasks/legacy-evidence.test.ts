@@ -26,8 +26,8 @@ afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: tru
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 function git(cwd: string, ...args: string[]) { const command = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (command.exitCode) throw new Error(command.stderr.toString()); return command.stdout.toString().trim(); }
 
-async function fixture(options: { taskId?: string; directoryEvidence?: boolean; directoryPurpose?: "development" | "review"; files?: number; privateBackup?: boolean; beforePrepare?: (task: RemoteTask) => Promise<void> } = {}) {
-  const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, "DRA-99"), archive = path.join(directory, "retained");
+async function fixture(options: { historicalSizeBytes?: boolean; taskId?: string; directoryEvidence?: boolean; directoryPurpose?: "development" | "review"; files?: number; privateBackup?: boolean; beforePrepare?: (task: RemoteTask) => Promise<void> } = {}) {
+  const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, options.historicalSizeBytes ? `dra52-${options.taskId ?? "task"}-evidence` : "DRA-99"), archive = path.join(directory, "retained");
   for (const dir of [root, historical, archive]) await mkdir(dir, { mode: 0o700 });
   git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
   await writeFile(path.join(root, "README.md"), "accepted\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture"); git(root, "worktree", "add", "-b", "codex/legacy", worktree);
@@ -46,7 +46,7 @@ async function fixture(options: { taskId?: string; directoryEvidence?: boolean; 
   for (const [index, body] of Array.from({ length: options.files ?? 2 }, (_, index) => index === 0 ? "saved capture\n" : index === 1 ? "sentinel without historical proof\n" : `sentinel ${index}\n`).entries()) {
     const name = `evidence-${index}.txt`, original = path.join(historical, name), retained = path.join(archive, name);
     await writeFile(original, body, { mode: 0o600 }); await copyFile(original, retained); await chmod(retained, 0o600);
-    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: `capture-${index}`, kind: "evidence", purpose: index === 0 ? "development" : "browser", externalId: original, state: "ready", metadata: index === 0 ? { sha256: sha(body), bytes: Buffer.byteLength(body), description: "original receipt" } : { description: "legacy sentinel" } } }));
+    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: `capture-${index}`, kind: "evidence", purpose: index === 0 ? "development" : "browser", externalId: original, state: "ready", metadata: options.historicalSizeBytes ? { sha256: sha(body), sizeBytes: Buffer.byteLength(body), description: "original receipt" } : index === 0 ? { sha256: sha(body), bytes: Buffer.byteLength(body), description: "original receipt" } : { description: "legacy sentinel" } } }));
     files.push({ path: name, sha256: sha(body), bytes: Buffer.byteLength(body) });
   }
   let treeResource: RemoteTaskResource | undefined;
@@ -140,10 +140,21 @@ test("generic resource writes and metadata claims cannot fabricate retained reti
 });
 
 test.each([
-  { bytes: 1, size: 2 }, { bytes: -1 }, { sha256: "invalid" }, { sha256: "0".repeat(64) },
+  { bytes: 1, size: 2 }, { bytes: 1, sizeBytes: 2 }, { sizeBytes: -1 }, { bytes: -1 }, { sha256: "invalid" }, { sha256: "0".repeat(64) },
 ])("conflicting or changed historical proof is refused: %j", async (metadata) => {
   const f = await fixture(); await db.prisma.remoteTaskResource.update({ where: { id: f.resources[0]!.id }, data: { metadata } });
   await expect(f.adopt()).rejects.toThrow(); expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "legacy-evidence-retained" } })).toBe(0);
+});
+
+test.each(["bytes", "byteSize", "size", "sizeBytes"])("retention adoption verifies %s and preserves the historical receipt", async sizeKey => {
+  const f = await fixture();
+  const original = f.resources[0]!;
+  const previous = original.metadata as { sha256: string; bytes: number };
+  const metadata = { sha256: previous.sha256, [sizeKey]: previous.bytes, description: "Unchanged historical receipt" };
+  await db.prisma.remoteTaskResource.update({ where: { id: original.id }, data: { metadata } });
+  const receipt = await f.adopt();
+  expect(receipt.proof.entries.find(entry => entry.resourceId === original.id)?.recorded).toEqual({ sha256: previous.sha256, size: previous.bytes });
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata).toEqual(metadata);
 });
 
 test("changed original or retained bytes cannot be authorized or confirmed", async () => {
@@ -240,6 +251,29 @@ test("an original retained tooling parent is not a whole-tree cleanup operation"
 });
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+
+test.skipIf(!draftedRoot)("DRA52 seven-file sizeBytes receipts keep their registered directory and original cleanup binding", async () => {
+  const f = await fixture({ files: 7, historicalSizeBytes: true }), receipt = await f.adopt();
+  const originalPrepare = legacyEvidenceDependencies.prepare;
+  legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const server = Bun.serve({ unix: path.join(directory, "dra52-evidence.sock"), fetch: f.app.fetch });
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageEvidenceResource } = await import(path.join(draftedRoot!, "src/evidence-resources.ts"));
+    const registry = taskRegistry(path.join(directory, "dra52-evidence.sock"), f.task.id);
+    expect(f.historical.split(path.sep)).not.toContain(f.task.id);
+    for (const original of f.resources) {
+      expect((await manageEvidenceResource({ registry, key: original.key, action: "release" })).observed).toBe("evidence-retired-archive-retained");
+      expect((await manageEvidenceResource({ registry, key: original.key, action: "release" })).state).toBe("released");
+      expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata).toEqual(original.metadata);
+    }
+    expect(await prepareTaskFinalization(f.finalInput, f.dependencies)).toEqual(f.prepared);
+    for (const entry of receipt.proof.entries) {
+      expect(await lstat(entry.target.path).catch(() => null)).toBeNull();
+      if (entry.target.type === "file") expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
+    }
+  } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+});
 test("saved evidence supplements an already bound cleanup without replacing its original records", async () => {
   const f = await fixture({ privateBackup: true });
   const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);

@@ -40,6 +40,9 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
   z.strictObject({ ...Common, kind: z.literal("cloudflare-tunnel"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/) }), name: z.string().min(1) }),
   z.strictObject({ ...Common, kind: z.literal("cloudflare-ingress-route"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/), tunnelId: z.string().min(1) }), hostname: z.string().min(1), routeDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-ingress-route"), scope: z.strictObject({ ...Scope, configFile: Absolute, tunnelId: Nonempty }), hostname: Nonempty, sourceDigest: Hash, routeDigest: Hash }),
+  z.strictObject({ ...Common, kind: z.literal("cloudflared-connector"), scope: z.strictObject({ ...Scope, purpose: z.enum(["development", "review"]), configFile: Absolute, pidFile: Absolute, tunnelId: z.uuid() }),
+    identity: z.strictObject({ process: z.strictObject({ pid: z.number().int().positive(), start: Nonempty, uid: z.number().int().nonnegative(), cwd: Absolute, executable: Absolute, argvDigest: Hash }),
+      configDigest: Hash, credentialsDigest: Hash, pidFileDigest: Hash }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("native-family"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), proof: z.strictObject({ file: Absolute, sha256: Hash }), planDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-endpoint"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), url: z.url(), nativeProofDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("browser-session"), scope: z.strictObject({ ...Scope, namespace: z.literal("drafted") }),
@@ -56,7 +59,7 @@ export function cleanupTargetDigest(target: Omit<CleanupTarget, "identityDigest"
   const { identityDigest: _, ...identity } = target as CleanupTarget;
   return cleanupDigest(identity);
 }
-export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk", "vault"]);
+export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk", "vault", "connector"]);
 export const CleanupObserverResource = z.strictObject({ id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.string().min(1), externalId: z.string().min(1), state: z.string(), expiresAt: z.string().nullable(), metadata: z.json().nullable() });
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])) : value;
 export const cleanupDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");

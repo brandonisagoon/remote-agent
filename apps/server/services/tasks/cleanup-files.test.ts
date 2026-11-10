@@ -21,6 +21,14 @@ async function fixture(kind = "evidence") {
     return plan;
   }, verify: (plan: FinalizationResourcePlan[], removed = false, observation = quiet) => assertFinalizationResources({ taskId: "task", resources, plan, removed, originalWork: true }, observation) };
 }
+
+test.each(["bytes", "byteSize", "size", "sizeBytes"])("standalone cleanup reads %s and rejects a conflicting retained identity", async key => {
+  const f = await fixture();
+  f.resources[0]!.metadata = { sha256: sha("original retained bytes\n"), [key]: 24 };
+  expect((await f.prepareDeletion())[0]!.disposition).toBe("retire-file");
+  f.resources[0]!.metadata = { sha256: sha("original retained bytes\n"), [key]: 24, sizeBytes: 25 };
+  await expect(f.prepareDeletion()).rejects.toThrow();
+});
 async function checkpoint() {
   const f = await fixture("source-checkpoint"), root = path.join(f.directory, "checkpoint"); await mkdir(root, { mode: 0o755 }); await chmod(root, 0o755);
   await mkdir(path.join(root, "original")); await writeFile(path.join(root, "original/source.ts"), "source bytes\n");

@@ -10,6 +10,7 @@ import { constants } from "node:fs";
 import { lstat, open, readFile, readlink, readdir, realpath } from "node:fs/promises";
 import net from "node:net";
 import path from "node:path";
+import { recordedEvidenceIdentity } from "./evidence-receipt.ts";
 import { z } from "zod";
 import { bunCommandClient } from "../../transports/command/index.ts";
 
@@ -389,8 +390,8 @@ export async function prepareFinalizationResources(input: { resources: Finalizat
     } else if (resource.kind === "evidence") {
       if (!inside(root, resource.externalId)) throw new Error("Legacy evidence is outside the adopted source root");
       const identity = await fileIdentity(resource.externalId);
-      const size = metadata.size ?? metadata.byteSize;
-      if (metadata.size !== undefined && metadata.byteSize !== undefined && metadata.size !== metadata.byteSize || size !== identity.size || metadata.sha256 !== identity.sha256) throw new Error("Recorded evidence bytes do not match their receipt");
+      const recorded = recordedEvidenceIdentity(metadata);
+      if (recorded.size !== identity.size || recorded.sha256 !== identity.sha256) throw new Error("Recorded evidence bytes do not match their receipt");
       allowed.push(resource.externalId); managedFiles.set(resource.externalId, resource.id);
       plan.push(FinalizationResourcePlan.parse({ ...common, disposition: "retire-owned", dependencies: [], target: { type: "file", path: resource.externalId, root, ...identity } }));
     } else if (resource.kind === "browser-profile") {

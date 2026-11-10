@@ -5,6 +5,9 @@ import { CleanupRetryDeferred } from "../../services/tasks/cleanup-retry.ts";
 import { deliverInstructions } from "../../services/sessions/inbox.ts";
 import { archiveRetentionProjection, assertArchiveResourceUpdate } from "../../services/tasks/archive-retention.ts";
 import { Hono } from "hono";
+import { validateEvidenceReceipt } from "../../services/tasks/evidence-receipt.ts";
+import { validateConnectorReceipt } from "../../services/tasks/connector-receipt.ts";
+import { assertConnectorOwnership } from "../../services/tasks/connector-ownership.ts";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { taskForSession } from "../../services/tasks/store.ts";
@@ -315,6 +318,14 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
   try {
     const development = await developmentResourceSelection({ prisma, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, key, values.state);
     const resource = await prisma.$transaction(async (tx) => {
+      if (["evidence", "cloudflared-connector"].includes(data.kind)) {
+        const previous = await tx.remoteTaskResource.findUnique({ where: { taskId_key: { taskId: task.id, key } } });
+        if (data.kind === "evidence") validateEvidenceReceipt(data.metadata ?? previous?.metadata, previous !== null);
+        else {
+          validateConnectorReceipt(data.externalId, data.metadata ?? previous?.metadata, previous !== null, { taskId: task.id, purpose: data.purpose });
+          await assertConnectorOwnership(tx, task.id, task.machineId, { key, externalId: data.externalId });
+        }
+      }
       const existing = await tx.remoteTaskResource.upsert({
         where: { taskId_key: { taskId: task.id, key } }, create: { taskId: task.id, key, ...values }, update: {},
       });

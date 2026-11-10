@@ -1,3 +1,4 @@
+import { recordedEvidenceIdentity } from "./evidence-receipt.ts";
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import path from "node:path";
@@ -32,8 +33,9 @@ export async function prepareStandaloneFiles(input: { resources: FinalizationRes
     const recordedHash = resource.kind === "scenario-fixture" && metadata?.sha256 && typeof metadata.sha256 === "object"
       ? z.record(z.string(), z.string().regex(/^[a-f0-9]{64}$/)).parse(metadata.sha256)[path.basename(file)] : metadata?.sha256;
     if (resource.kind === "scenario-fixture" && metadata?.sha256 !== undefined && recordedHash === undefined) throw new Error("Scenario fixture digest map lacks its exact registered file");
-    if (recordedHash !== undefined && recordedHash !== frozen.sha256
-      || [metadata?.bytes, metadata?.size, metadata?.byteSize].some(size => size !== undefined && size !== frozen.size)) throw new Error("Standalone file differs from its recorded bytes");
+    const recorded = recordedEvidenceIdentity({ ...metadata, sha256: recordedHash });
+    if (recorded.sha256 !== undefined && recorded.sha256 !== frozen.sha256
+      || recorded.size !== undefined && recorded.size !== frozen.size) throw new Error("Standalone file differs from its recorded bytes");
     const edges = captureAdapterDependencies(file, input.resources, input.plan), directory = path.join(path.dirname(file), `.drafted-evidence-${randomUUID()}`);
     if (input.protectedPaths.some(root => overlaps(root, directory)) || input.resources.some(other => path.isAbsolute(other.externalId) && overlaps(other.externalId, directory))
       || input.plan.some(entry => entry.disposition === "retain-archive" && overlaps(entry.archive.root, directory))) throw new Error("Standalone capture destination overlaps retained or protected material");

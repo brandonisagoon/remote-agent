@@ -92,3 +92,33 @@ operation IDs, resource/data identities and three-app cap. Installation,
 activation, server restart, live configuration changes, provider mutations and
 existing-task continuation are a separate controlled rollout. No issue is Done
 based only on these source tests.
+
+## November 10 cleanup and deployment-reader checkpoint
+
+RA-31 now has matching registration/cleanup evidence readers for `bytes`,
+`byteSize`, `size` and `sizeBytes`, including standalone, contained and retained
+files. New incomplete or conflicting file receipts fail before registration.
+Historical fields and original accepted cleanup requests remain unchanged.
+Dedicated connector receipts have a versioned complete process identity and a
+matching observer contract; unresolved duplicate PID claims on the same host
+block registration and cleanup renewal. Drafted owns the identity-bound signal
+and connection-checked provider deletion within the existing finalizer.
+
+The paired server/tooling fixture passed 167 tests with 701 assertions. It
+includes a seven-file DRA-52-shaped historical directory using `sizeBytes`, the
+actual control socket and retained-evidence adapter, replay, original binding
+preservation, and unchanged archive copies. Tooling's focused 11-suite run
+passed 165 tests with 987 assertions. Both repositories typecheck. Connector
+and Cloudflare effects remain synthetic in this batch. Combined original-task
+connector/finalizer acceptance, clean final full gates and deployed acceptance
+are still required; RA-31 remains Implementing.
+
+CI at `45670ab` failed a different deployment snapshot case: 3,141 passes,
+154 skips and one failure. Native database handles from the compatibility read
+could remain open after close, making the following WAL snapshot correctly
+refuse quiescence. A separate-process regression reproduced that failure without
+forced GC or sleeps, even after replacing the detached read transaction. The
+management read now runs in an awaited read-only Bun child, ending every handle
+before snapshotting. All 14 deployment/rollback tests now pass, with 72 assertions,
+including real-holder refusal and committed-WAL restoration. The snapshot guard
+was not weakened, and no live deployment ran. Full CI at the new source is pending.
