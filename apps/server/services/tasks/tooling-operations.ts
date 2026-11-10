@@ -279,6 +279,7 @@ const LOCAL_SERVICE_STOP: Record<"development" | "finalization", ToolingCallback
 export const TOOLING_CALLBACK_CLASSIFICATION = [
   ...TOOLING_CALLBACKS.map(callback => ({ route: callback.route, rule: "operation" as const, kind: callback.kind as string })),
   { route: "POST /api/sessions/:sessionId/local-service-stop-authority", rule: "operation" as const, kind: "development-intent (with development) | finalization" },
+  { route: "POST /api/sessions/:sessionId/task/runtime-health", rule: "evidence" as const, kind: "bound adapter-command", reason: "Records observed runtime health and an idempotent original-primary notice; never executes a provider or admits capacity." },
   { route: "PUT /api/sessions/:sessionId/task/resources", rule: "evidence" as const, kind: "optional; validated when present",
     reason: "Records resource receipts only; cleanup/development transitions keep their executing-turn and intent checks. Ordinary evidence registration is never blocked." },
   { route: "POST /api/tasks/:taskId/automation", rule: "owner-control" as const, kind: "none",
@@ -309,7 +310,8 @@ export function matchToolingCallback(method: string, pathname: string, body?: Bo
   return null;
 }
 const RESOURCE_REGISTRATION = sessionPath("task/resources");
-export const isToolingCallbackPath = (method: string, pathname: string) => method === "PUT" && RESOURCE_REGISTRATION.test(pathname)
+const RUNTIME_HEALTH = sessionPath("task/runtime-health");
+export const isToolingCallbackPath = (method: string, pathname: string) => method === "POST" && RUNTIME_HEALTH.test(pathname) || method === "PUT" && RESOURCE_REGISTRATION.test(pathname)
   || method !== "GET" && (sessionPath("local-service-stop-authority").test(pathname) || TOOLING_CALLBACKS.some(callback => callback.method === method && callback.path.test(pathname)));
 
 export type ToolingOperationDependencies = {
@@ -878,11 +880,13 @@ async function assertBindingAuthority(input: { prisma: PrismaClient; config: Ser
 export async function admitToolingCallback(input: { prisma: PrismaClient; config: ServerConfig; method: string; pathname: string; header: string | undefined; body: Body },
   dependencies: ToolingOperationDependencies = toolingOperationDependencies): Promise<CallbackAdmission | null> {
   const store = input.prisma as unknown as Store;
-  if (input.method === "PUT" && RESOURCE_REGISTRATION.test(input.pathname)) {
-    if (!input.header) return null;
-    const sessionId = decodeURIComponent(RESOURCE_REGISTRATION.exec(input.pathname)![1]!);
+  const health = input.method === "POST" && RUNTIME_HEALTH.test(input.pathname);
+  if (health || input.method === "PUT" && RESOURCE_REGISTRATION.test(input.pathname)) {
+    if (!input.header) { if (health) throw refuse("operation-required", "Runtime health requires its bound adapter command"); return null; }
+    const sessionId = decodeURIComponent((health ? RUNTIME_HEALTH : RESOURCE_REGISTRATION).exec(input.pathname)![1]!);
     const binding = await dependencies.read({ prisma: input.prisma, operationId: input.header });
     if (!binding || binding.sessionId !== sessionId) throw refuse("operation-ownership", "Resource evidence names an operation of another session");
+    if (health && binding.kind !== "adapter-command") throw refuse("operation-mismatch", "Runtime health requires its bound adapter command");
     // A closed resource release updates only its own exact existing receipt;
     // identity and cleanup transitions are rechecked by the handler.
     if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND && (input.body.key !== binding.resourceKey || ["bound", "running", "unknown"].indexOf(binding.status) < 0)) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);

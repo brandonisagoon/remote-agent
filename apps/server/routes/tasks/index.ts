@@ -1,3 +1,4 @@
+import { RuntimeHealthInput, recordRuntimeHealth } from "../../services/tasks/runtime-health.ts";
 import { taskPublicationContext } from "../../services/sessions/task-publication.ts";
 import { publishCleanupStatus } from "../../services/tasks/cleanup-status.ts";
 import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
@@ -289,6 +290,13 @@ const Progress = z.object({
   environmentStatus: z.enum(["pending", "preparing", "ready", "degraded", "stopped"]).optional(),
   recoveryDetail: z.string().max(8000).nullable().optional(),
 }).strict();
+
+sessionTaskRoutes.post("/:sessionId/task/runtime-health", async c => {
+  const input = RuntimeHealthInput.safeParse(await c.req.json().catch(() => null));
+  if (!input.success) return c.json({ error: "Invalid runtime health observation" }, 400);
+  try { return c.json(await recordRuntimeHealth(c.get("prisma"), c.req.param("sessionId"), input.data)); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 sessionTaskRoutes.patch("/:sessionId/task", async (c) => {
   const parsed = Progress.safeParse(await c.req.json());

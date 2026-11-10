@@ -27,6 +27,7 @@ export function readDeploymentState(file: string) {
     if (table("RuntimeMetadataEvent")) {
       // Include accepted preparations and interrupted journals. History is
       // immutable and can be reread after completion; no status erases a reader.
+      if (db.query("SELECT 1 FROM RuntimeMetadataEvent WHERE action = 'runtime-health' LIMIT 1").get()) contracts.add("runtime-health/v1");
       const kinds = db.query("SELECT DISTINCT j.value FROM RuntimeMetadataEvent e, json_tree(CASE WHEN json_valid(e.value) THEN e.value ELSE 'null' END) j WHERE j.key = 'kind' AND j.value IN ('clerk-assignment', 'configuration-completion/v1')").all() as Array<{ value: string }>;
       if (kinds.some(row => row.value === "clerk-assignment")) contracts.add("clerk-assignment/v1");
       if (kinds.some(row => row.value === "configuration-completion/v1")) contracts.add("configuration-completion/v1");

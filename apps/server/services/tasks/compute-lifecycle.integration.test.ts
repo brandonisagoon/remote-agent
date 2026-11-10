@@ -444,3 +444,43 @@ test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "repair-availabl
   expect(after).toMatchObject({ id: before.id, primarySessionId: before.primarySessionId, worktreePath: before.worktreePath, toolingRevision: before.toolingRevision });
   expect(f.effects.filter(value => value === "create")).toHaveLength(1);
 }, 30_000);
+
+test.skipIf(!clientRoot)("RA-33 actual Unix recovery retains admission and data and replays a lost report without a second restart", async () => {
+  const f = await fixture();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
+  const offer = await f.deliver();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
+  await f.settled(offer);
+  const original = f.container().id, stores = structuredClone([...f.remote]);
+  const operations = await import(path.join(clientRoot!, "src/tooling-operation.ts"));
+  const { reconcileRuntimeHealth } = await import(path.join(clientRoot!, "src/runtime-health.ts"));
+  const tree = git(f.tooling, "rev-parse", "HEAD^{tree}");
+  await f.prisma.toolingRelease.create({ data: { id: "paired-health-release", repositoryId: f.task.repositoryId, revision: f.toolingRevision, tree,
+    policyBlob: git(f.tooling, "rev-parse", "HEAD:runtime.md"), checkout: f.checkout, manifest: f.toolingManifest, lockfileDigest: "0".repeat(64), bunVersion: Bun.version } });
+  await f.prisma.toolingLegacyBoundary.create({ data: { repositoryId: f.task.repositoryId, activationRequestKey: "health-boundary", legacyRevision: f.toolingRevision, recordedAt: new Date() } });
+  await f.prisma.toolingSelection.create({ data: { repositoryId: f.task.repositoryId, generation: 1, releaseId: "paired-health-release", activatedAt: new Date() } });
+  const client = operations.toolingOperationClient(f.socket), requestKey = "original-health-sweep";
+  const guard = await operations.guardToolingOperation({ client, task: f.task, kind: "adapter-command", inputDigest: canonicalDigest({ key: "runtime-development" }), requestKey,
+    release: async () => ({ checkout: f.checkout, revision: f.toolingRevision, tree, manifest: f.toolingManifest }) });
+  const session = new operations.ToolingOperationSession(guard, { client, task: f.task, commandRequestKey: requestKey, socket: f.socket, settlementDirectory: f.root });
+  f.control.bindControlOperation(session); cleanup.push(async () => f.control.bindControlOperation(null));
+  const exit = { kind: "launcher-crash", containerId: original, image: f.container().image, createdAt: f.container().createdAt,
+    startedAt: "2026-11-10T00:00:00Z", finishedAt: "2026-11-10T00:21:00Z", exitCode: 133, oomKilled: false, bunVersion: "1.3.11" };
+  Object.assign(f.input.docker, { diagnoseExit: async () => f.container().running ? undefined : exit });
+  f.container().running = f.physical.running = false; await f.sync(); f.effects.length = 0;
+  const report = f.registry.reportRuntimeHealth; let lost = true;
+  f.registry.reportRuntimeHealth = async (value: any) => { const result = await report(value); if (value.notify && lost) { lost = false; throw new Error("Lost recovered report reply"); } return result; };
+  const manage = (value: any) => f.client.manageRuntimeResource(value, (input: any) => f.client.manageRuntime({ ...f.input, ...input }));
+  const recover = () => reconcileRuntimeHealth({ registry: f.registry, key: "runtime-development" }, manage);
+  await expect(recover()).rejects.toThrow("Lost recovered report reply");
+  const notices = () => f.prisma.runtimeInstruction.count({ where: { sessionId: f.task.primarySessionId!, id: { startsWith: "runtime-health:" } } });
+  expect(await notices()).toBe(1);
+  await f.prisma.$disconnect(); expect((await recover()).outcome).toBe("running"); expect(await notices()).toBe(1);
+  expect(f.effects.filter(effect => effect === "start")).toHaveLength(1);
+  expect(f.effects.filter(effect => effect.startsWith("create") || effect === "exec")).toEqual([]);
+  expect(f.container().id).toBe(original); expect([...f.remote]).toEqual(stores);
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).environmentStatus).toBe("ready");
+  expect(await f.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, key: "runtime-health-development", kind: "evidence" } })).toBe(1);
+  await session.complete(); f.control.bindControlOperation(null);
+}, 120_000);

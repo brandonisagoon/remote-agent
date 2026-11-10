@@ -64,7 +64,10 @@ export async function serializeIssuePublication<T>(key: string, publish: () => P
 async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof issueUpdateSource>>, client: typeof issueUpdateDelivery, native?: NativePublication) {
   const { prisma, sessionId } = input;
   const { session, link, config, issue } = source;
-  await assertTaskOpen(prisma, session.cwd);
+  // A settled native owner reports through its stronger receipt-bound guard
+  // while managed sessions remain paused. Session callers cannot supply it.
+  const assertPublisher = () => native ? native.assertAuthority() : assertTaskOpen(prisma, session.cwd);
+  await assertPublisher();
   const current = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
   if (current.status === "closed" || current.role === "delegate") throw new Error("Only an open primary session may publish source-issue updates");
   const task = await taskForSession(prisma, sessionId);
@@ -126,7 +129,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   // not-yet-uploaded videos before this attempt's first remote effect.
   if (await prepareIssueEvidence(evidence, context)) await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
   const checkState = async () => {
-    await assertTaskOpen(prisma, session.cwd);
+    await assertPublisher();
     const latest = await client.read(config, { id: issue.id });
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
@@ -179,7 +182,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
     if (!file.attachmentId) {
-      await assertTaskOpen(prisma, session.cwd);
+      await assertPublisher();
       file.attachmentId = await client.attach(config.linearApiKey, { issueId: issue.id, title: file.title, url: file.assetUrl });
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
