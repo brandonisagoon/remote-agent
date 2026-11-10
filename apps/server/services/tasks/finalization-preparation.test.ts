@@ -24,6 +24,7 @@ import { cleanupObserverFixture, existingCleanupObserverFixture } from "../../..
 import { runCleanupResourceObserver } from "./cleanup-resource-observer.ts";
 import { assertLinkedPathsIdle } from "./cleanup-open-handles.ts";
 import { FilesystemHandleDiagnosticError } from "./filesystem-handle-diagnostic.ts";
+import { Prisma } from "../../../../generated/prisma/client.ts";
 let db: TestDatabase, directory: string;
 let worker: ReturnType<typeof preparationJournalWorker> | undefined;
 // Full CI applies every migration to each disposable database. Keep that setup
@@ -31,6 +32,38 @@ let worker: ReturnType<typeof preparationJournalWorker> | undefined;
 beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); }, 20_000);
 afterEach(async () => { await worker?.stop(); worker = undefined; await db.cleanup(); await rm(directory, { recursive: true, force: true }); }, 20_000);
 const attempt = (boundary = "initial") => ({ version: 1 as const, attemptId: randomUUID(), boundary });
+
+test("idle preparation polling reads terminal states from the index without loading saved results", async () => {
+  const f = await fixture();
+  for (const state of ["ready", "failed"]) {
+    const accepted = await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id,
+      source: "preparation:task", action: "finalization-preparation-accepted", key: state, value: "{}" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id,
+      source: accepted.source, action: "finalization-preparation-status", key: String(accepted.sequence),
+      value: JSON.stringify({ state, stage: "response", result: "retained evidence ".repeat(20_000) }) } });
+  }
+  // Reproduce the deployed history's planner estimates without copying its
+  // private receipts or constructing hundreds of megabytes of fixture data.
+  await db.prisma.$executeRawUnsafe("ANALYZE RuntimeMetadataEvent");
+  await db.prisma.$executeRaw`UPDATE sqlite_stat1 SET stat = '3512 207 207 11 6' WHERE idx = 'finalization_preparation_terminal_state'`;
+  await db.prisma.$executeRaw`UPDATE sqlite_stat1 SET stat = '6790 142 20 3 1' WHERE idx = 'RuntimeMetadataEvent_action_source_key_sequence_idx'`;
+  await db.prisma.$executeRawUnsafe("ANALYZE sqlite_schema");
+  const plans: Array<{ detail: string }> = [];
+  const traced = new Proxy(db.prisma, { get(target, key, receiver) {
+    if (key !== "$queryRaw") return Reflect.get(target, key, receiver);
+    return async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const query = Prisma.sql(strings, ...values);
+      plans.push(...await target.$queryRaw<Array<{ detail: string }>>(Prisma.sql`EXPLAIN QUERY PLAN ${query}`));
+      return target.$queryRaw(query);
+    };
+  } });
+  let scans = 0;
+  worker = preparationJournalWorker({ prisma: traced, config: f.config, runtime: createFakeAgentRuntime() }, async () => { scans++; });
+  worker.tick(); await worker.idle();
+  expect(scans).toBe(0);
+  expect(plans.some(row => row.detail.includes("finalization_preparation_terminal_state") && row.detail.includes("<expr>="))).toBe(true);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "finalization-preparation-status" } })).toBe(2);
+});
 function git(cwd: string, ...args: string[]) {
   const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
   if (result.exitCode) throw new Error(result.stderr.toString());
