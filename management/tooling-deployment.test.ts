@@ -90,6 +90,28 @@ test("missing database is never created and corrupt selection fails closed", asy
   } finally { f.client.close(); }
 });
 
+test("compatibility reads close their WAL connection before the stopped-database snapshot", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "tooling-close-")); roots.push(root);
+  const databaseUrl = `file:${root}/test.sqlite`;
+  // Initialization exits before the read so fixture-library handles cannot
+  // masquerade as a leak in the management reader.
+  const init = Bun.spawnSync([process.execPath, "--no-env-file", "-e", `
+    import { Database } from "bun:sqlite";
+    const db = new Database(process.argv[1]);
+    db.exec("PRAGMA journal_mode=WAL; CREATE TABLE ToolingSelection (repositoryId TEXT, generation INTEGER, releaseId TEXT); CREATE TABLE ToolingRelease (id TEXT, revision TEXT, manifest TEXT); CREATE TABLE ToolingOperation (protocol INTEGER, status TEXT)");
+    db.query("INSERT INTO ToolingRelease VALUES (?, ?, ?)").run("release", "a".repeat(40), JSON.stringify({serverProtocol:{min:1,max:1}}));
+    db.exec("INSERT INTO ToolingSelection VALUES ('repo', 1, 'release')"); db.close();
+  `, databaseUrl.slice(5)], { stdout: "pipe", stderr: "pipe" });
+  expect(init.exitCode, init.stderr.toString()).toBe(0);
+  expect((await readToolingDeploymentState(databaseUrl)).selections).toHaveLength(1);
+  const snapshot = path.join(root, "snapshot.sqlite");
+  // A separate process is necessary: POSIX database locks are process-wide.
+  // No forced collection or wait may stand in for deterministic close.
+  const child = Bun.spawnSync([process.execPath, "--no-env-file", path.join(import.meta.dir, "sqlite-snapshot.ts"), "snapshot", databaseUrl.slice(5), snapshot, "0"], { stdout: "pipe", stderr: "pipe" });
+  expect(child.exitCode, child.stderr.toString()).toBe(0);
+  expect(existsSync(snapshot)).toBeTrue();
+});
+
 test("committed deployment protocol describes the server's implemented range", () => {
   const marker = JSON.parse(readFileSync(new URL("../lib/tooling-server-protocol.json", import.meta.url), "utf8"));
   expect(marker.operationProtocol).toEqual(SERVER_TOOLING_PROTOCOL);
