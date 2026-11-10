@@ -869,34 +869,36 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
     } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
   }
 
-  async releaseIdleTransports(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void> {
+  async releaseIdleTransports(input: { sessionIds: string[]; mode?: "stopped-only"; check: () => Promise<void>; commit: (evidence?: ClosedProviderEvidence[], assertUnchanged?: () => Promise<void>) => Promise<void> }): Promise<void> {
     const ids = [...new Set(input.sessionIds)].sort();
     const busy = (id: string) => this.recoveringSessions.has(id) || this.turnChains.has(id) || this.activeTurns.has(id) || Boolean(this.waitingTurns.get(id)?.size);
-    if (!ids.length || ids.some(busy)) throw new Error("Provider still has local work in flight");
+    const stoppedOnly = input.mode === "stopped-only";
+    const ownedTransport = (id: string) => this.handles.has(id) || this.runtimes.has(id) || this.executionDirectories.has(id);
+    if (!ids.length || ids.some(busy) || stoppedOnly && this.shuttingDown) throw new Error("Provider still has local work in flight");
     for (const id of ids) { this.recoveringSessions.add(id); this.releasingSessions.add(id); }
     try {
       await input.check();
       // Validate the entire family before stopping the first owned transport.
-      const owned = [];
+      const owned: Array<{ id: string; record: AcpSessionRecord; runtime: ReturnType<typeof createAcpRuntime> | undefined; handle: AcpRuntimeHandle | undefined }> = [];
       for (const id of ids) {
         const session = await this.prisma.runtimeSession.findUniqueOrThrow({ where: { id } });
-        if (!["idle", "closed"].includes(session.status)) throw new Error("Provider session is not idle");
+        if (!stoppedOnly && !["idle", "closed"].includes(session.status)) throw new Error("Provider session is not idle");
         const record = session.acpxRecordId ? await this.store.load(session.acpxRecordId) : undefined;
         if (!record) throw new Error("Provider transport identity is unavailable");
         if (record.acpxRecordId !== session.acpxRecordId || record.cwd !== session.cwd || record.acpSessionId !== session.acpxSessionId
           || record.agentSessionId !== (session.agentSessionId ?? undefined)) throw new Error("Provider transport identity changed");
         const runtime = this.runtimes.get(id), handle = this.handles.get(id);
-        if (!runtime || !handle) assertProviderStopped(record);
-        else if (handle.acpxRecordId !== record.acpxRecordId || handle.backendSessionId !== record.acpSessionId) throw new Error("Owned provider handle changed");
+        if (stoppedOnly || !runtime || !handle) assertProviderStopped(record);
+        if (handle && (handle.acpxRecordId !== record.acpxRecordId || handle.backendSessionId !== record.acpSessionId)) throw new Error("Owned provider handle changed");
         owned.push({ id, record, runtime, handle });
       }
       for (const entry of owned) {
         await input.check();
         assertRequestActive();
-        if (entry.runtime && entry.handle) await entry.runtime.close({ handle: entry.handle, reason: "Release idle transport for original-task cleanup", discardPersistentState: false });
+        if (!stoppedOnly && entry.runtime && entry.handle) await entry.runtime.close({ handle: entry.handle, reason: "Release idle transport for original-task cleanup", discardPersistentState: false });
         // close is a transport acknowledgment, not proof that a stale/foreign
         // provider exited. Observe the exact recorded process before proceeding.
-        const deadline = Date.now() + 5_000;
+        const deadline = Date.now() + (stoppedOnly ? 0 : 5_000);
         while (true) {
           try { assertProviderStopped(entry.record); break; }
           catch (error) { if (Date.now() >= deadline) throw error; await new Promise(resolve => setTimeout(resolve, 20)); }
@@ -905,7 +907,17 @@ export class AcpxSessionRuntime implements AgentSessionRuntime {
       }
       await input.check();
       assertRequestActive();
-      await input.commit();
+      const evidence = stoppedOnly ? owned.map(({ id, record }): ClosedProviderEvidence => ({ sessionId: id, recordDigest: closedFamilyDigest(record), historyDigest: closedFamilyDigest(record.messages), messages: record.messages,
+        lastPromptAt: record.lastPromptAt ?? null, lastUsedAt: record.lastUsedAt, lastRequestId: record.lastRequestId ?? null, absence: record.pid === undefined ? "recorded-exit" : "recorded-pid-ESRCH" })) : undefined;
+      const assertUnchanged = async () => {
+        assertRequestActive();
+        for (const { id, record } of owned) {
+          if (ownedTransport(id) || closedFamilyDigest(await this.store.load(record.acpxRecordId)) !== closedFamilyDigest(record)) throw new Error("Stopped provider identity changed");
+          assertProviderStopped(record);
+        }
+      };
+      if (stoppedOnly) await assertUnchanged();
+      await input.commit(evidence, stoppedOnly ? assertUnchanged : undefined);
     } finally { for (const id of ids) { this.recoveringSessions.delete(id); this.releasingSessions.delete(id); } }
   }
 

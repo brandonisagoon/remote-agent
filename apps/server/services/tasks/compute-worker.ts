@@ -12,6 +12,7 @@ import { canonicalDigest } from "./tooling-releases.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
+import { reconcileClosedTaskFamily } from "./closure-recovery.ts";
 
 /** Executing a recorded suspension continues the existing group with its own
  * code: the producer's release (bound once per environment/intent, so a retry
@@ -35,7 +36,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
-const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute };
+const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute, settle: reconcileClosedTaskFamily };
 
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
@@ -61,6 +62,10 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       try {
         const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
         const resource = await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: environment.resourceId! } });
+        if (task.phase === "closed" && !task.ownerPaused) {
+          const closure = await deps.settle({ prisma: input.prisma, runtime: input.runtime, machineId: input.config.machine, taskId: task.id });
+          if (closure.state === "pending") throw new Error(closure.reason);
+        }
         if (task.ownerPaused || task.phase === "closed" || resource.state === "released") {
           await deps.reclaim({ ...input, environmentId: environment.id });
           observed++; continue;

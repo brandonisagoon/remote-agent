@@ -185,3 +185,31 @@ separate real-Docker accounting proof above remains distinct. Typecheck passed.
 
 Closed-family recovery after interruption and the combined original-consumer
 release rehearsal remain open. No deployment or live task mutation occurred.
+
+
+### Interrupted task closure recovery — November 10
+
+The existing compute collector now reconciles a closed task's original bounded
+family before reclaiming its allocation. The existing provider reservation has
+a stopped-only mode: it never signals or opens a provider, independently verifies
+original records and process absence, and checks those records again inside the
+logical settlement transaction. A never-dispatched queued instruction needs
+unchanged inbox/journal history and a provider watermark preceding its creation.
+Unknown execution, live/missing providers, foreign ownership, pauses and changed
+records remain pending; their reason is visible in task activity. Original task,
+pins, family relations, provider history and resources are preserved. Overlapping
+collectors share the same recovery. Restart and lost responses reuse its audit.
+
+Validation: the related closure/reclamation/transport/supervision suite passed
+160 tests, one skipped actual-tooling archive scenario, zero failures and 674
+assertions. The final transport/closure/activity replay passed 54 tests, the same
+one skip, zero failures and 344 assertions; typecheck passed. Real disposable
+warm provider processes remain alive when stopped-only observation refuses; after
+fixture-owned process exit, the same cached identities reconcile. The collector
+fixture uses actual provider records/SQLite and synthetic app absence to release
+one original slot and offer it to the next queued task. That is not Greenfield
+health or deployed acceptance.
+
+RA-21 source implementation is ready for integrated verification. Final pair
+gates, combined restart/rollback rehearsal and original deployed consumers remain
+required. No service deployment or live task mutation occurred.

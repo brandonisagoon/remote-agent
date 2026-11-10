@@ -252,3 +252,23 @@ and operation binding execute it. A fresh running observation advances its
 original claim before stop; only a later fresh stopped observation with settled
 writers releases that exact allocation. Lost responses retry the same intent.
 Databases, worktree, task/session identity, pins and cleanup journal are retained.
+
+
+## Retry interrupted closed-family settlement
+
+Before physical reclamation of an unpaused closed task, the existing collector
+retries logical settlement of its original family, including moved descendants.
+It reserves those exact sessions through the existing provider transport seam
+with stopped-only observation. No provider is started or signalled. Original
+provider records and actual absence are checked before and during the atomic
+closure/inbox/audit write. Uncertain instructions are never completed or cancelled
+by this recovery; only unchanged, never-attempted queued work with older provider
+watermarks is cancelled. Missing/changed records, live processes, foreign family
+links or owner pause retain capacity and a task-activity diagnostic.
+
+The task closure, pins, original relations, provider history, application records
+and stores remain untouched. Logical settlement alone grants no capacity: normal
+independent app absence collection must still succeed. Concurrent observations
+share recovery, and a committed lost response or daemon restart does not repeat
+its dispositions. This runs only on the existing compute collector's closed-task
+path; the explicit history-reviewed unknown-instruction repair stays separate.

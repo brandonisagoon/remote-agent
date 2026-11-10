@@ -61,6 +61,16 @@ async function fixture() {
   return { prisma, primary, child, task, runtime, read };
 }
 
+test("closed task activity exposes pending family recovery without inventing execution or reopening the task", async () => {
+  const f = await fixture();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  const where = { runtimeSessionId: f.primary.id, source: `closure:${f.task.id}`, action: "task-closure-recovery", key: f.task.id };
+  await f.prisma.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify({ version: 1, state: "pending", reason: "Original provider is still running" }) } });
+  expect((await f.read())!.activity).toMatchObject({ state: "closed", closureRecovery: { state: "pending", reason: "Original provider is still running" }, cause: "Task is closed; session settlement remains pending: Original provider is still running" });
+  await f.prisma.runtimeMetadataEvent.create({ data: { ...where, value: JSON.stringify({ version: 1, state: "settled" }) } });
+  expect((await f.read())!.activity).toMatchObject({ state: "closed", closureRecovery: { state: "settled" }, cause: "Task or session is closed" });
+});
+
 test("an active delegate is waiting-active-work; its terminal result becomes delivery telemetry rather than pending execution", async () => {
   const f = await fixture();
   f.runtime.observeSessionActivity = (id) => ({ state: id === f.child.id ? "executing" : "unknown", observedAt: now });

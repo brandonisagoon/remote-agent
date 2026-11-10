@@ -1,4 +1,4 @@
-import type { ClosedFamilyReservation } from "./closed-family.ts";
+import type { ClosedFamilyReservation, ClosedProviderEvidence } from "./closed-family.ts";
 import type {
   CreateElicitationRequest,
   CreateElicitationResponse,
@@ -123,8 +123,10 @@ export interface AgentSessionRuntime {
   reconcileInterruptedSession?(sessionId: string): Promise<AgentRuntimeSession>;
   /** Process-local observation; absence of owned work never proves idle. */
   /** Release only locally owned idle provider transports. The caller's exact
-   * task checks and durable transition run under the same runtime reservation. */
-  releaseIdleTransports?(input: { sessionIds: string[]; check: () => Promise<void>; commit: () => Promise<void> }): Promise<void>;
+   * task checks and durable transition run under the same runtime reservation.
+   * stopped-only signals nothing: it requires absent original providers and
+   * supplies their immutable evidence for logical closed-task settlement. */
+  releaseIdleTransports?(input: { sessionIds: string[]; mode?: "stopped-only"; check: () => Promise<void>; commit: (evidence?: ClosedProviderEvidence[], assertUnchanged?: () => Promise<void>) => Promise<void> }): Promise<void>;
   assertClosedProviderAbsent?(sessionId: string): Promise<void>;
   /** Operator-only logical settlement; never opens/closes/signals a provider. */
   withClosedFamilyReservation?<T>(input: ClosedFamilyReservation<T>): Promise<T>;
