@@ -59,6 +59,7 @@ export async function deliverManagedMerge(input: {
       compatibility = recovered.receipt;
     }
     prompt = `Before every resumed lifecycle step, inspect_task and read_source_issue. Commit, push, PR publication and merge require the open task and current owner Merge authority. After accepted preparation, cleanup continues under the same saved operation independently of the status name; honor owner pause and revoked authority. Cleanup visibility never grants new deletion authority. Preserve the existing primary/worktree and all original task pins. Inspect existing commit/PR/merge/cleanup receipts before repeating an uncertain effect.\n\n${prompt}`;
+    if (approval.boundary === "configuration-only") prompt = "Accepted completion boundary: configuration-only. The owner explicitly scoped this delivery to configuration with unchanged product source. Do not create a product commit, push, PR or merge to satisfy this workflow. Verify the original clean base and accepted configuration result, then use the same complete-phase and prepared task-destroy lifecycle. Source authority, current verification, task ownership and cleanup checks remain required; a missing PR alone never supplies this scope.\n\n" + prompt;
     const current = await assertAuthority();
     await prisma.$transaction(async (tx) => {
       if (!(await isCurrentMergeApproval(tx, { taskId: task.id, sessionId: owned.session.id, approval }))) throw new Error("Completion authority was revoked or replaced before merge dispatch");

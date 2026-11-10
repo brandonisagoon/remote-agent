@@ -362,3 +362,29 @@ final rollback-reader gates and real browser switching remain required.
 Full CI at efe0db0 is green (42884343515), including lint, all tests and desktop
 build. This resolves the RA-22 wakeup CI gate; the account changes still need
 combined release validation. No live task or provider resource was changed.
+
+
+## RA-29: accepted configuration work can finish without a product PR
+
+An explicit owner configuration-only completion contract now preserves the
+original linked task and base commit. The normal Merge webhook carries that
+scope to the original primary, including the older tooling compatibility path.
+Current verification must establish clean, unchanged product source. Missing PRs
+never select this path, and product changes still require their normal delivery.
+The existing persistent finalizer performs cleanup and reports completion without
+claiming a fabricated PR or merge. Pauses, changed ownership/base/verification,
+and withdrawn approval refuse further effects; retries preserve accepted bytes.
+
+Validation: 43 tests / 206 assertions pass across completion, original older-pin
+Merge delivery and finalization. This includes the actual Drafted finalizer and
+server receipt path with a lost confirmation reply, plus four late-authority
+changes after preparation. Drafted's focused control/finalizer/skill checks pass
+94 tests / 1,135 assertions. Both repositories typecheck. The broader eight-file
+server run passed 390 and skipped 57 optional integrations; one archive test
+exceeded its five-second limit under load. All four changed-file cases passed
+when rerun separately (20 assertions). Final combined gates remain required.
+
+DRA-46's existing accepted configuration scope still needs to be recorded through
+owner control and independently verified at cutover before its original task can
+use this path. No live contract, task, account or service was changed. Greenfield's
+live Merge dispatch is already evidenced; no duplicate workflow was introduced.

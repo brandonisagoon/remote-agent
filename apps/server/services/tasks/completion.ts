@@ -8,13 +8,14 @@ import { confirmedFinalizationDelivery, worktreeIsMissing, type CompletionDelive
 const Text = z.string().trim().min(1).max(4000);
 export const CompletionContractInput = z.object({
   requestKey: z.string().min(1).max(200), expectedRevision: z.number().int().nonnegative(),
-  boundary: z.enum(["research", "local-only", "commit", "push", "pr", "review", "merge", "revoked"]),
+  boundary: z.enum(["research", "local-only", "configuration-only", "commit", "push", "pr", "review", "merge", "revoked"]),
   basis: Text, verificationRequired: z.boolean().default(true), reviewRequired: z.boolean().optional(),
   remote: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).default("origin"),
   repository: z.string().regex(/^[\w.-]+\/[\w.-]+$/).optional(),
   pullRequest: z.number().int().positive().optional(),
   baseBranch: z.string().min(1).max(200).optional(),
 }).strict().superRefine((value, context) => {
+  if (value.boundary === "configuration-only" && (!value.verificationRequired || value.reviewRequired === true || value.pullRequest !== undefined)) context.addIssue({ code: "custom", message: "Configuration-only completion requires verification and cannot replace PR review" });
   if (["push", "pr", "review", "merge"].includes(value.boundary) && !value.repository) context.addIssue({ code: "custom", message: "Remote delivery requires the authorized GitHub owner/repository", path: ["repository"] });
   if (["pr", "review", "merge"].includes(value.boundary) && !value.baseBranch) context.addIssue({ code: "custom", message: "PR delivery requires the authorized base branch", path: ["baseBranch"] });
 });
@@ -34,7 +35,7 @@ export async function isCurrentMergeApproval(prisma: Pick<PrismaClient, "runtime
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, action: CONTRACT, source: `owner:${input.taskId}` }, orderBy: { sequence: "desc" } });
   if (!latest || latest.sequence !== input.approval.contractRevision || latest.key !== input.approval.requestKey) return false;
   const parsed = CompletionContractInput.safeParse(JSON.parse(latest.value ?? "null"));
-  return parsed.success && parsed.data.boundary === "merge";
+  return parsed.success && ["merge", "configuration-only"].includes(parsed.data.boundary);
 }
 
 async function ownedTask({ prisma, config, taskId }: Context) {
@@ -54,6 +55,7 @@ async function contractFor(prisma: PrismaClient, taskId: string, sessionId: stri
 export async function setCompletionContract(input: Context & { contract: Contract }) {
   const { task, session } = await ownedTask(input);
   const contract = CompletionContractInput.parse(input.contract);
+  if (contract.boundary === "configuration-only" && (!task.connectionId || !task.issueIdentifier || !/^[a-f0-9]{40}$/.test(task.baseCommit ?? ""))) throw new Error("Configuration-only completion needs the original linked task and recorded base");
   const source = `owner:${task.id}`;
   return input.prisma.$transaction(async (tx) => {
     const prior = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: CONTRACT, source, key: contract.requestKey } });
@@ -121,6 +123,7 @@ export async function assertCompletionAllowed(input: { prisma: PrismaClient; con
   const { value: boundary } = contract;
   const snapshot = await observer.snapshot(task.worktreePath!);
   if (snapshot.branch !== task.branchName) throw new Error("Worktree branch changed; completion evidence belongs to another branch");
+  if (boundary.boundary === "configuration-only" && (!task.connectionId || !task.issueIdentifier || !snapshot.clean || snapshot.head !== task.baseCommit)) throw new Error("Configuration-only completion requires unchanged clean product source at the original task base");
   const local = boundary.boundary === "local-only" || boundary.boundary === "research";
   const verificationEvent = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: input.sessionId, action: VERIFICATION, source: `owner:${task.id}` }, orderBy: { sequence: "desc" } });
   const verification = verificationEvent ? JSON.parse(verificationEvent.value!) : null;
@@ -156,6 +159,8 @@ export async function assertCompletionAllowed(input: { prisma: PrismaClient; con
   const latest = await contractFor(input.prisma, task.id, input.sessionId);
   const currentTask = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
   if (latest?.revision !== contract.revision || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Completion authority or task identity changed during verification");
+  if (boundary.boundary === "configuration-only" && (currentTask.baseCommit !== task.baseCommit || currentTask.primarySessionId !== task.primarySessionId
+    || currentTask.connectionId !== task.connectionId || currentTask.issueIdentifier !== task.issueIdentifier || currentTask.worktreePath !== task.worktreePath)) throw new Error("Configuration completion ownership or original base changed during verification");
   const current = await observer.snapshot(task.worktreePath!);
   if (current.fingerprint !== snapshot.fingerprint || current.branch !== snapshot.branch || current.head !== snapshot.head || current.clean !== snapshot.clean) throw new Error("Worktree changed during completion verification");
   return { boundary: boundary.boundary, receipts };
@@ -186,7 +191,7 @@ export async function recordOwnerMergeApproval(input: Context & {
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: APPROVAL, source, key: requestKey } });
   const current = await contractFor(input.prisma, task.id, session.id);
   if (prior) {
-    if (current?.value.requestKey !== requestKey || current.value.boundary !== "merge") throw new Error("A newer owner completion decision superseded this Merge event");
+    if (current?.value.requestKey !== requestKey || !["merge", "configuration-only"].includes(current.value.boundary)) throw new Error("A newer owner completion decision superseded this Merge event");
     return JSON.parse(prior.value!);
   }
   const latestEvent = current && await input.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: current.revision } });
@@ -195,20 +200,21 @@ export async function recordOwnerMergeApproval(input: Context & {
   const repository = await observer.repository(task.worktreePath!);
   const baseBranch = (getRepositoryConfig(config, task.repositoryId).baseBranch ?? "main").replace(/^origin\//, "");
   if (snapshot.branch !== task.branchName) throw new Error("Owner Merge acceptance must match the task's original branch");
+  if (current?.value.boundary === "configuration-only" && (!snapshot.clean || snapshot.head !== task.baseCommit)) throw new Error("Owner configuration-only acceptance requires unchanged product source at its original base");
   const contract = CompletionContractInput.parse({
-    requestKey, expectedRevision: current?.revision ?? 0, boundary: "merge", verificationRequired: true,
+    requestKey, expectedRevision: current?.revision ?? 0, boundary: current?.value.boundary === "configuration-only" ? "configuration-only" : "merge", verificationRequired: true,
     reviewRequired: current?.value.reviewRequired ?? false,
     basis: `Owner ${actorId} accepted ${webhook.data.identifier} by moving it to Merge (delivery ${receipt.deliveryId}, workflow ${input.workflowId}).`,
     remote: repository.remote, repository: repository.repository, baseBranch,
   });
-  const provenance = { requestKey, actorId, organizationId: webhook.organizationId ?? null, issueId: webhook.data.id, issueIdentifier: webhook.data.identifier, webhookTimestamp: webhook.webhookTimestamp, receiptId: receipt.id, deliveryId: receipt.deliveryId, connectionId: receipt.connectionId, runId: run.id, workflowId: workflow.id, repository: repository.repository, baseBranch, snapshot };
+  const provenance = { requestKey, boundary: contract.boundary, actorId, organizationId: webhook.organizationId ?? null, issueId: webhook.data.id, issueIdentifier: webhook.data.identifier, webhookTimestamp: webhook.webhookTimestamp, receiptId: receipt.id, deliveryId: receipt.deliveryId, connectionId: receipt.connectionId, runId: run.id, workflowId: workflow.id, repository: repository.repository, baseBranch, snapshot };
   return input.prisma.$transaction(async (tx) => {
     const duplicate = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: APPROVAL, source, key: requestKey } });
     const latest = await tx.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: CONTRACT, source }, orderBy: { sequence: "desc" } });
     const currentTask = await tx.remoteTask.findUniqueOrThrow({ where: { id: task.id } });
     if (duplicate) {
       const authority = latest && CompletionContractInput.parse(JSON.parse(latest.value!));
-      if (authority?.requestKey !== requestKey || authority.boundary !== "merge" || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Owner completion authority or task closure changed during Merge acceptance");
+      if (authority?.requestKey !== requestKey || !["merge", "configuration-only"].includes(authority.boundary) || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Owner completion authority or task closure changed during Merge acceptance");
       return JSON.parse(duplicate.value!);
     }
     if ((latest?.sequence ?? 0) !== contract.expectedRevision || (currentTask.ownerPaused || currentTask.phase === "closed")) throw new Error("Owner completion authority or task closure changed during Merge acceptance");

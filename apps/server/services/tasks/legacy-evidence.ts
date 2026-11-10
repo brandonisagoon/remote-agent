@@ -1,3 +1,4 @@
+import { assertConfigurationCompletion } from "./configuration-completion.ts";
 import { activeCleanupRoots } from "./cleanup-scope.ts";
 import { recordedEvidenceIdentity } from "./evidence-receipt.ts";
 import { retainedArchiveResourceIds, projectedRetainedArchiveResourceIds } from "./archive-retention.ts";
@@ -44,6 +45,7 @@ async function preparation(prisma: Database, config: ServerConfig, taskId: strin
   const prepared = PreparedFinalization.parse(raw);
   if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== requestKey || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier || prepared.delivery.receipts.contractRevision !== prepared.contractRevision) throw new Error("Legacy evidence preparation identity or verified delivery changed");
   if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else if (prepared.configurationCompletion) await assertConfigurationCompletion(prisma, prepared);
   else {
     if (prepared.delivery.boundary !== "merge" || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha) throw new Error("Legacy evidence preparation identity or verified merge changed");
     const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${taskId}` }, orderBy: { sequence: "desc" } });

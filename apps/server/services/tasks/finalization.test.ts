@@ -20,7 +20,7 @@ function git(cwd: string, ...args: string[]) {
   return result.stdout.toString().trim();
 }
 
-async function fixture() {
+async function fixture(boundary: "merge" | "configuration-only" = "merge") {
   const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree");
   await mkdir(root); git(root, "init", "-b", "main");
   git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
@@ -28,12 +28,12 @@ async function fixture() {
   git(root, "worktree", "add", "-b", "codex/task", worktree);
   const config = testConfig({ repository: { ...testConfig().repository, root } });
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", cwd: worktree, repositoryId: config.repository.id, machineId: config.machine } });
-  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-75", primarySessionId: session.id, branchName: "codex/task", worktreePath: worktree, toolingRoot: directory, toolingRevision: "a".repeat(40), phase: "complete" } });
+  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-75", primarySessionId: session.id, branchName: "codex/task", baseCommit: git(root, "rev-parse", "HEAD"), worktreePath: worktree, toolingRoot: directory, toolingRevision: "a".repeat(40), phase: "complete" } });
   const link = await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-75", relationship: "handles" } });
   const states = [{ id: "merge", name: "Merge", type: "started" }, { id: "done", name: "Done", type: "completed" }, { id: "blocked", name: "Blocked", type: "started" }];
   const issue = { id: "issue", identifier: "DRA-75", branchName: "codex/task", title: "Task", description: "Request", state: states[0]!, team: { states: { nodes: states } }, labels: { nodes: [] }, relations: { nodes: [] }, inverseRelations: { nodes: [] } };
   const context = { prisma: db.prisma, config, taskId: task.id };
-  const contract = await setCompletionContract({ ...context, contract: CompletionContractInput.parse({ requestKey: "owner", expectedRevision: 0, boundary: "merge", basis: "Owner accepted Merge", repository: "owner/product", pullRequest: 12, baseBranch: "main" }) });
+  const contract = await setCompletionContract({ ...context, contract: CompletionContractInput.parse({ requestKey: "owner", expectedRevision: 0, boundary, basis: "Owner accepted the explicit delivery scope", ...(boundary === "merge" ? { repository: "owner/product", pullRequest: 12, baseBranch: "main" } : {}) }) });
   await recordCompletionVerification({ ...context, verification: { requestKey: "owner-verified", passed: true, evidence: ["Owner accepted verified content"] } });
   const head = git(worktree, "rev-parse", "HEAD");
   const remote = { remote: "origin", repository: "owner/product", remoteHead: head, remoteBase: "b".repeat(40), pullRequest: { url: "https://github.com/owner/product/pull/12", headRefOid: head, headRefName: "codex/task", baseRefName: "main", state: "MERGED", isDraft: false, reviewDecision: null, mergeCommit: { oid: "c".repeat(40) } } };
@@ -154,3 +154,80 @@ test("delegate identity and unprepared request keys cannot consume a primary's f
   await db.prisma.runtimeSession.create({ data: { id: "delegate", scopeKey: "delegate", agentCommand: "codex", status: "idle", role: "delegate", cwd: f.worktree, repositoryId: f.config.repository.id, machineId: f.config.machine } });
   await expect(confirmTaskFinalization({ ...f.input, sessionId: "delegate" }, f.dependencies)).rejects.toThrow("original primary");
 });
+
+test("accepted linked configuration-only work finalizes without fabricating a product PR or merge", async () => {
+  const f = await fixture("configuration-only");
+  f.observer.remote = async () => { throw new Error("Configuration scope must not discover a PR"); };
+  const input = { ...f.input, cleanup: true as const };
+  const prepared = await prepareTaskFinalization(input, f.dependencies);
+  expect(prepared).toMatchObject({ configurationCompletion: { kind: "configuration-completion/v1", baseCommit: f.task.baseCommit }, sourceRetirement: "delete" });
+  expect(prepared.cleanup).toBeDefined();
+  await expect(confirmTaskFinalization(input, f.dependencies)).rejects.toThrow();
+  const saved = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: FINALIZATION_PREPARED } });
+  expect(JSON.parse(saved.value!).delivery).toMatchObject({ boundary: "configuration-only", receipts: { pullRequest: { observed: false, url: null }, merge: { observed: false, merged: false, sha: null } } });
+  f.remove();
+  const confirmed = await confirmTaskFinalization(input, f.dependencies);
+  expect(confirmed.preparedRevision).toBe(prepared.preparedRevision);
+  expect(await confirmTaskFinalization(input, f.dependencies)).toEqual(confirmed);
+  expect((await assertCompletionAllowed(input, f.observer)).boundary).toBe("configuration-only");
+  const report = await db.prisma.runtimeIssueUpdate.findUniqueOrThrow({ where: { runtimeSessionId_requestKey: { runtimeSessionId: f.session.id, requestKey: input.requestKey + ":cleanup-report" } } });
+  expect((report.input as any).body).toContain("Cleanup is confirmed");
+  expect((report.input as any).body).not.toContain("merged");
+});
+
+for (const change of ["dirty", "committed-product", "missing-verification", "new-contract", "wrong-base", "foreign-link", "source-revoked", "paused"] as const) test("configuration completion refuses " + change + " without preparing cleanup", async () => {
+  const f = await fixture("configuration-only");
+  if (change === "dirty" || change === "committed-product") {
+    await writeFile(path.join(f.worktree, "README.md"), "product work\n");
+    if (change === "committed-product") { git(f.worktree, "add", "."); git(f.worktree, "commit", "-m", "product change"); await recordCompletionVerification({ ...f.context, verification: { requestKey: "changed", passed: true, evidence: ["Changed source"] } }); }
+  }
+  if (change === "missing-verification") await db.prisma.runtimeMetadataEvent.deleteMany({ where: { action: "completion-verification" } });
+  if (change === "new-contract") await f.revoke();
+  if (change === "wrong-base") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { baseCommit: "c".repeat(40) } });
+  if (change === "foreign-link") await db.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id }, data: { endedAt: new Date() } });
+  if (change === "source-revoked") f.issue.state = f.states[2]!;
+  if (change === "paused") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  await expect(prepareTaskFinalization({ ...f.input, cleanup: true }, f.dependencies)).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_PREPARED } })).toBe(0);
+  expect(git(f.worktree, "rev-parse", "--is-inside-work-tree")).toBe("true");
+});
+
+for (const change of ["pause", "contract", "base", "verification"] as const) test("prepared configuration cleanup refuses late " + change + " without replacing its receipt", async () => {
+  const f = await fixture("configuration-only"), input = { ...f.input, cleanup: true as const };
+  await prepareTaskFinalization(input, f.dependencies);
+  const original = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: FINALIZATION_PREPARED } });
+  f.remove();
+  if (change === "pause") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  if (change === "contract") await f.revoke();
+  if (change === "base") await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { baseCommit: "c".repeat(40) } });
+  if (change === "verification") {
+    const verified = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "completion-verification" }, orderBy: { sequence: "desc" } });
+    await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: verified.runtimeSessionId, source: verified.source, action: verified.action, key: "later-verification", value: verified.value } });
+  }
+  await expect(confirmTaskFinalization(input, f.dependencies)).rejects.toThrow();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: FINALIZATION_CONFIRMED } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: original.sequence } })).toEqual(original);
+});
+
+const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+test.skipIf(!draftedRoot)("actual Drafted finalizer completes linked configuration scope and retries a lost confirmation", async () => {
+  const f = await fixture("configuration-only"), input = { ...f.input, cleanup: true as const };
+  const { finalizeTask } = await import(path.join(draftedRoot!, "src/finalize.ts"));
+  const { TaskRecord } = await import(path.join(draftedRoot!, "src/control.ts"));
+  let lost = true, closed = false;
+  const registry = {
+    task: async () => TaskRecord.parse({ ...await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } }), resources: [] }),
+    resource: async () => { throw new Error("No resource write belongs to this fixture"); },
+    prepareFinalization: async () => prepareTaskFinalization(input, f.dependencies),
+    confirmFinalization: async () => { const value = await confirmTaskFinalization(input, f.dependencies); if (lost) { lost = false; throw new Error("lost confirmed response"); } return value; },
+    publishCleanupReport: async () => ({ published: false, recorded: true, reportId: "fixture-delivery-deferred" }),
+  };
+  await expect(finalizeTask({ registry, cleanup: true, close: async () => { closed = true; } })).rejects.toThrow("lost confirmed response");
+  expect(closed).toBeFalse();
+  const confirmations = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: FINALIZATION_CONFIRMED } });
+  expect(confirmations).toHaveLength(1);
+  expect(await finalizeTask({ registry, cleanup: true, close: async () => { closed = true; } })).toMatchObject({ closed: true });
+  expect(closed).toBeTrue();
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { action: FINALIZATION_CONFIRMED } })).toEqual(confirmations);
+  expect((await assertCompletionAllowed(input, f.observer)).receipts.merge).toEqual({ observed: false, merged: false, sha: null });
+}, 30_000);
