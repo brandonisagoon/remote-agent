@@ -55,10 +55,15 @@ async function latest(prisma: PrismaClient, accepted: { sequence: number; runtim
   return event ? State.parse(JSON.parse(event.value!)) : { state: "pending" as const, stage: "queued" };
 }
 async function unsettled(prisma: PrismaClient, sessionId: string | null = null, limit = 2000) {
+  // Pin the existing expression index. Real history statistics can otherwise
+  // favor action/source/key and repeatedly decode multi-megabyte terminal
+  // results on this one-second poll, blocking the native SQLite event loop.
+  // The literal action is the partial index predicate; keep it aligned with STATUS.
   const pending = await prisma.$queryRaw<Array<{ sequence: number }>>`
     SELECT a.sequence FROM RuntimeMetadataEvent a
     WHERE a.action = ${ACCEPTED} AND (${sessionId} IS NULL OR a.runtimeSessionId = ${sessionId}) AND NOT EXISTS (
-      SELECT 1 FROM RuntimeMetadataEvent s WHERE s.action = ${STATUS}
+      SELECT 1 FROM RuntimeMetadataEvent s INDEXED BY finalization_preparation_terminal_state
+      WHERE s.action = 'finalization-preparation-status'
       AND s.runtimeSessionId = a.runtimeSessionId AND s.source = a.source AND s.key = CAST(a.sequence AS TEXT)
       AND json_extract(s.value, '$.state') IN ('ready', 'failed'))
     ORDER BY a.sequence ASC LIMIT ${limit}`;

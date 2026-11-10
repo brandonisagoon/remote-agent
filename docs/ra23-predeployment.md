@@ -447,3 +447,35 @@ poisoning. Fresh composition from a product cwd and the full skills suite pass
 acceptance. Executing relevant cases with real approved identities is a
 post-cutover RA-26 requirement. Server CI at 7c86380 also passed its full verify
 job; final integrated source remains subject to its own complete gate.
+
+## RA-26 live cutover: finalization polling latency
+
+The paired PRs merged on November 10. Server `c8ac35aa644a9f82e29e48f2231b3d082cf3c75b`
+was installed before tooling `3c9a6527863f5574ed46800d2533b8134f41e3b3`
+was activated as generation 4. The first live checks found intermittent control
+and health timeouts, so healthy deployed acceptance remains open.
+
+The finalization worker's recurring terminal-state lookup can choose the
+action/source/key index and decode large retained result JSON. The deployed
+database has about 459 MB of metadata history. On a private snapshot using the
+actual libSQL client, the original lookup took 1,502 ms; selecting the existing
+terminal-state expression index returned identical rows in 12 ms. Reanalyzing
+the snapshot did not correct index selection. This is a measured query-level
+improvement, not yet a claim that all live latency has been resolved.
+
+The correction binds this lookup to the existing migrated expression index and
+uses its literal partial-index predicate. It changes no receipt, migration,
+cleanup authority or verification requirement. A real SQLite regression with
+the observed planner estimates fails before the correction and passes after it;
+terminal results remain retained and no completed verification runs again.
+Focused finalization/projection checks pass: 45 tests, one optional skip, 325
+assertions. Typecheck and desktop build pass. Full CI and sustained live health
+checks remain release gates for this follow-up.
+
+The release receipts are private under the installation's
+`maintenance/ra23-cutover-20261110` directory. Task identities, tooling pins,
+native ownership and resources remain preserved. The new collector correctly
+settled three already-closed historical tasks' stale idle primaries with saved
+provider-absence evidence. Maintenance releases reconcile lost responses before
+retry; original owner pauses are never cleared. DRA-46, DRA-52 and DRA-53 are
+closed and must not be reopened as acceptance tasks. Stripe remains excluded.
