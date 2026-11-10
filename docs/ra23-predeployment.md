@@ -15,7 +15,7 @@ Drafted's paired adapter now requires operation protocol 3; this server supports
 | RA-26 | Focused regression fixtures cover the changes above and the paired API-origin restart repair. | One combined route/adapter test across launch, recovery, capacity and handoff; then a deployed task with zero avoidable owner nudges. |
 | RA-27 | Drafted guidance carries standing synthetic-account authorization and distinguishes login access from scenario suitability. | Durable quota-bounded account allocation, exclusive task assignments and retry/concurrency recovery; actual Clerk age verification and browser switching. The existing identity command remains read-only. |
 | RA-28 | Drafted packages the exact November 5 seven-case source, a version/digest index, exclusions and provider-composed guidance for preparation, orchestration, verification and review. | Existing-task capability continuation and execution of selected cases on a deployed task. Missing source images remain explicit gaps. |
-| RA-29 | Confirmed the committed Drafted policy already routes Merge to the existing session and the merge skill rechecks current authority. | Inspect the serving host's boot-resolved policy, then add missing configuration or fix routing based on that evidence; exercise webhook retries and revoked approval. The local saved SSH alias did not resolve during this pass. |
+| RA-29 | Read-only inspection of the serving host confirms the selected Greenfield policy contains Merge. Actual DRA-46 and DRA-52 webhook receipts delivered to their existing primaries. DRA-52 has a verified merge and confirmed finalization. | Check other repositories' intended policies and preserve retry/revocation coverage. DRA-46's configuration-only delivery is blocked later by the completion contract requiring a PR; adding another Merge workflow would not fix that separate gap. |
 | RA-30 | Drafted derives consistent Platform API URLs, preserves admitted old recipes, and supports a narrowly scoped missing-server-origin repair with lost-acknowledgment recovery. | Paired server/adapter configuration replay and real catalog, proxy and server-rendered pricing checks on the serving host. |
 | RA-31 | Drafted's existing evidence reader accepts `sizeBytes` as an alias, rejects conflicting sizes and preserves the original metadata. | Shared registration/cleanup schema, complete server-side alias parity, historical task-directory validation, exact connector lifecycle adapter and provider-deletion retry tests. |
 
@@ -33,6 +33,35 @@ Drafted's corresponding runtime/API-origin, tooling-operation, evidence and
 composition tests use temporary worktrees, a real local control transport and
 synthetic provider/container responses. They do not prove Docker, Clerk, nginx,
 Cloudflare, live pricing or browser behavior on the remote execution host.
+
+Server source `22e1de0` passed local typecheck, 3,138 tests (154 skipped,
+zero failures), and desktop build. GitHub CI independently passed lint,
+3,140 tests (154 skipped, zero failures), and desktop build at the same commit.
+The platform-dependent test totals are recorded separately. The later changes
+to this file only update evidence.
+
+Drafted's complete sweep recorded 2,462 passes, 37 skips and two failures:
+an evaluation-document contract and a stale protocol-version expectation.
+Both were corrected; the affected four-suite replay passed 38 tests with zero
+failures, and final-head typecheck passed. This is not claimed as a clean full
+suite at the final Drafted head. Full paired integration remains outstanding.
+
+## Read-only Merge diagnosis
+
+The live server's authenticated tooling-selection read and SQLite receipts
+identify Greenfield generation 3 at Drafted `52c67d3`. Its policy blob
+`2b04bd7d1386e4966c2f2ba4a500bf76db6e7556` matches the saved boot pin and
+routes exact Merge state changes through the existing primary with Codex.
+The repository's target is staging. No live setting or transition was changed.
+
+DRA-52 receipt `cmw9x2j0d00q229xcovm9k50m` and DRA-46 receipt
+`cmwa1kimd017q29xc9xi7rlww` both have delivered merge workers and completed
+instructions. DRA-52 separately has a merge observation for Greenfield PR 4418,
+confirmed finalization and a closed task; Linear is Done. Its cleanup needed
+audited maintenance recovery, so this is not zero-intervention acceptance.
+DRA-46 remains waiting with its app stopped: accepted configuration-only work
+cannot pass the current PR-required finalization boundary. A completed inbox
+instruction alone proves neither merge nor cleanup.
 
 ## Deployment boundary
 
