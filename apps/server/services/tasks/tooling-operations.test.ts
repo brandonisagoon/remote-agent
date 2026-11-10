@@ -20,6 +20,7 @@ import { selectCapabilityRelease } from "./tooling-capabilities.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { cleanupObserverRelease } from "./cleanup-resource-observer.ts";
 import { FINALIZATION_PREPARED } from "./finalization-receipts.ts";
+import { configurationAttemptCode } from "./tooling-operations.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -77,6 +78,35 @@ function app(config: Config, respond: (pathname: string) => { status?: number; b
   return { seen, call };
 }
 const begin = (config: Config, request: Record<string, unknown>, sessionId = "primary") => beginSessionToolingOperation({ prisma: db.prisma, config, sessionId, request });
+
+test("guarded configuration observes its own pending producer and replays across lock PIDs; ordinary collectors refuse it", async () => {
+  const { config } = await fixture();
+  await bootstrap([]); await environment("configure-env"); await offer("configure-offer", "configure-env");
+  const body = { offerId: "configure-offer", resourceKey: "runtime-development", recipeHash: "next", lockPid: 123 };
+  const { lockPid: _pid, ...stable } = body;
+  const { binding } = await begin(config, { requestKey: "configure", kind: "compute-configure", existingOperationId: body.offerId, inputDigest: canonicalDigest(stable) });
+  const server = new Hono<AppEnv>();
+  server.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", config); await next(); });
+  server.use("/api/*", toolingOperationGuard());
+  let runs = 0;
+  server.post("/api/tasks/task/compute-configure", async c => {
+    const owner = await task(), request = await c.req.json();
+    if (++runs === 1) await expect(producerOperationId(db.prisma, owner, "configure-env")).rejects.toThrow("unconfirmed producer");
+    const selected = await configurationAttemptCode(db.prisma, owner, "configure-env", request);
+    expect(selected?.binding.operationId).toBe(binding.operationId);
+    expect(selected?.code.revision).toBe(A);
+    await expect(configurationAttemptCode(db.prisma, owner, "configure-env", { ...request, recipeHash: "foreign" })).rejects.toThrow("exact guarded attempt");
+    await expect(configurationAttemptCode(db.prisma, owner, "other-environment", request)).rejects.toThrow("another allocation");
+    return c.json({ verified: true });
+  });
+  for (const lockPid of [123, 456]) {
+    const response = await server.request("/api/tasks/task/compute-configure", { method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: binding.operationId }, body: JSON.stringify({ ...body, lockPid }) });
+    expect(response.status).toBe(200);
+  }
+  expect(runs).toBe(2);
+  expect(await configurationAttemptCode(db.prisma, await task(), "configure-env", body)).toBeUndefined();
+  expect(await producerOperationId(db.prisma, await task(), "configure-env")).toBe(binding.operationId);
+});
 
 test("a declined standalone admission can re-admit its exact request under a new operation", async () => {
   const { config } = await fixture();

@@ -14,7 +14,8 @@ export function computeFamilySettled(task: RemoteTask, sessions: RuntimeSession[
     return instruction.state !== "queued" || instruction.executionRequestId !== null || !fenced
       || !session || session.cwd !== task.worktreePath;
   })) return false;
-  return sessions.every(session => ["idle", "closed"].includes(session.status)
+  return sessions.every(session => (["idle", "closed"].includes(session.status)
+      || fenced && session.cwd === task.worktreePath && session.status === "error")
     && (!runtime.observeSessionActivity || runtime.observeSessionActivity(session.id).state === "unknown")
     && (session.closedAt || lifecycle.find(event => event?.runtimeSessionId === session.id)?.phase !== "started"));
 }

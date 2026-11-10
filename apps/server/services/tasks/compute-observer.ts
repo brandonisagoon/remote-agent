@@ -56,10 +56,10 @@ async function verifyComputeRuntimeReceipt(receipt: CompatibilityReceipt, execut
   return { receipt, adapterPath, checked, before };
 }
 
-export async function readConfiguredComputeObservation(input: { prisma: PrismaClient; config: ServerConfig }, task: RemoteTask, environment: ComputeEnvironment, resource: RemoteTaskResource, previousTraffic: ComputeTraffic[] = [], dependencies = { resolve: resolveSessionToolingCapability, execute: executeOwnedObserver }) {
+export async function readConfiguredComputeObservation(input: { prisma: PrismaClient; config: ServerConfig }, task: RemoteTask, environment: ComputeEnvironment, resource: RemoteTaskResource, previousTraffic: ComputeTraffic[] = [], dependencies = { resolve: resolveSessionToolingCapability, execute: executeOwnedObserver }, selection?: { code: ToolingCodeIdentity | null; binding: ToolingOperationBinding | null }) {
   if (!task.primarySessionId) throw new Error("Compute requires its original primary");
   const identity = finalizationResourceIdentity(resource);
-  const { code, binding } = await environmentCode(input.prisma, task, environment);
+  const { code, binding } = selection ?? await environmentCode(input.prisma, task, environment);
   const { receipt, adapterPath, checked, before } = await verifiedComputeRuntime({ ...input, sessionId: task.primarySessionId, release: code, install: false }, dependencies);
   const env = operationEnvironment(binding, input.config.controlIpcPath);
   const previous = ComputeObservation.safeParse(environment.observation).data;

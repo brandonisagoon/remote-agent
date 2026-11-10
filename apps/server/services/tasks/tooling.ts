@@ -17,9 +17,9 @@ export const RELEASE_MANIFEST_FILE = ".remote-agent-release.json";
 export const CAPABILITY_MANIFEST_FILE = ".remote-agent-capabilities.json";
 export const RELEASE_LOCKFILE = "bun.lock";
 /** Operation protocol versions this server implements. */
-// Protocol 2 adds saved-resource observation provenance and confirmed resume.
-// Existing protocol-1 operations and retained readers remain executable.
-export const SERVER_TOOLING_PROTOCOL = { min: 1, max: 2 } as const;
+// Protocol 3 adds configure-attempt observation and PID-independent callback
+// identity. Existing protocol-1/2 operations and readers remain executable.
+export const SERVER_TOOLING_PROTOCOL = { min: 1, max: 3 } as const;
 
 const FormatVersion = z.number().int().min(1).max(1000);
 export const ToolingReleaseManifestSchema = z.strictObject({

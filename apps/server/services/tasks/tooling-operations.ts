@@ -230,7 +230,7 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
     input: () => undefined, reference: offer, referenceRule: "admission", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-bind", reference: body.offerId as string } : null },
   { route: "POST /api/tasks/:taskId/compute-configure", method: "POST", path: taskPath("compute-configure"), scope: "task", kind: "compute-configure",
-    input: body => body, reference: offer, referenceRule: "existing", produces: offerProducer,
+    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid")), reference: offer, referenceRule: "existing", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-configure", reference: body.offerId as string } : null },
   // DRA-24: a projection transition plus (for a first-bootstrap group) its
   // legacy reader handoff. No reference rule: the binding continues the offer
@@ -323,9 +323,10 @@ export const toolingOperationDependencies: ToolingOperationDependencies = {
 
 /** Request scope set only by the guarded callback boundary. A legacy
  * continuation carries its exact first-bootstrap snapshot. */
-type Scope = { binding: ToolingOperationBinding; socket?: string } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
+type CallbackAttempt = { route: string; attemptId: string; body: Body };
+type Scope = { binding: ToolingOperationBinding; socket?: string; attempt?: CallbackAttempt } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
 const scope = new AsyncLocalStorage<Scope>();
-export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>, socket?: string) => scope.run({ binding, ...(socket ? { socket } : {}) }, operation);
+export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>, socket?: string, attempt?: CallbackAttempt) => scope.run({ binding, ...(socket ? { socket } : {}), ...(attempt ? { attempt } : {}) }, operation);
 /** Complete bound process context for a release-aware adapter or observer:
  * the operation plus the control socket, task and primary session it must
  * call back with. Empty for unbound (legacy) processes. */
@@ -645,6 +646,38 @@ export async function producerOperationId(store: Pick<PrismaClient, "runtimeMeta
   return null;
 }
 
+/** Only the guarded configure attempt may read its own pending generation.
+ * Ordinary collectors still require confirmed producer provenance. */
+export async function configurationAttemptCode(prisma: PrismaClient, task: RemoteTask, environmentId: string, request: Body) {
+  const active = scope.getStore();
+  if (!active || !("binding" in active)) return undefined;
+  const { binding, attempt } = active;
+  if (!attempt || attempt.route !== "POST /api/tasks/:taskId/compute-configure"
+    || canonicalDigest(attempt.body) !== canonicalDigest(request) || binding.kind !== "compute-configure"
+    || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId || binding.repositoryId !== task.repositoryId)
+    throw refuse("operation-mismatch", "Configuration observation requires its exact guarded attempt");
+  const current = await readToolingOperation({ prisma, operationId: binding.operationId });
+  if (!current || canonicalDigest(current) !== canonicalDigest(binding)
+    || !["running", "unknown", "completed"].includes(current.status)) throw refuse("operation-closed", "Configuration binding changed during observation");
+  if (current.parentOperationId) {
+    const parent = await readToolingOperation({ prisma, operationId: current.parentOperationId });
+    if (!parent || !["bound", "running"].includes(parent.status) || parent.kind !== ADAPTER_COMMAND_KIND
+      || parent.taskId !== task.id || parent.sessionId !== task.primarySessionId
+      || canonicalDigest(parent.release) !== canonicalDigest(current.release))
+      throw refuse("operation-closed", "Configuration command changed during observation");
+  }
+  const offer = await prisma.computeOffer.findUnique({ where: { id: String(request.offerId) } });
+  if (!offer || offer.environmentId !== environmentId || current.existingOperationId !== offer.id)
+    throw refuse("operation-ownership", "Configuration attempt names another allocation");
+  const records = await attemptRecords(prisma, binding, binding.operationId);
+  if (records[0]?.value?.attemptId !== attempt.attemptId || records[0]?.value?.state !== "intent")
+    throw refuse("operation-closed", "Configuration attempt is no longer pending");
+  const producers = await associations(prisma, task, "producer", `compute-environment:${environmentId}`);
+  if (producers[0]?.operationId !== binding.operationId || !["intent", "confirmed"].includes(producers[0].state))
+    throw refuse("producer-unknown", "Configuration producer was superseded");
+  return { code: binding.release, binding };
+}
+
 /** Read-only code selection before a saved resource's FIRST claim. The
  * acknowledged exact request is provenance, not a producer or start grant.
  * Once any claim may have started it, only a confirmed producer can select
@@ -842,7 +875,10 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     || binding.sessionId !== task.primarySessionId || (callback.scope === "session" && binding.sessionId !== param)) throw refuse("operation-ownership", "The operation does not belong to this task's primary session");
   if (binding.kind !== callback.kind) throw refuse("operation-mismatch", `${callback.route} requires a ${callback.kind} operation, not ${binding.kind}`);
   const projection = await callback.input(input.body, context);
-  if (projection !== undefined && dependencies.digest(projection) !== binding.inputDigest) throw refuse("operation-input", `${callback.route} input differs from the bound operation`);
+  // Existing bindings retain their original full-body digest. Only an exact
+  // legacy replay uses it; new bindings exclude the separately verified lock.
+  const exactLegacyConfiguration = callback.kind === "compute-configure" && dependencies.digest(input.body) === binding.inputDigest;
+  if (projection !== undefined && dependencies.digest(projection) !== binding.inputDigest && !exactLegacyConfiguration) throw refuse("operation-input", `${callback.route} input differs from the bound operation`);
   const reference = callback.reference ? await callback.reference(input.body, context) : null;
   if (callback.reference && !reference) throw refuse("operation-input", `${callback.route} names no existing operation`);
   let adopt: { environmentKey: string; offerId: string } | undefined;

@@ -5,7 +5,8 @@ import type { ServerConfig } from "../../../../lib/config.ts";
 import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admission.ts";
 import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
-import { verifiedComputeRuntime, readConfiguredComputeObservation } from "./compute-observer.ts";
+import { verifiedComputeRuntime, readConfiguredComputeObservation, operationEnvironment } from "./compute-observer.ts";
+import { configurationAttemptCode, currentToolingOperation } from "./tooling-operations.ts";
 import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
@@ -75,7 +76,7 @@ async function readConfiguration(input: Input, before: Snapshot) {
   const request = { request: input.request, task: { id: input.taskId, primarySessionId: before.owner.session.id, worktreePath: before.owner.task.worktreePath },
     environment: { id: before.environment.id, key: before.environment.key, purpose: before.environment.purpose, revision: before.environment.revision },
     resource: { id: before.resource.id, key: before.resource.key, kind: before.resource.kind, purpose: before.resource.purpose, externalId: before.resource.externalId, metadata: before.resource.metadata } };
-  const env = Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
+  const env = operationEnvironment(currentToolingOperation(), input.config.controlIpcPath);
   const proof = Proof.parse(JSON.parse(await executeOwnedObserver([process.execPath, "--no-env-file", adapterPath, "compute", "configuration-observe"], {
     cwd: receipt.checkout, timeoutMs: 30_000, env, input: JSON.stringify(request),
   })));
@@ -105,7 +106,8 @@ export async function configureCompute(input: Input, read = readConfiguration, h
   // The ordinary configured observer must accept the staged generation before
   // it can be activated. This supplies real stopped accounting now and leaves
   // a valid immutable manifest for subsequent collector refresh while queued.
-  const stopped = await observe(input, before.owner.task, candidate, projected, []);
+  const selection = await configurationAttemptCode(input.prisma, before.owner.task, candidate.id, input.request);
+  const stopped = await observe(input, before.owner.task, candidate, projected, [], undefined, selection);
   const observation = ComputeObservation.parse(stopped.observation);
   if (observation.state !== "stopped"
     || observation.operations.active !== 0 || observation.configurationDigest !== proof.compute.configurationSha256) throw new Error("Staged configuration has no fresh stopped accounting");
@@ -115,7 +117,15 @@ export async function configureCompute(input: Input, read = readConfiguration, h
     // This fresh snapshot also checks current pause, original primary/source
     // link, intent, slot, active offer and prior transition receipt.
     const current = await snapshot({ ...input, prisma: tx });
-    const stable = (value: Snapshot) => ({ identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment: value.environment, resource: value.resource, offer: value.offer, allocations: value.allocations, traffic: value.traffic, event: value.event, intent: value.intent });
+    await configurationAttemptCode(tx as PrismaClient, current.owner.task, candidate.id, input.request);
+    // Collector telemetry is not transition authority. Our independently
+    // observed staged generation replaces it atomically below. Retain every
+    // ownership, allocation, recipe and development-intent comparison.
+    const stable = (value: Snapshot) => {
+      const { observation: _observation, updatedAt: _updatedAt, ...environment } = value.environment;
+      return { identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment, resource: value.resource,
+        offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent };
+    };
     if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
     if (!current.event) {
       const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });

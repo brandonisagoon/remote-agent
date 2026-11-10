@@ -78,6 +78,20 @@ test("no durable transition means matching new digest alone cannot authorize ret
   await expect(configureCompute(f.input, f.read, f.head, f.observe)).rejects.toThrow("durable acknowledgment");
 });
 
+test("collector telemetry refresh does not invalidate unchanged configuration authority", async () => {
+  const f = await fixture();
+  let reads = 0;
+  const read = async () => {
+    if (++reads === 2) {
+      await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { observation: { collector: "new completed observation" } } });
+      await db.prisma.computeTraffic.update({ where: { routeId: "old-route" }, data: { sequence: 1, state: { collector: "refreshed" } } });
+    }
+    return f.proof;
+  };
+  expect(await configureCompute(f.input, read, f.head, f.observe)).toMatchObject({ recipeHash: nextHash });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(1);
+});
+
 test.each(["progress", "container", "coverage"])("crash after resource publication before bind reconciles only journaled progress: %s", async changed => {
   const f = await fixture(); await configureCompute(f.input, f.read, f.head, f.observe);
   const saved = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: f.resource.id } });

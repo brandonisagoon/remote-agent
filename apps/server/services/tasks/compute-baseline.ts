@@ -130,10 +130,10 @@ async function recordRefresh(input: Context, taskId: string, groupId: string, to
 
 const readInstalled: Read = async (input, task, request) => (await import("./compute-observer.ts")).readInstalledComputeBaseline(input, task, request);
 
-/** Accounting only, also usable before policy activation. Each group's proof
- * is invalidated when that group's own refresh begins (before its fallible
- * read), so a long pass never clears unrelated fresh proof. A failure of the
- * host-wide inventory is evidence against every group and invalidates all. */
+/** Accounting only, also usable before policy activation. Readers use the
+ * last completed proof while a replacement is collected. Admission still
+ * rechecks its freshness and complete ownership snapshot. A failed completed
+ * refresh revokes that proof; a superseded attempt cannot revoke newer proof. */
 export async function refreshComputeBaselines(input: Context, read: Read = readInstalled) {
   const machineId = input.config.machine, token = randomUUID();
   let existing: ComputeBaseline[], resources: Awaited<ReturnType<Store["remoteTaskResource"]["findMany"]>>, environments: Awaited<ReturnType<Store["computeEnvironment"]["findMany"]>>;
@@ -158,6 +158,7 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
     for (;;) {
       const entry = entries[index++]; if (!entry) return;
       const [id, group] = entry;
+      const invalidate = () => input.prisma.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: Prisma.DbNull } });
       let phase: z.infer<typeof BaselineRefreshPhase> = "snapshot";
       // The membership this refresh is for: what it upserts (planned until then).
       let membership = membershipOf([...group.ids, ...resources.filter(resource => resource.taskId === group.taskId && resource.purpose === group.purpose).map(resource => resource.id)]);
@@ -169,11 +170,11 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           const resourceIds = [...new Set([...group.ids, ...(current ? Ids.parse(current.resourceIds) : []),
             ...resources.filter(resource => resource.taskId === group.taskId && resource.purpose === group.purpose).map(resource => resource.id)])].sort();
           Ids.parse(resourceIds);
-          return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token, proof: Prisma.DbNull } });
+          return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token } });
         });
         membership = membershipOf(Ids.parse(row.resourceIds));
         const before = await snapshot(input.prisma, row, input.runtime);
-        if (!before.settled) { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
+        if (!before.settled) { unavailable++; await invalidate(); await recordRefresh(input, group.taskId, id, token, membership, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
         phase = "observe";
         const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
           purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
@@ -192,8 +193,8 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
         // Persisted as proof only; whether it credits (stopped, current, fresh)
         // is decided solely by computeBaselineCredits.
         if (credited) { observed++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "proof-recorded" }); }
-        else { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
-      } catch (error) { unavailable++; await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
+        else { unavailable++; await invalidate(); await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: PHASE_CODES.credit }); }
+      } catch (error) { unavailable++; await invalidate(); await recordRefresh(input, group.taskId, id, token, membership, { outcome: "failed", phase, code: refreshCode(phase, error) }); }
     }
   }));
   return { observed, unavailable };

@@ -30,28 +30,6 @@ function checkpointBody(event: AgentRuntimeLifecycleEvent, output: string): stri
   return `${event.phase === "failed" ? "### Agent turn failed" : "### Agent checkpoint"}\n\n${preview}${detail}`;
 }
 
-/** Only a confirmed explicit update from this same turn can replace an automatic
- * checkpoint. Missing journal timing is not evidence that a prior update covers
- * this turn. A comment alone suffices even if its optional state change failed. */
-async function alreadyPublished(prisma: PrismaClient, event: AgentRuntimeLifecycleEvent, connectionId: string, issueId: string, output: string): Promise<boolean> {
-  if (event.phase !== "completed") return false;
-  const endedAt = new Date(event.createdAt);
-  const started = await prisma.runtimeLifecycleEvent.findFirst({
-    where: { runtimeSessionId: event.sessionId, requestId: event.requestId, phase: "started", occurredAt: { lte: endedAt } },
-    orderBy: { sequence: "desc" },
-  });
-  if (!started) return false;
-  const receipt = await prisma.runtimeIssueUpdate.findFirst({
-    where: {
-      runtimeSessionId: event.sessionId, connectionId, issueId, commentPosted: true,
-      createdAt: { gte: started.occurredAt, lte: endedAt }, updatedAt: { lte: endedAt },
-    },
-    orderBy: [{ updatedAt: "desc" }, { createdAt: "desc" }, { id: "desc" }],
-  });
-  const input = z.object({ body: z.string() }).safeParse(receipt?.input);
-  return input.success && input.data.body.trim() === output;
-}
-
 /** New task sessions link directly to their source issue and need no separate
  * AGENT team. A stable comment UUID reconciles a lost response before retry. */
 export async function projectSourceCheckpoint(config: ServerConfig, prisma: PrismaClient, _runtime: AgentSessionRuntime, event: AgentRuntimeLifecycleEvent, delivery = client) {
@@ -74,8 +52,14 @@ export async function projectSourceCheckpoint(config: ServerConfig, prisma: Pris
     runtimeSessionId: event.sessionId, consumer, sourceCursor: JSON.stringify(next),
     generation: sequence > 0n ? sequence : cursor.generation,
   });
+  // Completed turns remain in the lifecycle journal. Meaningful task progress
+  // is published explicitly; wording changes are not a task transition.
+  if (event.phase === "completed") {
+    await remember();
+    return true;
+  }
   if (previous?.phase === next.phase && previous.fingerprint === next.fingerprint &&
-      (next.phase === "completed" || previous.requestId === next.requestId)) {
+      previous.requestId === next.requestId) {
     await remember();
     return true;
   }
@@ -83,10 +67,6 @@ export async function projectSourceCheckpoint(config: ServerConfig, prisma: Pris
   const scoped = scopeConfig(config, { repositoryId: session.repositoryId, connectionId: source.connectionId });
   const issue = await delivery.issue(scoped, { id: source.externalId });
   if (!issue) throw new Error("Checkpoint source issue missing");
-  if (await alreadyPublished(prisma, event, source.connectionId, issue.id, output)) {
-    await remember();
-    return true;
-  }
   const body = checkpointBody(event, output);
   const digest = createHash("sha256").update(`linear-checkpoint:${event.sessionId}:${event.id}`).digest("hex");
   // Linear accepts client IDs in UUIDv4 form; the hash keeps retries stable.
@@ -106,7 +86,7 @@ export async function projectSourceCheckpoint(config: ServerConfig, prisma: Pris
     // losing its acknowledgement. Reconcile that same event UUID, never replace
     // or duplicate its comment just because the preview policy has changed.
     const legacyOutput = event.phase === "failed" ? event.error ?? "The agent turn failed." : output;
-    const legacyBody = `${event.phase === "failed" ? "### Agent turn failed" : "### Agent checkpoint"}\n\n${legacyOutput.length > 8000 ? `…${legacyOutput.slice(-8000)}` : legacyOutput}`;
+    const legacyBody = `### Agent turn failed\n\n${legacyOutput.length > 8000 ? `…${legacyOutput.slice(-8000)}` : legacyOutput}`;
     if (existing?.id !== id || existing.issue?.id !== issue.id || (existing.body !== body && existing.body !== legacyBody)) throw new Error("Checkpoint delivery unconfirmed; retain event for reconciliation");
   }
   if (!thread) await registerThread(prisma, { provider: "linear", connectionId: source.connectionId, threadRootCommentId: id, runtimeSessionId: event.sessionId, relationship: "thread" });

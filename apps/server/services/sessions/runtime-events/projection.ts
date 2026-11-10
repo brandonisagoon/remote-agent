@@ -34,14 +34,7 @@ import { projectTaskStalls } from "./task-stalls.ts";
 
 const CONSUMER = "linear-projection:v1";
 const NOTIFY_CONSUMER = "delegate-notification:v1";
-const MAX_OUTPUT = 8_000;
 const yieldToRequests = () => new Promise<void>((resolve) => setImmediate(resolve));
-
-function checkpoint(output: string): string {
-  const text = output.trim();
-  const bounded = text.length > MAX_OUTPUT ? `…${text.slice(-MAX_OUTPUT)}` : text;
-  return ["### Agent checkpoint", "", bounded].join("\n");
-}
 
 export function agentIssueStateForRuntimeEvent(
   event: AgentRuntimeLifecycleEvent,
@@ -105,7 +98,7 @@ export async function projectRuntimeEvent(
     });
   }
 
-  if (!sourceReply && (event.phase === "completed" || event.phase === "failed")) {
+  if (!sourceReply && event.phase === "failed") {
     const sourceIdentifier = parseAgentIssueSourceIdentifier(issue.description);
     const source = sourceIdentifier
       ? await getSourceIssue(config, { id: sourceIdentifier })
@@ -125,14 +118,7 @@ export async function projectRuntimeEvent(
           });
         }
       }
-      const output = event.phase === "completed"
-        ? await runtime.output(event.sessionId)
-        : null;
-      const body = event.phase === "failed"
-        ? ["❌ Agent turn failed", "", event.error ?? "Unknown acpx error"].join("\n")
-        : output?.trim()
-          ? checkpoint(output)
-          : null;
+      const body = ["❌ Agent turn failed", "", event.error ?? "Unknown acpx error"].join("\n");
       if (body) {
         const posted = await createThreadedIssueComment(config.linearApiKey, {
           issueId: source.id,
