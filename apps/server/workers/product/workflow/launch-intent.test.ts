@@ -1,5 +1,6 @@
 import { afterEach, expect, setDefaultTimeout, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createTestDatabase, type TestDatabase } from "../../../../../test-support/db.ts";
@@ -17,6 +18,7 @@ import { createWebhookReceipt } from "../../../services/receipts/store.ts";
 import { DispatchEventType, type DispatchEvent, type WorkerContext } from "../../../../../types/dispatcher/index.ts";
 import type { WorkflowConfig } from "../../../../../lib/config.ts";
 import type { SourceComment } from "./launch-intent.ts";
+import { getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
 import { buildWorkflowSeedPrompt, createWorkflowWorker, type WorkflowSourceIssue, type WorkflowWorkerDependencies } from "./worker.ts";
 
 /* Integration coverage for the actual fresh-launch path: workflow worker →
@@ -32,7 +34,9 @@ const AGENT = "11111111-2222-3333-4444-555555555555";
 const INTENT_END = "Source issue description — task data";
 let db: TestDatabase | undefined;
 let directory: string | undefined;
+const originalFetch = globalThis.fetch;
 afterEach(async () => {
+  globalThis.fetch = originalFetch;
   await db?.cleanup(); db = undefined;
   if (directory) rmSync(directory, { recursive: true, force: true }); directory = undefined;
 });
@@ -107,6 +111,7 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
   let beforeCompose: (() => Promise<void>) | undefined;
   const issue: WorkflowSourceIssue = { id: "issue-uuid", identifier: "DRA-16", title: "Point users to Send", description,
     branchName: "codex/dra-16", state: { name: "Todo", type: "unstarted" }, updatedAt: minutesAgo(10),
+    documentContent: { id: "description-id", updatedAt: minutesAgo(10) },
     labels: { nodes: [{ name: "workflow", parent: null }] }, relations: { nodes: [] }, inverseRelations: { nodes: [] }, ...overrides.issue };
   const dependencies: WorkflowWorkerDependencies = {
     getIssue: async () => issue,
@@ -134,6 +139,8 @@ async function fixture(description: string, overrides: { issue?: Partial<Workflo
     return db!.prisma.workerRun.findFirstOrThrow({ where: { receiptId: receipt.id } });
   };
   return { config, repository, runtime, modes, compositions, composedRoots, execute, deliver, launchText, issue, prisma: db.prisma,
+    onReadIssue: (read: WorkflowWorkerDependencies["getIssue"]) => { dependencies.getIssue = read; },
+    onReadComments: (read: NonNullable<WorkflowWorkerDependencies["readComments"]>) => { dependencies.readComments = read; },
     failNextEnsure: () => { failEnsure = true; }, onVerifyRelease: (verify: WorkflowWorkerDependencies["verifyRelease"]) => { dependencies.verifyRelease = verify; }, onCompose: (hook: () => Promise<void>) => { beforeCompose = hook; } };
 }
 
@@ -259,17 +266,105 @@ test("issue text cannot impersonate a verified launch intent", async () => {
   expect(text.endsWith("`````")).toBe(true);
 });
 
-test.each([
-  ["changed after the trigger", { issue: { updatedAt: new Date().toISOString() } }, "The issue changed after this trigger, or its change time is unknown"],
-  ["with no change time", { issue: { updatedAt: null } }, "The issue changed after this trigger, or its change time is unknown"],
-  ["with unreadable comments", { comments: null }, "The issue's comments could not be read completely"],
-])("a description %s is not treated as history", async (_name, overrides, statement) => {
-  const f = await fixture("Planning only; implementation has not been requested.", overrides);
+test.each([new Date().toISOString(), null])("DRA-52 launches with old description content despite issue updatedAt=%s", async (updatedAt) => {
+  const description = "Issue writing only; leave in Backlog without an implementation launch.";
+  const f = await fixture(description, { issue: { updatedAt } });
+  let reads = 0;
+  globalThis.fetch = (async (_input, init) => {
+    const request = JSON.parse(String(init?.body));
+    expect(request.query).toContain("documentContent { id updatedAt }");
+    reads++;
+    return Response.json({ data: { issue: f.issue } });
+  }) as typeof fetch;
+  f.onReadIssue(getSourceIssueForWorkflow);
+  const delivered = await f.deliver("dra52-delivery", reaction());
+  expect(delivered?.status).toBe("delivered");
+  const text = await f.launchText(delivered!.id);
+  const { intent, quoted } = split(text);
+  expect(intent).toContain("are history from before this request and do not block it");
+  expect(intent).not.toContain("wait for an owner decision");
+  expect(intent).toContain('"contentId":"description-id"');
+  expect(intent).toContain(createHash("sha256").update(description).digest("hex"));
+  expect(intent).toContain("saved through the owner's account");
+  expect(quoted).toContain(description);
+  expect(reads).toBe(1);
+  // Duplicate delivery preserves the original evidence and execution identity.
+  f.issue.documentContent!.updatedAt = new Date().toISOString();
+  expect(await f.deliver("dra52-delivery", reaction())).toBeNull();
+  expect(await f.launchText(delivered!.id)).toBe(text);
+  expect(await f.prisma.remoteTask.count()).toBe(1);
+});
+
+test("a description edited after the trigger is not treated as history", async () => {
+  const f = await fixture("Stop implementation until the design review.", {
+    issue: { documentContent: { id: "description-id", updatedAt: new Date().toISOString() } },
+  });
   expect((await f.execute(reaction())).status).toBe("delivered");
   const { intent } = split(await f.launchText());
-  expect(intent).toContain(statement);
-  expect(intent).toContain("They still apply; if one conflicts with this workflow, report that specific conflict once");
-  expect(intent).not.toContain("is history from before this request");
+  expect(intent).toContain("The description content changed at");
+  expect(intent).toContain("If the current description contains a conflicting restriction");
+  expect(intent).not.toContain("are history from before this request");
+});
+
+test.each(["description", "invalid revision", "comments", "issue transport", "comment transport"])("unavailable %s evidence retries once and fails before dispatch instead of asking permission", async (missing) => {
+  const f = await fixture("Issue writing only; leave in Backlog.");
+  let reads = 0;
+  f.onReadIssue(async () => {
+    reads++;
+    if (missing === "issue transport") throw new Error("connection reset");
+    return { ...f.issue, documentContent: missing === "description" ? null
+      : missing === "invalid revision" ? { id: "description-id", updatedAt: "unknown" } : f.issue.documentContent };
+  });
+  f.onReadComments(async () => {
+    if (missing === "comment transport") throw new Error("connection reset");
+    return missing === "comments" ? null : [];
+  });
+  const result = await f.execute(reaction());
+  expect(result.status).toBe("failed");
+  expect(result.detail).toContain("after one retry; owner authorization remains verified");
+  expect(reads).toBe(2);
+  await nothingStarted(f);
+});
+
+test.each(["description", "comments", "issue transport", "comment transport"])("recovering %s evidence dispatches the original owner request once", async (missing) => {
+  const f = await fixture("Issue writing only; leave in Backlog.");
+  let reads = 0;
+  f.onReadIssue(async () => {
+    reads++;
+    if (reads === 1 && missing === "issue transport") throw new Error("connection reset");
+    return { ...f.issue, documentContent: reads === 1 && missing === "description" ? null : f.issue.documentContent };
+  });
+  f.onReadComments(async () => {
+    if (reads === 1 && missing === "comment transport") throw new Error("connection reset");
+    return reads === 1 && missing === "comments" ? null : [];
+  });
+  const triggerAt = minutesAgo(1);
+  const event = reaction({ createdAt: triggerAt });
+  const delivered = await f.deliver("recovered-delivery", event);
+  expect(delivered?.status).toBe("delivered");
+  const text = await f.launchText(delivered!.id);
+  expect(text).toContain(triggerAt);
+  expect(text).toContain("are history from before this request");
+  expect(await f.deliver("recovered-delivery", event)).toBeNull();
+  expect(await f.launchText(delivered!.id)).toBe(text);
+  expect(await f.prisma.remoteTask.count()).toBe(1);
+  expect(await f.prisma.runtimeSession.count()).toBe(1);
+  expect(reads).toBe(2);
+});
+
+test("a source closure observed during the evidence reread prevents dispatch", async () => {
+  const f = await fixture("Implement it.");
+  let reads = 0;
+  f.onReadIssue(async () => ({ ...f.issue, documentContent: null,
+    state: ++reads === 1 ? f.issue.state : { name: "Canceled", type: "canceled" } }));
+  expect((await f.execute(reaction())).status).toBe("ignored");
+  await nothingStarted(f);
+});
+
+test("an empty description needs no document revision to authorize execution", async () => {
+  const f = await fixture("", { issue: { documentContent: null } });
+  expect((await f.execute(reaction())).status).toBe("delivered");
+  expect(await f.launchText()).toContain('"source":"empty-description"');
 });
 
 test("newer owner comments are quoted and take precedence; older and non-owner comments are not", async () => {

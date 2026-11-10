@@ -40,11 +40,17 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
   z.strictObject({ ...Common, kind: z.literal("cloudflare-tunnel"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/) }), name: z.string().min(1) }),
   z.strictObject({ ...Common, kind: z.literal("cloudflare-ingress-route"), scope: z.strictObject({ ...Scope, accountId: z.string().regex(/^[a-f0-9]{32}$/), tunnelId: z.string().min(1) }), hostname: z.string().min(1), routeDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-ingress-route"), scope: z.strictObject({ ...Scope, configFile: Absolute, tunnelId: Nonempty }), hostname: Nonempty, sourceDigest: Hash, routeDigest: Hash }),
+  z.strictObject({ ...Common, kind: z.literal("cloudflared-connector"), scope: z.strictObject({ ...Scope, purpose: z.enum(["development", "review"]), configFile: Absolute, pidFile: Absolute, tunnelId: z.uuid() }),
+    identity: z.strictObject({ process: z.strictObject({ pid: z.number().int().positive(), start: Nonempty, uid: z.number().int().nonnegative(), cwd: Absolute, executable: Absolute, argvDigest: Hash }),
+      configDigest: Hash, credentialsDigest: Hash, pidFileDigest: Hash }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("native-family"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), proof: z.strictObject({ file: Absolute, sha256: Hash }), planDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("local-endpoint"), scope: z.strictObject({ ...Scope, anchorKey: z.string().min(1) }), url: z.url(), nativeProofDigest: Hash }),
   z.strictObject({ ...Common, kind: z.literal("browser-session"), scope: z.strictObject({ ...Scope, namespace: z.literal("drafted") }),
     profile: z.strictObject({ path: Absolute, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), ownerFile: Absolute, ownerSha256: Hash }) }),
   z.strictObject({ ...Common, kind: z.literal("clerk-user"), id: z.string().regex(/^user_[A-Za-z0-9]+$/), scope: ClerkScope,
+    creation: z.strictObject({ createdAt: z.number().int().nonnegative(), emailDigest: Hash }).nullable() }),
+  z.strictObject({ ...Common, kind: z.literal("clerk-assignment"), id: z.string().regex(/^drafted-test-[a-f0-9]{64}$/), scope: ClerkScope,
+    emailDigest: Hash, markerDigest: Hash, subjectId: z.string().regex(/^user_[A-Za-z0-9]+$/).nullable(),
     creation: z.strictObject({ createdAt: z.number().int().nonnegative(), emailDigest: Hash }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("clerk-session"), id: z.string().regex(/^sess_[A-Za-z0-9]+$/), userId: z.string().regex(/^user_[A-Za-z0-9]+$/), scope: ClerkScope,
     creation: z.strictObject({ createdAt: z.number().int().nonnegative() }).nullable() }),
@@ -56,7 +62,7 @@ export function cleanupTargetDigest(target: Omit<CleanupTarget, "identityDigest"
   const { identityDigest: _, ...identity } = target as CleanupTarget;
   return cleanupDigest(identity);
 }
-export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk", "vault"]);
+export const CleanupAdapter = z.enum(["docker", "compose", "runtime", "native", "preview", "endpoint", "browser", "clerk", "vault", "connector"]);
 export const CleanupObserverResource = z.strictObject({ id: z.string().min(1), key: z.string().min(1), kind: z.string().min(1), purpose: z.string().min(1), externalId: z.string().min(1), state: z.string(), expiresAt: z.string().nullable(), metadata: z.json().nullable() });
 const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, entry]) => [key, canonical(entry)])) : value;
 export const cleanupDigest = (value: unknown) => createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
@@ -94,7 +100,7 @@ export const CleanupObserverResult = z.strictObject({ version: z.literal(1), tas
     if (result.targets.some(target => target.identityDigest !== cleanupTargetDigest(target))) ctx.addIssue({ code: "custom", message: "Observer target digest does not match its exact identity" });
     if (result.targets.some(target => (target.kind === "docker-container" || target.kind === "docker-network") && target.presentAtPrepare && !/^[a-f0-9]{64}$/.test(target.id))) ctx.addIssue({ code: "custom", message: "Present Docker objects require complete IDs" });
     if (result.targets.some(target => target.scope.taskId !== result.taskId || target.kind.startsWith("docker-") && "identity" in target && target.presentAtPrepare !== (target.identity !== null))) ctx.addIssue({ code: "custom", message: "Observer target ownership or initial identity is invalid" });
-    if (result.targets.some(target => (target.kind === "clerk-user" || target.kind === "clerk-session") && target.presentAtPrepare && target.creation === null)) ctx.addIssue({ code: "custom", message: "A present Clerk target requires its original provider creation identity" });
+    if (result.targets.some(target => (target.kind === "clerk-user" || target.kind === "clerk-session" || target.kind === "clerk-assignment") && target.presentAtPrepare && (target.creation === null || target.kind === "clerk-assignment" && target.subjectId === null))) ctx.addIssue({ code: "custom", message: "A present Clerk target requires its original provider creation identity" });
   });
 export type CleanupObserverResult = z.infer<typeof CleanupObserverResult>;
 

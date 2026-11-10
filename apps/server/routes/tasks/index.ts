@@ -1,3 +1,5 @@
+import { RuntimeHealthInput, recordRuntimeHealth } from "../../services/tasks/runtime-health.ts";
+import { taskPublicationContext } from "../../services/sessions/task-publication.ts";
 import { publishCleanupStatus } from "../../services/tasks/cleanup-status.ts";
 import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
 import { CleanupEnqueueInput, enqueueTaskCleanup } from "../../services/tasks/cleanup-inbox.ts";
@@ -5,6 +7,9 @@ import { CleanupRetryDeferred } from "../../services/tasks/cleanup-retry.ts";
 import { deliverInstructions } from "../../services/sessions/inbox.ts";
 import { archiveRetentionProjection, assertArchiveResourceUpdate } from "../../services/tasks/archive-retention.ts";
 import { Hono } from "hono";
+import { validateEvidenceReceipt } from "../../services/tasks/evidence-receipt.ts";
+import { validateConnectorReceipt } from "../../services/tasks/connector-receipt.ts";
+import { assertConnectorOwnership } from "../../services/tasks/connector-ownership.ts";
 import { z } from "zod";
 import type { AppEnv } from "../../middleware/context.ts";
 import { taskForSession } from "../../services/tasks/store.ts";
@@ -277,7 +282,7 @@ taskRoutes.get("/:taskId", async (c) => {
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {
   const task = await taskForSession(c.get("prisma"), c.req.param("sessionId"));
-  return task ? c.json({ task: { ...taskResponse(task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
+  return task ? c.json({ task: { ...taskResponse(task), ...await taskPublicationContext(c.get("prisma"), task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
 });
 
 const Progress = z.object({
@@ -285,6 +290,13 @@ const Progress = z.object({
   environmentStatus: z.enum(["pending", "preparing", "ready", "degraded", "stopped"]).optional(),
   recoveryDetail: z.string().max(8000).nullable().optional(),
 }).strict();
+
+sessionTaskRoutes.post("/:sessionId/task/runtime-health", async c => {
+  const input = RuntimeHealthInput.safeParse(await c.req.json().catch(() => null));
+  if (!input.success) return c.json({ error: "Invalid runtime health observation" }, 400);
+  try { return c.json(await recordRuntimeHealth(c.get("prisma"), c.req.param("sessionId"), input.data)); }
+  catch (error) { return c.json({ error: error instanceof Error ? error.message : String(error) }, 409); }
+});
 
 sessionTaskRoutes.patch("/:sessionId/task", async (c) => {
   const parsed = Progress.safeParse(await c.req.json());
@@ -315,6 +327,14 @@ sessionTaskRoutes.put("/:sessionId/task/resources", async (c) => {
   try {
     const development = await developmentResourceSelection({ prisma, config: c.get("config"), runtime: c.get("agentRuntime"), sessionId: c.req.param("sessionId"), taskId: task.id }, key, values.state);
     const resource = await prisma.$transaction(async (tx) => {
+      if (["evidence", "cloudflared-connector"].includes(data.kind)) {
+        const previous = await tx.remoteTaskResource.findUnique({ where: { taskId_key: { taskId: task.id, key } } });
+        if (data.kind === "evidence") validateEvidenceReceipt(data.metadata ?? previous?.metadata, previous !== null);
+        else {
+          validateConnectorReceipt(data.externalId, data.metadata ?? previous?.metadata, previous !== null, { taskId: task.id, purpose: data.purpose });
+          await assertConnectorOwnership(tx, task.id, task.machineId, { key, externalId: data.externalId });
+        }
+      }
       const existing = await tx.remoteTaskResource.upsert({
         where: { taskId_key: { taskId: task.id, key } }, create: { taskId: task.id, key, ...values }, update: {},
       });

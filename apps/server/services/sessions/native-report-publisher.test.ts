@@ -11,6 +11,7 @@ import { NATIVE_REPORT_ORIGIN, readNativeReportOrigin, nativeReportDigest } from
 import { handleCommentWebhook } from "../../integrations/linear/webhooks/comment/handler.ts";
 import { LinearCommentWebhookSchema, type LinearCommentWebhook } from "../../integrations/linear/webhook-types/comment.ts";
 import { observeNativeReportWebhook, assertNativeReportWebhook } from "../../integrations/linear/native-report-ingress.ts";
+import { takeNativeOwnership, withNativeLaunchWork } from "../launches/native-takeover.ts";
 import { withRequestLifetime } from "../../request-lifetime.ts";
 
 let db: TestDatabase;
@@ -335,4 +336,73 @@ test("a create with missing canonical edit evidence waits without inventing a wi
   expect(await f.receive(f.event(comment))).toMatchObject({ kind: "ignored", reason: "native_report_publication" });
   expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } })).toEqual(origin);
   expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+});
+
+
+async function settledNativeFixture() {
+  const f = await fixture();
+  const source = { connectionId: f.config.activeConnectionId, repositoryId: f.config.activeRepositoryId, issueId: f.issue.id, issueIdentifier: f.issue.identifier };
+  const nativeChat = { threadId: f.input.request.owner.threadId, hostId: f.input.request.owner.hostId };
+  const decision = await takeNativeOwnership({ prisma: f.prisma, config: f.config, runtime: f.runtime }, { source, requestKey: "takeover", expectedRevision: 0, nativeChat });
+  expect(decision.state).toBe("native");
+  const inspection = await inspectNativeReportPublisher(f.input);
+  expect(inspection.nativeOwner).toEqual(nativeChat);
+  f.input.request.ownershipDigest = inspection.ownershipDigest;
+  return { ...f, source, control: decision.control!, nativeChat };
+}
+
+test("settled native owner publishes through HTTP and replays after reconnect while the managed family stays paused", async () => {
+  const f = await settledNativeFixture(); Object.assign(issueUpdateDelivery, f.client);
+  const url = `/api/tasks/${f.task.id}/native-reports`, headers = { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" };
+  expect((await f.app.request(url, { headers })).status).toBe(200);
+  const first = await f.app.request(url, { method: "POST", headers, body: JSON.stringify(f.input.request) });
+  expect(first.status).toBe(200); const result = await first.json(); expect(result.published).toBe(true);
+  await f.prisma.$disconnect(); expect(await f.publish()).toEqual(result);
+  expect(f.comments.size).toBe(1); expect(f.writes()).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).ownerPaused).toBe(true);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0); expect(await f.prisma.runtimeSourceMessage.count()).toBe(0);
+  expect(f.runtime.sentMessages).toEqual([]); expect(f.runtime.cancelledSessionIds).toEqual([]);
+});
+
+test("settled native publication recovers a lost response with the same immutable origin", async () => {
+  const f = await settledNativeFixture(); let unavailable = true;
+  const delivery = { ...f.client, create: async (...args: Parameters<typeof f.client.create>) => { await f.client.create(...args); return null; }, comment: async (...args: Parameters<typeof f.client.comment>) => { if (unavailable) throw new Error("lost native response"); return f.client.comment(...args); } };
+  await expect(f.publish(delivery)).rejects.toThrow("lost native response");
+  const before = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } });
+  await f.prisma.$disconnect(); unavailable = false;
+  expect((await f.publish(delivery)).published).toBe(true); expect(f.comments.size).toBe(1);
+  expect(await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: NATIVE_REPORT_ORIGIN } })).toEqual(before);
+});
+
+test.each(["thread", "host", "unsettled", "revision", "release", "unpaused", "active-family", "closed", "missing-reconciliation", "foreign-source"])("native report refuses %s drift before reserving an outbox", async kind => {
+  const f = await settledNativeFixture();
+  if (kind === "thread") f.input.request.owner.threadId = "foreign";
+  if (kind === "host") f.input.request.owner.hostId = "foreign";
+  if (kind === "unsettled") await f.prisma.nativeTakeover.update({ where: { id: f.control.id }, data: { settled: false } });
+  if (kind === "revision") await f.prisma.nativeTakeover.update({ where: { id: f.control.id }, data: { revision: 2 } });
+  if (kind === "release") await f.prisma.nativeTakeover.update({ where: { id: f.control.id }, data: { mode: "managed", revision: 2, grantedSessionId: f.session.id } });
+  if (kind === "unpaused") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  if (kind === "active-family") await f.prisma.runtimeSession.create({ data: { id: "active-delegate", scopeKey: "active-delegate", role: "delegate", agentCommand: "codex", cwd: f.session.cwd, repositoryId: f.task.repositoryId, machineId: f.task.machineId, status: "active" } });
+  if (kind === "closed") await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "closed" } });
+  if (kind === "missing-reconciliation") await f.prisma.nativeTakeoverEvent.deleteMany({ where: { controlId: f.control.id, kind: "reconciled" } });
+  if (kind === "foreign-source") await f.prisma.nativeTakeover.update({ where: { id: f.control.id }, data: { issueId: "foreign" } });
+  await expect(f.publish()).rejects.toThrow(); expect(f.writes()).toBe(0); expect(await f.prisma.runtimeIssueUpdate.count()).toBe(0);
+});
+
+test("late active takeover work is refused even when its stored settled bit predates that work", async () => {
+  const f = await settledNativeFixture();
+  await withNativeLaunchWork(f.prisma, { ...f.source, issue: f.issue.id }, "late-work", async () => {
+    await expect(inspectNativeReportPublisher(f.input)).rejects.toThrow("pending managed work");
+    await expect(f.publish()).rejects.toThrow("pending managed work");
+  });
+  expect((await f.publish()).published).toBe(true);
+});
+
+test.each(["reservation", "publication"])("native ownership change before %s cannot publish under the previous owner", async stage => {
+  const f = await settledNativeFixture();
+  const change = async () => { await f.prisma.nativeTakeover.update({ where: { id: f.control.id }, data: { settled: false } }); };
+  const client = stage === "reservation" ? { ...f.client, source: async () => { const source = await f.client.source(); await change(); return source; } } : f.client;
+  if (stage === "publication") { let reads = 0; f.setOnRead(async () => { if (++reads === 2) await change(); }); }
+  await expect(f.publish(client)).rejects.toThrow(); expect(f.writes()).toBe(0);
+  expect(await f.prisma.runtimeIssueUpdate.count()).toBe(stage === "reservation" ? 0 : 1);
 });

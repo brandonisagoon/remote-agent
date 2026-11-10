@@ -1,4 +1,6 @@
+import { assertConfigurationCompletion } from "./configuration-completion.ts";
 import { activeCleanupRoots } from "./cleanup-scope.ts";
+import { recordedEvidenceIdentity } from "./evidence-receipt.ts";
 import { retainedArchiveResourceIds, projectedRetainedArchiveResourceIds } from "./archive-retention.ts";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -43,6 +45,7 @@ async function preparation(prisma: Database, config: ServerConfig, taskId: strin
   const prepared = PreparedFinalization.parse(raw);
   if (prepared.taskId !== task.id || prepared.sessionId !== session.id || prepared.requestKey !== requestKey || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier || prepared.delivery.receipts.contractRevision !== prepared.contractRevision) throw new Error("Legacy evidence preparation identity or verified delivery changed");
   if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else if (prepared.configurationCompletion) await assertConfigurationCompletion(prisma, prepared);
   else {
     if (prepared.delivery.boundary !== "merge" || !prepared.delivery.receipts.merge.merged || !prepared.delivery.receipts.merge.sha) throw new Error("Legacy evidence preparation identity or verified merge changed");
     const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, action: "completion-contract", source: `owner:${taskId}` }, orderBy: { sequence: "desc" } });
@@ -56,15 +59,7 @@ async function preparation(prisma: Database, config: ServerConfig, taskId: strin
   return { task, session, event, prepared, identityDigest };
 }
 
-function recordedProof(resource: RemoteTaskResource) {
-  const metadata = resource.metadata as Record<string, unknown> | null;
-  if (metadata !== null && (typeof metadata !== "object" || Array.isArray(metadata))) throw new Error("Evidence receipt metadata is malformed");
-  const sha = metadata?.sha256;
-  if (sha !== undefined && (typeof sha !== "string" || !/^[a-f0-9]{64}$/.test(sha))) throw new Error("Recorded evidence digest is malformed");
-  const sizes = ["bytes", "size", "byteSize"].filter((key) => metadata?.[key] !== undefined).map((key) => metadata![key]);
-  if (sizes.some((size) => typeof size !== "number" || !Number.isSafeInteger(size) || size < 0) || sizes.some((size) => size !== sizes[0])) throw new Error("Recorded evidence sizes conflict or are invalid");
-  return { ...(sha !== undefined ? { sha256: sha as string } : {}), ...(sizes.length ? { size: sizes[0] as number } : {}) };
-}
+function recordedProof(resource: RemoteTaskResource) { return recordedEvidenceIdentity(resource.metadata); }
 function cleanupRoots(task: Awaited<ReturnType<typeof preparation>>["task"], prepared: PreparedFinalization, resources: RemoteTaskResource[], evidenceParents = true, retainedResourceIds = new Set<string>()) {
   const protectedRoots = [prepared.worktree, prepared.registeredWorktree, prepared.gitCwd, prepared.gitDirectory, task.toolingRoot, task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
   return [...new Set([...protectedRoots, ...activeCleanupRoots(resources, retainedResourceIds, evidenceParents)])];
@@ -301,10 +296,9 @@ export async function verifyRetainedToolingEvidence(prisma: PrismaClient, config
     for (const resource of resources) {
       if (within(prepared.worktree, resource.externalId)) throw new Error("Retained tooling evidence overlaps the source being removed");
       if ((await lstat(resource.externalId)).isDirectory()) { await verifyDirectory(resource.id); continue; }
-      const metadata = resource.metadata as Record<string, unknown> | null;
+      const recorded = recordedProof(resource);
       const observed = await observeLegacyEvidenceFile(resource.externalId);
-      const sizes = [metadata?.bytes, metadata?.byteSize, metadata?.size].filter(value => value !== undefined);
-      if (metadata?.sha256 !== observed.sha256 || !sizes.length || sizes.some(size => size !== observed.size)) throw new Error("Retained tooling evidence differs from its recorded identity");
+      if (recorded.sha256 !== observed.sha256 || recorded.size !== observed.size) throw new Error("Retained tooling evidence differs from its recorded identity");
     }
     return;
   }

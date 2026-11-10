@@ -102,7 +102,8 @@ async function instructionRequestId(prisma: PrismaClient, receipt: { id: string;
   return retry ? `${receipt.id}:retry:${retry.sequence}` : receipt.id;
 }
 
-async function instructionAuthorityAllows(prisma: Prisma.TransactionClient, receipt: { id: string; sessionId: string }) {
+async function instructionAuthorityAllows(prisma: Prisma.TransactionClient, receipt: { id: string; sessionId: string }, config?: ServerConfig) {
+  if (!(await (await import("../tasks/configuration-repair-wakeup.ts")).configurationRepairInstructionAllows(prisma, config, receipt))) return false;
   if (!(await (await import("../tasks/compute-admission.ts")).computeInstructionAllows(prisma, receipt))) return false;
   if (!(await cleanupTransportAllowsInstruction(prisma, receipt))) return false;
   if (!(await cleanupInstructionAllows(prisma, receipt))) return false;
@@ -138,7 +139,8 @@ export async function queueInstruction(prisma: Pick<PrismaClient, "runtimeInstru
   return receipt;
 }
 
-async function sourceAuthorityAllows(prisma: PrismaClient, config: ServerConfig | undefined, receipt: { id: string; sourceMessageId: string | null }) {
+async function sourceAuthorityAllows(prisma: PrismaClient, config: ServerConfig | undefined, receipt: { id: string; sessionId: string; sourceMessageId: string | null }) {
+  if (!(await (await import("../tasks/configuration-repair-wakeup.ts")).configurationRepairSourceAllows(prisma, config, receipt))) return false;
   if (!receipt.sourceMessageId) return true;
   if (!config) return false;
   try {
@@ -210,7 +212,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
         if (session.status === "active" || session.status === "provisioning") continue;
         const task = await prisma.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
         if (task && (task.ownerPaused || task.phase === "closed")) continue;
-        if (!(await instructionAuthorityAllows(prisma, receipt))) continue;
+        if (!(await instructionAuthorityAllows(prisma, receipt, config))) continue;
         try {
           if (!(await prepareQueuedCleanupTransport({ prisma, runtime, config, receipt }))) continue;
         } catch {
@@ -235,7 +237,7 @@ export async function deliverInstructions(prisma: PrismaClient, runtime: AgentSe
               return prisma.$transaction(async (tx) => {
               const currentTask = await tx.remoteTask.findUnique({ where: { worktreePath: session.cwd } });
               if (currentTask && (currentTask.ownerPaused || currentTask.phase === "closed")) return false;
-              if (!(await instructionAuthorityAllows(tx, receipt))) return false;
+              if (!(await instructionAuthorityAllows(tx, receipt, config))) return false;
               if (toolingTurn && !(await toolingTurn.claim(tx))) return false;
               const claim = await tx.runtimeInstruction.updateMany({ where: { id: receipt.id, state: "queued" }, data: { state: "dispatching", detail: null, executionRequestId: requestId } });
               if (claim.count && receipt.sourceMessageId) await bindSourceTurn(tx, receipt.sourceMessageId, receipt.sessionId, requestId);

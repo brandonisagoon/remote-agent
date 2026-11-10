@@ -1,5 +1,5 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
-import { ComputeConfiguration, configureCompute } from "../../services/tasks/compute-configuration.ts";
+import { ComputeConfiguration, ComputeConfigurationFailure, configureCompute } from "../../services/tasks/compute-configuration.ts";
 import { ComputeNeonRecovery, recoverComputeNeon } from "../../services/tasks/compute-neon-recovery.ts";
 import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
@@ -12,8 +12,25 @@ import { developmentProjection } from "../../services/tasks/development-intent.t
 import { NeonRecoveryResultUnverifiable, readCommittedNeonRecovery } from "../../services/tasks/compute-neon-recovery-result.ts";
 import { readSessionToolingOperation } from "../../services/tasks/tooling-operations.ts";
 import { ComputeAccountingInput, retainComputeAccountingInput } from "../../services/tasks/compute-accounting-input.ts";
+import { ComputeAccountingObserverInput, ComputeAccountingTarget, adoptComputeAccountingObserver, inspectComputeAccountingObserver } from "../../services/tasks/compute-accounting-observer.ts";
 
 export const computeRoutes = new Hono<AppEnv>();
+computeRoutes.use("/:taskId/compute-accounting-observer", apiAuthMiddleware());
+computeRoutes.use("/:taskId/compute-accounting-observer/inspect", apiAuthMiddleware());
+computeRoutes.post("/:taskId/compute-accounting-observer/inspect", async c => {
+  if (c.req.header("x-remote-agent-operation")) return c.json({ error: "Historical observer inspection is an owner control" }, 400);
+  const target = ComputeAccountingTarget.safeParse(await c.req.json().catch(() => null));
+  if (!target.success) return c.json({ error: "An exact historical accounting target is required" }, 400);
+  try { return c.json(await inspectComputeAccountingObserver({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), taskId: c.req.param("taskId"), target: target.data })); }
+  catch { return c.json({ error: "Historical accounting ownership or retained inputs could not be verified", code: "historical-accounting-input-unavailable" }, 409); }
+});
+computeRoutes.post("/:taskId/compute-accounting-observer", async c => {
+  if (c.req.header("x-remote-agent-operation")) return c.json({ error: "Historical observer adoption is not a tooling callback" }, 400);
+  const request = ComputeAccountingObserverInput.safeParse(await c.req.json().catch(() => null));
+  if (!request.success) return c.json({ error: "The inspected original binding, adoption generation and exact release are required" }, 400);
+  try { return c.json(await adoptComputeAccountingObserver({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"), taskId: c.req.param("taskId"), request: request.data })); }
+  catch { return c.json({ error: "Historical observer adoption was refused; original records and capacity are preserved", code: "historical-accounting-adoption-refused" }, 409); }
+});
 // Explicit owner authentication also applies on the otherwise trusted local
 // socket. This is not an adapter callback and grants no tooling authority.
 computeRoutes.use("/:taskId/compute-accounting-input", apiAuthMiddleware());
@@ -59,7 +76,8 @@ computeRoutes.post("/:taskId/compute-configure", async c => {
   const request = ComputeConfiguration.safeParse(await c.req.json());
   if (!request.success) return c.json({ error: "Exact pending configuration and previous allocation are required" }, 400);
   try { return c.json(await configureCompute({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data })); }
-  catch { return c.json({ error: "Pending runtime configuration could not be verified; preserve the existing claim and evidence" }, 409); }
+  catch (error) { return c.json({ error: "Pending runtime configuration could not be verified; preserve the existing claim and evidence",
+    ...(error instanceof ComputeConfigurationFailure ? { code: error.code, stage: error.stage, attemptId: error.attemptId } : { code: "configuration-unclassified-failure" }) }, 409); }
 });
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
 computeRoutes.get("/:taskId/compute-enroll", async c => {

@@ -105,8 +105,13 @@ its own Homebrew tap (`Formula/`) and Scoop bucket (`bucket/`).
   workflow, its own trigger and a configured-owner (`linear.userId`) actor
   with the original event time. Unverified execution, a closed source or a
   newer state starts nothing. Old restrictions count as history only within
-  the skill's scope and when the fetched issue and full comment timeline
-  predate the trigger; newer owner comments are quoted. Issue text is always
+  the skill's scope and when the description document revision predates the
+  trigger and the full comment timeline was read; newer owner comments are
+  quoted. Issue-wide activity timestamps never date description text. The
+  durable prompt records the content revision and hash, without attributing
+  agent-written filing notes to the owner. Unavailable evidence receives one
+  bounded reread before dispatch and is reported as a read failure rather than
+  a request to repeat implementation approval. Issue text is always
   fenced task data. Persisted pause/closure always wins. A later owner
   delivery retries a launch that failed before dispatch on its original task.
 

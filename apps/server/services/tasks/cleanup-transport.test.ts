@@ -90,6 +90,22 @@ async function fixture(delegates = 0, linked = false) {
   return { ...context, db, root, source, session, ids, store, request, schedule, app, capability };
 }
 
+test("stopped-only observation never signals live owned providers and clears dead cached handles only after actual exit", async () => {
+  const f = await fixture(1), records = await Promise.all(f.ids.map(id => f.store.load(id)));
+  let commits = 0;
+  await expect(f.runtime.releaseIdleTransports!({ sessionIds: f.ids, mode: "stopped-only", check: async () => {}, commit: async () => { commits++; } })).rejects.toThrow();
+  expect(commits).toBe(0); expect(records.every(record => record?.pid && alive(record.pid))).toBe(true);
+  // These exact processes were created by this fixture, never a task/provider
+  // selected by name. Emulate an interrupted close before logical settlement.
+  for (const record of records) process.kill(record!.pid!, "SIGTERM");
+  await until(async () => records.every(record => !alive(record!.pid!)));
+  await f.runtime.releaseIdleTransports!({ sessionIds: f.ids, mode: "stopped-only", check: async () => {}, commit: async (proof, check) => {
+    await check!(); expect(proof?.map(value => value.sessionId).sort()).toEqual([...f.ids].sort()); commits++;
+  } });
+  expect(commits).toBe(1);
+  expect(await f.prisma.runtimeSession.count({ where: { id: { in: f.ids }, status: "closed" } })).toBe(0);
+});
+
 test("real warm primary and delegates release; original cleanup resumes outside source with the same history and identity", async () => {
   const f = await fixture(2), taskBefore = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.taskId } });
   const primaryBefore = await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } });

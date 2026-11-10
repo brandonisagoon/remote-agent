@@ -1,3 +1,4 @@
+import { recordedEvidenceIdentity } from "./evidence-receipt.ts";
 import { randomUUID } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -136,8 +137,8 @@ export async function prepareRegisteredCaptures(input: { resources: Finalization
       const entry = inventory.find(entry => entry.path === path.relative(root, child.externalId));
       if (!entry || entry.kind !== "file") throw new Error("Contained file receipt is not an exact regular inventory member");
       const metadata = child.metadata as Record<string, unknown> | null;
-      const sizes = [metadata?.bytes, metadata?.size, metadata?.byteSize].filter(value => value !== undefined);
-      if (metadata?.sha256 !== undefined && metadata.sha256 !== entry.sha256 || sizes.some(size => size !== entry.size)) throw new Error("Contained evidence does not match its recorded bytes");
+      const recorded = recordedEvidenceIdentity(metadata);
+      if (recorded.sha256 !== undefined && recorded.sha256 !== entry.sha256 || recorded.size !== undefined && recorded.size !== entry.size) throw new Error("Contained evidence does not match its recorded bytes");
       result.push(ContainedFilePlan.parse({ ...finalizationResourceIdentity(child), disposition: "retire-contained", parentResourceId: tree.id, dependencies: [tree.id],
         target: { type: "file", path: child.externalId, dev: entry.dev, ino: entry.ino, mode: entry.mode, size: entry.size, sha256: entry.sha256 } }));
     }

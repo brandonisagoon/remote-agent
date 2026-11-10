@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ServerConfig, WorkflowConfig } from "../../../../../lib/config.ts";
 import { renderSkillToken } from "../../../../../lib/skills/compose.ts";
 import type { DispatchEvent, DispatchEventType } from "../../../../../types/dispatcher/index.ts";
@@ -38,8 +39,8 @@ export interface LaunchIssue {
   identifier: string;
   title: string;
   description: string | null;
-  /** When the fetched issue (and so its description) last changed. */
-  updatedAt?: string | null;
+  /** Linear's description document revision. Issue.updatedAt is unrelated activity. */
+  documentContent?: { id: string; updatedAt: string } | null;
   state?: { name: string; type?: string | null } | null;
 }
 
@@ -48,6 +49,8 @@ export interface LaunchIssue {
 export interface LaunchOrdering {
   /** The fetched description provably predates the verified trigger. */
   snapshotPredatesTrigger: boolean;
+  /** Stored with the quoted text in the durable instruction; not an authorship claim. */
+  descriptionRevision: { contentId: string | null; updatedAt: string | null; sha256: string; source: "document-content" | "empty-description" } | null;
   /** The full comment timeline was read. */
   commentsComplete: boolean;
   /** Owner comments created or edited after the trigger, quoted verbatim. */
@@ -129,14 +132,22 @@ export function executionConflict(intent: LaunchIntent, issue: LaunchIssue, webh
   return null;
 }
 
-/** Decide ordering from fetched evidence only: the issue's own change time
+/** Decide ordering from fetched evidence only: the description document revision
  * and the full comment timeline. Delivery time is never used. */
 export function launchOrdering(config: ServerConfig, intent: LaunchIntent, issue: LaunchIssue, comments: SourceComment[] | null): LaunchOrdering {
   const trigger = intent.occurredAt ? Date.parse(intent.occurredAt) : NaN;
-  const changed = issue.updatedAt ? Date.parse(issue.updatedAt) : NaN;
+  const changed = issue.documentContent?.updatedAt ? Date.parse(issue.documentContent.updatedAt) : NaN;
+  const sha256 = createHash("sha256").update(issue.description ?? "").digest("hex");
+  const empty = !issue.description?.trim();
+  const descriptionRevision: LaunchOrdering["descriptionRevision"] = empty
+    ? { contentId: issue.documentContent?.id ?? null, updatedAt: null, sha256, source: "empty-description" }
+    : issue.documentContent?.id && Number.isFinite(changed)
+      ? { contentId: issue.documentContent.id, updatedAt: new Date(changed).toISOString(), sha256, source: "document-content" }
+      : null;
   const after = (value: string | null | undefined) => Boolean(value) && Date.parse(value!) > trigger;
   return {
-    snapshotPredatesTrigger: intent.authority.verified && Number.isFinite(trigger) && Number.isFinite(changed) && changed <= trigger,
+    snapshotPredatesTrigger: intent.authority.verified && Number.isFinite(trigger) && descriptionRevision !== null && (empty || changed <= trigger),
+    descriptionRevision,
     commentsComplete: comments !== null,
     newerOwnerComments: !intent.authority.verified || !Number.isFinite(trigger) ? [] : (comments ?? []).filter((comment) =>
       comment.user && comment.user.id !== config.agentUserId && isConfiguredOwner(config, config.repository.id, comment.user.id)
@@ -144,7 +155,14 @@ export function launchOrdering(config: ServerConfig, intent: LaunchIntent, issue
   };
 }
 
-const UNORDERED = { snapshotPredatesTrigger: false, commentsComplete: false, newerOwnerComments: [] } satisfies LaunchOrdering;
+const UNORDERED = { snapshotPredatesTrigger: false, descriptionRevision: null, commentsComplete: false, newerOwnerComments: [] } satisfies LaunchOrdering;
+
+/** A failed source read is an operational failure, not missing owner permission. */
+export function launchEvidenceFailure(ordering: LaunchOrdering): string | null {
+  if (!ordering.descriptionRevision) return "Linear description content revision is unavailable or invalid";
+  if (!ordering.commentsComplete) return "Linear issue comment timeline could not be read completely";
+  return null;
+}
 
 function intentLines(intent: LaunchIntent, ordering: LaunchOrdering, continuation?: LaunchContinuation): string[] {
   if (intent.mode === "execution" && !intent.authority.verified) throw new Error("An unverified execution intent is never dispatched");
@@ -162,12 +180,16 @@ function intentLines(intent: LaunchIntent, ordering: LaunchOrdering, continuatio
     lines.push("- instruction: Planning only. Investigate and produce the plan this workflow asks for. Do not change product files or start implementation; execution needs a separate owner trigger.");
     return lines;
   }
+  const evidenceFailure = launchEvidenceFailure(ordering);
+  if (evidenceFailure) throw new Error(evidenceFailure);
   const historical = ordering.snapshotPredatesTrigger && ordering.commentsComplete;
   lines.push(
+    `- description revision: ${JSON.stringify(ordering.descriptionRevision)}. This identifies the quoted content and its change time, not who instructed the agent. Issue activity timestamps do not date description text.`,
     "- instruction: The owner requested this workflow now. Prepare the environment and carry out what its skill directs without asking for permission to start this workflow again.",
     historical
       ? `- earlier issue notes: Only if this workflow's skill directs implementation: issue notes written before ${at} that say implementation has not been requested, or that limit the issue to planning, drafting, filing or issue writing, are history from before this request and do not block it. Otherwise those notes still apply. Every other requirement and restriction in the issue still applies. Leave the text as written.`
-      : `- earlier issue notes: ${!ordering.commentsComplete ? "The issue's comments could not be read completely" : "The issue changed after this trigger, or its change time is unknown"}, so this launch cannot show that its restrictions predate the request. They still apply; if one conflicts with this workflow, report that specific conflict once on the source issue and wait for an owner decision.`,
+      : `- earlier issue notes: The description content changed at ${ordering.descriptionRevision!.updatedAt}, after this trigger. Do not assume its restrictions are historical. If the current description contains a conflicting restriction, report that specific conflict once on the source issue and wait for an owner decision.`,
+    "- attribution: Filing summaries and agent-written notes are not owner instructions merely because they appear on an issue or were saved through the owner's account. Attribute an owner restriction only to its actual source; do not turn an earlier filing-only assignment into a permanent implementation prohibition.",
     `- still binding: owner stop, pause or cancel instructions given after ${at}; a paused or closed task; product requirements; repository boundaries; compute admission; and every normal approval check. If one applies, report that conflict once and stop.`,
     ...(ordering.newerOwnerComments.length ? [`- newer owner comments: ${ordering.newerOwnerComments.length} owner comment(s) were written or edited after this trigger; they are quoted below and take precedence over it.`] : []),
     `- status updates: Task Setup and progress updates may state that the owner requested workflow ${intent.workflowId} with the ${intent.trigger} at ${at}.`,

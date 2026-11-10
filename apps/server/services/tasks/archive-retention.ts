@@ -1,3 +1,4 @@
+import { assertConfigurationCompletion } from "./configuration-completion.ts";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { z } from "zod";
@@ -47,6 +48,7 @@ async function context(prisma: Database, config: ServerConfig, taskId: string, p
     || prepared.taskWorktree !== task.worktreePath || prepared.branch !== task.branchName || prepared.repositoryId !== task.repositoryId || prepared.machineId !== task.machineId
     || prepared.connectionId !== task.connectionId || prepared.issueIdentifier !== task.issueIdentifier) throw new Error("Saved archive task or original primary changed");
   if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else if (prepared.configurationCompletion) await assertConfigurationCompletion(prisma, prepared);
   else {
     const contract = await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: session.id, source: `owner:${taskId}`, action: "completion-contract" }, orderBy: { sequence: "desc" } });
     if (contract?.sequence !== prepared.contractRevision || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Saved archive completion authority changed");

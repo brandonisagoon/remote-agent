@@ -12,12 +12,17 @@ import type { RemoteTask, RemoteTaskResource } from "../../../../generated/prism
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
-import { bindPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { bindPreparedCleanup, assertCleanupResourceUpdate } from "./cleanup-lifecycle.ts";
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tree.ts";
-import { finalizationDigest } from "./finalization-resources.ts";
+import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { adoptLegacyEvidence, assertLegacyEvidenceResourceUpdate, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
 import { LegacyEvidenceAdoptionInput, type LegacyEvidenceReceipt, type LegacyEvidenceOperationInput } from "./legacy-evidence-schema.ts";
+import { ComputePolicy } from "../../../../lib/compute-policy.ts";
+import { computeTaskIdentity, offerNextCompute, requestCompute } from "./compute-admission.ts";
+import { reclaimStoppedCompute } from "./compute-reclamation.ts";
+import { assertComputeStartIntent } from "./development-intent.ts";
+import type { readInstalledComputeReclamation } from "./compute-observer.ts";
 import { evidenceWriterObservation } from "./legacy-evidence-writers.ts";
 
 let db: TestDatabase, directory: string;
@@ -26,8 +31,8 @@ afterEach(async () => { await db.cleanup(); await rm(directory, { recursive: tru
 const sha = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
 function git(cwd: string, ...args: string[]) { const command = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" }); if (command.exitCode) throw new Error(command.stderr.toString()); return command.stdout.toString().trim(); }
 
-async function fixture(options: { taskId?: string; directoryEvidence?: boolean; directoryPurpose?: "development" | "review"; files?: number; privateBackup?: boolean; beforePrepare?: (task: RemoteTask) => Promise<void> } = {}) {
-  const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, "DRA-99"), archive = path.join(directory, "retained");
+async function fixture(options: { historicalSizeBytes?: boolean; taskId?: string; directoryEvidence?: boolean; directoryPurpose?: "development" | "review"; files?: number; privateBackup?: boolean; beforePrepare?: (task: RemoteTask) => Promise<void> } = {}) {
+  const root = path.join(directory, "repository"), worktree = path.join(directory, "worktree"), historical = path.join(directory, options.historicalSizeBytes ? `dra52-${options.taskId ?? "task"}-evidence` : "DRA-99"), archive = path.join(directory, "retained");
   for (const dir of [root, historical, archive]) await mkdir(dir, { mode: 0o700 });
   git(root, "init", "-b", "main"); git(root, "config", "user.name", "Fixture"); git(root, "config", "user.email", "fixture@example.com");
   await writeFile(path.join(root, "README.md"), "accepted\n"); git(root, "add", "."); git(root, "commit", "-m", "fixture"); git(root, "worktree", "add", "-b", "codex/legacy", worktree);
@@ -46,7 +51,7 @@ async function fixture(options: { taskId?: string; directoryEvidence?: boolean; 
   for (const [index, body] of Array.from({ length: options.files ?? 2 }, (_, index) => index === 0 ? "saved capture\n" : index === 1 ? "sentinel without historical proof\n" : `sentinel ${index}\n`).entries()) {
     const name = `evidence-${index}.txt`, original = path.join(historical, name), retained = path.join(archive, name);
     await writeFile(original, body, { mode: 0o600 }); await copyFile(original, retained); await chmod(retained, 0o600);
-    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: `capture-${index}`, kind: "evidence", purpose: index === 0 ? "development" : "browser", externalId: original, state: "ready", metadata: index === 0 ? { sha256: sha(body), bytes: Buffer.byteLength(body), description: "original receipt" } : { description: "legacy sentinel" } } }));
+    resources.push(await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, key: `capture-${index}`, kind: "evidence", purpose: index === 0 ? "development" : "browser", externalId: original, state: "ready", metadata: options.historicalSizeBytes ? { sha256: sha(body), sizeBytes: Buffer.byteLength(body), description: "original receipt" } : index === 0 ? { sha256: sha(body), bytes: Buffer.byteLength(body), description: "original receipt" } : { description: "legacy sentinel" } } }));
     files.push({ path: name, sha256: sha(body), bytes: Buffer.byteLength(body) });
   }
   let treeResource: RemoteTaskResource | undefined;
@@ -140,10 +145,21 @@ test("generic resource writes and metadata claims cannot fabricate retained reti
 });
 
 test.each([
-  { bytes: 1, size: 2 }, { bytes: -1 }, { sha256: "invalid" }, { sha256: "0".repeat(64) },
+  { bytes: 1, size: 2 }, { bytes: 1, sizeBytes: 2 }, { sizeBytes: -1 }, { bytes: -1 }, { sha256: "invalid" }, { sha256: "0".repeat(64) },
 ])("conflicting or changed historical proof is refused: %j", async (metadata) => {
   const f = await fixture(); await db.prisma.remoteTaskResource.update({ where: { id: f.resources[0]!.id }, data: { metadata } });
   await expect(f.adopt()).rejects.toThrow(); expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "legacy-evidence-retained" } })).toBe(0);
+});
+
+test.each(["bytes", "byteSize", "size", "sizeBytes"])("retention adoption verifies %s and preserves the historical receipt", async sizeKey => {
+  const f = await fixture();
+  const original = f.resources[0]!;
+  const previous = original.metadata as { sha256: string; bytes: number };
+  const metadata = { sha256: previous.sha256, [sizeKey]: previous.bytes, description: "Unchanged historical receipt" };
+  await db.prisma.remoteTaskResource.update({ where: { id: original.id }, data: { metadata } });
+  const receipt = await f.adopt();
+  expect(receipt.proof.entries.find(entry => entry.resourceId === original.id)?.recorded).toEqual({ sha256: previous.sha256, size: previous.bytes });
+  expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata).toEqual(metadata);
 });
 
 test("changed original or retained bytes cannot be authorized or confirmed", async () => {
@@ -240,6 +256,29 @@ test("an original retained tooling parent is not a whole-tree cleanup operation"
 });
 
 const draftedRoot = process.env.DRAFTED_INTEGRATION_ROOT;
+
+test.skipIf(!draftedRoot)("DRA52 seven-file sizeBytes receipts keep their registered directory and original cleanup binding", async () => {
+  const f = await fixture({ files: 7, historicalSizeBytes: true }), receipt = await f.adopt();
+  const originalPrepare = legacyEvidenceDependencies.prepare;
+  legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+  const server = Bun.serve({ unix: path.join(directory, "dra52-evidence.sock"), fetch: f.app.fetch });
+  try {
+    const { taskRegistry } = await import(path.join(draftedRoot!, "src/control.ts"));
+    const { manageEvidenceResource } = await import(path.join(draftedRoot!, "src/evidence-resources.ts"));
+    const registry = taskRegistry(path.join(directory, "dra52-evidence.sock"), f.task.id);
+    expect(f.historical.split(path.sep)).not.toContain(f.task.id);
+    for (const original of f.resources) {
+      expect((await manageEvidenceResource({ registry, key: original.key, action: "release" })).observed).toBe("evidence-retired-archive-retained");
+      expect((await manageEvidenceResource({ registry, key: original.key, action: "release" })).state).toBe("released");
+      expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: original.id } })).metadata).toEqual(original.metadata);
+    }
+    expect(await prepareTaskFinalization(f.finalInput, f.dependencies)).toEqual(f.prepared);
+    for (const entry of receipt.proof.entries) {
+      expect(await lstat(entry.target.path).catch(() => null)).toBeNull();
+      if (entry.target.type === "file") expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
+    }
+  } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
+}, 30_000);
 test("saved evidence supplements an already bound cleanup without replacing its original records", async () => {
   const f = await fixture({ privateBackup: true });
   const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
@@ -669,3 +708,166 @@ test("closed original operation uses its adopted evidence and refuses new owner 
   await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
   await expect(f.manage(saved, entry.key, "authorize")).rejects.toThrow();
 });
+
+
+async function cleanupComputeFixture() {
+  const configuration = { configurationFile: "/private/original-compute.json", configurationSha256: "b".repeat(64) };
+  const f = await fixture({ beforePrepare: async task => {
+    await db.prisma.remoteTaskResource.create({ data: { id: "original-app", taskId: task.id, key: "app", kind: "task-runtime", purpose: "development", externalId: "/private/original-runtime.json", state: "ready", metadata: { compute: configuration, containerId: "c".repeat(64) } } });
+  } });
+  f.config.compute = ComputePolicy.parse({ enabled: true, slots: 1 });
+  await f.adopt();
+  await bindPreparedCleanup(f.finalInput, async () => {});
+  const resource = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "original-app" } });
+  const source = await db.prisma.runtimeSessionResourceLink.findFirstOrThrow({ where: { runtimeSessionId: f.session.id, relationship: "handles" } });
+  const environment = await db.prisma.computeEnvironment.create({ data: { id: crypto.randomUUID(), taskId: f.task.id, primarySessionId: f.session.id, machineId: f.config.machine,
+    taskIdentity: computeTaskIdentity(f.task, f.session.id, f.config.machine, source.id), key: resource.key, purpose: "development", revision: "d".repeat(40), recipeDigest: "e".repeat(64),
+    resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest, state: "running", configuration } });
+  const offer = await db.prisma.computeOffer.create({ data: { id: crypto.randomUUID(), environmentId: environment.id, machineId: f.config.machine, instructionId: "original-app-start", state: "running", dispatchDeadline: new Date(), claimedAt: new Date() } });
+  await db.prisma.computeSlot.create({ data: { id: `${f.config.machine}:0`, machineId: f.config.machine, ordinal: 0, allocationId: offer.id } });
+  await db.prisma.$transaction(async tx => {
+    await assertCleanupResourceUpdate({ ...f.finalInput, prisma: tx, taskId: f.task.id }, resource, { state: "released", expiresAt: null });
+    await tx.remoteTaskResource.update({ where: { id: resource.id }, data: { state: "released" } });
+  });
+  // Active cleanup can be recorded as Working; that projection must not let
+  // the original claim restart the already removed application.
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "active" } });
+  await db.prisma.runtimeInstruction.create({ data: { id: "remaining-cleanup", sessionId: f.session.id, state: "dispatching", executionRequestId: "cleanup-turn", text: "Finish the accepted cleanup" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "cleanup-turn:start", runtimeSessionId: f.session.id, requestId: "cleanup-turn", phase: "started", occurredAt: new Date() } });
+  const runtime = { observeSessionActivity: (id: string) => ({ state: id === f.session.id ? "executing" as const : "unknown" as const, observedAt: Date.now(), ...(id === f.session.id ? { requestId: "cleanup-turn" } : {}) }) };
+  const input = { prisma: db.prisma, config: f.config, runtime, environmentId: environment.id };
+  const read: typeof readInstalledComputeReclamation = async (_input, _task, raw: any) => ({ version: 1, kind: "compute-reclamation", environmentId: raw.environment.id, taskId: raw.task.id, primarySessionId: raw.task.primarySessionId,
+    resourceId: raw.resource.id, resourceIdentity: raw.resource.identityDigest, allocationResourceIdentity: raw.allocationResourceIdentity, configurationDigest: raw.configurationDigest, observedAt: Date.now(), state: "absent", proofDigest: "f".repeat(64) });
+  return { ...f, resource, environment, offer, input, read };
+}
+
+test("released app frees its allocation while the original accepted cleanup continues", async () => {
+  const f = await cleanupComputeFixture();
+  const events = await db.prisma.runtimeMetadataEvent.findMany({ where: { source: `finalizer:${f.task.id}` }, orderBy: { sequence: "asc" } });
+  const evidence = await db.prisma.remoteTaskResource.findMany({ where: { kind: "evidence" }, orderBy: { id: "asc" } });
+  await expect(assertComputeStartIntent(db.prisma, f.task.id, f.environment.id, f.offer.id)).rejects.toThrow("cleanup authority remains active");
+  await db.prisma.runtimeSession.create({ data: { id: "next-primary", scopeKey: "next", agentCommand: "codex", status: "idle", role: "primary", cwd: "/next", repositoryId: f.task.repositoryId, machineId: f.config.machine } });
+  await db.prisma.remoteTask.create({ data: { id: "next-task", requestKey: "next", primarySessionId: "next-primary", repositoryId: f.task.repositoryId, machineId: f.config.machine, branchName: "next", worktreePath: "/next", toolingRoot: "/tooling", toolingRevision: "a".repeat(40), phase: "working" } });
+  const admission = { prisma: db.prisma, machineId: f.config.machine, policy: f.config.compute! };
+  await requestCompute({ ...admission, taskId: "next-task", request: { key: "app", purpose: "development", revision: "a".repeat(40), recipeDigest: "b".repeat(64) } });
+  expect(await offerNextCompute(admission)).toBeNull();
+  expect(await reclaimStoppedCompute(f.input, f.read)).toEqual({ released: true });
+  expect(await reclaimStoppedCompute(f.input, f.read)).toEqual({ released: true });
+  const next = await offerNextCompute(admission);
+  expect(next).not.toBeNull();
+  expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: next!.environmentId } })).toMatchObject({ taskId: "next-task" });
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).toMatchObject({ state: "stopped" });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { source: `finalizer:${f.task.id}` }, orderBy: { sequence: "asc" } })).toEqual(events);
+  expect(await db.prisma.remoteTaskResource.findMany({ where: { kind: "evidence" }, orderBy: { id: "asc" } })).toEqual(evidence);
+  expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).toMatchObject({ status: "active" });
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "remaining-cleanup" } })).toMatchObject({ state: "dispatching" });
+});
+
+for (const changed of ["running", "unknown", "failed", "revoked", "active-descendant", "queued-primary", "resource-changed"] as const) test(`cleanup reclamation retains the allocation when ${changed}`, async () => {
+  const f = await cleanupComputeFixture();
+  if (changed === "active-descendant") {
+    await db.prisma.runtimeSession.create({ data: { id: "delegate", scopeKey: "delegate", agentCommand: "codex", status: "active", role: "delegate", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.config.machine } });
+    await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "delegate", targetSessionId: f.session.id, relationship: "spawned-by" } });
+  }
+  if (changed === "queued-primary") await db.prisma.runtimeInstruction.create({ data: { id: "new-work", sessionId: f.session.id, text: "New work", state: "queued" } });
+  const read: typeof f.read = async (...args) => {
+    if (changed === "failed") throw new Error("physical inventory unavailable");
+    if (changed === "revoked") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "completion-retirement-authority", key: "revoke", value: JSON.stringify({ version: 1, action: "revoke" }) } });
+    if (changed === "resource-changed") await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { externalId: "/private/different-runtime.json" } });
+    return { ...await f.read(...args) as object, ...(["running", "unknown"].includes(changed) ? { state: changed } : {}) };
+  };
+  if (["revoked", "resource-changed", "failed"].includes(changed)) await expect(reclaimStoppedCompute(f.input, read)).rejects.toThrow();
+  else expect(await reclaimStoppedCompute(f.input, read)).toEqual({ released: false });
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).toMatchObject({ state: "running" });
+  expect(await db.prisma.computeSlot.findUniqueOrThrow({ where: { allocationId: f.offer.id } })).toBeDefined();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(0);
+});
+
+// The connector is a disposable sleeping executable, not a Cloudflare client.
+// Its process inspection and identity-bound signal are real; cloud HTTP is a fixture.
+test.skipIf(process.platform !== "darwin" || !draftedRoot)("original finalizer retries seven legacy files, a real connector and rejected/lost tunnel deletion", async () => {
+  const { connectorProcess } = await import(path.join(draftedRoot!, "test/fixtures/connector-process.ts"));
+  const { inspectHostProcess } = await import(path.join(draftedRoot!, "src/runtime-transfer-host.ts"));
+  const { taskRegistry, closeTask } = await import(path.join(draftedRoot!, "src/control.ts"));
+  const { finalizeTask } = await import(path.join(draftedRoot!, "src/finalize.ts"));
+  const { manageResource } = await import(path.join(draftedRoot!, "src/resources.ts"));
+  const { manageConnectorResource } = await import(path.join(draftedRoot!, "src/connector-resources.ts"));
+  const { releasePublicPreview } = await import(path.join(draftedRoot!, "src/public-preview.ts"));
+  const tunnelId = "11111111-2222-4333-8444-555555555555", accountId = "a".repeat(32), zoneId = "b".repeat(32);
+  const hostname = "drafted-task-dev.brandongoon.com", source = "http://127.0.0.1:3234";
+  const environment = path.join(directory, "environments", "task"), configPath = path.join(environment, "cloudflared.yml"), pidFile = path.join(environment, "connector.pid");
+  let processFixture: Awaited<ReturnType<typeof connectorProcess>> | undefined;
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  const savedPrepare = legacyEvidenceDependencies.prepare;
+  try {
+    const f = await fixture({ files: 7, historicalSizeBytes: true, beforePrepare: async task => {
+      await db.prisma.remoteTaskResource.deleteMany({ where: { taskId: task.id, key: "clerk" } });
+      await mkdir(environment, { recursive: true, mode: 0o700 });
+      const credentialFile = path.join(environment, "tunnel.json");
+      await writeFile(credentialFile, JSON.stringify({ TunnelID: tunnelId, AccountTag: accountId, TunnelSecret: "fixture-only" }), { mode: 0o600 });
+      await writeFile(configPath, JSON.stringify({ tunnel: tunnelId, "credentials-file": credentialFile, ingress: [{ hostname, service: source }, { service: "http_status:404" }] }), { mode: 0o600 });
+      processFixture = await connectorProcess(directory, task.worktreePath!, configPath);
+      const identity = processFixture.identity;
+      await writeFile(pidFile, String(identity.pid) + "\n", { mode: 0o600 });
+      const resources = [
+        { key: "development-env-directory", kind: "directory", externalId: environment, state: "ready", metadata: { trackedGreenfieldEdits: false } },
+        { key: "connector", kind: "cloudflared-connector", externalId: "pid:" + identity.pid, state: "ready", metadata: { version: 1, taskId: task.id, pid: identity.pid, process: identity, configPath, pidFile, tunnelId, hostname, source, dedicated: true, accountId } },
+        { key: "tunnel", kind: "cloudflare-tunnel", externalId: tunnelId, state: "ready", metadata: { shared: false, hostname, tunnelId, accountId, zoneId, dnsRecordId: "c".repeat(32), configPath, source } },
+        { key: "app", kind: "docker-container", externalId: "already-removed-app", state: "released", metadata: {} },
+        { key: "dns", kind: "cloudflare-dns-record", externalId: "c".repeat(32), state: "released", metadata: { hostname, tunnelId, zoneId } },
+      ];
+      for (const resource of resources) await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, purpose: "development", ...resource } });
+    } });
+    const retained = await f.adopt();
+    legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+    const socket = path.join(directory, "combined.sock");
+    server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+    const wire = taskRegistry(socket, f.task.id), input = { ...f.finalInput, cleanup: true as const };
+    const operation = await prepareTaskFinalization(input, f.dependencies);
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "legacy-evidence-retained"] } }, orderBy: { sequence: "asc" } });
+    const originalResources = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } });
+    let loseConnector = true, rejectDelete = true, loseDelete = true, loseConfirm = true, tunnelPresent = true, deleteAttempts = 0;
+    const provider = { request: async (method: string, route: string) => {
+      if (method === "GET" && route.includes("/dns_records")) return route.endsWith("c".repeat(32)) ? null : [];
+      if (method === "GET" && route.endsWith("/connections")) return await inspectHostProcess(processFixture!.identity.pid) ? [{ id: "live" }] : [];
+      if (route !== "/accounts/" + accountId + "/cfd_tunnel/" + tunnelId) throw new Error("Unexpected provider route: " + route);
+      if (method === "GET") return tunnelPresent ? { id: tunnelId, name: "fixture" } : null;
+      if (method !== "DELETE") throw new Error("Unexpected provider mutation");
+      expect(await inspectHostProcess(processFixture!.identity.pid)).toBeNull();
+      deleteAttempts++;
+      if (rejectDelete) { rejectDelete = false; throw new Error("HTTP 400 / code 1022 fixture rejection"); }
+      tunnelPresent = false;
+      if (loseDelete) { loseDelete = false; throw new Error("lost tunnel deletion reply"); }
+      return null;
+    } };
+    const registry = { ...wire,
+      prepareFinalization: (request: object) => prepareTaskFinalization({ ...input, ...request }, f.dependencies),
+      confirmFinalization: async () => { const result = await confirmTaskFinalization(input, f.dependencies); if (loseConfirm) { loseConfirm = false; throw new Error("lost final confirmation"); } return result; },
+      publishCleanupStatus: undefined,
+      publishCleanupReport: async () => ({ published: false, recorded: true, reportId: "fixture-report-deferred" }),
+      resource: async (receipt: any) => { await wire.resource(receipt); if (receipt.key === "connector" && receipt.state === "released" && loseConnector) { loseConnector = false; throw new Error("lost connector receipt reply"); } },
+    };
+    const manage = async (request: any) => (request.key === "tunnel"
+      ? releasePublicPreview({ registry: request.registry, key: "tunnel", provider, releaseConnector: (key: string) => manageConnectorResource({ registry: request.registry, key, action: "release" }) })
+      : manageResource(request));
+    const finalize = () => finalizeTask({ registry, cleanup: true, manage, close: () => closeTask(socket, f.task.id) });
+    await expect(finalize()).rejects.toThrow();
+    expect(loseConnector).toBeFalse(); expect(await inspectHostProcess(processFixture!.identity.pid)).toBeNull(); expect(deleteAttempts).toBe(0);
+    await expect(finalize()).rejects.toThrow(); expect(deleteAttempts).toBe(1); expect(tunnelPresent).toBeTrue();
+    await expect(finalize()).rejects.toThrow(); expect(deleteAttempts).toBe(2); expect(tunnelPresent).toBeFalse();
+    await expect(finalize()).rejects.toThrow("lost final confirmation");
+    const confirmation = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-confirmed" } });
+    expect(await finalize()).toMatchObject({ closed: true });
+    expect(await finalize()).toMatchObject({ closed: true, alreadyClosed: true });
+    expect(deleteAttempts).toBe(2);
+    expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: confirmation.sequence } })).toEqual(confirmation);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect(operation.cleanup!.operationRevision).toBeGreaterThan(0);
+    expect(await lstat(f.worktree).catch(() => null)).toBeNull();
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    for (const resource of originalResources.filter(row => row.key.startsWith("capture-") || row.key === "connector" || row.state === "released")) expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).metadata).toEqual(resource.metadata);
+    for (const entry of retained.proof.entries) if (entry.target.type === "file") expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
+  } finally { legacyEvidenceDependencies.prepare = savedPrepare; await server?.stop(true); await processFixture?.stop(); }
+}, 90_000);

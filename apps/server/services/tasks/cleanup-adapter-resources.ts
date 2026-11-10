@@ -16,7 +16,7 @@ type Observe = typeof runCleanupResourceObserver;
 const adapters: Record<string, z.infer<typeof CleanupAdapter>> = {
   "docker-container": "docker", "docker-network": "docker", "docker-volume": "docker", "docker-compose": "compose", "docker-compose-project": "compose",
   "task-runtime": "runtime", "planetscale-branch": "runtime", "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview", "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
-  "browser-profile": "browser",
+  "cloudflared-connector": "connector", "browser-profile": "browser",
   "clerk-test-user": "clerk", "clerk-test-session": "clerk",
   "browser-auth": "vault",
 };

@@ -38,8 +38,8 @@ export async function withNativeLaunchWork<T>(prisma: PrismaClient, source: { co
   finally { const remaining = runs.get(runId)! - 1; if (remaining) runs.set(runId, remaining); else runs.delete(runId); if (!runs.size) entries.delete(key); }
 }
 const processStartedAt = new Date();
-async function pendingNativeWork(prisma: PrismaClient, source: Source) {
-  const entries = activeWork.get(prisma);
+export async function pendingNativeWork(prisma: Pick<PrismaClient, "workerRun">, source: Source, processStore = prisma as PrismaClient) {
+  const entries = activeWork.get(processStore);
   const counts = new Map<string, number>();
   for (const issue of new Set([source.issueId, source.issueIdentifier])) for (const [run, count] of entries?.get(workKey(source.connectionId, source.repositoryId, issue)) ?? []) counts.set(run, (counts.get(run) ?? 0) + count);
   const active = [...counts.keys()];

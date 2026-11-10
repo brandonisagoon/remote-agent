@@ -215,6 +215,7 @@ const preparedFinalization = (route: string): ToolingCallback => ({ route: `POST
   kind: "finalization", input: async (_body, context) => ({ requestKey: await context.latestFinalizationKey() }),
   reference: async (_body, context) => finalizationRef(context, await context.latestFinalizationKey()) });
 const offerProducer = async (body: Body, context: CallbackContext) => { const environment = await offerEnvironment(context, body.offerId); return environment ? [environment.id] : []; };
+export const configurationRequestIdentity = (body: Body) => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid"));
 
 /** Bound adapter effect callbacks. TOOLING_CALLBACK_CLASSIFICATION lists
  * every other callback and why it needs no operation. */
@@ -230,7 +231,7 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
     input: () => undefined, reference: offer, referenceRule: "admission", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-bind", reference: body.offerId as string } : null },
   { route: "POST /api/tasks/:taskId/compute-configure", method: "POST", path: taskPath("compute-configure"), scope: "task", kind: "compute-configure",
-    input: body => body, reference: offer, referenceRule: "existing", produces: offerProducer,
+    input: configurationRequestIdentity, reference: offer, referenceRule: "existing", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-configure", reference: body.offerId as string } : null },
   // DRA-24: a projection transition plus (for a first-bootstrap group) its
   // legacy reader handoff. No reference rule: the binding continues the offer
@@ -278,12 +279,17 @@ const LOCAL_SERVICE_STOP: Record<"development" | "finalization", ToolingCallback
 export const TOOLING_CALLBACK_CLASSIFICATION = [
   ...TOOLING_CALLBACKS.map(callback => ({ route: callback.route, rule: "operation" as const, kind: callback.kind as string })),
   { route: "POST /api/sessions/:sessionId/local-service-stop-authority", rule: "operation" as const, kind: "development-intent (with development) | finalization" },
+  { route: "POST /api/sessions/:sessionId/task/runtime-health", rule: "evidence" as const, kind: "bound adapter-command", reason: "Records observed runtime health and an idempotent original-primary notice; never executes a provider or admits capacity." },
   { route: "PUT /api/sessions/:sessionId/task/resources", rule: "evidence" as const, kind: "optional; validated when present",
     reason: "Records resource receipts only; cleanup/development transitions keep their executing-turn and intent checks. Ordinary evidence registration is never blocked." },
   { route: "POST /api/tasks/:taskId/automation", rule: "owner-control" as const, kind: "none",
     reason: "Pause/close/stop cancel work, resume clears a flag, development requests only record intent; the handler runs no adapter or provider start. Recorded intents execute through bound development callbacks." },
   { route: "POST /api/tasks/:taskId/compute-accounting-input", rule: "owner-control" as const, kind: "none",
     reason: "Explicit owner bearer registers an exact retained configuration locator only; no executable, observation, allocation, resource generation or tooling selection is created." },
+  { route: "POST /api/tasks/:taskId/compute-accounting-observer/inspect", rule: "owner-control" as const, kind: "none",
+    reason: "Explicit owner bearer reads original historical accounting identity and observer availability; no provider mutation or capacity credit." },
+  { route: "POST /api/tasks/:taskId/compute-accounting-observer", rule: "owner-control" as const, kind: "none",
+    reason: "Explicit owner bearer adopts one verified compatible read-only observer after physical absence; only an audit receipt is added, never producer provenance or capacity credit." },
   { route: "POST /api/sessions/:sessionId/tooling-capability", rule: "resolution" as const, kind: "none",
     reason: "Returns instructions and an immutable adapter path and never executes it. Uses the guarded binding, else the active generation at this independent boundary; bound resolution never installs." },
   { route: "POST /api/sessions/:sessionId/tooling-operations", rule: "identity" as const, kind: "none", reason: "Persists identity before effects; grants no authority." },
@@ -304,7 +310,8 @@ export function matchToolingCallback(method: string, pathname: string, body?: Bo
   return null;
 }
 const RESOURCE_REGISTRATION = sessionPath("task/resources");
-export const isToolingCallbackPath = (method: string, pathname: string) => method === "PUT" && RESOURCE_REGISTRATION.test(pathname)
+const RUNTIME_HEALTH = sessionPath("task/runtime-health");
+export const isToolingCallbackPath = (method: string, pathname: string) => method === "POST" && RUNTIME_HEALTH.test(pathname) || method === "PUT" && RESOURCE_REGISTRATION.test(pathname)
   || method !== "GET" && (sessionPath("local-service-stop-authority").test(pathname) || TOOLING_CALLBACKS.some(callback => callback.method === method && callback.path.test(pathname)));
 
 export type ToolingOperationDependencies = {
@@ -323,9 +330,10 @@ export const toolingOperationDependencies: ToolingOperationDependencies = {
 
 /** Request scope set only by the guarded callback boundary. A legacy
  * continuation carries its exact first-bootstrap snapshot. */
-type Scope = { binding: ToolingOperationBinding; socket?: string } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
+type CallbackAttempt = { route: string; attemptId: string; body: Body };
+type Scope = { binding: ToolingOperationBinding; socket?: string; attempt?: CallbackAttempt } | { legacy: ExistingReference; code: ToolingCodeIdentity | null };
 const scope = new AsyncLocalStorage<Scope>();
-export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>, socket?: string) => scope.run({ binding, ...(socket ? { socket } : {}) }, operation);
+export const runWithToolingOperation = <T>(binding: ToolingOperationBinding, operation: () => Promise<T>, socket?: string, attempt?: CallbackAttempt) => scope.run({ binding, ...(socket ? { socket } : {}), ...(attempt ? { attempt } : {}) }, operation);
 /** Complete bound process context for a release-aware adapter or observer:
  * the operation plus the control socket, task and primary session it must
  * call back with. Empty for unbound (legacy) processes. */
@@ -337,6 +345,10 @@ export function toolingProcessContext(binding: Pick<ToolingOperationBinding, "op
 }
 export const runAsLegacyContinuation = <T>(reference: ExistingReference, code: ToolingCodeIdentity | null, operation: () => Promise<T>) => scope.run({ legacy: reference, code }, operation);
 export const currentToolingOperation = (): ToolingOperationBinding | undefined => { const value = scope.getStore(); return value && "binding" in value ? value.binding : undefined; };
+export const currentToolingAttempt = (): Pick<CallbackAttempt, "attemptId" | "route"> | undefined => {
+  const value = scope.getStore();
+  return value && "binding" in value && value.attempt ? { attemptId: value.attempt.attemptId, route: value.attempt.route } : undefined;
+};
 export const inLegacyContinuation = () => { const value = scope.getStore(); return Boolean(value && "legacy" in value); };
 /** Explicit identity, else the request scope (legacy snapshot or binding).
  * Undefined means no scope: only an outer independent boundary may select. */
@@ -370,11 +382,12 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
 /** This server process: a random per-boot nonce, its PID and local host.
  * Server-only metadata stamped on every new callback intent, so a later boot
  * can prove an orphaned attempt belonged to an exited process. */
+export const CONFIGURATION_REPAIR_CONTRACT = "configuration-command-recovery/v1";
 export const SERVER_INSTANCE: Readonly<{ instance: string; pid: number; host: string }> = Object.freeze({ instance: crypto.randomUUID(), pid: process.pid, host: hostname() });
 async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, attemptId: string, state: "intent" | "acknowledged" | "refused" | "unknown", status: number | null) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
     value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status,
-      ...(state === "intent" ? { server: SERVER_INSTANCE } : {}) }) } });
+      ...(state === "intent" ? { server: SERVER_INSTANCE, ...(route === "POST /api/tasks/:taskId/compute-configure" ? { repairContracts: [CONFIGURATION_REPAIR_CONTRACT] } : {}) } : {}) }) } });
 }
 /** Boot recovery only: the missing `unknown` result of an attempt whose
  * server process provably exited, copying the intent's exact identity. */
@@ -387,7 +400,7 @@ export async function recordInterruptedAttempt(tx: Prisma.TransactionClient, ope
 /** One operation's callback attempt records, newest first, bounded (overflow
  * refuses rather than dropping an older attempt). */
 const AttemptRecord = z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string(), route: z.string().optional(),
-  status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional() }).passthrough();
+  status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional(), repairContracts: z.array(z.string()).optional() }).passthrough();
 export async function attemptRecords(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operationId: string) {
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operationId) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operationId} exceeds its bound`);
@@ -430,7 +443,8 @@ async function latestAttemptAcknowledged(store: Pick<PrismaClient, "runtimeMetad
   for (const intent of intents) {
     const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
     if (!results.length) return false;
-    if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, operation)) return false;
+    if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, operation)
+      && !await (await import("./tooling-configuration-recovery.ts")).configurationAttemptReconciled(store, binding, operation, records, intent.attemptId)) return false;
   }
   return values.some(value => value.attemptId === intents[0]!.attemptId && value.state === "acknowledged");
 }
@@ -645,6 +659,75 @@ export async function producerOperationId(store: Pick<PrismaClient, "runtimeMeta
   return null;
 }
 
+/** Only the guarded configure attempt may read its own pending generation.
+ * Ordinary collectors still require confirmed producer provenance. */
+export async function configurationAttemptCode(prisma: PrismaClient, task: RemoteTask, environmentId: string, request: Body) {
+  const active = scope.getStore();
+  if (!active || !("binding" in active)) return undefined;
+  const { binding, attempt } = active;
+  if (!attempt || attempt.route !== "POST /api/tasks/:taskId/compute-configure"
+    || canonicalDigest(attempt.body) !== canonicalDigest(request) || binding.kind !== "compute-configure"
+    || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId || binding.repositoryId !== task.repositoryId)
+    throw refuse("operation-mismatch", "Configuration observation requires its exact guarded attempt");
+  const current = await readToolingOperation({ prisma, operationId: binding.operationId });
+  if (!current || canonicalDigest(current) !== canonicalDigest(binding)
+    || !["running", "unknown", "completed"].includes(current.status)) throw refuse("operation-closed", "Configuration binding changed during observation");
+  if (current.parentOperationId) {
+    const parent = await readToolingOperation({ prisma, operationId: current.parentOperationId });
+    if (!parent || !["bound", "running"].includes(parent.status) || parent.kind !== ADAPTER_COMMAND_KIND
+      || parent.taskId !== task.id || parent.sessionId !== task.primarySessionId
+      || canonicalDigest(parent.release) !== canonicalDigest(current.release))
+      throw refuse("operation-closed", "Configuration command changed during observation");
+  }
+  const offer = await prisma.computeOffer.findUnique({ where: { id: String(request.offerId) } });
+  if (!offer || offer.environmentId !== environmentId || current.existingOperationId !== offer.id)
+    throw refuse("operation-ownership", "Configuration attempt names another allocation");
+  const records = await attemptRecords(prisma, binding, binding.operationId);
+  if (records[0]?.value?.attemptId !== attempt.attemptId || records[0]?.value?.state !== "intent")
+    throw refuse("operation-closed", "Configuration attempt is no longer pending");
+  const producers = await associations(prisma, task, "producer", `compute-environment:${environmentId}`);
+  if (producers[0]?.operationId !== binding.operationId || !["intent", "confirmed"].includes(producers[0].state))
+    throw refuse("producer-unknown", "Configuration producer was superseded");
+  return { code: binding.release, binding };
+}
+
+/** Called inside the configuration commit, after its independently observed
+ * stopped generation is recorded. Keep the acknowledgment atomic with the
+ * transition: a collector may retire this reader before the HTTP hook runs.
+ * An already retired reader stays retired; only this exact stopped configure
+ * replay may fill its missing historical acknowledgment. */
+export async function acknowledgeConfigurationConsumer(tx: Prisma.TransactionClient, task: RemoteTask, environmentId: string, request: Body, transitionKey: string) {
+  const selected = await configurationAttemptCode(tx as PrismaClient, task, environmentId, request);
+  if (!selected) return; // Legacy tasks have no operation-bound reader.
+  const { binding } = selected;
+  const active = scope.getStore();
+  if (!active || !("binding" in active) || !active.attempt) throw refuse("operation-mismatch", "Configuration attempt disappeared before acknowledgment");
+  const operation = await tx.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } });
+  const rows = await tx.toolingRetainedConsumer.findMany({ where: { operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId }, take: 2 });
+  const row = rows[0], evidence = { kind: "compute-configure", reference: String(request.offerId) };
+  if (rows.length !== 1 || !row || row.taskId !== task.id || row.repositoryId !== binding.repositoryId
+    || row.releaseId !== binding.release.id || row.generation !== binding.generation || row.protocol !== operation.protocol
+    || row.scopeKey !== (binding.resourceKey ?? "task")) throw refuse("operation-mismatch", "Configuration reader changed before acknowledgment");
+  // This per-attempt receipt follows fresh physical verification even when
+  // the original reader's acknowledgment was already durable.
+  await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${task.id}`, action: "configuration-attempt-committed", key: `${binding.operationId}:${active.attempt.attemptId}`,
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, parentOperationId: binding.parentOperationId ?? null, inputDigest: binding.inputDigest,
+      attemptId: active.attempt.attemptId, requestDigest: canonicalDigest(configurationRequestIdentity(request)),
+      transitionKey, environmentId, readerId: row.id }) } });
+  if (["confirmed", "resolved"].includes(row.status) && row.confirmedAt && canonicalDigest(row.evidence) === canonicalDigest(evidence)) return;
+  const resolution = z.object({ kind: z.enum(["stopped", "absent"]), reference: z.literal(environmentId) }).strict().safeParse(row.resolution);
+  if (row.evidence !== null || row.confirmedAt !== null || row.status !== "pending"
+    && (row.status !== "resolved" || !row.resolvedAt || !resolution.success))
+    throw refuse("operation-mismatch", "Configuration reader has conflicting acknowledgment or retirement evidence");
+  const now = new Date();
+  await tx.toolingRetainedConsumer.update({ where: { id: row.id }, data: { evidence, confirmedAt: now,
+    ...(row.status === "pending" ? { status: "confirmed" } : {}) } });
+  if (row.status === "pending") await tx.toolingRetainedConsumer.updateMany({ where: { taskId: row.taskId, consumerKind: row.consumerKind, consumerId: row.consumerId, status: "confirmed", id: { not: row.id } },
+    data: { status: "resolved", resolution: { kind: "superseded", reference: row.id }, resolvedAt: now } });
+  await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${task.id}`, action: "configuration-reader-acknowledged", key: row.id,
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, environmentId, evidence, previousStatus: row.status, resolution: row.resolution }) } });
+}
+
 /** Read-only code selection before a saved resource's FIRST claim. The
  * acknowledged exact request is provenance, not a producer or start grant.
  * Once any claim may have started it, only a confirmed producer can select
@@ -797,11 +880,13 @@ async function assertBindingAuthority(input: { prisma: PrismaClient; config: Ser
 export async function admitToolingCallback(input: { prisma: PrismaClient; config: ServerConfig; method: string; pathname: string; header: string | undefined; body: Body },
   dependencies: ToolingOperationDependencies = toolingOperationDependencies): Promise<CallbackAdmission | null> {
   const store = input.prisma as unknown as Store;
-  if (input.method === "PUT" && RESOURCE_REGISTRATION.test(input.pathname)) {
-    if (!input.header) return null;
-    const sessionId = decodeURIComponent(RESOURCE_REGISTRATION.exec(input.pathname)![1]!);
+  const health = input.method === "POST" && RUNTIME_HEALTH.test(input.pathname);
+  if (health || input.method === "PUT" && RESOURCE_REGISTRATION.test(input.pathname)) {
+    if (!input.header) { if (health) throw refuse("operation-required", "Runtime health requires its bound adapter command"); return null; }
+    const sessionId = decodeURIComponent((health ? RUNTIME_HEALTH : RESOURCE_REGISTRATION).exec(input.pathname)![1]!);
     const binding = await dependencies.read({ prisma: input.prisma, operationId: input.header });
     if (!binding || binding.sessionId !== sessionId) throw refuse("operation-ownership", "Resource evidence names an operation of another session");
+    if (health && binding.kind !== "adapter-command") throw refuse("operation-mismatch", "Runtime health requires its bound adapter command");
     // A closed resource release updates only its own exact existing receipt;
     // identity and cleanup transitions are rechecked by the handler.
     if (binding.kind === CLOSED_RESOURCE_RELEASE_KIND && (input.body.key !== binding.resourceKey || ["bound", "running", "unknown"].indexOf(binding.status) < 0)) throw refuse("operation-mismatch", `A closed resource release updates only resource ${binding.resourceKey}`);
@@ -842,7 +927,10 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     || binding.sessionId !== task.primarySessionId || (callback.scope === "session" && binding.sessionId !== param)) throw refuse("operation-ownership", "The operation does not belong to this task's primary session");
   if (binding.kind !== callback.kind) throw refuse("operation-mismatch", `${callback.route} requires a ${callback.kind} operation, not ${binding.kind}`);
   const projection = await callback.input(input.body, context);
-  if (projection !== undefined && dependencies.digest(projection) !== binding.inputDigest) throw refuse("operation-input", `${callback.route} input differs from the bound operation`);
+  // Existing bindings retain their original full-body digest. Only an exact
+  // legacy replay uses it; new bindings exclude the separately verified lock.
+  const exactLegacyConfiguration = callback.kind === "compute-configure" && dependencies.digest(input.body) === binding.inputDigest;
+  if (projection !== undefined && dependencies.digest(projection) !== binding.inputDigest && !exactLegacyConfiguration) throw refuse("operation-input", `${callback.route} input differs from the bound operation`);
   const reference = callback.reference ? await callback.reference(input.body, context) : null;
   if (callback.reference && !reference) throw refuse("operation-input", `${callback.route} names no existing operation`);
   let adopt: { environmentKey: string; offerId: string } | undefined;
@@ -1048,6 +1136,12 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   }
   const current = await dependencies.read({ prisma, operationId: state.binding.operationId });
   if (!current) return;
+  if (ok && current.status !== "completed" && current.kind === "compute-configure" && current.parentOperationId && state.attemptId && admission.context.config) {
+    const { reconcileConfigurationChildren } = await import("./tooling-configuration-recovery.ts");
+    await reconcileConfigurationChildren({ prisma, config: admission.context.config, binding: current, body: admission.body, attemptId: state.attemptId })
+      .catch(error => console.warn(`Configuration ${current.operationId} reconciliation remains pending: ${String(error instanceof Error ? error.message : error).slice(0, 1000)}`));
+    if ((await dependencies.read({ prisma, operationId: current.operationId }))?.status === "completed") return;
+  }
   // An exact acknowledged replay of an earlier unknown request may reconcile
   // it, only with full proof; otherwise the operation stays unknown.
   if (ok && current.status === "unknown" && admission.callback.route === REQUEST_ROUTE && state.attemptId) {

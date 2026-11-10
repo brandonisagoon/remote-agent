@@ -8,7 +8,7 @@ import {
 } from "../../../../../types/dispatcher/index.ts";
 import type { WorkflowConfig } from "../../../../../lib/config.ts";
 import type { SourceIssueWithAgentIssues } from "../../../integrations/linear/session-store/source-issue/types.ts";
-import { getSourceIssueForUpdate, getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
+import { getSourceIssueForWorkflow } from "../../../integrations/linear/session-store/source-issue/read.ts";
 import { TrackerReaction, reactToIssue } from "../../../integrations/linear/reactions.ts";
 import { forwardMessage } from "../../../services/messages/index.ts";
 import {
@@ -26,7 +26,7 @@ import { getActiveToolingRelease } from "../../../services/tasks/tooling-release
 import { provisionTaskWorktree } from "../../../services/tasks/provision.ts";
 import { continuePlanningSession } from "./continue-plan.ts";
 import { deliverManagedMerge } from "./merge-delivery.ts";
-import { buildWorkflowLaunchPrompt, executionConflict, launchIntentRecord, launchOrdering, quotedSourceDescription, resolveLaunchIntent, type LaunchIntent, type SourceComment } from "./launch-intent.ts";
+import { buildWorkflowLaunchPrompt, executionConflict, launchEvidenceFailure, launchIntentRecord, launchOrdering, quotedSourceDescription, resolveLaunchIntent, type LaunchIntent, type SourceComment } from "./launch-intent.ts";
 import type { PrismaClient } from "../../../../../generated/prisma/client.ts";
 import { fetchIssueCommentTimeline } from "../../../integrations/linear/comments.ts";
 import { nativeLaunchControl } from "../../../services/launches/native-takeover.ts";
@@ -55,15 +55,15 @@ export interface WorkflowWorkerDependencies {
   verifyRelease?: Parameters<typeof prepareTaskPrompt>[0]["verifyRelease"];
 }
 
-/** The fetched issue; its change time and state type order the trigger. */
+/** The fetched issue; description revision and state are independent evidence. */
 export type WorkflowSourceIssue = SourceIssueWithAgentIssues & {
   updatedAt?: string | null;
+  documentContent?: { id: string; updatedAt: string } | null;
   state: { name: string; type?: string | null };
 };
 
 const defaultDependencies: WorkflowWorkerDependencies = {
-  // Same workflow query, typed with the change time and state type it reads.
-  getIssue: getSourceIssueForUpdate,
+  getIssue: getSourceIssueForWorkflow,
   react: reactToIssue,
   postWorktreeComment: postWorktreeLinkComment,
 };
@@ -184,10 +184,9 @@ export function createWorkflowWorker(
         if (fence && !(fence.mode === "managed" && fence.grantKey === context.runId)
           && !(event.webhook.type === "Reaction" && isFreshNativeReaction(context.config, repository.id, fence.decidedAt, event.webhook.data))) return result("ignored", "Launch withdrawn by native ownership", fence.issueIdentifier);
       }
-      const issue = await dependencies.getIssue(context.config, { id: issueRef });
-      if (!issue) return result("failed", "source issue not found");
-
       if (workflow.deliver === "message-session") {
+        const issue = await dependencies.getIssue(context.config, { id: issueRef });
+        if (!issue) return result("failed", "source issue not found");
         if (repository.tooling && workflow.skill.skillset === "merge") {
           if (event.webhook.type !== "Issue" || event.webhook.data.state?.name !== "Merge") return result("failed", "Merge requires an owner-selected Merge state transition");
           return deliverManagedMerge({ context, workflow, issueIdentifier: issue.identifier, webhook: event.webhook,
@@ -227,16 +226,33 @@ export function createWorkflowWorker(
       }
 
       let intent: LaunchIntent = resolveLaunchIntent({ config: context.config, workflow, webhook: event.webhook, requestKey: context.runId });
-      const launchIssue = { identifier: issue.identifier, title: issue.title, description: issue.description ?? null,
-        updatedAt: issue.updatedAt ?? null, state: issue.state };
-      // Unverified execution, a closed source or a newer state never reaches
-      // native resume, plan continuation or a fresh launch.
-      const conflict = executionConflict(intent, launchIssue, event.webhook);
-      if (conflict) return result("ignored", conflict, issue.identifier);
       const intentSummary = `${intent.mode}; owner authority ${intent.authority.verified ? "verified" : "not established"}`;
-      const ordering = launchOrdering(context.config, intent, launchIssue, intent.mode === "execution"
-        ? await (dependencies.readComments ?? ((config, id) => fetchIssueCommentTimeline(config.linearApiKey, id)))(context.config, issue.id)
-        : []);
+      const readComments = dependencies.readComments ?? ((config, id) => fetchIssueCommentTimeline(config.linearApiKey, id));
+      let source: { issue: WorkflowSourceIssue; ordering: ReturnType<typeof launchOrdering> } | null = null;
+      let evidenceFailure: string | null = null;
+      // One bounded reread, before allocating work or consuming a continuation.
+      // Missing metadata and transport errors never become authorization questions.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        let reading = "source issue";
+        try {
+          const issue = await dependencies.getIssue(context.config, { id: issueRef });
+          if (!issue) return result("failed", "source issue not found", issueRef);
+          // Recheck current state on every read, including recovery.
+          const conflict = executionConflict(intent, issue, event.webhook);
+          if (conflict) return result("ignored", conflict, issue.identifier);
+          reading = "issue comment timeline";
+          const ordering = launchOrdering(context.config, intent, issue, intent.mode === "execution"
+            ? await readComments(context.config, issue.id) : []);
+          evidenceFailure = intent.mode === "execution" ? launchEvidenceFailure(ordering) : null;
+          if (!evidenceFailure) { source = { issue, ordering }; break; }
+        } catch (error) {
+          if (intent.mode !== "execution" || !intent.authority.verified) throw error;
+          evidenceFailure = `Linear ${reading} read failed`;
+        }
+      }
+      if (!source) return result("failed", `${evidenceFailure} after one retry; owner authorization remains verified. No implementation was dispatched.`, issueRef);
+      const { issue, ordering } = source;
+      const launchIssue = issue;
 
       if (!dependencies.assertLaunch && event.webhook.type === "Reaction") {
         const resumed = await freshReactionNativeLaunch({ prisma: context.prisma, config: context.config, runtime: context.agentRuntime! },

@@ -197,3 +197,16 @@ export async function issueHasCommentContaining(
     return true;
   }
 }
+
+
+/** Bounded, complete read used only to reconcile pre-receipt mirror comments.
+ * Unknown/incomplete history must never be treated as a missing comment. */
+export async function fetchPublicationCommentTimeline(apiKey: LinearCredential, issueId: string) {
+  const data = z.object({ issue: z.object({ id: z.literal(issueId), comments: z.object({
+    nodes: z.array(z.object({ id: z.string(), body: z.string(), parentId: z.string().nullable(), createdAt: z.iso.datetime() })),
+    pageInfo: z.object({ hasNextPage: z.boolean() }),
+  }) }).nullable() }).parse(await linearGraphql<unknown>(apiKey,
+    "query PublicationMigrationComments($issueId: String!) { issue(id: $issueId) { id comments(first: 250) { nodes { id body parentId createdAt } pageInfo { hasNextPage } } } }", { issueId }));
+  if (!data.issue || data.issue.comments.pageInfo.hasNextPage) throw new Error("Legacy publication history is incomplete; retain the pending delivery");
+  return data.issue.comments.nodes;
+}

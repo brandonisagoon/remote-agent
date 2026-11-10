@@ -254,7 +254,7 @@ test("changing original credit with two eligible waiters never exceeds one manag
   expect(await f.prisma.remoteTaskResource.findMany({ where: { taskId: "old" } })).toEqual(originals);
 });
 
-test("DRA-36: a long refresh of one group never clears another group's fresh proof, and names the exact pending group", async () => {
+test("RA-21: a long refresh retains completed fresh proof for every unchanged group", async () => {
   const f = await fixture();
   await f.prisma.runtimeSession.create({ data: { id: "old-2", scopeKey: "old-2", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/old-2", status: "closed", closedAt: f.now } });
   await f.prisma.remoteTask.create({ data: { id: "old-2", requestKey: "old-2", repositoryId: "repo", machineId: "host", branchName: "codex/old-2", worktreePath: "/old-2", toolingRoot: "/old/tooling", toolingRevision: "a".repeat(40), primarySessionId: "old-2", phase: "closed" } });
@@ -266,13 +266,13 @@ test("DRA-36: a long refresh of one group never clears another group's fresh pro
   const held = new Promise<void>(resolve => { entered = resolve; }), gate = new Promise<void>(resolve => { release = resolve; });
   const pass = refreshComputeBaselines(f.context, async (input, task, raw) => { if (task.id === "old-2") { entered(); await gate; } return f.read(input, task, raw); });
   await held;
-  // Only the group whose own refresh is in progress loses credit.
+  // Starting a replacement read is not evidence of a new running app.
   const during = await readComputeCapacity(input);
-  expect(during).toMatchObject({ unaccounted: 1 });
-  // In flight after an earlier credit: no proof now, last recorded outcome credited.
-  expect(during.blockers.unaccounted).toEqual([{ group: "old-2:development", reason: "uncredited-baseline", ids: ["old-2-app"],
-    detail: `baseline missing-proof (last refresh proof-recorded since ${f.now.toISOString()})`, action: expect.stringContaining("baseline refresh"),
-    baseline: { reason: "missing-proof", refresh: { outcome: "proof-recorded", since: f.now.getTime() } } }]);
+  expect(during).toMatchObject({ unaccounted: 0 });
+  expect(during.blockers.unaccounted).toEqual([]);
+  // The previous generation still expires normally while this read is held.
+  const stale = await readComputeCapacity({ ...input, now: new Date(f.now.getTime() + 600_000) });
+  expect(stale.unaccounted).toBe(2);
   release();
   expect(await pass).toEqual({ observed: 2, unavailable: 0 });
   expect(await readComputeCapacity(input)).toMatchObject({ unaccounted: 0 });
@@ -422,4 +422,17 @@ test("pause generation change during a baseline read refuses even when paused ag
     return result;
   })).toEqual({ observed: 0, unavailable: 1 });
   expect(await readComputeCapacity({ ...f.admission, taskId: "waiting" })).toMatchObject({ unaccounted: 1 });
+});
+
+
+test.each(["settled", "executing", "started", "moved"])("RA-21: fenced errored delegate is %s without consuming its queued history", async condition => {
+  const f = await fixture();
+  await f.prisma.runtimeSession.create({ data: { id: "child", scopeKey: "child", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "delegate", cwd: condition === "moved" ? "/other" : "/old", status: "error" } });
+  await f.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "child", targetSessionId: "old", relationship: "spawned-by" } });
+  const queued = await f.prisma.runtimeInstruction.create({ data: { id: "child-work", sessionId: "child", state: "queued", text: "Retained owner instruction" } });
+  if (condition === "executing") f.runtime.observeSessionActivity = id => ({ state: id === "child" ? "executing" : "unknown", observedAt: f.now.getTime() });
+  if (condition === "started") await f.prisma.runtimeLifecycleEvent.create({ data: { id: "child-start", runtimeSessionId: "child", requestId: "old-attempt", phase: "started", occurredAt: f.now } });
+  expect(await refreshComputeBaselines(f.context, f.read)).toEqual(condition === "settled" ? { observed: 1, unavailable: 0 } : { observed: 0, unavailable: 1 });
+  expect(await f.prisma.runtimeInstruction.findUnique({ where: { id: queued.id } })).toEqual(queued);
+  expect((await f.prisma.runtimeSession.findUniqueOrThrow({ where: { id: "child" } })).status).toBe("error");
 });

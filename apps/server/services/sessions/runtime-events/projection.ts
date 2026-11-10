@@ -4,12 +4,9 @@ import type { ServerConfig } from "../../../../../lib/config.ts";
 import {
   agentIssueLabelIdsWithRouting,
   agentIssueRuntimeWithLabels,
-  createThreadedIssueComment,
   getAgentCatalog,
   getAgentStateId,
-  getSourceIssue,
   parseAgentIssueRuntime,
-  parseAgentIssueSourceIdentifier,
   updateAgentIssue,
 } from "../../../integrations/tracker/index.ts";
 import type {
@@ -24,7 +21,6 @@ import {
   advanceRuntimeEventCursor,
   getRuntimeEventCursor,
   listRuntimeLifecycleEvents,
-  pruneRuntimeLifecycleEvents,
 } from "../runtime-registry.ts";
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
 import { projectSourceCheckpoint } from "./source-checkpoint.ts";
@@ -34,14 +30,7 @@ import { projectTaskStalls } from "./task-stalls.ts";
 
 const CONSUMER = "linear-projection:v1";
 const NOTIFY_CONSUMER = "delegate-notification:v1";
-const MAX_OUTPUT = 8_000;
 const yieldToRequests = () => new Promise<void>((resolve) => setImmediate(resolve));
-
-function checkpoint(output: string): string {
-  const text = output.trim();
-  const bounded = text.length > MAX_OUTPUT ? `…${text.slice(-MAX_OUTPUT)}` : text;
-  return ["### Agent checkpoint", "", bounded].join("\n");
-}
 
 export function agentIssueStateForRuntimeEvent(
   event: AgentRuntimeLifecycleEvent,
@@ -105,44 +94,7 @@ export async function projectRuntimeEvent(
     });
   }
 
-  if (!sourceReply && (event.phase === "completed" || event.phase === "failed")) {
-    const sourceIdentifier = parseAgentIssueSourceIdentifier(issue.description);
-    const source = sourceIdentifier
-      ? await getSourceIssue(config, { id: sourceIdentifier })
-      : null;
-    if (source) {
-      let rootId = record.rootCommentId;
-      if (!rootId) {
-        const root = await createThreadedIssueComment(config.linearApiKey, {
-          issueId: source.id,
-          body: `● Remote Agent session · acpx \`${event.sessionId}\``,
-        });
-        if (root) {
-          rootId = root.id;
-          await prisma.sessionMirror.update({
-            where: { id: record.id },
-            data: { rootCommentId: root.id },
-          });
-        }
-      }
-      const output = event.phase === "completed"
-        ? await runtime.output(event.sessionId)
-        : null;
-      const body = event.phase === "failed"
-        ? ["❌ Agent turn failed", "", event.error ?? "Unknown acpx error"].join("\n")
-        : output?.trim()
-          ? checkpoint(output)
-          : null;
-      if (body) {
-        const posted = await createThreadedIssueComment(config.linearApiKey, {
-          issueId: source.id,
-          body,
-          ...(rootId ? { parentId: rootId } : {}),
-        });
-        if (!posted) throw new Error(`failed to project runtime event ${event.id}`);
-      }
-    }
-  }
+  if (!sourceReply) await projectSourceCheckpoint(config, prisma, runtime, event);
 
   await advanceRuntimeEventCursor(prisma, {
     runtimeSessionId: event.sessionId,
@@ -150,12 +102,7 @@ export async function projectRuntimeEvent(
     sourceCursor: event.id,
     generation: sequence > 0n ? sequence : cursor.generation + 1n,
   });
-  if (event.sequence != null) {
-    await pruneRuntimeLifecycleEvents(prisma, {
-      runtimeSessionId: event.sessionId,
-      throughSequence: event.sequence,
-    });
-  }
+
   return true;
 }
 
@@ -214,12 +161,17 @@ export async function drainRuntimeEventProjection(
   }
 }
 
-export function startRuntimeEventProjection(input: ProjectionInput, work = async () => {
-  await drainRuntimeEventProjection(input);
-  await reconcileSourceMessages(input.config, input.prisma, input.runtime);
-  await reconcileControlNotices(input.config, input.prisma);
-  await projectTaskStalls(input);
-}, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1]; confirmFinalization?: Parameters<typeof preparationJournalWorker>[2] } = {}): () => Promise<void> {
+export function startRuntimeEventProjection(input: ProjectionInput, work?: () => Promise<void>, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1]; confirmFinalization?: Parameters<typeof preparationJournalWorker>[2]; projectStalls?: typeof projectTaskStalls } = {}): () => Promise<void> {
+  const runEvents = work ?? (async () => {
+    await drainRuntimeEventProjection(input);
+    await reconcileSourceMessages(input.config, input.prisma, input.runtime);
+    await reconcileControlNotices(input.config, input.prisma);
+  });
+  // One optional scan in the existing worker, with the same shutdown boundary.
+  // A slow tracker request must not hold the delegate-result/instruction drain.
+  const scan = options.projectStalls ?? (!work ? projectTaskStalls : undefined);
+  const scanController = new AbortController();
+  let scanning: Promise<void> | undefined;
   const preparations = preparationJournalWorker(input, options.prepareFinalization, options.confirmFinalization);
   let running: Promise<void> | undefined;
   let requested = false;
@@ -227,12 +179,15 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
   const drain = () => {
     if (stopped) return;
     preparations.tick();
+    if (scan && !scanning) scanning = scan({ ...input, signal: scanController.signal })
+      .catch(error => console.error("[runtime-events] stall scan failed:", error))
+      .finally(() => { scanning = undefined; });
     requested = true;
     if (running) return;
     running = (async () => {
       do {
         requested = false;
-        try { await work(); }
+        try { await runEvents(); }
         catch (error) { console.error("[runtime-events] journal drain failed:", error); }
         await yieldToRequests();
       } while (requested && !stopped);
@@ -247,7 +202,8 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
     stopped = true;
     clearInterval(timer);
     unsubscribe();
-    await running;
+    scanController.abort();
+    await Promise.all([running, scanning]);
     await preparations.stop();
   };
 }

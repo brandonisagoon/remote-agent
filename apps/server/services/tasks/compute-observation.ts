@@ -6,6 +6,8 @@ import { ComputeRoute, trafficSummary, type TrafficState } from "../../../../lib
 import { ComputeDecisionEvidence } from "./compute-decision.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { assertSavedComputeObservation, isSavedComputeEnvironment } from "./compute-saved-resource.ts";
+import { mergedComputeStopScope } from "./compute-merged-delivery.ts";
+import { cleanupFamily } from "./closed-cleanup.ts";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const Identity = z.string().min(1).max(256);
@@ -120,7 +122,9 @@ export async function computeEvidenceState(input: Context & { allowStopped?: boo
   const resource = resources.find(resource => resource.id === observation.resourceId);
   if (!resource || resource.state === "released" || finalizationResourceIdentity(resource).identityDigest !== observation.resourceIdentity || observation.recipeDigest !== env.recipeDigest
     || observation.revision !== env.revision || observation.purpose !== env.purpose || observation.taskId !== task.id || observation.primarySessionId !== primary.id || observation.environmentId !== env.id) throw new Error("Compute observation resource identity changed");
-  const sessions = await input.prisma.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
+  const mergedStop = await mergedComputeStopScope(input.prisma, task, observation.sourceRevision, resources);
+  const sameDirectory = await input.prisma.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
+  const sessions = mergedStop ? [...new Map([...sameDirectory, ...await cleanupFamily(input.prisma, task, primary.id)].map(session => [session.id, session])).values()] : sameDirectory;
   if (sessions.length > 1000 || sessions.some(session => session.repositoryId !== task.repositoryId || session.machineId !== task.machineId)) throw new Error("Compute session ownership is ambiguous");
   const instructions = await input.prisma.runtimeInstruction.findMany({ where: { sessionId: { in: sessions.map(session => session.id) } }, orderBy: { sequence: "desc" }, take: 1001 });
   const pending = await input.prisma.runtimeInstruction.count({ where: { sessionId: { in: sessions.map(session => session.id) }, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } });
@@ -149,11 +153,13 @@ export async function computeEvidenceState(input: Context & { allowStopped?: boo
     && now >= observation.observedAt && now - observation.observedAt <= freshness;
   const operationsComplete = observation.operations.coverage === "complete" && observation.operations.active === 0;
   const reviewProtected = env.purpose === "review" || resources.some(resource => resource.purpose === "review" && resource.state !== "released" && (!resource.expiresAt || resource.expiresAt.getTime() > now));
-  const eligible = (covered || continuingStop) && settled && operationsComplete && !task.ownerPaused && !["complete", "closed"].includes(task.phase) && !reviewProtected && (observation.state === "running" || stopped) && (stopped || continuingStop || summaries.every(summary => summary.candidate));
+  const eligible = (covered || continuingStop) && settled && operationsComplete && !task.ownerPaused && task.phase !== "closed" && (task.phase !== "complete" || Boolean(mergedStop))
+    && !reviewProtected && (observation.state === "running" || stopped)
+    && (stopped || continuingStop || summaries.every(summary => summary.candidate) || Boolean(mergedStop) && summaries.every(summary => summary.inFlight === 0 && summary.activeStreams === 0));
   const last = (key: "lastMeaningfulAt" | "lastUnknownAt") => { const values = summaries.map(value => value[key]).filter((value): value is number => value !== null); return values.length ? Math.max(...values) : null; };
   // Heartbeats refresh evidence, but do not supersede an otherwise identical
   // decision. Activity, coverage generation, ownership and identity do.
-  const snapshotDigest = finalizationDigest({ task: { id: task.id, primarySessionId: task.primarySessionId, machineId: task.machineId, repositoryId: task.repositoryId, worktreePath: task.worktreePath, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot, ownerPaused: task.ownerPaused, phase: task.phase },
+  const snapshotDigest = finalizationDigest({ ...(mergedStop ? { mergedStop } : {}), task: { id: task.id, primarySessionId: task.primarySessionId, machineId: task.machineId, repositoryId: task.repositoryId, worktreePath: task.worktreePath, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot, ownerPaused: task.ownerPaused, phase: task.phase },
     observation: { ...observation, observedAt: undefined,
       application: observation.application ? { ...observation.application, stopped: undefined } : undefined,
       coverage: continuingStop ? "complete" : observation.coverage, state: ["running", "stopped"].includes(observation.state) ? "saved-compute" : observation.state }, resources: resources.map(value => ({ ...finalizationResourceIdentity(value), state: value.id === resource.id && ["ready", "allocated"].includes(value.state) ? "retained" : value.state })).sort((a,b) => a.key.localeCompare(b.key)),
@@ -171,7 +177,7 @@ export async function computeEvidenceState(input: Context & { allowStopped?: boo
       operations: { coverage: observation.operations.coverage, active: observation.operations.active } },
     thread: { name: primary.name ? sanitizeComputeConversation([{ role: "user", text: primary.name }], computeConversationSecrets(input.config))[0]?.text.slice(0, 256) ?? null : null,
       issueIdentifier: task.issueIdentifier, taskPhase: task.phase, order: "oldest-to-newest", totalMessages: 0, windowMessages: 0, omittedMessages: 0, messageIndexes: [], truncations: [] } });
-  return { evidence, snapshotDigest, eligible, physicalState: observation.state, sessionIds: sessions.filter(value => !value.closedAt && value.status !== "closed").map(value => value.id), resource: { id: resource.id, key: resource.key, identityDigest: observation.resourceIdentity } };
+  return { evidence, snapshotDigest, eligible, ...(mergedStop ? { mergedStop } : {}), physicalState: observation.state, sessionIds: sessions.filter(value => !value.closedAt && value.status !== "closed").map(value => value.id), resource: { id: resource.id, key: resource.key, identityDigest: observation.resourceIdentity } };
 }
 export async function collectComputeEvidence(input: Context & { runtime: Pick<AgentSessionRuntime, "history" | "observeSessionActivity"> }) {
   const result = await computeEvidenceState(input);

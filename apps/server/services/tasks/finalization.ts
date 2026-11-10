@@ -7,6 +7,7 @@ import { assertNoRemainingConsumers } from "./work-map-state.ts";
 import { executeFullPreparation } from "./finalization-preparation.ts";
 import { preparationStage } from "./preparation-diagnostics.ts";
 import { readLocalCompletion, assertLocalCompletion, assertLocalDelivery, assertLocalCleanupFamily } from "./local-completion.ts";
+import { readConfigurationCompletion, assertConfigurationCompletion, assertConfigurationDelivery } from "./configuration-completion.ts";
 import { PreparationDiagnosticError } from "./preparation-errors.ts";
 import { automaticCleanupTurn } from "./cleanup-inbox.ts";
 import { realpath } from "node:fs/promises";
@@ -88,6 +89,7 @@ async function cleanupSourceIdentity(input: FinalizationContext, taskId: string,
   const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: taskId } });
   const where = { runtimeSessionId: input.sessionId, source: `owner:${taskId}` };
   const contract = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: "completion-contract" }, orderBy: { sequence: "desc" } });
+  if (JSON.parse(contract?.value ?? "null")?.boundary === "configuration-only") return sourceAuthority(input, taskId, dependencies);
   if (!contract || JSON.parse(contract.value ?? "null")?.boundary !== "merge") throw new Error("Cleanup requires existing accepted owner delivery authority");
   const revoked = await input.prisma.runtimeMetadataEvent.findFirst({ where: { ...where, action: "delivered-retirement-revoked" }, orderBy: { sequence: "desc" } });
   const done = await latestDoneRetirement(input.prisma, taskId, input.sessionId);
@@ -115,6 +117,7 @@ function result(prepared: PreparedFinalization, preparedRevision: number, confir
     ...(archiveRetention ? { archiveRetention } : {}),
     ...(cleanup ? { cleanup, sourceRetirement: "delete" as const } : {}),
     ...(prepared.localCompletion ? { localCompletion: prepared.localCompletion } : {}),
+    ...(prepared.configurationCompletion ? { configurationCompletion: prepared.configurationCompletion } : {}),
     ...(authority ? { retirement: { authorityRevision: authority.revision, authorityDigest: authority.digest,
       doneHandoff: { requestKey: `${prepared.requestKey}:done`, expectedState: "Done" as const, state: "Done" as const,
         body: `Task ${prepared.taskId} retirement is confirmed under explicit owner authorization. Its accepted delivery at ${prepared.revision} is merged, ${archiveRetention ? "resources requiring removal are released and verified saved archives remain intact" : "recorded development, browser and review resources are released"}, and its exact development worktree and Git registration are absent. The issue remains Done; this coding session is now closing.` } } } : {}) };
@@ -159,6 +162,11 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
   if (input.authorityOnly) throw new Error("Authority-only checks require external finalization version 2");
   if (input.finalizationVersion === 2) throw new Error("Finalization version 2 requires an adopted external delivery binding");
   const local = direct ? await readLocalCompletion(input.prisma, task.id, input.sessionId) : undefined;
+  const configuration = direct ? null : await readConfigurationCompletion(input.prisma, task.id, input.sessionId);
+  if (configuration) {
+    if (!input.cleanup) throw new Error("Configuration completion requires the original persistent cleanup operation");
+    await assertLocalCleanupFamily(input.prisma, task, input.runtime);
+  }
   const source = direct ? undefined : await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
   if (source && (source.link.connectionId !== task.connectionId || source.issue.identifier !== task.issueIdentifier || source.session.id !== input.sessionId)) throw new Error("Finalization source does not belong to this task");
   const where = { runtimeSessionId: input.sessionId, action: FINALIZATION_PREPARED, source: `finalizer:${task.id}`, key: input.requestKey };
@@ -187,6 +195,7 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
   }
   const delivery = await dependencies.completion(input);
   if (local) assertLocalDelivery(delivery, local.reference, local.contract.sequence);
+  else if (configuration) assertConfigurationDelivery(delivery, configuration.reference, configuration.contract.sequence);
   else if (delivery.boundary !== "merge" || !delivery.receipts.merge.merged) throw new Error("Finalization requires verified authorized merge delivery");
   const worktree = await realpath(task.worktreePath!);
   const gitCwd = await realpath(getRepositoryConfig(input.config, task.repositoryId).root);
@@ -203,11 +212,12 @@ async function prepareFinalization(input: FinalizationContext, dependencies: Dep
     repositoryId: task.repositoryId, machineId: task.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, issueId: source?.issue.id ?? null,
     contractRevision: delivery.receipts.contractRevision,
     worktree, taskWorktree: task.worktreePath!, registeredWorktree: entry!.worktree!, revision: delivery.receipts.snapshot.head, branch: task.branchName, gitDirectory, gitCwd, delivery,
-    ...(local ? { localCompletion: local.reference } : {}), ...(source?.retirementAuthority ? { retirementAuthority: source.retirementAuthority } : {}) });
+    ...(local ? { localCompletion: local.reference } : {}), ...(configuration ? { configurationCompletion: configuration.reference } : {}), ...(source?.retirementAuthority ? { retirementAuthority: source.retirementAuthority } : {}) });
   const snapshot = await dependencies.snapshot(worktree);
   if (JSON.stringify(snapshot) !== JSON.stringify(delivery.receipts.snapshot)) throw new Error("Worktree changed during finalization preparation");
   if (prepared.localCompletion) await assertLocalCompletion(input.prisma, prepared);
-  else if (source) {
+  if (prepared.configurationCompletion) await assertConfigurationCompletion(input.prisma, prepared);
+  if (source) {
   const refreshedSource = await (input.cleanup ? cleanupSourceIdentity : sourceAuthority)(input, task.id, dependencies);
   if (refreshedSource.issue.id !== source.issue.id || refreshedSource.issue.identifier !== source.issue.identifier || refreshedSource.link.connectionId !== source.link.connectionId
     || refreshedSource.session.id !== source.session.id || refreshedSource.retirementAuthority?.revision !== source.retirementAuthority?.revision) throw new Error("Finalization source identity changed during initial verification");

@@ -271,7 +271,9 @@ test("a pending worker from an earlier process remains unverified instead of bei
 
 async function freshActualWorker(f: ReturnType<typeof fixture>, runId: string) {
   await Bun.sleep(3);
-  const issue = { id: f.source.issueId, identifier: f.source.issueIdentifier, title: "Owner continuation", description: "Continue existing task", branchName: "codex/original", state: { name: "Implementing" }, labels: { nodes: [] }, agentIssues: [] } as unknown as SourceIssueWithAgentIssues;
+  const issue = { id: f.source.issueId, identifier: f.source.issueIdentifier, title: "Owner continuation", description: "Continue existing task",
+    documentContent: { id: "description-id", updatedAt: new Date(Date.now() - 60_000).toISOString() },
+    branchName: "codex/original", state: { name: "Implementing" }, labels: { nodes: [] }, agentIssues: [] } as unknown as SourceIssueWithAgentIssues;
   const worker = createWorkflowWorker({ getIssue: async () => issue, react: async () => true, postWorktreeComment: async () => "posted", compose: async () => "Owner requested the existing workflow", readComments: async () => [] });
   const context: WorkerContext = { prisma: db.prisma, config: f.config, agentRuntime: f.runtime, runId, commandClient: { run: async () => ({ ok: true, stdout: "", stderr: "" }) } };
   return worker.execute({ type: DispatchEventType.TrackerWorkflowTriggered, workflowId: "implement", webhook: { type: "Reaction", action: "create", webhookTimestamp: Date.now(), data: { id: `reaction-${runId}`, createdAt: new Date().toISOString(), emoji: "🚀", userId: "owner", issueId: f.source.issueId, issue: { id: f.source.issueId, identifier: f.source.issueIdentifier } } } }, context);

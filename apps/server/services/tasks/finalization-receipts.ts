@@ -8,6 +8,7 @@ import { bunCommandClient } from "../../transports/command/index.ts";
 import { assertRetirementAuthority, RetirementReference } from "./retirement-receipts.ts";
 import { retainedArchiveResourceIds, verifyPreparedArchives } from "./archive-retention.ts";
 import { LocalCompletion, assertLocalCompletion } from "./local-completion.ts";
+import { ConfigurationCompletion, assertConfigurationCompletion } from "./configuration-completion.ts";
 
 export const FINALIZATION_PREPARED = "finalization-prepared";
 export const FINALIZATION_CONFIRMED = "finalization-confirmed";
@@ -29,10 +30,11 @@ const PreparedIdentity = z.object({
   worktree: z.string(), taskWorktree: z.string(), registeredWorktree: z.string(), revision: z.string(), branch: z.string(), gitDirectory: z.string(), gitCwd: z.string(),
   delivery: CompletionDelivery,
 });
-export const PreparedLinkedFinalization = PreparedIdentity.extend({ connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(), retirementAuthority: RetirementReference.optional(), localCompletion: z.undefined().optional() });
+export const PreparedLinkedFinalization = PreparedIdentity.extend({ connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(), retirementAuthority: RetirementReference.optional(), localCompletion: z.undefined().optional(), configurationCompletion: z.undefined().optional() });
 export const PreparedFinalization = z.union([
   PreparedLinkedFinalization,
-  PreparedIdentity.extend({ connectionId: z.null(), issueId: z.null(), issueIdentifier: z.null(), localCompletion: LocalCompletion, retirementAuthority: z.undefined().optional() }).strict(),
+  PreparedIdentity.extend({ connectionId: z.string(), issueId: z.string(), issueIdentifier: z.string(), configurationCompletion: ConfigurationCompletion, localCompletion: z.undefined().optional(), retirementAuthority: z.undefined().optional() }).strict(),
+  PreparedIdentity.extend({ connectionId: z.null(), issueId: z.null(), issueIdentifier: z.null(), localCompletion: LocalCompletion, configurationCompletion: z.undefined().optional(), retirementAuthority: z.undefined().optional() }).strict(),
 ]);
 export type PreparedFinalization = z.infer<typeof PreparedFinalization>;
 export type FinalizationContext = { prisma: PrismaClient; config: ServerConfig; sessionId: string; requestKey: string; finalizationVersion?: 2; authorityOnly?: true; cleanup?: true; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
@@ -79,6 +81,11 @@ export async function assertFinalizationAuthority(prisma: Database, config: Serv
   if (task.worktreePath !== prepared.taskWorktree) throw new Error("Finalization worktree ownership changed");
   if (await realpath(getRepositoryConfig(config, task.repositoryId).root) !== prepared.gitCwd) throw new Error("Finalization configured repository changed");
   if (prepared.localCompletion) await assertLocalCompletion(prisma, prepared);
+  else if (prepared.configurationCompletion) {
+    await assertConfigurationCompletion(prisma, prepared);
+    const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(active?.closedContinuation ? {} : { endedAt: null }) } });
+    if (!link) throw new Error("Configuration completion source ownership changed");
+  }
   else {
     const link = await prisma.runtimeSessionResourceLink.findFirst({ where: { runtimeSessionId: session.id, provider: "linear", connectionId: prepared.connectionId, resourceType: "issue-identifier", externalId: prepared.issueIdentifier, relationship: "handles", ...(active?.closedContinuation ? {} : { endedAt: null }) } });
     if (!link) throw new Error("Finalization source ownership changed");

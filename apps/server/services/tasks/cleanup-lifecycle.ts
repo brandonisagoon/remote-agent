@@ -1,4 +1,5 @@
 import path from "node:path";
+import { assertConnectorOwnership } from "./connector-ownership.ts";
 import { assertRegisteredPathSharing } from "./cleanup-filesystem.ts";
 import { localCleanupReferenceRetention } from "./local-cleanup-reference.ts";
 import { assertClosedCleanupFamily } from "./closed-cleanup.ts";
@@ -17,6 +18,7 @@ import { inspectExternalCleanupAuthority } from "./external-cleanup-authority.ts
 import type { PreparedExternalFinalization } from "./external-finalization-schema.ts";
 import { cleanupDeliveryRetention } from "./cleanup-delivery-reference.ts";
 import { assertLocalCompletion, assertLocalCleanupFamily } from "./local-completion.ts";
+import { assertConfigurationCompletion } from "./configuration-completion.ts";
 
 export const CLEANUP_OPERATION = "finalization-cleanup-started";
 export const CLEANUP_EVIDENCE_SUPPLEMENT = "finalization-cleanup-evidence-supplement";
@@ -63,6 +65,7 @@ async function current(input: Context, allowConfirmedClosed = false) {
   // These are local ownership checks, including at compact renewal boundaries.
   const root = task.worktreePath, within = (file: string) => file === root || file.startsWith(`${root}${path.sep}`);
   await assertRegisteredPathSharing(input.prisma, task.id, [root]);
+  await assertConnectorOwnership(input.prisma, task.id, task.machineId);
   const ancestors: string[] = [];
   for (let cursor = root; ; cursor = path.dirname(cursor)) { ancestors.push(cursor); if (cursor === path.dirname(cursor)) break; }
   if (await input.prisma.remoteTask.findFirst({ where: { id: { not: task.id }, OR: [
@@ -115,10 +118,14 @@ async function current(input: Context, allowConfirmedClosed = false) {
   ] }, orderBy: { sequence: "desc" } });
   const latest = records.filter((event, index) => records.findIndex(candidate => candidate.action === event.action && candidate.source === event.source) === index);
   const contract = latest.find(event => event.action === "completion-contract"), policy = JSON.parse(contract?.value ?? "null");
-  if (!contract || contract.sequence !== prepared.contractRevision || policy?.boundary !== (prepared.localCompletion?.boundary ?? "merge")) throw new Error("Cleanup accepted completion authority was revoked or replaced");
+  if (!contract || contract.sequence !== prepared.contractRevision || policy?.boundary !== (prepared.localCompletion?.boundary ?? (prepared.configurationCompletion ? "configuration-only" : "merge"))) throw new Error("Cleanup accepted completion authority was revoked or replaced");
   const receipt = prepared.delivery.receipts;
   if (prepared.localCompletion) {
     await assertLocalCompletion(input.prisma, prepared);
+    if (!allowConfirmedClosed && !closedContinuation) await assertLocalCleanupFamily(inboxStore(input.prisma), task, input.runtime);
+  }
+  else if (prepared.configurationCompletion) {
+    await assertConfigurationCompletion(input.prisma, prepared);
     if (!allowConfirmedClosed && !closedContinuation) await assertLocalCleanupFamily(inboxStore(input.prisma), task, input.runtime);
   }
   else if (prepared.delivery.boundary !== "merge" || receipt.contractRevision !== contract.sequence || !receipt.snapshot.clean || receipt.snapshot.head !== prepared.revision

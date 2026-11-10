@@ -20,6 +20,7 @@ import { selectCapabilityRelease } from "./tooling-capabilities.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { cleanupObserverRelease } from "./cleanup-resource-observer.ts";
 import { FINALIZATION_PREPARED } from "./finalization-receipts.ts";
+import { configurationAttemptCode } from "./tooling-operations.ts";
 
 let db: TestDatabase;
 let directory: string;
@@ -78,6 +79,35 @@ function app(config: Config, respond: (pathname: string) => { status?: number; b
 }
 const begin = (config: Config, request: Record<string, unknown>, sessionId = "primary") => beginSessionToolingOperation({ prisma: db.prisma, config, sessionId, request });
 
+test("guarded configuration observes its own pending producer and replays across lock PIDs; ordinary collectors refuse it", async () => {
+  const { config } = await fixture();
+  await bootstrap([]); await environment("configure-env"); await offer("configure-offer", "configure-env");
+  const body = { offerId: "configure-offer", resourceKey: "runtime-development", recipeHash: "next", lockPid: 123 };
+  const { lockPid: _pid, ...stable } = body;
+  const { binding } = await begin(config, { requestKey: "configure", kind: "compute-configure", existingOperationId: body.offerId, inputDigest: canonicalDigest(stable) });
+  const server = new Hono<AppEnv>();
+  server.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", config); await next(); });
+  server.use("/api/*", toolingOperationGuard());
+  let runs = 0;
+  server.post("/api/tasks/task/compute-configure", async c => {
+    const owner = await task(), request = await c.req.json();
+    if (++runs === 1) await expect(producerOperationId(db.prisma, owner, "configure-env")).rejects.toThrow("unconfirmed producer");
+    const selected = await configurationAttemptCode(db.prisma, owner, "configure-env", request);
+    expect(selected?.binding.operationId).toBe(binding.operationId);
+    expect(selected?.code.revision).toBe(A);
+    await expect(configurationAttemptCode(db.prisma, owner, "configure-env", { ...request, recipeHash: "foreign" })).rejects.toThrow("exact guarded attempt");
+    await expect(configurationAttemptCode(db.prisma, owner, "other-environment", request)).rejects.toThrow("another allocation");
+    return c.json({ verified: true });
+  });
+  for (const lockPid of [123, 456]) {
+    const response = await server.request("/api/tasks/task/compute-configure", { method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: binding.operationId }, body: JSON.stringify({ ...body, lockPid }) });
+    expect(response.status).toBe(200);
+  }
+  expect(runs).toBe(2);
+  expect(await configurationAttemptCode(db.prisma, await task(), "configure-env", body)).toBeUndefined();
+  expect(await producerOperationId(db.prisma, await task(), "configure-env")).toBe(binding.operationId);
+});
+
 test("a declined standalone admission can re-admit its exact request under a new operation", async () => {
   const { config } = await fixture();
   const { ComputePolicy } = await import("../../../../lib/compute-policy.ts");
@@ -129,7 +159,7 @@ test("every adapter callback is classified: effects are bound, owner controls an
     "POST /api/tasks/:taskId/automation", "POST /api/tasks/:taskId/development-authority", "POST /api/tasks/:taskId/development-complete", "POST /api/tasks/:taskId/confirm-finalization",
     "POST /api/sessions/:sessionId/confirm-finalization", "POST /api/tasks/:taskId/cleanup-progress", "POST /api/tasks/:taskId/cleanup-status", "POST /api/tasks/:taskId/cleanup-report",
     "POST /api/sessions/:sessionId/legacy-evidence", "POST /api/sessions/:sessionId/local-service-stop-authority", "POST /api/sessions/:sessionId/browser-stop-authority",
-    "POST /api/sessions/:sessionId/archive-retention", "PUT /api/sessions/:sessionId/task/resources", "POST /api/tasks/:taskId/cleanup-request", "POST /api/sessions/:sessionId/tooling-capability"];
+    "POST /api/sessions/:sessionId/archive-retention", "PUT /api/sessions/:sessionId/task/resources", "POST /api/sessions/:sessionId/task/runtime-health", "POST /api/tasks/:taskId/cleanup-request", "POST /api/sessions/:sessionId/tooling-capability"];
   const classified = new Map<string, (typeof TOOLING_CALLBACK_CLASSIFICATION)[number]>(TOOLING_CALLBACK_CLASSIFICATION.map(row => [row.route, row]));
   for (const route of drafted) expect(classified.has(route)).toBe(true);
   for (const row of TOOLING_CALLBACK_CLASSIFICATION) if (row.rule !== "operation") expect("reason" in row && row.reason.length > 20).toBe(true);
@@ -1198,4 +1228,39 @@ test("closed public-preview receipts accept the preview writer's exact discovery
   expect(await put("preview", "ready", { ...discovered, publicUrl: `https://${hostname}`, publicPreviewCleanup: { complete: true, hostname, tunnelId, sharedTunnelPreserved: false, observedAt } })).toBe(409);
   expect(await put("preview", "ready", { ...discovered, publicUrl: null, publicPreviewCleanup: { complete: true, hostname, tunnelId, sharedTunnelPreserved: true, observedAt } })).toBe(409);
   expect(await put("dns", "ready", { ...resources.dns.metadata, ...discovered, cleanupObserved: "exact-dns-record-absent" })).toBe(409);
+});
+
+test("RA-33 runtime health uses its bound original owner, deduplicates notification and never rewinds later readiness", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const { binding } = await begin(config, { requestKey: "health-sweep", kind: "adapter-command", inputDigest: "6".repeat(64) });
+  const app = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  const body = { requestKey: "recovered-original", resourceKey: "runtime-development", state: "recovered", detail: "Original application recovered", notify: true };
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: body.resourceKey, kind: "task-runtime", purpose: "development", externalId: "/original/runtime.json", state: "ready", metadata: { progress: { step: "launcher-recovery", detail: body.detail } } } });
+  const send = (value = body, operationId: string | undefined = binding.operationId, sessionId = "primary") => app.request(`/api/sessions/${sessionId}/task/runtime-health`, { method: "POST", headers: { "content-type": "application/json", ...(operationId ? { [TOOLING_OPERATION_HEADER]: operationId } : {}) }, body: JSON.stringify(value) });
+  expect((await send(body, "")).status).toBe(428); expect((await send(body, binding.operationId, "other-primary")).status).toBe(409);
+  const first = await send(); expect(first.status).toBe(200); const receipt = await first.json();
+  expect((await task()).environmentStatus).toBe("ready"); expect(await db.prisma.runtimeInstruction.count({ where: { sessionId: "primary" } })).toBe(1);
+  await db.prisma.$disconnect(); await db.prisma.remoteTask.update({ where: { id: "task" }, data: { environmentStatus: "stopped" } });
+  expect(await (await send()).json()).toEqual(receipt); expect((await task()).environmentStatus).toBe("stopped");
+  expect(await db.prisma.runtimeInstruction.count({ where: { sessionId: "primary" } })).toBe(1);
+  expect((await send({ ...body, detail: "Changed payload" })).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+  expect((await send()).status).toBe(409);
+});
+
+test("RA-33 native takeover, closed task and mismatched runtime evidence refuse health publication", async () => {
+  const { config } = await fixture(); await bootstrap([]);
+  const { binding } = await begin(config, { requestKey: "health-sweep", kind: "adapter-command", inputDigest: "6".repeat(64) });
+  const app = createApp({ prisma: db.prisma, config, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
+  const body = { requestKey: "failed-original", resourceKey: "runtime-development", state: "failed", detail: "Recovery exhausted", notify: true };
+  await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: body.resourceKey, kind: "task-runtime", purpose: "development", externalId: "/original/runtime.json", state: "ready", metadata: { progress: { step: "launcher-recovery", detail: body.detail } } } });
+  const send = () => app.request("/api/sessions/primary/task/runtime-health", { method: "POST", headers: { "content-type": "application/json", [TOOLING_OPERATION_HEADER]: binding.operationId }, body: JSON.stringify(body) });
+  expect((await send()).status).toBe(409);
+  await db.prisma.remoteTaskResource.updateMany({ where: { taskId: "task" }, data: { state: "failed" } });
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { connectionId: "connection", issueIdentifier: "DRA-health" } });
+  await db.prisma.nativeTakeover.create({ data: { sourceKey: "health-source", repositoryId: "repo", machineId: "host", connectionId: "connection", issueId: "issue", issueIdentifier: "DRA-health", revision: 1, mode: "native", settled: true, decidedAt: new Date() } });
+  expect((await send()).status).toBe(409);
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { phase: "closed" } }); expect((await send()).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "runtime-health" } })).toBe(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
 });

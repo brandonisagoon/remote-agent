@@ -227,3 +227,24 @@ test("replaying an accepted Merge trigger cannot override a later owner revocati
   await expect(recordOwnerMergeApproval(input, observer)).rejects.toThrow("superseded");
   expect((await inspectTaskCompletion(context)).boundary).toBe("revoked");
 });
+
+test("configuration scope needs an explicit owner contract and cannot waive its verification", async () => {
+  const f = await fixture();
+  await expect(setCompletionContract({ ...f.context, contract: f.contract("configuration-only") })).rejects.toThrow("original linked task");
+  expect(() => f.contract("configuration-only", { verificationRequired: false })).toThrow();
+  expect(() => f.contract("configuration-only", { reviewRequired: true })).toThrow();
+  expect(() => f.contract("configuration-only", { pullRequest: 12 })).toThrow();
+});
+
+test("the existing owner Merge transition preserves explicit configuration scope and its retry identity", async () => {
+  const f = await mergeFixture();
+  await db.prisma.remoteTask.update({ where: { id: "task" }, data: { baseCommit: git("rev-parse", "HEAD") } });
+  await setCompletionContract({ ...f.context, contract: f.contract("configuration-only") });
+  f.input.webhook.webhookTimestamp = Date.now() + 1;
+  f.observer.discover = async () => { throw new Error("No product PR belongs to this scope"); };
+  const approval = await recordOwnerMergeApproval(f.input, f.observer);
+  expect(approval.boundary).toBe("configuration-only");
+  expect(await recordOwnerMergeApproval(f.input, f.observer)).toEqual(approval);
+  expect((await assertCompletionAllowed(f.gate, f.observer)).receipts.merge.merged).toBeFalse();
+  expect((await inspectTaskCompletion(f.context)).boundary).toBe("configuration-only");
+});

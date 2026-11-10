@@ -6,6 +6,7 @@ import { ComputeSuspensionDecision as Decision, ComputeDecisionEvidence, Compute
 import { assertComputeEvidence, collectComputeEvidence, computeEvidenceState, refreshComputeObservation } from "./compute-observation.ts";
 import { developmentProjection, recordRuntimeSuspension } from "./development-intent.ts";
 import { finalizationDigest } from "./finalization-resources.ts";
+import { verifyMergedComputeStopSource } from "./compute-merged-delivery.ts";
 
 import { computeIdleAttemptStatus, currentComputeIdleClaim, finishComputeIdleAttempt, reserveComputeIdleAttempt, type ComputeIdleClaim } from "./compute-idle-attempt.ts";
 
@@ -95,6 +96,33 @@ export async function considerIdleComputeSuspension(input: Omit<Context, "attemp
   const now = dependencies.now ?? Date.now;
   const observed = await computeEvidenceState(input);
   if (!await idleDevelopmentAvailable(input, observed.evidence.task.id)) return;
+  if (observed.mergedStop && observed.eligible && observed.physicalState === "running") {
+    // The owner's observed merge supplies the reason to stop an unused app.
+    // Do not fabricate a model choice or spend an idle-classification attempt.
+    await (dependencies.refresh ?? refreshComputeObservation)(input);
+    const fresh = await computeEvidenceState(input);
+    if (!fresh.mergedStop || !fresh.eligible || fresh.physicalState !== "running") return;
+    const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: fresh.evidence.task.id } });
+    await verifyMergedComputeStopSource(task, fresh.mergedStop);
+    return input.prisma.$transaction(async tx => {
+      const current = await assertComputeEvidence({ ...input, prisma: tx, snapshotDigest: fresh.snapshotDigest });
+      if (!current.mergedStop || current.sessionIds.some(id => ["executing", "queued"].includes(input.runtime.observeSessionActivity?.(id)?.state ?? ""))
+        || !await idleDevelopmentAvailable({ ...input, prisma: tx }, task.id)) return;
+      const requestKey = `merged-compute:${finalizationDigest([input.environmentId, current.snapshotDigest])}`;
+      const intent = await recordRuntimeSuspension({ ...input, prisma: tx, taskId: task.id, requestKey, suspension: {
+        environmentId: input.environmentId, snapshotDigest: current.snapshotDigest,
+        resourceId: current.resource.id, resourceKey: current.resource.key, resourceIdentity: current.resource.identityDigest,
+      } });
+      const where = { runtimeSessionId: task.primarySessionId!, source: `compute:${task.id}`, action: "compute-merged-delivery-stop", key: requestKey };
+      const value = JSON.stringify({ version: 1, origin: "owner-authorized-observed-merge", environmentId: input.environmentId, scope: current.mergedStop,
+        snapshotDigest: current.snapshotDigest, intent });
+      const prior = await tx.runtimeMetadataEvent.findFirst({ where });
+      if (prior && prior.value !== value) throw new Error("Merged app stop request changed");
+      const event = prior ?? await tx.runtimeMetadataEvent.create({ data: { ...where, value } });
+      return { kind: "merged-delivery-stop" as const, outcome: "suspension-recorded" as const, intent, revision: event.sequence,
+        replayed: Boolean(prior), requestKey, snapshotDigest: current.snapshotDigest, evidence: current.evidence };
+    });
+  }
   const status = await computeIdleAttemptStatus({ ...input, observed, now: now() });
   if (status.status === "cooldown" || status.status === "blocked" || status.status === "advisory" || status.status === "suspension-recorded" || status.status === "pending" && now() < status.nextEligibleAt!) return;
   if (status.status === "due") {

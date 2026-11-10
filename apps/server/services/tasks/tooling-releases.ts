@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { assertServerDataContracts } from "../../../../lib/server-data-contracts.ts";
 import { z } from "zod";
 import type { Prisma, PrismaClient, ToolingOperation, ToolingRelease } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -43,6 +44,7 @@ export function canonicalDigest(value: unknown): string {
 }
 
 function record(row: ToolingRelease): ToolingReleaseRecord {
+  assertServerDataContracts(ToolingReleaseManifestSchema.parse(row.manifest).serverContracts);
   return { id: row.id, repositoryId: row.repositoryId, revision: row.revision, tree: row.tree, policyBlob: row.policyBlob, checkout: row.checkout,
     manifest: ToolingReleaseManifestSchema.parse(row.manifest) };
 }
@@ -682,7 +684,10 @@ export async function confirmToolingConsumer(input: { prisma: PrismaClient; id: 
   return input.prisma.$transaction(async (tx) => {
     const row = await tx.toolingRetainedConsumer.findUnique({ where: { id: input.id } });
     if (!row) throw new ToolingOperationError("not-found", "Retained consumer not found");
-    if (row.status === "confirmed" && sameEvidence(row.evidence, evidence.data)) return consumerRecord(tx, row);
+    // A stopped/superseded reader keeps its original acknowledgment. A lost
+    // response may replay that fact, but must never reactivate the reader.
+    if ((row.status === "confirmed" || row.status === "resolved" && row.confirmedAt !== null)
+      && sameEvidence(row.evidence, evidence.data)) return consumerRecord(tx, row);
     const now = new Date();
     if ((await tx.toolingRetainedConsumer.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "confirmed", evidence: evidence.data, confirmedAt: now } })).count !== 1) {
       throw new ToolingOperationError("transition-conflict", `Retained consumer is ${row.status}, not pending`);

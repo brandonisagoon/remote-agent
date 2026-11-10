@@ -8,7 +8,7 @@ const adapters = {
   "docker-compose": "compose", "docker-compose-project": "compose", "task-runtime": "runtime", "planetscale-branch": "runtime",
   "native-app": "native", "local-process": "native", "local-http": "endpoint", "public-preview": "preview",
   "cloudflare-dns-record": "preview", "cloudflare-dns-route": "preview", "cloudflare-tunnel": "preview",
-  "browser-profile": "browser", "clerk-test-user": "clerk", "clerk-test-session": "clerk", "browser-auth": "vault",
+  "cloudflared-connector": "connector", "browser-profile": "browser", "clerk-test-user": "clerk", "clerk-test-session": "clerk", "browser-auth": "vault",
 } as const;
 export const CleanupObserverFailureCode = z.enum([
   "invalid-input", "input-too-large", "unsupported-resource", "invalid-observation", "ownership-mismatch", "identity-changed",
@@ -18,7 +18,7 @@ export const CleanupObserverFailureCode = z.enum([
 export const CleanupObserverFailure = z.strictObject({ version: z.literal(1), type: z.literal("cleanup-observer-failure"),
   stage: z.enum(["input", "resource", "writers", "output"]), code: CleanupObserverFailureCode,
   resource: z.strictObject({ id: Name, key: Name, kind: z.enum(Object.keys(adapters) as [keyof typeof adapters, ...Array<keyof typeof adapters>]),
-    adapter: z.enum(["docker", "compose", "runtime", "native", "endpoint", "preview", "browser", "clerk", "vault"]) }).optional(),
+    adapter: z.enum(["docker", "compose", "runtime", "native", "endpoint", "preview", "browser", "clerk", "vault", "connector"]) }).optional(),
 });
 type Failure = z.infer<typeof CleanupObserverFailure>;
 type Resource = NonNullable<Failure["resource"]>;

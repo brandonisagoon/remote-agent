@@ -12,6 +12,7 @@ import { finalizationDigest, finalizationResourceIdentity } from "./finalization
 import { TrafficStateSchema } from "../../../../lib/compute-telemetry.ts";
 import type { ToolingOperationBinding } from "../../../../types/tooling-release.ts";
 import { currentToolingOperation, resourceGroupCode, toolingOperationDependencies, toolingProcessContext, type ToolingCodeIdentity } from "./tooling-operations.ts";
+import { AccountingObserverUnavailable } from "./compute-accounting-errors.ts";
 const Output = z.object({ observation: ComputeObservation, traffic: z.array(TrafficStateSchema).max(32) }).strict();
 
 const processEnvironment = () => Object.fromEntries(["PATH", "HOME", "USER", "TMPDIR"].flatMap(key => process.env[key] === undefined ? [] : [[key, process.env[key]!]]));
@@ -56,10 +57,10 @@ async function verifyComputeRuntimeReceipt(receipt: CompatibilityReceipt, execut
   return { receipt, adapterPath, checked, before };
 }
 
-export async function readConfiguredComputeObservation(input: { prisma: PrismaClient; config: ServerConfig }, task: RemoteTask, environment: ComputeEnvironment, resource: RemoteTaskResource, previousTraffic: ComputeTraffic[] = [], dependencies = { resolve: resolveSessionToolingCapability, execute: executeOwnedObserver }) {
+export async function readConfiguredComputeObservation(input: { prisma: PrismaClient; config: ServerConfig }, task: RemoteTask, environment: ComputeEnvironment, resource: RemoteTaskResource, previousTraffic: ComputeTraffic[] = [], dependencies = { resolve: resolveSessionToolingCapability, execute: executeOwnedObserver }, selection?: { code: ToolingCodeIdentity | null; binding: ToolingOperationBinding | null }) {
   if (!task.primarySessionId) throw new Error("Compute requires its original primary");
   const identity = finalizationResourceIdentity(resource);
-  const { code, binding } = await environmentCode(input.prisma, task, environment);
+  const { code, binding } = selection ?? await environmentCode(input.prisma, task, environment);
   const { receipt, adapterPath, checked, before } = await verifiedComputeRuntime({ ...input, sessionId: task.primarySessionId, release: code, install: false }, dependencies);
   const env = operationEnvironment(binding, input.config.controlIpcPath);
   const previous = ComputeObservation.safeParse(environment.observation).data;
@@ -106,7 +107,7 @@ export async function refreshComputeObservation(input: { prisma: PrismaClient; c
  * its snapshot; a group whose every member was registered after the
  * boundary has frozen post-boundary provenance and is an independently bound
  * observation of the active release; anything else fails closed. */
-export async function accountingCode(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", dependencies = toolingOperationDependencies)
+export async function originalAccountingCode(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", dependencies = toolingOperationDependencies)
   : Promise<{ code: ToolingCodeIdentity | null; binding: ToolingOperationBinding | null }> {
   if (!input.prisma) return { code: null, binding: null };
   if (mode === "reclaim-observe") {
@@ -131,22 +132,46 @@ export async function accountingCode(input: { config: ServerConfig; prisma?: Pri
   return { code: active.release, binding: null };
 }
 
-async function readInstalledComputeAccounting(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", execute = executeOwnedObserver, explicit?: { code: ToolingCodeIdentity | null; binding?: ToolingOperationBinding | null }) {
+export async function accountingCode(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", dependencies = toolingOperationDependencies) {
+  try {
+    const adopted = input.prisma && await (await import("./compute-accounting-observer.ts")).adoptedAccountingCode(input.prisma, input.config, task, request, mode);
+    if (adopted) return { ...adopted, adopted: true as const };
+  } catch { throw new AccountingObserverUnavailable("ACCOUNTING_OBSERVER_CHANGED"); }
+  return originalAccountingCode(input, task, request, mode, dependencies);
+}
+
+/** Read-only code verification without invoking its physical observer. This
+ * lets explicit historical adoption distinguish an unavailable executable
+ * from a provider failure, which must never select a replacement reader. */
+export async function verifyInstalledComputeAccountingCode(input: { config: ServerConfig }, task: RemoteTask, mode: "reclaim-observe" | "baseline-observe",
+  code: ToolingCodeIdentity | null, execute = executeOwnedObserver, historical = false) {
   const repository = input.config.repositories[task.repositoryId];
   if (!repository?.tooling) throw new Error("No configured compute reclamation runtime");
-  const { code, binding } = explicit ? { code: explicit.code, binding: explicit.binding ?? null } : await accountingCode(input, task, request, mode);
   if (code && code.repositoryId !== task.repositoryId) throw new Error("Compute accounting code belongs to another repository");
   const revision = code?.revision ?? repository.tooling.revision;
   const checkout = code?.checkout ?? path.join(input.config.installRoot, "tooling", repository.id, revision);
   const manifest = JSON.parse(await execute(["git", "--no-optional-locks", "-c", "core.fsmonitor=false", "show", `${revision}:.remote-agent-capabilities.json`], { cwd: checkout, timeoutMs: 10_000 }));
   const relative = z.string().min(1).parse(manifest.capabilities?.runtime?.adapter);
+  if (historical && (!manifest.capabilities?.runtime?.observationContracts?.includes("compute-historical-accounting/v1")
+    || !manifest.capabilities?.runtime?.observationContracts?.includes(mode === "reclaim-observe" ? "compute-reclamation/v1" : "compute-baseline/v1"))) throw new Error("Compute observer does not declare compatibility with historical accounting inputs");
   if (mode === "baseline-observe" && !manifest.capabilities?.runtime?.observationContracts?.includes("compute-baseline/v1")) throw new Error("Configured runtime cannot observe initial compute accounting");
   if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes("..")) throw new Error("Compute reclamation adapter path changed");
   const verified = await verifyComputeRuntimeReceipt({ contract: "remote-agent.tooling-capability/v1", capability: "runtime", source: "configured-host", taskToolingRevision: task.toolingRevision,
     capabilityRevision: revision, checkout, instructions: "", adapter: path.join(checkout, relative) }, execute);
+  return verified;
+}
+
+async function readInstalledComputeAccounting(input: { config: ServerConfig; prisma?: PrismaClient }, task: RemoteTask, request: unknown, mode: "reclaim-observe" | "baseline-observe", execute = executeOwnedObserver, explicit?: { code: ToolingCodeIdentity | null; binding?: ToolingOperationBinding | null }) {
+  let selected: Awaited<ReturnType<typeof accountingCode>>;
+  try { selected = explicit ? { code: explicit.code, binding: explicit.binding ?? null } : await accountingCode(input, task, request, mode); }
+  catch (error) { if (error instanceof AccountingObserverUnavailable) throw error; throw new AccountingObserverUnavailable("ACCOUNTING_OBSERVER_REQUIRED"); }
+  const { code, binding } = selected;
+  let verified: Awaited<ReturnType<typeof verifyInstalledComputeAccountingCode>>;
+  try { verified = await verifyInstalledComputeAccountingCode(input, task, mode, code, execute); }
+  catch { throw new AccountingObserverUnavailable("adopted" in selected ? "ACCOUNTING_OBSERVER_CHANGED" : "ACCOUNTING_OBSERVER_REQUIRED"); }
   const payload = JSON.stringify(request);
   if (Buffer.byteLength(payload) > 2*1024*1024) throw new Error("Compute reclamation input exceeds its bound");
-  const result = JSON.parse(await execute([process.execPath, "--no-env-file", verified.adapterPath, "compute", mode], { cwd: checkout, env: operationEnvironment(binding, input.config.controlIpcPath), timeoutMs: mode === "baseline-observe" ? 60_000 : 10_000, input: payload }));
+  const result = JSON.parse(await execute([process.execPath, "--no-env-file", verified.adapterPath, "compute", mode], { cwd: verified.receipt.checkout, env: operationEnvironment(binding, input.config.controlIpcPath), timeoutMs: mode === "baseline-observe" ? 60_000 : 10_000, input: payload }));
   if (verified.before !== await verified.checked()) throw new Error("Compute reclamation observer changed during observation");
   return result;
 }

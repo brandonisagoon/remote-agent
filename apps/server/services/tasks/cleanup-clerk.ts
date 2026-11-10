@@ -1,20 +1,20 @@
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
-import type { CleanupTarget } from "./cleanup-observer-schema.ts";
+import { cleanupDigest, type CleanupTarget } from "./cleanup-observer-schema.ts";
 import { finalizationResourceIdentity, type FinalizationResourcePlan } from "./finalization-resources.ts";
 
-type Clerk = Extract<CleanupTarget, { kind: "clerk-user" | "clerk-session" }>;
+type Clerk = Extract<CleanupTarget, { kind: "clerk-user" | "clerk-session" | "clerk-assignment" }>;
 const metadata = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
-type ClerkSelection = { resourceId: string; purpose: string; identityDigest: string; kind: Clerk["kind"]; id: string; userId?: string };
+type ClerkSelection = { resourceId: string; purpose: string; identityDigest: string; kind: Clerk["kind"]; id: string; userId?: string; emailDigest?: string };
 
 /** Local registry checks supplement provider identity. A legacy user's external
  * ID may be its email, so provider IDs in the recorded metadata must also be
  * considered. These reads grant no effect and perform no provider IO. */
 export async function assertClerkCleanupSharing(prisma: Pick<PrismaClient, "remoteTaskResource">, taskId: string, plan: FinalizationResourcePlan[]) {
   const selected = plan.flatMap(entry => entry.disposition === "retire-adapter" && entry.adapter === "clerk"
-    ? entry.targets.filter((target): target is Clerk => target.kind === "clerk-user" || target.kind === "clerk-session").map(target => ({ entry, target })) : []);
+    ? entry.targets.filter((target): target is Clerk => target.kind === "clerk-user" || target.kind === "clerk-session" || target.kind === "clerk-assignment").map(target => ({ entry, target })) : []);
   for (const { entry, target } of selected) if (target.scope.taskId !== taskId || target.scope.purpose !== entry.purpose) throw new Error("Clerk target belongs to another task or purpose");
   await assertClerkResourceSharing(prisma, taskId, selected.map(({ entry, target }) => ({ resourceId: entry.id, purpose: entry.purpose,
-    identityDigest: entry.identityDigest, kind: target.kind, id: target.id, ...(target.kind === "clerk-session" ? { userId: target.userId } : {}) })));
+    identityDigest: entry.identityDigest, kind: target.kind, id: target.id, ...(target.kind === "clerk-session" ? { userId: target.userId } : target.kind === "clerk-assignment" ? { userId: target.subjectId ?? undefined, emailDigest: target.emailDigest } : {}) })));
 }
 
 /** The same bounded registry check also protects exact v1 receipt scopes. It
@@ -28,12 +28,16 @@ export async function assertClerkResourceSharing(prisma: Pick<PrismaClient, "rem
     for (const record of records) {
       const meta = metadata(record.metadata);
       const user = record.kind === "clerk-test-user" ? record.externalId.startsWith("user_") ? record.externalId : meta.clerkUserId : meta.userId;
-      const claims = record.kind === "clerk-test-user" ? [record.externalId, meta.clerkUserId] : [meta.userId];
-      const matches = target.kind === "clerk-user" ? claims.includes(target.id) : record.kind === "clerk-test-session" && record.externalId === target.id;
+      const assignment = metadata(meta.testIdentityPending ?? meta.testIdentity);
+      const claims = record.kind === "clerk-test-user" ? [record.externalId, meta.clerkUserId, assignment.subject] : [meta.userId];
+      const matches = target.kind === "clerk-user" ? claims.includes(target.id) : target.kind === "clerk-assignment"
+        ? claims.includes(target.userId ?? "__no_subject__") || record.kind === "clerk-test-user" && (assignment.externalId === target.id
+          || typeof meta.email === "string" && cleanupDigest(meta.email) === target.emailDigest || record.externalId.includes("@") && cleanupDigest(record.externalId) === target.emailDigest)
+        : record.kind === "clerk-test-session" && record.externalId === target.id;
       if (!matches) continue;
       const own = selected.find(item => item.resourceId === record.id);
       if (record.taskId !== taskId || record.purpose !== target.purpose || !own || finalizationResourceIdentity(record).identityDigest !== own.identityDigest
-        || (record.kind === "clerk-test-user" ? own.kind !== "clerk-user" || own.id !== user
+        || (record.kind === "clerk-test-user" ? own.kind === "clerk-assignment" ? own.id !== assignment.externalId || own.emailDigest !== cleanupDigest(meta.email) : own.kind !== "clerk-user" || own.id !== user
           : own.kind !== "clerk-session" || own.id !== record.externalId || own.userId !== user)) throw new Error("Clerk authentication identity is shared with another active resource");
     }
   }

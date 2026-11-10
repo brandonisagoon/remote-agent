@@ -1,3 +1,4 @@
+import { wakeConfigurationAfterRepair } from "./configuration-repair-wakeup.ts";
 import { createHash } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -12,6 +13,7 @@ import { canonicalDigest } from "./tooling-releases.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
+import { reconcileClosedTaskFamily } from "./closure-recovery.ts";
 
 /** Executing a recorded suspension continues the existing group with its own
  * code: the producer's release (bound once per environment/intent, so a retry
@@ -35,7 +37,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
-const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute };
+const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute, settle: reconcileClosedTaskFamily, repair: wakeConfigurationAfterRepair };
 
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
@@ -61,10 +63,15 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
       try {
         const task = await input.prisma.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
         const resource = await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: environment.resourceId! } });
+        if (task.phase === "closed" && !task.ownerPaused) {
+          const closure = await deps.settle({ prisma: input.prisma, runtime: input.runtime, machineId: input.config.machine, taskId: task.id });
+          if (closure.state === "pending") throw new Error(closure.reason);
+        }
         if (task.ownerPaused || task.phase === "closed" || resource.state === "released") {
           await deps.reclaim({ ...input, environmentId: environment.id });
           observed++; continue;
         }
+        await deps.repair({ ...input, taskId: task.id, environmentId: environment.id });
         await deps.refresh({ ...input, environmentId: environment.id });
         if (isSavedComputeEnvironment(environment)) {
           // Physical-only legacy recipes never supply inactivity authority.
@@ -77,6 +84,11 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
         const projection = await developmentProjection(context);
         const intent = projection.developmentIntent;
         const evidence = await deps.evidence({ ...context, allowStopped: true });
+        // A freshly observed app may become eligible before any earlier tick
+        // advanced its claim to running. Preserve that physical transition
+        // before stopping, so a real stop can settle the same allocation.
+        if (evidence.physicalState === "running") await reconcileObservedCompute({ prisma: input.prisma, machineId: input.config.machine,
+          policy: input.config.compute!, environmentId: environment.id, runtime: input.runtime });
         if (intent?.state === "pending" && intent.reason === "runtime-suspended" && intent.suspension?.environmentId === environment.id
           && evidence.eligible && evidence.snapshotDigest === intent.suspension.snapshotDigest) {
           await deps.continue({ ...context, primarySessionId: environment.primarySessionId, intentRevision: intent.revision, intentDigest: intent.digest });

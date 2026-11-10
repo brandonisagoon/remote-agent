@@ -12,7 +12,7 @@ import { deliverManagedMerge } from "../../workers/product/workflow/merge-delive
 import type { SourceIssueWithAgentIssues } from "../../integrations/linear/session-store/source-issue/types.ts";
 import { deliverInstructions } from "../sessions/inbox.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../sessions/issue-updates.ts";
-import { assertCompletionAllowed, recordOwnerMergeApproval } from "./completion.ts";
+import { assertCompletionAllowed, recordOwnerMergeApproval, setCompletionContract, CompletionContractInput } from "./completion.ts";
 import { completionObservation, type PullRequestObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
 
@@ -32,12 +32,12 @@ function commit(cwd: string, message: string) { git(cwd, "add", "."); git(cwd, "
 
 /** Git/reconciliation/hooks/push and server boundaries are real. GitHub and the
  * agent's choices are controlled fixture boundaries, not an LLM quality test. */
-async function fixture() {
+async function fixture(configurationOnly = false) {
   const product = path.join(directory, "product"), remote = path.join(directory, "remote.git"), worktree = path.join(directory, "worktree");
   initialize(product, "staging"); write(product, "feature.txt", "baseline\n");
   const base = commit(product, "base"); git(directory, "init", "--bare", remote); git(product, "remote", "add", "origin", remote); git(product, "push", "origin", "staging");
   git(product, "worktree", "add", "-b", "codex/task", worktree);
-  write(worktree, "feature.txt", "accepted implementation\n"); // Owner accepts dirty, unpublished work.
+  if (!configurationOnly) write(worktree, "feature.txt", "accepted implementation\n"); // Owner accepts dirty, unpublished work.
   const tooling = path.join(directory, "tooling"); initialize(tooling, "main");
   write(tooling, "AGENTS.md", "Preserve the original task policy and run its checks.");
   const oldRevision = commit(tooling, "before merge capability");
@@ -56,8 +56,9 @@ async function fixture() {
   };
   const oldPin = pin(oldRevision); pin(hostRevision);
   const session = await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "primary", agentCommand: "codex", status: "idle", role: "primary", repositoryId: config.repository.id, machineId: config.machine, cwd: worktree } });
-  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-48", primarySessionId: session.id, worktreePath: worktree, branchName: "codex/task", toolingRoot: tooling, toolingRevision: oldRevision, pinnedToolingRoot: oldPin, phase: "review" } });
+  const task = await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: config.repository.id, machineId: config.machine, connectionId: config.activeConnectionId, issueIdentifier: "DRA-48", primarySessionId: session.id, worktreePath: worktree, branchName: "codex/task", baseCommit: base, toolingRoot: tooling, toolingRevision: oldRevision, pinnedToolingRoot: oldPin, phase: "review" } });
   const link = await db.prisma.runtimeSessionResourceLink.create({ data: { runtimeSessionId: session.id, provider: "linear", connectionId: config.activeConnectionId, resourceType: "issue-identifier", externalId: "DRA-48", relationship: "handles" } });
+  if (configurationOnly) await setCompletionContract({ prisma: db.prisma, config, taskId: task.id, contract: CompletionContractInput.parse({ requestKey: "owner-configuration", expectedRevision: 0, boundary: "configuration-only", basis: "Owner accepted the external test configuration; product source is unchanged." }) });
   const intake = await db.prisma.webhookReceipt.create({ data: { webhookId: config.activeWebhookId, connectionId: config.activeConnectionId, repositoryId: config.repository.id, provider: "linear", deliveryId: "owner-merge", eventType: "issue", trigger: "merge", resourceId: "DRA-48", status: "accepted" } });
   const run = await db.prisma.workerRun.create({ data: { receiptId: intake.id, workerKey: "product.workflow:merge", status: "pending" } });
   const states = [{ id: "merge", name: "Merge", type: "started" }, { id: "done", name: "Done", type: "completed" }];
@@ -171,4 +172,22 @@ test("content-changing staging reconciliation gives an explicit stale-verificati
   expect(existsSync(f.worktree)).toBe(true);
   expect(f.issue.state.name).toBe("Merge");
   expect(f.effects.cleanup).toBe(0);
+});
+
+test("old-pin Merge dispatch preserves explicit configuration-only scope on its original primary", async () => {
+  const f = await fixture(true);
+  expect((await f.dispatch()).status).toBe("delivered");
+  const instruction = await db.prisma.runtimeInstruction.findFirstOrThrow();
+  expect(instruction.sessionId).toBe(f.session.id);
+  expect(instruction.text).toContain("Accepted completion boundary: configuration-only");
+  expect(instruction.text).toContain("Do not create a product commit, push, PR or merge");
+  expect(instruction.text).toContain(f.hostRevision);
+  await db.prisma.$disconnect(); expect((await f.dispatch()).status).toBe("existing");
+  await deliverInstructions(db.prisma, f.runtime);
+  for (let attempt = 0; attempt < 100 && (await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: instruction.id } })).state !== "completed"; attempt++) await Bun.sleep(5);
+  expect(f.runtime.sentMessages).toHaveLength(1);
+  expect((await assertCompletionAllowed(f.gate, f.observer)).boundary).toBe("configuration-only");
+  expect(f.effects).toMatchObject({ push: 0, pr: 0, merge: 0 });
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin });
+  expect(await db.prisma.runtimeInstruction.count()).toBe(1);
 });

@@ -11,6 +11,7 @@ import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObs
 
 import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
+import { cleanupFamily } from "./closed-cleanup.ts";
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date; config?: ServerConfig; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
@@ -562,6 +563,14 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
 async function finishComputeValidation(input: ClaimInput, request: z.infer<typeof ComputeRequest>, token: string, refresh: typeof refreshBaseline) {
   try {
     await refresh(input);
+    // A completed fresh observation is usable while its replacement reads.
+    // If it has expired, join the existing collector before deciding that a
+    // timely reservation has lost capacity. The final SQL check remains the
+    // sole admission decision and rechecks every identity and budget.
+    const observedCapacity = await computeAdmissionCapacity(input.prisma, input);
+    if (observedCapacity.occupied + observedCapacity.unaccounted > observedCapacity.slots || observedCapacity.occupied > observedCapacity.usable) {
+      await (await import("./compute-reclamation.ts")).waitForComputeReclamation(input.prisma, input.machineId);
+    }
     return await input.prisma.$transaction(async store => {
       const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
       const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });
@@ -711,8 +720,10 @@ async function reconcileObservedComputeOnce(input: Context & { environmentId: st
     }
     if (observation.state !== "stopped" || offer && !["running", "unknown"].includes(offer.state)) return { released: false };
     const task = await store.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
-    const sessions = await store.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
-    if (sessions.length > 1000 || sessions.some(value => !value.closedAt && (!["idle", "closed"].includes(value.status)
+    const sameDirectory = await store.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
+    const sessions = [...new Map([...sameDirectory, ...await cleanupFamily(store, task, environment.primarySessionId)].map(session => [session.id, session])).values()];
+    if (sessions.length > 1000 || sessions.some(value => value.repositoryId !== task.repositoryId || value.machineId !== task.machineId
+      || !value.closedAt && (!["idle", "closed"].includes(value.status)
       || ["executing", "queued"].includes(input.runtime.observeSessionActivity?.(value.id)?.state ?? "")))) return { released: false };
     if (await store.runtimeInstruction.count({ where: { sessionId: { in: sessions.map(value => value.id) }, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } })) return { released: false };
     const lifecycle = await store.runtimeLifecycleEvent.findMany({ where: { runtimeSessionId: { in: sessions.map(value => value.id) } }, orderBy: { sequence: "desc" }, take: 1001 });

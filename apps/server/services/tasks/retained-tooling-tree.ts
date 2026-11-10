@@ -30,7 +30,7 @@ async function binding(prisma: PrismaClient, active: Active, resourceId: string)
   const root = resource.externalId;
   if (!path.isAbsolute(root) || path.normalize(root) !== root || root === path.parse(root).root) throw Error("Retained tooling tree path is not exact");
   const metadata = resource.metadata as Record<string, unknown> | null;
-  if (["sha256", "bytes", "byteSize", "size"].some(key => metadata?.[key] !== undefined)) throw Error("Directory retention cannot reinterpret a recorded file identity");
+  if (["sha256", "bytes", "byteSize", "size", "sizeBytes"].some(key => metadata?.[key] !== undefined)) throw Error("Directory retention cannot reinterpret a recorded file identity");
   const protectedRoots = [active.prepared.worktree, active.prepared.registeredWorktree, active.prepared.gitCwd,
     active.prepared.gitDirectory, active.task.toolingRoot, active.task.pinnedToolingRoot].filter((value): value is string => Boolean(value));
   if (protectedRoots.some(file => overlaps(root, file))) throw Error("Retained tooling tree overlaps a protected cleanup root");

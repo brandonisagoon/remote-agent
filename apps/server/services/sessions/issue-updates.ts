@@ -1,3 +1,4 @@
+import { TaskPublication, publicationAlias, publicationEvidenceCacheKey, reserveTaskPublication, reuseTaskPublication } from "./task-publication.ts";
 import { assertMappedIssueDelivery } from "./work-map.ts";
 import { rm } from "node:fs/promises";
 import { z } from "zod";
@@ -15,12 +16,13 @@ import { latestExternalBinding } from "../tasks/external-deliveries.ts";
 import { assertExternalDoneAllowed } from "../tasks/external-finalization.ts";
 import { latestDoneRetirement } from "../tasks/delivered-retirement.ts";
 import { assertPreparedDoneHandoff } from "../tasks/finalization.ts";
-import { linkedSourceIssue } from "./questions.ts";
+import { issueUpdateSource } from "./issue-update-source.ts";
 import { registerThread } from "./threads.ts";
 import { EvidenceReceipt, evidenceCacheDirectory, evidenceUpload, issueUpdateBody, prepareIssueEvidence, readEvidenceUpload, readIssueEvidence } from "./issue-evidence.ts";
 import { readNativeReportOrigin } from "./native-report-origin.ts";
 
 export const IssueUpdateInput = z.object({
+  publication: TaskPublication.optional(),
   requestKey: z.string().trim().min(1).max(200), body: z.string().trim().min(1).max(30_000),
   state: z.string().trim().min(1).max(100).optional(), expectedState: z.string().trim().min(1).max(100).optional(),
   evidence: z.array(z.object({ path: z.string().min(1).max(4096), title: z.string().trim().min(1).max(200) }).strict()).max(8).default([]),
@@ -31,7 +33,7 @@ type Input = z.infer<typeof IssueUpdateInput>;
 type NativePublication = { receiptId: string; assertAuthority: () => Promise<void> };
 
 export const issueUpdateDelivery = {
-  source: linkedSourceIssue, read: getSourceIssueForUpdate, update: updateSourceIssue,
+  source: issueUpdateSource, read: getSourceIssueForUpdate, update: updateSourceIssue,
   graph: getIssueWorkGraph,
   complete: async (input: Parameters<typeof assertCompletionAllowed>[0] & Partial<Input>) => {
     const task = await input.prisma.remoteTask.findUnique({ where: { primarySessionId: input.sessionId } });
@@ -59,18 +61,26 @@ export async function serializeIssuePublication<T>(key: string, publish: () => P
   try { return await run; } finally { if (writes.get(key) === run) writes.delete(key); }
 }
 
-async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof linkedSourceIssue>>, client: typeof issueUpdateDelivery, native?: NativePublication) {
+async function publish(input: Input & { prisma: PrismaClient; config: ServerConfig; sessionId: string }, source: Awaited<ReturnType<typeof issueUpdateSource>>, client: typeof issueUpdateDelivery, native?: NativePublication) {
   const { prisma, sessionId } = input;
   const { session, link, config, issue } = source;
-  await assertTaskOpen(prisma, session.cwd);
+  // A settled native owner reports through its stronger receipt-bound guard
+  // while managed sessions remain paused. Session callers cannot supply it.
+  const assertPublisher = () => native ? native.assertAuthority() : assertTaskOpen(prisma, session.cwd);
+  await assertPublisher();
   const current = await prisma.runtimeSession.findUniqueOrThrow({ where: { id: sessionId } });
   if (current.status === "closed" || current.role === "delegate") throw new Error("Only an open primary session may publish source-issue updates");
   const task = await taskForSession(prisma, sessionId);
   if (task && task.primarySessionId !== sessionId) throw new Error("Only the task's primary session may publish its issue updates");
-  const payload = IssueUpdateInput.parse(inputPayload(input));
+  let payload = IssueUpdateInput.parse(inputPayload(input));
+  const publicationOwner = { sessionId, taskId: task?.id ?? null, repositoryId: current.repositoryId, machineId: current.machineId, connectionId: link.connectionId, issueId: issue.id };
   const ownedPaths = task?.resources.filter((resource) => resource.kind === "evidence" && resource.state !== "released").map((resource) => resource.externalId) ?? [];
   const context = { cwd: session.cwd, ownedPaths, cacheDirectory: evidenceCacheDirectory(config.acpxStateDir, sessionId, payload.requestKey) };
   let receipt = await prisma.runtimeIssueUpdate.findUnique({ where: { runtimeSessionId_requestKey: { runtimeSessionId: sessionId, requestKey: payload.requestKey } } });
+  if (!receipt && payload.publication) {
+    receipt = await publicationAlias(prisma, publicationOwner, payload) ?? await reuseTaskPublication(prisma, publicationOwner, payload);
+    if (receipt) payload = IssueUpdateInput.parse(receipt.input);
+  }
   const nativeOrigin = receipt && payload.requestKey.startsWith("native-report:") ? await readNativeReportOrigin(prisma, receipt.connectionId, receipt.id) : null;
   if (nativeOrigin && (!native || native.receiptId !== receipt!.id)) throw new Error("Native reports must use their owner-authenticated publisher");
   if (native) {
@@ -87,6 +97,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
   };
   // Refused child/foreign scope must not reserve the parent's stable key.
   if (!receipt) await checkCleanupHandoff();
+  let preparedHere = false;
   if (!receipt) {
     // Validate every capture, then prepare every video, before publishing
     // anything. The source and prepared digests bind retries to the same bytes
@@ -94,17 +105,31 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
     const evidence = [];
     for (const file of payload.evidence) evidence.push((await readIssueEvidence(file, session.cwd, ownedPaths)).receipt);
     await prepareIssueEvidence(evidence, context);
-    receipt = await prisma.runtimeIssueUpdate.create({ data: { runtimeSessionId: sessionId, requestKey: payload.requestKey, connectionId: link.connectionId, issueId: issue.id, input: payload, evidence } });
+    preparedHere = true;
+    if (payload.publication) {
+      receipt = await reserveTaskPublication(prisma, publicationOwner, payload, evidence);
+      payload = IssueUpdateInput.parse(receipt.input); // First reservation freezes the shared comment.
+    } else receipt = await prisma.runtimeIssueUpdate.create({ data: { runtimeSessionId: sessionId, requestKey: payload.requestKey, connectionId: link.connectionId, issueId: issue.id, input: payload, evidence } });
   }
-  if (JSON.stringify(receipt.input) !== JSON.stringify(payload) || receipt.issueId !== issue.id || receipt.connectionId !== link.connectionId) throw new Error("Update requestKey already belongs to a different update; use the original payload to retry");
+  if (JSON.stringify(IssueUpdateInput.parse(receipt.input)) !== JSON.stringify(payload) || receipt.issueId !== issue.id || receipt.connectionId !== link.connectionId) throw new Error("Update requestKey already belongs to a different update; use the original payload to retry");
+  if (payload.publication) {
+    const cacheKey = await publicationEvidenceCacheKey(prisma, sessionId, receipt.id);
+    if (cacheKey) {
+      const reservedDirectory = evidenceCacheDirectory(config.acpxStateDir, sessionId, cacheKey);
+      if (reservedDirectory !== context.cacheDirectory) {
+        if (preparedHere) await rm(context.cacheDirectory, { recursive: true, force: true });
+        context.cacheDirectory = reservedDirectory;
+      }
+    }
+  }
   const evidence = z.array(EvidenceReceipt).parse(receipt.evidence);
-  const result = () => ({ published: true, commentId: receipt.id, issueIdentifier: issue.identifier, state: payload.state ?? null, evidence: evidence.map((file) => ({ title: file.title, url: file.assetUrl, attachmentId: file.attachmentId, ...evidenceUpload(file) })) });
+  const result = () => ({ published: true, ...(payload.publication ? { publication: payload.publication } : {}), commentId: receipt.id, issueIdentifier: issue.identifier, state: payload.state ?? null, evidence: evidence.map((file) => ({ title: file.title, url: file.assetUrl, attachmentId: file.attachmentId, ...evidenceUpload(file) })) });
   if (receipt.published) return result(); // A retry must never rewind later owner changes.
   // An unpublished receipt from before video preparation converts its
   // not-yet-uploaded videos before this attempt's first remote effect.
   if (await prepareIssueEvidence(evidence, context)) await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
   const checkState = async () => {
-    await assertTaskOpen(prisma, session.cwd);
+    await assertPublisher();
     const latest = await client.read(config, { id: issue.id });
     if (!latest) throw new Error("Linked issue no longer exists");
     if (payload.state && latest.state.name !== payload.expectedState && latest.state.name !== payload.state) throw new Error(`Issue is now '${latest.state.name}'; inspect it before publishing a new update`);
@@ -157,7 +182,7 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
     if (!file.attachmentId) {
-      await assertTaskOpen(prisma, session.cwd);
+      await assertPublisher();
       file.attachmentId = await client.attach(config.linearApiKey, { issueId: issue.id, title: file.title, url: file.assetUrl });
       await prisma.runtimeIssueUpdate.update({ where: { id: receipt.id }, data: { evidence } });
     }
@@ -201,5 +226,5 @@ async function publish(input: Input & { prisma: PrismaClient; config: ServerConf
 }
 
 function inputPayload(input: Input): Input {
-  return { requestKey: input.requestKey, body: input.body, ...(input.state ? { state: input.state } : {}), ...(input.expectedState ? { expectedState: input.expectedState } : {}), evidence: input.evidence };
+  return { requestKey: input.requestKey, body: input.body, ...(input.state ? { state: input.state } : {}), ...(input.expectedState ? { expectedState: input.expectedState } : {}), evidence: input.evidence, ...(input.publication ? { publication: input.publication } : {}) };
 }

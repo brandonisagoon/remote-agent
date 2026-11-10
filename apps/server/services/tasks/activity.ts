@@ -167,7 +167,16 @@ export async function readTaskActivity(prisma: PrismaClient, runtime: AgentSessi
   }
   const projectionRetries = primarySession ? await listRuntimeProjectionRetries(prisma, [primarySession.id, ...children.map((child) => child.id)]) : [];
   const reviewHandoff = await sourceReviewHandoff(prisma, task, primarySession);
-  const activity = { ...main.activity, reviewHandoff: reviewHandoff ? { receiptId: reviewHandoff.receiptId, issueIdentifier: reviewHandoff.issueIdentifier, issueId: reviewHandoff.issueId, publishedAt: reviewHandoff.publishedAt } : null, pendingDelegateResults, projectionRetries, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
+  const closureEvent = task.phase === "closed" && primarySession ? await prisma.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: primarySession.id, source: `closure:${task.id}`, action: "task-closure-recovery", key: task.id }, orderBy: { sequence: "desc" } }) : null;
+  let closureRecovery: { state: "settled" | "pending"; reason?: string; revision: number; observedAt: string } | null = null;
+  if (closureEvent) {
+    try {
+      const result = z.object({ version: z.literal(1), state: z.enum(["settled", "pending"]), reason: z.string().max(1000).optional() }).strict().parse(JSON.parse(closureEvent.value!));
+      closureRecovery = { state: result.state, ...(result.reason ? { reason: result.reason } : {}), revision: closureEvent.sequence, observedAt: closureEvent.occurredAt.toISOString() };
+    } catch { closureRecovery = { state: "pending", reason: "Saved closure recovery diagnostic is unreadable", revision: closureEvent.sequence, observedAt: closureEvent.occurredAt.toISOString() }; }
+  }
+  const activity = { ...main.activity, closureRecovery, reviewHandoff: reviewHandoff ? { receiptId: reviewHandoff.receiptId, issueIdentifier: reviewHandoff.issueIdentifier, issueId: reviewHandoff.issueId, publishedAt: reviewHandoff.publishedAt } : null, pendingDelegateResults, projectionRetries, activeDelegateSessionIds: children.filter((_, index) => delegates[index]?.activity.execution.state === "executing").map((child) => child.id) };
+  if (activity.state === "closed" && closureRecovery?.state === "pending") activity.cause = `Task is closed; session settlement remains pending: ${closureRecovery.reason ?? "Provider proof is unavailable"}`;
   if (activity.state === "idle" && pendingDelegateResults.length) {
     activity.state = "stalled"; activity.cause = "A completed delegate result has not completed delivery to the primary";
     activity.since = pendingDelegateResults[0]!.since; activity.durationMs = pendingDelegateResults[0]!.durationMs;

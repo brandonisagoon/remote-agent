@@ -347,3 +347,38 @@ comment. Subsequent metadata changes deduplicate against that edit's timestamp.
 Old raw initial witnesses retain their original timestamp behavior, without an
 implicit migration. Missing canonical edit evidence holds the webhook for retry;
 it cannot establish an unedited publication.
+
+
+## Task progress identities
+
+Managed `publish_issue_update` accepts optional `publication` metadata; older
+receipts retain their original keys and payloads. New primaries obtain valid
+subjects/codes/versions and blocker occurrences from `inspect_task` and tool
+results. Milestone/review-handoff subjects are completed instructions/operations,
+accepted completion events or registered evidence hashes. Blocker/recovery
+subjects are owned instructions, operations, questions, result events, exhausted
+projections or primary execution. A claimed subject is verified against the
+original primary, task, repository/host and recorded delegate ancestry.
+
+A task/source-scoped cursor records each blocker entry and observed resolution.
+No body hash, turn request, retry count or updatedAt defines an occurrence.
+Resolved lifecycle events between failures survive catch-up after restart.
+An immutable journal records each boundary; recovery names its original episode.
+Explicit and fallback reports atomically reserve the same RuntimeIssueUpdate,
+freeze its canonical payload and prepared-evidence cache, and reuse its comment
+UUID. Original request aliases require the original payload. A conflicting state
+or evidence claim cannot replace the first report. Missing current facts never
+manufacture a recovery.
+
+Completed turns and routine delegate failures remain internal. Concrete primary
+failures and task stalls use the same publisher, and pending outboxes continue
+even after the underlying failure resolves. Owner questions, bound replies,
+source-message acknowledgments and native reports keep their separate identities.
+
+Upgrade reconciliation preserves old confirmed/suppressed checkpoint cursors,
+checks existing direct UUIDs, validates exact retained-mirror thread children,
+and adopts the literal durable subject fields of pending old stall receipts.
+Ambiguous/incomplete provider history remains unconfirmed; it does not authorize
+a duplicate comment. All original lifecycle and publication history remains.
+Rollback rehearsal must include pending typed publication receipts, aliases and
+prepared evidence; a pre-feature strict input parser is not a compatible reader.

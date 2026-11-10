@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import deployedManifest from "../../../../test-support/fixtures/drafted-2d05a52-capabilities.json";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { testConfig } from "../../../../test-support/config.ts";
@@ -30,7 +31,7 @@ function write(root: string, relative: string, text: string) { mkdirSync(path.di
 function commit(root: string) { git(root, "add", "."); git(root, "commit", "-m", "fixture"); return git(root, "rev-parse", "HEAD"); }
 const workflow: WorkflowConfig = { id: "merge", on: "issue.state-changed", when: [{ "issue.state": ["Merge"] }], connectionId: null, deliver: "message-session", providerId: "codex", model: null, plan: null, skill: { skillset: "merge", flags: [] } };
 
-async function fixture(pinnedPreparation = false) {
+async function fixture(pinnedPreparation = false, evaluationRoot?: string) {
   const source = path.join(directory, "source"); mkdirSync(source);
   git(source, "init"); git(source, "config", "user.name", "Fixture"); git(source, "config", "user.email", "fixture@example.com");
   write(source, "AGENTS.md", "Pinned owner authorizes isolated headless verification.");
@@ -51,6 +52,7 @@ async function fixture(pinnedPreparation = false) {
   write(source, "projects/browser.md", "Reviewed headless browser: reuse the task-owned profile and verify the actual app.");
   write(source, "credentials/README.md", "Approved development recovery: inspect field names, verify integrity, export only task-required keys. Never use production fallback. Decryption is not provider validation.");
   write(source, "src/credentials-backup.ts", "throw new Error('Capability resolution must not execute this adapter');");
+  if (evaluationRoot) for (const file of [".remote-agent-capabilities.json", "projects/greenfield/runtime.md", "projects/greenfield/browser.md", "projects/greenfield/evaluation-cases.md", "projects/greenfield/lot-regression-2026-11-05.md", "projects/greenfield/evaluation-report-template.md"]) write(source, file, readFileSync(path.join(evaluationRoot, file), "utf8"));
   const hostRevision = commit(source);
   const config = testConfig({ installRoot: path.join(directory, "install") });
   const repository = { ...config.repository, root: path.join(directory, "product"), tooling: { root: source, revision: oldRevision } };
@@ -392,3 +394,29 @@ test("capability paths cannot escape the committed checkout through symlinks", a
   expect(await db.prisma.runtimeInstruction.count()).toBe(0);
   expect(existsSync(outside)).toBeTrue();
 });
+
+for (const capability of ["runtime", "browser"] as const) test.skipIf(!process.env.DRAFTED_INTEGRATION_ROOT)("actual evaluation suite reaches an older task through " + capability + " without changing its pin", async () => {
+  const f = await fixture(true, process.env.DRAFTED_INTEGRATION_ROOT);
+  const original = await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  const input = { prisma: db.prisma, config: f.config, sessionId: f.session.id, capability };
+  const result = await resolveSessionToolingCapability(input);
+  expect(result.receipt).toMatchObject({ source: "configured-host", capabilityRevision: f.hostRevision, taskToolingRevision: f.oldRevision });
+  expect(result.instructions).toContain("lot-regression/2026-11-05/v1");
+  expect(result.instructions).toContain("immutable checkout in that capability receipt");
+  expect(result.instructions).toContain("Ocean Grove is excluded");
+  const root = result.receipt.checkout, file = "projects/greenfield/lot-regression-2026-11-05.md";
+  const source = readFileSync(path.join(root, file));
+  const digest = createHash("sha256").update(source).digest("hex");
+  expect(digest).toBe("d8d8df525cd5cdb4ec1dd05c33c8e2089e78aca0ea6efbefe8027d8fb01dc2d3");
+  const casebook = readFileSync(path.join(root, "projects/greenfield/evaluation-cases.md"), "utf8");
+  expect(casebook).toContain(digest);
+  for (const id of ["STANTON", "BRADSHAW", "ALBATROSS", "WOODCREEK", "HEIDELBERG", "TYLER", "HEATHER"]) expect(casebook).toContain("LOT-" + id);
+  expect(casebook).toContain("original two reference images");
+  expect(existsSync(path.join(f.oldPin, file))).toBeFalse();
+  write(f.source, file, "UNCOMMITTED REPLACEMENT");
+  await db.prisma.$disconnect();
+  expect(await resolveSessionToolingCapability(input)).toEqual(result);
+  expect(readFileSync(path.join(root, file))).toEqual(source);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(original);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+}, 30_000);

@@ -152,7 +152,7 @@ taskSupervisionRoutes.post("/:taskId/automation", async (c) => {
       const sessions = await runtime.listSessions({ cwd: task.worktreePath });
       for (const session of sessions) {
         if (session.cwd !== task.worktreePath || session.repositoryId !== task.repositoryId || session.machineId !== task.machineId) continue;
-        await runtime.close(session.id, "Owner closed task; code, history and retained previews are preserved");
+        if (session.status !== "closed") await runtime.close(session.id, "Owner closed task; code, history and retained previews are preserved");
         await prisma.runtimeInstruction.updateMany({ where: { sessionId: session.id, state: "queued" }, data: { state: "cancelled", detail: "Task closed by owner" } });
       }
     }
