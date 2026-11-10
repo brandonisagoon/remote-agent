@@ -228,19 +228,21 @@ test("H2: of two competing adoptions exactly one lineage wins atomically, and th
   console.log(JSON.stringify({ race: { winner: winner.operationId.slice(0, 8), admissions: await f.admissions(), handled: f.handled, refusal: loser.body } }));
 });
 
-test("H2: waiting work with a claimed effect, a paused task or another recipe is never adopted", async () => {
+test("H2: waiting work with a claimed effect is never adopted", async () => {
   const claimedEffect = await waiting();
   await claimedEffect.claimed("offer-delivered");
   const late = await claimedEffect.command("b-late");
   expect((await late.beginChild("offer-delivered")).body).toMatchObject({ code: "retained-release-required" });
+});
 
-  await db.cleanup(); db = await createTestDatabase();
+test("H2: waiting work with another recipe is never adopted", async () => {
   const mismatch = await waiting();
   const other = await mismatch.command("b-other-recipe");
   const otherBody = { ...computeBody, revision: "e".repeat(40) };
   expect((await other.beginChild("offer-delivered", otherBody)).body).toMatchObject({ code: "retained-release-required" });
+});
 
-  await db.cleanup(); db = await createTestDatabase();
+test("H2: waiting work for a paused task is never adopted", async () => {
   const paused = await waiting();
   // Pause blocks the claim itself (compute-admission is pause-blocked), so the command begins first.
   const pausedCommand = await paused.command("b-paused");

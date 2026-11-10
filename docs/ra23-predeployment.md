@@ -40,6 +40,14 @@ zero failures), and desktop build. GitHub CI independently passed lint,
 The platform-dependent test totals are recorded separately. The later changes
 to this file only update evidence.
 
+The subsequent CI run at documentation commit `75f6bb5` recorded 3,139 passes,
+154 skips and one five-second timeout in the adoption-lifetime test that bundled
+three database scenarios. Its isolated replay passed all 24 tests. Those three
+independent scenarios now have separate tests using the existing setup/cleanup,
+assertions and unchanged timeout. The revised suite passed 26 tests and 794
+assertions, and typecheck passed. Full CI for this test-only correction is pending;
+the earlier green run is not represented as the latest head's result.
+
 Drafted's complete sweep recorded 2,462 passes, 37 skips and two failures:
 an evaluation-document contract and a stale protocol-version expectation.
 Both were corrected; the affected four-suite replay passed 38 tests with zero
