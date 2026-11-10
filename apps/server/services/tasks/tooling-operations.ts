@@ -215,6 +215,7 @@ const preparedFinalization = (route: string): ToolingCallback => ({ route: `POST
   kind: "finalization", input: async (_body, context) => ({ requestKey: await context.latestFinalizationKey() }),
   reference: async (_body, context) => finalizationRef(context, await context.latestFinalizationKey()) });
 const offerProducer = async (body: Body, context: CallbackContext) => { const environment = await offerEnvironment(context, body.offerId); return environment ? [environment.id] : []; };
+export const configurationRequestIdentity = (body: Body) => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid"));
 
 /** Bound adapter effect callbacks. TOOLING_CALLBACK_CLASSIFICATION lists
  * every other callback and why it needs no operation. */
@@ -230,7 +231,7 @@ export const TOOLING_CALLBACKS: readonly ToolingCallback[] = [
     input: () => undefined, reference: offer, referenceRule: "admission", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-bind", reference: body.offerId as string } : null },
   { route: "POST /api/tasks/:taskId/compute-configure", method: "POST", path: taskPath("compute-configure"), scope: "task", kind: "compute-configure",
-    input: body => Object.fromEntries(Object.entries(body).filter(([key]) => key !== "lockPid")), reference: offer, referenceRule: "existing", produces: offerProducer,
+    input: configurationRequestIdentity, reference: offer, referenceRule: "existing", produces: offerProducer,
     completes: body => text(body.offerId) ? { kind: "compute-configure", reference: body.offerId as string } : null },
   // DRA-24: a projection transition plus (for a first-bootstrap group) its
   // legacy reader handoff. No reference rule: the binding continues the offer
@@ -687,16 +688,24 @@ export async function configurationAttemptCode(prisma: PrismaClient, task: Remot
  * transition: a collector may retire this reader before the HTTP hook runs.
  * An already retired reader stays retired; only this exact stopped configure
  * replay may fill its missing historical acknowledgment. */
-export async function acknowledgeConfigurationConsumer(tx: Prisma.TransactionClient, task: RemoteTask, environmentId: string, request: Body) {
+export async function acknowledgeConfigurationConsumer(tx: Prisma.TransactionClient, task: RemoteTask, environmentId: string, request: Body, transitionKey: string) {
   const selected = await configurationAttemptCode(tx as PrismaClient, task, environmentId, request);
   if (!selected) return; // Legacy tasks have no operation-bound reader.
   const { binding } = selected;
+  const active = scope.getStore();
+  if (!active || !("binding" in active) || !active.attempt) throw refuse("operation-mismatch", "Configuration attempt disappeared before acknowledgment");
   const operation = await tx.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } });
   const rows = await tx.toolingRetainedConsumer.findMany({ where: { operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId }, take: 2 });
   const row = rows[0], evidence = { kind: "compute-configure", reference: String(request.offerId) };
   if (rows.length !== 1 || !row || row.taskId !== task.id || row.repositoryId !== binding.repositoryId
     || row.releaseId !== binding.release.id || row.generation !== binding.generation || row.protocol !== operation.protocol
     || row.scopeKey !== (binding.resourceKey ?? "task")) throw refuse("operation-mismatch", "Configuration reader changed before acknowledgment");
+  // This per-attempt receipt follows fresh physical verification even when
+  // the original reader's acknowledgment was already durable.
+  await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${task.id}`, action: "configuration-attempt-committed", key: `${binding.operationId}:${active.attempt.attemptId}`,
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, parentOperationId: binding.parentOperationId ?? null, inputDigest: binding.inputDigest,
+      attemptId: active.attempt.attemptId, requestDigest: canonicalDigest(configurationRequestIdentity(request)),
+      transitionKey, environmentId, readerId: row.id }) } });
   if (["confirmed", "resolved"].includes(row.status) && row.confirmedAt && canonicalDigest(row.evidence) === canonicalDigest(evidence)) return;
   const resolution = z.object({ kind: z.enum(["stopped", "absent"]), reference: z.literal(environmentId) }).strict().safeParse(row.resolution);
   if (row.evidence !== null || row.confirmedAt !== null || row.status !== "pending"
@@ -1117,6 +1126,12 @@ export async function afterBoundCallback(prisma: PrismaClient, admission: Extrac
   }
   const current = await dependencies.read({ prisma, operationId: state.binding.operationId });
   if (!current) return;
+  if (ok && current.status !== "completed" && current.kind === "compute-configure" && current.parentOperationId && state.attemptId && admission.context.config) {
+    const { reconcileConfigurationChildren } = await import("./tooling-configuration-recovery.ts");
+    await reconcileConfigurationChildren({ prisma, config: admission.context.config, binding: current, body: admission.body, attemptId: state.attemptId })
+      .catch(error => console.warn(`Configuration ${current.operationId} reconciliation remains pending: ${String(error instanceof Error ? error.message : error).slice(0, 1000)}`));
+    if ((await dependencies.read({ prisma, operationId: current.operationId }))?.status === "completed") return;
+  }
   // An exact acknowledged replay of an earlier unknown request may reconcile
   // it, only with full proof; otherwise the operation stays unknown.
   if (ok && current.status === "unknown" && admission.callback.route === REQUEST_ROUTE && state.attemptId) {

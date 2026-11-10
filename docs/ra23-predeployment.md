@@ -9,7 +9,7 @@ Drafted's paired adapter now requires operation protocol 3; this server supports
 | --- | --- | --- |
 | RA-20 | Existing launch-ordering work remains in server PR #112 and Drafted PR #113. | Integrate and validate those separate changes; deployed acceptance. |
 | RA-21 | Keep completed fresh baseline proof while its replacement is collected; revoke on completed failure with refresh-token fencing. Fenced errored delegates with no actual activity no longer reserve absent compute solely because of their error status. | Historical observer adoption, reclamation refresh stability, completed cleanup proof/slot reconciliation, safe app-only stop while finalization is pending, combined claim/collector stress coverage. The three-app cap is unchanged. |
-| RA-22 | A guarded configure attempt can observe its own pending generation using its bound release. Ordinary collectors still refuse unconfirmed producers. Recheck attempt/parent/offer ownership at commit; ignore telemetry-only changes. New configure identities exclude the independently checked lock PID; exact legacy digest replays still work. Drafted preserves the accepted resource projection across restart before acknowledgment. Configuration now acknowledges its exact reader atomically with the verified stopped transition; a retired reader keeps that historical acknowledgment and never reactivates. | Legacy full-body binding recovery with a changed PID; ended configure-child reconciliation; bounded diagnostics and web-memory policy; automatic original-task continuation and full paired route/adapter replay. |
+| RA-22 | A guarded configure attempt can observe its own pending generation using its bound release. Ordinary collectors still refuse unconfirmed producers. Recheck attempt/parent/offer ownership at commit; ignore telemetry-only changes. New configure identities exclude the independently checked lock PID; exact legacy digest replays still work. Drafted preserves the accepted resource projection across restart before acknowledgment. Configuration acknowledges its exact reader atomically with the verified stopped transition; a retired reader stays retired. A fresh stopped replay under the original parent reconciles ended configure children, including old PID-bound digests, through explicit verified-replacement evidence that preserves every original error and request. | Bounded diagnostics and web-memory policy; automatic original-task continuation and full paired route/adapter replay. |
 | RA-24 | Drafted makes localized implementation and supported recovery primary-owned; useful delegation and independent review remain available. | Composed skill tests plus a real small task with no mandatory setup/implementation delegate. |
 | RA-25 | Completed turns stop generating source comments in direct-source and mirror projection. Explicit replies and failed-turn delivery remain. Suppressed output remains journaled. | Typed durable progress identities, blocker episodes and recurrence, shared explicit/fallback receipt reservation, legacy pending-delivery migration, stall integration. This is not full task-level deduplication. |
 | RA-26 | Focused regression fixtures cover the changes above and the paired API-origin restart repair. | One combined route/adapter test across launch, recovery, capacity and handoff; then a deployed task with zero avoidable owner nudges. |
@@ -213,3 +213,21 @@ health or deployed acceptance.
 RA-21 source implementation is ready for integrated verification. Final pair
 gates, combined restart/rollback rehearsal and original deployed consumers remain
 required. No service deployment or live task mutation occurred.
+
+### Interrupted configuration command recovery
+
+A successful guarded configure persists its per-attempt receipt in the same
+transaction as the configuration transition and reader acknowledgment. After
+HTTP acknowledgment, bounded same-parent recovery requires the original terminal
+stopped offer, no allocation/new active offer, fresh matching stopped accounting,
+current task/primary/parent/release/protocol, the immutable transition journal,
+and every earlier configure attempt's ended outcome. In-flight attempts, separate
+state-write effects and unrelated reader retirement still block settlement.
+
+Old full-body digests are not reinterpreted as a new PID's request. The adapter's
+normal normalized callback under the original command verifies the requested
+final configuration; the server records verified replacement of that command's
+ended configure children. Their request digests, refusal/unknown records, original
+resources and terminal offer remain intact. Ordinary command settlement then
+completes, including separately proven never-attempted bound children. This path
+creates no allocation, start permission, alternate parent or provider mutation.

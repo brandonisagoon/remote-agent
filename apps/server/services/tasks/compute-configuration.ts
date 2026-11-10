@@ -155,7 +155,27 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       if (previous) throw new Error("Staged route is already owned by another environment");
       await tx.computeTraffic.create({ data: { routeId: state.route.id, taskId: input.taskId, environmentId: current.environment.id, epoch: state.epoch, sequence: state.sequence, state } });
     }
-    await acknowledgeConfigurationConsumer(tx, current.owner.task, current.environment.id, input.request);
+    await acknowledgeConfigurationConsumer(tx, current.owner.task, current.environment.id, input.request, current.key);
     return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash, compute: proof.compute };
   });
+}
+
+/** Readback for retiring interrupted configure callbacks after a supported
+ * replay. The caller also requires that replay's atomic per-attempt receipt.
+ * Only a physically verified stopped, unallocated original offer qualifies. */
+export async function acknowledgedStoppedConfiguration(input: Omit<Input, "prisma"> & { prisma: Prisma.TransactionClient }) {
+  const current = await snapshot(input);
+  const observation = ComputeObservation.parse(current.environment.observation);
+  const age = Date.now() - observation.observedAt;
+  if (!current.stopped || !current.event || current.environment.recipeDigest !== input.request.recipeHash
+    || observation.state !== "stopped" || observation.operations.active !== 0 || age < -1000 || age > 10_000
+    || observation.taskId !== input.taskId || observation.primarySessionId !== current.owner.session.id || observation.environmentId !== current.environment.id
+    || observation.recipeDigest !== input.request.recipeHash || observation.revision !== current.environment.revision
+    || observation.resourceId !== current.resource.id || observation.resourceIdentity !== current.environment.resourceIdentity
+    || observation.configurationDigest !== input.request.coverage.next.configurationSha256)
+    throw new Error("Configuration recovery requires the original stopped offer and fresh matching generation");
+  const journal = JSON.parse(current.event.value!);
+  if (journal.baselineFile !== input.request.baselineFile || finalizationDigest(journal.compute) !== finalizationDigest(input.request.coverage.next))
+    throw new Error("Configuration recovery journal changed");
+  return current;
 }
