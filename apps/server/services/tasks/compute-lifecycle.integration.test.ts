@@ -15,6 +15,7 @@ import { tickCompute } from "./compute-worker.ts";
 import { assertCompletionAllowed, CompletionContractInput, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
+import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
 
 const clientRoot = process.env.DRAFTED_INTEGRATION_ROOT;
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -43,15 +44,26 @@ async function fixture() {
   await repository(product); git(product, "commit", "--allow-empty", "--quiet", "-m", "Original product");
   const productRevision = git(product, "rev-parse", "HEAD");
   await repository(tooling);
+  const toolingManifest = await Bun.file(path.join(clientRoot!, ".remote-agent-release.json")).json();
+  await writeFile(path.join(tooling, ".remote-agent-release.json"), JSON.stringify(toolingManifest));
   await writeFile(path.join(tooling, "runtime.md"), "Fixture physical observation only.\n");
-  await writeFile(path.join(tooling, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { runtime: { instructions: "runtime.md", adapter: "observe.ts", observationContracts: ["compute-traffic/v1"] } } }));
+  await writeFile(path.join(tooling, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { runtime: { instructions: "runtime.md", adapter: "observe.ts", observationContracts: ["compute-traffic/v1", "runtime-configuration/v1"] } } }));
   await writeFile(path.join(tooling, "observe.ts"), `
 const input = JSON.parse(await Bun.stdin.text());
 const physical = await Bun.file(${JSON.stringify(physicalFile)}).json();
+if (process.argv[3] === "configuration-observe") {
+  const { observeRuntimeConfiguration } = await import(${JSON.stringify(path.join(clientRoot!, "src/runtime-configuration-observer.ts"))});
+  const { guardObservation, toolingOperationClient, checkoutRelease } = await import(${JSON.stringify(path.join(clientRoot!, "src/tooling-operation.ts"))});
+  await guardObservation({ client: toolingOperationClient(process.env.REMOTE_AGENT_SOCKET), taskId: input.task.id, sessionId: input.task.primarySessionId,
+    release: () => checkoutRelease(process.cwd()) });
+  const docker = { inspect: async id => physical.container?.id === id ? { ...physical.container, running: physical.running } : null };
+  console.log(JSON.stringify(await observeRuntimeConfiguration(input, docker)));
+  process.exit(0);
+}
 const now = Date.now();
 const route = { id: "pair-api", taskId: input.task.id, primarySessionId: input.task.primarySessionId,
   environmentId: input.environment.id, resourceId: input.resource.id, resourceIdentity: input.resource.identityDigest,
-  purpose: input.environment.purpose, service: "api", revision: input.environment.revision, proxyId: "pair-proxy", configurationDigest: "e".repeat(64) };
+  purpose: input.environment.purpose, service: "api", revision: input.environment.revision, proxyId: "pair-proxy", configurationDigest: input.resource.metadata.compute?.configurationSha256 ?? "e".repeat(64) };
 const previous = input.previousTraffic[0];
 const traffic = previous ? { ...previous, route, sequence: previous.sequence + 1, lastReceivedAt: now, lastObservedAt: now }
   : { version: 1, route, epoch: "pair-epoch", sequence: 1, lastReceivedAt: now, lastObservedAt: now, coverage: "complete", coverageSince: now - 60000,
@@ -84,7 +96,7 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
   await writeFile(configFile, JSON.stringify({ version: 1, profile: "platform", image: "fixture:1", credentialsFile,
     runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "OPENAI_API_KEY"], planetscale: { organization: "fixture", database: "fixture", baseBranch: "main", baseBranchId: "base" },
     setup: [["bun", "install"]], fixtures: [["bun", "seed-task.ts"]], services: { api: { command: ["bun", "api.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], readyTimeoutSeconds: 1 }));
-  const physical: { running: boolean; active: number; sourceRevision?: string } = { running: false, active: 0 }; const sync = () => savePrivate(physicalFile, physical); await sync();
+  const physical: { running: boolean; active: number; sourceRevision?: string; container?: unknown } = { running: false, active: 0 }; const sync = () => savePrivate(physicalFile, physical); await sync();
   const effects: string[] = [], remote = new Map<string, unknown>(); let container: any = null, proxy: any = null;
   const network = { id: "c".repeat(64), createdAt: "original-network" };
   const labels = { "dev.drafted.task": task.id, "dev.drafted.purpose": "development" };
@@ -92,7 +104,7 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
     preflight: async () => { effects.push("preflight"); },
     create: async (state: any, directory: string, environment: unknown) => { effects.push("create"); await savePrivate(path.join(directory, "app", "environment.json"), environment);
       state.network = network;
-      container = { id: "a".repeat(64), image: `sha256:${"a".repeat(64)}`, createdAt: "2026-01-01T00:00:00.000Z", running: false, labels: { "dev.drafted.task": task.id, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } }; return container; },
+      container = { id: "a".repeat(64), image: `sha256:${"a".repeat(64)}`, createdAt: "2026-01-01T00:00:00.000Z", running: false, labels: { "dev.drafted.task": task.id, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } }; physical.container = container; await sync(); return container; },
     inspect: async () => container,
     start: async () => { effects.push("start"); container.running = physical.running = true; await sync(); },
     exec: async () => { effects.push("exec"); },
@@ -148,7 +160,8 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
     fetch: async () => Response.json({ answers: [{ type: "choice", name: "compute_action", choice: "suspend-compute", confidence: 0.92 }] }) }) });
   const continuationErrors: unknown[] = [];
   const continueSaved = async () => { try { return await continueDevelopmentIntent(registry, manage); } catch (error) { continuationErrors.push(error); throw error; } };
-  return { ...context, admission, registry, client, input, configFile, effects, remote, physical, sync, deliver, settled, consider, continueSaved, continuationErrors, task, productRevision, root, container: () => container };
+  return { ...context, admission, registry, client, input, configFile, effects, remote, physical, sync, deliver, settled, consider, continueSaved, continuationErrors, task, productRevision, root,
+    control, socket, tooling, toolingManifest, toolingRevision, checkout, container: () => container };
 }
 
 test.skipIf(!clientRoot).each([false, true])("actual Unix lifecycle suspends idle compute and resumes the saved runtime (lost completion: %s)", async lostCompletion => {
@@ -309,3 +322,78 @@ test.skipIf(!clientRoot)("setup, migrations and fixtures retain their claimed sl
   expect((await f.consider({ ...f, environmentId: offer.environmentId, requestKey: "ready-and-quiet" })).outcome).toBe("suspension-recorded");
   expect(f.effects).not.toContain("stop");
 }, 90_000);
+
+test.skipIf(!clientRoot).each([false, true])("actual client/observer configuration replays through Unix routes and ordinary admission (lost acknowledgment: %s)", async lost => {
+  const f = await fixture();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
+  const first = await f.deliver();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: first.id })).phase).toBe("ready");
+  await f.settled(first);
+  const refresh = () => refreshComputeObservation({ ...f, environmentId: first.environmentId });
+  await refresh(); await reconcileObservedCompute({ ...f.admission, environmentId: first.environmentId, runtime: f.runtime });
+  const stores = structuredClone([...f.remote]), originalContainer = f.container().id, before = await f.registry.task();
+  const recipe = await Bun.file(f.configFile).json(); recipe.readyTimeoutSeconds = 2;
+  await writeFile(f.configFile, JSON.stringify(recipe));
+  const operations = await import(path.join(clientRoot!, "src/tooling-operation.ts"));
+  const tree = git(f.tooling, "rev-parse", "HEAD^{tree}");
+  await f.prisma.toolingRelease.create({ data: { id: "paired-configuration-release", repositoryId: f.task.repositoryId, revision: f.toolingRevision, tree,
+    policyBlob: git(f.tooling, "rev-parse", "HEAD:runtime.md"), checkout: f.checkout, manifest: f.toolingManifest, lockfileDigest: "0".repeat(64), bunVersion: Bun.version } });
+  await f.prisma.toolingLegacyBoundary.create({ data: { repositoryId: f.task.repositoryId, activationRequestKey: "paired-boundary", legacyRevision: f.toolingRevision, recordedAt: new Date() } });
+  await f.prisma.toolingSelection.create({ data: { repositoryId: f.task.repositoryId, generation: 1, releaseId: "paired-configuration-release", activatedAt: new Date() } });
+  const client = operations.toolingOperationClient(f.socket), requestKey = "original-configure-command";
+  const guard = await operations.guardToolingOperation({ client, task: f.task, kind: "adapter-command", inputDigest: canonicalDigest(recipe), requestKey,
+    release: async () => ({ checkout: f.checkout, revision: f.toolingRevision, tree, manifest: f.toolingManifest }) });
+  expect(guard.mode).toBe("bound");
+  const session = new operations.ToolingOperationSession(guard, { client, task: f.task, commandRequestKey: requestKey, socket: f.socket, settlementDirectory: f.root });
+  f.control.bindControlOperation(session); cleanup.push(async () => f.control.bindControlOperation(null));
+  const configure = f.registry.configureCompute; let drop = lost;
+  const legacy: Array<{ id: string; inputDigest: string; events: Awaited<ReturnType<typeof f.prisma.runtimeMetadataEvent.findMany>> }> = [];
+  f.registry.configureCompute = async (request: any) => {
+    if (lost && !legacy.length) {
+      // Two ended old full-body/PID requests, refused by the real observer's
+      // current-lock check. The supported callback stays under this parent.
+      for (const offset of [1, 2]) {
+        const old = { ...request, lockPid: process.pid + offset }, inputDigest = canonicalDigest(old);
+        const child = await client.begin(f.task.primarySessionId, { requestKey: `old-process-${offset}`, kind: "compute-configure", parentOperationId: guard.operationId,
+          existingOperationId: request.offerId, inputDigest });
+        const response = await fetch("http://remote-agent/api/tasks/pair-task/compute-configure", { method: "POST", unix: f.socket,
+          headers: { "content-type": "application/json", "x-remote-agent-operation": child.binding.operationId }, body: JSON.stringify(old) });
+        expect(response.status).toBe(409);
+        const failure = await response.json() as { code: string };
+        expect(failure.code).toBe("configuration-observation-failed");
+        legacy.push({ id: child.binding.operationId, inputDigest, events: await f.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${child.binding.operationId}` }, orderBy: { sequence: "asc" } }) });
+      }
+    }
+    const result = await configure(request);
+    if (drop) { drop = false; throw new Error("Fixture lost verified configuration response"); }
+    return result;
+  };
+  if (lost) {
+    await expect(f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).rejects.toThrow("lost verified configuration response");
+    expect(f.container().running).toBe(false);
+    await refresh(); await reconcileObservedCompute({ ...f.admission, environmentId: first.environmentId, runtime: f.runtime });
+    expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("stopped");
+  }
+  const configured = await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile });
+  expect(configured.phase).toBe(lost ? "waiting-compute" : "ready");
+  await session.complete(); f.control.bindControlOperation(null);
+  expect((await readToolingOperation({ prisma: f.prisma, operationId: guard.operationId }))?.status).toBe("completed");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(1);
+  for (const old of legacy) {
+    expect(await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id: old.id } })).toMatchObject({ status: "completed", inputDigest: old.inputDigest, parentOperationId: guard.operationId,
+      completionEvidence: { kind: "verified-configuration-transition" } });
+    expect(await f.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${old.id}` }, orderBy: { sequence: "asc" } })).toEqual(old.events);
+  }
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-command-recovery" } })).toBe(lost ? 1 : 0);
+  expect(f.container().id).toBe(originalContainer); expect([...f.remote]).toEqual(stores);
+  if (lost) {
+    expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("stopped");
+    const queued = await f.prisma.computeOffer.findFirstOrThrow({ where: { environmentId: first.environmentId, state: "queued" } });
+    const instruction = await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: queued.instructionId } });
+    expect(instruction.sessionId).toBe(f.task.primarySessionId!);
+    expect(queued.id).not.toBe(first.id);
+  }
+  const after = await f.registry.task();
+  expect(after).toMatchObject({ id: before.id, primarySessionId: before.primarySessionId, worktreePath: before.worktreePath, toolingRevision: before.toolingRevision });
+  expect(f.effects.filter(value => value === "create")).toHaveLength(1);
+}, 30_000);
