@@ -426,3 +426,24 @@ Greenfield, on macbook-air. Authenticated active selection still reports generat
 3 at 52c67d3c11f08a0ef99e0899acce32a40a434b8f, policy blob
 2b04bd7d1386e4966c2f2ba4a500bf76db6e7556. Its already verified Merge route is the
 intended scope; historical Cubic policy is not a second active repository to enable.
+
+
+## RA-28: existing tasks receive the canonical suite without repinning
+
+The prepare fallback deliberately prefers an older task's own constituent
+instructions. That means it cannot promise newer evaluation assets. Runtime and
+browser compatibility instructions now point to the exact canonical suite and
+digest in their separately recorded immutable capability checkout. The casebook
+and preparation guidance name those supported routes; original task policy,
+source, resources and tooling pin remain unchanged. Required images, exact input
+order and the Ocean Grove exclusion remain explicit.
+
+Two paired compatibility cases pass (38 assertions) using the actual current
+Drafted instructions, casebook and original seven-case source committed into a
+disposable host release. Runtime and browser resolution preserve the old task,
+return the canonical digest and survive database reconnection and mutable-source
+poisoning. Fresh composition from a product cwd and the full skills suite pass
+11 tests (575 assertions). This proves delivery of inputs, not product/browser
+acceptance. Executing relevant cases with real approved identities is a
+post-cutover RA-26 requirement. Server CI at 7c86380 also passed its full verify
+job; final integrated source remains subject to its own complete gate.
