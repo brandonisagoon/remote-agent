@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { RepositoryConfig } from "../../../../lib/config.ts";
 import { readToolingSourceAt } from "../../../../lib/tooling-source.ts";
 import type { ToolingReleaseManifest } from "../../../../types/tooling-release.ts";
+import { assertServerDataContracts } from "../../../../lib/server-data-contracts.ts";
 
 async function run(command: string[], cwd: string): Promise<string> {
   const child = Bun.spawn(command, { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -24,6 +25,7 @@ export const SERVER_TOOLING_PROTOCOL = { min: 1, max: 3 } as const;
 const FormatVersion = z.number().int().min(1).max(1000);
 export const ToolingReleaseManifestSchema = z.strictObject({
   contract: z.literal("remote-agent.tooling-release/v1"),
+  serverContracts: z.array(z.string().regex(/^[a-z][a-z0-9-]{0,63}\/v[1-9][0-9]{0,2}$/)).max(32).refine(values => new Set(values).size === values.length).optional(),
   serverProtocol: z.strictObject({ min: z.number().int().min(1), max: z.number().int().min(1) }).refine(value => value.min <= value.max, "serverProtocol.min must not exceed max"),
   stateFormats: z.record(z.string().regex(/^[a-z][a-z0-9-]{0,63}(?:\.[a-z][a-z0-9-]{0,63}){1,3}$/), z.strictObject({
     read: z.array(FormatVersion).min(1).max(32).refine(values => new Set(values).size === values.length, "read versions must be unique"),
@@ -224,6 +226,7 @@ async function prepareToolingReleaseOnce(input: PrepareToolingReleaseInput, inst
   let manifest: ToolingReleaseManifest;
   try { manifest = ToolingReleaseManifestSchema.parse(JSON.parse((await blobBytes(input.toolingRoot, manifestBlob)).toString("utf8"))); }
   catch (error) { throw new Error(`Invalid ${RELEASE_MANIFEST_FILE}: ${error instanceof Error ? error.message : String(error)}`); }
+  assertServerDataContracts(manifest.serverContracts);
   if (manifest.serverProtocol.max < SERVER_TOOLING_PROTOCOL.min || manifest.serverProtocol.min > SERVER_TOOLING_PROTOCOL.max) {
     throw new Error(`Tooling revision ${source.revision} supports operation protocol ${manifest.serverProtocol.min}-${manifest.serverProtocol.max}; this server supports ${SERVER_TOOLING_PROTOCOL.min}-${SERVER_TOOLING_PROTOCOL.max}`);
   }

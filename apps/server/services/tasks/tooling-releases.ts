@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { assertServerDataContracts } from "../../../../lib/server-data-contracts.ts";
 import { z } from "zod";
 import type { Prisma, PrismaClient, ToolingOperation, ToolingRelease } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -43,6 +44,7 @@ export function canonicalDigest(value: unknown): string {
 }
 
 function record(row: ToolingRelease): ToolingReleaseRecord {
+  assertServerDataContracts(ToolingReleaseManifestSchema.parse(row.manifest).serverContracts);
   return { id: row.id, repositoryId: row.repositoryId, revision: row.revision, tree: row.tree, policyBlob: row.policyBlob, checkout: row.checkout,
     manifest: ToolingReleaseManifestSchema.parse(row.manifest) };
 }

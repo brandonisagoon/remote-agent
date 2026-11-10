@@ -626,3 +626,22 @@ test("preparation locks are recovered only from provably exited owners", () => {
   release();
   expect(existsSync(`${destination}.lock`)).toBeFalse();
 });
+
+test("required saved-data contracts refuse an unsupported tooling release before installation or selection", async () => {
+  commit("future-contract", { ".remote-agent-release.json": JSON.stringify({ ...JSON.parse(release()), serverContracts: ["future-contract/v1"] }) });
+  let installs = 0;
+  await expect(prepareToolingRelease({ repositoryId: REPO, toolingRoot: source, installRoot: config.installRoot, revision: revisions["future-contract"]! }, async () => { installs++; })).rejects.toThrow("does not support required saved-data contracts");
+  expect(installs).toBe(0); expect(await db.prisma.toolingSelection.count()).toBe(0); expect(await db.prisma.toolingRelease.count()).toBe(0);
+});
+
+test("required saved-data contracts bind only the new release and preserve an older operation's original manifest", async () => {
+  const first = await activate("old-active", "A", 0), task = await ownedTask();
+  const request = { requestKey: "old-command", inputDigest: "a".repeat(64), kind: "adapter-command" };
+  const old = await bindToolingOperation({ prisma: db.prisma, config, taskId: task.id, sessionId: task.primarySessionId!, turnId: null, request });
+  git(source, "checkout", "-q", revisions.B!);
+  commit("reader-contracts", { ".remote-agent-release.json": JSON.stringify({ ...JSON.parse(release()), serverContracts: ["task-publication/v1", "clerk-assignment/v1", "configuration-completion/v1"] }) });
+  const next = await activate("new-active", "reader-contracts", first.generation);
+  expect(next.release.manifest.serverContracts).toEqual(["task-publication/v1", "clerk-assignment/v1", "configuration-completion/v1"]);
+  expect((await readToolingOperation({ prisma: db.prisma, operationId: old.operationId }))?.release.manifest).toEqual(first.release.manifest);
+  expect(old.release.manifest.serverContracts).toBeUndefined();
+});

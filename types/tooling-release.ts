@@ -11,6 +11,7 @@ export interface ToolingStateFormat {
 export interface ToolingReleaseManifest {
   contract: "remote-agent.tooling-release/v1";
   serverProtocol: { min: number; max: number };
+  serverContracts?: string[];
   stateFormats: Record<string, ToolingStateFormat>;
 }
 
