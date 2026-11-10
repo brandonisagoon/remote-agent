@@ -562,6 +562,14 @@ export async function claimCompute(input: ClaimInput, refresh = refreshBaseline)
 async function finishComputeValidation(input: ClaimInput, request: z.infer<typeof ComputeRequest>, token: string, refresh: typeof refreshBaseline) {
   try {
     await refresh(input);
+    // A completed fresh observation is usable while its replacement reads.
+    // If it has expired, join the existing collector before deciding that a
+    // timely reservation has lost capacity. The final SQL check remains the
+    // sole admission decision and rechecks every identity and budget.
+    const observedCapacity = await computeAdmissionCapacity(input.prisma, input);
+    if (observedCapacity.occupied + observedCapacity.unaccounted > observedCapacity.slots || observedCapacity.occupied > observedCapacity.usable) {
+      await (await import("./compute-reclamation.ts")).waitForComputeReclamation(input.prisma, input.machineId);
+    }
     return await input.prisma.$transaction(async store => {
       const offer = await store.computeOffer.findUniqueOrThrow({ where: { id: input.offerId } });
       const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: offer.environmentId } });

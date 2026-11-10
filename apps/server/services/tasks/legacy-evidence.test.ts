@@ -12,12 +12,17 @@ import type { RemoteTask, RemoteTaskResource } from "../../../../generated/prism
 import { CompletionContractInput, assertCompletionAllowed, recordCompletionVerification, setCompletionContract } from "./completion.ts";
 import { completionObservation } from "./completion-observation.ts";
 import { prepareTaskFinalization, confirmTaskFinalization } from "./finalization.ts";
-import { bindPreparedCleanup } from "./cleanup-lifecycle.ts";
+import { bindPreparedCleanup, assertCleanupResourceUpdate } from "./cleanup-lifecycle.ts";
 import { enqueueTaskCleanup } from "./cleanup-inbox.ts";
 import { observeLegacyEvidenceTree, isEvidenceTree } from "./legacy-evidence-tree.ts";
-import { finalizationDigest } from "./finalization-resources.ts";
+import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { adoptLegacyEvidence, assertLegacyEvidenceResourceUpdate, legacyEvidenceDependencies, legacyEvidenceProjection, manageLegacyEvidence } from "./legacy-evidence.ts";
 import { LegacyEvidenceAdoptionInput, type LegacyEvidenceReceipt, type LegacyEvidenceOperationInput } from "./legacy-evidence-schema.ts";
+import { ComputePolicy } from "../../../../lib/compute-policy.ts";
+import { computeTaskIdentity, offerNextCompute, requestCompute } from "./compute-admission.ts";
+import { reclaimStoppedCompute } from "./compute-reclamation.ts";
+import { assertComputeStartIntent } from "./development-intent.ts";
+import type { readInstalledComputeReclamation } from "./compute-observer.ts";
 import { evidenceWriterObservation } from "./legacy-evidence-writers.ts";
 
 let db: TestDatabase, directory: string;
@@ -702,4 +707,80 @@ test("closed original operation uses its adopted evidence and refuses new owner 
   expect(await readFile(path.join(f.archive, f.files[0]!.path), "utf8")).toBe("saved capture\n");
   await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
   await expect(f.manage(saved, entry.key, "authorize")).rejects.toThrow();
+});
+
+
+async function cleanupComputeFixture() {
+  const configuration = { configurationFile: "/private/original-compute.json", configurationSha256: "b".repeat(64) };
+  const f = await fixture({ beforePrepare: async task => {
+    await db.prisma.remoteTaskResource.create({ data: { id: "original-app", taskId: task.id, key: "app", kind: "task-runtime", purpose: "development", externalId: "/private/original-runtime.json", state: "ready", metadata: { compute: configuration, containerId: "c".repeat(64) } } });
+  } });
+  f.config.compute = ComputePolicy.parse({ enabled: true, slots: 1 });
+  await f.adopt();
+  await bindPreparedCleanup(f.finalInput, async () => {});
+  const resource = await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: "original-app" } });
+  const source = await db.prisma.runtimeSessionResourceLink.findFirstOrThrow({ where: { runtimeSessionId: f.session.id, relationship: "handles" } });
+  const environment = await db.prisma.computeEnvironment.create({ data: { id: crypto.randomUUID(), taskId: f.task.id, primarySessionId: f.session.id, machineId: f.config.machine,
+    taskIdentity: computeTaskIdentity(f.task, f.session.id, f.config.machine, source.id), key: resource.key, purpose: "development", revision: "d".repeat(40), recipeDigest: "e".repeat(64),
+    resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest, state: "running", configuration } });
+  const offer = await db.prisma.computeOffer.create({ data: { id: crypto.randomUUID(), environmentId: environment.id, machineId: f.config.machine, instructionId: "original-app-start", state: "running", dispatchDeadline: new Date(), claimedAt: new Date() } });
+  await db.prisma.computeSlot.create({ data: { id: `${f.config.machine}:0`, machineId: f.config.machine, ordinal: 0, allocationId: offer.id } });
+  await db.prisma.$transaction(async tx => {
+    await assertCleanupResourceUpdate({ ...f.finalInput, prisma: tx, taskId: f.task.id }, resource, { state: "released", expiresAt: null });
+    await tx.remoteTaskResource.update({ where: { id: resource.id }, data: { state: "released" } });
+  });
+  // Active cleanup can be recorded as Working; that projection must not let
+  // the original claim restart the already removed application.
+  await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "working" } });
+  await db.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { status: "active" } });
+  await db.prisma.runtimeInstruction.create({ data: { id: "remaining-cleanup", sessionId: f.session.id, state: "dispatching", executionRequestId: "cleanup-turn", text: "Finish the accepted cleanup" } });
+  await db.prisma.runtimeLifecycleEvent.create({ data: { id: "cleanup-turn:start", runtimeSessionId: f.session.id, requestId: "cleanup-turn", phase: "started", occurredAt: new Date() } });
+  const runtime = { observeSessionActivity: (id: string) => ({ state: id === f.session.id ? "executing" as const : "unknown" as const, observedAt: Date.now(), ...(id === f.session.id ? { requestId: "cleanup-turn" } : {}) }) };
+  const input = { prisma: db.prisma, config: f.config, runtime, environmentId: environment.id };
+  const read: typeof readInstalledComputeReclamation = async (_input, _task, raw: any) => ({ version: 1, kind: "compute-reclamation", environmentId: raw.environment.id, taskId: raw.task.id, primarySessionId: raw.task.primarySessionId,
+    resourceId: raw.resource.id, resourceIdentity: raw.resource.identityDigest, allocationResourceIdentity: raw.allocationResourceIdentity, configurationDigest: raw.configurationDigest, observedAt: Date.now(), state: "absent", proofDigest: "f".repeat(64) });
+  return { ...f, resource, environment, offer, input, read };
+}
+
+test("released app frees its allocation while the original accepted cleanup continues", async () => {
+  const f = await cleanupComputeFixture();
+  const events = await db.prisma.runtimeMetadataEvent.findMany({ where: { source: `finalizer:${f.task.id}` }, orderBy: { sequence: "asc" } });
+  const evidence = await db.prisma.remoteTaskResource.findMany({ where: { kind: "evidence" }, orderBy: { id: "asc" } });
+  await expect(assertComputeStartIntent(db.prisma, f.task.id, f.environment.id, f.offer.id)).rejects.toThrow("cleanup authority remains active");
+  await db.prisma.runtimeSession.create({ data: { id: "next-primary", scopeKey: "next", agentCommand: "codex", status: "idle", role: "primary", cwd: "/next", repositoryId: f.task.repositoryId, machineId: f.config.machine } });
+  await db.prisma.remoteTask.create({ data: { id: "next-task", requestKey: "next", primarySessionId: "next-primary", repositoryId: f.task.repositoryId, machineId: f.config.machine, branchName: "next", worktreePath: "/next", toolingRoot: "/tooling", toolingRevision: "a".repeat(40), phase: "working" } });
+  const admission = { prisma: db.prisma, machineId: f.config.machine, policy: f.config.compute! };
+  await requestCompute({ ...admission, taskId: "next-task", request: { key: "app", purpose: "development", revision: "a".repeat(40), recipeDigest: "b".repeat(64) } });
+  expect(await offerNextCompute(admission)).toBeNull();
+  expect(await reclaimStoppedCompute(f.input, f.read)).toEqual({ released: true });
+  expect(await reclaimStoppedCompute(f.input, f.read)).toEqual({ released: true });
+  const next = await offerNextCompute(admission);
+  expect(next).not.toBeNull();
+  expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: next!.environmentId } })).toMatchObject({ taskId: "next-task" });
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).toMatchObject({ state: "stopped" });
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { source: `finalizer:${f.task.id}` }, orderBy: { sequence: "asc" } })).toEqual(events);
+  expect(await db.prisma.remoteTaskResource.findMany({ where: { kind: "evidence" }, orderBy: { id: "asc" } })).toEqual(evidence);
+  expect(await db.prisma.runtimeSession.findUniqueOrThrow({ where: { id: f.session.id } })).toMatchObject({ status: "active" });
+  expect(await db.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: "remaining-cleanup" } })).toMatchObject({ state: "dispatching" });
+});
+
+for (const changed of ["running", "unknown", "failed", "revoked", "active-descendant", "queued-primary", "resource-changed"] as const) test(`cleanup reclamation retains the allocation when ${changed}`, async () => {
+  const f = await cleanupComputeFixture();
+  if (changed === "active-descendant") {
+    await db.prisma.runtimeSession.create({ data: { id: "delegate", scopeKey: "delegate", agentCommand: "codex", status: "active", role: "delegate", cwd: f.worktree, repositoryId: f.task.repositoryId, machineId: f.config.machine } });
+    await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "delegate", targetSessionId: f.session.id, relationship: "spawned-by" } });
+  }
+  if (changed === "queued-primary") await db.prisma.runtimeInstruction.create({ data: { id: "new-work", sessionId: f.session.id, text: "New work", state: "queued" } });
+  const read: typeof f.read = async (...args) => {
+    if (changed === "failed") throw new Error("physical inventory unavailable");
+    if (changed === "revoked") await db.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `owner:${f.task.id}`, action: "completion-retirement-authority", key: "revoke", value: JSON.stringify({ version: 1, action: "revoke" }) } });
+    if (changed === "resource-changed") await db.prisma.remoteTaskResource.update({ where: { id: f.resource.id }, data: { externalId: "/private/different-runtime.json" } });
+    return { ...await f.read(...args) as object, ...(["running", "unknown"].includes(changed) ? { state: changed } : {}) };
+  };
+  if (["revoked", "resource-changed", "failed"].includes(changed)) await expect(reclaimStoppedCompute(f.input, read)).rejects.toThrow();
+  else expect(await reclaimStoppedCompute(f.input, read)).toEqual({ released: false });
+  expect(await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).toMatchObject({ state: "running" });
+  expect(await db.prisma.computeSlot.findUniqueOrThrow({ where: { allocationId: f.offer.id } })).toBeDefined();
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(0);
 });

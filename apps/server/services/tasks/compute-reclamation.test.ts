@@ -3,10 +3,10 @@ import { Prisma } from "../../../../generated/prisma/client.ts";
 import { createTestDatabase } from "../../../../test-support/db.ts";
 import { testConfig } from "../../../../test-support/config.ts";
 import { createFakeAgentRuntime } from "../../../../test-support/agent-runtime.ts";
-import { computeTaskIdentity, requestCompute, offerNextCompute, claimCompute } from "./compute-admission.ts";
+import { computeTaskIdentity, requestCompute, offerNextCompute, claimCompute, confirmComputeDelivery, computeAdmissionCapacity } from "./compute-admission.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
-import { reclaimStoppedCompute } from "./compute-reclamation.ts";
+import { reclaimStoppedCompute, waitForComputeReclamation } from "./compute-reclamation.ts";
 import { ComputeObservation } from "./compute-observation.ts";
 import { tickCompute } from "./compute-worker.ts";
 import { readInstalledComputeReclamation } from "./compute-observer.ts";
@@ -166,6 +166,58 @@ test("collector reclaims paused capacity before any active observer or Decisions
   await requestCompute({ ...context, taskId: "next", request: { key: "new", purpose: "development", revision: "a".repeat(40), recipeDigest: "b".repeat(64) } });
   const next = await offerNextCompute(context); expect(next).not.toBeNull();
   expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: next!.environmentId } })).taskId).toBe("next");
+});
+
+for (const expired of [false, true]) test(`a held reclamation refresh cooperates with ordinary offer and claim (expired=${expired})`, async () => {
+  const f = await fixture();
+  await reclaimStoppedCompute(f.context, f.read);
+  const context = { prisma: f.prisma, machineId: "host", policy: f.config.compute!, runtime: f.context.runtime };
+  const session = await f.prisma.runtimeSession.create({ data: { id: "next", scopeKey: "next", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/next", status: "idle" } });
+  await f.prisma.remoteTask.create({ data: { id: "next", requestKey: "next", repositoryId: "repo", machineId: "host", branchName: "next", worktreePath: session.cwd, toolingRoot: "/tooling", toolingRevision: "a".repeat(40), primarySessionId: session.id, phase: "working" } });
+  const request = { key: "new", purpose: "development" as const, revision: "a".repeat(40), recipeDigest: "b".repeat(64) };
+  await requestCompute({ ...context, taskId: "next", request });
+  const next = (await offerNextCompute(context))!; expect(next).not.toBeNull();
+  await f.prisma.runtimeInstruction.update({ where: { id: next.instructionId }, data: { state: "dispatching", executionRequestId: next.instructionId } });
+  await f.prisma.runtimeSession.update({ where: { id: session.id }, data: { status: "active" } });
+  await f.prisma.runtimeLifecycleEvent.create({ data: { id: `${next.instructionId}:started`, runtimeSessionId: session.id, requestId: next.instructionId, phase: "started", occurredAt: new Date() } });
+  await confirmComputeDelivery({ ...context, sessionId: session.id, requestId: next.instructionId });
+  if (expired) {
+    const recorded = await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+    await f.prisma.computeEnvironment.update({ where: { id: recorded.id }, data: { observation: { ...recorded.observation as object, observedAt: 0 } } });
+  }
+  const before = await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+  let release!: () => void, started!: () => void, reads = 0;
+  const held = new Promise<void>(resolve => { release = resolve; }), entered = new Promise<void>(resolve => { started = resolve; });
+  const read: typeof f.read = async (...args) => { reads++; started(); await held; return f.read(...args); };
+  const first = reclaimStoppedCompute(f.context, read); await entered;
+  const duplicate = reclaimStoppedCompute(f.context, read);
+  let claim: ReturnType<typeof claimCompute> | undefined;
+  try {
+    expect(await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toEqual(before);
+    expect(await computeAdmissionCapacity(f.prisma, context)).toMatchObject({ usable: expired ? 0 : 1, unaccounted: expired ? 1 : 0 });
+    claim = claimCompute({ ...context, taskId: "next", offerId: next.id, request });
+    void claim.catch(() => {});
+    if (expired) {
+      // The bounded join fails without changing the collector or its prior
+      // proof. The ordinary claim's longer join can still complete normally.
+      await expect(waitForComputeReclamation(f.prisma, "host", 30)).rejects.toThrow("still collecting");
+      expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: next.id } })).state).toBe("validating");
+    } else expect((await claim).offer.state).toBe("claimed");
+    expect(reads).toBe(1);
+  } finally { release(); await Promise.all([first, duplicate]); }
+  expect((await claim!).offer.state).toBe("claimed");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(1);
+});
+
+for (const sameProof of [false, true]) test(`a stale refresh failure cannot invalidate a newer generation (same proof=${sameProof})`, async () => {
+  const f = await fixture(); await reclaimStoppedCompute(f.context, f.read);
+  const before = await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+  const newer = { ...before.observation as object, ...(sameProof ? {} : { observedAt: Date.now() + 1 }) };
+  await expect(reclaimStoppedCompute(f.context, async () => {
+    await f.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { observation: newer, updatedAt: new Date(before.updatedAt.getTime() + 1) } });
+    throw new Error("old observation failed");
+  })).rejects.toThrow("old observation failed");
+  expect(await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toMatchObject({ state: "suspended", observation: newer });
 });
 for (const closed of [false, true]) test.each(["running", "unknown", "failed"])(`new %s evidence invalidates prior free capacity (closed=${closed})`, async state => {
   const f = await fixture(closed);

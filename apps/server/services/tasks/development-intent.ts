@@ -186,6 +186,7 @@ export async function assertComputeStartIntent(prisma: Database, taskId: string,
     || !environment || environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId || environment.machineId !== task.machineId
     || !offer || offer.environmentId !== environment.id || offer.machineId !== task.machineId || !offer.claimedAt || !["claimed", "running", "unknown"].includes(offer.state)
     || !await prisma.computeSlot.findFirst({ where: { allocationId: offer.id, machineId: task.machineId } })) throw new Error("Compute start requires its current allocated claim");
+  await assertDevelopmentWork({ prisma }, task);
   const latest = await prisma.runtimeMetadataEvent.findFirst({ where: eventWhere(task), orderBy: { sequence: "desc" } });
   if (latest?.value && Intent.parse(JSON.parse(latest.value)).action === "stop" && !await superseded(prisma, task, latest.sequence)) throw new Error("Compute start was superseded by a development stop");
 }
