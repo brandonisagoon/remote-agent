@@ -313,7 +313,7 @@ test("a closed task reads only an existing clean configured adapter, never insta
   expect(await readInstalledComputeReclamation({ config }, f.task, { exact: "input" })).toEqual({ input: { exact: "input" }, mode: "reclaim-observe" });
   expect(await f.prisma.runtimeMetadataEvent.count()).toBe(0);
   const file = path.join(checkout, "observer.ts"), bytes = await readFile(file); await writeFile(file, "throw new Error('dirty')");
-  await expect(readInstalledComputeReclamation({ config }, f.task, {})).rejects.toThrow("checkout changed"); await writeFile(file, bytes);
+  await expect(readInstalledComputeReclamation({ config }, f.task, {})).rejects.toMatchObject({ code: "ACCOUNTING_OBSERVER_REQUIRED" }); await writeFile(file, bytes);
   await rm(checkout, { recursive: true });
   await expect(readInstalledComputeReclamation({ config }, f.task, {})).rejects.toThrow();
   expect(await Bun.file(path.join(checkout, "observer.ts")).exists()).toBeFalse();

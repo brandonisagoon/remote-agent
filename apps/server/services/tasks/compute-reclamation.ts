@@ -9,7 +9,7 @@ import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 import { isSavedComputeEnvironment } from "./compute-saved-resource.ts";
 import { readInstalledComputeReclamation } from "./compute-observer.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
-import { computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
+import { computeAccountingOwnership, computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
 import { retainedComputeConfiguration } from "./compute-accounting-input.ts";
 import { releasedComputeCleanupFence } from "./compute-cleanup-reclamation.ts";
 
@@ -70,7 +70,17 @@ export async function readComputeReclamationSnapshot(store: Store, input: Contex
   }
   const tuple = { environment, task, primary, links, resource, offers, slots, sessions, relations, instructions, lifecycle, originalConfiguration, retainedConfiguration, cleanupFence,
     environmentGeneration: environment.updatedAt.toISOString(), familyGeneration: computeFamilyGeneration(task, sessions, instructions) };
-  return { ...tuple, settled, identity, configurationDigest, digest: finalizationDigest(tuple) };
+  return { ...tuple, settled, identity, configurationDigest, digest: finalizationDigest(tuple), ownership: computeAccountingOwnership(task, sessions, relations, links) };
+}
+
+export function computeReclamationRequest(snapshot: Awaited<ReturnType<typeof readComputeReclamationSnapshot>>) {
+  const { task, environment, resource, identity } = snapshot;
+  return { version: 1, task: { id: task.id, primarySessionId: environment.primarySessionId, toolingRevision: task.toolingRevision, worktreePath: task.worktreePath },
+      environment: { id: environment.id, key: environment.key, purpose: environment.purpose, revision: environment.revision, recipeDigest: environment.recipeDigest },
+      resource: { ...identity, metadata: snapshot.retainedConfiguration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata),
+        compute: { configurationFile: snapshot.retainedConfiguration.retainedConfigurationFile, configurationSha256: snapshot.configurationDigest } }
+        : environment.configuration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata), compute: environment.configuration } : resource.metadata },
+      allocationResourceIdentity: environment.resourceIdentity, configurationDigest: snapshot.configurationDigest };
 }
 
 /** Collector-only reconciliation. It cannot resume, classify, install tooling,
@@ -121,12 +131,7 @@ async function reclaimStoppedComputeOnce(input: Context, read = readInstalledCom
     const before = await readComputeReclamationSnapshot(input.prisma, input);
     if (!before.task.ownerPaused && before.task.phase !== "closed" && before.resource.state !== "released" || !before.settled) { await invalidate(); return { released: false }; }
     const { environment, task, resource, identity } = before;
-    const request = { version: 1, task: { id: task.id, primarySessionId: environment.primarySessionId, toolingRevision: task.toolingRevision, worktreePath: task.worktreePath },
-      environment: { id: environment.id, key: environment.key, purpose: environment.purpose, revision: environment.revision, recipeDigest: environment.recipeDigest },
-      resource: { ...identity, metadata: before.retainedConfiguration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata),
-        compute: { configurationFile: before.retainedConfiguration.retainedConfigurationFile, configurationSha256: before.configurationDigest } }
-        : environment.configuration ? { ...z.record(z.string(), z.unknown()).parse(resource.metadata), compute: environment.configuration } : resource.metadata },
-      allocationResourceIdentity: environment.resourceIdentity, configurationDigest: before.configurationDigest };
+    const request = computeReclamationRequest(before);
     const observation = ComputeReclamation.parse(await read(input, task, request));
     if (!["stopped", "absent"].includes(observation.state)) { await invalidate(); return { released: false }; }
     return await input.prisma.$transaction(async tx => {

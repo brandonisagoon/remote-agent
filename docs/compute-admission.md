@@ -51,9 +51,18 @@ missing native proofs and observation errors retain capacity. Only fresh stopped
 or absent evidence releases the slot; the result cannot authorize a claim or an
 inactivity decision. Original task/resource metadata and owner pauses are unchanged.
 
-Before each fallible physical read, earlier free-capacity evidence is invalidated.
-Running or unknown environments remain counted even when their registry row is
-Released; an outage cannot reuse an old stopped observation as zero usage.
+During a replacement physical read, the last completed observation remains
+available under its original freshness bound. Completed failures, running or
+unknown findings invalidate only that unchanged observation generation. A blocked
+claim may join an existing reclamation read outside SQL for up to ten seconds;
+its final transaction still rechecks capacity, ownership and freshness. Running
+or unknown environments remain counted even when their registry row is Released.
+
+Accepted cleanup can settle a released app's exact allocation while its original
+primary finishes unrelated cleanup. It needs fresh physical absence, an unchanged
+accepted cleanup operation and restart fence, a matching executing primary turn,
+and settled other writers. Start and renewal guards enforce the same cleanup
+fence. This neither alters the finalizer nor waives completion verification.
 
 Final affected reclamation checks passed 133 tests / 495 assertions on the server
 and 63 / 195 on Drafted, with both typechecks. Independent review and final broad
@@ -63,8 +72,9 @@ No live host configuration or original task was changed by these source tests.
 DRA-242 adds separate initial accounting for original development/review groups
 that have counted resources but no compute environment. `ComputeBaseline` is one
 bounded row per machine/task/purpose, not an environment, offer, enrollment or
-resource disposition. Every refresh clears earlier credit before inventory or
-adapter reads. The installed immutable `compute baseline-observe` contract reads
+resource disposition. A refresh preserves completed credit during its replacement
+read under the original freshness bound; a completed refusal revokes that
+unchanged generation. The installed immutable `compute baseline-observe` contract reads
 the complete original member set; every member must be freshly stopped or absent.
 Unsupported, running, changed or unreadable members keep the group reserved.
 Previously recorded members remain in that set after registry release.
@@ -183,3 +193,41 @@ requests cannot enter validation. Saved revision/configuration changes refuse a
 validation reservation. An explicit-offer CLI command skips queue selection and
 uses a default 315-second claim request timeout; explicit caller deadlines remain
 authoritative.
+
+
+## Explicit historical accounting observer adoption
+
+Owner bearer authentication is required even over the trusted local socket.
+Adapters cannot call these controls with a tooling-operation header.
+
+1. POST `/api/tasks/:taskId/compute-accounting-observer/inspect` with either
+   `{ "kind": "baseline", "purpose": "development" }` (`review` also supported)
+   or `{ "kind": "environment", "environmentId": "<original UUID>" }`.
+   The response exposes the current binding digest, adoption revision, settled
+   state and original executable availability, without private input bytes.
+2. If the original executable is unavailable, POST
+   `/api/tasks/:taskId/compute-accounting-observer` with that `target`, an owner
+   `requestKey`, the inspected `expectedBindingDigest` and `expectedRevision`,
+   and an exact registered `releaseId`. Available original readers are preferred.
+3. The compatible immutable reader must prove fresh stopped/absent state for
+   every original member. The task must remain paused or closed with settled
+   writers. Input, ownership and release changes refuse the adoption. A retry of
+   the same accepted request returns the original audit receipt.
+4. Adoption only appends `compute-accounting-observer-adopted`. It does not grant
+   capacity, rewrite producer provenance, activate a tooling release, change task
+   pins or reopen work. The ordinary collector independently observes again
+   before crediting capacity; normal delivery and claim then apply.
+
+The selected runtime must declare `compute-historical-accounting/v1` and the
+corresponding `compute-baseline/v1` or `compute-reclamation/v1` contract. Its
+registered release, installed dependency receipt, immutable checkout and adapter
+bytes remain verified. Its selection applies only to accounting. Start, recovery
+and cleanup keep their existing operation provenance. Original resource states
+may become Released without claiming physical absence; immutable member identity
+and retained configuration hashes remain binding.
+
+Baseline refresh diagnostics distinguish `ACCOUNTING_OBSERVER_REQUIRED` from
+`ACCOUNTING_OBSERVER_CHANGED`. Provider failures still report their observation
+failure and retain capacity. Missing retained configuration uses the existing
+owner `compute-accounting-input` control; selecting a new reader cannot invent
+missing bytes, physical members or original ownership.

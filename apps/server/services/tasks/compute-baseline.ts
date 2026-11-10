@@ -7,7 +7,8 @@ import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { CleanupObserverError, cleanupObserverReasons } from "./cleanup-observer-diagnostics.ts";
-import { computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
+import { computeAccountingOwnership, computeFamilyGeneration, computeFamilySettled } from "./compute-family.ts";
+import { AccountingObserverUnavailable } from "./compute-accounting-errors.ts";
 
 export const countedComputeKinds = ["native-app", "launch-agent", "launch-agents", "task-runtime", "docker-container", "docker-compose-project"];
 const Purpose = z.enum(["development", "review"]);
@@ -26,7 +27,7 @@ type Context = { prisma: PrismaClient; config: ServerConfig; runtime: Runtime; n
 type Read = (input: Context, task: RemoteTask, request: unknown) => Promise<unknown>;
 const key = (machineId: string, taskId: string, purpose: string) => finalizationDigest({ machineId, taskId, purpose });
 
-async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
+export async function readComputeBaselineSnapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
   const purpose = Purpose.parse(row.purpose), ids = Ids.parse(row.resourceIds);
   if (row.id !== key(row.machineId, row.taskId, purpose)) throw new Error("Compute baseline group identity changed");
   const task = await store.remoteTask.findUniqueOrThrow({ where: { id: row.taskId } });
@@ -63,10 +64,19 @@ async function snapshot(store: Store, row: ComputeBaseline, runtime: Runtime) {
     familyGeneration: computeFamilyGeneration(task, sessions, instructions),
     claims: claims.map(resource => ({ taskId: resource.taskId, ...finalizationResourceIdentity(resource) })) });
   return { task, primary, resources, identities, resourceSetDigest: finalizationDigest(identities), digest,
+    ownership: computeAccountingOwnership(task, sessions, relations, links),
     settled: settled && !offers.some(offer => ["claimed", "running", "unknown"].includes(offer.state)) };
 }
 
-function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: ComputeBaseline, current: Awaited<ReturnType<typeof snapshot>>, now: Date, freshness: number) {
+
+export function computeBaselineRequest(before: Awaited<ReturnType<typeof readComputeBaselineSnapshot>>, purpose: string) {
+  return { version: 1, kind: "compute-baseline", machineId: before.task.machineId,
+    task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
+    purpose, resourceSetDigest: before.resourceSetDigest,
+    resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
+}
+
+function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: ComputeBaseline, current: Awaited<ReturnType<typeof readComputeBaselineSnapshot>>, now: Date, freshness: number) {
   return observation.machineId === row.machineId && observation.taskId === row.taskId && observation.primarySessionId === current.primary.id
     && observation.purpose === row.purpose && observation.resourceSetDigest === current.resourceSetDigest
     && observation.observedAt <= now.getTime() && now.getTime() - observation.observedAt <= freshness * 1000
@@ -92,14 +102,14 @@ function matches(observation: z.infer<typeof ComputeBaselineObservation>, row: C
 export const BaselineRefreshPhase = z.enum(["snapshot", "observe", "validate", "credit"]);
 const PHASE_CODES = { snapshot: "SNAPSHOT_UNAVAILABLE", observe: "OBSERVER_UNVERIFIED", validate: "OBSERVATION_INVALID", credit: "PROOF_REJECTED" } as const;
 export const BaselineRefreshCode = z.enum([...Object.keys(cleanupObserverReasons) as [keyof typeof cleanupObserverReasons, ...Array<keyof typeof cleanupObserverReasons>],
-  ...Object.values(PHASE_CODES), "FAMILY_ACTIVE"]);
+  ...Object.values(PHASE_CODES), "FAMILY_ACTIVE", "ACCOUNTING_OBSERVER_REQUIRED", "ACCOUNTING_OBSERVER_CHANGED"]);
 const RefreshRecord = z.object({ version: z.literal(1), groupId: Sha, refreshToken: z.string().uuid(), membership: Sha, outcome: z.enum(["proof-recorded", "failed", "deferred"]),
   phase: BaselineRefreshPhase.optional(), code: BaselineRefreshCode.optional(), since: z.number().int().nonnegative() }).strict();
 export type BaselineRefresh = Omit<z.infer<typeof RefreshRecord>, "version" | "groupId" | "refreshToken" | "membership">;
 const membershipOf = (ids: readonly string[]) => finalizationDigest([...new Set(ids)].sort());
 const REFRESH_ACTION = "compute-baseline-refresh";
 const refreshSource = (machineId: string) => `compute-baseline:${machineId}`;
-const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown): z.infer<typeof BaselineRefreshCode> => error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
+const refreshCode = (phase: z.infer<typeof BaselineRefreshPhase>, error: unknown): z.infer<typeof BaselineRefreshCode> => error instanceof AccountingObserverUnavailable ? error.code : error instanceof CleanupObserverError ? error.diagnostic.code : PHASE_CODES[phase];
 const parseJson = (text: string | null | undefined) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
 async function latestRefresh(store: Pick<Store, "remoteTask" | "runtimeMetadataEvent">, machineId: string, taskId: string, groupId: string) {
   const task = await store.remoteTask.findUnique({ where: { id: taskId }, select: { primarySessionId: true } });
@@ -173,11 +183,10 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
           return tx.computeBaseline.upsert({ where: { id }, create: { id, machineId, taskId: group.taskId, purpose: group.purpose, resourceIds, refreshToken: token }, update: { resourceIds, refreshToken: token } });
         });
         membership = membershipOf(Ids.parse(row.resourceIds));
-        const before = await snapshot(input.prisma, row, input.runtime);
+        const before = await readComputeBaselineSnapshot(input.prisma, row, input.runtime);
         if (!before.settled) { unavailable++; await invalidate(); await recordRefresh(input, group.taskId, id, token, membership, { outcome: "deferred", phase: "snapshot", code: "FAMILY_ACTIVE" }); continue; }
         phase = "observe";
-        const request = { version: 1, kind: "compute-baseline", machineId, task: { id: before.task.id, primarySessionId: before.primary.id, toolingRevision: before.task.toolingRevision, worktreePath: before.task.worktreePath },
-          purpose: group.purpose, resourceSetDigest: before.resourceSetDigest, resources: before.resources.map(resource => ({ ...finalizationResourceIdentity(resource), state: resource.state, metadata: resource.metadata })) };
+        const request = computeBaselineRequest(before, group.purpose);
         const raw = await read(input, before.task, request);
         phase = "validate";
         const observation = ComputeBaselineObservation.parse(raw);
@@ -185,7 +194,7 @@ export async function refreshComputeBaselines(input: Context, read: Read = readI
         const credited = await input.prisma.$transaction(async tx => {
           const held = await tx.computeBaseline.findUniqueOrThrow({ where: { id } });
           if (held.refreshToken !== token) return false;
-          const current = await snapshot(tx, held, input.runtime);
+          const current = await readComputeBaselineSnapshot(tx, held, input.runtime);
           if (!current.settled || current.digest !== before.digest || !matches(observation, held, current, input.now ?? new Date(), (input.config.compute ?? ComputePolicy.parse({})).collectorFreshnessSeconds)) return false;
           const saved = await tx.computeBaseline.updateMany({ where: { id, refreshToken: token }, data: { proof: { snapshotDigest: current.digest, observation } } });
           return saved.count === 1;
@@ -226,7 +235,7 @@ export async function computeBaselineCredits(store: Store, input: { machineId: s
     else {
       observedAt = proof.data.observation.observedAt;
       try {
-        const current = await snapshot(store, row, input.runtime), now = input.now ?? new Date();
+        const current = await readComputeBaselineSnapshot(store, row, input.runtime), now = input.now ?? new Date();
         const fresh = observedAt <= now.getTime() && now.getTime() - observedAt <= input.policy.collectorFreshnessSeconds * 1000;
         credited = current.settled && current.digest === proof.data.snapshotDigest && matches(proof.data.observation, row, current, now, input.policy.collectorFreshnessSeconds);
         if (!credited) reason = !current.settled ? "family-active" : current.digest !== proof.data.snapshotDigest ? "membership-changed" : !fresh ? "proof-stale" : "not-proven-stopped";

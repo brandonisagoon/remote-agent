@@ -121,4 +121,44 @@ forced GC or sleeps, even after replacing the detached read transaction. The
 management read now runs in an awaited read-only Bun child, ending every handle
 before snapshotting. All 14 deployment/rollback tests now pass, with 72 assertions,
 including real-holder refusal and committed-WAL restoration. The snapshot guard
-was not weakened, and no live deployment ran. Full CI at the new source is pending.
+was not weakened, and no live deployment ran. Full CI subsequently passed at
+`1f82fbe` (run 42851450857). The later capacity source needs its own final gates.
+
+
+## November 10 capacity and historical-observer checkpoint
+
+RA-21 now keeps fresh completed reclamation proof during a replacement read,
+shares concurrent collectors, and lets a blocked claim join a pending collection
+outside SQL for up to ten seconds. Expiry and final identity/budget checks remain
+mandatory. Failed or running reads revoke only their original generation.
+Accepted cleanup can relinquish a removed app's exact allocation while its
+original primary continues unrelated cleanup; a fresh independent absence check,
+current accepted cleanup authority, restart fence and settled other writers are
+required. Starts and renewals honor that same fence.
+
+Owner-only historical observer inspection/adoption supports both baseline groups
+and original environments. Available original executables are preferred. When
+unavailable, a registered immutable compatible reader must independently prove
+all original physical members stopped or absent before its choice is recorded.
+Adoption changes only one audited reader selection, never task pins, producer
+provenance, pause, resource/configuration state or capacity. Normal collection
+must read again before granting credit. The reader and retained owner/member
+identity remain bound, and incompatible, changed, active, unknown or shared
+inputs refuse. Finite baseline diagnostics distinguish missing original readers
+from changed adoptions.
+
+Validation: 220 focused tests passed with 1,238 assertions and typecheck passed.
+The separate accepted-cleanup/refresh batch passed 217 tests with 850 assertions.
+The actual paired Drafted adapter at `b6b8d81`, immutable installation receipts,
+SQLite and disposable Docker containers passed two integration scenarios with
+34 assertions: ordinary original-reader collection and explicit historical-reader
+adoption; extra-member refusal; actual restarted-container claim refusal; and
+claim of the same waiting reservation after physical shutdown. Original task,
+resource, pause and pin records remain preserved. Every created container was
+removed by its recorded exact ID after verifying its task label.
+
+That integration fixture uses real containers and the real accounting adapter;
+it is not actual Greenfield application health or deployed workflow acceptance.
+App-only stop before final verification, combined interruption/restart and
+original-consumer zero-nudge acceptance remain open. New observation contracts
+require this server before dependent Drafted activation in the coordinated cutover.

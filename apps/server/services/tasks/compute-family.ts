@@ -1,4 +1,4 @@
-import type { RemoteTask, RuntimeInstruction, RuntimeLifecycleEvent, RuntimeSession } from "../../../../generated/prisma/client.ts";
+import type { RemoteTask, RuntimeInstruction, RuntimeLifecycleEvent, RuntimeSession, RuntimeSessionRelation, RuntimeSessionResourceLink } from "../../../../generated/prisma/client.ts";
 import type { AgentSessionRuntime } from "../../../../types/runtime/index.ts";
 
 /** Accounting only. A durable queue is not executing work when the same
@@ -26,4 +26,17 @@ export function computeFamilySettled(task: RemoteTask, sessions: RuntimeSession[
 export function computeFamilyGeneration(task: RemoteTask, sessions: RuntimeSession[], instructions: RuntimeInstruction[]) {
   return { task: task.updatedAt.toISOString(), sessions: sessions.map(value => [value.id, value.updatedAt.toISOString()]),
     instructions: instructions.map(value => [value.id, value.updatedAt.toISOString()]) };
+}
+
+/** Stable ownership for an explicitly adopted read-only historical checker.
+ * Activity is checked separately on every collection; it is never frozen as
+ * an assertion that this family will remain stopped. */
+export function computeAccountingOwnership(task: RemoteTask, sessions: RuntimeSession[], relations: RuntimeSessionRelation[], links: RuntimeSessionResourceLink[]) {
+  return { task: { id: task.id, primarySessionId: task.primarySessionId, repositoryId: task.repositoryId, machineId: task.machineId,
+    connectionId: task.connectionId, issueIdentifier: task.issueIdentifier, worktreePath: task.worktreePath, branchName: task.branchName,
+    baseCommit: task.baseCommit, toolingRoot: task.toolingRoot, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot },
+  sessions: sessions.map(session => ({ id: session.id, machineId: session.machineId, repositoryId: session.repositoryId, cwd: session.cwd, role: session.role })),
+  relations: relations.map(relation => ({ id: relation.id, sourceSessionId: relation.sourceSessionId, targetSessionId: relation.targetSessionId, relationship: relation.relationship })),
+  links: links.filter(link => link.relationship === "handles").map(link => ({ id: link.id, runtimeSessionId: link.runtimeSessionId, provider: link.provider,
+    connectionId: link.connectionId, resourceType: link.resourceType, externalId: link.externalId, relationship: link.relationship })) };
 }
