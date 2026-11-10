@@ -290,7 +290,7 @@ test("a committed but unknown configure replay settles the original command with
   expect((await operation.settle()).outcome).toBe("completed");
   expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: outcomes.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(outcomes);
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-command-recovery" } })).toBe(1);
-  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.binding.operationId } })).completionEvidence).toMatchObject({ kind: "verified-configuration-transition" });
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.binding.operationId } })).completionEvidence).toMatchObject({ kind: "callback-acknowledged" });
   expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("stopped");
   expect(await db.prisma.computeSlot.count()).toBe(0);
   expect((await operation.settle()).outcome).toBe("completed");
@@ -317,6 +317,32 @@ test("three same-parent configure children recover legacy PID digests through a 
   expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: history.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(history);
   expect(await db.prisma.toolingRetainedConsumer.count({ where: { operationId: { in: originals.map(row => row.id) }, status: "resolved" } })).toBe(2);
   expect(await db.prisma.computeSlot.count()).toBe(0);
+});
+
+test("a verified callback remains replayable after a lost response while the original claim is retained", async () => {
+  const f = await fixture(), operation = await boundConfiguration(f, true), original = await operation.prepare();
+  await original.run(); await original.acknowledge("exception");
+  const replay = await operation.prepare(456); await replay.run(); await replay.acknowledge();
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.binding.operationId } })).status).toBe("running");
+  const retry = await operation.prepare(789); await retry.run(); await retry.acknowledge();
+  expect((await operation.settle()).outcome).toBe("completed");
+  expect((await db.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
+});
+
+test.each(["new-unknown", "changed-audit"])("historical verified configuration cannot hide %s during command settlement", async fault => {
+  const f = await stoppedConfiguration(), operation = await boundConfiguration(f, true), original = await operation.prepare();
+  await original.run(); await original.acknowledge("exception");
+  const replay = await operation.prepare(456); await replay.run(); await replay.acknowledge();
+  if (fault === "new-unknown") {
+    const later = await operation.prepare(789); await later.run(); await later.acknowledge("exception");
+  } else {
+    const audit = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "configuration-command-recovery" } });
+    const value = JSON.parse(audit.value!); value.history[0].inputDigest = "f".repeat(64);
+    await db.prisma.runtimeMetadataEvent.update({ where: { sequence: audit.sequence }, data: { value: JSON.stringify(value) } });
+  }
+  await expect(operation.settle()).rejects.toThrow("without a confirmed latest callback outcome");
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.parent!.operationId } })).status).not.toBe("completed");
 });
 
 test.each(["in-flight", "pause", "running", "stale", "resource", "separate-write", "foreign-release", "parent-release", "missing-commit", "foreign-retirement", "new-offer"])('configure recovery keeps the original command open on %s', async fault => {

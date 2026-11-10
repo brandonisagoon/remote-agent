@@ -289,3 +289,53 @@ worker/database cleanup a bounded 20-second hook budget. Worker/request deadline
 and malformed-handle assertions are unchanged. Both affected filesystem-handle
 cases pass (21 assertions), including rejection of malformed diagnostics. The
 prior failed CI remains failed; a new full run is still required.
+
+## RA-22: continue the original task after a shared repair
+
+The existing compute collector now recognizes ended configuration attempts from
+before `configuration-command-recovery/v1` and queues one continuation for the
+original primary and command. It resolves the original immutable runtime
+capability, verifies the worktree revision and observes the actual original
+provider as stopped. A stale active row becomes idle only with that independent
+absence proof and its matching durable terminal turn. No provider is signaled,
+task is repinned, old result is rewritten or capacity allowance is granted.
+
+The normal inbox rechecks the task, source issue, command family, attempt
+history, environment, resources and instruction before starting. Owner pauses
+retain the queue. Changed ownership/completion authority or resolved work
+prevents replay; live providers, uncertain attempts and missing capabilities
+remain pending. New attempts record the repair contract so a repeated failure
+cannot generate an automatic retry loop. Concurrent scans and a lost committed
+response retain the same instruction.
+
+The actual paired replay exposed a second completion gap: a physically stopped
+app may still exclusively hold its original valid claim. Its verified callback
+now reconciles ended configure children in that state as well as after the
+original offer is terminal and unallocated. Fresh stopped generation, original
+allocation, reader replacement, full attempt history and atomic transition
+proof remain required. A running app or a newer allocation still refuses.
+
+Focused regression: 163 tests / 1,054 assertions pass across configuration,
+guarded operations, wakeup and inbox. Typecheck passes. The added actual-pair
+case uses real Unix routes, SQLite, committed capability resolution, provider
+record/absence checks and the actual Drafted configuration client/observer;
+the original inbox runs the supported retry and settles the same command.
+Docker/provider responses and the language-model turn are disposable fixtures;
+the pre-upgrade attempt fixture omits the repair marker that old servers lacked.
+This is source integration evidence, not live browser acceptance.
+
+Replacement full CI at `66c1826` passed (run 42878249135), resolving the earlier
+fixture-hook gate. The new wakeup changes still require their own full CI and
+the final frozen-pair cutover/restart/rollback rehearsal. Nothing was deployed.
+
+The expanded paired sweep also exposed a lost-response regression when the
+current successful callback was completed before its enclosing command. Recovery
+now completes only the superseded children; the current callback stays open for
+an exact retry. A previously unknown attempt settles only through the verified
+replay's immutable captured history; a later unknown attempt or changed audit
+still refuses. Final configuration integration passes all three cases (normal,
+lost acknowledgment and automatic repair continuation), 71 assertions. The five
+other lifecycle cases passed in the preceding sweep. Final configuration and
+operation regression passes 106 tests / 807 assertions; the expanded configuration
+suite passes 54 tests / 237 assertions. Full combined release rehearsal remains
+the final frozen-pair gate.

@@ -74,7 +74,7 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   }
   const traffic = await input.prisma.computeTraffic.findMany({ where: { environmentId: environment.id }, orderBy: { routeId: "asc" }, take: 33 });
   if (traffic.length > 32) throw new Error("Configuration traffic inventory exceeds its bound");
-  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, intent };
+  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, retained, intent };
 }
 
 async function readConfiguration(input: Input, before: Snapshot) {
@@ -194,18 +194,20 @@ export async function configureCompute(input: Input, read = readConfiguration, h
 
 /** Readback for retiring interrupted configure callbacks after a supported
  * replay. The caller also requires that replay's atomic per-attempt receipt.
- * Only a physically verified stopped, unallocated original offer qualifies. */
+ * Physical stopped proof is required whether the original claim is still
+ * exclusively retained or already terminal and unallocated. Neither case
+ * creates/revives a claim; ordinary admission still controls the restart. */
 export async function acknowledgedStoppedConfiguration(input: Omit<Input, "prisma"> & { prisma: Prisma.TransactionClient }) {
   const current = await snapshot(input);
   const observation = ComputeObservation.parse(current.environment.observation);
   const age = Date.now() - observation.observedAt;
-  if (!current.stopped || !current.event || current.environment.recipeDigest !== input.request.recipeHash
+  if ((!current.stopped && !current.retained) || !current.event || current.environment.recipeDigest !== input.request.recipeHash
     || observation.state !== "stopped" || observation.operations.active !== 0 || age < -1000 || age > 10_000
     || observation.taskId !== input.taskId || observation.primarySessionId !== current.owner.session.id || observation.environmentId !== current.environment.id
     || observation.recipeDigest !== input.request.recipeHash || observation.revision !== current.environment.revision
     || observation.resourceId !== current.resource.id || observation.resourceIdentity !== current.environment.resourceIdentity
     || observation.configurationDigest !== input.request.coverage.next.configurationSha256)
-    throw new Error("Configuration recovery requires the original stopped offer and fresh matching generation");
+    throw new Error("Configuration recovery requires the original exclusive or terminal offer and fresh physically stopped generation");
   const journal = JSON.parse(current.event.value!);
   if (journal.baselineFile !== input.request.baselineFile || finalizationDigest(journal.compute) !== finalizationDigest(input.request.coverage.next))
     throw new Error("Configuration recovery journal changed");

@@ -16,6 +16,10 @@ import { assertCompletionAllowed, CompletionContractInput, recordCompletionVerif
 import { completionObservation } from "./completion-observation.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
+import { createRuntimeStore, type AcpSessionRecord } from "acpx/runtime";
+import { createAcpxSessionRuntime } from "../../transports/acpx/session-runtime.ts";
+import { wakeConfigurationAfterRepair } from "./configuration-repair-wakeup.ts";
+import { deliverInstructions } from "../sessions/inbox.ts";
 
 const clientRoot = process.env.DRAFTED_INTEGRATION_ROOT;
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -323,7 +327,8 @@ test.skipIf(!clientRoot)("setup, migrations and fixtures retain their claimed sl
   expect(f.effects).not.toContain("stop");
 }, 90_000);
 
-test.skipIf(!clientRoot).each([false, true])("actual client/observer configuration replays through Unix routes and ordinary admission (lost acknowledgment: %s)", async lost => {
+test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "repair-available"])("actual client/observer configuration replays through Unix routes and ordinary admission (%s)", async mode => {
+  const lost = mode === "lost-acknowledgment", repair = mode === "repair-available";
   const f = await fixture();
   expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
   const first = await f.deliver();
@@ -349,7 +354,7 @@ test.skipIf(!clientRoot).each([false, true])("actual client/observer configurati
   const configure = f.registry.configureCompute; let drop = lost;
   const legacy: Array<{ id: string; inputDigest: string; events: Awaited<ReturnType<typeof f.prisma.runtimeMetadataEvent.findMany>> }> = [];
   f.registry.configureCompute = async (request: any) => {
-    if (lost && !legacy.length) {
+    if ((lost || repair) && !legacy.length) {
       // Two ended old full-body/PID requests, refused by the real observer's
       // current-lock check. The supported callback stays under this parent.
       for (const offset of [1, 2]) {
@@ -361,8 +366,16 @@ test.skipIf(!clientRoot).each([false, true])("actual client/observer configurati
         expect(response.status).toBe(409);
         const failure = await response.json() as { code: string };
         expect(failure.code).toBe("configuration-observation-failed");
+        if (repair) {
+          // Fixture the persisted pre-upgrade server contract: its guarded
+          // refusal is real, but that version did not stamp repairContracts.
+          const intent = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { key: `outcome:${child.binding.operationId}` }, orderBy: { sequence: "asc" } });
+          const { repairContracts: _unsupported, ...prior } = JSON.parse(intent.value!);
+          await f.prisma.runtimeMetadataEvent.update({ where: { sequence: intent.sequence }, data: { value: JSON.stringify(prior) } });
+        }
         legacy.push({ id: child.binding.operationId, inputDigest, events: await f.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${child.binding.operationId}` }, orderBy: { sequence: "asc" } }) });
       }
+      if (repair) throw new Error("Fixture original command stopped before shared repair");
     }
     const result = await configure(request);
     if (drop) { drop = false; throw new Error("Fixture lost verified configuration response"); }
@@ -374,7 +387,41 @@ test.skipIf(!clientRoot).each([false, true])("actual client/observer configurati
     await refresh(); await reconcileObservedCompute({ ...f.admission, environmentId: first.environmentId, runtime: f.runtime });
     expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("stopped");
   }
-  const configured = await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile });
+  let configured: any;
+  if (repair) {
+    await expect(f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).rejects.toThrow("original command stopped before shared repair");
+    expect(f.container().running).toBe(false);
+    const stateDir = path.join(f.root, "provider-state"), providerId = "original-configure-provider", requestId = "original-configure-turn";
+    const providerConfig = { ...f.config, acpxStateDir: stateDir };
+    await f.prisma.runtimeSession.update({ where: { id: f.task.primarySessionId! }, data: { status: "active", acpxRecordId: providerId, acpxSessionId: providerId } });
+    await f.prisma.runtimeLifecycleEvent.create({ data: { id: requestId, runtimeSessionId: f.task.primarySessionId!, requestId, phase: "failed", occurredAt: new Date("2026-01-02T00:00:01Z") } });
+    const record: AcpSessionRecord = { schema: "acpx.session.v1", acpxRecordId: providerId, acpSessionId: providerId, agentCommand: "codex", cwd: f.task.worktreePath!,
+      createdAt: "2026-01-01T00:00:00Z", lastUsedAt: "2026-01-02T00:00:01Z", lastSeq: 1, pid: 2147483647, lastPromptAt: "2026-01-02T00:00:00Z", lastRequestId: requestId,
+      eventLog: { active_path: path.join(stateDir, "original.stream"), segment_count: 1, max_segment_bytes: 100000, max_segments: 1 }, messages: [], updated_at: "2026-01-02T00:00:01Z", cumulative_token_usage: {}, request_token_usage: {} };
+    await createRuntimeStore({ stateDir }).save(record);
+    const waking = { ...f, config: providerConfig, runtime: createAcpxSessionRuntime(f.prisma, providerConfig), taskId: f.task.id, environmentId: first.environmentId };
+    const wake = await wakeConfigurationAfterRepair(waking);
+    expect(wake.state).toBe("queued");
+    expect(await wakeConfigurationAfterRepair(waking)).toEqual({ state: "not-needed" });
+    const continuation = await f.prisma.runtimeInstruction.findFirstOrThrow({ where: { id: { startsWith: "configuration-repair:" } } });
+    expect(continuation).toMatchObject({ sessionId: f.task.primarySessionId, state: "queued" });
+    expect(continuation.text).toContain(f.checkout);
+    let done!: () => void, failed!: (error: unknown) => void;
+    const completed = new Promise<void>((resolve, reject) => { done = resolve; failed = reject; });
+    f.runtime.startTurn = input => ({ requestId: input.requestId!, events: { async *[Symbol.asyncIterator]() {} }, cancel: async () => {}, result: (async () => {
+      try {
+        expect(input.sessionId).toBe(f.task.primarySessionId!);
+        expect(await input.beforeStart?.()).toBe(true);
+        configured = await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile });
+        done(); return { status: "completed" as const };
+      } catch (error) { failed(error); return { status: "failed" as const, error: String(error) }; }
+    })() });
+    await deliverInstructions(f.prisma, f.runtime, f.config);
+    await completed;
+    for (let i = 0; i < 100 && (await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: continuation.id } })).state !== "completed"; i++) await Bun.sleep(5);
+    expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id: continuation.id } })).toMatchObject({ state: "completed" });
+    expect(await f.prisma.runtimeInstruction.count({ where: { id: { startsWith: "configuration-repair:" } } })).toBe(1);
+  } else configured = await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile });
   expect(configured.phase).toBe(lost ? "waiting-compute" : "ready");
   await session.complete(); f.control.bindControlOperation(null);
   expect((await readToolingOperation({ prisma: f.prisma, operationId: guard.operationId }))?.status).toBe("completed");
@@ -384,7 +431,7 @@ test.skipIf(!clientRoot).each([false, true])("actual client/observer configurati
       completionEvidence: { kind: "verified-configuration-transition" } });
     expect(await f.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${old.id}` }, orderBy: { sequence: "asc" } })).toEqual(old.events);
   }
-  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-command-recovery" } })).toBe(lost ? 1 : 0);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-command-recovery" } })).toBe(lost || repair ? 1 : 0);
   expect(f.container().id).toBe(originalContainer); expect([...f.remote]).toEqual(stores);
   if (lost) {
     expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("stopped");

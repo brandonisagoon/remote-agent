@@ -380,11 +380,12 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
 /** This server process: a random per-boot nonce, its PID and local host.
  * Server-only metadata stamped on every new callback intent, so a later boot
  * can prove an orphaned attempt belonged to an exited process. */
+export const CONFIGURATION_REPAIR_CONTRACT = "configuration-command-recovery/v1";
 export const SERVER_INSTANCE: Readonly<{ instance: string; pid: number; host: string }> = Object.freeze({ instance: crypto.randomUUID(), pid: process.pid, host: hostname() });
 async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, attemptId: string, state: "intent" | "acknowledged" | "refused" | "unknown", status: number | null) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
     value: JSON.stringify({ version: 1, operationId: binding.operationId, role: "outcome", state, attemptId, route, inputDigest: binding.inputDigest, requestKey: binding.requestKey, status,
-      ...(state === "intent" ? { server: SERVER_INSTANCE } : {}) }) } });
+      ...(state === "intent" ? { server: SERVER_INSTANCE, ...(route === "POST /api/tasks/:taskId/compute-configure" ? { repairContracts: [CONFIGURATION_REPAIR_CONTRACT] } : {}) } : {}) }) } });
 }
 /** Boot recovery only: the missing `unknown` result of an attempt whose
  * server process provably exited, copying the intent's exact identity. */
@@ -397,7 +398,7 @@ export async function recordInterruptedAttempt(tx: Prisma.TransactionClient, ope
 /** One operation's callback attempt records, newest first, bounded (overflow
  * refuses rather than dropping an older attempt). */
 const AttemptRecord = z.object({ state: z.string(), attemptId: z.string(), operationId: z.string(), inputDigest: z.string(), route: z.string().optional(),
-  status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional() }).passthrough();
+  status: z.number().nullable().optional(), acknowledgedAttemptId: z.string().optional(), repairContracts: z.array(z.string()).optional() }).passthrough();
 export async function attemptRecords(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string }, operationId: string) {
   const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", operationId) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (events.length > 1000) throw refuse("operation-input", `Callback attempt history of ${operationId} exceeds its bound`);
@@ -440,7 +441,8 @@ async function latestAttemptAcknowledged(store: Pick<PrismaClient, "runtimeMetad
   for (const intent of intents) {
     const results = values.filter(value => value.attemptId === intent.attemptId && value.state !== "intent" && value.state !== "reconciled").map(value => value.state);
     if (!results.length) return false;
-    if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, operation)) return false;
+    if (results.includes("unknown") && !validReconciliation(records, intent.attemptId, operation)
+      && !await (await import("./tooling-configuration-recovery.ts")).configurationAttemptReconciled(store, binding, operation, records, intent.attemptId)) return false;
   }
   return values.some(value => value.attemptId === intents[0]!.attemptId && value.state === "acknowledged");
 }

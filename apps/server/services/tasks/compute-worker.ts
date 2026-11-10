@@ -1,3 +1,4 @@
+import { wakeConfigurationAfterRepair } from "./configuration-repair-wakeup.ts";
 import { createHash } from "node:crypto";
 import type { PrismaClient } from "../../../../generated/prisma/client.ts";
 import type { ServerConfig } from "../../../../lib/config.ts";
@@ -36,7 +37,7 @@ async function continueSuspension(input: Context & { taskId: string; primarySess
   if (runtime.before !== await runtime.checked()) throw new Error("Compute runtime changed during continuation");
 }
 type Context = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
-const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute, settle: reconcileClosedTaskFamily };
+const defaults = { refresh: refreshComputeObservation, evidence: computeEvidenceState, consider: considerIdleComputeSuspension, continue: continueSuspension, reclaim: reclaimStoppedCompute, settle: reconcileClosedTaskFamily, repair: wakeConfigurationAfterRepair };
 
 /** A bounded host collector uses the configured immutable runtime capability.
  * It never asks an agent to invent a stop, nor treats an observation failure as
@@ -70,6 +71,7 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
           await deps.reclaim({ ...input, environmentId: environment.id });
           observed++; continue;
         }
+        await deps.repair({ ...input, taskId: task.id, environmentId: environment.id });
         await deps.refresh({ ...input, environmentId: environment.id });
         if (isSavedComputeEnvironment(environment)) {
           // Physical-only legacy recipes never supply inactivity authority.

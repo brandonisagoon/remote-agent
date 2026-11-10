@@ -70,7 +70,7 @@ export async function reconcileConfigurationChildren(input: { prisma: PrismaClie
         || record.value.route !== Route || !["intent", "acknowledged", "refused", "unknown"].includes(record.value.state)))
         throw new Error("Configuration child has unreadable or unrelated callback history");
       const intents = records.filter(record => record.value?.state === "intent");
-      if (!intents.length) throw new Error("Configuration child has no recorded attempt");
+      if (!intents.length || new Set(intents.map(record => record.value!.attemptId)).size !== intents.length) throw new Error("Configuration child has no unique recorded attempts");
       for (const original of intents) {
         const results = records.filter(record => record.value?.attemptId === original.value!.attemptId && record.value.state !== "intent");
         if (results.length !== 1 || results[0]!.sequence <= original.sequence) throw new Error("A configure attempt is still in flight or has conflicting outcomes");
@@ -102,7 +102,9 @@ export async function reconcileConfigurationChildren(input: { prisma: PrismaClie
     }
     for (const child of candidates) {
       if ((await tx.toolingOperation.updateMany({ where: { id: child.id, status: child.status, parentOperationId: parent.id },
-        data: { status: "completed", completionEvidence: { kind: "verified-configuration-transition", reference: `${current.id}:${attemptId}` } } })).count !== 1)
+        // The successful current callback remains replayable until the outer
+        // command settles. Its acknowledgment can itself be lost in transit.
+        data: child.id === current.id ? { status: "running" } : { status: "completed", completionEvidence: { kind: "verified-configuration-transition", reference: `${current.id}:${attemptId}` } } })).count !== 1)
         throw new Error("Configuration child changed during reconciliation");
     }
     await tx.runtimeMetadataEvent.update({ where: { sequence: marker.sequence }, data: { value: JSON.stringify({ version: 1, parentOperationId: parent.id,
@@ -110,4 +112,34 @@ export async function reconcileConfigurationChildren(input: { prisma: PrismaClie
       environmentId: state.environment.id, offerId: request.offerId, history: histories }) } });
     return candidates.length;
   });
+}
+
+/** An earlier unknown attempt of the still-open callback can be settled only
+ * through the immutable history captured by the verified configuration replay.
+ * A later unknown result is not covered by that historical proof. */
+export async function configurationAttemptReconciled(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: { sessionId: string; taskId: string },
+  operation: { id: string; inputDigest: string }, records: Awaited<ReturnType<typeof attemptRecords>>, attemptId: string) {
+  const original = records.find(record => record.value?.attemptId === attemptId && record.value.state === "intent");
+  const unknown = records.find(record => record.value?.attemptId === attemptId && record.value.state === "unknown");
+  if (!original || !unknown || original.value?.route !== Route || unknown.value?.route !== Route || unknown.sequence <= original.sequence) return false;
+  const events = await store.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`,
+    action: "configuration-command-recovery", key: { startsWith: `${operation.id}:` } }, orderBy: { sequence: "desc" }, take: 101 });
+  if (events.length > 100) return false;
+  const Audit = z.object({ version: z.literal(1), operationId: z.literal(operation.id), attemptId: z.string(), replaySequence: z.number().int().positive(),
+    history: z.array(z.object({ operationId: z.string(), inputDigest: z.string(), attempts: z.array(z.object({ sequence: z.number().int().positive(), value: z.unknown() })) }).strict()).max(100),
+  });
+  for (const event of events) {
+    const parsed = Audit.safeParse(parse(event.value)); if (!parsed.success) return false;
+    const audit = parsed.data, saved = audit.history.filter(row => row.operationId === operation.id);
+    if (saved.length !== 1 || saved[0]!.inputDigest !== operation.inputDigest || saved[0]!.attempts.length > 1000 || event.key !== `${operation.id}:${audit.attemptId}`) return false;
+    const frozen = saved[0]!.attempts;
+    if (frozen.some(record => !records.some(current => current.sequence === record.sequence && canonicalDigest(current) === canonicalDigest(record)))) return false;
+    const replay = records.find(record => record.value?.attemptId === audit.attemptId && record.value.state === "intent");
+    const acknowledged = records.filter(record => record.value?.attemptId === audit.attemptId && record.value.state === "acknowledged");
+    if (replay && acknowledged.length === 1 && replay.value?.route === Route && acknowledged[0]!.value?.route === Route
+      && replay.sequence > unknown.sequence && audit.replaySequence > replay.sequence && acknowledged[0]!.sequence > audit.replaySequence && event.sequence > acknowledged[0]!.sequence
+      && typeof acknowledged[0]!.value!.status === "number" && acknowledged[0]!.value!.status! >= 200 && acknowledged[0]!.value!.status! < 300
+      && [original, unknown, replay, acknowledged[0]!].every(record => frozen.some(saved => saved.sequence === record.sequence))) return true;
+  }
+  return false;
 }
