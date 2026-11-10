@@ -65,6 +65,19 @@ instruction alone proves neither merge nor cleanup.
 
 ## Deployment boundary
 
+The owner's November 9 direction is one coordinated cutover after the remaining
+pre-deployment work across RA-23. Child issues and PRs are implementation/review
+units, not separate deployments. Integrate the RA-20 changes with this batch and
+subsequent reviewed source before freezing the exact server/tooling revisions.
+Require clean final repository gates, combined acceptance, an isolated upgrade,
+restart and interrupted-operation rehearsal, and a verified rollback procedure
+from the serving versions. Resolve any required intermediate live rollout before
+calling the pair ready.
+
+Prepare one release manifest with compatible server installation followed by
+dependent tooling activation in the same cutover. Original affected-task checks
+and the RA-26 zero-avoidable-nudge run follow that cutover.
+
 Complete the remaining source work and paired integration coverage before
 calling the whole epic source-ready. Preserve the original task pins, accepted
 operation IDs, resource/data identities and three-app cap. Installation,
