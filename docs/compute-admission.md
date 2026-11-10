@@ -231,3 +231,24 @@ Baseline refresh diagnostics distinguish `ACCOUNTING_OBSERVER_REQUIRED` from
 failure and retain capacity. Missing retained configuration uses the existing
 owner `compute-accounting-input` control; selecting a new reader cannot invent
 missing bytes, physical members or original ownership.
+
+## Stop merged app compute while final verification is pending
+
+The normal collector may record an existing scoped `runtime-suspended` intent
+when the current owner contract requires a merge and the server has observed
+that exact clean source merged. The whole worktree is read again before intent
+selection and effect renewal. Final verification may remain stale: this stop
+neither refreshes it nor grants Done, deletion or finalizer authority.
+
+Complete fresh traffic and background-operation coverage, no active requests,
+settled original descendants (including moved working directories), and no
+pending instructions are required. An explicit work-map consumer, browser
+resource, retained review environment, newer contract, revocation or owner pause
+preserves the app. Physical-only legacy enrollment cannot claim this coverage.
+
+`compute-merged-delivery-stop` records the owner-observed merge reason without
+inventing an idle model choice. The original producer's existing stop adapter
+and operation binding execute it. A fresh running observation advances its
+original claim before stop; only a later fresh stopped observation with settled
+writers releases that exact allocation. Lost responses retry the same intent.
+Databases, worktree, task/session identity, pins and cleanup journal are retained.

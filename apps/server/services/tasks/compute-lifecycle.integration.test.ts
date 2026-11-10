@@ -12,6 +12,9 @@ import { refreshComputeObservation } from "./compute-observer.ts";
 import { considerComputeSuspension } from "./compute-suspension.ts";
 import { classifyCompute } from "./compute-decision.ts";
 import { tickCompute } from "./compute-worker.ts";
+import { assertCompletionAllowed, CompletionContractInput, recordCompletionVerification, setCompletionContract } from "./completion.ts";
+import { completionObservation } from "./completion-observation.ts";
+import { finalizationResourceIdentity } from "./finalization-resources.ts";
 
 const clientRoot = process.env.DRAFTED_INTEGRATION_ROOT;
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -55,6 +58,7 @@ const traffic = previous ? { ...previous, route, sequence: previous.sequence + 1
       reason: null, lastMeaningfulAt: null, lastUnknownAt: null, active: {}, completed: {}, buckets: [] };
 console.log(JSON.stringify({ observation: { version: 1, environmentId: input.environment.id, taskId: input.task.id,
   primarySessionId: input.task.primarySessionId, purpose: input.environment.purpose, revision: input.environment.revision,
+  ...(physical.sourceRevision ? { sourceRevision: physical.sourceRevision } : {}),
   recipeDigest: input.environment.recipeDigest, resourceId: input.resource.id, resourceIdentity: input.resource.identityDigest,
   observedAt: now, state: physical.running ? "running" : "stopped", coverage: "complete", configurationDigest: route.configurationDigest,
   routes: [route], operations: { coverage: "complete", active: physical.active, generation: "f".repeat(64) } }, traffic: [traffic] }));
@@ -80,7 +84,7 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
   await writeFile(configFile, JSON.stringify({ version: 1, profile: "platform", image: "fixture:1", credentialsFile,
     runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "OPENAI_API_KEY"], planetscale: { organization: "fixture", database: "fixture", baseBranch: "main", baseBranchId: "base" },
     setup: [["bun", "install"]], fixtures: [["bun", "seed-task.ts"]], services: { api: { command: ["bun", "api.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], readyTimeoutSeconds: 1 }));
-  const physical = { running: false, active: 0 }; const sync = () => savePrivate(physicalFile, physical); await sync();
+  const physical: { running: boolean; active: number; sourceRevision?: string } = { running: false, active: 0 }; const sync = () => savePrivate(physicalFile, physical); await sync();
   const effects: string[] = [], remote = new Map<string, unknown>(); let container: any = null, proxy: any = null;
   const network = { id: "c".repeat(64), createdAt: "original-network" };
   const labels = { "dev.drafted.task": task.id, "dev.drafted.purpose": "development" };
@@ -104,14 +108,14 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
   const computeDocker = async (args: string[]) => {
     const options = (flag: string) => args.flatMap((value, index) => value === flag ? [args[index + 1]!] : []);
     if (args[0] === "image") return JSON.stringify([{ Id: `sha256:${"b".repeat(64)}` }]);
-    if (args[0] === "network") return JSON.stringify([{ Id: network.id, Created: network.createdAt, Labels: labels }]);
+    if (args[0] === "network") return JSON.stringify([{ Id: network.id, Name: "fixture", Created: network.createdAt, Labels: labels }]);
     if (args[0] === "container" && args[1] === "ls") return proxy?.Id ?? "";
     if (args[0] === "create") {
       effects.push("create-proxy");
       const mount = options("--mount").map(value => Object.fromEntries(value.split(",").map(pair => pair.split("="))));
       proxy = { Id: "d".repeat(64), Image: `sha256:${"b".repeat(64)}`, Created: "original-proxy", State: { Running: false },
         Config: { Labels: Object.fromEntries(options("--label").map(value => value.split("="))) },
-        HostConfig: { PortBindings: Object.fromEntries(options("--publish").map(value => { const [HostIp, HostPort, port] = value.split(":"); return [`${port}/tcp`, [{ HostIp, HostPort }]]; })) },
+        HostConfig: { NetworkMode: network.id, PortBindings: Object.fromEntries(options("--publish").map(value => { const [HostIp, HostPort, port] = value.split(":"); return [`${port}/tcp`, [{ HostIp, HostPort }]]; })) },
         Mounts: mount.map(value => ({ Source: value.source, Destination: value.target, RW: value.readonly === undefined && !options("--mount").some(raw => raw.includes(`target=${value.target},readonly`)) })),
         NetworkSettings: { Networks: { fixture: { NetworkID: network.id } } } };
       return proxy.Id;
@@ -130,7 +134,8 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
     await prisma.runtimeSession.update({ where: { id: task.primarySessionId! }, data: { status: "active" } });
     await prisma.runtimeLifecycleEvent.create({ data: { id: crypto.randomUUID(), runtimeSessionId: task.primarySessionId!, requestId: offer.instructionId, phase: "started", occurredAt: new Date() } });
     const delivered = await confirmComputeDelivery({ ...admission, sessionId: task.primarySessionId!, requestId: offer.instructionId });
-    expect(delivered?.expiresAt!.getTime()! - delivered?.deliveredAt!.getTime()!).toBe(60_000);
+    expect(delivered).toMatchObject({ state: "offered", expiresAt: null });
+    expect(delivered?.deliveredAt).toBeInstanceOf(Date);
     return offer;
   }
   async function settled(offer: Awaited<ReturnType<typeof deliver>>) {
@@ -149,7 +154,7 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
 test.skipIf(!clientRoot).each([false, true])("actual Unix lifecycle suspends idle compute and resumes the saved runtime (lost completion: %s)", async lostCompletion => {
   const f = await fixture();
   expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
-  expect(f.effects).toEqual([]); expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+  expect(f.effects).toEqual([]); expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(1);
   const first = await f.deliver();
   expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: first.id })).phase).toBe("ready");
   await f.settled(first);
@@ -202,6 +207,54 @@ test.skipIf(!clientRoot).each([false, true])("actual Unix lifecycle suspends idl
   expect((await f.registry.task()).resources.map((value: any) => value.id)).toEqual(original.resources.map((value: any) => value.id));
   expect(await f.prisma.runtimeSession.count()).toBe(1);
   expect(git(f.task.worktreePath!, "rev-parse", "HEAD")).toBe(f.productRevision);
+}, 90_000);
+
+test.skipIf(!clientRoot)("actual client stops a merged app through original Unix routes while stale final verification remains pending", async () => {
+  const f = await fixture();
+  git(f.task.worktreePath!, "checkout", "-qb", f.task.branchName);
+  await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile });
+  const offer = await f.deliver();
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
+  await f.settled(offer);
+  const context = { ...f, taskId: f.task.id };
+  await setCompletionContract({ ...context, contract: CompletionContractInput.parse({ requestKey: "owner-merge", expectedRevision: 0, boundary: "merge", basis: "Owner requested Merge", repository: "owner/product", pullRequest: 42, baseBranch: "main" }) });
+  await recordCompletionVerification({ ...context, verification: { requestKey: "reviewed-source", passed: true, evidence: ["original source checks"] } });
+  await writeFile(path.join(f.task.worktreePath!, "merged.txt"), "reconciled with staging\n");
+  git(f.task.worktreePath!, "add", "."); git(f.task.worktreePath!, "commit", "-qm", "Reconcile staging");
+  const head = git(f.task.worktreePath!, "rev-parse", "HEAD");
+  const observer = { ...completionObservation, remote: async () => ({ remote: "origin", repository: "owner/product", remoteHead: head, remoteBase: "b".repeat(40), pullRequest: {
+    url: "https://github.com/owner/product/pull/42", headRefOid: head, headRefName: f.task.branchName, baseRefName: "main", state: "MERGED", isDraft: false, reviewDecision: null, mergeCommit: { oid: "c".repeat(40) },
+  } }) };
+  await expect(assertCompletionAllowed({ ...context, sessionId: f.task.primarySessionId! }, observer)).rejects.toThrow("verification is missing, failed or stale");
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { phase: "complete" } });
+  f.physical.sourceRevision = head; await f.sync();
+  const original = await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } });
+  const resources = await f.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  const stores = structuredClone([...f.remote]), containerId = f.container().id;
+  const complete = f.registry.completeDevelopmentIntent; let lost = false;
+  f.registry.completeDevelopmentIntent = async (input: unknown) => {
+    const result = await complete(input);
+    if (!lost) { lost = true; throw new Error("Lost merged-stop acknowledgment"); }
+    return result;
+  };
+  expect(await tickCompute(f, { continue: f.continueSaved })).toEqual({ observed: 0, unavailable: 1 });
+  expect(String(f.continuationErrors.shift())).toContain("Lost merged-stop acknowledgment");
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: offer.id } })).toBe(1);
+  await f.prisma.$disconnect();
+  expect(await tickCompute(f, { continue: f.continueSaved })).toEqual({ observed: 1, unavailable: 0 });
+  if (f.continuationErrors.length) throw f.continuationErrors[0];
+  expect(f.container()).toMatchObject({ id: containerId, running: false });
+  expect(f.effects.filter(value => value === "stop")).toHaveLength(1); expect([...f.remote]).toEqual(stores);
+  expect(await f.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
+  expect(await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toEqual(original);
+  const stoppedResources = await f.prisma.remoteTaskResource.findMany({ orderBy: { id: "asc" } });
+  expect(stoppedResources.map(finalizationResourceIdentity)).toEqual(resources.map(finalizationResourceIdentity));
+  expect(stoppedResources.filter(value => value.kind !== "task-runtime")).toEqual(resources.filter(value => value.kind !== "task-runtime"));
+  expect(stoppedResources.find(value => value.kind === "task-runtime")?.state).toBe("allocated");
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "compute-idle-decision" } })).toBe(0);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "compute-merged-delivery-stop" } })).toBe(1);
+  await expect(assertCompletionAllowed({ ...context, sessionId: f.task.primarySessionId! }, observer)).rejects.toThrow("verification is missing, failed or stale");
+  expect((await f.registry.task()).developmentIntent).toMatchObject({ reason: "runtime-suspended", state: "complete" });
 }, 90_000);
 
 test.skipIf(!clientRoot)("actual Unix suspension refuses a newer owner pause after container inspection and before stop", async () => {

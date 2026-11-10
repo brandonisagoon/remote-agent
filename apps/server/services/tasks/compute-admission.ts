@@ -11,6 +11,7 @@ import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObs
 
 import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
+import { cleanupFamily } from "./closed-cleanup.ts";
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date; config?: ServerConfig; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
 const Key = z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,179}$/);
@@ -719,8 +720,10 @@ async function reconcileObservedComputeOnce(input: Context & { environmentId: st
     }
     if (observation.state !== "stopped" || offer && !["running", "unknown"].includes(offer.state)) return { released: false };
     const task = await store.remoteTask.findUniqueOrThrow({ where: { id: environment.taskId } });
-    const sessions = await store.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
-    if (sessions.length > 1000 || sessions.some(value => !value.closedAt && (!["idle", "closed"].includes(value.status)
+    const sameDirectory = await store.runtimeSession.findMany({ where: { cwd: task.worktreePath! }, take: 1001 });
+    const sessions = [...new Map([...sameDirectory, ...await cleanupFamily(store, task, environment.primarySessionId)].map(session => [session.id, session])).values()];
+    if (sessions.length > 1000 || sessions.some(value => value.repositoryId !== task.repositoryId || value.machineId !== task.machineId
+      || !value.closedAt && (!["idle", "closed"].includes(value.status)
       || ["executing", "queued"].includes(input.runtime.observeSessionActivity?.(value.id)?.state ?? "")))) return { released: false };
     if (await store.runtimeInstruction.count({ where: { sessionId: { in: sessions.map(value => value.id) }, state: { in: ["queued", "preparing", "dispatching", "unknown"] } } })) return { released: false };
     const lifecycle = await store.runtimeLifecycleEvent.findMany({ where: { runtimeSessionId: { in: sessions.map(value => value.id) } }, orderBy: { sequence: "desc" }, take: 1001 });

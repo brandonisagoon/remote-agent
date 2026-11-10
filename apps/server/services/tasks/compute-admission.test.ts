@@ -188,6 +188,10 @@ test("physical stopped reconciliation releases exactly one settled allocation an
   await finishTurn(offer);
   expect(await reconcile()).toEqual({ released: false }); // missing terminal lifecycle stays uncertain
   await db.prisma.runtimeLifecycleEvent.create({ data: { id: "saved-terminal", runtimeSessionId: "primary-saved", requestId: offer.instructionId, phase: "completed", occurredAt: context(3).now } });
+  await db.prisma.runtimeSession.create({ data: { id: "moved-descendant", scopeKey: "moved-descendant", agentCommand: "codex", role: "delegate", repositoryId: "repo", machineId: "host", cwd: "/different/worktree", status: "active" } });
+  await db.prisma.runtimeSessionRelation.create({ data: { sourceSessionId: "moved-descendant", targetSessionId: "primary-saved", relationship: "spawned-by" } });
+  expect(await reconcile()).toEqual({ released: false }); // source movement does not erase a live writer
+  await db.prisma.runtimeSession.update({ where: { id: "moved-descendant" }, data: { status: "idle" } });
   expect(await reconcile()).toEqual({ released: true });
   expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
   expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).state).toBe("ready");

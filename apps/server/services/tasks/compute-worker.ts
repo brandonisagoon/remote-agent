@@ -77,6 +77,11 @@ export async function tickCompute(input: Context, dependencies: Partial<typeof d
         const projection = await developmentProjection(context);
         const intent = projection.developmentIntent;
         const evidence = await deps.evidence({ ...context, allowStopped: true });
+        // A freshly observed app may become eligible before any earlier tick
+        // advanced its claim to running. Preserve that physical transition
+        // before stopping, so a real stop can settle the same allocation.
+        if (evidence.physicalState === "running") await reconcileObservedCompute({ prisma: input.prisma, machineId: input.config.machine,
+          policy: input.config.compute!, environmentId: environment.id, runtime: input.runtime });
         if (intent?.state === "pending" && intent.reason === "runtime-suspended" && intent.suspension?.environmentId === environment.id
           && evidence.eligible && evidence.snapshotDigest === intent.suspension.snapshotDigest) {
           await deps.continue({ ...context, primarySessionId: environment.primarySessionId, intentRevision: intent.revision, intentDigest: intent.digest });

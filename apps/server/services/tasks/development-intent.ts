@@ -8,6 +8,7 @@ import { readDevelopmentJson, retainedDevelopmentIds } from "./development-selec
 
 import { AutomationInput, DevelopmentAuthority, DevelopmentAuthorityInput, DevelopmentCompleteInput, DevelopmentProjection, DevelopmentReference, RuntimeSuspension } from "../../../../lib/development-intent.ts";
 import { assertComputeEvidence, computeEvidenceMatches, refreshComputeObservation } from "./compute-observation.ts";
+import { verifyMergedComputeStopSource, type MergedComputeStopScope } from "./compute-merged-delivery.ts";
 export { AutomationInput, DevelopmentAuthority, DevelopmentAuthorityInput, DevelopmentCompleteInput, DevelopmentProjection, DevelopmentReference } from "../../../../lib/development-intent.ts";
 const Digest = DevelopmentReference.shape.intentDigest;
 const Key = DevelopmentProjection.shape.requestKey;
@@ -129,9 +130,10 @@ async function superseded(prisma: Database, task: RemoteTask, revision: number) 
  * an owner pause, grants closure, or selects another environment's compute. */
 export async function recordRuntimeSuspension(input: Context & { requestKey: string; suspension: z.infer<typeof RuntimeSuspension> }) {
   const suspension = RuntimeSuspension.parse(input.suspension), owned = await ownership(input);
-  if (owned.task.ownerPaused || owned.task.phase === "complete") throw new Error("Automatic suspension requires an open unpaused task");
+  if (owned.task.ownerPaused) throw new Error("Automatic suspension requires an open unpaused task");
   await assertDevelopmentWork(input, owned.task);
   const observed = await assertComputeEvidence({ ...input, ...suspension });
+  if (owned.task.phase === "complete" && !observed.mergedStop) throw new Error("Automatic suspension requires an open unpaused task");
   if (observed.evidence.task.id !== owned.task.id || observed.evidence.task.purpose !== "development"
     || observed.resource.id !== suspension.resourceId || observed.resource.key !== suspension.resourceKey || observed.resource.identityDigest !== suspension.resourceIdentity) throw new Error("Automatic suspension resource scope changed");
   const prior = await input.prisma.runtimeMetadataEvent.findFirst({ where: eventWhere(owned.task), orderBy: { sequence: "desc" } });
@@ -204,6 +206,7 @@ async function current(input: Context, reference?: z.infer<typeof DevelopmentRef
 }
 export async function assertDevelopmentRequest(input: Context & z.infer<typeof DevelopmentReference>) {
   const active = await current(input, input);
+  let mergedStop: MergedComputeStopScope | undefined;
   if (active.value.reason === "owner-pause" ? !active.task.ownerPaused : active.task.ownerPaused) throw new Error("Development intent does not match the current owner pause");
   if (active.value.action === "resume" && active.task.phase === "complete") throw new Error("A completed task cannot resume development services");
   if (active.value.action === "resume") await assertDevelopmentWork(input, active.task);
@@ -211,10 +214,11 @@ export async function assertDevelopmentRequest(input: Context & z.infer<typeof D
   if (active.value.suspension) {
     await assertDevelopmentWork(input, active.task);
     const checked = await assertComputeEvidence({ ...input, ...active.value.suspension, allowStopped: true });
+    mergedStop = checked.mergedStop;
     if (checked.evidence.task.id !== active.task.id || checked.resource.id !== active.value.suspension.resourceId || checked.resource.key !== active.value.suspension.resourceKey
       || checked.resource.identityDigest !== active.value.suspension.resourceIdentity) throw new Error("Runtime suspension resource identity changed");
   }
-  return active;
+  return { ...active, ...(mergedStop ? { mergedStop } : {}) };
 }
 export async function assertDevelopmentIntent(input: Context & z.infer<typeof DevelopmentReference>) {
   const active = await assertDevelopmentRequest(input);
@@ -241,6 +245,7 @@ async function selection(input: Context & z.infer<typeof DevelopmentReference>, 
   const before = await current(input, input);
   if (before.value.suspension) await (input.refreshCompute ?? refreshComputeObservation)({ prisma: input.prisma as PrismaClient, config: input.config, environmentId: before.value.suspension.environmentId });
   const active = await assertDevelopmentIntent(input);
+  if (active.mergedStop) await verifyMergedComputeStopSource(active.task, active.mergedStop);
   const records = await input.prisma.remoteTaskResource.findMany({ where: { taskId: active.task.id } });
   // Held local proof reads finish before a write transaction. The transaction
   // then rechecks the original identity, intent and complete resource epoch.
@@ -302,7 +307,8 @@ export async function developmentProjection(input: Context) {
   try { active = await current(input); } catch { return { developmentBlocked: "The saved development intent no longer matches the original task identity" }; }
   if (active.intent.reason !== "owner-pause") {
     try {
-      if (active.task.phase === "complete") throw new Error("Task completed");
+      if (active.task.phase === "complete" && (!active.value.suspension
+        || !(await assertComputeEvidence({ ...input, ...active.value.suspension, allowStopped: true })).mergedStop)) throw new Error("Task completed");
       await assertDevelopmentWork(input, active.task);
     } catch { return { developmentBlocked: "The saved development resume or review handoff is unavailable during cleanup or until work is restored" }; }
   }

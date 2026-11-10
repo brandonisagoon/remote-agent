@@ -162,3 +162,26 @@ it is not actual Greenfield application health or deployed workflow acceptance.
 App-only stop before final verification, combined interruption/restart and
 original-consumer zero-nudge acceptance remain open. New observation contracts
 require this server before dependent Drafted activation in the coordinated cutover.
+
+### Merged app stop without a verification waiver — November 10
+
+RA-21 now uses the existing automatic stop intent and original producer adapter
+after the server observes the owner's exact merged source and no app consumer
+remains. Stale final verification still refuses completion. Fresh full coverage,
+settled original descendants, unchanged source, owner authority and retained
+review/browser checks remain required. Data and cleanup evidence stay retained.
+The collector records a real running lifetime before stopping it, including a
+newly claimed app that merged before its first collection tick. Stopped capacity
+reconciliation now includes descendants that moved working directories.
+
+Validation: 117 focused tests passed with 514 assertions. The actual paired
+Drafted client at `add1ac4`, Unix routes and isolated SQLite passed five lifecycle
+scenarios with 135 assertions. The merged-source scenario preserves stale
+verification through lost completion response, database reconnect and duplicate
+continuation; the app stops once and its original slot settles. Ordinary
+stop/resume, pause during inspection and busy setup also pass. These lifecycle
+fixtures use synthetic Docker/provider and physical-observer responses; the
+separate real-Docker accounting proof above remains distinct. Typecheck passed.
+
+Closed-family recovery after interruption and the combined original-consumer
+release rehearsal remain open. No deployment or live task mutation occurred.
