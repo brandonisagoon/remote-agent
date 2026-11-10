@@ -388,3 +388,41 @@ DRA-46's existing accepted configuration scope still needs to be recorded throug
 owner control and independently verified at cutover before its original task can
 use this path. No live contract, task, account or service was changed. Greenfield's
 live Merge dispatch is already evidenced; no duplicate workflow was introduced.
+
+
+## RA-31 and combined release readers — November 10
+
+The original finalizer now has a paired replay with seven historical sizeBytes
+files, an already removed app/DNS, and a real disposable connector process.
+The process has the recorded connector argument shape but opens no listener and
+never contacts Cloudflare. Actual operating-system identity inspection and bound
+shutdown run; provider HTTP is a fixture. Lost connector receipt, provider
+rejection, lost tunnel-deletion reply and lost final confirmation all resume the
+same accepted operation. Original evidence/connector metadata and prepared proof
+bytes remain unchanged, retained copies verify, and the original task closes.
+
+This combined replay found a retry that rewrote an already released DNS receipt.
+The adapter now leaves that receipt unchanged and refuses a reappeared provider
+record before any deletion. Preview/connector regression: 104 passes / 363
+assertions. The paired evidence/registration sweep recorded 81 passes and one
+five-second timeout in the older seven-file integration. That actual integration
+now has a bounded 30-second budget; its final replay plus the new complete
+finalizer pass together (76 assertions). Both repositories typecheck. RA-31 source
+moves to Verification; real Cloudflare and deployed zero-nudge acceptance remain.
+
+The release manifest now declares task-publication/v1, clerk-assignment/v1 and
+configuration-completion/v1 reader requirements. Activation rejects an unsupported
+server before installation; deployment checks every registered release and saved
+publication/completion/cleanup history before stopping or replacing anything.
+Inactive releases and delivered retry inputs still count. An incompatible older
+server and automatic database rewind are refused without changing history.
+The operation protocol stays 1–3 so existing bindings retain their original code.
+Forty-eight deployment/release tests pass (323 assertions); 28 Drafted manifest,
+operation and CLI guard tests pass (550 assertions). This is compatible source
+preparation, not activation. Server bfc7f49 and Drafted 8278a06 implement the gate.
+
+Read-only configured-policy inventory found one connected product repository,
+Greenfield, on macbook-air. Authenticated active selection still reports generation
+3 at 52c67d3c11f08a0ef99e0899acce32a40a434b8f, policy blob
+2b04bd7d1386e4966c2f2ba4a500bf76db6e7556. Its already verified Merge route is the
+intended scope; historical Cubic policy is not a second active repository to enable.

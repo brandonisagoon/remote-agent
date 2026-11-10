@@ -278,7 +278,7 @@ test.skipIf(!draftedRoot)("DRA52 seven-file sizeBytes receipts keep their regist
       if (entry.target.type === "file") expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
     }
   } finally { await server.stop(true); legacyEvidenceDependencies.prepare = originalPrepare; }
-});
+}, 30_000);
 test("saved evidence supplements an already bound cleanup without replacing its original records", async () => {
   const f = await fixture({ privateBackup: true });
   const active = await prepareTaskFinalization({ ...f.finalInput, cleanup: true }, f.dependencies);
@@ -784,3 +784,90 @@ for (const changed of ["running", "unknown", "failed", "revoked", "active-descen
   expect(await db.prisma.computeSlot.findUniqueOrThrow({ where: { allocationId: f.offer.id } })).toBeDefined();
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-capacity-reclaimed" } })).toBe(0);
 });
+
+// The connector is a disposable sleeping executable, not a Cloudflare client.
+// Its process inspection and identity-bound signal are real; cloud HTTP is a fixture.
+test.skipIf(process.platform !== "darwin" || !draftedRoot)("original finalizer retries seven legacy files, a real connector and rejected/lost tunnel deletion", async () => {
+  const { connectorProcess } = await import(path.join(draftedRoot!, "test/fixtures/connector-process.ts"));
+  const { inspectHostProcess } = await import(path.join(draftedRoot!, "src/runtime-transfer-host.ts"));
+  const { taskRegistry, closeTask } = await import(path.join(draftedRoot!, "src/control.ts"));
+  const { finalizeTask } = await import(path.join(draftedRoot!, "src/finalize.ts"));
+  const { manageResource } = await import(path.join(draftedRoot!, "src/resources.ts"));
+  const { manageConnectorResource } = await import(path.join(draftedRoot!, "src/connector-resources.ts"));
+  const { releasePublicPreview } = await import(path.join(draftedRoot!, "src/public-preview.ts"));
+  const tunnelId = "11111111-2222-4333-8444-555555555555", accountId = "a".repeat(32), zoneId = "b".repeat(32);
+  const hostname = "drafted-task-dev.brandongoon.com", source = "http://127.0.0.1:3234";
+  const environment = path.join(directory, "environments", "task"), configPath = path.join(environment, "cloudflared.yml"), pidFile = path.join(environment, "connector.pid");
+  let processFixture: Awaited<ReturnType<typeof connectorProcess>> | undefined;
+  let server: ReturnType<typeof Bun.serve> | undefined;
+  const savedPrepare = legacyEvidenceDependencies.prepare;
+  try {
+    const f = await fixture({ files: 7, historicalSizeBytes: true, beforePrepare: async task => {
+      await db.prisma.remoteTaskResource.deleteMany({ where: { taskId: task.id, key: "clerk" } });
+      await mkdir(environment, { recursive: true, mode: 0o700 });
+      const credentialFile = path.join(environment, "tunnel.json");
+      await writeFile(credentialFile, JSON.stringify({ TunnelID: tunnelId, AccountTag: accountId, TunnelSecret: "fixture-only" }), { mode: 0o600 });
+      await writeFile(configPath, JSON.stringify({ tunnel: tunnelId, "credentials-file": credentialFile, ingress: [{ hostname, service: source }, { service: "http_status:404" }] }), { mode: 0o600 });
+      processFixture = await connectorProcess(directory, task.worktreePath!, configPath);
+      const identity = processFixture.identity;
+      await writeFile(pidFile, String(identity.pid) + "\n", { mode: 0o600 });
+      const resources = [
+        { key: "development-env-directory", kind: "directory", externalId: environment, state: "ready", metadata: { trackedGreenfieldEdits: false } },
+        { key: "connector", kind: "cloudflared-connector", externalId: "pid:" + identity.pid, state: "ready", metadata: { version: 1, taskId: task.id, pid: identity.pid, process: identity, configPath, pidFile, tunnelId, hostname, source, dedicated: true, accountId } },
+        { key: "tunnel", kind: "cloudflare-tunnel", externalId: tunnelId, state: "ready", metadata: { shared: false, hostname, tunnelId, accountId, zoneId, dnsRecordId: "c".repeat(32), configPath, source } },
+        { key: "app", kind: "docker-container", externalId: "already-removed-app", state: "released", metadata: {} },
+        { key: "dns", kind: "cloudflare-dns-record", externalId: "c".repeat(32), state: "released", metadata: { hostname, tunnelId, zoneId } },
+      ];
+      for (const resource of resources) await db.prisma.remoteTaskResource.create({ data: { taskId: task.id, purpose: "development", ...resource } });
+    } });
+    const retained = await f.adopt();
+    legacyEvidenceDependencies.prepare = f.manageDependencies.prepare;
+    const socket = path.join(directory, "combined.sock");
+    server = Bun.serve({ unix: socket, fetch: f.app.fetch });
+    const wire = taskRegistry(socket, f.task.id), input = { ...f.finalInput, cleanup: true as const };
+    const operation = await prepareTaskFinalization(input, f.dependencies);
+    const frozen = await db.prisma.runtimeMetadataEvent.findMany({ where: { action: { in: ["finalization-prepared", "finalization-cleanup-started", "legacy-evidence-retained"] } }, orderBy: { sequence: "asc" } });
+    const originalResources = await db.prisma.remoteTaskResource.findMany({ where: { taskId: f.task.id } });
+    let loseConnector = true, rejectDelete = true, loseDelete = true, loseConfirm = true, tunnelPresent = true, deleteAttempts = 0;
+    const provider = { request: async (method: string, route: string) => {
+      if (method === "GET" && route.includes("/dns_records")) return route.endsWith("c".repeat(32)) ? null : [];
+      if (method === "GET" && route.endsWith("/connections")) return await inspectHostProcess(processFixture!.identity.pid) ? [{ id: "live" }] : [];
+      if (route !== "/accounts/" + accountId + "/cfd_tunnel/" + tunnelId) throw new Error("Unexpected provider route: " + route);
+      if (method === "GET") return tunnelPresent ? { id: tunnelId, name: "fixture" } : null;
+      if (method !== "DELETE") throw new Error("Unexpected provider mutation");
+      expect(await inspectHostProcess(processFixture!.identity.pid)).toBeNull();
+      deleteAttempts++;
+      if (rejectDelete) { rejectDelete = false; throw new Error("HTTP 400 / code 1022 fixture rejection"); }
+      tunnelPresent = false;
+      if (loseDelete) { loseDelete = false; throw new Error("lost tunnel deletion reply"); }
+      return null;
+    } };
+    const registry = { ...wire,
+      prepareFinalization: (request: object) => prepareTaskFinalization({ ...input, ...request }, f.dependencies),
+      confirmFinalization: async () => { const result = await confirmTaskFinalization(input, f.dependencies); if (loseConfirm) { loseConfirm = false; throw new Error("lost final confirmation"); } return result; },
+      publishCleanupStatus: undefined,
+      publishCleanupReport: async () => ({ published: false, recorded: true, reportId: "fixture-report-deferred" }),
+      resource: async (receipt: any) => { await wire.resource(receipt); if (receipt.key === "connector" && receipt.state === "released" && loseConnector) { loseConnector = false; throw new Error("lost connector receipt reply"); } },
+    };
+    const manage = async (request: any) => (request.key === "tunnel"
+      ? releasePublicPreview({ registry: request.registry, key: "tunnel", provider, releaseConnector: (key: string) => manageConnectorResource({ registry: request.registry, key, action: "release" }) })
+      : manageResource(request));
+    const finalize = () => finalizeTask({ registry, cleanup: true, manage, close: () => closeTask(socket, f.task.id) });
+    await expect(finalize()).rejects.toThrow();
+    expect(loseConnector).toBeFalse(); expect(await inspectHostProcess(processFixture!.identity.pid)).toBeNull(); expect(deleteAttempts).toBe(0);
+    await expect(finalize()).rejects.toThrow(); expect(deleteAttempts).toBe(1); expect(tunnelPresent).toBeTrue();
+    await expect(finalize()).rejects.toThrow(); expect(deleteAttempts).toBe(2); expect(tunnelPresent).toBeFalse();
+    await expect(finalize()).rejects.toThrow("lost final confirmation");
+    const confirmation = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "finalization-confirmed" } });
+    expect(await finalize()).toMatchObject({ closed: true });
+    expect(await finalize()).toMatchObject({ closed: true, alreadyClosed: true });
+    expect(deleteAttempts).toBe(2);
+    expect(await db.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: confirmation.sequence } })).toEqual(confirmation);
+    expect(await db.prisma.runtimeMetadataEvent.findMany({ where: { sequence: { in: frozen.map(row => row.sequence) } }, orderBy: { sequence: "asc" } })).toEqual(frozen);
+    expect(operation.cleanup!.operationRevision).toBeGreaterThan(0);
+    expect(await lstat(f.worktree).catch(() => null)).toBeNull();
+    expect(git(f.root, "worktree", "list", "--porcelain")).not.toContain(f.worktree);
+    for (const resource of originalResources.filter(row => row.key.startsWith("capture-") || row.key === "connector" || row.state === "released")) expect((await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).metadata).toEqual(resource.metadata);
+    for (const entry of retained.proof.entries) if (entry.target.type === "file") expect(sha(await readFile(entry.retained.path))).toBe(entry.target.sha256);
+  } finally { legacyEvidenceDependencies.prepare = savedPrepare; await server?.stop(true); await processFixture?.stop(); }
+}, 90_000);
