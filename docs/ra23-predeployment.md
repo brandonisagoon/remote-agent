@@ -339,3 +339,26 @@ other lifecycle cases passed in the preceding sweep. Final configuration and
 operation regression passes 106 tests / 807 assertions; the expanded configuration
 suite passes 54 tests / 237 assertions. Full combined release rehearsal remains
 the final frozen-pair gate.
+
+## RA-27 account preparation and exact cleanup
+
+Drafted now supplies durable, exclusive synthetic test scenarios before compute
+setup while ordinary approved shared login stays read-only. The compatible server
+accepts the exact interrupted-creation assignment target and checks cross-task
+email, provider ID, external ID and session claims before prepared cleanup.
+An absent assignment never invents a provider user ID; late creation or changed
+lifetime invalidates the old preparation. No provider credentials or raw errors
+are published. Ordinary generation checks use task-local allowance resets;
+Stripe checkout is separate scope.
+
+The server cleanup/regression batch passes 64 tests / 262 assertions. The final
+expanded Clerk suite passes 18 tests / 193 assertions, including actual Drafted
+observation and retirement through the server's planner/confirmation after a lost
+creation/deletion reply. Server typecheck passes. Provider and registry responses
+are fixtures. Drafted's 90 focused checks pass / 1,965 assertions and check passes.
+The new cleanup target and account state family require the compatible pair;
+final rollback-reader gates and real browser switching remain required.
+
+Full CI at efe0db0 is green (42884343515), including lint, all tests and desktop
+build. This resolves the RA-22 wakeup CI gate; the account changes still need
+combined release validation. No live task or provider resource was changed.

@@ -49,6 +49,9 @@ export const CleanupTarget = z.discriminatedUnion("kind", [
     profile: z.strictObject({ path: Absolute, dev: z.number().int().nonnegative(), ino: z.number().int().nonnegative(), mode: z.number().int().nonnegative(), ownerFile: Absolute, ownerSha256: Hash }) }),
   z.strictObject({ ...Common, kind: z.literal("clerk-user"), id: z.string().regex(/^user_[A-Za-z0-9]+$/), scope: ClerkScope,
     creation: z.strictObject({ createdAt: z.number().int().nonnegative(), emailDigest: Hash }).nullable() }),
+  z.strictObject({ ...Common, kind: z.literal("clerk-assignment"), id: z.string().regex(/^drafted-test-[a-f0-9]{64}$/), scope: ClerkScope,
+    emailDigest: Hash, markerDigest: Hash, subjectId: z.string().regex(/^user_[A-Za-z0-9]+$/).nullable(),
+    creation: z.strictObject({ createdAt: z.number().int().nonnegative(), emailDigest: Hash }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("clerk-session"), id: z.string().regex(/^sess_[A-Za-z0-9]+$/), userId: z.string().regex(/^user_[A-Za-z0-9]+$/), scope: ClerkScope,
     creation: z.strictObject({ createdAt: z.number().int().nonnegative() }).nullable() }),
   z.strictObject({ ...Common, kind: z.literal("browser-auth-entry"), id: z.string().regex(/^[A-Za-z0-9_-]+$/), scope: z.strictObject({ ...Scope, namespace: z.literal("drafted"), keyFile: Absolute, keySha256: Hash }),
@@ -97,7 +100,7 @@ export const CleanupObserverResult = z.strictObject({ version: z.literal(1), tas
     if (result.targets.some(target => target.identityDigest !== cleanupTargetDigest(target))) ctx.addIssue({ code: "custom", message: "Observer target digest does not match its exact identity" });
     if (result.targets.some(target => (target.kind === "docker-container" || target.kind === "docker-network") && target.presentAtPrepare && !/^[a-f0-9]{64}$/.test(target.id))) ctx.addIssue({ code: "custom", message: "Present Docker objects require complete IDs" });
     if (result.targets.some(target => target.scope.taskId !== result.taskId || target.kind.startsWith("docker-") && "identity" in target && target.presentAtPrepare !== (target.identity !== null))) ctx.addIssue({ code: "custom", message: "Observer target ownership or initial identity is invalid" });
-    if (result.targets.some(target => (target.kind === "clerk-user" || target.kind === "clerk-session") && target.presentAtPrepare && target.creation === null)) ctx.addIssue({ code: "custom", message: "A present Clerk target requires its original provider creation identity" });
+    if (result.targets.some(target => (target.kind === "clerk-user" || target.kind === "clerk-session" || target.kind === "clerk-assignment") && target.presentAtPrepare && (target.creation === null || target.kind === "clerk-assignment" && target.subjectId === null))) ctx.addIssue({ code: "custom", message: "A present Clerk target requires its original provider creation identity" });
   });
 export type CleanupObserverResult = z.infer<typeof CleanupObserverResult>;
 

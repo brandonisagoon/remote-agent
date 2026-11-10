@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import path from "node:path";
 import { CleanupAdapterPlan } from "./cleanup-adapter-resources.ts";
 import { assertRegisteredCaptureSharing } from "./cleanup-filesystem.ts";
-import { cleanupTargetDigest } from "./cleanup-observer-schema.ts";
+import { cleanupDigest, cleanupTargetDigest } from "./cleanup-observer-schema.ts";
 import { assertFinalizationResources, finalizationResourceIdentity, prepareFinalizationResources, type FinalizationResourceRecord, type ResourceObservation } from "./finalization-resources.ts";
 
 function fixture() {
@@ -95,3 +95,54 @@ test.skipIf(!draftedRoot)("actual prepared client revokes the exact session befo
   await run(); await verify(true); expect(effects).toHaveLength(2); expect(writes).toEqual(["development-session", "development-user"]);
   expect((resources[0]!.metadata as Record<string, unknown>).credentialsFile).toBe("/never/read/receipt.env");
 }, 30_000);
+
+for (const change of ["none", "foreign-email", "foreign-subject", "foreign-assignment", "changed-own", "cross-purpose-session"] as const) test("pending assignment cleanup binds server sharing inventory: " + change, async () => {
+  const f = fixture(), externalId = "drafted-test-" + "a".repeat(64), email = "drafted." + "a".repeat(40) + "+clerk_test@example.com";
+  const record = f.records[0]!;
+  record.externalId = email; record.metadata = { email, testIdentityPending: { externalId } } as never;
+  const old = f.plan[0]!, prior = old.targets[0]!;
+  const target = { ...prior, kind: "clerk-assignment", id: externalId, subjectId: "user_Exact", emailDigest: cleanupDigest(email), markerDigest: "b".repeat(64) };
+  f.plan[0] = CleanupAdapterPlan.parse({ ...old, ...finalizationResourceIdentity(record), targets: [{ ...target, identityDigest: cleanupTargetDigest(target as never) }] });
+  if (change === "changed-own") (record.metadata as any).changed = true;
+  else if (change !== "none") {
+    const other = { ...structuredClone(record), id: "another", key: "another", taskId: "another-task" };
+    if (change === "foreign-email") other.metadata = { email } as never;
+    if (change === "foreign-subject") { other.externalId = "user_Exact"; other.metadata = {} as never; }
+    if (change === "cross-purpose-session") { other.kind = "clerk-test-session"; other.purpose = "review"; other.externalId = "sess_Other"; other.metadata = { userId: "user_Exact" } as never; }
+    f.records.push(other);
+  }
+  if (change === "none") await f.check(); else await expect(f.check()).rejects.toThrow("shared");
+});
+
+test.skipIf(!draftedRoot)("actual client reconciles interrupted account creation through the server's frozen cleanup plan", async () => {
+  const taskId = "original-task", primarySessionId = "primary", userId = "user_Created", externalId = "drafted-test-" + "a".repeat(64);
+  const email = "drafted." + "a".repeat(40) + "+clerk_test@example.com";
+  const marker = { version: 1, taskId, primarySessionId, purpose: "development", allocationId: "b".repeat(64), scenarioDigest: "c".repeat(64), slot: 0, instanceId: "ins_Test" };
+  const resources: FinalizationResourceRecord[] = [{ id: "user", key: "assigned-user", kind: "clerk-test-user", purpose: "development", externalId: email, state: "unknown",
+    metadata: { synthetic: true, createdByTask: true, email, testIdentityPending: { ...marker, externalId, requestedCreatedAt: "2020-01-01T00:00:00.000Z" } } }];
+  const descriptor = { id: taskId, primarySessionId, worktreePath: "/private/disposable-product", toolingRevision: "a".repeat(40) };
+  const capability = { version: 1 as const, source: "configured-host" as const, checkout: "/private/disposable-tooling", revision: "b".repeat(40), adapter: "/private/disposable-tooling/src/cli.ts", adapterSha256: "c".repeat(64) };
+  const credentials = { backupFile: "/private/fixed.enc.json", backupSha256: "a".repeat(64), keyFile: "/private/fixed.key", keyId: "b".repeat(64) };
+  let present = true, lost = true, deletions = 0;
+  const clerk = { credentials: async () => credentials, request: async (method: string, route: string, expected: unknown, beforeEffect?: () => Promise<void>) => {
+    expect(expected).toEqual(credentials);
+    if (method === "DELETE" && route === "/users/" + userId) { await beforeEffect!(); present = false; deletions++; if (lost) { lost = false; throw new Error("lost acknowledgment"); } return null; }
+    if (method !== "GET") throw new Error("unselected mutation");
+    if (route === "/instance") return { id: "ins_Test", environment_type: "development" };
+    if (route === "/users?" + new URLSearchParams({ "email_address[]": email, limit: "2" })) return present ? [{ id: userId, created_at: Date.parse("2020-01-01T00:00:00Z"), external_id: externalId, email_addresses: [{ email_address: email }], private_metadata: { draftedTestIdentity: marker } }] : [];
+    throw new Error("unselected read");
+  } };
+  const { observeCleanupBatch } = await import(path.join(draftedRoot!, "src/cleanup-observer.ts"));
+  const { releasePreparedResources } = await import(path.join(draftedRoot!, "src/finalization-resources.ts"));
+  const { adapterReceipt } = await import(path.join(draftedRoot!, "test/fixtures/prepared-adapter.ts"));
+  const observation: ResourceObservation = { rootIdle: async () => {}, endpointAbsent: async () => {}, browserAbsent: async () => {}, adapters: ({ request }) => observeCleanupBatch(request, { clerk }) };
+  const plan = await prepareFinalizationResources({ taskId, sessionId: primarySessionId, resources, sourcePaths: [], deliveries: [], toolingRoot: "/private/old-tooling", originalWork: true, ownership: { ownedPaths: [] }, adapterContext: { task: descriptor, capability } }, observation);
+  const task = { ...descriptor, phase: "waiting", finalizationVersion: 2, resources }, prepared = adapterReceipt(task, plan);
+  const verify = (removed = false) => assertFinalizationResources({ taskId, resources, plan, originalWork: true, removed }, observation);
+  const registry = { task: async () => structuredClone(task), prepareFinalization: async () => structuredClone(prepared), resource: async (update: { key: string; state: string }) => { Object.assign(resources[0]!, update); await verify(); } };
+  const run = () => releasePreparedResources({ registry, prepared, adapters: { observer: { clerk } }, assertAuthority: () => verify(), observation });
+  expect((await run()).results.some((result: { outcome: string }) => result.outcome === "failed")).toBeTrue();
+  expect(resources[0]!.state).toBe("unknown"); expect(deletions).toBe(1);
+  expect((await run()).results.filter((result: { outcome: string }) => result.outcome === "failed")).toEqual([]);
+  await verify(true); expect(resources[0]!.state).toBe("released"); expect(deletions).toBe(1);
+});
