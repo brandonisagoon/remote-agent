@@ -161,12 +161,17 @@ export async function drainRuntimeEventProjection(
   }
 }
 
-export function startRuntimeEventProjection(input: ProjectionInput, work = async () => {
-  await drainRuntimeEventProjection(input);
-  await reconcileSourceMessages(input.config, input.prisma, input.runtime);
-  await reconcileControlNotices(input.config, input.prisma);
-  await projectTaskStalls(input);
-}, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1]; confirmFinalization?: Parameters<typeof preparationJournalWorker>[2] } = {}): () => Promise<void> {
+export function startRuntimeEventProjection(input: ProjectionInput, work?: () => Promise<void>, options: { prepareFinalization?: Parameters<typeof preparationJournalWorker>[1]; confirmFinalization?: Parameters<typeof preparationJournalWorker>[2]; projectStalls?: typeof projectTaskStalls } = {}): () => Promise<void> {
+  const runEvents = work ?? (async () => {
+    await drainRuntimeEventProjection(input);
+    await reconcileSourceMessages(input.config, input.prisma, input.runtime);
+    await reconcileControlNotices(input.config, input.prisma);
+  });
+  // One optional scan in the existing worker, with the same shutdown boundary.
+  // A slow tracker request must not hold the delegate-result/instruction drain.
+  const scan = options.projectStalls ?? (!work ? projectTaskStalls : undefined);
+  const scanController = new AbortController();
+  let scanning: Promise<void> | undefined;
   const preparations = preparationJournalWorker(input, options.prepareFinalization, options.confirmFinalization);
   let running: Promise<void> | undefined;
   let requested = false;
@@ -174,12 +179,15 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
   const drain = () => {
     if (stopped) return;
     preparations.tick();
+    if (scan && !scanning) scanning = scan({ ...input, signal: scanController.signal })
+      .catch(error => console.error("[runtime-events] stall scan failed:", error))
+      .finally(() => { scanning = undefined; });
     requested = true;
     if (running) return;
     running = (async () => {
       do {
         requested = false;
-        try { await work(); }
+        try { await runEvents(); }
         catch (error) { console.error("[runtime-events] journal drain failed:", error); }
         await yieldToRequests();
       } while (requested && !stopped);
@@ -194,7 +202,8 @@ export function startRuntimeEventProjection(input: ProjectionInput, work = async
     stopped = true;
     clearInterval(timer);
     unsubscribe();
-    await running;
+    scanController.abort();
+    await Promise.all([running, scanning]);
     await preparations.stop();
   };
 }

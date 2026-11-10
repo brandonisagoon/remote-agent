@@ -166,3 +166,17 @@ test("RA-25: recovery does not strand a pending blocker publication", async () =
   expect([...f.comments.values()][1]!.body).toContain("Earlier blocker resolved");
   expect(await f.prisma.runtimeIssueUpdate.count({ where: { published: false } })).toBe(0);
 });
+
+
+test("RA-25: quiet tasks perform no tracker reads and a stopped scan cannot publish", async () => {
+  const f = await fixture();
+  let reads = 0; const source = f.client.source;
+  f.client.source = async input => { reads++; return source(input); };
+  await f.instruction("waiting", "queued"); await f.scan();
+  expect(reads).toBe(0);
+  await f.instruction();
+  const controller = new AbortController(); controller.abort();
+  await projectTaskStalls({ prisma: f.prisma, config: f.config, runtime: f.runtime, signal: controller.signal }, f.client, () => f.time() + 60000);
+  expect(reads).toBe(0);
+  expect(f.comments.size).toBe(0);
+});

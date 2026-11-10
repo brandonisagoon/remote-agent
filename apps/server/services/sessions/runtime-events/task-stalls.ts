@@ -8,7 +8,7 @@ import { listRuntimeProjectionRetries, resolveRuntimeProjectionRetry, runRuntime
 
 const scans = new WeakMap<PrismaClient, number>();
 const graceMs = 60_000;
-type Input = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime };
+type Input = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime; signal?: AbortSignal };
 type Signal = { kind: "instruction" | "question" | "result" | "projection" | "operation"; sessionId: string; id: string; since: string; cause: string };
 const terminal = (issue: { state: { type: string } }) => ["completed", "canceled"].includes(issue.state.type);
 const eligible = { ownerPaused: false, phase: { notIn: ["complete", "closed"] }, environmentStatus: { not: "stopped" } };
@@ -23,14 +23,12 @@ export async function projectTaskStalls(input: Input, client = issueUpdateDelive
   scans.set(prisma, at);
   const tasks = await prisma.remoteTask.findMany({ where: { ...eligible, machineId: config.machine, primarySessionId: { not: null } } });
   for (const task of tasks) {
+    if (input.signal?.aborted) break;
     try {
       const primary = await prisma.runtimeSession.findUnique({ where: { id: task.primarySessionId! }, include: { sessionMirror: true } });
       if (!primary || primary.status === "closed" || primary.role !== "primary" || primary.cwd !== task.worktreePath || primary.machineId !== task.machineId || primary.repositoryId !== task.repositoryId) continue;
       const links = await prisma.runtimeSessionResourceLink.findMany({ where: { runtimeSessionId: primary.id, provider: "linear", resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
       if (links.length > 1 || !links.length && !primary.sessionMirror) continue;
-      const source = await client.source({ ...input, sessionId: primary.id });
-      const link = links[0] ?? source.link;
-      if ( task.connectionId && task.connectionId !== link.connectionId || task.issueIdentifier && task.issueIdentifier !== link.externalId) continue;
       const children = await prisma.runtimeSession.findMany({ where: { role: "delegate", machineId: primary.machineId, repositoryId: primary.repositoryId, outgoingRelations: { some: { targetSessionId: primary.id, relationship: "spawned-by", endedAt: null } } } });
       const sessionIds = [primary.id, ...children.filter((row) => row.status !== "closed").map((row) => row.id)];
       const [instructions, questions, notifications, retries] = await Promise.all([
@@ -57,7 +55,15 @@ export async function projectTaskStalls(input: Input, client = issueUpdateDelive
         if (retry.stage === "stall" || retry.state !== "exhausted") continue;
         signals.push({ kind: "projection", sessionId: retry.sessionId, id: `${retry.stage}:${retry.eventId}`, since: new Date(retry.failedAt).toISOString(), cause: `${retry.stage === "notify" ? "Delegate-result notification" : "Source-update publication"} exhausted automatic delivery attempts; explicit projection recovery is required.` });
       }
+      if (!signals.length && !await prisma.toolingOperation.count({ where: { taskId: task.id, sessionId: primary.id, status: { in: ["running", "unknown"] } } })
+        && !await prisma.runtimeEventCursor.count({ where: { runtimeSessionId: primary.id, consumer: { startsWith: "task-publication:v1:" }, sourceCursor: { not: null } } })
+        && !await prisma.runtimeIssueUpdate.count({ where: { runtimeSessionId: primary.id, published: false, OR: [{ requestKey: { startsWith: "task-publication:v1:" } }, { requestKey: { startsWith: "task-stall:v1:" } }] } })) continue;
+      if (input.signal?.aborted) break;
+      const source = await client.source({ ...input, sessionId: primary.id });
+      const link = links[0] ?? source.link;
+      if (task.connectionId && task.connectionId !== link.connectionId || task.issueIdentifier && task.issueIdentifier !== link.externalId) continue;
       const stillOwned = async () => {
+        if (input.signal?.aborted) return false;
         const current = await prisma.remoteTask.findFirst({ where: { id: task.id, ...eligible, primarySessionId: primary.id, worktreePath: primary.cwd, repositoryId: primary.repositoryId, machineId: primary.machineId, connectionId: task.connectionId, issueIdentifier: task.issueIdentifier } });
         const currentLinks = await prisma.runtimeSessionResourceLink.findMany({ where: { runtimeSessionId: primary.id, provider: "linear", resourceType: "issue-identifier", relationship: "handles", endedAt: null } });
         if (!links.length) {

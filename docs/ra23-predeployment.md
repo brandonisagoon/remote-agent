@@ -273,3 +273,13 @@ handle test; its assertions did not run. This remains a release-validation gap
 until the fixture hook and the full combined CI are verified. New publication
 receipt inputs also require a compatible rollback reader; unchanged SQL schema
 alone is not a rollback compatibility proof.
+
+
+RA-25 publication fairness is now covered by the existing projection worker's
+single independently awaited scan. A held tracker scan cannot hold the durable
+delegate-result drain; a later result reaches its original primary exactly once.
+The worker retains one scan, aborts further publication on shutdown and awaits
+it before stopping. Quiet tasks with no failure/history/outbox perform no tracker
+read. All 39 runtime-event tests pass (219 assertions), including the held-scan,
+quiet-task and stop cases; typecheck passes. RA-25 source work can move to
+Verification, retaining the final compatible upgrade/rollback and live task gates.

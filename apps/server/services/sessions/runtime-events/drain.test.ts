@@ -319,3 +319,29 @@ test("events arriving during notification wait for the next pass without delayin
   expect(projected).toEqual(notified);
   expect(await input.prisma.runtimeLifecycleEvent.count()).toBe(6);
 });
+
+
+test("RA-25: a held tracker scan cannot strand a later delegate result, and shutdown retains one scan", async () => {
+  const { input, first } = await fixture();
+  let listener: ((event: any) => void | Promise<void>) | undefined;
+  input.runtime.subscribeAll = callback => { listener = callback; return () => { listener = undefined; }; };
+  let scans = 0, release!: () => void, aborted = false;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const stop = startRuntimeEventProjection(input, undefined, { projectStalls: async scanInput => {
+    scans++;
+    scanInput.signal?.addEventListener("abort", () => { aborted = true; release(); }, { once: true });
+    await held;
+  } });
+  try {
+    for (let tries = 0; tries < 500 && await input.prisma.runtimeInstruction.count() < 3; tries++) await Bun.sleep(2);
+    expect(await input.prisma.runtimeInstruction.count()).toBe(3);
+    const event = await appendRuntimeLifecycleEvent(input.prisma, { kind: "turn", id: "later-during-tracker-wait", requestId: "later-during-tracker-wait", sessionId: first.id, createdAt: Date.now(), phase: "completed", output: "A real later result" });
+    for (let index = 0; index < 100; index++) await listener?.(event);
+    for (let tries = 0; tries < 500 && await input.prisma.runtimeInstruction.count() < 4; tries++) await Bun.sleep(2);
+    expect(await input.prisma.runtimeInstruction.count()).toBe(4);
+    expect(scans).toBe(1);
+    expect(await input.prisma.runtimeIssueUpdate.count()).toBe(0);
+  } finally { await stop(); release(); }
+  expect(aborted).toBe(true);
+  expect(listener).toBeUndefined();
+}, 10_000);
