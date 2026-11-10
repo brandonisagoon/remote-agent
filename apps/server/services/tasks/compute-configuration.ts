@@ -6,7 +6,7 @@ import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admis
 import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { verifiedComputeRuntime, readConfiguredComputeObservation, operationEnvironment } from "./compute-observer.ts";
-import { acknowledgeConfigurationConsumer, configurationAttemptCode, currentToolingOperation } from "./tooling-operations.ts";
+import { acknowledgeConfigurationConsumer, configurationAttemptCode, currentToolingAttempt, currentToolingOperation } from "./tooling-operations.ts";
 import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
@@ -21,6 +21,14 @@ const Proof = z.object({ version: z.literal(1), taskId: z.string(), primarySessi
 type Input = { prisma: PrismaClient; config: ServerConfig; taskId: string; request: z.infer<typeof ComputeConfiguration> };
 type Snapshot = Awaited<ReturnType<typeof snapshot>>;
 const Action = "compute-runtime-configuration";
+type ConfigurationStage = "validation" | "authority" | "source" | "configuration-observation" | "observer-selection" | "stopped-observation" | "source-recheck" | "authority-recheck" | "transition-commit" | "reader-acknowledgment";
+export class ComputeConfigurationFailure extends Error {
+  readonly code: string;
+  constructor(readonly stage: ConfigurationStage, readonly attemptId: string, cause: unknown) {
+    super(cause instanceof Error ? cause.message : "Runtime configuration failed", { cause });
+    this.code = `configuration-${stage.replace(/^configuration-/, "")}-failed`;
+  }
+}
 async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.TransactionClient }) {
   const owner = await computeTaskOwner(input.prisma, input.taskId, input.config.machine);
   const offer = await input.prisma.computeOffer.findUniqueOrThrow({ where: { id: input.request.offerId } });
@@ -89,75 +97,99 @@ async function readConfiguration(input: Input, before: Snapshot) {
  * admission must allocate afresh. No offer, slot, start permission, pin or provider is created.
  * The journal and both hashes commit together; retries still re-observe ownership. */
 export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision, observe = readConfiguredComputeObservation) {
-  if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
-  input = { ...input, request: ComputeConfiguration.parse(input.request) };
-  const before = await snapshot(input);
-  if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed");
-  const proof = Proof.parse(await read(input, before));
-  if (proof.taskId !== input.taskId || proof.primarySessionId !== before.owner.session.id || proof.environmentId !== before.environment.id || proof.resourceId !== before.resource.id
-    || proof.offerId !== input.request.offerId || proof.revision !== before.environment.revision || proof.previousRecipeHash !== input.request.previousRecipeHash || proof.recipeHash !== input.request.recipeHash
-    || finalizationDigest(proof.compute) !== finalizationDigest(input.request.coverage.next)) throw new Error("Configuration proof changed ownership");
-  const again = Proof.parse(await read(input, before));
-  if (finalizationDigest(again) !== finalizationDigest(proof)) throw new Error("Configuration evidence changed during observation");
-  const metadata = { ...z.record(z.string(), z.json()).parse(before.resource.metadata), recipeHash: input.request.recipeHash, compute: proof.compute };
-  const projected = { ...before.resource, metadata };
-  const projectedIdentity = finalizationResourceIdentity(projected).identityDigest;
-  const candidate = { ...before.environment, recipeDigest: input.request.recipeHash, resourceIdentity: projectedIdentity, observation: null };
-  // The ordinary configured observer must accept the staged generation before
-  // it can be activated. This supplies real stopped accounting now and leaves
-  // a valid immutable manifest for subsequent collector refresh while queued.
-  const selection = await configurationAttemptCode(input.prisma, before.owner.task, candidate.id, input.request);
-  const stopped = await observe(input, before.owner.task, candidate, projected, [], undefined, selection);
-  const observation = ComputeObservation.parse(stopped.observation);
-  if (observation.state !== "stopped"
-    || observation.operations.active !== 0 || observation.configurationDigest !== proof.compute.configurationSha256) throw new Error("Staged configuration has no fresh stopped accounting");
-  if (stopped.traffic.length !== observation.routes.length || stopped.traffic.some(value => !observation.routes.some(route => finalizationDigest(route) === finalizationDigest(value.route)))) throw new Error("Staged configuration traffic proof changed");
-  if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed during observation");
-  return input.prisma.$transaction(async tx => {
-    // This fresh snapshot also checks current pause, original primary/source
-    // link, intent, slot, active offer and prior transition receipt.
-    const current = await snapshot({ ...input, prisma: tx });
-    await configurationAttemptCode(tx as PrismaClient, current.owner.task, candidate.id, input.request);
-    // Collector telemetry is not transition authority. Our independently
-    // observed staged generation replaces it atomically below. Retain every
-    // ownership, allocation, recipe and development-intent comparison.
-    const stable = (value: Snapshot) => {
-      const { observation: _observation, updatedAt: _updatedAt, ...environment } = value.environment;
-      return { identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment, resource: value.resource,
-        offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent };
-    };
-    if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
-    if (!current.event) {
-      const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
-      await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
-        value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
-          traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile,
-          allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
-      await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
-        observation: Prisma.DbNull } });
-      await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
-    } else {
-      const prior = JSON.parse(current.event.value!);
-      if (prior.proof.baselineSha256 !== proof.baselineSha256 || finalizationDigest(prior.compute) !== finalizationDigest(proof.compute)) throw new Error("Configuration baseline or staged manifest changed after acknowledgment");
-      const identity = finalizationResourceIdentity(current.resource).identityDigest;
-      if (identity !== current.environment.resourceIdentity) {
-        await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: `${Action}-projection`,
-          key: finalizationDigest({ transition: current.key, before: current.environment.resourceIdentity, after: identity }),
-          value: JSON.stringify({ transition: current.key, before: current.environment, resource: current.resource, proof }) } });
-        await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { resourceIdentity: identity, observation: Prisma.DbNull } });
+  const binding = currentToolingOperation(), attempt = currentToolingAttempt();
+  const attemptId = attempt?.route === "POST /api/tasks/:taskId/compute-configure" ? attempt.attemptId : crypto.randomUUID();
+  let stage: ConfigurationStage = "validation", sessionId: string | undefined;
+  try {
+    if (!input.config.compute?.enabled) throw new Error("Compute admission is disabled");
+    input = { ...input, request: ComputeConfiguration.parse(input.request) };
+    stage = "authority";
+    const before = await snapshot(input);
+    sessionId = before.owner.session.id;
+    stage = "source";
+    if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed");
+    stage = "configuration-observation";
+    const proof = Proof.parse(await read(input, before));
+    if (proof.taskId !== input.taskId || proof.primarySessionId !== before.owner.session.id || proof.environmentId !== before.environment.id || proof.resourceId !== before.resource.id
+      || proof.offerId !== input.request.offerId || proof.revision !== before.environment.revision || proof.previousRecipeHash !== input.request.previousRecipeHash || proof.recipeHash !== input.request.recipeHash
+      || finalizationDigest(proof.compute) !== finalizationDigest(input.request.coverage.next)) throw new Error("Configuration proof changed ownership");
+    const again = Proof.parse(await read(input, before));
+    if (finalizationDigest(again) !== finalizationDigest(proof)) throw new Error("Configuration evidence changed during observation");
+    const metadata = { ...z.record(z.string(), z.json()).parse(before.resource.metadata), recipeHash: input.request.recipeHash, compute: proof.compute };
+    const projected = { ...before.resource, metadata };
+    const projectedIdentity = finalizationResourceIdentity(projected).identityDigest;
+    const candidate = { ...before.environment, recipeDigest: input.request.recipeHash, resourceIdentity: projectedIdentity, observation: null };
+    // The ordinary configured observer must accept the staged generation before
+    // it can be activated. This supplies real stopped accounting now and leaves
+    // a valid immutable manifest for subsequent collector refresh while queued.
+    stage = "observer-selection";
+    const selection = await configurationAttemptCode(input.prisma, before.owner.task, candidate.id, input.request);
+    stage = "stopped-observation";
+    const stopped = await observe(input, before.owner.task, candidate, projected, [], undefined, selection);
+    const observation = ComputeObservation.parse(stopped.observation);
+    if (observation.state !== "stopped"
+      || observation.operations.active !== 0 || observation.configurationDigest !== proof.compute.configurationSha256) throw new Error("Staged configuration has no fresh stopped accounting");
+    if (stopped.traffic.length !== observation.routes.length || stopped.traffic.some(value => !observation.routes.some(route => finalizationDigest(route) === finalizationDigest(value.route)))) throw new Error("Staged configuration traffic proof changed");
+    stage = "source-recheck";
+    if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed during observation");
+    return await input.prisma.$transaction(async tx => {
+      // This fresh snapshot also checks current pause, original primary/source
+      // link, intent, slot, active offer and prior transition receipt.
+      stage = "authority-recheck";
+      const current = await snapshot({ ...input, prisma: tx });
+      await configurationAttemptCode(tx as PrismaClient, current.owner.task, candidate.id, input.request);
+      // Collector telemetry is not transition authority. Our independently
+      // observed staged generation replaces it atomically below. Retain every
+      // ownership, allocation, recipe and development-intent comparison.
+      const stable = (value: Snapshot) => {
+        const { observation: _observation, updatedAt: _updatedAt, ...environment } = value.environment;
+        return { identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment, resource: value.resource,
+          offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent };
+      };
+      if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
+      stage = "transition-commit";
+      if (!current.event) {
+        const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
+        await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
+          value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
+            traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile,
+            allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
+        await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
+          observation: Prisma.DbNull } });
         await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
+      } else {
+        const prior = JSON.parse(current.event.value!);
+        if (prior.proof.baselineSha256 !== proof.baselineSha256 || finalizationDigest(prior.compute) !== finalizationDigest(proof.compute)) throw new Error("Configuration baseline or staged manifest changed after acknowledgment");
+        const identity = finalizationResourceIdentity(current.resource).identityDigest;
+        if (identity !== current.environment.resourceIdentity) {
+          await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: `${Action}-projection`,
+            key: finalizationDigest({ transition: current.key, before: current.environment.resourceIdentity, after: identity }),
+            value: JSON.stringify({ transition: current.key, before: current.environment, resource: current.resource, proof }) } });
+          await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { resourceIdentity: identity, observation: Prisma.DbNull } });
+          await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
+        }
       }
-    }
-    await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
-    await recordComputeObservation({ ...input, prisma: tx, environmentId: current.environment.id, observation });
-    for (const state of stopped.traffic) {
-      const previous = await tx.computeTraffic.findUnique({ where: { routeId: state.route.id } });
-      if (previous) throw new Error("Staged route is already owned by another environment");
-      await tx.computeTraffic.create({ data: { routeId: state.route.id, taskId: input.taskId, environmentId: current.environment.id, epoch: state.epoch, sequence: state.sequence, state } });
-    }
-    await acknowledgeConfigurationConsumer(tx, current.owner.task, current.environment.id, input.request, current.key);
-    return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash, compute: proof.compute };
-  });
+      await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
+      await recordComputeObservation({ ...input, prisma: tx, environmentId: current.environment.id, observation });
+      for (const state of stopped.traffic) {
+        const previous = await tx.computeTraffic.findUnique({ where: { routeId: state.route.id } });
+        if (previous) throw new Error("Staged route is already owned by another environment");
+        await tx.computeTraffic.create({ data: { routeId: state.route.id, taskId: input.taskId, environmentId: current.environment.id, epoch: state.epoch, sequence: state.sequence, state } });
+      }
+      stage = "reader-acknowledgment";
+      await acknowledgeConfigurationConsumer(tx, current.owner.task, current.environment.id, input.request, current.key);
+      return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash, compute: proof.compute };
+    });
+  } catch (cause) {
+    const failure = new ComputeConfigurationFailure(stage, attemptId, cause);
+    // Persist only bounded identifiers and classification, never observer
+    // stderr, credentials, request bodies or arbitrary exception messages.
+    const primary = sessionId ?? (binding?.taskId === input.taskId ? binding.sessionId : undefined);
+    if (primary) await input.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: primary, source: `compute:${input.taskId}`,
+      action: "compute-configuration-failure", key: attemptId,
+      value: JSON.stringify({ version: 1, code: failure.code, stage, attemptId, operationId: binding?.operationId ?? null }) } }).catch(() => undefined);
+    throw failure;
+  }
 }
 
 /** Readback for retiring interrupted configure callbacks after a supported

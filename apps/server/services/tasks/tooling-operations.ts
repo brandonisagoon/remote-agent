@@ -343,6 +343,10 @@ export function toolingProcessContext(binding: Pick<ToolingOperationBinding, "op
 }
 export const runAsLegacyContinuation = <T>(reference: ExistingReference, code: ToolingCodeIdentity | null, operation: () => Promise<T>) => scope.run({ legacy: reference, code }, operation);
 export const currentToolingOperation = (): ToolingOperationBinding | undefined => { const value = scope.getStore(); return value && "binding" in value ? value.binding : undefined; };
+export const currentToolingAttempt = (): Pick<CallbackAttempt, "attemptId" | "route"> | undefined => {
+  const value = scope.getStore();
+  return value && "binding" in value && value.attempt ? { attemptId: value.attempt.attemptId, route: value.attempt.route } : undefined;
+};
 export const inLegacyContinuation = () => { const value = scope.getStore(); return Boolean(value && "legacy" in value); };
 /** Explicit identity, else the request scope (legacy snapshot or binding).
  * Undefined means no scope: only an outer independent boundary may select. */

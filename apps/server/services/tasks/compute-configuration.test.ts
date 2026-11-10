@@ -5,10 +5,14 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { requestCompute, bindComputeResource, offerNextCompute, confirmComputeDelivery, claimCompute } from "./compute-admission.ts";
 import type { readConfiguredComputeObservation } from "./compute-observer.ts";
 import { beginTraffic } from "../../../../lib/compute-telemetry.ts";
-import { configureCompute } from "./compute-configuration.ts";
+import { ComputeConfigurationFailure, configureCompute } from "./compute-configuration.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
 import { admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation, resolveEnvironmentConsumers, runWithToolingOperation, settleToolingCommand } from "./tooling-operations.ts";
 import { canonicalDigest } from "./tooling-releases.ts";
+import { Hono } from "hono";
+import type { AppEnv } from "../../middleware/context.ts";
+import { computeRoutes } from "../../routes/tasks/compute.ts";
+import { toolingOperationGuard } from "../../routes/tasks/tooling-operations.ts";
 
 let db: TestDatabase;
 const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: true, slots: 1 }) });
@@ -341,4 +345,35 @@ test.each(["in-flight", "pause", "running", "stale", "resource", "separate-write
   expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.binding.operationId } })).status).toBe(fault === "in-flight" ? "running" : "unknown");
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-command-recovery" } })).toBe(0);
   expect(await db.prisma.computeSlot.count()).toBe(0);
+});
+
+test("configuration diagnostics retain the guarded attempt and stage without observer output or secrets", async () => {
+  const f = await fixture(), operation = await boundConfiguration(f), attempt = await operation.prepare();
+  const secret = "private-observer-stderr-".repeat(10000);
+  f.read = async () => { throw new Error(secret); };
+  const failure = await attempt.run().catch(error => error);
+  expect(failure).toBeInstanceOf(ComputeConfigurationFailure);
+  expect(failure).toMatchObject({ code: "configuration-observation-failed", stage: "configuration-observation", attemptId: attempt.state.attemptId });
+  const record = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-configuration-failure" } });
+  expect(JSON.parse(record.value!)).toEqual({ version: 1, code: failure.code, stage: failure.stage, attemptId: attempt.state.attemptId, operationId: operation.binding.operationId });
+  expect(record.value!.length).toBeLessThan(350);
+  expect(record.value).not.toContain("private-observer-stderr");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(0);
+});
+
+test("the actual configure route reports a bounded source failure and its durable attempt instead of an opaque 409", async () => {
+  const f = await fixture(), operation = await boundConfiguration(f);
+  const app = new Hono<AppEnv>();
+  app.use("*", async (c, next) => { c.set("prisma", db.prisma); c.set("config", operation.config); await next(); });
+  app.use("/api/*", toolingOperationGuard()); app.route("/api/tasks", computeRoutes);
+  const response = await app.request("/api/tasks/task/compute-configure", { method: "POST", headers: { "content-type": "application/json", "x-remote-agent-operation": operation.binding.operationId }, body: JSON.stringify(f.input.request) });
+  expect(response.status).toBe(409);
+  const body = await response.json() as { code: string; stage: string; attemptId: string };
+  expect(body).toMatchObject({ code: "configuration-source-failed", stage: "source", attemptId: expect.any(String) });
+  expect(JSON.stringify(body)).not.toContain("/fixture/task");
+  expect(JSON.stringify(body).length).toBeLessThan(350);
+  const stored = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-configuration-failure", key: body.attemptId } });
+  expect(JSON.parse(stored.value!)).toMatchObject({ code: body.code, stage: body.stage, attemptId: body.attemptId, operationId: operation.binding.operationId });
+  const attempt = await db.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${operation.binding.operationId}` } });
+  expect(attempt.map(row => JSON.parse(row.value!))).toEqual(expect.arrayContaining([expect.objectContaining({ attemptId: body.attemptId, state: "refused", status: 409 })]));
 });

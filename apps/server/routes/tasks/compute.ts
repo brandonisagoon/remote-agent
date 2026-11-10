@@ -1,5 +1,5 @@
 import { apiAuthMiddleware } from "../../middleware/api-auth.ts";
-import { ComputeConfiguration, configureCompute } from "../../services/tasks/compute-configuration.ts";
+import { ComputeConfiguration, ComputeConfigurationFailure, configureCompute } from "../../services/tasks/compute-configuration.ts";
 import { ComputeNeonRecovery, recoverComputeNeon } from "../../services/tasks/compute-neon-recovery.ts";
 import { ComputeEnrollment, computeEnrollmentStatus, enrollCompute } from "../../services/tasks/compute-enrollment.ts";
 import { Hono } from "hono";
@@ -76,7 +76,8 @@ computeRoutes.post("/:taskId/compute-configure", async c => {
   const request = ComputeConfiguration.safeParse(await c.req.json());
   if (!request.success) return c.json({ error: "Exact pending configuration and previous allocation are required" }, 400);
   try { return c.json(await configureCompute({ prisma: c.get("prisma"), config: c.get("config"), taskId: c.req.param("taskId"), request: request.data })); }
-  catch { return c.json({ error: "Pending runtime configuration could not be verified; preserve the existing claim and evidence" }, 409); }
+  catch (error) { return c.json({ error: "Pending runtime configuration could not be verified; preserve the existing claim and evidence",
+    ...(error instanceof ComputeConfigurationFailure ? { code: error.code, stage: error.stage, attemptId: error.attemptId } : { code: "configuration-unclassified-failure" }) }, 409); }
 });
 computeRoutes.use("/:taskId/compute-enroll", apiAuthMiddleware());
 computeRoutes.get("/:taskId/compute-enroll", async c => {
