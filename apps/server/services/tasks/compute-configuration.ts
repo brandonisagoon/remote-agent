@@ -6,7 +6,7 @@ import { assertComputeEnvironmentOwner, computeTaskOwner } from "./compute-admis
 import { assertComputeStartIntent, developmentProjection } from "./development-intent.ts";
 import { executeOwnedObserver } from "./cleanup-resource-observer.ts";
 import { verifiedComputeRuntime, readConfiguredComputeObservation, operationEnvironment } from "./compute-observer.ts";
-import { configurationAttemptCode, currentToolingOperation } from "./tooling-operations.ts";
+import { acknowledgeConfigurationConsumer, configurationAttemptCode, currentToolingOperation } from "./tooling-operations.ts";
 import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
@@ -155,6 +155,7 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       if (previous) throw new Error("Staged route is already owned by another environment");
       await tx.computeTraffic.create({ data: { routeId: state.route.id, taskId: input.taskId, environmentId: current.environment.id, epoch: state.epoch, sequence: state.sequence, state } });
     }
+    await acknowledgeConfigurationConsumer(tx, current.owner.task, current.environment.id, input.request);
     return { environmentId: current.environment.id, resourceId: current.resource.id, recipeHash: input.request.recipeHash, compute: proof.compute };
   });
 }

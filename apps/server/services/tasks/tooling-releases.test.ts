@@ -484,6 +484,8 @@ test("retained consumers keep their release's readers after the producing callba
   expect((await readToolingRetainedConsumers({ prisma: db.prisma, taskId: task.id, family: "drafted.other", scopeKey: "task" }))[0]?.format).toBeNull();
   const resolved = await resolveToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence: { kind: "compute-absent", reference: "env-1" } });
   expect(resolved).toMatchObject({ status: "resolved", resolution: { kind: "compute-absent", reference: "env-1" }, evidence });
+  expect(await confirmToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence })).toEqual(resolved);
+  await expect(confirmToolingConsumer({ prisma: db.prisma, id: consumer.id, evidence: { kind: evidence.kind, reference: "foreign" } })).rejects.toMatchObject({ code: "transition-conflict" });
   expect((await write("runtime:development")).version).toBe(2);
   expect(await readToolingRetainedConsumers({ prisma: db.prisma, taskId: task.id, family: "drafted.runtime", scopeKey: "task" })).toEqual([]);
   expect(await db.prisma.toolingRetainedConsumer.count()).toBe(1);
@@ -517,6 +519,14 @@ test("pending producers stay retained and confirmation supersedes only the confi
   expect(await retain(p1.operationId)).toMatchObject({ id: r1.id, status: "resolved" });
   await expect(resolveToolingConsumer({ prisma: db.prisma, id: r1.id, evidence })).rejects.toMatchObject({ code: "transition-conflict" });
   expect(await db.prisma.toolingRetainedConsumer.count()).toBe(3);
+});
+
+test("a resolved pending reader cannot invent its original acknowledgment", async () => {
+  const task = await ownedTask(); await activate("k1", "A", 0);
+  const producer = await opFor(task, "unacknowledged"), reader = await retain(producer.operationId);
+  const resolved = await resolveToolingConsumer({ prisma: db.prisma, id: reader.id, evidence: { kind: "stopped", reference: "env-1" } });
+  await expect(confirmToolingConsumer({ prisma: db.prisma, id: reader.id, evidence })).rejects.toMatchObject({ code: "transition-conflict" });
+  expect(await retain(producer.operationId)).toEqual(resolved);
 });
 
 test("a confirmed retained consumer continues on its producing release after a newer activation", async () => {

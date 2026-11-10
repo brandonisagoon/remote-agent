@@ -682,7 +682,10 @@ export async function confirmToolingConsumer(input: { prisma: PrismaClient; id: 
   return input.prisma.$transaction(async (tx) => {
     const row = await tx.toolingRetainedConsumer.findUnique({ where: { id: input.id } });
     if (!row) throw new ToolingOperationError("not-found", "Retained consumer not found");
-    if (row.status === "confirmed" && sameEvidence(row.evidence, evidence.data)) return consumerRecord(tx, row);
+    // A stopped/superseded reader keeps its original acknowledgment. A lost
+    // response may replay that fact, but must never reactivate the reader.
+    if ((row.status === "confirmed" || row.status === "resolved" && row.confirmedAt !== null)
+      && sameEvidence(row.evidence, evidence.data)) return consumerRecord(tx, row);
     const now = new Date();
     if ((await tx.toolingRetainedConsumer.updateMany({ where: { id: row.id, status: "pending" }, data: { status: "confirmed", evidence: evidence.data, confirmedAt: now } })).count !== 1) {
       throw new ToolingOperationError("transition-conflict", `Retained consumer is ${row.status}, not pending`);

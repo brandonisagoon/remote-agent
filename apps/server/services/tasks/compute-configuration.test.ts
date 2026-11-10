@@ -7,12 +7,37 @@ import type { readConfiguredComputeObservation } from "./compute-observer.ts";
 import { beginTraffic } from "../../../../lib/compute-telemetry.ts";
 import { configureCompute } from "./compute-configuration.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
+import { admitToolingCallback, afterBoundCallback, beforeBoundCallback, beginSessionToolingOperation, resolveEnvironmentConsumers, runWithToolingOperation } from "./tooling-operations.ts";
+import { canonicalDigest } from "./tooling-releases.ts";
 
 let db: TestDatabase;
 const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: true, slots: 1 }) });
 const revision = "a".repeat(40), oldHash = "b".repeat(64), nextHash = "c".repeat(64);
 beforeEach(async () => { db = await createTestDatabase(); });
 afterEach(async () => { await db.cleanup(); });
+
+async function boundConfiguration(f: Awaited<ReturnType<typeof fixture>>) {
+  const repository = { ...config.repository, id: "repo", tooling: { root: "/fixture/tooling", revision: "d".repeat(40) } };
+  const guardedConfig = { ...config, repository, repositories: { repo: repository } };
+  await db.prisma.toolingRelease.create({ data: { id: "configuration-release", repositoryId: "repo", revision: "d".repeat(40), tree: "e".repeat(40), policyBlob: "f".repeat(40), checkout: "/install/tooling/configuration",
+    manifest: { contract: "remote-agent.tooling-release/v1", serverProtocol: { min: 1, max: 1 }, stateFormats: { "drafted.runtime": { read: [1], write: 1, preservesUnknown: true } } }, lockfileDigest: "0".repeat(64), bunVersion: "1.3.0" } });
+  await db.prisma.toolingLegacyBoundary.create({ data: { repositoryId: "repo", activationRequestKey: "first", legacyRevision: "d".repeat(40), recordedAt: new Date() } });
+  await db.prisma.toolingSelection.create({ data: { repositoryId: "repo", generation: 1, releaseId: "configuration-release", activatedAt: new Date() } });
+  const { lockPid: _pid, ...stable } = f.input.request;
+  const { binding } = await beginSessionToolingOperation({ prisma: db.prisma, config: guardedConfig, sessionId: "primary", request: {
+    requestKey: "configure", kind: "compute-configure", existingOperationId: f.offer.id, inputDigest: canonicalDigest(stable) } });
+  const prepare = async (lockPid = 123) => {
+    const body = { ...f.input.request, lockPid };
+    const admission = await admitToolingCallback({ prisma: db.prisma, config: guardedConfig, method: "POST", pathname: "/api/tasks/task/compute-configure", header: binding.operationId, body });
+    if (!admission || admission.mode !== "bound") throw new Error("Expected bound configuration");
+    const state = await beforeBoundCallback(db.prisma, guardedConfig, admission);
+    const run = () => runWithToolingOperation(state.binding, () => configureCompute({ ...f.input, config: guardedConfig, request: body }, f.read, f.head, f.observe), guardedConfig.controlIpcPath,
+      { route: admission.callback.route, attemptId: state.attemptId, body });
+    const acknowledge = () => afterBoundCallback(db.prisma, admission, state, 200);
+    return { run, acknowledge, state };
+  };
+  return { prepare, binding };
+}
 async function fixture(projected = false) {
   await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "task", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/fixture/task", status: "idle" } });
   await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: "repo", machineId: "host", branchName: "codex/task", worktreePath: "/fixture/task", toolingRoot: "/fixture/tooling", toolingRevision: "d".repeat(40), primarySessionId: "primary", phase: "working" } });
@@ -196,5 +221,41 @@ test("staged route collision preserves the other environment and rolls back the 
   };
   await expect(configureCompute(f.input, f.read, f.head, observe)).rejects.toThrow("already owned");
   expect((await db.prisma.computeTraffic.findUniqueOrThrow({ where: { routeId: "foreign-route" } })).environmentId).toBe(other.id);
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
+});
+
+test.each(["before-commit", "after-commit"])('configuration acknowledgment survives reader retirement %s without reactivation', async timing => {
+  const f = await fixture(), operation = await boundConfiguration(f), attempt = await operation.prepare();
+  const retire = () => resolveEnvironmentConsumers(db.prisma, f.environment.id, { kind: "stopped", reference: f.environment.id });
+  if (timing === "before-commit") await retire();
+  await attempt.run();
+  if (timing === "after-commit") await retire();
+  const reader = await db.prisma.toolingRetainedConsumer.findFirstOrThrow({ where: { operationId: operation.binding.operationId } });
+  expect(reader).toMatchObject({ status: "resolved", evidence: { kind: "compute-configure", reference: f.offer.id }, resolution: { kind: "stopped", reference: f.environment.id } });
+  expect(reader.confirmedAt).not.toBeNull();
+  // Model a lost response: keep the original operation running, replay with
+  // the new process lock, then run the actual callback settlement hook.
+  const replay = await operation.prepare(456);
+  await replay.run(); await replay.acknowledge();
+  expect(await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } })).toEqual(reader);
+  expect((await db.prisma.toolingOperation.findUniqueOrThrow({ where: { id: operation.binding.operationId } })).status).toBe("completed");
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(1);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-reader-acknowledged" } })).toBe(1);
+  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
+  expect(await db.prisma.computeSlot.count()).toBe(1);
+});
+
+test.each(["foreign-retirement", "superseded", "foreign-reader", "running-proof"])('configuration acknowledgment refuses %s and rolls back the transition', async fault => {
+  const f = await fixture(), operation = await boundConfiguration(f), attempt = await operation.prepare();
+  const reader = await db.prisma.toolingRetainedConsumer.findFirstOrThrow({ where: { operationId: operation.binding.operationId } });
+  if (fault === "foreign-reader") await db.prisma.toolingRetainedConsumer.update({ where: { id: reader.id }, data: { generation: 9 } });
+  else if (fault === "running-proof") {
+    const original = f.observe; f.observe = async (...args) => { const observed = await original(...args); observed.observation.state = "running"; return observed; };
+  } else await db.prisma.toolingRetainedConsumer.update({ where: { id: reader.id }, data: { status: "resolved", resolvedAt: new Date(), resolution: {
+    kind: fault === "superseded" ? "superseded" : "stopped", reference: fault === "superseded" ? "other-reader" : "foreign-environment" } } });
+  const before = await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } });
+  await expect(attempt.run()).rejects.toThrow();
+  expect(await db.prisma.toolingRetainedConsumer.findUniqueOrThrow({ where: { id: reader.id } })).toEqual(before);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: { in: ["compute-runtime-configuration", "configuration-reader-acknowledged"] } } })).toBe(0);
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
 });

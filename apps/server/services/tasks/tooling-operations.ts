@@ -682,6 +682,35 @@ export async function configurationAttemptCode(prisma: PrismaClient, task: Remot
   return { code: binding.release, binding };
 }
 
+/** Called inside the configuration commit, after its independently observed
+ * stopped generation is recorded. Keep the acknowledgment atomic with the
+ * transition: a collector may retire this reader before the HTTP hook runs.
+ * An already retired reader stays retired; only this exact stopped configure
+ * replay may fill its missing historical acknowledgment. */
+export async function acknowledgeConfigurationConsumer(tx: Prisma.TransactionClient, task: RemoteTask, environmentId: string, request: Body) {
+  const selected = await configurationAttemptCode(tx as PrismaClient, task, environmentId, request);
+  if (!selected) return; // Legacy tasks have no operation-bound reader.
+  const { binding } = selected;
+  const operation = await tx.toolingOperation.findUniqueOrThrow({ where: { id: binding.operationId } });
+  const rows = await tx.toolingRetainedConsumer.findMany({ where: { operationId: binding.operationId, consumerKind: "compute-environment", consumerId: environmentId }, take: 2 });
+  const row = rows[0], evidence = { kind: "compute-configure", reference: String(request.offerId) };
+  if (rows.length !== 1 || !row || row.taskId !== task.id || row.repositoryId !== binding.repositoryId
+    || row.releaseId !== binding.release.id || row.generation !== binding.generation || row.protocol !== operation.protocol
+    || row.scopeKey !== (binding.resourceKey ?? "task")) throw refuse("operation-mismatch", "Configuration reader changed before acknowledgment");
+  if (["confirmed", "resolved"].includes(row.status) && row.confirmedAt && canonicalDigest(row.evidence) === canonicalDigest(evidence)) return;
+  const resolution = z.object({ kind: z.enum(["stopped", "absent"]), reference: z.literal(environmentId) }).strict().safeParse(row.resolution);
+  if (row.evidence !== null || row.confirmedAt !== null || row.status !== "pending"
+    && (row.status !== "resolved" || !row.resolvedAt || !resolution.success))
+    throw refuse("operation-mismatch", "Configuration reader has conflicting acknowledgment or retirement evidence");
+  const now = new Date();
+  await tx.toolingRetainedConsumer.update({ where: { id: row.id }, data: { evidence, confirmedAt: now,
+    ...(row.status === "pending" ? { status: "confirmed" } : {}) } });
+  if (row.status === "pending") await tx.toolingRetainedConsumer.updateMany({ where: { taskId: row.taskId, consumerKind: row.consumerKind, consumerId: row.consumerId, status: "confirmed", id: { not: row.id } },
+    data: { status: "resolved", resolution: { kind: "superseded", reference: row.id }, resolvedAt: now } });
+  await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${task.id}`, action: "configuration-reader-acknowledged", key: row.id,
+    value: JSON.stringify({ version: 1, operationId: binding.operationId, environmentId, evidence, previousStatus: row.status, resolution: row.resolution }) } });
+}
+
 /** Read-only code selection before a saved resource's FIRST claim. The
  * acknowledged exact request is provenance, not a producer or start grant.
  * Once any claim may have started it, only a confirmed producer can select
