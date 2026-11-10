@@ -1,3 +1,5 @@
+import { reserveTaskPublication, taskPublicationContext } from "./task-publication.ts";
+import { issueUpdateSource } from "./issue-update-source.ts";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
@@ -477,3 +479,128 @@ test("mapped implementation children finish through the real update flow while t
   await expect(publishSessionIssueUpdate({ ...f.input, requestKey: "parent-done", state: "Done", expectedState: "On Course", evidence: [] }, client)).rejects.toThrow("unobserved");
   expect(f.comments.size).toBe(2);
 });
+
+
+test("RA-25: reworded explicit and fallback reports reserve one receipt; original retry payload stays immutable", async () => {
+  const f = await fixture();
+  await f.prisma.runtimeInstruction.create({ data: { id: "failed-work", sessionId: f.session.id, text: "private instruction", state: "unknown" } });
+  const base = { prisma: f.prisma, config: f.config, sessionId: f.session.id, evidence: [], publication: { category: "blocker" as const, subject: { kind: "instruction" as const, id: "failed-work" }, code: "instruction-unknown" } };
+  const [explicit, fallback] = await Promise.all([
+    publishSessionIssueUpdate({ ...base, requestKey: "primary-result", body: "The original operation needs recovery." }, f.client),
+    publishSessionIssueUpdate({ ...base, requestKey: "fallback-result", body: "Different wording of the same failure." }, f.client),
+  ]);
+  expect(fallback.commentId).toBe(explicit.commentId);
+  expect(f.comments.size).toBe(1);
+  expect(await f.prisma.runtimeIssueUpdate.count()).toBe(1);
+  expect(explicit.publication).toMatchObject({ occurrence: 1 });
+  await f.prisma.$disconnect();
+  await f.prisma.runtimeInstruction.update({ where: { id: "failed-work" }, data: { state: "completed" } });
+  expect((await publishSessionIssueUpdate({ ...base, requestKey: "fallback-result", body: "Different wording of the same failure." }, f.client)).commentId).toBe(explicit.commentId);
+  await expect(publishSessionIssueUpdate({ ...base, requestKey: "primary-result", body: "Edited retry" }, f.client)).rejects.toThrow("different update");
+  expect(f.comments.size).toBe(1);
+});
+
+test("RA-25: same text on distinct subjects, recovery, and recurrence retain separate durable identities", async () => {
+  const f = await fixture();
+  for (const id of ["one", "two"]) await f.prisma.runtimeInstruction.create({ data: { id, sessionId: f.session.id, text: "Work", state: "unknown" } });
+  const publish = (key: string, id: string, category: "blocker" | "recovery" = "blocker") => publishSessionIssueUpdate({ prisma: f.prisma, config: f.config, sessionId: f.session.id, requestKey: key, body: "Same text", evidence: [], publication: { category, subject: { kind: "instruction", id }, code: "instruction-unknown" } }, f.client);
+  const first = await publish("first", "one");
+  const second = await publish("second", "two");
+  expect(second.commentId).not.toBe(first.commentId);
+  await f.prisma.runtimeInstruction.update({ where: { id: "one" }, data: { state: "completed" } });
+  const recovery = await publish("recovery", "one", "recovery");
+  expect(recovery.publication).toMatchObject({ category: "recovery", occurrence: 1 });
+  await f.prisma.runtimeInstruction.update({ where: { id: "one" }, data: { state: "unknown" } });
+  const recurrence = await publish("recurrence", "one");
+  expect(recurrence.publication).toMatchObject({ occurrence: 2 });
+  expect(f.comments.size).toBe(4);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "task-publication-episode" } })).toBe(4);
+});
+
+test("RA-25: invented failures, foreign subjects, conflicting state/evidence, and fabricated versions reserve nothing", async () => {
+  const f = await fixture();
+  const base = { prisma: f.prisma, config: f.config, sessionId: f.session.id, requestKey: "claim", body: "Result", evidence: [] };
+  const subject = { kind: "instruction" as const, id: "work" };
+  await f.prisma.runtimeInstruction.create({ data: { id: subject.id, sessionId: f.session.id, text: "Work", state: "queued" } });
+  await expect(publishSessionIssueUpdate({ ...base, publication: { category: "blocker", subject, code: "instruction-unknown" } }, f.client)).rejects.toThrow("does not match");
+  await expect(publishSessionIssueUpdate({ ...base, publication: { category: "milestone", subject, version: "completed" } }, f.client)).rejects.toThrow("version");
+  const other = await beginRuntimeSession(f.prisma, { sessionKey: "other", agent: "codex", role: "primary", cwd: f.session.cwd, repositoryId: f.session.repositoryId, machineId: f.session.machineId });
+  await f.prisma.runtimeInstruction.update({ where: { id: subject.id }, data: { state: "unknown", sessionId: other.id } });
+  await expect(publishSessionIssueUpdate({ ...base, publication: { category: "blocker", subject, code: "instruction-unknown" } }, f.client)).rejects.toThrow("another primary");
+  expect(await f.prisma.runtimeIssueUpdate.count()).toBe(0);
+  expect(await f.prisma.runtimeEventCursor.count()).toBe(0);
+  await f.prisma.runtimeInstruction.update({ where: { id: subject.id }, data: { sessionId: f.session.id } });
+  const publication = { category: "blocker" as const, subject, code: "instruction-unknown" };
+  await publishSessionIssueUpdate({ ...base, publication }, f.client);
+  await expect(publishSessionIssueUpdate({ ...base, requestKey: "changed-state", state: "Off Course", expectedState: "On Course", publication }, f.client)).rejects.toThrow("incompatible state or evidence");
+  expect(f.comments.size).toBe(1);
+});
+
+
+test("RA-25: direct SQL reservations race on one operation identity, and inspect_task supplies its real failure code", async () => {
+  const f = await fixture();
+  const owner = { sessionId: f.session.id, taskId: f.task.id, repositoryId: f.session.repositoryId, machineId: f.session.machineId, connectionId: f.config.activeConnectionId, issueId: f.issue.id };
+  for (const id of ["operation-one", "operation-two"]) {
+    await f.prisma.toolingOperation.create({ data: { id, taskId: f.task.id, requestKey: id, kind: "compute.configure", repositoryId: f.session.repositoryId, sessionId: f.session.id, inputDigest: "a".repeat(64), generation: 1, releaseId: "release", protocol: 3, status: "running" } });
+    await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `tooling-operation:${f.task.id}`, action: "tooling-operation-association", key: `outcome:${id}`, value: JSON.stringify({ operationId: id, inputDigest: "a".repeat(64), state: "refused", attemptId: `${id}:attempt` }) } });
+    await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: f.session.id, source: `compute:${f.task.id}`, action: "compute-configuration-failure", key: `${id}:attempt`, value: JSON.stringify({ operationId: id, attemptId: `${id}:attempt`, code: "configuration-source-failed" }) } });
+  }
+  const publication = { category: "blocker" as const, subject: { kind: "operation" as const, id: "operation-one" }, code: "configuration-source-failed" };
+  const records = await Promise.all(["one", "two"].map(requestKey => reserveTaskPublication(f.prisma, owner, { requestKey, body: `Reporter ${requestKey}`, evidence: [], publication }, [])));
+  expect(records[0]!.id).toBe(records[1]!.id);
+  expect(await f.prisma.runtimeIssueUpdate.count()).toBe(1);
+  const inspection = await taskPublicationContext(f.prisma, f.task);
+  expect(inspection.publicationSubjects).toContainEqual({ subject: publication.subject, status: "blocked", code: publication.code });
+  expect(inspection.publicationEpisodes[0]).toMatchObject({ subject: publication.subject, code: publication.code, occurrence: 1 });
+  const base = { prisma: f.prisma, config: f.config, sessionId: f.session.id, evidence: [], body: "Same failure", publication };
+  const one = await publishSessionIssueUpdate({ ...base, requestKey: "report-one" }, f.client);
+  const two = await publishSessionIssueUpdate({ ...base, requestKey: "report-two", publication: { ...publication, subject: { kind: "operation", id: "operation-two" } } }, f.client);
+  expect(one.commentId).not.toBe(two.commentId);
+  expect(f.comments.size).toBe(2);
+});
+
+test("RA-25: retained mirrors resolve their recorded source and share the primary publication path", async () => {
+  const f = await fixture();
+  const originalFetch = globalThis.fetch;
+  try {
+    const mirror = await f.prisma.sessionMirror.create({ data: { sessionKey: "retained", connectionId: f.config.activeConnectionId, externalId: "agent-issue", machineId: f.session.machineId } });
+    await f.prisma.runtimeSession.update({ where: { id: f.session.id }, data: { sessionMirrorId: mirror.id } });
+    await f.prisma.runtimeSessionResourceLink.updateMany({ where: { runtimeSessionId: f.session.id, relationship: "handles" }, data: { endedAt: new Date() } });
+    globalThis.fetch = (async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.query.includes("AgentIssueById")) return Response.json({ data: { issue: { id: "agent-issue", identifier: "AGENT-1", title: "Session", description: "| Runtime field | Value |\n| --- | --- |\n| Source issue | `DRA-8` |", team: { id: "team", key: "AGENT" }, assignee: null, state: { id: "error", name: "Error", type: "started" }, labels: { nodes: [] } } } });
+      if (body.query.includes("SourceIssueForWorkflow")) return Response.json({ data: { issue: f.issue } });
+      throw new Error("Unexpected provider request");
+    }) as typeof fetch;
+    const source = await issueUpdateSource({ prisma: f.prisma, config: f.config, sessionId: f.session.id });
+    expect(source.link.id).toBe(`mirror:${mirror.id}`);
+    expect(source.link.connectionId).toBe(f.config.activeConnectionId);
+    expect(source.issue.id).toBe(f.issue.id);
+    await f.prisma.runtimeInstruction.create({ data: { id: "mirror-work", sessionId: f.session.id, text: "Work", state: "unknown" } });
+    const result = await publishSessionIssueUpdate({ prisma: f.prisma, config: f.config, sessionId: f.session.id, requestKey: "mirror-result", body: "Current failure", evidence: [], publication: { category: "blocker", subject: { kind: "instruction", id: "mirror-work" }, code: "instruction-unknown" } }, { ...f.client, source: async () => source });
+    expect(result.published).toBe(true);
+    expect(f.comments.size).toBe(1);
+    expect(await f.prisma.runtimeSessionResourceLink.count({ where: { relationship: "handles", endedAt: null } })).toBe(0);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+media("RA-25: a fallback resumes the first report's prepared video bytes and cache", async () => {
+  const f = await fixture();
+  const webm = encode(path.join(directory, "transition.webm"), ["-c:v", "libvpx", "-c:a", "libopus"]);
+  await f.prisma.runtimeInstruction.create({ data: { id: "video-work", sessionId: f.session.id, text: "Work", state: "completed" } });
+  const input = { prisma: f.prisma, config: f.config, sessionId: f.session.id, requestKey: "primary-video", body: "Verified result", evidence: [{ path: webm, title: "Flow" }], publication: { category: "milestone" as const, subject: { kind: "instruction" as const, id: "video-work" }, version: "completed" } };
+  await expect(publishSessionIssueUpdate(input, { ...f.client, upload: async () => { throw new Error("upload offline"); } })).rejects.toThrow("upload offline");
+  const receipt = await f.prisma.runtimeIssueUpdate.findFirstOrThrow();
+  const saved = IssueUpdateInput.parse(receipt.input);
+  expect(saved.requestKey).not.toBe(input.requestKey);
+  await f.prisma.$disconnect();
+  const result = await publishSessionIssueUpdate({ prisma: f.prisma, config: f.config, sessionId: f.session.id, ...saved }, f.client);
+  expect(result.commentId).toBe(receipt.id);
+  expect(f.uploaded).toHaveLength(1);
+  expect(f.uploaded[0]!.contentType).toBe("video/mp4");
+  await rm(webm);
+  expect((await publishSessionIssueUpdate({ ...input, requestKey: "later-reworded-report", body: "The same verified result" }, f.client)).commentId).toBe(receipt.id);
+  expect(f.comments.size).toBe(1);
+  expect(await f.prisma.runtimeIssueUpdate.count()).toBe(1);
+}, MEDIA_TIMEOUT);

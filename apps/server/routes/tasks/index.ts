@@ -1,3 +1,4 @@
+import { taskPublicationContext } from "../../services/sessions/task-publication.ts";
 import { publishCleanupStatus } from "../../services/tasks/cleanup-status.ts";
 import { PreparationAttempt, requestFinalizationPreparation, requestFinalizationConfirmation, assertNoPendingPreparation } from "../../services/tasks/finalization-preparation.ts";
 import { CleanupEnqueueInput, enqueueTaskCleanup } from "../../services/tasks/cleanup-inbox.ts";
@@ -280,7 +281,7 @@ taskRoutes.get("/:taskId", async (c) => {
 
 sessionTaskRoutes.get("/:sessionId/task", async (c) => {
   const task = await taskForSession(c.get("prisma"), c.req.param("sessionId"));
-  return task ? c.json({ task: { ...taskResponse(task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
+  return task ? c.json({ task: { ...taskResponse(task), ...await taskPublicationContext(c.get("prisma"), task), ...await developmentProjection({ prisma: c.get("prisma"), config: c.get("config"), taskId: task.id }), ...await externalFinalizationProjection(c.get("prisma"), task), ...await legacyEvidenceProjection(c.get("prisma"), c.get("config"), task), ...await archiveRetentionProjection(c.get("prisma"), c.get("config"), task), ...await cleanupProjection(c.get("prisma"), c.get("config"), task) } }) : c.json({ error: "Session has no managed task" }, 404);
 });
 
 const Progress = z.object({

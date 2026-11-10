@@ -4,12 +4,9 @@ import type { ServerConfig } from "../../../../../lib/config.ts";
 import {
   agentIssueLabelIdsWithRouting,
   agentIssueRuntimeWithLabels,
-  createThreadedIssueComment,
   getAgentCatalog,
   getAgentStateId,
-  getSourceIssue,
   parseAgentIssueRuntime,
-  parseAgentIssueSourceIdentifier,
   updateAgentIssue,
 } from "../../../integrations/tracker/index.ts";
 import type {
@@ -24,7 +21,6 @@ import {
   advanceRuntimeEventCursor,
   getRuntimeEventCursor,
   listRuntimeLifecycleEvents,
-  pruneRuntimeLifecycleEvents,
 } from "../runtime-registry.ts";
 import { findAgentIssue } from "../lifecycle/agent-issue/queries/index.ts";
 import { projectSourceCheckpoint } from "./source-checkpoint.ts";
@@ -98,37 +94,7 @@ export async function projectRuntimeEvent(
     });
   }
 
-  if (!sourceReply && event.phase === "failed") {
-    const sourceIdentifier = parseAgentIssueSourceIdentifier(issue.description);
-    const source = sourceIdentifier
-      ? await getSourceIssue(config, { id: sourceIdentifier })
-      : null;
-    if (source) {
-      let rootId = record.rootCommentId;
-      if (!rootId) {
-        const root = await createThreadedIssueComment(config.linearApiKey, {
-          issueId: source.id,
-          body: `● Remote Agent session · acpx \`${event.sessionId}\``,
-        });
-        if (root) {
-          rootId = root.id;
-          await prisma.sessionMirror.update({
-            where: { id: record.id },
-            data: { rootCommentId: root.id },
-          });
-        }
-      }
-      const body = ["❌ Agent turn failed", "", event.error ?? "Unknown acpx error"].join("\n");
-      if (body) {
-        const posted = await createThreadedIssueComment(config.linearApiKey, {
-          issueId: source.id,
-          body,
-          ...(rootId ? { parentId: rootId } : {}),
-        });
-        if (!posted) throw new Error(`failed to project runtime event ${event.id}`);
-      }
-    }
-  }
+  if (!sourceReply) await projectSourceCheckpoint(config, prisma, runtime, event);
 
   await advanceRuntimeEventCursor(prisma, {
     runtimeSessionId: event.sessionId,
@@ -136,12 +102,7 @@ export async function projectRuntimeEvent(
     sourceCursor: event.id,
     generation: sequence > 0n ? sequence : cursor.generation + 1n,
   });
-  if (event.sequence != null) {
-    await pruneRuntimeLifecycleEvents(prisma, {
-      runtimeSessionId: event.sessionId,
-      throughSequence: event.sequence,
-    });
-  }
+
   return true;
 }
 
