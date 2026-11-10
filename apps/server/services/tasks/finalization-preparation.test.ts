@@ -26,8 +26,10 @@ import { assertLinkedPathsIdle } from "./cleanup-open-handles.ts";
 import { FilesystemHandleDiagnosticError } from "./filesystem-handle-diagnostic.ts";
 let db: TestDatabase, directory: string;
 let worker: ReturnType<typeof preparationJournalWorker> | undefined;
-beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); });
-afterEach(async () => { await worker?.stop(); worker = undefined; await db.cleanup(); await rm(directory, { recursive: true, force: true }); });
+// Full CI applies every migration to each disposable database. Keep that setup
+// budget separate from the worker/request deadlines asserted by these tests.
+beforeEach(async () => { db = await createTestDatabase(); directory = await realpath(await mkdtemp(path.join(tmpdir(), "prep-"))); }, 20_000);
+afterEach(async () => { await worker?.stop(); worker = undefined; await db.cleanup(); await rm(directory, { recursive: true, force: true }); }, 20_000);
 const attempt = (boundary = "initial") => ({ version: 1 as const, attemptId: randomUUID(), boundary });
 function git(cwd: string, ...args: string[]) {
   const result = Bun.spawnSync(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });

@@ -283,3 +283,9 @@ it before stopping. Quiet tasks with no failure/history/outbox perform no tracke
 read. All 39 runtime-event tests pass (219 assertions), including the held-scan,
 quiet-task and stop cases; typecheck passes. RA-25 source work can move to
 Verification, retaining the final compatible upgrade/rollback and live task gates.
+
+The finalization fixture now gives disposable migration setup and awaited
+worker/database cleanup a bounded 20-second hook budget. Worker/request deadlines
+and malformed-handle assertions are unchanged. Both affected filesystem-handle
+cases pass (21 assertions), including rejection of malformed diagnostics. The
+prior failed CI remains failed; a new full run is still required.
