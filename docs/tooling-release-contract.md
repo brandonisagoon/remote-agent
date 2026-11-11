@@ -559,3 +559,31 @@ relabel the old operation as success/no-effect, or repin the task. The normal
 command settles its successor after verification. Persisted handoff receipts
 require `configuration-refusal-recovery/v1`, including after completion, so a
 server rollback that cannot read the lineage is refused before service changes.
+
+## Retiring a superseded failed startup
+
+A health-failed `runtime up` or `runtime configure` can leave its command open
+after its callbacks were acknowledged. A later successful configuration does
+not make the earlier command successful. Ordinary fresh-offer adoption may
+record `runtime-command-superseded` only after proving that the original turn
+ended before the successor, every callback has a definite outcome with its
+latest attempt acknowledged, and all its readers resolve to the same stopped
+offer. Unknown callbacks, unrelated state writes or children, changed runtime
+identity, missing configuration receipts and still-live readers refuse.
+
+The later admitting command must have successfully completed an exact atomic
+configuration transition of the retained runtime. Its receipt, original source,
+recipe, resource and reader chain remain authoritative. Normal adoption still
+requires terminal earlier offers, a fresh stopped observation of the current
+resource, current source ownership, an unpaused task and the normal capacity
+claim. Read/prebinding checks are pure. Only the final adoption transaction,
+after taking its write lock and rechecking the evidence, retires the old parent
+and acknowledged callbacks together. Failures roll back the whole change.
+
+`runtime-command-retired` records the original parent, child identities and
+statuses, resolved readers and successor transition sequences. Request keys,
+digests, task pins, failed history and providers are unchanged. This is neither
+command success nor a no-effect settlement; a later success settlement of the
+retired command is refused. The saved receipt requires
+`runtime-command-retirement/v1` even after completion, preventing an older
+server from silently misreading the result during rollback.

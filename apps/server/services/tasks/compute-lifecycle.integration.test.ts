@@ -507,7 +507,8 @@ test.skipIf(!clientRoot)("RA-33 actual Unix recovery retains admission and data 
   await session.complete(); f.control.bindControlOperation(null);
 }, 120_000);
 
-test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses releases once and retains the existing claimed runtime, lost acknowledgment=%s", async lost => {
+test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "unsettled-startups"])("a refused configuration crosses releases once and retains the existing runtime (%s)", async mode => {
+  const lost = mode === "lost-acknowledgment", unsettled = mode === "unsettled-startups";
   const f = await fixture(true);
   const operations = await import(path.join(clientRoot!, "src/tooling-operation.ts"));
   const { sessionStateAuthority } = await import(path.join(clientRoot!, "src/tooling-state-evidence.ts"));
@@ -521,6 +522,7 @@ test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses re
   await f.prisma.toolingSelection.create({ data: { repositoryId: f.task.repositoryId, generation: 1, releaseId: old.id, activatedAt: new Date() } });
   const release = () => Promise.resolve({ checkout: f.checkout, revision: f.toolingRevision, tree, manifest: f.toolingManifest });
   const operationClient = operations.toolingOperationClient(f.socket);
+  const interrupted: string[] = [];
   const values = { task: f.task.id, config: f.configFile, "state-directory": f.root, purpose: "development" };
   const start = async (action: string, extra: Record<string, string> = {}) => {
     const session = await operations.bindCliOperation({ positionals: ["runtime", action], values: { ...values, ...extra }, taskId: f.task.id, socket: f.socket,
@@ -532,18 +534,33 @@ test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses re
   expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
   await session.complete(); f.control.bindControlOperation(null);
   const offer = await f.deliver(); session = await start("up", { "compute-offer": offer.id });
-  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
-  await session.complete(); f.control.bindControlOperation(null); await f.settled(offer);
+  const unhealthy = { ...f.input, request: async () => new Response("Unavailable", { status: 503 }) };
+  if (unsettled) {
+    await expect(f.client.manageRuntime({ ...unhealthy, action: "up", configFile: f.configFile, computeOffer: offer.id })).rejects.toThrow();
+    interrupted.push(session.operationId!);
+  } else {
+    expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
+    await session.complete();
+  }
+  f.control.bindControlOperation(null); if (!unsettled) await f.settled(offer);
   // A prior successful configuration owns this offer; the next correction
   // must not bypass that ownership merely by selecting a newer executable.
   let recipe = await Bun.file(f.configFile).json(); recipe.readyTimeoutSeconds = 2; await savePrivate(f.configFile, recipe);
   session = await start("configure");
-  expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe("ready");
-  await session.complete(); f.control.bindControlOperation(null);
+  if (unsettled) {
+    await expect(f.client.manageRuntime({ ...unhealthy, action: "configure", configFile: f.configFile })).rejects.toThrow();
+    interrupted.push(session.operationId!);
+  } else {
+    expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe("ready");
+    await session.complete();
+  }
+  f.control.bindControlOperation(null);
+  if (unsettled) await f.settled(offer);
   recipe = await Bun.file(f.configFile).json(); recipe.checks[1].path = "/"; await savePrivate(f.configFile, recipe);
   const failed = await start("configure");
   const resource = (await f.registry.task()).resources.find((r: any) => r.key === "runtime-development")!;
   const state = await Bun.file(resource.externalId).json(), original = structuredClone(state), effects = [...f.effects];
+  const history = await f.prisma.runtimeMetadataEvent.findMany({ where: { action: "tooling-operation-association", source: `tooling-operation:${f.task.id}` }, orderBy: { sequence: "asc" } });
   // Persist the exact old reader's validation-refusal boundary: only its
   // failed progress write exists, with no configuration journal or callback.
   state.phase = "failed"; state.progress = { step: "health", detail: configurationValidationFailure, state: "failed", updatedAt: new Date().toISOString() };
@@ -564,17 +581,26 @@ test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses re
   expect(f.effects).toEqual(effects);
   expect(await repairConfigurationRefusal(repairInput, { observe: async () => { throw new Error("replay must not observe"); } })).toEqual(repaired);
   await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  if (unsettled) {
+    await refreshComputeObservation({ ...f, environmentId: offer.environmentId });
+    await reconcileObservedCompute({ ...f.admission, environmentId: offer.environmentId, runtime: f.runtime });
+  }
   const successor = await operations.bindCliOperation({ positionals: ["runtime", "configure"], values, taskId: f.task.id, socket: f.socket,
     task: () => f.registry.task(), files: { config: await readFile(f.configFile) }, client: operationClient, journalDirectory: f.root,
     env: { REMOTE_AGENT_TOOLING_OPERATION: repaired.binding.operationId }, release: async () => ({ checkout, revision, tree: correctedTree, manifest: f.toolingManifest }) });
   f.control.bindControlOperation(successor);
-  const configure = f.registry.configureCompute; let drop = lost;
+  const configure = f.registry.configureCompute; let drop = lost || unsettled;
   f.registry.configureCompute = async (request: any) => { const result = await configure(request); if (drop) { drop = false; throw new Error("Lost repaired configuration response"); } return result; };
-  if (lost) {
+  if (lost || unsettled) {
     await expect(f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).rejects.toThrow("Lost repaired configuration response");
     expect(f.container().running).toBe(false);
+    if (unsettled) {
+      await refreshComputeObservation({ ...f, environmentId: offer.environmentId });
+      await reconcileObservedCompute({ ...f.admission, environmentId: offer.environmentId, runtime: f.runtime });
+      expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe("stopped");
+    }
   }
-  expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe("ready");
+  expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe(unsettled ? "waiting-compute" : "ready");
   await successor.complete(); f.control.bindControlOperation(null);
   const after = await Bun.file(resource.externalId).json();
   for (const field of ["container", "resources", "network", "dependencyVolume", "ports", "urls", "fingerprints"]) expect(after[field]).toEqual(original[field]);
@@ -582,4 +608,26 @@ test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses re
   expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.task.toolingRevision);
   expect((await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id: failed.operationId! } })).completionEvidence).toEqual({ kind: "configuration-validation-failed", reference: repaired.binding.operationId });
   expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
+  if (unsettled) {
+    const next = await f.deliver();
+    expect(next.id).not.toBe(offer.id);
+    const restart = await operations.bindCliOperation({ positionals: ["runtime", "up"], values: { ...values, "compute-offer": next.id }, taskId: f.task.id, socket: f.socket,
+      task: () => f.registry.task(), files: { config: await readFile(f.configFile) }, client: operationClient, journalDirectory: f.root,
+      release: async () => ({ checkout, revision, tree: correctedTree, manifest: f.toolingManifest }) });
+    f.control.bindControlOperation(restart);
+    expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: next.id })).phase).toBe("ready");
+    await restart.complete(); f.control.bindControlOperation(null);
+    for (const id of interrupted) {
+      const retired = await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id } });
+      expect(retired.completionEvidence).toEqual({ kind: "runtime-command-superseded", reference: successor.operationId });
+      const response = await fetch(`http://remote-agent/api/sessions/${f.task.primarySessionId}/tooling-operations/${id}/settlement`, { method: "POST", unix: f.socket,
+        headers: { "content-type": "application/json", "x-remote-agent-operation": id }, body: JSON.stringify({ requestKey: retired.requestKey, inputDigest: retired.inputDigest, outcome: "completed" }) });
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ code: "operation-closed" });
+    }
+    for (const event of history) expect(await f.prisma.runtimeMetadataEvent.findUnique({ where: { sequence: event.sequence } })).toEqual(event);
+    expect(f.container()).toMatchObject({ id: original.container.id, running: true });
+    expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
+    expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe("stopped");
+  }
 }, 30_000);
