@@ -1,5 +1,6 @@
 import { assertComputeStartIntent, assertDevelopmentWork, DevelopmentWorkUnavailable, supersedeRuntimeSuspension } from "./development-intent.ts";
 import { randomUUID } from "node:crypto";
+import path from "node:path";
 import { z } from "zod";
 import type { Prisma, PrismaClient, ComputeEnvironment } from "../../../../generated/prisma/client.ts";
 import { ComputePolicy } from "../../../../lib/compute-policy.ts";
@@ -11,6 +12,7 @@ import { SavedComputeBinding, SavedComputeIdentityChanged, assertSavedComputeObs
 
 import { ComputeReclamation } from "./compute-reclamation-schema.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
+import { readComputeReviewRevision, reviewRevisionAnchor } from "./compute-review-revision.ts";
 import { cleanupFamily } from "./closed-cleanup.ts";
 type Store = Prisma.TransactionClient;
 type Context = { prisma: PrismaClient; machineId: string; policy: ComputePolicy; now?: Date; config?: ServerConfig; runtime?: Pick<AgentSessionRuntime, "observeSessionActivity"> };
@@ -219,11 +221,11 @@ export async function withdrawComputeConfigurationOffers(store: Store, environme
 /** Before the first claim, admission is the authority that prevents provider
  * creation. A complete never-claimed ledger can advance with product HEAD;
  * absent local files alone must never make a previously started app eligible. */
-async function unstartedRevisionEvidence(store: Store, environment: ComputeEnvironment) {
+async function unstartedRevisionEvidence(store: Store, environment: ComputeEnvironment, revision: string, now: Date) {
   const owned = await assertComputeEnvironmentOwner(store, environment);
-  if (owned.task.phase === "complete" || environment.purpose !== "development" || !["waiting", "offered"].includes(environment.state)
-    || environment.resourceId !== null || environment.resourceIdentity !== null || environment.configuration !== null || environment.observation !== null) throw new Error("Compute revision requires a never-started development environment");
-  const intent = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owned.session.id, source: `development:${environment.taskId}`, action: "development-compute-intent" }, orderBy: { sequence: "desc" } });
+  if (owned.task.phase === "complete" || !["development", "review"].includes(environment.purpose) || !["waiting", "offered"].includes(environment.state)
+    || environment.resourceId !== null || environment.resourceIdentity !== null || environment.configuration !== null || environment.observation !== null) throw new Error("Compute revision requires a never-started environment");
+  const intent = environment.purpose === "development" ? await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: owned.session.id, source: `development:${environment.taskId}`, action: "development-compute-intent" }, orderBy: { sequence: "desc" } }) : null;
   if (intent && z.object({ version: z.literal(1), action: z.enum(["stop", "resume"]) }).parse(JSON.parse(intent.value!)).action !== "resume") throw new Error("Compute revision cannot supersede development stop");
   const allocations = await savedRevisionAllocations(store, environment.id);
   if (allocations.offers.some(offer => offer.claimedAt !== null || !["queued", "offered", "expired", "declined", "ineligible"].includes(offer.state))) throw new Error("Compute revision has a prior or uncertain claim");
@@ -231,15 +233,29 @@ async function unstartedRevisionEvidence(store: Store, environment: ComputeEnvir
   // are retained inputs, not evidence that this app has started. Unknown kinds,
   // provider/runtime resources and collisions with this runtime's key still
   // refuse, even if marked released. The complete claim ledger remains required.
-  if (await store.remoteTaskResource.count({ where: { taskId: environment.taskId, purpose: environment.purpose,
-    OR: [{ kind: { notIn: ["directory", "evidence", "clerk-test-user"] } }, { key: environment.key }] } })
+  const resources = await store.remoteTaskResource.findMany({ where: { taskId: environment.taskId, purpose: environment.purpose }, orderBy: { id: "asc" }, take: 1001 });
+  const allowed = ["directory", "evidence", "clerk-test-user", ...(environment.purpose === "review" ? ["git-worktree"] : [])];
+  if (resources.length > 1000 || resources.some(resource => !allowed.includes(resource.kind) || resource.key === environment.key)
     || await store.computeTraffic.count({ where: { environmentId: environment.id } })) throw new Error("Compute revision has existing resources or traffic");
+  let review;
+  if (environment.purpose === "review") {
+    for (const resource of resources.filter(resource => resource.kind === "git-worktree")) reviewRevisionAnchor(owned.task, resource);
+    review = resources.find(resource => resource.kind === "git-worktree" && resource.key === `review-${revision}`);
+    if (!review || review.state !== "ready" || !review.expiresAt || review.expiresAt.getTime() <= now.getTime()) throw new Error("Compute revision requires the registered ready review checkout");
+    const parents: string[] = [];
+    for (let current = review.externalId; ; current = path.dirname(current)) { parents.push(current); if (current === path.dirname(current)) break; }
+    if (await store.remoteTaskResource.count({ where: { taskId: { not: owned.task.id }, state: { not: "released" }, OR: [{ externalId: { in: parents } }, { externalId: { startsWith: `${review.externalId}${path.sep}` } }] } })
+      || await store.remoteTask.count({ where: { id: { not: owned.task.id }, OR: [{ worktreePath: { in: parents } }, { worktreePath: { startsWith: `${review.externalId}${path.sep}` } }] } }))
+      throw new Error("Compute review checkout is claimed by another task");
+  }
   const waiting = await store.computeWait.findUnique({ where: { environmentId: environment.id } });
   if (!waiting || waiting.machineId !== environment.machineId) throw new Error("Compute revision has no original queue entry");
-  return { identity: owned.identity, worktree: owned.task.worktreePath!, allocations, waiting, intent };
+  return { identity: owned.identity, worktree: review?.externalId ?? owned.task.worktreePath!, allocations, waiting, intent,
+    resources: resources.map(resource => ({ id: resource.id, state: resource.state, identity: finalizationResourceIdentity(resource).identityDigest })),
+    ...(review ? { review, task: { id: owned.task.id, toolingRevision: owned.task.toolingRevision, worktreePath: owned.task.worktreePath } } : {}) };
 }
 
-export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation, readUnstartedHead = readComputeWorktreeRevision) {
+export async function requestCompute(input: Context & { taskId: string; request: z.infer<typeof ComputeRequest>; config?: ServerConfig }, readRevision?: typeof import("./compute-observer.ts").readConfiguredComputeObservation, readUnstartedHead = readComputeWorktreeRevision, readReview = readComputeReviewRevision) {
   policy(input); const request = ComputeRequest.parse(input.request);
   const prior = await input.prisma.computeEnvironment.findUnique({ where: { taskId_key: { taskId: input.taskId, key: request.key } } });
   // A saved app can survive normal product commits. Observe the actual new
@@ -249,9 +265,10 @@ export async function requestCompute(input: Context & { taskId: string; request:
     if (!input.config || input.config.machine !== input.machineId) throw new Error("Compute request identity changed");
     if (!request.saved) {
       if (prior.purpose !== request.purpose || prior.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
-      const evidence = await unstartedRevisionEvidence(input.prisma, prior);
-      if (await readUnstartedHead(evidence.worktree) !== request.revision) throw new Error("Compute request does not match worktree HEAD");
-      return { unstarted: evidence };
+      const evidence = await unstartedRevisionEvidence(input.prisma, prior, request.revision, at(input));
+      const source = evidence.review ? await readReview(evidence.task!, evidence.review, request.revision, at(input)) : { revision: await readUnstartedHead(evidence.worktree) };
+      if (source.revision !== request.revision) throw new Error("Compute request does not match worktree HEAD");
+      return { unstarted: evidence, source };
     }
     const owned = await assertComputeEnvironmentOwner(input.prisma, prior);
     assertSavedComputeRequest(prior, request.saved);
@@ -274,13 +291,14 @@ export async function requestCompute(input: Context & { taskId: string; request:
       if (old.taskIdentity !== owned.identity || old.purpose !== request.purpose || old.recipeDigest !== request.recipeDigest) throw new Error("Compute request identity changed");
       assertSavedComputeRequest(old, request.saved);
       if (transition && "unstarted" in transition) {
-        const evidence = await unstartedRevisionEvidence(store, old);
+        const evidence = await unstartedRevisionEvidence(store, old, request.revision, at(input));
+        const source = evidence.review ? await readReview(evidence.task!, evidence.review, request.revision, at(input)) : { revision: await readUnstartedHead(evidence.worktree) };
         if (finalizationDigest(old) !== finalizationDigest(prior) || finalizationDigest(evidence) !== finalizationDigest(transition.unstarted)
-          || await readUnstartedHead(evidence.worktree) !== request.revision) throw new Error("Unstarted compute revision changed during observation");
+          || finalizationDigest(source) !== finalizationDigest(transition.source)) throw new Error("Unstarted compute revision changed during observation");
         // Withdraw old unclaimed offers without rotating the existing queue.
         // Old instructions and results remain; their old offers cannot claim.
         for (const offer of evidence.allocations.offers) if (["queued", "offered"].includes(offer.state)) await withdraw(store, offer.id, "ineligible", at(input), { preserveQueue: true });
-        await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: old.primarySessionId, source: `compute:${old.taskId}`, action: "compute-unstarted-revision", key: finalizationDigest({ environmentId: old.id, from: old.revision, to: request.revision }), value: JSON.stringify({ version: 1, environmentId: old.id, taskIdentity: old.taskIdentity, fromRevision: old.revision, toRevision: request.revision, evidence }) } });
+        await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: old.primarySessionId, source: `compute:${old.taskId}`, action: "compute-unstarted-revision", key: finalizationDigest({ environmentId: old.id, from: old.revision, to: request.revision }), value: JSON.stringify({ version: 1, environmentId: old.id, taskIdentity: old.taskIdentity, fromRevision: old.revision, toRevision: request.revision, evidence, source }) } });
         return store.computeEnvironment.update({ where: { id: old.id }, data: { revision: request.revision, state: "waiting" } });
       }
       if (transition) {
