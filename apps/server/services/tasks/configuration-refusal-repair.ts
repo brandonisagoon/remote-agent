@@ -72,7 +72,11 @@ async function snapshot(store: PrismaClient | Prisma.TransactionClient, input: C
     || !format?.read.includes(1) || !(format.writeVersions ?? [format.write]).includes(1) || manifest.serverProtocol.min > operation.protocol || manifest.serverProtocol.max < operation.protocol) throw new Error("Configuration refusal repair needs the selected compatible corrected release");
   const owner = { taskId: task.id, primarySessionId: task.primarySessionId, repositoryId: task.repositoryId, machineId: task.machineId,
     worktreePath: task.worktreePath, toolingRevision: task.toolingRevision, pinnedToolingRoot: task.pinnedToolingRoot };
-  return { task, operation, selection, release, owner, environment, resource, offers, anchor, digest: stableDigest({ task, native, operation: { ...operation, updatedAt: null }, selection, release, writes, latestWrite, resources, environment, offers, allocations, sessions, instructions, lifecycle }) };
+  // Collector refreshes are not handoff authority. The selected immutable
+  // observer independently proves the unchanged receipt and original refusal;
+  // retain every owner, source, state, recipe, resource and allocation field.
+  const { observation: _observation, updatedAt: _updatedAt, ...environmentAuthority } = environment;
+  return { task, operation, selection, release, owner, environment, resource, offers, anchor, digest: stableDigest({ task, native, operation: { ...operation, updatedAt: null }, selection, release, writes, latestWrite, resources, environment: environmentAuthority, offers, allocations, sessions, instructions, lifecycle }) };
 }
 
 async function observe(release: ToolingRelease, request: unknown) {
