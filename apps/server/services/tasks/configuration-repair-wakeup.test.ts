@@ -9,6 +9,7 @@ import { ComputePolicy } from "../../../../lib/compute-policy.ts";
 import { createAcpxSessionRuntime } from "../../transports/acpx/session-runtime.ts";
 import { CONFIGURATION_REPAIR_CONTRACT, TOOLING_OPERATION_ASSOCIATION } from "./tooling-operations.ts";
 import { finalizationResourceIdentity } from "./finalization-resources.ts";
+import { canonicalDigest } from "./tooling-releases.ts";
 import { configurationRepairInstructionAllows, configurationRepairSourceAllows, wakeConfigurationAfterRepair } from "./configuration-repair-wakeup.ts";
 import type { linkedSourceIssue } from "../sessions/questions.ts";
 import { tickCompute } from "./compute-worker.ts";
@@ -82,6 +83,35 @@ test("concurrent collectors and a lost committed response cannot duplicate the c
   await Promise.all([f.wake(), f.wake()]);
   expect(await f.prisma.runtimeInstruction.count()).toBe(1);
   expect(await f.wake()).toEqual({ state: "not-needed" });
+});
+
+test("a failed v1 repair receives the new repair once without rewriting its attempts", async () => {
+  const f = await fixture();
+  await f.attempt("intent", { attemptId: "v1-attempt", repairContracts: ["configuration-command-recovery/v1"] });
+  await f.attempt("unknown", { attemptId: "v1-attempt" });
+  const attempts = await f.prisma.runtimeMetadataEvent.findMany({ where: { action: TOOLING_OPERATION_ASSOCIATION } });
+  expect((await f.wake()).state).toBe("queued");
+  const instruction = await f.prisma.runtimeInstruction.findFirstOrThrow();
+  expect(instruction.text).toContain("configuration-command-recovery/v2");
+  expect(await f.prisma.$transaction(tx => configurationRepairInstructionAllows(tx, f.config, instruction))).toBe(true);
+  expect(await f.wake()).toEqual({ state: "not-needed" });
+  expect(await f.prisma.runtimeMetadataEvent.findMany({ where: { action: TOOLING_OPERATION_ASSOCIATION } })).toEqual(attempts);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(1);
+});
+
+test("an undispatched v1 continuation is superseded through the ordinary inbox before v2 queues", async () => {
+  const f = await fixture();
+  const id = `configuration-repair:${canonicalDigest({ taskId: f.taskId, parentId: "original-command", contract: "configuration-command-recovery/v1" })}`;
+  const instruction = await f.prisma.runtimeInstruction.create({ data: { id, sessionId: "primary", text: "Original v1 repair continuation" } });
+  const event = await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "configuration-repair-wakeup", key: id,
+    value: JSON.stringify({ state: "queued", repairContract: "configuration-command-recovery/v1" }) } });
+  expect(await f.wake()).toEqual({ state: "not-needed" });
+  expect(await f.prisma.$transaction(tx => configurationRepairInstructionAllows(tx, f.config, instruction))).toBe(false);
+  expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id } })).toMatchObject({ state: "cancelled", executionRequestId: null, text: instruction.text });
+  expect(await f.prisma.runtimeMetadataEvent.findUniqueOrThrow({ where: { sequence: event.sequence } })).toEqual(event);
+  expect((await f.wake()).state).toBe("queued");
+  expect(await f.wake()).toEqual({ state: "not-needed" });
+  expect(await f.prisma.runtimeInstruction.count({ where: { state: "queued" } })).toBe(1);
 });
 
 for (const refusal of ["pause", "closed", "review", "live-provider", "wrong-turn", "missing-provider", "invalid-time", "new-execution", "unknown-inbox", "in-flight-attempt", "duplicate-intent", "orphan-outcome", "malformed-history", "repair-already-attempted", "foreign-parent", "changed-release", "released-resource", "owner-completion", "cleanup", "worktree", "capability"] as const)

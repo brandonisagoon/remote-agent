@@ -382,7 +382,10 @@ async function associations(store: Pick<PrismaClient, "runtimeMetadataEvent">, t
 /** This server process: a random per-boot nonce, its PID and local host.
  * Server-only metadata stamped on every new callback intent, so a later boot
  * can prove an orphaned attempt belonged to an exited process. */
-export const CONFIGURATION_REPAIR_CONTRACT = "configuration-command-recovery/v1";
+// v2 also re-observes terminal stopped allocations whose resumed task has
+// invalidated cached accounting. A failed v1 attempt must not suppress this
+// distinct repair; attempts made with v2 still prevent automatic retry loops.
+export const CONFIGURATION_REPAIR_CONTRACT = "configuration-command-recovery/v2";
 export const SERVER_INSTANCE: Readonly<{ instance: string; pid: number; host: string }> = Object.freeze({ instance: crypto.randomUUID(), pid: process.pid, host: hostname() });
 async function recordCallbackOutcome(store: Pick<PrismaClient, "runtimeMetadataEvent">, binding: ToolingOperationBinding, route: string, attemptId: string, state: "intent" | "acknowledged" | "refused" | "unknown", status: number | null) {
   await store.runtimeMetadataEvent.create({ data: { runtimeSessionId: binding.sessionId, source: `tooling-operation:${binding.taskId}`, action: ASSOCIATION, key: associationKey("outcome", binding.operationId),
