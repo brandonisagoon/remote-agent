@@ -562,7 +562,7 @@ export function freshObservation(observedAt: number, now: number, freshnessSecon
  * mapped, settled, resolved and freshly observed stopped) and whose admitting
  * command definitively settled. Returns the refusal, or null. */
 async function adoptionRefused(store: AdmissionStore, config: ServerConfig, task: RemoteTask, offerId: string, binding: Pick<ToolingOperationBinding, "operationId" | "parentOperationId" | "release" | "inputDigest" | "generation">,
-  dependencies: Pick<ToolingOperationDependencies, "read" | "legacy">, body?: Body) {
+  dependencies: Pick<ToolingOperationDependencies, "read" | "legacy">, body?: Body, retireHistorical = false) {
   const offer = await store.computeOffer.findUnique({ where: { id: offerId } });
   const environment = offer ? await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } }) : null;
   const current = await store.remoteTask.findUnique({ where: { id: task.id } });
@@ -610,6 +610,7 @@ async function adoptionRefused(store: AdmissionStore, config: ServerConfig, task
     key: associationKey("producer", `compute-environment:${environment.id}`) }, orderBy: { sequence: "desc" }, take: 1001 });
   if (producerEvents.length > 1000) return `Environment ${environment.id} producer history exceeds its bound`;
   const latestProducer = new Map<string, string>();
+  const retirements = new Map<string, import("./runtime-command-retirement.ts").RuntimeCommandRetirement>();
   for (const event of producerEvents) {
     const value = Association.safeParse(parseJson(event.value));
     if (!value.success || value.data.role !== "producer") return `Environment ${environment.id} producer record ${event.sequence} is unreadable`;
@@ -620,7 +621,16 @@ async function adoptionRefused(store: AdmissionStore, config: ServerConfig, task
     if (state !== "confirmed" && state !== "failed") return `Environment ${environment.id} has an unknown producer outcome (${operationId})`;
     const producer = await dependencies.read({ prisma: store as PrismaClient, operationId });
     const producerCommand = producer ? await commandOf(store, producer, dependencies.read) : null;
-    if (!producer || producer.status !== "completed" || !producerCommand || producerCommand.status !== "completed") return `Environment ${environment.id} earlier producer ${operationId} has not settled`;
+    if (!producer || !producerCommand) return `Environment ${environment.id} earlier producer ${operationId} has no command lineage`;
+    if (producer.status !== "completed" || producerCommand.status !== "completed") {
+      if (!retirements.has(producerCommand.operationId)) {
+        const { planRuntimeCommandRetirement } = await import("./runtime-command-retirement.ts");
+        const result = await planRuntimeCommandRetirement(store, { task: current, environment, parentId: producerCommand.operationId,
+          admittingCommandId: command.operationId, admissionSequence: admitted.sequence, offerCreatedAt: offer.createdAt });
+        if ("reason" in result) return `Environment ${environment.id} earlier producer ${operationId} has not settled: ${result.reason}`;
+        retirements.set(producerCommand.operationId, result.plan);
+      }
+    }
     if (state === "failed") continue;
     const readers = await store.toolingRetainedConsumer.findMany({ where: { operationId, consumerKind: "compute-environment", consumerId: environment.id }, take: 11 });
     const proofs = readers.flatMap(reader => { const proof = z.object({ kind: z.enum(["compute-bind", "compute-configure"]), reference: z.string() }).safeParse(reader.evidence); return proof.success ? [{ reader, offer: proof.data.reference }] : []; });
@@ -652,6 +662,13 @@ async function adoptionRefused(store: AdmissionStore, config: ServerConfig, task
     if (!freshObservation(observation.data.observedAt, Date.now(), freshness)) return `Environment ${environment.id} stopped observation is not fresh (observed ${observation.data.observedAt}, freshness ${freshness}s)`;
   }
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: { in: ["pending", "confirmed"] } } })) return `Environment ${environment.id} has a retained reader`;
+  if (retirements.size) {
+    await assertOpenTaskPrimary({ prisma: store as PrismaClient, config, sessionId: current.primarySessionId! });
+    if (retireHistorical) {
+      const { retireRuntimeCommand } = await import("./runtime-command-retirement.ts");
+      for (const plan of retirements.values()) await retireRuntimeCommand(store, plan);
+    }
+  }
   return null;
 }
 const parseJson = (text: string | null) => { try { return JSON.parse(text ?? "null"); } catch { return null; } };
@@ -1042,7 +1059,7 @@ async function prepareBoundEffects(prisma: PrismaClient, config: ServerConfig, a
   else if (admitted && current?.operationId !== binding.operationId) {
     await prisma.$transaction(async tx => {
       await recordAssociation(tx, binding, "admission", `environment-key:${admitted}`, "intent");
-      const refused = admission.adopt ? await adoptionRefused(tx, config, context.task, admission.adopt.offerId, binding, dependencies, body) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read, true);
+      const refused = admission.adopt ? await adoptionRefused(tx, config, context.task, admission.adopt.offerId, binding, dependencies, body, true) : await admissionHeld(tx, context.task, admitted, binding, dependencies.read, true);
       if (refused) throw refuse("retained-release-required", refused);
     });
     admittedKey = admitted;

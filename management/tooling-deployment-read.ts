@@ -31,6 +31,7 @@ export function readDeploymentState(file: string) {
       if (db.query("SELECT 1 FROM RuntimeMetadataEvent WHERE action = 'runtime-health' LIMIT 1").get()) contracts.add("runtime-health/v1");
       if (db.query("SELECT 1 FROM RuntimeMetadataEvent WHERE action = 'tooling-capability-resolution' LIMIT 1").get()) contracts.add("capability-publication/v1");
       if (db.query("SELECT 1 FROM RuntimeMetadataEvent WHERE action = 'configuration-refusal-repaired' LIMIT 1").get()) contracts.add("configuration-refusal-recovery/v1");
+      if (db.query("SELECT 1 FROM RuntimeMetadataEvent WHERE action = 'runtime-command-retired' LIMIT 1").get()) contracts.add("runtime-command-retirement/v1");
       const kinds = db.query("SELECT DISTINCT j.value FROM RuntimeMetadataEvent e, json_tree(CASE WHEN json_valid(e.value) THEN e.value ELSE 'null' END) j WHERE j.key = 'kind' AND j.value IN ('clerk-assignment', 'configuration-completion/v1')").all() as Array<{ value: string }>;
       if (kinds.some(row => row.value === "clerk-assignment")) contracts.add("clerk-assignment/v1");
       if (kinds.some(row => row.value === "configuration-completion/v1")) contracts.add("configuration-completion/v1");
