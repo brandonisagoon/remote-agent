@@ -34,6 +34,10 @@ test("integrated activation exists only on the bearer TCP app and validates owne
   expect((await tcp.request(repairPath, { method: "POST", body })).status).toBe(401);
   expect((await tcp.request(repairPath, { method: "POST", headers: auth, body: "{}" })).status).toBe(400);
   expect((await socket.request(repairPath, { method: "POST", headers: auth, body })).status).toBe(404);
+  const configurationRepair = "/api/tooling-releases/test-repository/tasks/task/configuration-refusal-repairs";
+  expect((await tcp.request(configurationRepair, { method: "POST", body })).status).toBe(401);
+  expect((await tcp.request(configurationRepair, { method: "POST", headers: auth, body: "{}" })).status).toBe(400);
+  expect((await socket.request(configurationRepair, { method: "POST", headers: auth, body })).status).toBe(404);
 });
 
 test("a disabled route refuses activation before preparing any candidate", async () => {

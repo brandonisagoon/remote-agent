@@ -5,6 +5,7 @@ import { verifyBearerToken } from "../../security.ts";
 import { ToolingActivationError, activateToolingRelease, getActiveToolingRelease, type ToolingActivationErrorCode } from "../../services/tasks/tooling-releases.ts";
 import { inventoryLegacyToolingConsumers } from "../../services/tasks/tooling-operations.ts";
 import { IdentityPreparationRepairInput, repairIdentityPreparation } from "../../services/tasks/identity-preparation-repair.ts";
+import { ConfigurationRefusalRepairInput, repairConfigurationRefusal } from "../../services/tasks/configuration-refusal-repair.ts";
 
 const ActivationBody = z.strictObject({ requestKey: z.string(), revision: z.string(), expectedGeneration: z.number() });
 const STATUS: Record<ToolingActivationErrorCode, 400 | 409 | 422> = {
@@ -35,6 +36,17 @@ export function toolingReleaseRoutes(options: { enabled: boolean; activate?: typ
         repositoryId: c.req.param("repositoryId"), taskId: c.req.param("taskId"), request: body.data }));
     } catch (error) {
       return c.json({ error: error instanceof Error ? error.message : "Identity preparation repair refused", code: "repair-refused" }, 409);
+    }
+  });
+  routes.post("/:repositoryId/tasks/:taskId/configuration-refusal-repairs", async c => {
+    if (!options.enabled) return c.json({ error: "Tooling repair is unavailable", code: "repair-unavailable" }, 409);
+    const body = ConfigurationRefusalRepairInput.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: "Configuration repair requires the original refused command and expected release generation", code: "invalid-request" }, 400);
+    try {
+      return c.json(await repairConfigurationRefusal({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"),
+        repositoryId: c.req.param("repositoryId"), taskId: c.req.param("taskId"), request: body.data }));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "Configuration refusal repair failed", code: "repair-refused" }, 409);
     }
   });
   routes.post("/:repositoryId/activations", async (c) => {

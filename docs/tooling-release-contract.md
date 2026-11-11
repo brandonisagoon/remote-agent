@@ -524,3 +524,38 @@ contract and independent integration review. The compatibility correction has
 passed real-route runtime, preview and crash-recovery checks. Source activation
 is enabled for the isolated lifecycle rehearsal; no live activation or shared
 deployment is authorized by that source change.
+
+## Recovering a refused Platform configuration
+
+The owner-only TCP endpoint
+`POST /api/tooling-releases/:repositoryId/tasks/:taskId/configuration-refusal-repairs`
+handles the known local validation refusal before a configuration journal or
+callback was created. It is unavailable over the session socket. The request
+names the original command, exact input digest, selected generation and original
+`runtime configure` values (`task`, `config`, `state-directory`, `purpose`).
+
+The original task must be held paused and its whole provider family inactive.
+Its command must remain bound, with only its own version-1 runtime progress
+writes, no children or retained consumers, and no later writer. The selected
+immutable reader must advertise `runtime-configuration-refusal/v1`. It checks
+private unchanged inputs, the exact validation error, original prepared runtime,
+provider/container/network identity, source and coverage. Only the missing test
+API public key and obsolete Platform home readiness correction qualify. It does
+not edit the app, providers, saved state, task pin or original request journal.
+
+One transaction records `configuration-validation-failed` on the original
+command and creates a linked successor with the same input on the corrected
+release. The receipt freezes only acknowledged admission/configuration
+predecessors; uncertain callbacks/readers refuse. This successor can continue
+only that runtime and offer, through the ordinary locks, capacity admission,
+stopped-app configuration observer and ownership guards. It cannot adopt an
+unrelated or later producer. Exact endpoint retries return the same successor,
+including after resume; changed requests and competing repairs refuse.
+
+Resume the original primary using the returned immutable release and
+`REMOTE_AGENT_TOOLING_OPERATION` with the original arguments and file bytes.
+Keep the old journal and failure history; do not mint a replacement request key,
+relabel the old operation as success/no-effect, or repin the task. The normal
+command settles its successor after verification. Persisted handoff receipts
+require `configuration-refusal-recovery/v1`, including after completion, so a
+server rollback that cannot read the lineage is refused before service changes.

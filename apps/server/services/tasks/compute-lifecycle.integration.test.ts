@@ -37,7 +37,7 @@ async function repository(root: string) {
 /** Real SQLite/routes/Unix registry and client runtime. Only cloud/Docker and
  * the external physical-observer transport are disposable fixtures. The
  * configured observer is committed and resolved by the production verifier. */
-async function fixture() {
+async function fixture(platformHome = false) {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "compute-pair-")));
   cleanup.push(() => rm(root, { recursive: true, force: true })); await chmod(root, 0o700);
   const db = await createTestDatabase(); cleanup.push(db.cleanup); const { prisma } = db;
@@ -46,7 +46,13 @@ async function fixture() {
   const { savePrivate } = await import(path.join(clientRoot!, "src/runtime-config.ts"));
   const { continueDevelopmentIntent } = await import(path.join(clientRoot!, "src/development-intent.ts"));
   const product = path.join(root, "product"), tooling = path.join(root, "tooling"), physicalFile = path.join(root, "physical.json");
-  await repository(product); git(product, "commit", "--allow-empty", "--quiet", "-m", "Original product");
+  await repository(product);
+  if (platformHome) {
+    await mkdir(path.join(product, "apps/web/src/app"), { recursive: true });
+    await writeFile(path.join(product, "apps/web/src/app/page.tsx"), "export default function Page() { return 'Home'; }\n");
+    git(product, "add", ".");
+  }
+  git(product, "commit", "--allow-empty", "--quiet", "-m", "Original product");
   const productRevision = git(product, "rev-parse", "HEAD");
   await repository(tooling);
   const toolingManifest = await Bun.file(path.join(clientRoot!, ".remote-agent-release.json")).json();
@@ -101,6 +107,12 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
   await writeFile(configFile, JSON.stringify({ version: 1, profile: "platform", image: "fixture:1", credentialsFile,
     runtimeSecrets: ["CLERK_SECRET_KEY", "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "OPENAI_API_KEY"], planetscale: { organization: "fixture", database: "fixture", baseBranch: "main", baseBranchId: "base" },
     setup: [["bun", "install"]], fixtures: [["bun", "seed-task.ts"]], services: { api: { command: ["bun", "api.ts"], port: 8080 } }, checks: [{ service: "api", path: "/health", representative: true, json: { ready: true } }], readyTimeoutSeconds: 1 }));
+  if (platformHome) {
+    const recipe = await Bun.file(configFile).json();
+    recipe.services.web = { command: ["bun", "--no-env-file", "run", "--cwd", "apps/web", "dev"], port: 3000 };
+    recipe.checks.push({ service: "web", path: "/create", status: 200, representative: true });
+    await savePrivate(configFile, recipe);
+  }
   const physical: { running: boolean; active: number; sourceRevision?: string; container?: unknown } = { running: false, active: 0 }; const sync = () => savePrivate(physicalFile, physical); await sync();
   const effects: string[] = [], remote = new Map<string, unknown>(); let container: any = null, proxy: any = null;
   const network = { id: "c".repeat(64), createdAt: "original-network" };
@@ -493,3 +505,80 @@ test.skipIf(!clientRoot)("RA-33 actual Unix recovery retains admission and data 
   expect(await f.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, key: "runtime-health-development", kind: "evidence" } })).toBe(1);
   await session.complete(); f.control.bindControlOperation(null);
 }, 120_000);
+
+test.skipIf(!clientRoot).each([false, true])("a refused configuration crosses releases once and retains the existing claimed runtime, lost acknowledgment=%s", async lost => {
+  const f = await fixture(true);
+  const operations = await import(path.join(clientRoot!, "src/tooling-operation.ts"));
+  const { sessionStateAuthority } = await import(path.join(clientRoot!, "src/tooling-state-evidence.ts"));
+  const { savePrivate } = await import(path.join(clientRoot!, "src/runtime-config.ts"));
+  const { saveRuntimeStateFile, lossKeysForReaders } = await import(path.join(clientRoot!, "src/tooling-state-formats.ts"));
+  const { observeConfigurationRefusal, configurationValidationFailure } = await import(path.join(clientRoot!, "src/runtime-configuration-refusal-observer.ts"));
+  const { repairConfigurationRefusal } = await import("./configuration-refusal-repair.ts");
+  const tree = git(f.tooling, "rev-parse", "HEAD^{tree}");
+  const old = await f.prisma.toolingRelease.create({ data: { id: "original-release", repositoryId: f.task.repositoryId, revision: f.toolingRevision, tree,
+    policyBlob: git(f.tooling, "rev-parse", "HEAD:runtime.md"), checkout: f.checkout, manifest: f.toolingManifest, lockfileDigest: "0".repeat(64), bunVersion: Bun.version } });
+  await f.prisma.toolingSelection.create({ data: { repositoryId: f.task.repositoryId, generation: 1, releaseId: old.id, activatedAt: new Date() } });
+  const release = () => Promise.resolve({ checkout: f.checkout, revision: f.toolingRevision, tree, manifest: f.toolingManifest });
+  const operationClient = operations.toolingOperationClient(f.socket);
+  const values = { task: f.task.id, config: f.configFile, "state-directory": f.root, purpose: "development" };
+  const start = async (action: string, extra: Record<string, string> = {}) => {
+    const session = await operations.bindCliOperation({ positionals: ["runtime", action], values: { ...values, ...extra }, taskId: f.task.id, socket: f.socket,
+      task: () => f.registry.task(), files: { config: await readFile(f.configFile) }, release, client: operationClient, journalDirectory: f.root });
+    f.control.bindControlOperation(session); return session;
+  };
+  cleanup.push(async () => f.control.bindControlOperation(null));
+  let session = await start("up");
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
+  await session.complete(); f.control.bindControlOperation(null);
+  const offer = await f.deliver(); session = await start("up", { "compute-offer": offer.id });
+  expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile, computeOffer: offer.id })).phase).toBe("ready");
+  await session.complete(); f.control.bindControlOperation(null); await f.settled(offer);
+  // A prior successful configuration owns this offer; the next correction
+  // must not bypass that ownership merely by selecting a newer executable.
+  let recipe = await Bun.file(f.configFile).json(); recipe.readyTimeoutSeconds = 2; await savePrivate(f.configFile, recipe);
+  session = await start("configure");
+  expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe("ready");
+  await session.complete(); f.control.bindControlOperation(null);
+  recipe = await Bun.file(f.configFile).json(); recipe.checks[1].path = "/"; await savePrivate(f.configFile, recipe);
+  const failed = await start("configure");
+  const resource = (await f.registry.task()).resources.find((r: any) => r.key === "runtime-development")!;
+  const state = await Bun.file(resource.externalId).json(), original = structuredClone(state), effects = [...f.effects];
+  // Persist the exact old reader's validation-refusal boundary: only its
+  // failed progress write exists, with no configuration journal or callback.
+  state.phase = "failed"; state.progress = { step: "health", detail: configurationValidationFailure, state: "failed", updatedAt: new Date().toISOString() };
+  const authority = sessionStateAuthority(failed);
+  await saveRuntimeStateFile(resource.externalId, state, { authority: "bound", scopeKey: "runtime-development", registerWrite: authority.evidence.registerWrite, lossKeys: lossKeysForReaders((await authority.evidence.read({ family: "drafted.runtime", scopeKey: "runtime-development" })).consumers) });
+  await f.registry.resource({ key: resource.key, kind: resource.kind, purpose: resource.purpose, externalId: resource.externalId, state: "failed", metadata: { ...resource.metadata, observed: "failed", progress: state.progress } });
+  f.control.bindControlOperation(null);
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  f.runtime.observeSessionActivity = () => ({ state: "unknown", observedAt: Date.now() });
+  await writeFile(path.join(f.tooling, "corrected.txt"), "Corrected validation reader fixture\n"); git(f.tooling, "add", "."); git(f.tooling, "commit", "--quiet", "-m", "Corrected reader");
+  const revision = git(f.tooling, "rev-parse", "HEAD"), correctedTree = git(f.tooling, "rev-parse", "HEAD^{tree}"), checkout = path.join(f.config.installRoot, "tooling", f.task.repositoryId, revision);
+  git(f.tooling, "worktree", "add", "--detach", checkout, revision); await writeFile(`${checkout}.ready`, `${revision}\n`);
+  const corrected = await f.prisma.toolingRelease.create({ data: { ...old, manifest: f.toolingManifest, id: "corrected-release", revision, tree: correctedTree, checkout } });
+  await f.prisma.toolingSelection.update({ where: { repositoryId: f.task.repositoryId }, data: { generation: 2, releaseId: corrected.id } });
+  const repairInput = { ...f, repositoryId: f.task.repositoryId, taskId: f.task.id, request: { requestKey: "repair-original-refusal", operationId: failed.operationId!,
+    expectedInputDigest: failed.guard.binding.inputDigest, expectedGeneration: 2, values: { ...values, purpose: "development" as const } } };
+  const repaired = await repairConfigurationRefusal(repairInput, { observe: (_release, raw) => observeConfigurationRefusal(raw, f.input.docker) });
+  expect(f.effects).toEqual(effects);
+  expect(await repairConfigurationRefusal(repairInput, { observe: async () => { throw new Error("replay must not observe"); } })).toEqual(repaired);
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  const successor = await operations.bindCliOperation({ positionals: ["runtime", "configure"], values, taskId: f.task.id, socket: f.socket,
+    task: () => f.registry.task(), files: { config: await readFile(f.configFile) }, client: operationClient, journalDirectory: f.root,
+    env: { REMOTE_AGENT_TOOLING_OPERATION: repaired.binding.operationId }, release: async () => ({ checkout, revision, tree: correctedTree, manifest: f.toolingManifest }) });
+  f.control.bindControlOperation(successor);
+  const configure = f.registry.configureCompute; let drop = lost;
+  f.registry.configureCompute = async (request: any) => { const result = await configure(request); if (drop) { drop = false; throw new Error("Lost repaired configuration response"); } return result; };
+  if (lost) {
+    await expect(f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).rejects.toThrow("Lost repaired configuration response");
+    expect(f.container().running).toBe(false);
+  }
+  expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: f.configFile })).phase).toBe("ready");
+  await successor.complete(); f.control.bindControlOperation(null);
+  const after = await Bun.file(resource.externalId).json();
+  for (const field of ["container", "resources", "network", "dependencyVolume", "ports", "urls", "fingerprints"]) expect(after[field]).toEqual(original[field]);
+  expect(after.recipe.checks[1].path).toBe("/"); expect(after.configuration).toBeUndefined();
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.task.toolingRevision);
+  expect((await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id: failed.operationId! } })).completionEvidence).toEqual({ kind: "configuration-validation-failed", reference: repaired.binding.operationId });
+  expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
+}, 30_000);
