@@ -13,12 +13,17 @@ import { Hono } from "hono";
 import type { AppEnv } from "../../middleware/context.ts";
 import { computeRoutes } from "../../routes/tasks/compute.ts";
 import { toolingOperationGuard } from "../../routes/tasks/tooling-operations.ts";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { retainedReviewFixture } from "../../../../test-support/retained-review.ts";
 
 let db: TestDatabase;
+const roots: string[] = [];
 const config = testConfig({ machine: "host", compute: ComputePolicy.parse({ enabled: true, slots: 1 }) });
 const revision = "a".repeat(40), oldHash = "b".repeat(64), nextHash = "c".repeat(64);
 beforeEach(async () => { db = await createTestDatabase(); });
-afterEach(async () => { await db.cleanup(); });
+afterEach(async () => { await db.cleanup(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
 
 async function boundConfiguration(f: Awaited<ReturnType<typeof fixture>>, parented = false, legacyPid?: number) {
   const repository = { ...config.repository, id: "repo", tooling: { root: "/fixture/tooling", revision: "d".repeat(40) } };
@@ -51,12 +56,17 @@ async function boundConfiguration(f: Awaited<ReturnType<typeof fixture>>, parent
   };
   return { prepare, binding, parent, begin, settle, config: guardedConfig };
 }
-async function fixture(projected = false) {
-  await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "task", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: "/fixture/task", status: "idle" } });
-  await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: "repo", machineId: "host", branchName: "codex/task", worktreePath: "/fixture/task", toolingRoot: "/fixture/tooling", toolingRevision: "d".repeat(40), primarySessionId: "primary", phase: "working" } });
+async function fixture(projected = false, review = false) {
+  const root = review ? await realpath(await mkdtemp(path.join(tmpdir(), "review-config-"))) : null;
+  if (root) roots.push(root);
+  const source = root ? await retainedReviewFixture(root, "task", "d".repeat(40)) : null;
+  const purpose = review ? "review" : "development", sourceRevision = source?.revision ?? revision, worktree = source?.worktree ?? "/fixture/task";
+  await db.prisma.runtimeSession.create({ data: { id: "primary", scopeKey: "task", agentCommand: "codex", repositoryId: "repo", machineId: "host", role: "primary", cwd: worktree, status: "idle" } });
+  await db.prisma.remoteTask.create({ data: { id: "task", requestKey: "task", repositoryId: "repo", machineId: "host", branchName: "codex/task", worktreePath: worktree, toolingRoot: "/fixture/tooling", toolingRevision: "d".repeat(40), primarySessionId: "primary", phase: "working" } });
+  const anchor = source ? await db.prisma.remoteTaskResource.create({ data: source.anchorData }) : null;
   const context = { prisma: db.prisma, config, machineId: "host", policy: config.compute! };
-  const environment = await requestCompute({ ...context, taskId: "task", request: { key: "runtime-development", purpose: "development", revision, recipeDigest: oldHash } });
-  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: environment.key, kind: "task-runtime", purpose: "development", externalId: "/private/runtime.json", state: "failed", metadata: { recipeHash: projected ? nextHash : oldHash, revision, containerId: "original-container", compute: { configurationSha256: "e".repeat(64) } } } });
+  const environment = await requestCompute({ ...context, taskId: "task", request: { key: `runtime-${purpose}`, purpose, revision: sourceRevision, recipeDigest: oldHash } });
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: environment.key, kind: "task-runtime", purpose, externalId: "/private/runtime.json", state: "failed", metadata: { recipeHash: projected ? nextHash : oldHash, revision: sourceRevision, containerId: "original-container", compute: { configurationSha256: "e".repeat(64) } } } });
   const offer = await db.prisma.computeOffer.create({ data: { id: crypto.randomUUID(), environmentId: environment.id, machineId: "host", instructionId: "original-offer", dispatchDeadline: new Date(), state: "claimed", claimedAt: new Date() } });
   await db.prisma.computeSlot.create({ data: { id: "host:0", ordinal: 0, machineId: "host", allocationId: offer.id } });
   await db.prisma.computeEnvironment.update({ where: { id: environment.id }, data: { state: "starting", resourceId: resource.id, resourceIdentity: finalizationResourceIdentity(resource).identityDigest, observation: { old: "coverage must not survive" } } });
@@ -65,14 +75,44 @@ async function fixture(projected = false) {
   const request = { offerId: offer.id, resourceKey: environment.key, previousRecipeHash: oldHash, recipeHash: nextHash, baselineFile: "/private/baseline.json", lockPid: 123,
     coverage: { previousFile: "/private/immutable-before.json", next: compute } };
   const input = { prisma: db.prisma, config, taskId: "task", request };
-  const proof = { version: 1 as const, taskId: "task", primarySessionId: "primary", environmentId: environment.id, resourceId: resource.id, offerId: offer.id, revision, previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "1".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), stopped: true as const, compute };
+  const proof = { version: 1 as const, taskId: "task", primarySessionId: "primary", environmentId: environment.id, resourceId: resource.id, offerId: offer.id, revision: sourceRevision, previousRecipeHash: oldHash, recipeHash: nextHash, receiptSha256: "1".repeat(64), baselineSha256: "2".repeat(64), lockSha256: "3".repeat(64), stopped: true as const, compute };
   const observe: typeof readConfiguredComputeObservation = async (_input, _task, env, target) => ({ observation: {
-    version: 1, taskId: env.taskId, primarySessionId: env.primarySessionId, environmentId: env.id, purpose: "development", revision: env.revision, sourceRevision: env.revision,
+    version: 1, taskId: env.taskId, primarySessionId: env.primarySessionId, environmentId: env.id, purpose, revision: env.revision, ...(review ? {} : { sourceRevision: env.revision }),
     recipeDigest: env.recipeDigest, resourceId: target.id, resourceIdentity: finalizationResourceIdentity(target).identityDigest, observedAt: Date.now(), state: "stopped",
     coverage: "incomplete", configurationDigest: compute.configurationSha256, routes: [], operations: { coverage: "incomplete", active: 0, generation: "1".repeat(64) },
   }, traffic: [] });
-  return { context, input, proof, environment, resource, offer, read: async () => proof, head: async () => revision, observe };
+  return { context, input, proof, environment, resource, offer, source, anchor, read: async () => proof, head: async () => sourceRevision, observe };
 }
+test("retained review configuration ignores later development HEAD and replays a lost acknowledgment without replacing capacity", async () => {
+  const f = await fixture(false, true), resources = await db.prisma.remoteTaskResource.findMany(), offers = await db.prisma.computeOffer.findMany(), slots = await db.prisma.computeSlot.findMany();
+  const noDevelopmentHead = async () => { throw new Error("Review must not use development HEAD"); };
+  const result = await configureCompute(f.input, f.read, noDevelopmentHead, f.observe);
+  expect(result.recipeHash).toBe(nextHash);
+  expect(await configureCompute(f.input, f.read, noDevelopmentHead, f.observe)).toEqual(result);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(1);
+  expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: f.anchor!.id } })).toEqual(resources.find(r => r.id === f.anchor!.id)!);
+  expect(await db.prisma.computeOffer.findMany()).toEqual(offers); expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
+});
+test.each(["missing", "expired", "pin", "dirty", "branch", "receipt", "late-receipt", "late-anchor", "late-expiry", "late-pause"])("retained review configuration refuses %s drift without committing", async fault => {
+  const f = await fixture(false, true), source = f.source!, anchor = f.anchor!;
+  if (fault === "missing") await db.prisma.remoteTaskResource.delete({ where: { id: anchor.id } });
+  if (fault === "expired") await db.prisma.remoteTaskResource.update({ where: { id: anchor.id }, data: { expiresAt: new Date(0) } });
+  if (fault === "pin") await db.prisma.remoteTaskResource.update({ where: { id: anchor.id }, data: { metadata: { ...anchor.metadata as object, toolingRevision: "e".repeat(40) } } });
+  if (fault === "dirty") await writeFile(path.join(source.checkout, "untracked"), "changed");
+  if (fault === "branch") source.git(source.checkout, "checkout", "-b", "unexpected");
+  if (fault === "receipt") await writeFile(source.file, JSON.stringify({ ...source.receipt, taskId: "foreign" }));
+  const read = async () => {
+    if (fault === "late-receipt") await writeFile(source.file, JSON.stringify({ ...source.receipt, taskId: "foreign" }));
+    if (fault === "late-anchor") await db.prisma.remoteTaskResource.update({ where: { id: anchor.id }, data: { state: "released" } });
+    if (fault === "late-expiry") await db.prisma.remoteTaskResource.update({ where: { id: anchor.id }, data: { expiresAt: new Date(anchor.expiresAt!.getTime() + 1) } });
+    if (fault === "late-pause") await db.prisma.remoteTask.update({ where: { id: "task" }, data: { ownerPaused: true } });
+    return f.proof;
+  };
+  await expect(configureCompute(f.input, read, f.head, f.observe)).rejects.toThrow();
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(0);
+  expect(await db.prisma.computeSlot.count({ where: { allocationId: f.offer.id } })).toBe(1);
+});
 test.each([false, true])("atomic transition recovers partial projection=%s, preserves claim and replays lost acknowledgment", async projected => {
   const f = await fixture(projected), slot = await db.prisma.computeSlot.findMany(), offer = await db.prisma.computeOffer.findMany();
   const result = await configureCompute(f.input, f.read, f.head, f.observe);

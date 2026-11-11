@@ -688,7 +688,11 @@ export async function producerOperationId(store: Pick<PrismaClient, "runtimeMeta
 /** Freeze only acknowledged predecessor callbacks for the owner-verified
  * validation-refusal handoff. Unknown callback effects cannot be adopted. */
 export async function configurationRefusalPredecessors(store: AdmissionStore, task: RemoteTask, environmentId: string, offerId: string) {
-  const admission = (await admissionHistory(store, task, "runtime-development"))[0];
+  const environment = await store.computeEnvironment.findUniqueOrThrow({ where: { id: environmentId } });
+  if (environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId
+    || !["development", "review"].includes(environment.purpose) || environment.key !== `runtime-${environment.purpose}`)
+    throw new Error("Configuration refusal predecessor environment changed");
+  const admission = (await admissionHistory(store, task, environment.key))[0];
   const producer = await producerOperationId(store, task, environmentId);
   const owner = await owningOperationId(store, task, { type: "compute-offer", id: offerId });
   if (admission && admission.state !== "confirmed") throw new Error("Configuration refusal admission is uncertain");
