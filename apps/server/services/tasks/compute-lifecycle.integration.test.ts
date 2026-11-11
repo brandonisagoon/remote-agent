@@ -122,6 +122,7 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
     preflight: async () => { effects.push("preflight"); },
     create: async (state: any, directory: string, environment: unknown) => { effects.push("create"); await savePrivate(path.join(directory, "app", "environment.json"), environment);
       state.network = network;
+      labels["dev.drafted.purpose"] = state.purpose;
       container = { id: "a".repeat(64), image: `sha256:${"a".repeat(64)}`, createdAt: "2026-01-01T00:00:00.000Z", running: false, labels: { "dev.drafted.task": task.id, "dev.drafted.purpose": state.purpose, "dev.drafted.runtime": "1" } }; physical.container = container; await sync(); return container; },
     inspect: async () => container,
     start: async () => { effects.push("start"); container.running = physical.running = true; await sync(); },
@@ -181,6 +182,60 @@ console.log(JSON.stringify({ observation: { version: 1, environmentId: input.env
   return { ...context, admission, registry, client, input, configFile, effects, remote, physical, sync, deliver, settled, consider, continueSaved, continuationErrors, task, productRevision, root,
     control, socket, tooling, toolingManifest, toolingRevision, checkout, container: () => container };
 }
+
+test.skipIf(!clientRoot).each([false, true])("actual Unix review advances its unstarted queue to the corrected detached checkout (bound lost response: %s)", async bound => {
+  const f = await fixture();
+  const operations = await import(path.join(clientRoot!, "src/tooling-operation.ts")), tree = git(f.tooling, "rev-parse", "HEAD^{tree}");
+  if (bound) {
+    await f.prisma.toolingRelease.create({ data: { id: "paired-review-release", repositoryId: f.task.repositoryId, revision: f.toolingRevision, tree,
+      policyBlob: git(f.tooling, "rev-parse", "HEAD:runtime.md"), checkout: f.checkout, manifest: f.toolingManifest, lockfileDigest: "0".repeat(64), bunVersion: Bun.version } });
+    await f.prisma.toolingLegacyBoundary.create({ data: { repositoryId: f.task.repositoryId, activationRequestKey: "review-boundary", legacyRevision: f.toolingRevision, recordedAt: new Date() } });
+    await f.prisma.toolingSelection.create({ data: { repositoryId: f.task.repositoryId, generation: 1, releaseId: "paired-review-release", activatedAt: new Date() } });
+    cleanup.push(async () => f.control.bindControlOperation(null));
+  }
+  const up = async (revision: string, computeOffer?: string) => {
+    let session;
+    if (bound) {
+      const client = operations.toolingOperationClient(f.socket), requestKey = `review:${revision}:${computeOffer ?? "request"}`;
+      const guard = await operations.guardToolingOperation({ client, task: f.task, kind: "adapter-command", resourceKey: "runtime-review", inputDigest: canonicalDigest({ revision, computeOffer }), requestKey,
+        release: async () => ({ checkout: f.checkout, revision: f.toolingRevision, tree, manifest: f.toolingManifest }) });
+      session = new operations.ToolingOperationSession(guard, { client, task: f.task, commandRequestKey: requestKey, socket: f.socket, settlementDirectory: f.root });
+      f.control.bindControlOperation(session);
+    }
+    try {
+      const result = await f.client.manageRuntime({ ...f.input, action: "up", purpose: "review", revision, configFile: f.configFile, computeOffer });
+      await session?.complete(); return result;
+    } finally { if (bound) f.control.bindControlOperation(null); }
+  };
+  expect((await up(f.productRevision)).phase).toBe("waiting-compute");
+  const original = await f.prisma.computeEnvironment.findFirstOrThrow({ where: { taskId: f.task.id, purpose: "review" } });
+  const waiting = await f.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: original.id } });
+  const anchor = await f.prisma.remoteTaskResource.findFirstOrThrow({ where: { taskId: f.task.id, key: `review-${f.productRevision}` } });
+  const firstOffer = await f.prisma.computeOffer.findFirstOrThrow({ where: { environmentId: original.id } });
+  expect(f.effects).toEqual([]);
+  git(f.task.worktreePath!, "commit", "--allow-empty", "--quiet", "-m", "Correct product after browser verification");
+  const revision = git(f.task.worktreePath!, "rev-parse", "HEAD");
+  if (bound) {
+    const request = f.registry.requestCompute; let lost = true;
+    f.registry.requestCompute = async (value: any) => { const result = await request(value); if (lost) { lost = false; throw new Error("Lost committed review advance response"); } return result; };
+    await expect(up(revision)).rejects.toThrow("Lost committed review advance response");
+    await f.prisma.$disconnect();
+  }
+  expect((await up(revision)).phase).toBe("waiting-compute");
+  expect(await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: original.id } })).toMatchObject({ revision, recipeDigest: original.recipeDigest, resourceId: null });
+  expect(await f.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: original.id } })).toEqual(waiting);
+  expect(await f.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: anchor.id } })).toEqual(anchor);
+  expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: firstOffer.id } })).state).toBe("ineligible");
+  expect(f.effects).toEqual([]);
+  const offer = await f.deliver();
+  expect(offer.id).not.toBe(firstOffer.id);
+  expect((await up(revision, offer.id)).phase).toBe("ready");
+  expect(f.effects.filter(value => value === "create")).toHaveLength(1);
+  expect(f.effects.filter(value => value === "create-planetscale")).toHaveLength(1);
+  expect(await f.prisma.remoteTaskResource.count({ where: { taskId: f.task.id, kind: "git-worktree", purpose: "review" } })).toBe(2);
+  expect((await f.registry.task()).toolingRevision).toBe(f.task.toolingRevision);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "compute-unstarted-revision" } })).toBe(1);
+}, 90_000);
 
 test.skipIf(!clientRoot).each([false, true])("actual Unix lifecycle suspends idle compute and resumes the saved runtime (lost completion: %s)", async lostCompletion => {
   const f = await fixture();

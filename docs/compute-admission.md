@@ -2,12 +2,27 @@
 
 Before the first compute claim, a development request may follow the actual
 product worktree HEAD without replacing its environment or queue position.
-The server verifies the original ownership and a complete never-claimed history,
-with no resource, configuration, observation or traffic. It rechecks this proof
-inside the update transaction, withdraws old unclaimed offers, and journals the
+The server verifies original ownership, unchanged recipe and complete
+never-claimed history, with no runtime/provider resource, configuration,
+observation or traffic. Known preparation directories, evidence and test-account
+records remain intact. Unknown resource kinds or collisions with the runtime
+key refuse, including released records. The transaction rechecks this evidence,
+withdraws old unclaimed offers without rotating the queue, and journals the
 revision change. Prior claims (including uncertain or stopped ones) still need
 the existing saved-resource observation path. No revision update grants capacity
 or starts providers; ordinary delivery and claim checks remain mandatory.
+
+A never-started review queue can similarly advance after a product correction.
+Its source is the registered, unexpired detached review checkout for the exact
+requested commit, independently verified against the original private receipt,
+tooling pin and Git repository membership. Later development HEAD does not
+replace that review source. Dirty, attached, expired, redirected or foreign-owned
+checkouts refuse. Both the original and corrected review checkouts stay retained;
+no preview is relabeled or released. The source proof and complete registry
+evidence are compared again inside the same transaction. A lost response retries
+the original request, keeps one transition and requires an ordinary fresh offer.
+The actual client/Unix-route tests cover startup and lost-response continuation;
+their Docker/cloud effects remain explicit fixtures.
 
 DRA182 adds a disabled-by-default host application-compute budget, separate from provider turn capacity. Existing unknown or stale compute is counted conservatively. A queued message reserves no slot; the durable confirmed executing-turn event starts an exact 60-second claim period. A start command claims atomically, repeats the same allocation on retry, and keeps uncertain started capacity until independent stopped observation. Explicit owner resume queues its saved runtime before any effect, then completes the same intent after a real claim. Raw maintenance unpause remains separate.
 
