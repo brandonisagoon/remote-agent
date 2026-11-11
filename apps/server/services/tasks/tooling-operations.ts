@@ -484,7 +484,11 @@ export async function owningOperationId(store: Pick<PrismaClient, "runtimeMetada
 async function claimOwnership(prisma: PrismaClient, binding: ToolingOperationBinding, task: RemoteTask, reference: ExistingReference, read: ToolingOperationDependencies["read"]) {
   if (!await owningOperationId(prisma, task, reference)) await recordAssociation(prisma, binding, "owner", referenceId(reference), "confirmed");
   const owner = await owningOperationId(prisma, task, reference);
-  if (!owner || !await sameLineage(prisma, owner, binding, read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
+  if (!owner || !await sameLineage(prisma, owner, binding, read) && !await repairedConfigurationOwner(prisma, task, binding, reference, owner)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
+}
+async function repairedConfigurationOwner(store: AdmissionStore, task: RemoteTask, binding: ToolingOperationBinding, reference: ExistingReference, owner: string) {
+  if (!["compute-configure", "compute-admission"].includes(binding.kind) || reference.type !== "compute-offer") return false;
+  return (await import("./configuration-refusal-repair.ts")).configurationRefusalContinuationAllows(store, task, binding, { kind: "configuration", offerId: reference.id, owner });
 }
 /** Admissions in newest-first order of each operation's latest record. Only
  * exact domain proof marks one `failed` (it never admitted anything); an
@@ -533,6 +537,8 @@ async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmen
   const original = await read({ prisma: store as PrismaClient, operationId: prior.operationId });
   if (!original) return `Environment key ${environmentKey} was admitted by unknown operation ${prior.operationId}`;
   if (original.release.id === binding.release.id) return null;
+  if (prior.state === "confirmed" && await (await import("./configuration-refusal-repair.ts")).configurationRefusalContinuationAllows(store, task, binding,
+    { kind: "admission", environmentKey, owner: original.operationId })) return null;
   const held = `Environment key ${environmentKey} is held by operation ${original.operationId} (release ${original.release.revision})`;
   const command = await commandOf(store, original, read);
   if (!command || command.status !== "completed") return `${held}: its command is ${command?.status ?? "missing"}`;
@@ -660,6 +666,24 @@ export async function producerOperationId(store: Pick<PrismaClient, "runtimeMeta
     if (value.state === "intent" && !settled.has(value.operationId)) throw new ToolingOperationRefused("producer-unknown", `Compute environment ${environmentId} has an unconfirmed producer change by ${value.operationId}; retry that operation to reconcile it`);
   }
   return null;
+}
+
+/** Freeze only acknowledged predecessor callbacks for the owner-verified
+ * validation-refusal handoff. Unknown callback effects cannot be adopted. */
+export async function configurationRefusalPredecessors(store: AdmissionStore, task: RemoteTask, environmentId: string, offerId: string) {
+  const admission = (await admissionHistory(store, task, "runtime-development"))[0];
+  const producer = await producerOperationId(store, task, environmentId);
+  const owner = await owningOperationId(store, task, { type: "compute-offer", id: offerId });
+  if (admission && admission.state !== "confirmed") throw new Error("Configuration refusal admission is uncertain");
+  const ids = [...new Set([admission?.operationId, producer, owner].filter((id): id is string => Boolean(id)))];
+  for (const id of ids) {
+    const operation = await store.toolingOperation.findUnique({ where: { id } });
+    if (!operation || operation.taskId !== task.id || operation.sessionId !== task.primarySessionId || operation.repositoryId !== task.repositoryId
+      || !await latestAttemptAcknowledged(store, { taskId: task.id, sessionId: task.primarySessionId! }, operation)) throw new Error("Configuration refusal predecessor has an uncertain callback outcome");
+  }
+  if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environmentId, status: "pending" } }))
+    throw new Error("Configuration refusal has an uncertain runtime reader");
+  return { admission: admission?.operationId ?? null, producer, owner };
 }
 
 /** Only the guarded configure attempt may read its own pending generation.
@@ -952,7 +976,7 @@ export async function admitToolingCallback(input: { prisma: PrismaClient; config
     }
   } else if (reference) {
     const owner = await owningOperationId(store, task, reference);
-    if (owner && !await sameLineage(input.prisma, owner, binding, dependencies.read)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
+    if (owner && !await sameLineage(input.prisma, owner, binding, dependencies.read) && !await repairedConfigurationOwner(input.prisma, task, binding, reference, owner)) throw refuse("operation-mismatch", `${reference.type} ${reference.id} belongs to operation ${owner}`);
     if (callback.referenceRule === "existing" && !owner && binding.existingOperationId !== reference.id.slice(reference.id.startsWith(`${task.id}:`) ? task.id.length + 1 : 0)) throw refuse("operation-mismatch", `${callback.route} continues ${reference.type} ${reference.id}, not this operation's existing operation`);
     // Never take over an uncertain first-bootstrap consumer with newer code.
     if (!owner) {
@@ -1260,7 +1284,9 @@ export async function beginSessionToolingOperation(input: { prisma: PrismaClient
       // atomically under the admission write lock). Everything else is refused.
       {
         const sibling = Boolean(request.parentOperationId && original.parentOperationId === request.parentOperationId);
-        const refusal = sibling ? null : !admitted || !requested ? "it is not waiting work this command can adopt" : await adoptionRefused(input.prisma, input.config, before.task, request.existingOperationId,
+        const repaired = parent && ["compute-configure", "compute-admission"].includes(request.kind) && await repairedConfigurationOwner(input.prisma, before.task,
+          { ...parent, operationId: "", parentOperationId: parent.operationId, kind: request.kind, existingOperationId: request.existingOperationId }, reference, ownerId);
+        const refusal = sibling || repaired ? null : !admitted || !requested ? "it is not waiting work this command can adopt" : await adoptionRefused(input.prisma, input.config, before.task, request.existingOperationId,
           { operationId: "", parentOperationId: request.parentOperationId ?? null, release: requested, inputDigest: request.inputDigest, generation: requestedGeneration ?? 0 }, dependencies);
         if (refusal) throw new ToolingOperationRefused("retained-release-required", `${type} ${request.existingOperationId} belongs to operation ${original.operationId} (${original.kind}, release ${original.release.revision}); continue that operation with its release (${refusal})`);
       }
