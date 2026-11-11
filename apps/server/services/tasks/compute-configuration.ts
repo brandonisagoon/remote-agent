@@ -44,7 +44,12 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   const retained = ["claimed", "running", "unknown"].includes(offer.state) && !offer.completedAt && active.length === 1 && active[0]!.id === offer.id
     && slots.length === 1 && slots[0]!.allocationId === offer.id && slots[0]!.machineId === input.config.machine;
   const lastClaim = offers.filter(value => value.claimedAt).sort((a, b) => b.claimedAt!.getTime() - a.claimedAt!.getTime())[0];
-  const stopped = offer.state === "stopped" && Boolean(offer.completedAt) && lastClaim?.id === offer.id && environment.state === "suspended" && active.length === 0 && slots.length === 0;
+  // Resuming a paused task revokes reclamation's cached observation and can
+  // change suspended to unknown. Its terminal allocation history still lets
+  // the configure observer verify the exact stopped runtime; it grants no
+  // start permission or capacity. Fresh stopped proof remains mandatory below.
+  const stopped = offer.state === "stopped" && Boolean(offer.completedAt) && lastClaim?.id === offer.id
+    && ["suspended", "unknown"].includes(environment.state) && active.length === 0 && slots.length === 0;
   const intent = await developmentProjection(input);
   if (owner.task.phase === "complete" || intent.developmentBlocked || intent.developmentIntent?.blocked
     || intent.developmentIntent?.action === "stop" && intent.developmentIntent.reason !== "runtime-suspended") throw new Error("Configuration was superseded by a development stop");
@@ -171,6 +176,7 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       }
       await tx.computeTraffic.deleteMany({ where: { environmentId: current.environment.id } });
       await recordComputeObservation({ ...input, prisma: tx, environmentId: current.environment.id, observation });
+      if (current.stopped) await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { state: "suspended" } });
       for (const state of stopped.traffic) {
         const previous = await tx.computeTraffic.findUnique({ where: { routeId: state.route.id } });
         if (previous) throw new Error("Staged route is already owned by another environment");
