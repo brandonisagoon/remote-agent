@@ -227,7 +227,12 @@ async function unstartedRevisionEvidence(store: Store, environment: ComputeEnvir
   if (intent && z.object({ version: z.literal(1), action: z.enum(["stop", "resume"]) }).parse(JSON.parse(intent.value!)).action !== "resume") throw new Error("Compute revision cannot supersede development stop");
   const allocations = await savedRevisionAllocations(store, environment.id);
   if (allocations.offers.some(offer => offer.claimedAt !== null || !["queued", "offered", "expired", "declined", "ineligible"].includes(offer.state))) throw new Error("Compute revision has a prior or uncertain claim");
-  if (await store.remoteTaskResource.count({ where: { taskId: environment.taskId, purpose: environment.purpose } })
+  // Preparation records can predate both admission and product commits. They
+  // are retained inputs, not evidence that this app has started. Unknown kinds,
+  // provider/runtime resources and collisions with this runtime's key still
+  // refuse, even if marked released. The complete claim ledger remains required.
+  if (await store.remoteTaskResource.count({ where: { taskId: environment.taskId, purpose: environment.purpose,
+    OR: [{ kind: { notIn: ["directory", "evidence", "clerk-test-user"] } }, { key: environment.key }] } })
     || await store.computeTraffic.count({ where: { environmentId: environment.id } })) throw new Error("Compute revision has existing resources or traffic");
   const waiting = await store.computeWait.findUnique({ where: { environmentId: environment.id } });
   if (!waiting || waiting.machineId !== environment.machineId) throw new Error("Compute revision has no original queue entry");

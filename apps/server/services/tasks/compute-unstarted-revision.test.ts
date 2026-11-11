@@ -26,6 +26,36 @@ async function task(id = "one", worktree = `/fixture/${id}`, initial = request) 
 }
 const advance = (head: (worktree: string) => Promise<string> = async () => B) => requestCompute({ ...context(), taskId: "one", request: next() }, undefined, head);
 
+test.each(["directory", "evidence", "clerk-test-user"])("preparation %s survives a never-started revision advance", async kind => {
+  const environment = await task();
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "one", key: "preparation-input", kind, purpose: "development", externalId: "/fixture/preparation", state: "ready", metadata: { taskId: "one", retained: true } } });
+  const waiting = await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: environment.id } });
+  expect(await advance()).toMatchObject({ id: environment.id, revision: B, state: "waiting" });
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
+  expect(await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: environment.id } })).toEqual(waiting);
+  expect(await db.prisma.computeOffer.count({ where: { claimedAt: { not: null } } })).toBe(0);
+});
+
+test.each(["task-runtime", "native-app", "launch-agent", "launch-agents", "docker-container", "docker-compose-project", "neon-branch", "redis", "storage", "docker-volume", "unknown-kind", "directory-runtime-key", "evidence-runtime-key"])("runtime, provider or ambiguous preparation blocks revision advance: %s", async kind => {
+  const environment = await task();
+  const collision = kind.endsWith("-runtime-key");
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "one", key: collision ? request.key : "existing-resource", kind: collision ? kind.slice(0, -"-runtime-key".length) : kind, purpose: "development", externalId: "/fixture/existing", state: "released" } });
+  await expect(advance()).rejects.toThrow("existing resources");
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: environment.id } })).revision).toBe(A);
+  expect(await db.prisma.remoteTaskResource.findUniqueOrThrow({ where: { id: resource.id } })).toEqual(resource);
+});
+
+test("a preparation resource becoming runtime evidence during HEAD observation refuses atomically", async () => {
+  const environment = await task();
+  const resource = await db.prisma.remoteTaskResource.create({ data: { taskId: "one", key: "preparation", kind: "directory", purpose: "development", externalId: "/fixture/preparation" } });
+  await expect(advance(async () => {
+    await db.prisma.remoteTaskResource.update({ where: { id: resource.id }, data: { kind: "task-runtime" } });
+    return B;
+  })).rejects.toThrow("existing resources");
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: environment.id } })).revision).toBe(A);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-unstarted-revision" } })).toBe(0);
+});
+
 test("never-started revision keeps the same environment, queue position and offer history, once", async () => {
   const environment = await task(); await task("peer");
   const offer = (await offerNextCompute(context()))!;
@@ -125,6 +155,8 @@ test("ordinary HTTP request advances actual product HEAD but creates no claim or
     const git = (...args: string[]) => { const r = Bun.spawnSync(["git", "-C", root, ...args]); if (r.exitCode) throw new Error(r.stderr.toString()); return r.stdout.toString().trim(); };
     git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "initial");
     const environment = await task("one", root, { ...request, revision: git("rev-parse", "HEAD") });
+    for (const kind of ["directory", "evidence", "clerk-test-user"]) await db.prisma.remoteTaskResource.create({ data: { taskId: "one", key: `preparation-${kind}`, kind, purpose: "development", externalId: `/fixture/${kind}`, state: "ready" } });
+    const preparation = await db.prisma.remoteTaskResource.findMany({ where: { taskId: "one" }, orderBy: { id: "asc" } });
     const waiting = await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: environment.id } });
     git("-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-qm", "product change");
     const revision = git("rev-parse", "HEAD");
@@ -135,6 +167,6 @@ test("ordinary HTTP request advances actual product HEAD but creates no claim or
     expect(await db.prisma.computeWait.findUniqueOrThrow({ where: { environmentId: environment.id } })).toEqual(waiting);
     expect(await db.prisma.computeSlot.count({ where: { allocationId: { not: null } } })).toBe(0);
     expect(await db.prisma.computeOffer.count({ where: { claimedAt: { not: null } } })).toBe(0);
-    expect(await db.prisma.remoteTaskResource.count()).toBe(0);
+    expect(await db.prisma.remoteTaskResource.findMany({ where: { taskId: "one" }, orderBy: { id: "asc" } })).toEqual(preparation);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
