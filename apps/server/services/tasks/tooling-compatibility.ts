@@ -12,7 +12,8 @@ const RelativePath = z.string().min(1).refine((value) => !path.isAbsolute(value)
 const Capability = z.object({ instructions: RelativePath, adapter: RelativePath }).strict();
 const PreparationObservationContracts = z.array(z.literal("test-identity-preparation/v1")).length(1);
 export const CleanupObservationContracts = z.array(z.string().regex(/^[a-z][a-z0-9-]{0,63}\/v[1-9][0-9]{0,2}$/)).min(1).max(16).refine(values => new Set(values).size === values.length);
-const RuntimeObservationContracts = z.array(z.enum(["compute-traffic/v1", "compute-baseline/v1", "compute-reclamation/v1", "compute-historical-accounting/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1"])).min(1).max(6).refine(values => new Set(values).size === values.length);
+const RuntimeObservationContract = z.enum(["compute-traffic/v1", "compute-baseline/v1", "compute-reclamation/v1", "compute-historical-accounting/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1", "runtime-configuration-refusal/v1"]);
+const RuntimeObservationContracts = z.array(RuntimeObservationContract).min(1).max(RuntimeObservationContract.options.length).refine(values => new Set(values).size === values.length);
 const Manifest = z.object({ version: z.literal(1), capabilities: z.object({ prepare: Capability.extend({ observationContracts: PreparationObservationContracts.optional() }).strict().optional(), merge: Capability.optional(), cleanup: Capability.extend({ observationContracts: CleanupObservationContracts.optional() }).strict().optional(), runtime: Capability.extend({ observationContracts: RuntimeObservationContracts.optional() }).strict().optional(), browser: Capability.optional(), "development-credentials": Capability.optional() }).strict() }).strict();
 export type ToolingCapability = "prepare" | "merge" | "cleanup" | "runtime" | "browser" | "development-credentials";
 export interface CompatibilityReceipt {

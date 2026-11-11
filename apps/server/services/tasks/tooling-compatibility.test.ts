@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import deployedManifest from "../../../../test-support/fixtures/drafted-2d05a52-capabilities.json";
-import currentManifest from "../../../../test-support/fixtures/drafted-b11109b-capabilities.json";
+import previousManifest from "../../../../test-support/fixtures/drafted-b11109b-capabilities.json";
+import currentManifest from "../../../../test-support/fixtures/drafted-f08c87c-capabilities.json";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -186,7 +187,7 @@ async function withRuntimeManifest(contracts: unknown) {
   return { ...f, revision, hostPin, request };
 }
 
-for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"],
+for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, previousManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"],
   ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1"]]) {
   test(`deployed runtime manifest resolves supported contracts ${contracts.join(",")}`, async () => {
     const f = await withRuntimeManifest(contracts);
@@ -206,6 +207,7 @@ for (const contracts of [deployedManifest.capabilities.runtime.observationContra
 }
 
 for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["compute-traffic/v1", "unknown/v1"], ["runtime-neon-recovery/v2"], ["runtime-neon-recovery/v1", "runtime-neon-recovery/v1"],
+  ["runtime-configuration-refusal/v2"], ["runtime-configuration-refusal/v1", "runtime-configuration-refusal/v1"],
   ["compute-traffic/v2"], ["compute-traffic/v1", "compute-baseline/v1", "compute-baseline/v1"], "compute-traffic/v1", null]) {
   test(`deployed runtime manifest rejects invalid contracts ${JSON.stringify(contracts)}`, async () => {
     const f = await withRuntimeManifest(contracts);
@@ -216,8 +218,8 @@ for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["com
   });
 }
 
-// Exact complete manifest from Drafted b11109b643aabdda72f2518a63dd431ec7508613.
-// An unrelated preparation declaration must not strand a real runtime offer.
+// Exact complete manifest from Drafted f08c87c3f8d773f5ab5412daaf4e05fb4b7ca0d0.
+// Recovery observations must not strand the ordinary capability or configuration path.
 async function withCurrentManifest(prepareContracts: unknown = currentManifest.capabilities.prepare.observationContracts) {
   const f = await fixture(true);
   const manifest = structuredClone(currentManifest);

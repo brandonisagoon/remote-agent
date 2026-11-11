@@ -56,9 +56,10 @@ async function fixture(platformHome = false) {
   const productRevision = git(product, "rev-parse", "HEAD");
   await repository(tooling);
   const toolingManifest = await Bun.file(path.join(clientRoot!, ".remote-agent-release.json")).json();
+  const runtimeContracts = (await Bun.file(path.join(clientRoot!, ".remote-agent-capabilities.json")).json()).capabilities.runtime.observationContracts;
   await writeFile(path.join(tooling, ".remote-agent-release.json"), JSON.stringify(toolingManifest));
   await writeFile(path.join(tooling, "runtime.md"), "Fixture physical observation only.\n");
-  await writeFile(path.join(tooling, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { runtime: { instructions: "runtime.md", adapter: "observe.ts", observationContracts: ["compute-traffic/v1", "runtime-configuration/v1"] } } }));
+  await writeFile(path.join(tooling, ".remote-agent-capabilities.json"), JSON.stringify({ version: 1, capabilities: { runtime: { instructions: "runtime.md", adapter: "observe.ts", observationContracts: runtimeContracts } } }));
   await writeFile(path.join(tooling, "observe.ts"), `
 const input = JSON.parse(await Bun.stdin.text());
 const physical = await Bun.file(${JSON.stringify(physicalFile)}).json();
