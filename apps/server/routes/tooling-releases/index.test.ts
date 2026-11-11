@@ -30,6 +30,10 @@ test("integrated activation exists only on the bearer TCP app and validates owne
   const socket = createApp({ config, prisma: db.prisma, agentRuntime: createFakeAgentRuntime(), trustLocal: true });
   expect((await socket.request("/api/tooling-releases/test-repository/activations", { method: "POST", headers: auth, body })).status).toBe(404);
   expect((await socket.request("/api/tooling-releases/test-repository", { headers: auth })).status).toBe(404);
+  const repairPath = "/api/tooling-releases/test-repository/tasks/task/identity-preparation-repairs";
+  expect((await tcp.request(repairPath, { method: "POST", body })).status).toBe(401);
+  expect((await tcp.request(repairPath, { method: "POST", headers: auth, body: "{}" })).status).toBe(400);
+  expect((await socket.request(repairPath, { method: "POST", headers: auth, body })).status).toBe(404);
 });
 
 test("a disabled route refuses activation before preparing any candidate", async () => {

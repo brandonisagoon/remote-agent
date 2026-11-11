@@ -195,6 +195,33 @@ A paused task gets no new work from activation.
 
 ## Saved tooling state
 
+### Failed identity reservation repair
+
+The owner TCP endpoint `POST /api/tooling-releases/:repositoryId/tasks/:taskId/identity-preparation-repairs`
+provides one narrow independent boundary for a defective identity adapter. It
+requires the original task to be held paused, its managed family inactive, no
+native owner, the exact bound command/input and selected compatible generation.
+Only version-1 `drafted.test-identities/test-identities` writes are allowed;
+children, retained consumers, account resources, compute environments, later
+writers, attempted/unknown accounts and changed ownership refuse. The selected
+immutable release's `test-identity-preparation/v1` observer reconstructs the
+original CLI input digest and verifies the original private assignment has only
+planned dedicated slots with zero attempts. It makes no provider requests.
+
+After fresh proof and a transactional recheck, the server retains the original
+binding and writes, records `identity-preparation-failed` as its terminal
+evidence, and binds one linked successor on the corrected release. This is a
+recorded failure, never successful preparation or account-absence proof. The
+owner request key replays the same receipt after lost acknowledgment; changed
+payload refuses. The successor is returned for the original primary to resume
+with the original command arguments and `REMOTE_AGENT_TOOLING_OPERATION` set
+to that successor ID. Normal pause, ownership, state and provider checks still
+apply. The API does not unpause, dispatch, repin a task, replace an account or
+delete the reservation. Original pins and immutable release history remain.
+
+This source addition requires a compatible paired rollout before use. It is not
+a generic operation replacement API and cannot recover uncertain provider writes.
+
 DRA-30 inventories current runtime/configuration/compute/cleanup receipt readers
 and adds validated format handling at their shared boundaries. Prefer reading a
 compatible existing version without rewriting it. Do not bump version 1 only

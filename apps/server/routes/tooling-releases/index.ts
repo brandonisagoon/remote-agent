@@ -4,6 +4,7 @@ import type { AppEnv } from "../../middleware/context.ts";
 import { verifyBearerToken } from "../../security.ts";
 import { ToolingActivationError, activateToolingRelease, getActiveToolingRelease, type ToolingActivationErrorCode } from "../../services/tasks/tooling-releases.ts";
 import { inventoryLegacyToolingConsumers } from "../../services/tasks/tooling-operations.ts";
+import { IdentityPreparationRepairInput, repairIdentityPreparation } from "../../services/tasks/identity-preparation-repair.ts";
 
 const ActivationBody = z.strictObject({ requestKey: z.string(), revision: z.string(), expectedGeneration: z.number() });
 const STATUS: Record<ToolingActivationErrorCode, 400 | 409 | 422> = {
@@ -24,6 +25,17 @@ export function toolingReleaseRoutes(options: { enabled: boolean; activate?: typ
   routes.get("/:repositoryId", async (c) => {
     const selection = await getActiveToolingRelease({ prisma: c.get("prisma"), config: c.get("config"), repositoryId: c.req.param("repositoryId") });
     return c.json({ selection, activationEnabled: options.enabled });
+  });
+  routes.post("/:repositoryId/tasks/:taskId/identity-preparation-repairs", async c => {
+    if (!options.enabled) return c.json({ error: "Tooling repair is unavailable", code: "repair-unavailable" }, 409);
+    const body = IdentityPreparationRepairInput.safeParse(await c.req.json().catch(() => null));
+    if (!body.success) return c.json({ error: "Identity repair requires the original command and expected release generation", code: "invalid-request" }, 400);
+    try {
+      return c.json(await repairIdentityPreparation({ prisma: c.get("prisma"), config: c.get("config"), runtime: c.get("agentRuntime"),
+        repositoryId: c.req.param("repositoryId"), taskId: c.req.param("taskId"), request: body.data }));
+    } catch (error) {
+      return c.json({ error: error instanceof Error ? error.message : "Identity preparation repair refused", code: "repair-refused" }, 409);
+    }
   });
   routes.post("/:repositoryId/activations", async (c) => {
     if (!options.enabled) return c.json({ error: "Tooling release activation is unavailable until operation adoption is integrated", code: "activation-unavailable" }, 409);
