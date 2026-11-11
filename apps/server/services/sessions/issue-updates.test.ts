@@ -1,4 +1,5 @@
 import { reserveTaskPublication, taskPublicationContext } from "./task-publication.ts";
+import { recordCapabilityOutcome } from "../tasks/tooling-capability-outcome.ts";
 import { issueUpdateSource } from "./issue-update-source.ts";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
@@ -480,6 +481,41 @@ test("mapped implementation children finish through the real update flow while t
   expect(f.comments.size).toBe(2);
 });
 
+
+test("capability blockers publish once, preserve immutable retries and observe recovery between recurring failures", async () => {
+  const f = await fixture();
+  const record = (state: "blocked" | "resolved") => f.prisma.$transaction(tx => recordCapabilityOutcome(tx, {
+    version: 1, capability: "runtime", state, taskId: f.task.id, sessionId: f.session.id,
+    worktreePath: directory, taskToolingRevision: f.task.toolingRevision, capabilityRevision: "reviewed-release",
+  }));
+  const publication = { category: "blocker" as const, subject: { kind: "capability" as const, id: "runtime" as const }, code: "tooling-capability-unavailable" };
+  const input = { prisma: f.prisma, config: f.config, sessionId: f.session.id, evidence: [], publication };
+  await expect(publishSessionIssueUpdate({ ...input, requestKey: "invented", body: "Unavailable" }, f.client)).rejects.toThrow();
+  await record("blocked");
+  const first = await publishSessionIssueUpdate({ ...input, requestKey: "first", body: "Runtime instructions are unavailable." }, f.client);
+  await record("blocked");
+  expect((await publishSessionIssueUpdate({ ...input, requestKey: "reworded", body: "Same failure, different words." }, f.client)).commentId).toBe(first.commentId);
+  expect(f.comments.size).toBe(1);
+  await record("resolved");
+  // No publication scan between this successful resolution and the next failure.
+  await record("blocked");
+  await f.prisma.$disconnect();
+  const recurrence = await publishSessionIssueUpdate({ ...input, requestKey: "recurrence", body: "Runtime instructions are unavailable again." }, f.client);
+  expect(recurrence.commentId).not.toBe(first.commentId);
+  expect(recurrence.publication).toMatchObject({ occurrence: 2 });
+  const recovery = await publishSessionIssueUpdate({ ...input, requestKey: "first-recovery", body: "The first failure resolved.",
+    publication: { ...publication, category: "recovery", occurrence: 1 } }, f.client);
+  expect(recovery.publication).toMatchObject({ occurrence: 1, category: "recovery" });
+  expect((await publishSessionIssueUpdate({ ...input, requestKey: "first", body: "Runtime instructions are unavailable." }, f.client)).commentId).toBe(first.commentId);
+  await expect(publishSessionIssueUpdate({ ...input, requestKey: "first", body: "Changed payload" }, f.client)).rejects.toThrow("different update");
+  await expect(publishSessionIssueUpdate({ ...input, requestKey: "wrong-subject", body: "Browser failed", publication: { ...publication, subject: { kind: "capability", id: "browser" } } }, f.client)).rejects.toThrow();
+  expect(f.comments.size).toBe(3);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await f.prisma.toolingOperation.count()).toBe(0);
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { issueIdentifier: "DRA-OTHER" } });
+  await expect(publishSessionIssueUpdate({ ...input, requestKey: "changed-source", body: "Old failure on another source." }, f.client)).rejects.toThrow("ownership changed");
+  expect(f.comments.size).toBe(3);
+});
 
 test("RA-25: reworded explicit and fallback reports reserve one receipt; original retry payload stays immutable", async () => {
   const f = await fixture();

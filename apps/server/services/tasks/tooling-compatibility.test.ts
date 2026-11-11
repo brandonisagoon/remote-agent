@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import deployedManifest from "../../../../test-support/fixtures/drafted-2d05a52-capabilities.json";
+import currentManifest from "../../../../test-support/fixtures/drafted-b11109b-capabilities.json";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -13,6 +14,7 @@ import { beginTask } from "./store.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
+import { taskPublicationContext } from "../sessions/task-publication.ts";
 import { recordDevelopmentIntent } from "./development-intent.ts";
 import { createApp } from "../../app.ts";
 import { deliverManagedMerge } from "../../workers/product/workflow/merge-delivery.ts";
@@ -214,6 +216,92 @@ for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["com
   });
 }
 
+// Exact complete manifest from Drafted b11109b643aabdda72f2518a63dd431ec7508613.
+// An unrelated preparation declaration must not strand a real runtime offer.
+async function withCurrentManifest(prepareContracts: unknown = currentManifest.capabilities.prepare.observationContracts) {
+  const f = await fixture(true);
+  const manifest = structuredClone(currentManifest);
+  for (const [name, capability] of Object.entries(manifest.capabilities)) {
+    write(f.source, capability.instructions, `Reviewed ${name} instructions`);
+  }
+  write(f.source, ".remote-agent-capabilities.json", JSON.stringify({ ...manifest, capabilities: {
+    ...manifest.capabilities, prepare: { ...manifest.capabilities.prepare, observationContracts: prepareContracts },
+  } }));
+  const revision = commit(f.source);
+  f.repository.tooling.revision = revision;
+  const hostPin = f.pin(revision);
+  const app = createApp({ config: f.config, prisma: db.prisma, agentRuntime: f.runtime });
+  const request = (capability: string) => app.request(`/api/sessions/${f.session.id}/tooling-capability`, {
+    method: "POST", headers: { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ capability }),
+  });
+  return { ...f, revision, hostPin, request };
+}
+
+for (const capability of ["runtime", "browser", "cleanup", "development-credentials"] as const) {
+  test(`current complete manifest resolves ${capability} with preparation observations and preserves ownership`, async () => {
+    const f = await withCurrentManifest();
+    const first = await f.request(capability);
+    expect(first.status).toBe(200);
+    const result = await first.json();
+    expect(result.receipt).toMatchObject({ capability, source: "configured-host", capabilityRevision: f.revision,
+      taskToolingRevision: f.oldRevision, adapter: realpathSync(path.join(f.hostPin, currentManifest.capabilities[capability].adapter)) });
+    expect(await (await f.request(capability)).json()).toEqual(result);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(1);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect(await db.prisma.remoteTaskResource.count()).toBe(0);
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({
+      primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin,
+    });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    expect((await f.request(capability)).status).toBe(409);
+  });
+}
+
+for (const contracts of [[], ["test-identity-preparation/v2"], ["test-identity-preparation/v1", "test-identity-preparation/v1"], ["unknown/v1"], "test-identity-preparation/v1", null]) {
+  test(`current complete manifest refuses malformed preparation observations ${JSON.stringify(contracts)}`, async () => {
+    const f = await withCurrentManifest(contracts);
+    expect((await f.request("runtime")).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
+  });
+}
+
+test("real capability refusal exposes one durable blocker, then resolves on a successful reread without repinning", async () => {
+  const f = await withCurrentManifest(["test-identity-preparation/v2"]);
+  const failed = await f.request("runtime");
+  expect(failed.status).toBe(409);
+  expect((await failed.json()).error).toContain("inspect_task");
+  expect((await taskPublicationContext(db.prisma, f.task)).publicationSubjects).toContainEqual({
+    subject: { kind: "capability", id: "runtime" }, status: "blocked", code: "tooling-capability-unavailable",
+  });
+  expect((await f.request("runtime")).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(1);
+  write(f.source, ".remote-agent-capabilities.json", JSON.stringify(currentManifest));
+  f.repository.tooling.revision = commit(f.source); f.pin(f.repository.tooling.revision);
+  expect((await f.request("runtime")).status).toBe(200);
+  expect((await taskPublicationContext(db.prisma, f.task)).publicationSubjects).toContainEqual({
+    subject: { kind: "capability", id: "runtime" }, status: "resolved",
+  });
+  expect((await f.request("runtime")).status).toBe(200);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(2);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ toolingRevision: f.oldRevision, primarySessionId: f.session.id });
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.toolingOperation.count()).toBe(0);
+});
+
+test("revoked ownership during a failed capability read records no blocker or execution", async () => {
+  const f = await fixture(true);
+  await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "runtime" }, async () => {
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    throw new Error("Manifest unavailable");
+  })).rejects.toThrow("paused");
+  expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.runtimeEventCursor.count()).toBe(0);
+});
+
 test("paused runtime resolution requires the exact development intent and cannot resolve another capability or a superseded request", async () => {
   const f = await fixture(true), context = { prisma: db.prisma, config: f.config, taskId: f.task.id };
   const development = await recordDevelopmentIntent({ ...context, request: { action: "pause", development: true, requestKey: "desktop-pause" } });
@@ -245,7 +333,8 @@ test("undeclared development credential capability fails concretely without upgr
   write(f.source, ".remote-agent-capabilities.json", JSON.stringify({ version: 1, capabilities: {} }));
   const revision = commit(f.source); f.repository.tooling.revision = revision; f.pin(revision);
   await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "development-credentials" })).rejects.toThrow("does not supply capability development-credentials");
-  expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(1);
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
 });
 
