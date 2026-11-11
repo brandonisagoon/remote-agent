@@ -149,15 +149,16 @@ test.each(["progress", "container", "coverage"])("crash after resource publicati
   expect((await db.prisma.computeSlot.findUniqueOrThrow({ where: { id: "host:0" } })).allocationId).toBe(f.offer.id);
 });
 
-test("verified stopped terminal offer is retained as history; configuration grants no allocation and normal admission queues afresh", async () => {
+test.each(["suspended", "unknown"])("verified terminal offer with %s observation grants no allocation and normal admission queues afresh", async state => {
   const f = await fixture(true);
   await db.prisma.computeOffer.update({ where: { id: f.offer.id }, data: { state: "stopped", completedAt: new Date() } });
   await db.prisma.computeSlot.update({ where: { id: "host:0" }, data: { allocationId: null } });
   await db.prisma.computeWait.deleteMany({ where: { environmentId: f.environment.id } });
-  await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { state: "suspended" } });
+  await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { state } });
   const history = await db.prisma.computeOffer.findMany(), slots = await db.prisma.computeSlot.findMany();
   await configureCompute(f.input, f.read, f.head, f.observe);
   await configureCompute(f.input, f.read, f.head, f.observe);
+  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).state).toBe("suspended");
   expect(await db.prisma.computeOffer.findMany()).toEqual(history); expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
   expect(await db.prisma.computeWait.count()).toBe(0);
   await requestCompute({ ...f.context, taskId: "task", request: { key: f.resource.key, purpose: "development", revision, recipeDigest: nextHash } });
@@ -188,9 +189,18 @@ test.each(["unexplained-slot", "another-offer", "not-suspended", "no-completion"
   expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
 });
 
-test.each(["running", "identity", "stale", "manifest"])("invalid independently observed stopped accounting %s rolls back the configuration", async fault => {
+test.each(["retained", "unknown-terminal"].flatMap(allocation => ["running", "identity", "stale", "manifest", "observer-failure"].map(fault => [allocation, fault])))
+  ("invalid stopped accounting for %s: %s rolls back the configuration", async (allocation, fault) => {
   const f = await fixture(true);
+  if (allocation === "unknown-terminal") {
+    await db.prisma.computeOffer.update({ where: { id: f.offer.id }, data: { state: "stopped", completedAt: new Date() } });
+    await db.prisma.computeSlot.update({ where: { id: "host:0" }, data: { allocationId: null } });
+    await db.prisma.computeEnvironment.update({ where: { id: f.environment.id }, data: { state: "unknown" } });
+  }
+  const before = await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } });
+  const offers = await db.prisma.computeOffer.findMany(), slots = await db.prisma.computeSlot.findMany();
   const observe: typeof readConfiguredComputeObservation = async (...args) => {
+    if (fault === "observer-failure") throw new Error("Stopped observation failed");
     const output = await f.observe(...args);
     if (fault === "running") output.observation.state = "running";
     if (fault === "identity") output.observation.resourceIdentity = "9".repeat(64);
@@ -199,9 +209,10 @@ test.each(["running", "identity", "stale", "manifest"])("invalid independently o
     return output;
   };
   await expect(configureCompute(f.input, f.read, f.head, observe)).rejects.toThrow();
-  expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
+  expect(await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).toEqual(before);
   expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(0);
-  expect((await db.prisma.computeOffer.findUniqueOrThrow({ where: { id: f.offer.id } })).state).toBe("claimed");
+  expect(await db.prisma.computeOffer.findMany()).toEqual(offers);
+  expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
 });
 
 test("fresh stopped route evidence replaces the old generation with the new configuration", async () => {

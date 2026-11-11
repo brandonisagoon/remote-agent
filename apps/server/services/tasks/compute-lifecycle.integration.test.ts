@@ -19,6 +19,7 @@ import { canonicalDigest, readToolingOperation } from "./tooling-releases.ts";
 import { createRuntimeStore, type AcpSessionRecord } from "acpx/runtime";
 import { createAcpxSessionRuntime } from "../../transports/acpx/session-runtime.ts";
 import { wakeConfigurationAfterRepair } from "./configuration-repair-wakeup.ts";
+import { reclaimStoppedCompute } from "./compute-reclamation.ts";
 import { deliverInstructions } from "../sessions/inbox.ts";
 
 const clientRoot = process.env.DRAFTED_INTEGRATION_ROOT;
@@ -327,8 +328,8 @@ test.skipIf(!clientRoot)("setup, migrations and fixtures retain their claimed sl
   expect(f.effects).not.toContain("stop");
 }, 90_000);
 
-test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "repair-available"])("actual client/observer configuration replays through Unix routes and ordinary admission (%s)", async mode => {
-  const lost = mode === "lost-acknowledgment", repair = mode === "repair-available";
+test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "resumed-terminal", "repair-available", "repair-after-v1"])("actual client/observer configuration replays through Unix routes and ordinary admission (%s)", async mode => {
+  const lost = mode === "lost-acknowledgment" || mode === "resumed-terminal", repair = mode === "repair-available" || mode === "repair-after-v1";
   const f = await fixture();
   expect((await f.client.manageRuntime({ ...f.input, action: "up", configFile: f.configFile })).phase).toBe("waiting-compute");
   const first = await f.deliver();
@@ -368,10 +369,11 @@ test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "repair-availabl
         expect(failure.code).toBe("configuration-observation-failed");
         if (repair) {
           // Fixture the persisted pre-upgrade server contract: its guarded
-          // refusal is real, but that version did not stamp repairContracts.
+          // refusal is real; older versions either had no repair stamp or v1.
           const intent = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { key: `outcome:${child.binding.operationId}` }, orderBy: { sequence: "asc" } });
           const { repairContracts: _unsupported, ...prior } = JSON.parse(intent.value!);
-          await f.prisma.runtimeMetadataEvent.update({ where: { sequence: intent.sequence }, data: { value: JSON.stringify(prior) } });
+          await f.prisma.runtimeMetadataEvent.update({ where: { sequence: intent.sequence }, data: { value: JSON.stringify({ ...prior,
+            ...(mode === "repair-after-v1" ? { repairContracts: ["configuration-command-recovery/v1"] } : {}) }) } });
         }
         legacy.push({ id: child.binding.operationId, inputDigest, events: await f.prisma.runtimeMetadataEvent.findMany({ where: { key: `outcome:${child.binding.operationId}` }, orderBy: { sequence: "asc" } }) });
       }
@@ -386,6 +388,13 @@ test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "repair-availabl
     expect(f.container().running).toBe(false);
     await refresh(); await reconcileObservedCompute({ ...f.admission, environmentId: first.environmentId, runtime: f.runtime });
     expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: first.id } })).state).toBe("stopped");
+    if (mode === "resumed-terminal") {
+      // Once the task is active again, reclamation invalidates its cached
+      // suspended accounting. Replay must re-observe the stopped app instead
+      // of treating the unknown cache as a new allocation or permanent stop.
+      expect(await reclaimStoppedCompute({ ...f, environmentId: first.environmentId }, async () => { throw new Error("Active task must not reclaim"); })).toEqual({ released: false });
+      expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: first.environmentId } })).state).toBe("unknown");
+    }
   }
   let configured: any;
   if (repair) {
