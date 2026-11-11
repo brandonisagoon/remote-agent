@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import deployedManifest from "../../../../test-support/fixtures/drafted-2d05a52-capabilities.json";
+import currentManifest from "../../../../test-support/fixtures/drafted-b11109b-capabilities.json";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -208,6 +209,58 @@ for (const contracts of [[], ["compute-traffic/v1", "compute-traffic/v1"], ["com
   test(`deployed runtime manifest rejects invalid contracts ${JSON.stringify(contracts)}`, async () => {
     const f = await withRuntimeManifest(contracts);
     expect((await f.request()).status).toBe(409);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
+  });
+}
+
+// Exact complete manifest from Drafted b11109b643aabdda72f2518a63dd431ec7508613.
+// An unrelated preparation declaration must not strand a real runtime offer.
+async function withCurrentManifest(prepareContracts: unknown = currentManifest.capabilities.prepare.observationContracts) {
+  const f = await fixture(true);
+  const manifest = structuredClone(currentManifest);
+  for (const [name, capability] of Object.entries(manifest.capabilities)) {
+    write(f.source, capability.instructions, `Reviewed ${name} instructions`);
+  }
+  write(f.source, ".remote-agent-capabilities.json", JSON.stringify({ ...manifest, capabilities: {
+    ...manifest.capabilities, prepare: { ...manifest.capabilities.prepare, observationContracts: prepareContracts },
+  } }));
+  const revision = commit(f.source);
+  f.repository.tooling.revision = revision;
+  const hostPin = f.pin(revision);
+  const app = createApp({ config: f.config, prisma: db.prisma, agentRuntime: f.runtime });
+  const request = (capability: string) => app.request(`/api/sessions/${f.session.id}/tooling-capability`, {
+    method: "POST", headers: { authorization: `Bearer ${f.config.apiKey}`, "content-type": "application/json" },
+    body: JSON.stringify({ capability }),
+  });
+  return { ...f, revision, hostPin, request };
+}
+
+for (const capability of ["runtime", "browser", "cleanup", "development-credentials"] as const) {
+  test(`current complete manifest resolves ${capability} with preparation observations and preserves ownership`, async () => {
+    const f = await withCurrentManifest();
+    const first = await f.request(capability);
+    expect(first.status).toBe(200);
+    const result = await first.json();
+    expect(result.receipt).toMatchObject({ capability, source: "configured-host", capabilityRevision: f.revision,
+      taskToolingRevision: f.oldRevision, adapter: realpathSync(path.join(f.hostPin, currentManifest.capabilities[capability].adapter)) });
+    expect(await (await f.request(capability)).json()).toEqual(result);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(1);
+    expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+    expect(await db.prisma.remoteTaskResource.count()).toBe(0);
+    expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({
+      primarySessionId: f.session.id, toolingRevision: f.oldRevision, pinnedToolingRoot: f.oldPin,
+    });
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    expect((await f.request(capability)).status).toBe(409);
+  });
+}
+
+for (const contracts of [[], ["test-identity-preparation/v2"], ["test-identity-preparation/v1", "test-identity-preparation/v1"], ["unknown/v1"], "test-identity-preparation/v1", null]) {
+  test(`current complete manifest refuses malformed preparation observations ${JSON.stringify(contracts)}`, async () => {
+    const f = await withCurrentManifest(contracts);
+    expect((await f.request("runtime")).status).toBe(409);
     expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
     expect(await db.prisma.runtimeInstruction.count()).toBe(0);
     expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
