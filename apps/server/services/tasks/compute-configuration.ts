@@ -10,6 +10,7 @@ import { acknowledgeConfigurationConsumer, configurationAttemptCode, currentTool
 import { ComputeObservation, recordComputeObservation } from "./compute-observation.ts";
 import { finalizationDigest, finalizationResourceIdentity } from "./finalization-resources.ts";
 import { readComputeWorktreeRevision } from "./compute-worktree-revision.ts";
+import { readComputeReviewRevision } from "./compute-review-revision.ts";
 
 const Sha = z.string().regex(/^[a-f0-9]{64}$/);
 const Absolute = z.string().max(4096).refine(p => path.isAbsolute(p) && path.normalize(p) === p);
@@ -55,7 +56,8 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
     || intent.developmentIntent?.action === "stop" && intent.developmentIntent.reason !== "runtime-suspended") throw new Error("Configuration was superseded by a development stop");
   if (retained) await assertComputeStartIntent(input.prisma, input.taskId, environment.id, offer.id);
   if (environment.taskId !== input.taskId || environment.primarySessionId !== owner.session.id || environment.taskIdentity !== owner.identity || environment.machineId !== input.config.machine
-    || environment.purpose !== "development" || environment.configuration !== null || environment.key !== input.request.resourceKey
+    || !["development", "review"].includes(environment.purpose) || environment.configuration !== null || environment.key !== input.request.resourceKey
+    || environment.key !== `runtime-${environment.purpose}`
     || resource.kind !== "task-runtime" || resource.purpose !== environment.purpose || resource.state === "released" || environment.resourceId !== resource.id
     || metadata.revision !== environment.revision || ![input.request.previousRecipeHash, input.request.recipeHash].includes(String(metadata.recipeHash))
     || ![input.request.previousRecipeHash, input.request.recipeHash].includes(environment.recipeDigest) || input.request.previousRecipeHash === input.request.recipeHash
@@ -79,14 +81,18 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   }
   const traffic = await input.prisma.computeTraffic.findMany({ where: { environmentId: environment.id }, orderBy: { routeId: "asc" }, take: 33 });
   if (traffic.length > 32) throw new Error("Configuration traffic inventory exceeds its bound");
-  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, retained, intent };
+  const review = environment.purpose === "review" ? await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: {
+    taskId_key: { taskId: input.taskId, key: `review-${environment.revision}` } } }) : null;
+  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, retained, intent, review };
 }
 
 async function readConfiguration(input: Input, before: Snapshot) {
   const { receipt, adapterPath, checked, before: adapterHash } = await verifiedComputeRuntime({ ...input, sessionId: before.owner.session.id });
   const manifest = await Bun.file(path.join(receipt.checkout, ".remote-agent-capabilities.json")).json();
   if (!manifest.capabilities?.runtime?.observationContracts?.includes("runtime-configuration/v1")) throw new Error("Configured runtime cannot verify saved configuration transitions");
+  if (before.review && !manifest.capabilities.runtime.observationContracts.includes("runtime-review-configuration/v1")) throw new Error("Configured runtime cannot verify retained review configuration");
   const request = { request: input.request, task: { id: input.taskId, primarySessionId: before.owner.session.id, worktreePath: before.owner.task.worktreePath },
+    ...(before.review ? { reviewWorktree: before.review.externalId } : {}),
     environment: { id: before.environment.id, key: before.environment.key, purpose: before.environment.purpose, revision: before.environment.revision },
     resource: { id: before.resource.id, key: before.resource.key, kind: before.resource.kind, purpose: before.resource.purpose, externalId: before.resource.externalId, metadata: before.resource.metadata } };
   const env = operationEnvironment(currentToolingOperation(), input.config.controlIpcPath);
@@ -101,7 +107,7 @@ async function readConfiguration(input: Input, before: Snapshot) {
  * application. A terminal stopped offer is history, never revived: ordinary
  * admission must allocate afresh. No offer, slot, start permission, pin or provider is created.
  * The journal and both hashes commit together; retries still re-observe ownership. */
-export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision, observe = readConfiguredComputeObservation) {
+export async function configureCompute(input: Input, read = readConfiguration, head = readComputeWorktreeRevision, observe = readConfiguredComputeObservation, reviewSource = readComputeReviewRevision) {
   const binding = currentToolingOperation(), attempt = currentToolingAttempt();
   const attemptId = attempt?.route === "POST /api/tasks/:taskId/compute-configure" ? attempt.attemptId : crypto.randomUUID();
   let stage: ConfigurationStage = "validation", sessionId: string | undefined;
@@ -112,7 +118,12 @@ export async function configureCompute(input: Input, read = readConfiguration, h
     const before = await snapshot(input);
     sessionId = before.owner.session.id;
     stage = "source";
-    if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed");
+    const source = async () => {
+      if (before.review) return reviewSource(before.owner.task, before.review, before.environment.revision, new Date());
+      if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed");
+      return null;
+    };
+    const originalSource = await source();
     stage = "configuration-observation";
     const proof = Proof.parse(await read(input, before));
     if (proof.taskId !== input.taskId || proof.primarySessionId !== before.owner.session.id || proof.environmentId !== before.environment.id || proof.resourceId !== before.resource.id
@@ -136,7 +147,7 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       || observation.operations.active !== 0 || observation.configurationDigest !== proof.compute.configurationSha256) throw new Error("Staged configuration has no fresh stopped accounting");
     if (stopped.traffic.length !== observation.routes.length || stopped.traffic.some(value => !observation.routes.some(route => finalizationDigest(route) === finalizationDigest(value.route)))) throw new Error("Staged configuration traffic proof changed");
     stage = "source-recheck";
-    if (await head(before.owner.task.worktreePath!) !== before.environment.revision) throw new Error("Configuration source changed during observation");
+    if (finalizationDigest(await source()) !== finalizationDigest(originalSource)) throw new Error("Configuration source changed during observation");
     return await input.prisma.$transaction(async tx => {
       // This fresh snapshot also checks current pause, original primary/source
       // link, intent, slot, active offer and prior transition receipt.
@@ -149,15 +160,16 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       const stable = (value: Snapshot) => {
         const { observation: _observation, updatedAt: _updatedAt, ...environment } = value.environment;
         return { identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment, resource: value.resource,
-          offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent };
+          offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent, review: value.review };
       };
-      if (finalizationDigest(stable(current)) !== finalizationDigest(stable(before))) throw new Error("Configuration authority changed during observation");
+      const generation = (value: Snapshot) => finalizationDigest(JSON.parse(JSON.stringify(stable(value))));
+      if (generation(current) !== generation(before)) throw new Error("Configuration authority changed during observation");
       stage = "transition-commit";
       if (!current.event) {
         const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
         await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
           value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
-            traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile,
+            traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile, review: current.review, source: originalSource,
             allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
         await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
           observation: Prisma.DbNull } });

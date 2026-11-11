@@ -188,7 +188,8 @@ async function withRuntimeManifest(contracts: unknown) {
 }
 
 for (const contracts of [deployedManifest.capabilities.runtime.observationContracts, previousManifest.capabilities.runtime.observationContracts, ["compute-traffic/v1"], ["compute-baseline/v1", "compute-traffic/v1"], ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1"],
-  ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1"]]) {
+  ["compute-traffic/v1", "compute-baseline/v1", "runtime-configuration/v1", "runtime-neon-recovery/v1"],
+  ["compute-traffic/v1", "runtime-configuration/v1", "runtime-configuration-refusal/v1", "runtime-review-configuration/v1", "compute-baseline/v1", "compute-reclamation/v1", "compute-historical-accounting/v1", "runtime-neon-recovery/v1"]]) {
   test(`deployed runtime manifest resolves supported contracts ${contracts.join(",")}`, async () => {
     const f = await withRuntimeManifest(contracts);
     const response = await f.request();
