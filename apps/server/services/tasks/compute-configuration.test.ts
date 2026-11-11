@@ -93,6 +93,30 @@ test("retained review configuration ignores later development HEAD and replays a
   expect(await db.prisma.remoteTaskResource.findUnique({ where: { id: f.anchor!.id } })).toEqual(resources.find(r => r.id === f.anchor!.id)!);
   expect(await db.prisma.computeOffer.findMany()).toEqual(offers); expect(await db.prisma.computeSlot.findMany()).toEqual(slots);
 });
+test.each(["unchanged", "hostname", "purpose", "removed", "additional"])("review configuration rechecks registered preview authority: %s", async change => {
+  const f = await fixture(false, true);
+  const preview = await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "preview", kind: "cloudflared-connector", purpose: "review",
+    externalId: "pid:1234", state: "ready", metadata: { hostname: "drafted-test-review.brandongoon.com" } } });
+  let changed = false;
+  const read = async () => {
+    if (changed) return f.proof;
+    changed = true;
+    if (change === "hostname") await db.prisma.remoteTaskResource.update({ where: { id: preview.id }, data: { metadata: { hostname: "different.brandongoon.com" } } });
+    if (change === "purpose") await db.prisma.remoteTaskResource.update({ where: { id: preview.id }, data: { purpose: "development" } });
+    if (change === "removed") await db.prisma.remoteTaskResource.delete({ where: { id: preview.id } });
+    if (change === "additional") await db.prisma.remoteTaskResource.create({ data: { taskId: "task", key: "other-preview", kind: "cloudflared-connector", purpose: "review", externalId: "pid:5678", state: "ready" } });
+    return f.proof;
+  };
+  if (change === "unchanged") {
+    expect((await configureCompute(f.input, read, f.head, f.observe)).recipeHash).toBe(nextHash);
+    const event = await db.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "compute-runtime-configuration" } });
+    expect(JSON.parse(event.value!).previewResources).toMatchObject([{ id: preview.id }]);
+  } else {
+    await expect(configureCompute(f.input, read, f.head, f.observe)).rejects.toThrow("Configuration authority changed");
+    expect((await db.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: f.environment.id } })).recipeDigest).toBe(oldHash);
+    expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "compute-runtime-configuration" } })).toBe(0);
+  }
+});
 test.each(["missing", "expired", "pin", "dirty", "branch", "receipt", "late-receipt", "late-anchor", "late-expiry", "late-pause"])("retained review configuration refuses %s drift without committing", async fault => {
   const f = await fixture(false, true), source = f.source!, anchor = f.anchor!;
   if (fault === "missing") await db.prisma.remoteTaskResource.delete({ where: { id: anchor.id } });

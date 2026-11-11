@@ -50,6 +50,7 @@ async function fixture(platformHome = false, review = false) {
   if (platformHome) {
     await mkdir(path.join(product, "apps/web/src/app"), { recursive: true });
     await writeFile(path.join(product, "apps/web/src/app/page.tsx"), "export default function Page() { return 'Home'; }\n");
+    await writeFile(path.join(product, "apps/web/next.config.ts"), "export default { allowedDevOrigins: [process.env.DEV_LAN_HOST] };\n");
     git(product, "add", ".");
   }
   git(product, "commit", "--allow-empty", "--quiet", "-m", "Original product");
@@ -680,6 +681,34 @@ test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "unsettled-start
   expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.task.toolingRevision);
   expect((await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id: failed.operationId! } })).completionEvidence).toEqual({ kind: "configuration-validation-failed", reference: repaired.binding.operationId });
   expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
+  if (review) {
+    // A separate host request follows the completed heap repair. Its baseline
+    // retains the accepted heap instead of replaying stale 4 GiB recipe bytes.
+    const hostname = "drafted-pair-review.brandongoon.com", tunnelId = crypto.randomUUID(), hostFile = path.join(f.root, "review-host.json");
+    await f.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "review-connector", kind: "cloudflared-connector", purpose: "review", externalId: "pid:1234", state: "ready",
+      metadata: { version: 1, taskId: f.task.id, pid: 1234, dedicated: true, tunnelId, hostname, source: after.urls.web } } });
+    await f.prisma.remoteTaskResource.create({ data: { taskId: f.task.id, key: "review-tunnel", kind: "cloudflare-tunnel", purpose: "review", externalId: tunnelId, state: "allocated",
+      metadata: { dedicated: true, tunnelId, hostname, revision: after.revision } } });
+    await writeFile(path.join(f.tooling, "review-host.txt"), "Separate preview-host release fixture\n");
+    git(f.tooling, "add", "."); git(f.tooling, "commit", "--quiet", "-m", "Preview host reader");
+    const hostRevision = git(f.tooling, "rev-parse", "HEAD"), hostTree = git(f.tooling, "rev-parse", "HEAD^{tree}"), hostCheckout = path.join(f.config.installRoot, "tooling", f.task.repositoryId, hostRevision);
+    git(f.tooling, "worktree", "add", "--detach", hostCheckout, hostRevision); await writeFile(`${hostCheckout}.ready`, `${hostRevision}\n`);
+    const hostRelease = await f.prisma.toolingRelease.create({ data: { ...old, manifest: f.toolingManifest, id: "host-release", revision: hostRevision, tree: hostTree, checkout: hostCheckout } });
+    await f.prisma.toolingSelection.update({ where: { repositoryId: f.task.repositoryId }, data: { generation: 3, releaseId: hostRelease.id } });
+    const hostRecipe = structuredClone(after.recipe); hostRecipe.services.web.environment.DEV_LAN_HOST = hostname; await savePrivate(hostFile, hostRecipe);
+    const hostSession = await operations.bindCliOperation({ positionals: ["runtime", "configure"], values: { ...values, config: hostFile }, taskId: f.task.id, socket: f.socket,
+      task: () => f.registry.task(), files: { config: await readFile(hostFile) }, client: operationClient, journalDirectory: f.root,
+      release: async () => ({ checkout: hostCheckout, revision: hostRevision, tree: hostTree, manifest: f.toolingManifest }) });
+    f.control.bindControlOperation(hostSession); drop = lost;
+    if (lost) await expect(f.client.manageRuntime({ ...f.input, action: "configure", configFile: hostFile })).rejects.toThrow("Lost repaired configuration response");
+    expect((await f.client.manageRuntime({ ...f.input, action: "configure", configFile: hostFile })).phase).toBe("ready");
+    await hostSession.complete(); f.control.bindControlOperation(null);
+    const hosted = await Bun.file(resource.externalId).json();
+    expect(hosted.recipe.services.web.environment).toMatchObject({ NODE_OPTIONS: "--max-old-space-size=6144", DEV_LAN_HOST: hostname });
+    for (const field of ["container", "resources", "network", "ports", "urls", "fingerprints", "worktree", "revision", "expiresAt"]) expect(hosted[field]).toEqual(after[field]);
+    expect(hosted.configuration).toBeUndefined();
+    expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
+  }
   if (unsettled) {
     const next = await f.deliver();
     expect(next.id).not.toBe(offer.id);
@@ -702,4 +731,4 @@ test.skipIf(!clientRoot).each(["normal", "lost-acknowledgment", "unsettled-start
     expect(f.effects.filter(effect => effect === "create")).toHaveLength(1);
     expect((await f.prisma.computeOffer.findUniqueOrThrow({ where: { id: offer.id } })).state).toBe("stopped");
   }
-}, 30_000);
+}, 60_000);
