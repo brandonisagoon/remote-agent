@@ -78,6 +78,42 @@ test("zero-effect review refusal records one corrected successor and preserves i
   expect(await configurationRefusalContinuationAllows(f.prisma, task, child, { kind: "configuration", offerId: prior.offer.id, owner: "configured" })).toBe(false);
 });
 
+test.each([false, true])("refusal repair ignores concurrent collector telemetry while retaining physical proof: review=%s", async review => {
+  const f = await fixture(review), prior = await predecessors(f);
+  const observation = { collector: "refreshed during independent physical observation" };
+  const result = await f.run(async (...args) => {
+    await f.prisma.computeEnvironment.update({ where: { id: prior.environment.id }, data: {
+      observation, updatedAt: new Date(prior.environment.updatedAt.getTime() + 1000),
+    } });
+    return f.observe(...args);
+  });
+  expect(result.binding.inputDigest).toBe(f.request.expectedInputDigest);
+  expect(await f.prisma.toolingOperation.count({ where: { releaseId: "fixed" } })).toBe(1);
+  expect((await f.prisma.computeEnvironment.findUniqueOrThrow({ where: { id: prior.environment.id } })).observation).toEqual(observation);
+  expect(await f.run(async () => { throw new Error("Saved handoff must replay"); })).toEqual(result);
+});
+
+for (const review of [false, true])
+test.each(["state", "revision", "recipe", "identity", "resource-identity", "configuration", "lease"])("refusal repair rejects concurrent authority changes despite telemetry refresh: review=" + review + " %s", async change => {
+  const f = await fixture(review), prior = await predecessors(f);
+  await expect(f.run(async (...args) => {
+    await f.prisma.computeEnvironment.update({ where: { id: prior.environment.id }, data: {
+      observation: { collector: "fresh" }, updatedAt: new Date(prior.environment.updatedAt.getTime() + 1000),
+      ...(change === "state" ? { state: "unknown" } : {}),
+      ...(change === "revision" ? { revision: "f".repeat(40) } : {}),
+      ...(change === "recipe" ? { recipeDigest: "f".repeat(64) } : {}),
+      ...(change === "identity" ? { taskIdentity: "f".repeat(64) } : {}),
+      ...(change === "resource-identity" ? { resourceIdentity: "f".repeat(64) } : {}),
+      ...(change === "configuration" ? { configuration: { changed: true } } : {}),
+    } });
+    if (change === "lease") await f.prisma.computeOffer.update({ where: { id: prior.offer.id }, data: { expiresAt: new Date(prior.offer.expiresAt!.getTime() + 1000) } });
+    return f.observe(...args);
+  })).rejects.toThrow();
+  expect((await f.prisma.toolingOperation.findUniqueOrThrow({ where: { id: "original" } })).status).toBe("bound");
+  expect(await f.prisma.toolingOperation.count({ where: { releaseId: "fixed" } })).toBe(0);
+  expect(await f.prisma.runtimeMetadataEvent.count({ where: { action: "configuration-refusal-repaired" } })).toBe(0);
+});
+
 test.each(["state-write", "later-writer", "child", "consumer", "missing-anchor", "dirty", "late-receipt", "late-anchor", "wrong-transition"])("review preflight refusal cannot continue after %s", async fault => {
   const f = await fixture(true);
   if (fault === "state-write" || fault === "later-writer") await f.prisma.toolingStateWrite.create({ data: { taskId: "task", repositoryId: "repo", operationId: fault === "state-write" ? "original" : "later", releaseId: "old", family: "drafted.runtime", scopeKey: "runtime-review", version: 1, preservesUnknown: false } });
