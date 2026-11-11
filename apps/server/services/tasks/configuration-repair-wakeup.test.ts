@@ -101,10 +101,16 @@ test("a failed v1 repair receives the new repair once without rewriting its atte
 
 test("an undispatched v1 continuation is superseded through the ordinary inbox before v2 queues", async () => {
   const f = await fixture();
+  expect((await f.wake()).state).toBe("queued");
+  const current = await f.prisma.runtimeInstruction.findFirstOrThrow();
+  const currentEvent = await f.prisma.runtimeMetadataEvent.findFirstOrThrow({ where: { action: "configuration-repair-wakeup", key: current.id } });
+  // Preserve the complete real receipt and all ownership digests, changing
+  // only the versioned identity to model an undispatched pre-upgrade queue.
   const id = `configuration-repair:${canonicalDigest({ taskId: f.taskId, parentId: "original-command", contract: "configuration-command-recovery/v1" })}`;
-  const instruction = await f.prisma.runtimeInstruction.create({ data: { id, sessionId: "primary", text: "Original v1 repair continuation" } });
-  const event = await f.prisma.runtimeMetadataEvent.create({ data: { runtimeSessionId: "primary", source: "tooling-operation:task", action: "configuration-repair-wakeup", key: id,
-    value: JSON.stringify({ state: "queued", repairContract: "configuration-command-recovery/v1" }) } });
+  const text = current.text.replace(CONFIGURATION_REPAIR_CONTRACT, "configuration-command-recovery/v1");
+  const instruction = await f.prisma.runtimeInstruction.update({ where: { id: current.id }, data: { id, text } });
+  const event = await f.prisma.runtimeMetadataEvent.update({ where: { sequence: currentEvent.sequence }, data: { key: id,
+    value: JSON.stringify({ ...JSON.parse(currentEvent.value!), repairContract: "configuration-command-recovery/v1", instructionId: id, instructionTextDigest: canonicalDigest(text) }) } });
   expect(await f.wake()).toEqual({ state: "not-needed" });
   expect(await f.prisma.$transaction(tx => configurationRepairInstructionAllows(tx, f.config, instruction))).toBe(false);
   expect(await f.prisma.runtimeInstruction.findUniqueOrThrow({ where: { id } })).toMatchObject({ state: "cancelled", executionRequestId: null, text: instruction.text });
