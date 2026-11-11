@@ -83,7 +83,10 @@ async function snapshot(input: Omit<Input, "prisma"> & { prisma: Prisma.Transact
   if (traffic.length > 32) throw new Error("Configuration traffic inventory exceeds its bound");
   const review = environment.purpose === "review" ? await input.prisma.remoteTaskResource.findUniqueOrThrow({ where: {
     taskId_key: { taskId: input.taskId, key: `review-${environment.revision}` } } }) : null;
-  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, retained, intent, review };
+  const previewResources = review ? await input.prisma.remoteTaskResource.findMany({ where: { taskId: input.taskId,
+    kind: { in: ["cloudflared-connector", "cloudflare-tunnel"] } }, orderBy: { id: "asc" }, take: 101 }) : [];
+  if (previewResources.length > 100) throw new Error("Configuration preview registration exceeds its bound");
+  return { owner, offer, environment, resource, allocations, traffic, event, key, stopped, retained, intent, review, previewResources };
 }
 
 async function readConfiguration(input: Input, before: Snapshot) {
@@ -93,6 +96,10 @@ async function readConfiguration(input: Input, before: Snapshot) {
   if (before.review && !manifest.capabilities.runtime.observationContracts.includes("runtime-review-configuration/v1")) throw new Error("Configured runtime cannot verify retained review configuration");
   const request = { request: input.request, task: { id: input.taskId, primarySessionId: before.owner.session.id, worktreePath: before.owner.task.worktreePath },
     ...(before.review ? { reviewWorktree: before.review.externalId } : {}),
+    // Older strict observers keep their original input. A new host transition
+    // requires this explicit capability and independently scoped registration.
+    ...(before.review && manifest.capabilities.runtime.observationContracts.includes("runtime-preview-host-configuration/v1")
+      ? { previewResources: before.previewResources } : {}),
     environment: { id: before.environment.id, key: before.environment.key, purpose: before.environment.purpose, revision: before.environment.revision },
     resource: { id: before.resource.id, key: before.resource.key, kind: before.resource.kind, purpose: before.resource.purpose, externalId: before.resource.externalId, metadata: before.resource.metadata } };
   const env = operationEnvironment(currentToolingOperation(), input.config.controlIpcPath);
@@ -160,7 +167,7 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       const stable = (value: Snapshot) => {
         const { observation: _observation, updatedAt: _updatedAt, ...environment } = value.environment;
         return { identity: value.owner.identity, ownerPaused: value.owner.task.ownerPaused, environment, resource: value.resource,
-          offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent, review: value.review };
+          offer: value.offer, allocations: value.allocations, event: value.event, intent: value.intent, review: value.review, previewResources: value.previewResources };
       };
       const generation = (value: Snapshot) => finalizationDigest(JSON.parse(JSON.stringify(stable(value))));
       if (generation(current) !== generation(before)) throw new Error("Configuration authority changed during observation");
@@ -168,8 +175,9 @@ export async function configureCompute(input: Input, read = readConfiguration, h
       if (!current.event) {
         const resource = await tx.remoteTaskResource.update({ where: { id: current.resource.id }, data: { metadata } });
         await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: current.owner.session.id, source: `compute:${input.taskId}`, action: Action, key: current.key,
-          value: JSON.stringify({ version: 1, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
+          value: JSON.stringify({ version: 1, operationId: binding?.operationId ?? null, taskIdentity: current.owner.identity, environment: current.environment, resource: current.resource, offer: current.offer, allocations: current.allocations,
             traffic: current.traffic, proof, compute: proof.compute, stoppedObservation: observation, baselineFile: input.request.baselineFile, review: current.review, source: originalSource,
+            previewResources: current.previewResources,
             allocation: current.stopped ? "previously-stopped-await-normal-admission" : "retained-existing-claim" }) } });
         await tx.computeEnvironment.update({ where: { id: current.environment.id }, data: { recipeDigest: input.request.recipeHash, resourceIdentity: finalizationResourceIdentity(resource).identityDigest,
           observation: Prisma.DbNull } });

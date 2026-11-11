@@ -488,7 +488,8 @@ async function claimOwnership(prisma: PrismaClient, binding: ToolingOperationBin
 }
 async function repairedConfigurationOwner(store: AdmissionStore, task: RemoteTask, binding: ToolingOperationBinding, reference: ExistingReference, owner: string) {
   if (!["compute-configure", "compute-admission"].includes(binding.kind) || reference.type !== "compute-offer") return false;
-  return (await import("./configuration-refusal-repair.ts")).configurationRefusalContinuationAllows(store, task, binding, { kind: "configuration", offerId: reference.id, owner });
+  return await (await import("./configuration-refusal-repair.ts")).configurationRefusalContinuationAllows(store, task, binding, { kind: "configuration", offerId: reference.id, owner })
+    || await completedReviewConfigurationAllows(store, task, binding, { offerId: reference.id, owner });
 }
 /** Admissions in newest-first order of each operation's latest record. Only
  * exact domain proof marks one `failed` (it never admitted anything); an
@@ -539,6 +540,7 @@ async function admissionHeld(store: AdmissionStore, task: RemoteTask, environmen
   if (original.release.id === binding.release.id) return null;
   if (prior.state === "confirmed" && await (await import("./configuration-refusal-repair.ts")).configurationRefusalContinuationAllows(store, task, binding,
     { kind: "admission", environmentKey, owner: original.operationId })) return null;
+  if (prior.state === "confirmed" && await completedReviewConfigurationAllows(store, task, binding, { environmentKey, owner: original.operationId })) return null;
   const held = `Environment key ${environmentKey} is held by operation ${original.operationId} (release ${original.release.revision})`;
   const command = await commandOf(store, original, read);
   if (!command || command.status !== "completed") return `${held}: its command is ${command?.status ?? "missing"}`;
@@ -705,6 +707,59 @@ export async function configurationRefusalPredecessors(store: AdmissionStore, ta
   if (await store.toolingRetainedConsumer.count({ where: { consumerKind: "compute-environment", consumerId: environmentId, status: "pending" } }))
     throw new Error("Configuration refusal has an uncertain runtime reader");
   return { admission: admission?.operationId ?? null, producer, owner };
+}
+
+/** A later settings request may follow a completed review configuration. It
+ * retains the first allocation owner; it cannot adopt unfinished work. Every
+ * predecessor must be acknowledged and settled, and subsequent admission is
+ * allowed only after this command's own verified configuration has committed. */
+export async function completedReviewConfigurationAllows(store: AdmissionStore, task: RemoteTask, binding: ToolingOperationBinding,
+  reference: { offerId: string; owner: string } | { environmentKey: string; owner: string }) {
+  if (task.ownerPaused || ["closed", "complete"].includes(task.phase) || !task.primarySessionId || !binding.parentOperationId
+    || !["compute-configure", "compute-admission"].includes(binding.kind) || binding.taskId !== task.id || binding.sessionId !== task.primarySessionId || binding.repositoryId !== task.repositoryId) return false;
+  const parent = await store.toolingOperation.findUnique({ where: { id: binding.parentOperationId } });
+  if (!parent || parent.kind !== "adapter-command" || parent.resourceKey !== "runtime-review" || !["bound", "running"].includes(parent.status)
+    || parent.taskId !== task.id || parent.sessionId !== task.primarySessionId || parent.repositoryId !== task.repositoryId || parent.releaseId !== binding.release.id || parent.generation !== binding.generation) return false;
+  const offer = "offerId" in reference ? await store.computeOffer.findUnique({ where: { id: reference.offerId } }) : null;
+  const environment = "offerId" in reference
+    ? offer ? await store.computeEnvironment.findUnique({ where: { id: offer.environmentId } }) : null
+    : await store.computeEnvironment.findUnique({ where: { taskId_key: { taskId: task.id, key: reference.environmentKey } } });
+  if (!environment || environment.taskId !== task.id || environment.primarySessionId !== task.primarySessionId || environment.machineId !== task.machineId
+    || environment.purpose !== "review" || environment.key !== "runtime-review" || environment.configuration !== null) return false;
+  const settled = async (id: string, own = false) => {
+    const operation = await store.toolingOperation.findUnique({ where: { id } });
+    if (!operation || operation.taskId !== task.id || operation.sessionId !== task.primarySessionId || operation.repositoryId !== task.repositoryId
+      || operation.status !== "completed" && !(own && operation.parentOperationId === parent.id && operation.status === "running") || operation.generation > binding.generation
+      || !await latestAttemptAcknowledged(store, { taskId: task.id, sessionId: task.primarySessionId! }, operation)) return false;
+    const command = operation.parentOperationId ? await store.toolingOperation.findUnique({ where: { id: operation.parentOperationId } }) : null;
+    return Boolean(command && command.kind === "adapter-command" && command.taskId === task.id && command.sessionId === task.primarySessionId
+      && command.repositoryId === task.repositoryId && command.releaseId === operation.releaseId && command.generation === operation.generation
+      && (command.status === "completed" || own && command.id === parent.id));
+  };
+  if (!await settled(reference.owner)) return false;
+  const history = await associations(store, task, "producer", `compute-environment:${environment.id}`);
+  const outcomes = new Set(history.filter(value => value.state !== "intent").map(value => value.operationId));
+  let producer: string | undefined;
+  for (const value of history) {
+    // The exact callback may recheck its own intent; another unknown producer
+    // is never permission to select a new operation or release.
+    if (value.operationId === binding.operationId) continue;
+    if (value.state === "intent" && !outcomes.has(value.operationId)) return false;
+    if (value.state === "confirmed") { producer = value.operationId; break; }
+  }
+  if (!producer || !await settled(producer, true)) return false;
+  const admission = (await admissionHistory(store, task, environment.key)).find(value => value.operationId !== binding.operationId);
+  if (!admission || admission.state !== "confirmed" || !await settled(admission.operationId, true)) return false;
+  const pending = await store.toolingRetainedConsumer.findMany({ where: { consumerKind: "compute-environment", consumerId: environment.id, status: "pending" }, take: 101 });
+  if (pending.length > 100 || pending.some(value => value.operationId !== binding.operationId)) return false;
+  if (binding.kind === "compute-configure") return "offerId" in reference && binding.existingOperationId === reference.offerId;
+  const event = await store.runtimeMetadataEvent.findFirst({ where: { runtimeSessionId: task.primarySessionId, source: `compute:${task.id}`, action: "compute-runtime-configuration" }, orderBy: { sequence: "desc" } });
+  const journal = z.object({ operationId: z.string(), proof: z.object({ environmentId: z.string(), resourceId: z.string(), offerId: z.string(), recipeHash: z.string() }) }).safeParse(parseJson(event?.value ?? null));
+  if (!journal.success || journal.data.proof.environmentId !== environment.id || journal.data.proof.resourceId !== environment.resourceId
+    || journal.data.proof.recipeHash !== environment.recipeDigest || "offerId" in reference && journal.data.proof.offerId !== reference.offerId) return false;
+  const configuration = await store.toolingOperation.findUnique({ where: { id: journal.data.operationId } });
+  return configuration?.kind === "compute-configure" && configuration.parentOperationId === parent.id
+    && configuration.existingOperationId === journal.data.proof.offerId && await settled(configuration.id, true);
 }
 
 /** Only the guarded configure attempt may read its own pending generation.
