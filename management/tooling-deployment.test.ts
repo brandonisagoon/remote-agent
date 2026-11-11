@@ -143,16 +143,29 @@ for (const published of [0, 1]) test("typed publication protects pending and del
   } finally { f.client.close(); }
 });
 
-for (const kind of ["clerk-assignment", "configuration-completion/v1", "configuration-contract", "runtime-health"] as const) test("saved " + kind + " requires a compatible reader even without selected tooling", async () => {
+for (const kind of ["clerk-assignment", "configuration-completion/v1", "configuration-contract", "runtime-health", "tooling-capability-resolution"] as const) test("saved " + kind + " requires a compatible reader even without selected tooling", async () => {
   const f = await fixture();
   try {
     await f.client.execute("CREATE TABLE RuntimeMetadataEvent (action TEXT, value TEXT)");
     const value = kind === "configuration-contract" ? { boundary: "configuration-only" } : { resources: [{ targets: [{ kind }] }] };
-    await f.client.execute({ sql: "INSERT INTO RuntimeMetadataEvent VALUES (?, ?)", args: [kind === "configuration-contract" ? "completion-contract" : kind === "runtime-health" ? "runtime-health" : "finalization-prepared", JSON.stringify(value)] });
-    const expected = kind === "clerk-assignment" ? "clerk-assignment/v1" : kind === "runtime-health" ? "runtime-health/v1" : "configuration-completion/v1";
+    await f.client.execute({ sql: "INSERT INTO RuntimeMetadataEvent VALUES (?, ?)", args: [kind === "configuration-contract" ? "completion-contract" : ["runtime-health", "tooling-capability-resolution"].includes(kind) ? kind : "finalization-prepared", JSON.stringify(value)] });
+    const expected = kind === "clerk-assignment" ? "clerk-assignment/v1" : kind === "runtime-health" ? "runtime-health/v1" : kind === "tooling-capability-resolution" ? "capability-publication/v1" : "configuration-completion/v1";
     expect((await readToolingDeploymentState(f.databaseUrl)).serverContracts).toEqual([expected]);
     await expect(assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: f.current })).rejects.toThrow(expected);
     await assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: compatibleReader(f, [expected]) });
+  } finally { f.client.close(); }
+});
+
+for (const published of [0, 1]) test(`capability report protects its reader before and after delivery: ${published}`, async () => {
+  const f = await fixture();
+  try {
+    await f.client.execute("CREATE TABLE RuntimeIssueUpdate (input TEXT, published INTEGER)");
+    const input = JSON.stringify({ publication: { category: "blocker", subject: { kind: "capability", id: "runtime" }, code: "tooling-capability-unavailable" } });
+    await f.client.execute({ sql: "INSERT INTO RuntimeIssueUpdate VALUES (?, ?)", args: [input, published] });
+    expect((await readToolingDeploymentState(f.databaseUrl)).serverContracts).toEqual(["capability-publication/v1", "task-publication/v1"]);
+    await expect(assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: compatibleReader(f, ["task-publication/v1"]) })).rejects.toThrow("capability-publication/v1");
+    await assertToolingServerCompatibility({ databaseUrl: f.databaseUrl, repository: f.root, revision: compatibleReader(f, ["task-publication/v1", "capability-publication/v1"]) });
+    expect((await f.client.execute("SELECT input FROM RuntimeIssueUpdate")).rows[0]!.input).toBe(input);
   } finally { f.client.close(); }
 });
 

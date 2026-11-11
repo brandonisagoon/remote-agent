@@ -6,6 +6,7 @@ import { beginRuntimeSession } from "../runtime-registry.ts";
 import { issueUpdateDelivery, publishSessionIssueUpdate } from "../issue-updates.ts";
 import { projectTaskStalls } from "./task-stalls.ts";
 import { listRuntimeProjectionRetries } from "./projection-retries.ts";
+import { recordCapabilityOutcome } from "../../tasks/tooling-capability-outcome.ts";
 
 let db: TestDatabase;
 afterEach(async () => { await db?.cleanup(); });
@@ -31,6 +32,30 @@ async function fixture() {
   const instruction = (id = "instruction", state = "unknown", sessionId = session.id) => prisma.runtimeInstruction.create({ data: { id, sessionId, text: "Internal instruction never copied", state, updatedAt: new Date(at - 90_000) } });
   return { prisma, config, session, task, link, issue, comments, client, runtime, scan, instruction, time: () => at };
 }
+
+test("capability resolution failure reaches the fallback publisher once and recovery preserves the paused family", async () => {
+  const f = await fixture();
+  const record = (state: "blocked" | "resolved") => f.prisma.$transaction(tx => recordCapabilityOutcome(tx, {
+    version: 1, capability: "runtime", state, taskId: f.task.id, sessionId: f.session.id,
+    worktreePath: f.session.cwd, taskToolingRevision: f.task.toolingRevision, capabilityRevision: "reviewed-release",
+  }));
+  await record("blocked"); await f.scan();
+  expect(f.comments.size).toBe(1);
+  expect([...f.comments.values()][0]!.body).toContain("runtime tooling capability could not be resolved");
+  await record("blocked"); await f.prisma.$disconnect(); await f.scan();
+  expect(f.comments.size).toBe(1);
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+  await record("resolved"); await f.scan();
+  expect(f.comments.size).toBe(1);
+  expect((await f.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).ownerPaused).toBeTrue();
+  await f.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: false } });
+  await f.scan();
+  expect(f.comments.size).toBe(2);
+  expect([...f.comments.values()][1]!.body).toContain("Earlier blocker resolved");
+  await f.scan(); expect(f.comments.size).toBe(2);
+  expect(f.runtime.sentMessages).toEqual([]);
+  expect(await f.prisma.runtimeInstruction.count()).toBe(0);
+});
 
 test("one durable concise stall notification survives reconnect; mutable retry timestamps do not publish again", async () => {
   const f = await fixture();

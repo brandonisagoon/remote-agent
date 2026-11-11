@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { Prisma, PrismaClient, RuntimeIssueUpdate } from "../../../../generated/prisma/client.ts";
+import { CapabilityOutcome, ReportableCapability, capabilityFailureCode, capabilityOutcomeConsumer } from "../tasks/tooling-capability-outcome.ts";
 
 const Id = z.string().trim().min(1).max(512);
 const FailureSubject = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("capability"), id: ReportableCapability }).strict(),
   z.object({ kind: z.literal("instruction"), id: Id }).strict(),
   z.object({ kind: z.literal("operation"), id: Id }).strict(),
   z.object({ kind: z.literal("question"), id: Id }).strict(),
@@ -55,6 +57,19 @@ export async function readPublicationFact(tx: Prisma.TransactionClient, owner: P
   const task = owner.taskId ? await tx.remoteTask.findUnique({ where: { id: owner.taskId } }) : null;
   if (owner.taskId && (!task || task.primarySessionId !== primary.id || task.repositoryId !== primary.repositoryId || task.machineId !== primary.machineId || task.worktreePath !== primary.cwd || task.phase === "closed"))
     throw new Error("Task publication ownership changed");
+  if (subject.kind === "capability") {
+    if (!task) throw new Error("Capability publication requires its original task");
+    const cursor = await tx.runtimeEventCursor.findUnique({ where: { runtimeSessionId_consumer: {
+      runtimeSessionId: primary.id, consumer: capabilityOutcomeConsumer(task.id, subject.id),
+    } } });
+    const value = CapabilityOutcome.parse(json(cursor?.sourceCursor ?? null));
+    if (value.taskId !== task.id || value.sessionId !== primary.id || value.capability !== subject.id
+      || value.worktreePath !== task.worktreePath || value.taskToolingRevision !== task.toolingRevision
+      || value.connectionId !== task.connectionId || value.issueIdentifier !== task.issueIdentifier)
+      throw new Error("Capability publication ownership changed");
+    return { status: value.state, ...(value.state === "blocked" ? { code: capabilityFailureCode } : {}),
+      witness: { kind: subject.kind, id: subject.id, generation: Number(cursor!.generation), lastResolvedGeneration: value.lastResolvedGeneration, capabilityRevision: value.capabilityRevision, state: value.state } };
+  }
   if (subject.kind === "instruction") {
     const row = await tx.runtimeInstruction.findUnique({ where: { id: subject.id } });
     if (!row) throw new Error("Publication instruction is missing"); await assertFamily(tx, owner, row.sessionId);
@@ -156,9 +171,11 @@ async function observeEpisode(tx: Prisma.TransactionClient, owner: PublicationOw
   let changed = false;
   // Lifecycle projection may catch up after several turns. A recorded resolved
   // turn between two failures is still an observed boundary, even after restart.
-  if (episode?.state === "blocked" && fact.status === "blocked" && subject.kind === "execution" && Number(fact.witness.lastResolvedSequence) > Number(episode.entry.sequence)) {
+  const interveningResolution = subject.kind === "execution" && Number(fact.witness.lastResolvedSequence) > Number(episode?.entry.sequence)
+    || subject.kind === "capability" && Number(fact.witness.lastResolvedGeneration) > Number(episode?.entry.generation);
+  if (episode?.state === "blocked" && fact.status === "blocked" && interveningResolution) {
     episode = { ...episode, state: "resolved" };
-    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: owner.sessionId, source: "task-publication:v1", action: "task-publication-episode", key: cursor.id, value: JSON.stringify({ ...episode, observed: { sequence: fact.witness.lastResolvedSequence } }) } });
+    await tx.runtimeMetadataEvent.create({ data: { runtimeSessionId: owner.sessionId, source: "task-publication:v1", action: "task-publication-episode", key: cursor.id, value: JSON.stringify({ ...episode, observed: subject.kind === "capability" ? { generation: fact.witness.lastResolvedGeneration } : { sequence: fact.witness.lastResolvedSequence } }) } });
   }
   if (fact.status === "blocked" && (!episode || episode.state === "resolved" || episode.code !== fact.code)) {
     const occurrence = Number(cursor.generation) + 1;
@@ -273,15 +290,17 @@ export async function canonicalPublicationReceipt(prisma: PrismaClient | Prisma.
 export async function taskPublicationContext(prisma: PrismaClient, task: { id: string; primarySessionId: string | null; repositoryId: string; machineId: string }) {
   if (!task.primarySessionId) return { publicationSubjects: [], publicationEpisodes: [] };
   const sessionId = task.primarySessionId;
-  const [instructions, operations, events, evidence, cursors] = await Promise.all([
+  const [instructions, operations, events, evidence, cursors, capabilities] = await Promise.all([
     prisma.runtimeInstruction.findMany({ where: { sessionId, state: { in: ["unknown", "failed", "completed"] } }, orderBy: { updatedAt: "desc" }, take: 50 }),
     prisma.toolingOperation.findMany({ where: { taskId: task.id, sessionId }, orderBy: { createdAt: "desc" }, take: 50 }),
     prisma.runtimeMetadataEvent.findMany({ where: { runtimeSessionId: sessionId, source: `owner:${task.id}`, action: { in: ["completion-contract", "completion-verification", "completion-owner-approval"] } }, orderBy: { sequence: "desc" }, take: 50 }),
     prisma.remoteTaskResource.findMany({ where: { taskId: task.id, kind: "evidence", state: { not: "released" } }, take: 50 }),
     prisma.runtimeEventCursor.findMany({ where: { runtimeSessionId: sessionId, consumer: { startsWith: "task-publication:v1:" }, sourceCursor: { not: null } }, orderBy: { id: "desc" }, take: 100 }),
+    prisma.runtimeEventCursor.findMany({ where: { runtimeSessionId: sessionId, consumer: { startsWith: `tooling-capability-resolution:v1:${task.id}:` }, sourceCursor: { not: null } }, take: 4 }),
   ]);
   const owner = { sessionId, taskId: task.id, repositoryId: task.repositoryId, machineId: task.machineId, connectionId: "", issueId: "" };
   const subjects: Subject[] = [
+    ...capabilities.flatMap(row => { const parsed = CapabilityOutcome.safeParse(json(row.sourceCursor)); return parsed.success ? [{ kind: "capability" as const, id: parsed.data.capability }] : []; }),
     ...instructions.map(row => ({ kind: "instruction" as const, id: row.id })),
     ...operations.map(row => ({ kind: "operation" as const, id: row.id })),
     ...events.map(row => ({ kind: "task-event" as const, id: String(row.sequence) })),

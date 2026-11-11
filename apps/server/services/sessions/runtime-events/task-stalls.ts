@@ -5,11 +5,12 @@ import type { ServerConfig } from "../../../../../lib/config.ts";
 import type { AgentSessionRuntime } from "../../../../../types/runtime/index.ts";
 import { IssueUpdateInput, issueUpdateDelivery, publishSessionIssueUpdate } from "../issue-updates.ts";
 import { listRuntimeProjectionRetries, resolveRuntimeProjectionRetry, runRuntimeProjectionAttempt } from "./projection-retries.ts";
+import { CapabilityOutcome, ReportableCapability } from "../../tasks/tooling-capability-outcome.ts";
 
 const scans = new WeakMap<PrismaClient, number>();
 const graceMs = 60_000;
 type Input = { prisma: PrismaClient; config: ServerConfig; runtime: AgentSessionRuntime; signal?: AbortSignal };
-type Signal = { kind: "instruction" | "question" | "result" | "projection" | "operation"; sessionId: string; id: string; since: string; cause: string };
+type Signal = { kind: "instruction" | "question" | "result" | "projection" | "operation" | "capability"; sessionId: string; id: string; since: string; cause: string };
 const terminal = (issue: { state: { type: string } }) => ["completed", "canceled"].includes(issue.state.type);
 const eligible = { ownerPaused: false, phase: { notIn: ["complete", "closed"] }, environmentStatus: { not: "stopped" } };
 
@@ -31,13 +32,21 @@ export async function projectTaskStalls(input: Input, client = issueUpdateDelive
       if (links.length > 1 || !links.length && !primary.sessionMirror) continue;
       const children = await prisma.runtimeSession.findMany({ where: { role: "delegate", machineId: primary.machineId, repositoryId: primary.repositoryId, outgoingRelations: { some: { targetSessionId: primary.id, relationship: "spawned-by", endedAt: null } } } });
       const sessionIds = [primary.id, ...children.filter((row) => row.status !== "closed").map((row) => row.id)];
-      const [instructions, questions, notifications, retries] = await Promise.all([
+      const [instructions, questions, notifications, retries, capabilities] = await Promise.all([
         prisma.runtimeInstruction.findMany({ where: { sessionId: { in: sessionIds }, OR: [{ state: "unknown" }, { sessionId: primary.id, state: "failed" }], NOT: { id: { startsWith: "delegate-result:" } } }, select: { id: true, sessionId: true, state: true, updatedAt: true } }),
         prisma.runtimeQuestion.findMany({ where: { runtimeSessionId: { in: sessionIds }, state: "unknown" }, select: { id: true, runtimeSessionId: true, updatedAt: true } }),
         prisma.runtimeSessionRelation.findMany({ where: { sourceSessionId: { in: children.map((row) => row.id) }, targetSessionId: primary.id, relationship: "notifies-parent", endedAt: null } }),
         listRuntimeProjectionRetries(prisma, [primary.id, ...children.map((row) => row.id)]),
+        prisma.runtimeEventCursor.findMany({ where: { runtimeSessionId: primary.id, consumer: { startsWith: `tooling-capability-resolution:v1:${task.id}:` }, sourceCursor: { not: null } }, take: 4 }),
       ]);
       const signals: Signal[] = [
+        ...capabilities.flatMap(row => {
+          let value; try { value = CapabilityOutcome.parse(JSON.parse(row.sourceCursor!)); } catch { return []; }
+          if (value.taskId !== task.id || value.sessionId !== primary.id || value.worktreePath !== task.worktreePath
+            || value.taskToolingRevision !== task.toolingRevision || value.connectionId !== task.connectionId || value.issueIdentifier !== task.issueIdentifier) return [];
+          return value.state === "blocked" ? [{ kind: "capability" as const, sessionId: primary.id, id: value.capability, since: "",
+            cause: `The ${value.capability} tooling capability could not be resolved. The original task and tooling pin are preserved; inspect its saved compatibility failure before retrying.` }] : [];
+        }),
         ...instructions.map((row) => ({ kind: "instruction" as const, sessionId: row.sessionId, id: row.id, since: row.updatedAt.toISOString(), cause: row.state === "unknown" ? "Instruction delivery is unconfirmed; inspect the old writer before explicitly resolving or retrying it." : "An accepted instruction failed. Inspect its original result before recovery." })),
         ...questions.map((row) => ({ kind: "question" as const, sessionId: row.runtimeSessionId, id: row.id, since: row.updatedAt.toISOString(), cause: "Owner-question delivery is unconfirmed; reconcile the original question receipt." })),
       ];
@@ -113,6 +122,7 @@ export async function projectTaskStalls(input: Input, client = issueUpdateDelive
       for (const signal of signals) {
         const subject: TaskPublication["subject"] = signal.kind === "projection"
           ? { kind: "projection", id: signal.id.slice(signal.id.indexOf(":") + 1), sessionId: signal.sessionId, stage: signal.id.startsWith("notify:") ? "notify" : "project" }
+          : signal.kind === "capability" ? { kind: "capability", id: ReportableCapability.parse(signal.id) }
           : { kind: signal.kind, id: signal.id };
         const fact = await readPublicationFact(prisma, owner, subject);
         if (fact.status !== "blocked" || !fact.code) continue;

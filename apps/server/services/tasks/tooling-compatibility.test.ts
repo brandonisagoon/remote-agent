@@ -14,6 +14,7 @@ import { beginTask } from "./store.ts";
 import { prepareTaskPrompt } from "./preparation.ts";
 import { resolveToolingCompatibility } from "./tooling-compatibility.ts";
 import { resolveSessionToolingCapability } from "./tooling-capabilities.ts";
+import { taskPublicationContext } from "../sessions/task-publication.ts";
 import { recordDevelopmentIntent } from "./development-intent.ts";
 import { createApp } from "../../app.ts";
 import { deliverManagedMerge } from "../../workers/product/workflow/merge-delivery.ts";
@@ -267,6 +268,40 @@ for (const contracts of [[], ["test-identity-preparation/v2"], ["test-identity-p
   });
 }
 
+test("real capability refusal exposes one durable blocker, then resolves on a successful reread without repinning", async () => {
+  const f = await withCurrentManifest(["test-identity-preparation/v2"]);
+  const failed = await f.request("runtime");
+  expect(failed.status).toBe(409);
+  expect((await failed.json()).error).toContain("inspect_task");
+  expect((await taskPublicationContext(db.prisma, f.task)).publicationSubjects).toContainEqual({
+    subject: { kind: "capability", id: "runtime" }, status: "blocked", code: "tooling-capability-unavailable",
+  });
+  expect((await f.request("runtime")).status).toBe(409);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(1);
+  write(f.source, ".remote-agent-capabilities.json", JSON.stringify(currentManifest));
+  f.repository.tooling.revision = commit(f.source); f.pin(f.repository.tooling.revision);
+  expect((await f.request("runtime")).status).toBe(200);
+  expect((await taskPublicationContext(db.prisma, f.task)).publicationSubjects).toContainEqual({
+    subject: { kind: "capability", id: "runtime" }, status: "resolved",
+  });
+  expect((await f.request("runtime")).status).toBe(200);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(2);
+  expect(await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toMatchObject({ toolingRevision: f.oldRevision, primarySessionId: f.session.id });
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.toolingOperation.count()).toBe(0);
+});
+
+test("revoked ownership during a failed capability read records no blocker or execution", async () => {
+  const f = await fixture(true);
+  await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "runtime" }, async () => {
+    await db.prisma.remoteTask.update({ where: { id: f.task.id }, data: { ownerPaused: true } });
+    throw new Error("Manifest unavailable");
+  })).rejects.toThrow("paused");
+  expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
+  expect(await db.prisma.runtimeInstruction.count()).toBe(0);
+  expect(await db.prisma.runtimeEventCursor.count()).toBe(0);
+});
+
 test("paused runtime resolution requires the exact development intent and cannot resolve another capability or a superseded request", async () => {
   const f = await fixture(true), context = { prisma: db.prisma, config: f.config, taskId: f.task.id };
   const development = await recordDevelopmentIntent({ ...context, request: { action: "pause", development: true, requestKey: "desktop-pause" } });
@@ -298,7 +333,8 @@ test("undeclared development credential capability fails concretely without upgr
   write(f.source, ".remote-agent-capabilities.json", JSON.stringify({ version: 1, capabilities: {} }));
   const revision = commit(f.source); f.repository.tooling.revision = revision; f.pin(revision);
   await expect(resolveSessionToolingCapability({ prisma: db.prisma, config: f.config, sessionId: f.session.id, capability: "development-credentials" })).rejects.toThrow("does not supply capability development-credentials");
-  expect(await db.prisma.runtimeMetadataEvent.count()).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability" } })).toBe(0);
+  expect(await db.prisma.runtimeMetadataEvent.count({ where: { action: "tooling-capability-resolution" } })).toBe(1);
   expect((await db.prisma.remoteTask.findUniqueOrThrow({ where: { id: f.task.id } })).toolingRevision).toBe(f.oldRevision);
 });
 
